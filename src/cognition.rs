@@ -11,11 +11,10 @@ pub mod mcp;
 pub mod operations;
 pub use operations::{CheckReport, Cognition};
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use anybytes::View;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
@@ -183,12 +182,11 @@ pub fn publish_events_with_storage(
     })
 }
 
-/// Verify that one authored event is structurally valid and carries every
-/// directly typed payload it names. Ambient pile contents do not participate:
-/// this is the publication-unit invariant which makes an event independently
-/// transferable and recoverable.
+/// Verify that one authored event carries every directly typed payload it
+/// names. Ambient pile contents do not participate: this is the
+/// publication-unit invariant which makes an event independently transferable
+/// and recoverable.
 pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
-    validate_singleton_fields(fragment.facts().iter().copied())?;
     let facts = fragment.facts().clone();
     let metafacts = fragment.metafacts().clone();
     let mut local = fragment.clone();
@@ -201,18 +199,17 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
     Ok(())
 }
 
-/// Validate the known invariants and directly typed attachments of a complete
-/// Cognition value. Unknown facts remain legal: Cognition is intentionally a
-/// shared event ledger, and independent producers may extend its ontology.
+/// Validate the directly typed attachments of a complete Cognition value.
+/// Unknown facts remain legal: Cognition is intentionally a shared event
+/// ledger, and independent producers may extend its ontology. A field with
+/// several values is legal too; readers choose among them deterministically.
 pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    validate_singleton_fields(facts.iter().copied())?;
     validate_payloads(reader, None::<&PileSnapshot>, facts.iter().copied())
 }
 
 /// Explicitly validate a maintained Cognition archive without flattening its
 /// physical shards into a second fact store.
 pub fn validate_archive(reader: &impl BlobStoreGet, facts: &FactArchive) -> Result<()> {
-    validate_singleton_fields(facts.iter())?;
     validate_payloads(reader, None::<&PileSnapshot>, facts.iter())
 }
 
@@ -225,7 +222,6 @@ pub fn validate_candidate(
 ) -> Result<()> {
     let mut union = current.clone();
     union += fragment.facts().clone();
-    validate_singleton_fields(union.iter().copied())?;
     let mut staged = fragment.clone();
     let overlay = staged
         .blobs_mut()
@@ -278,89 +274,6 @@ fn interval_start(interval: IntervalValue) -> i128 {
         .try_from_inline()
         .expect("NsTAIInterval values decode as epochs");
     lower.to_tai_duration().total_nanoseconds()
-}
-
-fn singleton_field(attribute: Id) -> Option<&'static str> {
-    let field = if attribute == reason::text.id() {
-        "reason::text"
-    } else if attribute == reason::about_turn.id() {
-        "reason::about_turn"
-    } else if attribute == reason::worker.id() {
-        "reason::worker"
-    } else if attribute == reason::command_text.id() {
-        "reason::command_text"
-    } else if attribute == patience::about_request.id() {
-        "patience::about_request"
-    } else if attribute == patience::worker.id() {
-        "patience::worker"
-    } else if attribute == patience::timeout_ms.id() {
-        "patience::timeout_ms"
-    } else if attribute == patience::requested_at.id() {
-        "patience::requested_at"
-    } else if attribute == exec::command_text.id() {
-        "exec::command_text"
-    } else if attribute == exec::about_request.id() {
-        "exec::about_request"
-    } else if attribute == exec::attempt.id() {
-        "exec::attempt"
-    } else if attribute == exec::exit_code.id() {
-        "exec::exit_code"
-    } else if attribute == exec::stdout_text.id() {
-        "exec::stdout_text"
-    } else if attribute == exec::stderr_text.id() {
-        "exec::stderr_text"
-    } else if attribute == exec::error.id() {
-        "exec::error"
-    } else if attribute == exec::about_thought.id() {
-        "exec::about_thought"
-    } else if attribute == model_chat::about_request.id() {
-        "model_chat::about_request"
-    } else if attribute == model_chat::attempt.id() {
-        "model_chat::attempt"
-    } else if attribute == model_chat::about_thought.id() {
-        "model_chat::about_thought"
-    } else if attribute == model_chat::output_text.id() {
-        "model_chat::output_text"
-    } else if attribute == model_chat::reasoning_text.id() {
-        "model_chat::reasoning_text"
-    } else if attribute == model_chat::error.id() {
-        "model_chat::error"
-    } else if attribute == context::summary.id() {
-        "context::summary"
-    } else if attribute == context::start_at.id() {
-        "context::start_at"
-    } else if attribute == context::end_at.id() {
-        "context::end_at"
-    } else if attribute == context::left.id() {
-        "context::left"
-    } else if attribute == context::right.id() {
-        "context::right"
-    } else if attribute == context::about_exec_result.id() {
-        "context::about_exec_result"
-    } else if attribute == cog::context.id() {
-        "cog::context"
-    } else {
-        return None;
-    };
-    Some(field)
-}
-
-fn validate_singleton_fields(facts: impl IntoIterator<Item = Trible>) -> Result<()> {
-    let mut seen = BTreeMap::<(Id, Id), [u8; 32]>::new();
-    for fact in facts {
-        let entity = *fact.e();
-        let attribute = *fact.a();
-        let Some(field) = singleton_field(attribute) else {
-            continue;
-        };
-        let value: [u8; 32] = fact.data[32..64].try_into().expect("inline width");
-        if let Some(previous) = seen.insert((entity, attribute), value) {
-            if previous != value {
-                bail!("Cognition entity {entity:X} has conflicting {field} values");
-            }
-        }
-    }
-    Ok(())
 }
 
 fn long_string_field(attribute: Id) -> Option<&'static str> {
@@ -650,18 +563,28 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_singleton_is_rejected() {
+    fn repeated_field_values_validate_and_read_deterministically() {
         let event = id(6);
-        let mut facts = entity! { ExclusiveId::force_ref(&event) @
-            reason::text: Inline::new([7; 32]),
-        }
-        .into_facts();
-        facts += entity! { ExclusiveId::force_ref(&event) @
-            reason::text: Inline::new([8; 32]),
-        }
-        .into_facts();
-        let error = validate_singleton_fields(facts.iter().copied()).unwrap_err();
-        assert!(format!("{error:#}").contains("conflicting reason::text"));
+        let mut fragment = Fragment::empty();
+        let first = fragment.put("first".to_owned());
+        let second = fragment.put("second".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &KIND_REASON_ID,
+            reason::text: first,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&event) @ reason::text: second };
+        validate_fragment(&fragment).unwrap();
+
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.snapshot().unwrap();
+        let rows = crate::triage::collect_reason_state(&reader, fragment.facts()).unwrap();
+        let smallest = if first.raw < second.raw {
+            "first"
+        } else {
+            "second"
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text.as_deref(), Some(smallest));
     }
 
     #[test]
