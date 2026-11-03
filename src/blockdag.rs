@@ -2292,4 +2292,86 @@ mod tests {
             CatalogValidation::Rejected(reason) if reason.contains("unknown modality")
         ));
     }
+
+    /// The open world, as this reader meets it: a catalog holding facts it
+    /// does not model is read, never refused. Each case is staged with the
+    /// bytes it names, so everything it names is resident.
+    fn assert_read(fragment: &Fragment) {
+        let validation = validate_fragment(fragment);
+        assert_eq!(validation, CatalogValidation::Accepted, "{validation:?}");
+    }
+
+    fn receipt_of(block: Fragment) -> Fragment {
+        source_projection(
+            schema::source_projection::SOURCE_CLAUDE_CODE,
+            "session:open-world",
+            br#"{"type":"test"}"#.as_slice(),
+            block,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fact_with_an_unknown_modality_or_direction_is_read() {
+        let modality = text_fact(id(12), schema::content_fact::direction::IN, "new modality");
+        assert_read(&projection(modality.unwrap()));
+        let direction = text_fact(
+            schema::content_fact::modality::TEXT,
+            id(14),
+            "new direction",
+        );
+        assert_read(&projection(direction.unwrap()));
+    }
+
+    #[test]
+    fn a_text_fact_with_unmodelled_attributes_is_read() {
+        let mut fact = text("annotated by someone else");
+        let fact_id = fact.root().unwrap();
+        fact += entity! { ExclusiveId::force_ref(&fact_id) @
+            metadata::name: "a name no Archive reader models on a fact",
+            schema::content_fact::media_type: &id(13),
+        };
+        assert_read(&projection(fact));
+    }
+
+    #[test]
+    fn a_fact_with_two_payloads_is_read() {
+        let mut fact = text("first payload");
+        let fact_id = fact.root().unwrap();
+        fact += entity! { ExclusiveId::force_ref(&fact_id) @
+            schema::content_fact::payload: "second payload",
+        };
+        assert_read(&projection(fact));
+    }
+
+    #[test]
+    fn entities_whose_ids_do_not_re_derive_are_read() {
+        let fact = fucid();
+        let fact = entity! { &fact @
+            metadata::tag: &schema::content_fact::KIND,
+            schema::content_fact::modality: &schema::content_fact::modality::TEXT,
+            schema::content_fact::direction: &schema::content_fact::direction::IN,
+            schema::content_fact::payload: "held under a fresh id",
+        };
+        let node = fucid();
+        let node = entity! { &node @
+            metadata::tag: &schema::block::KIND,
+            schema::block::holds*: fact,
+        };
+        assert_read(&receipt_of(node));
+    }
+
+    #[test]
+    fn a_node_naming_entities_this_catalog_lacks_is_read() {
+        let node = fucid();
+        let node = entity! { &node @
+            metadata::tag: &schema::block::KIND,
+            schema::block::previous: &id(97),
+            schema::block::holds: &id(98),
+            schema::block::responds_to: &id(99),
+        };
+        let mut catalog = receipt_of(node);
+        catalog += text("a fact no node holds");
+        assert_read(&catalog);
+    }
 }

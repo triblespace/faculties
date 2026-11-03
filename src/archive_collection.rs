@@ -2772,6 +2772,50 @@ mod tests {
         pile.close().unwrap();
     }
 
+    /// A predecessor this snapshot does not hold as a block (not synced yet,
+    /// or never a block) names no position. The block is read at its own
+    /// time, and the rest of the timeline with it.
+    #[test]
+    fn timeline_reads_past_a_predecessor_the_snapshot_lacks() {
+        let absent = fucid();
+        let block = fucid();
+        let later = fucid();
+        let at = |ns: i128| {
+            crate::clock::point(hifitime::Epoch::from_tai_duration(
+                hifitime::Duration::from_total_nanoseconds(ns),
+            ))
+            .unwrap()
+        };
+        let mut fragment = entity! { &block @
+            metadata::tag: &schema::block::KIND,
+            schema::block::timestamp: at(4),
+            schema::block::previous: &absent.id,
+        };
+        fragment += entity! { &later @
+            metadata::tag: &schema::block::KIND,
+            schema::block::timestamp: at(9),
+            schema::block::previous: &block.id,
+        };
+        let timeline = timeline_after(
+            fragment.facts(),
+            ArchiveTimelineCursor::AfterTime(i128::MIN),
+        )
+        .unwrap();
+        assert_eq!(
+            timeline,
+            [
+                ArchiveTimelineBlock {
+                    position: 4,
+                    block: block.id
+                },
+                ArchiveTimelineBlock {
+                    position: 9,
+                    block: later.id
+                },
+            ]
+        );
+    }
+
     #[test]
     fn timeline_uses_all_timestamp_annotations_without_scalar_validation() {
         let block = fucid();

@@ -4047,4 +4047,138 @@ mod tests {
             );
         }
     }
+
+    /// The open world, end to end: facts no Archive reader models are read
+    /// as far as it understands them, and none of them refuses a listing, a
+    /// projection or a replay.
+    #[test]
+    fn foreign_facts_are_listed_shown_and_replayed() {
+        use crate::blockdag;
+        use triblespace::core::id::ExclusiveId;
+        use triblespace::prelude::{entity, fucid};
+
+        let at = |seconds: f64| crate::clock::point(Epoch::from_unix_seconds(seconds)).unwrap();
+        let text = |modality: Id, body: &str| {
+            blockdag::text_fact(modality, archive_schema::content_fact::direction::IN, body)
+                .unwrap()
+        };
+        let receipt = |block: Fragment| {
+            blockdag::block_source_projection(
+                archive_schema::source_projection::SOURCE_CODEX,
+                block,
+            )
+            .unwrap()
+        };
+        let mut catalog = Fragment::empty();
+        let mut shown = Vec::new();
+
+        // A modality this reader has no name for.
+        let modality = fucid().id;
+        let fact = text(modality, "foreign modality body");
+        let fact = receipt(blockdag::block([], Some(at(100.0)), fact).unwrap());
+        shown.push((fact.root().unwrap(), "foreign modality body"));
+        catalog += fact;
+
+        // A text fact carrying attributes a text fact never has.
+        let mut fact = text(
+            archive_schema::content_fact::modality::TEXT,
+            "annotated body",
+        );
+        let id = fact.root().unwrap();
+        fact += entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "a name on a fact",
+            archive_schema::content_fact::media_type: &fucid().id,
+        };
+        let fact = receipt(blockdag::block([], Some(at(101.0)), fact).unwrap());
+        shown.push((fact.root().unwrap(), "annotated body"));
+        catalog += fact;
+
+        // Two payloads on one fact: both are read.
+        let mut fact = text(
+            archive_schema::content_fact::modality::TEXT,
+            "first payload",
+        );
+        let id = fact.root().unwrap();
+        fact += entity! { ExclusiveId::force_ref(&id) @
+            archive_schema::content_fact::payload: "second payload",
+        };
+        let fact = receipt(blockdag::block([], Some(at(102.0)), fact).unwrap());
+        shown.push((fact.root().unwrap(), "second payload"));
+        catalog += fact;
+
+        // A fact and a node under fresh ids that no core re-derives.
+        let fact = fucid();
+        let fact = entity! { &fact @
+            metadata::tag: &archive_schema::content_fact::KIND,
+            archive_schema::content_fact::modality: &archive_schema::content_fact::modality::TEXT,
+            archive_schema::content_fact::direction: &archive_schema::content_fact::direction::IN,
+            archive_schema::content_fact::payload: "underived body",
+        };
+        let node = fucid();
+        let node = entity! { &node @
+            metadata::tag: &archive_schema::block::KIND,
+            archive_schema::block::timestamp: at(103.0),
+            archive_schema::block::holds*: fact,
+        };
+        let node = receipt(node);
+        shown.push((node.root().unwrap(), "underived body"));
+        catalog += node;
+
+        // A node after a predecessor this pile does not hold.
+        let fact = text(
+            archive_schema::content_fact::modality::TEXT,
+            "after an absent node",
+        );
+        let fact = receipt(blockdag::block([fucid().id], Some(at(104.0)), fact).unwrap());
+        shown.push((fact.root().unwrap(), "after an absent node"));
+        catalog += fact;
+
+        let fixture = fixture();
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            archive_schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
+        pile.commit(collection, &signer, catalog).unwrap();
+        pile.close().unwrap();
+
+        let bodies = [
+            "foreign modality body",
+            "annotated body",
+            "first payload",
+            "second payload",
+            "underived body",
+            "after an absent node",
+        ];
+        let listed = printed(|out| run_list(storage(&fixture), 20, FORCED, out)).unwrap();
+        for body in bodies {
+            assert!(listed.contains(body), "{body}: {listed}");
+        }
+        for (projection, body) in &shown {
+            let projection = format!("{projection:X}");
+            let rendered =
+                printed(|out| run_show(storage(&fixture), &projection, FORCED, out)).unwrap();
+            assert!(rendered.contains(body), "{body}: {rendered}");
+        }
+        let foreign =
+            printed(|out| run_show(storage(&fixture), &format!("{:X}", shown[0].0), FORCED, out))
+                .unwrap();
+        assert!(
+            foreign.contains(&format!("modality:{modality:X}")),
+            "{foreign}"
+        );
+
+        let archive = Archive::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        archive
+            .replay_start("open-world", Epoch::from_unix_seconds(0.0))
+            .unwrap();
+        let replayed = printed(|out| archive.replay("open-world", 50, true, FORCED, out)).unwrap();
+        for body in bodies {
+            assert!(replayed.contains(body), "{body}: {replayed}");
+        }
+        assert!(replayed.contains("nothing remains"), "{replayed}");
+    }
 }
