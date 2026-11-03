@@ -743,11 +743,11 @@ const CLASSIFIER_STOPS: [&str; 2] = [
 
 /// Why a read withholds `node`, if a recorded classifier stop followed it:
 /// a stop reached from it forward through nodes that bring no new input,
-/// which are the stopped response and the notices around the stop. So the
-/// input a stopped model was answering is withheld, and the response and
-/// notices with it; the next input ends the search. Reading such content
-/// back into a model of that provider tends to stop the reader too, which
-/// ends its turn with no visible cause.
+/// which are the stopped response, the results of its tool calls, and the
+/// notices around the stop. So the input a stopped model was answering is
+/// withheld, and the whole turn with it; the next input ends the search.
+/// Reading such content back into a model of that provider tends to stop
+/// the reader too, which ends its turn with no visible cause.
 ///
 /// Decided from the facts at every read and never stored: nothing about the
 /// content is judged, only what happened right after it. The model named is
@@ -769,13 +769,23 @@ fn classifier_stop(facts: &FactArchive, reader: &PileSnapshot, node: Id) -> Resu
                 let mut models = BTreeSet::new();
                 let mut step = cursor;
                 loop {
+                    // A tool result names no model; the call it answers
+                    // does, and that call opened this turn's walk behind it.
                     for model in find!(
                         model: TextHandle,
                         pattern!(facts, [{
                             _?receipt @ archive_schema::source_projection::projects_to: step,
                             archive_schema::source_projection::raw_model: ?model
                         }])
-                    ) {
+                    )
+                    .chain(find!(
+                        model: TextHandle,
+                        pattern!(facts, [
+                            { step @ archive_schema::block::responds_to: _?call },
+                            { _?receipt @ archive_schema::source_projection::projects_to: _?call,
+                              archive_schema::source_projection::raw_model: ?model },
+                        ])
+                    )) {
                         models.insert(read_text(reader, model)?);
                     }
                     if step == node {
@@ -803,7 +813,11 @@ fn classifier_stop(facts: &FactArchive, reader: &PileSnapshot, node: Id) -> Resu
                     format_interval(at)
                 )));
             }
-            let input = find!(
+            // A tool's result, every part of it, answers a call the turn
+            // made: the turn goes on through it.
+            let input = !exists!(pattern!(facts, [{
+                next @ archive_schema::block::responds_to: _?call
+            }])) && find!(
                 modality: Id,
                 pattern!(facts, [
                     { next @ archive_schema::block::holds: _?fact },
@@ -812,7 +826,10 @@ fn classifier_stop(facts: &FactArchive, reader: &PileSnapshot, node: Id) -> Resu
                       archive_schema::content_fact::modality: ?modality },
                 ])
             )
-            .any(|modality| modality != archive_schema::content_fact::modality::EVENT);
+            .any(|modality| {
+                modality != archive_schema::content_fact::modality::EVENT
+                    && modality != archive_schema::content_fact::modality::TOOL_RESULT
+            });
             if !input && !came_from.contains_key(&next) {
                 came_from.insert(next, cursor);
                 pending.push(next);
@@ -3222,6 +3239,64 @@ mod tests {
         let thread =
             printed(|out| run_thread(storage(&fixture), &quoted, 10, None, false, out)).unwrap();
         assert!(!thread.contains("withheld"), "{thread}");
+    }
+
+    /// A stopped turn that called a tool: its result, text and image, came
+    /// back before the stop. The result belongs to the turn and is no new
+    /// input, so the input that opened the turn is withheld, and every node
+    /// from it to the stop; the input after the stop prints.
+    #[test]
+    fn a_read_withholds_a_stopped_turn_through_its_tool_results() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("tooled.jsonl");
+        let line = |json: String| json + "\n";
+        let text = [
+            line(r#"{"type":"user","sessionId":"tool","uuid":"u1","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"slate harbor question"}}"#.to_owned()),
+            line(r#"{"type":"assistant","sessionId":"tool","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T15:34:02Z","message":{"role":"assistant","model":"claude-test-9","content":[{"type":"tool_use","id":"toolu_9","name":"Probe","input":{"marker":"heron"}}]}}"#.to_owned()),
+            line(r#"{"type":"user","sessionId":"tool","uuid":"r1","parentUuid":"a1","timestamp":"2026-03-01T15:34:03Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":[{"type":"text","text":"Interrupted"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw=="}}]}]}}"#.to_owned()),
+            line(r#"{"type":"system","subtype":"informational","level":"notice","sessionId":"tool","uuid":"s1","parentUuid":"r1","timestamp":"2026-03-01T15:34:04Z","content":"stopped"}"#.to_owned()),
+            line(serde_json::json!({"type":"user","isMeta":true,"sessionId":"tool","uuid":"x1","parentUuid":"s1","timestamp":"2026-03-01T15:34:05Z","message":{"role":"user","content":STOP}}).to_string()),
+            line(r#"{"type":"user","sessionId":"tool","uuid":"u2","parentUuid":"x1","timestamp":"2026-03-01T15:34:06Z","message":{"role":"user","content":"pewter after words"}}"#.to_owned()),
+        ]
+        .concat();
+        fs::write(&source, text).unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+
+        let input = holder(&fixture, "slate harbor question");
+        let result = holder(&fixture, "Interrupted");
+        let image = {
+            let archive = storage(&fixture).load().unwrap();
+            let facts = archive.facts().unwrap();
+            let mut images: Vec<String> = find!(
+                block: Id,
+                pattern!(&facts, [
+                    { ?block @ archive_schema::block::holds: _?fact },
+                    { _?fact @ archive_schema::content_fact::blob: _?bytes },
+                ])
+            )
+            .map(|block| format!("{block:X}"))
+            .collect();
+            assert_eq!(images.len(), 1);
+            images.pop().unwrap()
+        };
+        for node in [&input, &result, &image] {
+            let shown = printed(|out| run_show(storage(&fixture), node, false, out)).unwrap();
+            assert!(
+                shown.contains(&format!(
+                    "withheld {node}: a safety classifier stopped a claude-test-9 turn"
+                )),
+                "{shown}"
+            );
+        }
+
+        let after = holder(&fixture, "pewter after words");
+        let thread =
+            printed(|out| run_thread(storage(&fixture), &after, 10, None, false, out)).unwrap();
+        assert!(thread.contains("pewter after words"), "{thread}");
+        assert!(thread.contains(STOP), "{thread}");
+        assert!(!thread.contains("slate harbor"), "{thread}");
+        assert!(!thread.contains("heron"), "{thread}");
+        assert!(thread.contains(&format!("withheld {input}")), "{thread}");
     }
 
     #[test]
