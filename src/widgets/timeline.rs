@@ -549,6 +549,9 @@ fn collect_reason_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Eve
 /// holding no text remains visible as a typed placeholder.
 fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
     let source_times = earliest_source_times(dataset.facts);
+    // A chip shows a node's text, and a capture carries it to a model: what
+    // a recorded classifier stop followed shows only that it is withheld.
+    let stopped = crate::archive::classifier_stopped(dataset.facts);
 
     let mut block_times = BTreeMap::new();
     for (block, timestamp) in find!(
@@ -601,26 +604,30 @@ fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Ev
             continue;
         };
         let texts = text_parts.get(&block);
-        let content = texts
-            .map(|parts| {
-                parts
-                    .iter()
-                    .map(|(_, text)| text.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| {
-                format!(
-                    "[{} non-text part{}]",
-                    part_counts.get(&block).copied().unwrap_or(0),
-                    if part_counts.get(&block).copied().unwrap_or(0) == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            });
+        let content = if stopped.contains(&block) {
+            "[withheld: a classifier stop followed this]".to_owned()
+        } else {
+            texts
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .map(|(_, text)| text.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "[{} non-text part{}]",
+                        part_counts.get(&block).copied().unwrap_or(0),
+                        if part_counts.get(&block).copied().unwrap_or(0) == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                })
+        };
         let Some(ts_ns) = interval_start(*timestamp) else {
             continue;
         };

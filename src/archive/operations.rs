@@ -895,30 +895,65 @@ fn classifier_stop(
                     ),
                 )));
             }
-            // A tool's result, every part of it, answers a call the turn
-            // made: the turn goes on through it.
-            let input = !exists!(pattern!(facts, [{
-                next @ archive_schema::block::responds_to: _?call
-            }])) && find!(
-                modality: Id,
-                pattern!(facts, [
-                    { next @ archive_schema::block::holds: _?fact },
-                    { _?fact @ archive_schema::content_fact::direction:
-                        archive_schema::content_fact::direction::IN,
-                      archive_schema::content_fact::modality: ?modality },
-                ])
-            )
-            .any(|modality| {
-                modality != archive_schema::content_fact::modality::EVENT
-                    && modality != archive_schema::content_fact::modality::TOOL_RESULT
-            });
-            if !input && !came_from.contains_key(&next) {
+            if !brings_input(facts, next) && !came_from.contains_key(&next) {
                 came_from.insert(next, cursor);
                 pending.push(next);
             }
         }
     }
     Ok(None)
+}
+
+/// Whether `node` brings a stopped turn new input, which ends it: input that
+/// is no event. A tool's result, every part of it, answers a call the turn
+/// made, so the turn goes on through it.
+fn brings_input(facts: &FactArchive, node: Id) -> bool {
+    !exists!(pattern!(facts, [{
+        node @ archive_schema::block::responds_to: _?call
+    }])) && find!(
+        modality: Id,
+        pattern!(facts, [
+            { node @ archive_schema::block::holds: _?fact },
+            { _?fact @ archive_schema::content_fact::direction:
+                archive_schema::content_fact::direction::IN,
+              archive_schema::content_fact::modality: ?modality },
+        ])
+    )
+    .any(|modality| {
+        modality != archive_schema::content_fact::modality::EVENT
+            && modality != archive_schema::content_fact::modality::TOOL_RESULT
+    })
+}
+
+/// Every node a recorded classifier stop followed: the nodes
+/// [`classifier_stop`] finds one at a time, found backwards from each stop,
+/// for a reader that shows many nodes at once. A stop's predecessors are
+/// stopped, and so are theirs while the node between brings no input.
+/// Withholds from every reader; no provider is declared here.
+#[cfg_attr(not(feature = "widgets"), allow(dead_code))]
+pub(crate) fn classifier_stopped(facts: &FactArchive) -> BTreeSet<Id> {
+    let mut stopped = BTreeSet::new();
+    for (_, stop) in CLASSIFIER_STOPS {
+        let mut pending: Vec<Id> = find!(
+            node: Id,
+            pattern!(facts, [
+                { ?node @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::payload: stop },
+            ])
+        )
+        .collect();
+        while let Some(cursor) = pending.pop() {
+            for before in find!(
+                before: Id,
+                pattern!(facts, [{ cursor @ archive_schema::block::previous: ?before }])
+            ) {
+                if stopped.insert(before) && !brings_input(facts, before) {
+                    pending.push(before);
+                }
+            }
+        }
+    }
+    stopped
 }
 
 /// The facts a node holds (a set: one, or several at the same moment) and
@@ -3251,6 +3286,28 @@ mod tests {
     /// response, the notice Claude Code writes, then the stop itself; a
     /// second input stopped with no response recorded; and an input followed
     /// by a message that merely quotes the stop text.
+    /// The bulk set found backwards from the stops is exactly the nodes the
+    /// forward walk withholds one at a time.
+    fn assert_bulk_agrees(fixture: &Fixture) {
+        let archive = storage(fixture).load().unwrap();
+        let facts = archive.facts().unwrap();
+        let nodes: BTreeSet<Id> = find!(
+            node: Id,
+            pattern!(&facts, [{ ?node @ archive_schema::block::holds: _?fact }])
+        )
+        .collect();
+        let forward: BTreeSet<Id> = nodes
+            .into_iter()
+            .filter(|&node| {
+                classifier_stop(&facts, archive.snapshot(), node)
+                    .unwrap()
+                    .is_some()
+            })
+            .collect();
+        assert!(!forward.is_empty());
+        assert_eq!(classifier_stopped(&facts), forward);
+    }
+
     fn stopped_session(fixture: &Fixture) {
         let source = fixture._directory.path().join("stopped.jsonl");
         let line = |json: String| json + "\n";
@@ -3388,6 +3445,7 @@ mod tests {
         })
         .unwrap();
         assert!(!thread.contains("withheld"), "{thread}");
+        assert_bulk_agrees(&fixture);
     }
 
     /// The stops recorded are Anthropic's. A reader declaring that provider,
@@ -3519,6 +3577,7 @@ mod tests {
         assert!(!thread.contains("slate harbor"), "{thread}");
         assert!(!thread.contains("heron"), "{thread}");
         assert!(thread.contains(&format!("withheld {input}")), "{thread}");
+        assert_bulk_agrees(&fixture);
     }
 
     #[test]
