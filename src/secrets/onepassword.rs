@@ -490,7 +490,8 @@ impl<'a> OnePasswordArchive<'a> {
                 ) else {
                     continue;
                 };
-                let blob: Blob<SimpleArchive> = Blob::new(bytes.to_vec().into());
+                // One aligned zeroizing copy; `bytes` is zeroized on drop.
+                let blob: Blob<SimpleArchive> = Blob::new(super::encrypted::clear_bytes(&bytes));
                 let Ok(private) = blob.try_from_blob::<TribleSet>() else {
                     continue;
                 };
@@ -1142,8 +1143,9 @@ pub(crate) mod tests {
             opened.open_child(attachment).unwrap().bytes.as_ref(),
             b"SYNTHETIC-PRIVATE-binary\0\xff"
         );
-        let receipt: Blob<SimpleArchive> =
-            Blob::new(after.open(report.receipt, &signer).unwrap().into());
+        let receipt: Blob<SimpleArchive> = Blob::new(super::super::encrypted::clear_bytes(
+            &Zeroizing::new(after.open(report.receipt, &signer).unwrap()),
+        ));
         let receipt: TribleSet = receipt.try_from_blob().unwrap();
         assert_eq!(
             find!(id: Id, pattern!(&receipt, [{ import_entry: ?id }])).count(),
@@ -1500,8 +1502,9 @@ pub(crate) mod tests {
             .unwrap();
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
-        let original: Blob<SimpleArchive> =
-            Blob::new(observed.open(first.receipt, &signer).unwrap().into());
+        let original: Blob<SimpleArchive> = Blob::new(super::super::encrypted::clear_bytes(
+            &Zeroizing::new(observed.open(first.receipt, &signer).unwrap()),
+        ));
         let original: TribleSet = original.try_from_blob().unwrap();
         let root = genid();
         let mut private = entity! { &root @ metadata::tag: KIND_1PASSWORD_IMPORT,
@@ -1535,8 +1538,9 @@ pub(crate) mod tests {
         // iteration ordering among concurrently valid receipt alternatives.
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
-        let content: Blob<SimpleArchive> =
-            Blob::new(observed.open(opaque, &signer).unwrap().into());
+        let content: Blob<SimpleArchive> = Blob::new(super::super::encrypted::clear_bytes(
+            &Zeroizing::new(observed.open(opaque, &signer).unwrap()),
+        ));
         let native: TribleSet = content.try_from_blob().unwrap();
         assert!(exists!(
             pattern!(&native, [{ root.id @ metadata::tag: KIND_1PASSWORD_IMPORT }])

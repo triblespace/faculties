@@ -792,7 +792,9 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&native.stderr)
         );
-        let archive: Blob<blobencodings::SimpleArchive> = Blob::new(native.stdout.into());
+        let archive: Blob<blobencodings::SimpleArchive> = Blob::new(
+            crate::secrets::encrypted::clear_bytes(&Zeroizing::new(native.stdout)),
+        );
         assert_eq!(archive.try_from_blob::<TribleSet>().unwrap(), facts);
         let inspected = command()
             .args([

@@ -260,8 +260,10 @@ impl OnePasswordArchive<'_> {
                     let bytes = access
                         .unlock_password(password)?
                         .open_raw(reader, &access)?;
+                    // One aligned zeroizing copy; `bytes` is zeroized on drop.
                     let private: TribleSet =
-                        Blob::<SimpleArchive>::new(bytes.to_vec().into()).try_from_blob()?;
+                        Blob::<SimpleArchive>::new(crate::secrets::encrypted::clear_bytes(&bytes))
+                            .try_from_blob()?;
                     for (root, archive, archive_body, archive_resource, archive_envelope) in find!((
                         root: Id, archive: Id, archive_body: BytesHandle, archive_resource: CollectionHandle, archive_envelope: BytesHandle),
                         pattern!(&private, [{ ?root @ metadata::tag: KIND_PROTECTED_1PASSWORD_IMPORT,

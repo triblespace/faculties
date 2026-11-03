@@ -7,8 +7,8 @@ use std::marker::PhantomData;
 
 use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::{
-    aead::{Aead, Payload},
-    KeyInit, XChaCha20Poly1305, XNonce,
+    aead::{Aead, AeadInPlace, Payload},
+    KeyInit, Tag, XChaCha20Poly1305, XNonce,
 };
 use dryoc::{
     dryocsecretbox::{Key, Nonce},
@@ -19,7 +19,7 @@ use triblespace::core::blob::{Blob, BlobEncoding, Bundle, Bytes, MemoryBlobStore
 use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
-use zeroize::Zeroizing;
+use zeroize::{DefaultIsZeroes, Zeroizing};
 
 /// XChaCha20-Poly1305 with this module's aligned, authenticated reference header.
 /// Minted with installed `trible genid` on 2026-10-17.
@@ -148,22 +148,64 @@ pub fn seal_blob<T: BlobEncoding>(
     Ok(Blob::new(bytes.into()))
 }
 
-// The immutable Vec allocation stays at the same address when its owner moves.
-// AnyBytes retains this owner until the last cloned/sliced byte view is dropped.
-struct ClearBytes(Zeroizing<Vec<u8>>);
+/// One 16-byte, 16-aligned plaintext block. Archive readers view the bytes in
+/// place as 16-aligned tribles and refuse anything else, so the alignment is a
+/// property of this element type, never of whatever the allocator returned.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(16))]
+struct ClearBlock([u8; 16]);
+impl DefaultIsZeroes for ClearBlock {}
+
+// Plaintext lives only in this zeroizing, block-aligned allocation. The Vec is
+// never grown after construction, so its address is stable when the owner
+// moves, and AnyBytes retains this owner until the last cloned/sliced byte view
+// is dropped. Dropping it zeroizes the whole capacity, tail padding included.
+struct ClearBytes {
+    blocks: Zeroizing<Vec<ClearBlock>>,
+    len: usize,
+}
+
+impl ClearBytes {
+    fn zeroed(len: usize) -> Self {
+        Self {
+            blocks: Zeroizing::new(vec![ClearBlock::default(); len.div_ceil(16)]),
+            len,
+        }
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        // SAFETY: ClearBlock is repr(C) over [u8; 16] (size 16, no padding),
+        // the Vec holds len.div_ceil(16) initialized blocks, so the first
+        // `len` bytes are in bounds, initialized, and uniquely borrowed here.
+        unsafe { std::slice::from_raw_parts_mut(self.blocks.as_mut_ptr().cast(), self.len) }
+    }
+}
+
 unsafe impl anybytes::ByteSource for ClearBytes {
     type Owner = Self;
     fn as_bytes(&self) -> &[u8] {
-        &self.0
+        // SAFETY: as in `as_mut_bytes`, shared instead of unique.
+        unsafe { std::slice::from_raw_parts(self.blocks.as_ptr().cast(), self.len) }
     }
     fn get_owner(self) -> Self {
         self
     }
 }
 
+/// Copy already-decrypted plaintext once into a 16-aligned zeroizing owner,
+/// so it can be decoded as an archive. The caller still owns and must zeroize
+/// `plaintext` (e.g. hold it in `Zeroizing`); no other copy is made.
+pub fn clear_bytes(plaintext: &[u8]) -> Bytes {
+    let mut clear = ClearBytes::zeroed(plaintext.len());
+    clear.as_mut_bytes().copy_from_slice(plaintext);
+    Bytes::from_source(clear)
+}
+
 /// Authenticate the expected encoding and complete public header, then open.
-/// The result has its own plaintext hash and a zeroizing backing owner. This
-/// cannot erase caller copies, plaintext inputs or decoded TribleSet allocations.
+/// The result has its own plaintext hash and a 16-aligned zeroizing backing
+/// owner; decryption happens in place there, so no other plaintext buffer
+/// exists. This cannot erase caller copies, plaintext inputs or decoded
+/// TribleSet allocations.
 pub fn open_blob<T: BlobEncoding>(key: &ItemKey, blob: Blob<Encrypted<T>>) -> Result<Blob<T>> {
     let bytes = blob.bytes.as_ref();
     let header = header_len(bytes)?;
@@ -172,18 +214,21 @@ pub fn open_blob<T: BlobEncoding>(key: &ItemKey, blob: Blob<Encrypted<T>>) -> Re
     }
     let cipher = XChaCha20Poly1305::new_from_slice(key.dek.as_slice())
         .map_err(|_| anyhow!("invalid item key"))?;
-    let plaintext = cipher
-        .decrypt(
+    // header_len guarantees the 16-byte Poly1305 tag follows the header.
+    let (ciphertext, tag) = bytes[header..].split_at(bytes.len() - header - 16);
+    let mut clear = ClearBytes::zeroed(ciphertext.len());
+    clear.as_mut_bytes().copy_from_slice(ciphertext);
+    // The tag is verified before the keystream is applied; on failure `clear`
+    // still holds only ciphertext and is zeroized on drop anyway.
+    cipher
+        .decrypt_in_place_detached(
             XNonce::from_slice(&bytes[32..56]),
-            Payload {
-                msg: &bytes[header..],
-                aad: &associated_data::<T>(&bytes[..header]),
-            },
+            &associated_data::<T>(&bytes[..header]),
+            clear.as_mut_bytes(),
+            Tag::from_slice(tag),
         )
         .map_err(|_| anyhow!("encrypted blob authentication failed"))?;
-    Ok(Blob::new(Bytes::from_source(ClearBytes(Zeroizing::new(
-        plaintext,
-    )))))
+    Ok(Blob::new(Bytes::from_source(clear)))
 }
 
 /// Tiny authoring inventory: only ciphertext created here can be carried out.
@@ -259,6 +304,66 @@ mod tests {
         drop(retained);
         assert_eq!(last_view.as_ref(), b"retained");
         drop(last_view);
+    }
+
+    #[test]
+    fn opened_and_copied_plaintext_is_aligned_by_type_for_every_length() {
+        let key = ItemKey::generate(genid().id);
+        for len in (0..=67).chain([255, 256, 257, 4095, 4096, 4097]) {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let cipher =
+                seal_blob::<blobencodings::RawBytes>(&key, plain.clone().to_blob(), &[]).unwrap();
+            let opened = open_blob(&key, cipher).unwrap();
+            assert_eq!(opened.bytes.as_ref(), plain.as_slice(), "len {len}");
+            assert_eq!(
+                opened.bytes.as_ptr() as usize % 16,
+                0,
+                "open_blob len {len}"
+            );
+            let copied = clear_bytes(&plain);
+            assert_eq!(copied.as_ref(), plain.as_slice(), "len {len}");
+            assert_eq!(copied.as_ptr() as usize % 16, 0, "clear_bytes len {len}");
+        }
+        // Even from a deliberately misaligned source view.
+        let source = vec![0u8; 65];
+        let copied = clear_bytes(&source[1..]);
+        assert_eq!(copied.as_ptr() as usize % 16, 0);
+    }
+
+    #[test]
+    fn archive_decodes_from_a_copy_of_misaligned_plaintext() {
+        let facts = entity! { metadata::name: "synthetic-aligned-archive" }.into_facts();
+        let archive: Blob<SimpleArchive> = facts.clone().to_blob();
+        let mut shifted = vec![0u8; archive.bytes.len() + 1];
+        shifted[1..].copy_from_slice(archive.bytes.as_ref());
+        // The reader refuses the misaligned view itself, so the copy matters.
+        let misaligned = Bytes::from_source(shifted.clone()).slice(1..);
+        assert_ne!(misaligned.as_ptr() as usize % 16, 0);
+        assert!(Blob::<SimpleArchive>::new(misaligned)
+            .try_from_blob::<TribleSet>()
+            .is_err());
+        let decoded: TribleSet = Blob::<SimpleArchive>::new(clear_bytes(&shifted[1..]))
+            .try_from_blob()
+            .unwrap();
+        assert_eq!(decoded, facts);
+    }
+
+    #[test]
+    fn clear_owner_zeroizes_its_whole_aligned_capacity() {
+        fn zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        // Drop of the owner is Zeroizing's drop; this is what it runs.
+        zeroize_on_drop::<Zeroizing<Vec<ClearBlock>>>();
+        let mut clear = ClearBytes::zeroed(21);
+        clear.as_mut_bytes().fill(0xa5);
+        clear.blocks.last_mut().unwrap().0[15] = 0x5a; // tail padding too
+        let capacity = clear.blocks.capacity() * 16;
+        assert_eq!(capacity, 32);
+        zeroize::Zeroize::zeroize(&mut *clear.blocks);
+        // SAFETY: the allocation is still owned by `clear` (zeroize clears the
+        // length, not the capacity) and every byte was just written by it.
+        let all =
+            unsafe { std::slice::from_raw_parts(clear.blocks.as_ptr().cast::<u8>(), capacity) };
+        assert!(all.iter().all(|byte| *byte == 0));
     }
 
     #[test]
