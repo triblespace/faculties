@@ -256,6 +256,99 @@ fn byte_identical_code_in_two_files_is_one_item_with_two_placements() {
 }
 
 #[test]
+fn exact_duplicates_cross_repositories_only_in_the_selected_revisions() {
+    let directory = tempfile::tempdir().unwrap();
+    let repos: Vec<PathBuf> = ["source-a", "source-b"]
+        .into_iter()
+        .map(|name| {
+            let repo = directory.path().join(name);
+            fs::create_dir_all(repo.join("src")).unwrap();
+            fs::write(repo.join("src/mesh.rs"), MESH).unwrap();
+            code_git::initialize(&repo);
+            repo
+        })
+        .collect();
+    let initial_commit = git2::Repository::open(&repos[0])
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    let other_commit = git2::Repository::open(&repos[1])
+        .unwrap()
+        .head()
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    assert_eq!(initial_commit, other_commit);
+    let pile = directory.path().join("code.pile");
+    let key = directory.path().join("code.key");
+    fs::File::create(&pile).unwrap();
+    initialize_signer(&pile, Some(&key)).unwrap();
+    let code = Code::new(pile, Some(key));
+    code.ingest(&repos, &IngestOptions::default()).unwrap();
+
+    // Neither repository has a local duplicate: there is exactly one
+    // placement in each. Both ordinary and cross-repository reports see it.
+    for cross_repo in [false, true] {
+        let report = code.duplicates(1, cross_repo, &Filter::default()).unwrap();
+        assert_eq!(report.groups.len(), 1, "{report:?}");
+        let group = &report.groups[0];
+        assert_eq!(group.name.as_deref(), Some("arc_points"));
+        assert_eq!(group.places.len(), 2);
+        assert_eq!(
+            group
+                .places
+                .iter()
+                .map(|hit| hit.repo.as_str())
+                .collect::<Vec<_>>(),
+            ["source-a", "source-b"]
+        );
+    }
+    let one_repo = code
+        .duplicates(
+            1,
+            false,
+            &Filter {
+                repo: Some("source-a".to_owned()),
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+    assert!(one_repo.groups.is_empty(), "{one_repo:?}");
+
+    // The old placement remains in the pile, but no longer belongs to the
+    // selected latest scan of source-b. Joining all historical scans leaks it.
+    fs::write(repos[1].join("src/mesh.rs"), MESH.replace("n + 1", "n + 2")).unwrap();
+    let changed = code
+        .ingest(&[repos[1].clone()], &IngestOptions::default())
+        .unwrap();
+    assert!(changed.repos[0].commit.starts_with("worktree:"));
+    assert_ne!(changed.repos[0].commit, initial_commit);
+    let latest = code.duplicates(1, true, &Filter::default()).unwrap();
+    assert!(latest.groups.is_empty(), "{latest:?}");
+
+    // These fixture repositories began with identical Git trees and commit
+    // metadata, so one exact revision selects their original scan in each.
+    let original = code
+        .duplicates(
+            1,
+            true,
+            &Filter {
+                revision: Revision::Selector(initial_commit),
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(original.groups.len(), 1, "{original:?}");
+    assert_eq!(original.groups[0].places.len(), 2);
+}
+
+#[test]
 fn an_unparseable_file_is_catalogued_rather_than_refused() {
     let fixture = Fixture::new();
     fixture.ingest();

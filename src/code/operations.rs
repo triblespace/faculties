@@ -548,19 +548,24 @@ impl Code {
         let provenance = provenance(&facts, &scans);
 
         let mut pairs: BTreeSet<(Id, Id, Id)> = BTreeSet::new();
-        for scan in &scans {
-            for (item, left, right, _, _) in code::duplicate_placements_in_scan(&facts, scan.id) {
-                // Bag-to-set presentation: the self-join necessarily yields the
-                // reflexive pair and both orderings.
-                if left == right {
-                    continue;
+        for (index, left_scan) in scans.iter().enumerate() {
+            for right_scan in &scans[index..] {
+                for (item, left, right, _, _) in
+                    code::duplicate_placements_between_scans(&facts, left_scan.id, right_scan.id)
+                {
+                    // Bag-to-set presentation: joining a scan with itself yields
+                    // reflexive pairs and both orderings. Different scans may
+                    // also share an unchanged unit and its placements.
+                    if left == right {
+                        continue;
+                    }
+                    let (low, high) = if left < right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    pairs.insert((item, low, high));
                 }
-                let (low, high) = if left < right {
-                    (left, right)
-                } else {
-                    (right, left)
-                };
-                pairs.insert((item, low, high));
             }
         }
 

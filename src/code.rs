@@ -565,21 +565,26 @@ where
     .collect()
 }
 
-/// Items placed more than once, as a self-join on the placement relation.
+/// Items shared by two selected scans, as a join on the placement relation.
+/// Passing the same scan twice also finds duplicates within one repository.
 ///
 /// Byte-identical code is already ONE item, so the pile's content addressing IS
 /// the clone detector: no hash attribute, no hashing pass, no comparison. The
 /// caller drops the reflexive pairs and canonicalises pair order, which is
 /// bag-to-set presentation, not a filter standing in for a missing constraint.
-pub fn duplicate_placements_in_scan<P>(facts: &P, scan: Id) -> Vec<(Id, Id, Id, Id, Id)>
+pub fn duplicate_placements_between_scans<P>(
+    facts: &P,
+    left_scan: Id,
+    right_scan: Id,
+) -> Vec<(Id, Id, Id, Id, Id)>
 where
     P: TriblePattern + ?Sized,
 {
     find!(
         (item: Id, left: Id, right: Id, left_unit: Id, right_unit: Id),
         pattern!(facts, [
-            { scan @ attrs::holds: ?left_unit },
-            { scan @ attrs::holds: ?right_unit },
+            { left_scan @ attrs::holds: ?left_unit },
+            { right_scan @ attrs::holds: ?right_unit },
             { ?left @ attrs::unit: ?left_unit, attrs::item: ?item },
             { ?right @ attrs::unit: ?right_unit, attrs::item: ?item },
         ])

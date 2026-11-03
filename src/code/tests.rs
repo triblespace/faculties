@@ -195,7 +195,7 @@ fn byte_identical_declarations_in_two_files_are_one_item_with_two_placements() {
     // attribute, no hashing pass, no comparison.
     assert_eq!(items.len(), 1);
 
-    let pairs = duplicate_placements_in_scan(&facts, scan);
+    let pairs = duplicate_placements_between_scans(&facts, scan, scan);
     let distinct: std::collections::BTreeSet<(Id, Id)> = pairs
         .iter()
         .filter(|(_, left, right, _, _)| left != right)
