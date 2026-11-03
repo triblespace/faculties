@@ -119,7 +119,13 @@ pub(super) enum Command {
     },
     /// Show one source projection (receipt) or one node by id prefix; a
     /// search hit's leading id is a node.
-    Show { id: String },
+    Show {
+        id: String,
+        /// Print content a recorded classifier stop followed, which a read
+        /// otherwise withholds and names in its place.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show the complete canonical ancestor DAG of one source projection
     /// (receipt) or one node, by id prefix; a search hit's leading id is a
     /// node.
@@ -134,6 +140,10 @@ pub(super) enum Command {
         /// after N, so --limit does not apply.
         #[arg(long)]
         tail: Option<usize>,
+        /// Print content a recorded classifier stop followed, which a read
+        /// otherwise withholds and names in its place.
+        #[arg(long)]
+        force: bool,
     },
     /// Search canonical block text through an exact portable BM25 cover.
     Search {
@@ -155,6 +165,10 @@ pub(super) enum Command {
         /// Include tool, thinking, event, and media-only blocks.
         #[arg(long)]
         with_tools: bool,
+        /// Print content a recorded classifier stop followed, which a read
+        /// otherwise withholds and names in its place.
+        #[arg(long)]
+        force: bool,
         /// Cursor owner. There is deliberately no default persona.
         #[arg(long, env = "PERSONA")]
         persona: Option<String>,
@@ -418,8 +432,13 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             )
         }
         Command::List { limit } => archive.list(limit, out),
-        Command::Show { id } => archive.show(&id, out),
-        Command::Thread { id, limit, tail } => archive.thread(&id, limit, tail, out),
+        Command::Show { id, force } => archive.show(&id, force, out),
+        Command::Thread {
+            id,
+            limit,
+            tail,
+            force,
+        } => archive.thread(&id, limit, tail, force, out),
         Command::Search { text, limit } => {
             archive.search(&crate::text_arg(&text, "search text")?, limit, out)
         }
@@ -428,6 +447,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             action,
             limit,
             with_tools,
+            force,
             persona,
         } => {
             let persona=persona.as_deref().ok_or_else(||anyhow!("no persona: set $PERSONA or pass --persona; replay cursors are session bookkeeping"))?;
@@ -451,7 +471,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                     out.line(format!("replay stopped (persona {persona})"))
                 }
                 Some(other) => bail!("unknown replay action `{other}` (start/stop or nothing)"),
-                None => archive.replay(persona, limit, with_tools, out),
+                None => archive.replay(persona, limit, with_tools, force, out),
             }
         }
     }

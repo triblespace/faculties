@@ -152,17 +152,20 @@ impl Archive {
     pub fn list(&self, limit: usize, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_list(storage, limit, out))
     }
-    pub fn show(&self, prefix: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| run_show(storage, prefix, out))
+    /// `force` prints content a classifier stop followed, which a read
+    /// otherwise withholds and names in its place.
+    pub fn show(&self, prefix: &str, force: bool, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| run_show(storage, prefix, force, out))
     }
     pub fn thread(
         &self,
         prefix: &str,
         limit: usize,
         tail: Option<usize>,
+        force: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        self.with_operation(|storage| run_thread(storage, prefix, limit, tail, out))
+        self.with_operation(|storage| run_thread(storage, prefix, limit, tail, force, out))
     }
     pub fn search(&self, text: &str, limit: usize, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_search(storage, text, limit, out))
@@ -196,9 +199,10 @@ impl Archive {
         persona: &str,
         limit: usize,
         with_tools: bool,
+        force: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        self.with_operation(|storage| run_replay(storage, limit, with_tools, persona, out))
+        self.with_operation(|storage| run_replay(storage, limit, with_tools, force, persona, out))
     }
 }
 fn validate_persona(persona: &str) -> Result<()> {
@@ -653,6 +657,9 @@ fn projection_actor(facts: &FactArchive, reader: &PileSnapshot, projection: Id) 
 }
 
 fn block_snippet(facts: &FactArchive, reader: &PileSnapshot, block: Id) -> Result<String> {
+    if let Some(withheld) = classifier_stop(facts, reader, block)? {
+        return Ok(withheld);
+    }
     let held: BTreeSet<Id> = find!(
         fact: Id,
         pattern!(facts, [{ block @ archive_schema::block::holds: ?fact }])
@@ -722,6 +729,97 @@ fn render_projection_summary(
         projection_actor(facts, reader, projection)?,
         snippets.join(" / "),
     ))
+}
+
+/// The texts Claude Code records, as a user message of its own, right after
+/// a safety classifier stopped a model's response; both wordings sessions
+/// hold. A node holding exactly one of them is a stop, and it is a stop by an
+/// Anthropic model, since only Claude Code writes them. A message quoting one
+/// inside longer text holds another text, and is no stop.
+const CLASSIFIER_STOPS: [&str; 2] = [
+    "Your response above was stopped by a safety classifier \u{2014} this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.",
+    "Your response above was stopped by a safety classifier \u{2014} this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded. Exception: a tool call whose result reads \"Interrupted\" was already running when the response was stopped; it may have partially or fully completed.",
+];
+
+/// Why a read withholds `node`, if a recorded classifier stop followed it:
+/// a stop reached from it forward through nodes that bring no new input,
+/// which are the stopped response and the notices around the stop. So the
+/// input a stopped model was answering is withheld, and the response and
+/// notices with it; the next input ends the search. Reading such content
+/// back into a model of that provider tends to stop the reader too, which
+/// ends its turn with no visible cause.
+///
+/// Decided from the facts at every read and never stored: nothing about the
+/// content is judged, only what happened right after it. The model named is
+/// the stopped response's, where the session recorded one.
+fn classifier_stop(facts: &FactArchive, reader: &PileSnapshot, node: Id) -> Result<Option<String>> {
+    let mut came_from = BTreeMap::from([(node, node)]);
+    let mut pending = vec![node];
+    while let Some(cursor) = pending.pop() {
+        for next in find!(
+            next: Id,
+            pattern!(facts, [{ ?next @ archive_schema::block::previous: cursor }])
+        ) {
+            if CLASSIFIER_STOPS.iter().any(|stop| {
+                exists!(pattern!(facts, [
+                    { next @ archive_schema::block::holds: _?fact },
+                    { _?fact @ archive_schema::content_fact::payload: *stop },
+                ]))
+            }) {
+                let mut models = BTreeSet::new();
+                let mut step = cursor;
+                loop {
+                    for model in find!(
+                        model: TextHandle,
+                        pattern!(facts, [{
+                            _?receipt @ archive_schema::source_projection::projects_to: step,
+                            archive_schema::source_projection::raw_model: ?model
+                        }])
+                    ) {
+                        models.insert(read_text(reader, model)?);
+                    }
+                    if step == node {
+                        break;
+                    }
+                    step = came_from[&step];
+                }
+                models.remove("<synthetic>");
+                let turn = if models.is_empty() {
+                    "an Anthropic model's turn".to_owned()
+                } else {
+                    format!(
+                        "a {} turn",
+                        models.into_iter().collect::<Vec<_>>().join("/")
+                    )
+                };
+                let at = find!(
+                    value: (i128, i128),
+                    pattern!(facts, [{ next @ archive_schema::block::timestamp: ?value }])
+                )
+                .min();
+                return Ok(Some(format!(
+                    "withheld {node:X}: a safety classifier stopped {turn} right after this \
+                     content at {} (stop {next:X}); use --force to print it",
+                    format_interval(at)
+                )));
+            }
+            let input = find!(
+                modality: Id,
+                pattern!(facts, [
+                    { next @ archive_schema::block::holds: _?fact },
+                    { _?fact @ archive_schema::content_fact::direction:
+                        archive_schema::content_fact::direction::IN,
+                      archive_schema::content_fact::modality: ?modality },
+                ])
+            )
+            .any(|modality| modality != archive_schema::content_fact::modality::EVENT);
+            if !input && !came_from.contains_key(&next) {
+                came_from.insert(next, cursor);
+                pending.push(next);
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The facts a node holds (a set: one, or several at the same moment) and
@@ -806,7 +904,30 @@ fn render_parts(
     Ok(())
 }
 
-fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id) -> Result<String> {
+/// A node's parts, or, unless `force`, the line saying why they are withheld.
+fn render_or_withhold(
+    out: &mut String,
+    facts: &FactArchive,
+    reader: &PileSnapshot,
+    block: Id,
+    include_all: bool,
+    force: bool,
+) -> Result<()> {
+    if !force {
+        if let Some(withheld) = classifier_stop(facts, reader, block)? {
+            writeln!(out, "{withheld}")?;
+            return Ok(());
+        }
+    }
+    render_parts(out, facts, reader, block, include_all)
+}
+
+fn render_projection(
+    facts: &FactArchive,
+    reader: &PileSnapshot,
+    projection: Id,
+    force: bool,
+) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "projection: {projection:X}")?;
     if exists!(pattern!(facts, [{
@@ -909,7 +1030,7 @@ fn render_projection(facts: &FactArchive, reader: &PileSnapshot, projection: Id)
         ) {
             writeln!(out, "block_previous: {previous:X}")?;
         }
-        render_parts(&mut out, facts, reader, block, true)?;
+        render_or_withhold(&mut out, facts, reader, block, true, force)?;
     }
     Ok(out)
 }
@@ -1141,16 +1262,21 @@ fn resolve_in(facts: &FactArchive, prefix: &str) -> Result<Named> {
     )
 }
 
-fn run_show(storage: ArchiveStorage<'_>, prefix: &str, out: &mut Out<'_>) -> Result<()> {
+fn run_show(
+    storage: ArchiveStorage<'_>,
+    prefix: &str,
+    force: bool,
+    out: &mut Out<'_>,
+) -> Result<()> {
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
     out.text(match resolve_in(&facts, prefix)? {
         Named::Projection(projection) => {
-            render_projection(&facts, observed.snapshot(), projection)?
+            render_projection(&facts, observed.snapshot(), projection, force)?
         }
         // The node as `thread` prints it: its parts once, and a line for
         // every receipt that projects to it, so no receipt is picked.
-        Named::Block(block) => render_block(&facts, observed.snapshot(), block, true)?,
+        Named::Block(block) => render_block(&facts, observed.snapshot(), block, true, force)?,
     })?;
     Ok(())
 }
@@ -1308,6 +1434,7 @@ fn render_block(
     reader: &PileSnapshot,
     block: Id,
     include_all_parts: bool,
+    force: bool,
 ) -> Result<String> {
     let mut out = String::new();
     writeln!(out, "block: {block:X}")?;
@@ -1365,7 +1492,7 @@ fn render_block(
             projection_actor(facts, reader, receipt)?,
         )?;
     }
-    render_parts(&mut out, facts, reader, block, include_all_parts)?;
+    render_or_withhold(&mut out, facts, reader, block, include_all_parts, force)?;
     Ok(out)
 }
 
@@ -1374,6 +1501,7 @@ fn run_thread(
     prefix: &str,
     limit: usize,
     tail: Option<usize>,
+    force: bool,
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
@@ -1401,7 +1529,7 @@ fn run_thread(
         }
         out.text(format!(
             "{}",
-            render_block(&facts, observed.snapshot(), block, true)?
+            render_block(&facts, observed.snapshot(), block, true, force)?
         ))?;
     }
     Ok(())
@@ -1628,6 +1756,7 @@ fn run_replay(
     storage: ArchiveStorage<'_>,
     limit: usize,
     with_tools: bool,
+    force: bool,
     persona: &str,
     out: &mut Out<'_>,
 ) -> Result<()> {
@@ -1659,7 +1788,13 @@ fn run_replay(
     for block in &selected {
         out.text(format!(
             "{}",
-            render_block(&facts, replay.archive.snapshot(), block.block, with_tools)?
+            render_block(
+                &facts,
+                replay.archive.snapshot(),
+                block.block,
+                with_tools,
+                force,
+            )?
         ))?;
         out.line(format!("---"))?;
     }
@@ -2046,7 +2181,7 @@ mod tests {
         .next()
         .unwrap();
         assert!(
-            !render_projection(&before_facts, before.snapshot(), receipt)
+            !render_projection(&before_facts, before.snapshot(), receipt, false)
                 .unwrap()
                 .contains("source_summary: compaction")
         );
@@ -2065,15 +2200,24 @@ mod tests {
         }])));
         drop(facts);
         drop(observed);
-        let shown =
-            printed(|out| run_show(storage(&fixture), &format!("{receipt:X}"), out)).unwrap();
+        let shown = printed(|out| run_show(storage(&fixture), &format!("{receipt:X}"), false, out))
+            .unwrap();
         assert!(shown.contains("source_summary: compaction"));
         assert!(shown.contains("raw_role: user"));
-        let shown = printed(|out| run_show(storage(&fixture), &format!("{block:X}"), out)).unwrap();
+        let shown =
+            printed(|out| run_show(storage(&fixture), &format!("{block:X}"), false, out)).unwrap();
         assert!(shown.contains("[source compaction summary]"));
-        let thread =
-            printed(|out| run_thread(storage(&fixture), &format!("{block:X}"), 10, None, out))
-                .unwrap();
+        let thread = printed(|out| {
+            run_thread(
+                storage(&fixture),
+                &format!("{block:X}"),
+                10,
+                None,
+                false,
+                out,
+            )
+        })
+        .unwrap();
         assert!(thread.contains("[source compaction summary]"));
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
         assert_eq!(
@@ -2184,9 +2328,11 @@ mod tests {
         .map(|(lower, _)| lower)
         .min()
         .unwrap();
-        assert!(!render_block(&facts, archive.snapshot(), block, false)
-            .unwrap()
-            .contains("<untimed>"));
+        assert!(
+            !render_block(&facts, archive.snapshot(), block, false, false)
+                .unwrap()
+                .contains("<untimed>")
+        );
         let timeline =
             archive_collection::timeline_after(&facts, ArchiveTimelineCursor::AfterTime(i128::MIN))
                 .unwrap();
@@ -2506,7 +2652,7 @@ mod tests {
         let archive = storage(&fixture).load().unwrap();
         let facts = archive.facts().unwrap();
         let id = projection_ids(&facts)[0];
-        assert!(render_projection(&facts, archive.snapshot(), id)
+        assert!(render_projection(&facts, archive.snapshot(), id, false)
             .unwrap()
             .contains("quasar needle"));
         assert_eq!(
@@ -2880,7 +3026,7 @@ mod tests {
         // directly instead of matching it against every node.
         assert_eq!(block.len(), 32, "{hit}");
 
-        let shown = printed(|out| run_show(storage(&fixture), block, out)).unwrap();
+        let shown = printed(|out| run_show(storage(&fixture), block, false, out)).unwrap();
         assert!(shown.starts_with(&format!("block: {block}")), "{shown}");
         assert!(shown.contains("quasar needle"), "{shown}");
         for receipt in receipts.split(',').filter(|receipt| *receipt != "-") {
@@ -2889,7 +3035,8 @@ mod tests {
                 "{receipt}: {shown}"
             );
             // A receipt id still opens its source projection.
-            let projection = printed(|out| run_show(storage(&fixture), receipt, out)).unwrap();
+            let projection =
+                printed(|out| run_show(storage(&fixture), receipt, false, out)).unwrap();
             assert!(
                 projection.starts_with(&format!("projection: {receipt}")),
                 "{projection}"
@@ -2925,7 +3072,8 @@ mod tests {
         let (block, receipts) = (words[1], words[3]);
         assert_eq!(words[2], "receipt", "{hit}");
 
-        let thread = printed(|out| run_thread(storage(&fixture), block, 10, None, out)).unwrap();
+        let thread =
+            printed(|out| run_thread(storage(&fixture), block, 10, None, false, out)).unwrap();
         assert_eq!(thread.matches("block: ").count(), 2, "{thread}");
         assert!(
             thread.contains("alpha"),
@@ -2940,8 +3088,140 @@ mod tests {
         let receipts: Vec<&str> = receipts.split(',').collect();
         assert_eq!(receipts.len(), 1, "{hit}");
         let by_receipt =
-            printed(|out| run_thread(storage(&fixture), receipts[0], 10, None, out)).unwrap();
+            printed(|out| run_thread(storage(&fixture), receipts[0], 10, None, false, out))
+                .unwrap();
         assert_eq!(thread, by_receipt, "a node's thread is its receipt's");
+    }
+
+    /// The text Claude Code writes after a classifier stop, as the session
+    /// records it, and a message that only quotes it.
+    const STOP: &str = "Your response above was stopped by a safety classifier — this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.";
+
+    /// A session shaped like the recorded stops: an input, the stopped
+    /// response, the notice Claude Code writes, then the stop itself; a
+    /// second input stopped with no response recorded; and an input followed
+    /// by a message that merely quotes the stop text.
+    fn stopped_session(fixture: &Fixture) {
+        let source = fixture._directory.path().join("stopped.jsonl");
+        let line = |json: String| json + "\n";
+        let quoted = format!("He pasted this: {STOP} and we went on.");
+        let text = [
+            line(r#"{"type":"user","sessionId":"stop","uuid":"u1","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"plain opening words"}}"#.to_owned()),
+            line(r#"{"type":"user","sessionId":"stop","uuid":"u2","parentUuid":"u1","timestamp":"2026-03-01T15:34:02Z","message":{"role":"user","content":"violet lantern probe"}}"#.to_owned()),
+            line(r#"{"type":"assistant","sessionId":"stop","uuid":"a1","parentUuid":"u2","timestamp":"2026-03-01T15:34:03Z","message":{"role":"assistant","model":"claude-test-9","stop_reason":"refusal","content":[{"type":"thinking","thinking":"weighing it","signature":"opaque"}]}}"#.to_owned()),
+            line(r#"{"type":"system","subtype":"informational","level":"notice","sessionId":"stop","uuid":"s1","parentUuid":"a1","timestamp":"2026-03-01T15:34:04Z","content":"stopped"}"#.to_owned()),
+            line(serde_json::json!({"type":"user","isMeta":true,"sessionId":"stop","uuid":"x1","parentUuid":"s1","timestamp":"2026-03-01T15:34:05Z","message":{"role":"user","content":STOP}}).to_string()),
+            line(r#"{"type":"user","sessionId":"stop","uuid":"u3","parentUuid":"x1","timestamp":"2026-03-01T15:34:06Z","message":{"role":"user","content":"copper bell retry"}}"#.to_owned()),
+            line(r#"{"type":"system","subtype":"informational","level":"notice","sessionId":"stop","uuid":"s2","parentUuid":"u3","timestamp":"2026-03-01T15:34:07Z","content":"stopped again"}"#.to_owned()),
+            line(serde_json::json!({"type":"user","isMeta":true,"sessionId":"stop","uuid":"x2","parentUuid":"s2","timestamp":"2026-03-01T15:34:08Z","message":{"role":"user","content":STOP}}).to_string()),
+            line(r#"{"type":"user","sessionId":"quote","uuid":"q1","timestamp":"2026-03-01T15:35:01Z","message":{"role":"user","content":"amber kettle words"}}"#.to_owned()),
+            line(serde_json::json!({"type":"user","sessionId":"quote","uuid":"q2","parentUuid":"q1","timestamp":"2026-03-01T15:35:02Z","message":{"role":"user","content":quoted}}).to_string()),
+        ]
+        .concat();
+        fs::write(&source, text).unwrap();
+        run_import(storage(fixture), &source, CliImportSource::ClaudeCode).unwrap();
+    }
+
+    /// The nodes holding `text`, as full hexadecimal ids.
+    fn holders(fixture: &Fixture, text: &str) -> Vec<String> {
+        let archive = storage(fixture).load().unwrap();
+        let facts = archive.facts().unwrap();
+        find!(
+            block: Id,
+            pattern!(&facts, [
+                { ?block @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::payload: text },
+            ])
+        )
+        .map(|block| format!("{block:X}"))
+        .collect()
+    }
+
+    /// The one node holding `text`.
+    fn holder(fixture: &Fixture, text: &str) -> String {
+        let mut holders = holders(fixture, text);
+        assert_eq!(holders.len(), 1, "{text}");
+        holders.pop().unwrap()
+    }
+
+    /// A read withholds what a classifier stop followed, says so in its
+    /// place with the stopped model and the time, and goes on; `--force`
+    /// prints it. Unrelated nodes print, and a message that only quotes the
+    /// stop text withholds nothing.
+    #[test]
+    fn a_read_withholds_what_a_classifier_stop_followed() {
+        let fixture = fixture();
+        stopped_session(&fixture);
+        let input = holder(&fixture, "violet lantern probe");
+        let stops = holders(&fixture, STOP);
+        assert_eq!(stops.len(), 2);
+        let shown = printed(|out| run_show(storage(&fixture), &input, false, out)).unwrap();
+        assert!(!shown.contains("violet lantern"), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "withheld {input}: a safety classifier stopped a claude-test-9 turn right after this content at 2026-03-01T15:34:42 TAI"
+            )),
+            "{shown}"
+        );
+        assert!(
+            stops
+                .iter()
+                .any(|stop| shown.contains(&format!("(stop {stop})"))),
+            "{shown}"
+        );
+        assert!(shown.contains("use --force to print it"), "{shown}");
+        // The read still names the node and its receipt.
+        assert!(shown.starts_with(&format!("block: {input}")), "{shown}");
+        assert!(shown.contains("receipt: "), "{shown}");
+
+        for stop in &stops {
+            let thread =
+                printed(|out| run_thread(storage(&fixture), stop, 10, None, false, out)).unwrap();
+            assert!(thread.contains("plain opening words"), "{thread}");
+            assert!(!thread.contains("violet lantern"), "{thread}");
+            assert!(
+                !thread.contains("weighing it"),
+                "the stopped response too: {thread}"
+            );
+            assert!(!thread.contains("copper bell"), "{thread}");
+            assert!(thread.contains(STOP), "the stop itself prints: {thread}");
+            assert!(thread.contains(&format!("withheld {input}")), "{thread}");
+        }
+
+        // No response was recorded for the retry; the stop text names the
+        // provider, so the read still says whose classifier.
+        let retry = holder(&fixture, "copper bell retry");
+        let shown = printed(|out| run_show(storage(&fixture), &retry, false, out)).unwrap();
+        assert!(!shown.contains("copper bell"), "{shown}");
+        assert!(
+            shown.contains(&format!(
+                "withheld {retry}: a safety classifier stopped an Anthropic model's turn"
+            )),
+            "{shown}"
+        );
+
+        // Forced, the read prints it, here and in a thread.
+        let forced = printed(|out| run_show(storage(&fixture), &input, true, out)).unwrap();
+        assert!(forced.contains("violet lantern probe"), "{forced}");
+        assert!(!forced.contains("withheld"), "{forced}");
+        let forced =
+            printed(|out| run_thread(storage(&fixture), &stops[0], 10, None, true, out)).unwrap();
+        assert!(forced.contains("violet lantern probe"), "{forced}");
+
+        // A search hit names the node and withholds its text too.
+        archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
+        let search = printed(|out| run_search(storage(&fixture), "violet", 10, out)).unwrap();
+        assert!(search.contains(&input), "{search}");
+        assert!(!search.contains("violet lantern"), "{search}");
+        assert!(search.contains(&format!("withheld {input}")), "{search}");
+
+        let quoted = holder(&fixture, "amber kettle words");
+        let shown = printed(|out| run_show(storage(&fixture), &quoted, false, out)).unwrap();
+        assert!(shown.contains("amber kettle words"), "{shown}");
+        assert!(!shown.contains("withheld"), "{shown}");
+        let thread =
+            printed(|out| run_thread(storage(&fixture), &quoted, 10, None, false, out)).unwrap();
+        assert!(!thread.contains("withheld"), "{thread}");
     }
 
     #[test]
@@ -3106,7 +3386,7 @@ mod tests {
         drop(archive);
         let last = format!("{last:X}");
         let thread = |limit: usize, tail: Option<usize>| {
-            printed(|out| run_thread(storage(&fixture), &last, limit, tail, out))
+            printed(|out| run_thread(storage(&fixture), &last, limit, tail, false, out))
         };
 
         let refused = thread(100, None).unwrap_err().to_string();
@@ -3276,6 +3556,7 @@ mod tests {
             storage(&fixture),
             0,
             false,
+            false,
             "replay-test",
             &mut Out::new(&mut |_| Ok(())),
         )
@@ -3373,7 +3654,7 @@ mod tests {
 
         let observed = storage(&fixture).load().unwrap();
         let facts = observed.facts().unwrap();
-        let rendered = render_projection(&facts, observed.snapshot(), projection).unwrap();
+        let rendered = render_projection(&facts, observed.snapshot(), projection, false).unwrap();
         assert!(rendered.contains("one author"));
         assert!(rendered.contains("another author"));
         assert!(rendered.contains("readable body"));
@@ -3384,7 +3665,8 @@ mod tests {
         assert!(summary.contains("readable body"));
         assert!(summary.contains("[source compaction summary]"));
         for include_all in [false, true] {
-            let block = render_block(&facts, observed.snapshot(), block_id, include_all).unwrap();
+            let block =
+                render_block(&facts, observed.snapshot(), block_id, include_all, false).unwrap();
             assert!(
                 block.contains("[source compaction summary]"),
                 "show, thread and replay use the same receipt rendering"

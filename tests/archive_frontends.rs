@@ -333,6 +333,7 @@ fn replay_result_failure_does_not_advance_and_equal_time_peer_is_not_skipped() {
             "one",
             1,
             false,
+            false,
             &mut Out::new(&mut |part| {
                 if let Part::Text { text } = part {
                     emitted.push_str(&text);
