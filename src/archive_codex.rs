@@ -2855,4 +2855,483 @@ mod tests {
             "every replayed node is annotated anew"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Pinned projections. Every record kind the item, header, fork and
+    // replay paths read, spelled the ways a dynamic JSON reader and a
+    // byte scanner could disagree on (duplicate keys, escapes, floats a
+    // lossy decimal reader rounds, nesting depth, out-of-range numbers,
+    // non-UTF-8 strings). The digests were taken from the importer as it
+    // stood before its record reads moved to the scanner; they pin the
+    // emitted facts and the projection summary exactly.
+    // -----------------------------------------------------------------
+
+    /// The emitted fragments' facts in order, and the summary.
+    fn pinned_digest(name: &str, text: &[u8]) -> std::result::Result<String, String> {
+        let mut hasher = blake3::Hasher::new();
+        let summary = project_bytes(name, Bytes::from_source(text.to_vec()), |projected| {
+            for trible in projected.fragment.facts().iter_ordered() {
+                hasher.update(&trible.data);
+            }
+            hasher.update(b"|fragment|");
+            Ok(())
+        })
+        .map_err(|error| format!("{error:#}"))?;
+        hasher.update(format!("{summary:?}").as_bytes());
+        Ok(hasher.finalize().to_hex()[..32].to_owned())
+    }
+
+    fn lines(lines: &[&str]) -> Vec<u8> {
+        let mut text = Vec::new();
+        for line in lines {
+            text.extend_from_slice(line.replace("~u", "\\u").as_bytes());
+            text.push(b'\n');
+        }
+        text
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// Response items, compactions and world states in a rollout without
+    /// events, so every item kind projects.
+    fn item_rollout() -> Vec<u8> {
+        lines(&[
+            r#"{"timestamp":"2026-09-01T10:00:00.000Z","type":"session_meta","payload":{"id":"items-eq","session_id":"items-eq"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:00.010Z","type":"turn_context","payload":{"model":"gpt-eq"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:00.020Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"  first prompt ~u00e9~ud83d~ude00 \"q\"\n"},"bare string item","   ",{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="},{"type":"input_image","image_url":"data:image/png;base64,***"},{"type":"input_image","image_url":"data:image/png,plain"},{"type":"input_image","url":"https://example.invalid/a.png"},{"type":"input_image","image_url":7,"url":"file:///x.png"},{"type":"mystery","value":0.30000000000000004,"n":123456789012345678901234567890,"neg":-9223372036854775809,"z":-0,"e":1E+2,"small":5e-324,"b":true,"nil":null,"arr":[1,-1,1.5,2.5e-3,18446744073709551615,18446744073709551616],"s":"\u0001\t\u001f\/"},{"text":7,"other":"x"},{"text":"   "},42,null,true]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":"developer instructions","timestamp":"2026-09-01T10:00:01.000Z"}}"#,
+            r#"{"timestamp":5,"type":"response_item","payload":{"type":"message","role":"user","content":null,"timestamp":"2026-09-01T10:00:01.100Z"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.200Z","type":"response_item","payload":{"type":"message","role":"user"}}"#,
+            r#"{"timestamp":"not-a-time","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer one"}]}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.300Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"thinking a"},{"text":""},{"type":"x"},"loose"],"content":[{"type":"reasoning_text","text":"thinking b"}],"encrypted_content":"c2VhbGVkLXRva2Vu"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.400Z","type":"response_item","payload":{"type":"reasoning","summary":"not an array","encrypted_content":""}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.500Z","type":"response_item","payload":{"type":"ghost_snapshot","ghost_commit":{"id":"abc"}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.600Z","type":"response_item","payload":{"foo":1}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.700Z","type":"response_item","payload":{"type":5,"id":"x"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:01.800Z","type":"response_item","payload":[1,2]}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.000Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","call_id":"call_1","status":"completed","name":"shell","arguments":"{\"cmd\":[\"ls\"]}","timestamp":"x","created_at":1.5,"create_time":2,"internal_chat_message_metadata_passthrough":{"a":1},"nested":{"z":1,"a":[0.1,1e21,1.7976931348623157e308,2.2250738585072014e-308,123456789.12345678,1e-7,0.1e1,100e-2,9007199254740993,9007199254740993.0,1.00000000000000011102230246251565404236316680908203125]},"dup":1,"dup":{"b":2,"a":[]}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.100Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"done \"quoted\" ~u2028"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.200Z","type":"response_item","payload":{"type":"custom_tool_call","call_id":"call_2","name":"apply_patch","input":"*** Begin"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.300Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_2","output":[{"type":"input_text","text":"line"},{"type":"input_image","image_url":"data:image/jpeg;base64,/9j/4AAQ"},"tail text",{"type":"other","detail":[1.25]}]}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.400Z","type":"response_item","payload":{"type":"local_shell_call","action":{"type":"exec","command":["ls"],"timeout_ms":10000}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_missing","output":{"content":"x","success":true,"n":1.0}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.600Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":""}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.700Z","type":"response_item","payload":{"type":"tool_search_output","output":null}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.800Z","type":"response_item","payload":{"type":"tool_search_output","output":3.25,"call_id":7}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:02.900Z","type":"response_item","payload":{"type":"web_search_call","status":"completed","action":{"type":"search","query":"q"}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.000Z","type":"response_item","payload":{"type":"agent_message","id":"amsg_1","author":"/root/peer","recipient":"/root","content":[{"type":"input_text","text":"peer says hi"}],"created_at":"2026-09-01T10:00:03Z"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.100Z","type":"compacted","payload":{"message":"summary text","replacement_history":[{"type":"message","content":[]},{"encrypted_content":"c2VhbGVk"},{"encrypted_content":""},{"encrypted_content":5},"str"]}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.200Z","type":"compacted","payload":{"message":"   ","replacement_history":{"encrypted_content":"c2VhbGVk"}}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.300Z","type":"world_state","payload":{"cwd":"/w","files":[{"path":"a","size":10}],"ratio":0.1,"deep":[[[[{"k":"v"}]]]]}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.400Z","type":"world_state","payload":{}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.500Z","type":"world_state"}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.600Z","type":"world_state","payload":"just a string"}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.700Z","type":"note","payload":{"text":"response_item"}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.800Z","type":"telemetry","payload":{}}"#,
+            r#"{"timestamp":"2026-09-01T10:00:03.900Z","type":"telemetry","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"lost"}]},"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"dup wins"}]}}"#,
+            "{\"timestamp\":\"2026-09-01T10:00:04.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"crlf line\"}]}} \r",
+            r#"  {"timestamp":"2026-09-01T10:00:04.100Z","type":"response_item","payload":{"type":"function_call","name":"f","arguments":"{}","weird":[-0.0,-1e-400,1e-400,0e999999999999,4.9e-324,2.4703282292062328e-324]}}  "#,
+        ])
+    }
+
+    /// The same kinds where an event stream carries the dialogue.
+    const EVENT_ITEMS: &str = concat!(
+        r#"{"timestamp":"2026-09-02T10:00:00.000Z","type":"session_meta","payload":{"id":"events-eq"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.100Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question"},{"type":"input_text","text":"context"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.200Z","type":"event_msg","payload":{"type":"user_message","message":"question","images":[]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.300Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"from events"}],"encrypted_content":"c2VhbGVk"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.400Z","type":"event_msg","payload":{"type":"agent_reasoning","text":"from events"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.500Z","type":"event_msg","payload":{"type":"agent_message","message":"answer"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.600Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-09-02T10:00:00.700Z","type":"event_msg","payload":{"type":"user_message","message":"unmirrored follow-up","images":[]}}"#,
+        "\n",
+    );
+
+    /// The legacy bare format: a header naming the session, then bare items.
+    fn legacy_rollout(header: &str) -> Vec<u8> {
+        lines(&[
+            header,
+            r#"{"record_type":"state"}"#,
+            r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy prompt"}]}"#,
+            r#"{"type":"reasoning","summary":[{"type":"summary_text","text":"legacy thought"}],"encrypted_content":"c2VhbGVk"}"#,
+            r#"{"type":"function_call","id":"fc","call_id":"c1","name":"shell","arguments":"{}","timestamp":"2025-04-01T10:00:01.000Z"}"#,
+            r#"{"type":"function_call_output","call_id":"c1","output":"ok"}"#,
+            r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"legacy answer"}],"timestamp":"2025-04-01T10:00:02.000Z"}"#,
+        ])
+    }
+
+    /// A fork replaying its parent; `turn` is the payload of the event
+    /// that may end the replay.
+    fn fork_eq(meta_extra: &str, ancestor: bool, context_turn: &str, turn: &str) -> Vec<u8> {
+        let meta = format!(
+            r#"{{"timestamp":"2026-08-03T09:00:00.000Z","type":"session_meta","payload":{{"id":"fork-eq","session_id":"fork-eq","forked_from_id":"parent-eq"{meta_extra}}}}}"#
+        );
+        let context = format!(
+            r#"{{"timestamp":"2026-08-03T09:00:00.200Z","type":"turn_context","payload":{{"model":"gpt-old","turn_id":"{context_turn}"}}}}"#
+        );
+        let turn = format!(
+            r#"{{"timestamp":"2026-08-03T09:00:00.700Z","type":"event_msg","payload":{{"type":"task_started",{turn}}}}}"#
+        );
+        let ancestor = if ancestor {
+            r#"{"timestamp":"2026-08-03T09:00:00.100Z","type":"session_meta","payload":{"id":"parent-eq","session_id":"parent-eq"}}"#
+        } else {
+            r#"{"timestamp":"2026-08-03T09:00:00.100Z","type":"event_msg","payload":{"type":"token_count"}}"#
+        };
+        lines(&[
+            &meta,
+            ancestor,
+            &context,
+            r#"{"timestamp":"2026-08-03T09:00:00.300Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"replayed question"}]}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.300Z","type":"event_msg","payload":{"type":"user_message","message":"replayed question","images":[]}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.400Z","type":"event_msg","payload":{"type":"task_started","started_at":1785747540,"turn_id":"x"}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.500Z","type":"event_msg","payload":{"type":"task_started","started_at":1785747601,"huge":1e400}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.600Z","type":"event_msg","payload":{"type":"agent_message","message":"replayed answer"}}"#,
+            &turn,
+            r#"{"timestamp":"2026-08-03T09:00:00.800Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"own question"}]}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.800Z","type":"event_msg","payload":{"type":"user_message","message":"own question","images":[]}}"#,
+            r#"{"timestamp":"2026-08-03T09:00:00.900Z","type":"event_msg","payload":{"type":"agent_message","message":"own answer"}}"#,
+        ])
+    }
+
+    const BEFORE_FORK: &str = "019fc6d9-0820-7000-8000-000000000000";
+    const AFTER_FORK: &str = "019fc6d9-f668-7000-8000-000000000001";
+
+    fn pinned_fixtures() -> Vec<(String, Vec<u8>)> {
+        let mut fixtures = vec![
+            ("items".to_owned(), item_rollout()),
+            ("events".to_owned(), EVENT_ITEMS.as_bytes().to_vec()),
+            ("rollout".to_owned(), ROLLOUT.as_bytes().to_vec()),
+            ("parent".to_owned(), PARENT_ROLLOUT.as_bytes().to_vec()),
+            ("fork".to_owned(), fork_rollout().into_bytes()),
+            ("grand-2025".to_owned(), GRAND_2025.as_bytes().to_vec()),
+            (
+                "resume-2025".to_owned(),
+                resume_2025("own-2025", "2025-11-27T10:00:00.000Z", GRAND_2025, "own").into_bytes(),
+            ),
+            (
+                "legacy".to_owned(),
+                legacy_rollout(
+                    r#"{"id":"legacy-eq","timestamp":"2025-04-01T10:00:00.000Z","instructions":null}"#,
+                ),
+            ),
+            (
+                "legacy-duplicate-id".to_owned(),
+                legacy_rollout(r#"{"id":"legacy-old","id":"legacy-new","timestamp":"2025-04-01"}"#),
+            ),
+            (
+                "legacy-escaped-id".to_owned(),
+                legacy_rollout(
+                    r#"{"id":"legacy~u002deq ","timestamp":"2025-04-01T10:00:00.000Z"}"#,
+                ),
+            ),
+        ];
+        let deep = format!(r#","deep":{}"#, nested(125));
+        let too_deep = format!(r#","deep":{}"#, nested(126));
+        let ends = |turn: &str| turn.to_owned();
+        let cases: Vec<(&str, &str, bool, &str, String)> = vec![
+            (
+                "fork-float-start-turn-id",
+                "",
+                true,
+                BEFORE_FORK,
+                format!(r#""started_at":1785747601.5,"turn_id":"{AFTER_FORK}""#),
+            ),
+            (
+                "fork-int-start",
+                "",
+                true,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-negative-zero-start",
+                "",
+                true,
+                BEFORE_FORK,
+                format!(r#""started_at":-0,"turn_id":"{AFTER_FORK}""#),
+            ),
+            (
+                "fork-negative-start",
+                "",
+                true,
+                BEFORE_FORK,
+                format!(r#""started_at":-5,"turn_id":"{AFTER_FORK}""#),
+            ),
+            (
+                "fork-u64-start",
+                "",
+                true,
+                BEFORE_FORK,
+                ends(r#""started_at":9223372036854775808"#),
+            ),
+            (
+                "fork-exponent-start",
+                "",
+                true,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601e0"#),
+            ),
+            (
+                "fork-string-start",
+                "",
+                true,
+                BEFORE_FORK,
+                ends(r#""started_at":"1785747601""#),
+            ),
+            (
+                "fork-duplicate-start",
+                "",
+                true,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601,"started_at":null"#),
+            ),
+            (
+                "fork-unparsable-turn",
+                "",
+                true,
+                BEFORE_FORK,
+                format!(r#""started_at":1785747601,"turn_id":"{AFTER_FORK}","bad":1e400"#),
+            ),
+            (
+                "fork-context-ends-replay",
+                "",
+                true,
+                AFTER_FORK,
+                ends(r#""started_at":null"#),
+            ),
+            (
+                "fork-single-meta",
+                "",
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-unparsable-meta",
+                r#","huge":1e400"#,
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-blank-forked-from",
+                r#","forked_from_id":"  ""#,
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-number-forked-from",
+                r#","forked_from_id":7"#,
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-deep-meta",
+                &deep,
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+            (
+                "fork-too-deep-meta",
+                &too_deep,
+                false,
+                BEFORE_FORK,
+                ends(r#""started_at":1785747601"#),
+            ),
+        ];
+        for (name, meta_extra, ancestor, context_turn, turn) in cases {
+            fixtures.push((
+                name.to_owned(),
+                fork_eq(meta_extra, ancestor, context_turn, &turn),
+            ));
+        }
+        fixtures
+    }
+
+    const PINNED: &[(&str, &str)] = &[
+        ("items", "1fa349bfec3765dad80d4ca9dc1fba16"),
+        ("events", "20270aeb660780c1897dcb073c6acafd"),
+        ("rollout", "f611e41ec1f0740cf95136cc1144e486"),
+        ("parent", "ff6de39d0c19f6cf54d4ae53208d0ba3"),
+        ("fork", "4d8969b81b197bb935fce676f59ef6ef"),
+        ("grand-2025", "788736ba21385b82898bdd9709bad866"),
+        ("resume-2025", "3a8a082d6adea7449f4d30f18e4e7a0f"),
+        ("legacy", "acae7ba636558b4a7fcdb1c4ae0d02bf"),
+        ("legacy-duplicate-id", "0a2beae84407483a8243d6cb4ff6691c"),
+        ("legacy-escaped-id", "50c82efac9f7e38511247801f0136311"),
+        (
+            "fork-float-start-turn-id",
+            "2e06ce2835e1a43e4a22dc55ffcbfa92",
+        ),
+        ("fork-int-start", "b71f36b87d3c706b9a6c151036a374ff"),
+        (
+            "fork-negative-zero-start",
+            "8d687834b71d02b50b10a29ab5bc19f1",
+        ),
+        ("fork-negative-start", "173786c973190705fbb0e34bcab8cd4d"),
+        ("fork-u64-start", "52dd0a5fd82f46ab2b89a506a5f74445"),
+        ("fork-exponent-start", "9e1388504fc2e759af1024136f091da0"),
+        ("fork-string-start", "9e1388504fc2e759af1024136f091da0"),
+        ("fork-duplicate-start", "00659b27539443112cd903f14d46a1d7"),
+        ("fork-unparsable-turn", "5e5b78908d65619dd6598280c6d3b984"),
+        (
+            "fork-context-ends-replay",
+            "8e5f4b7c64ac68590c041668a79bbe6e",
+        ),
+        ("fork-single-meta", "0eda2697a98ae89ed8bbb7559bd4bdc4"),
+        ("fork-unparsable-meta", "42d14c47c81e304c3e6f39ddb1dbfe12"),
+        ("fork-blank-forked-from", "b1eec6ed3b1bdb5c7486a34fb4d01a59"),
+        (
+            "fork-number-forked-from",
+            "f5436c973d888b39b9c704b9d4f2f70d",
+        ),
+        ("fork-deep-meta", "e76a4a4c7f4dc1a2582846663cc19208"),
+        ("fork-too-deep-meta", "e88591c222c2381c0ed0d67ce7a889fb"),
+    ];
+
+    #[test]
+    fn record_reads_project_exactly_the_pinned_facts() {
+        let mut actual = Vec::new();
+        for (name, text) in pinned_fixtures() {
+            let digest = pinned_digest(&format!("{name}.jsonl"), &text)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                pinned_digest(&format!("{name}.jsonl"), &text).unwrap(),
+                digest,
+                "{name}: projection is deterministic"
+            );
+            actual.push((name, digest));
+        }
+        let rendered: String = actual
+            .iter()
+            .map(|(name, digest)| format!("        (\"{name}\", \"{digest}\"),\n"))
+            .collect();
+        assert_eq!(
+            actual.len(),
+            PINNED.len(),
+            "pinned table is incomplete:\n{rendered}"
+        );
+        for ((name, digest), (pinned_name, pinned)) in actual.iter().zip(PINNED) {
+            assert_eq!(name, pinned_name, "fixture order:\n{rendered}");
+            assert_eq!(digest, pinned, "{name}:\n{rendered}");
+        }
+    }
+
+    /// Records the importer refuses, and near misses it accepts.
+    #[test]
+    fn record_reads_refuse_exactly_what_they_refused() {
+        let base = |extra: &[u8]| {
+            let mut text = lines(&[
+                r#"{"timestamp":"2026-09-03T10:00:00.000Z","type":"session_meta","payload":{"id":"bad-eq"}}"#,
+                r#"{"timestamp":"2026-09-03T10:00:00.100Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}"#,
+            ]);
+            text.extend_from_slice(extra);
+            text.push(b'\n');
+            text
+        };
+        let item = |payload: &str| {
+            format!(r#"{{"timestamp":"2026-09-03T10:00:01.000Z","type":"world_state","payload":{payload}}}"#)
+                .into_bytes()
+        };
+        let mut invalid_utf8 = item(r#"{"text":"ab"}"#);
+        let at = invalid_utf8.len() - 4;
+        invalid_utf8[at] = 0xff;
+        let mut overlong = item(r#"{"text":"ab"}"#);
+        let at = overlong.len() - 5;
+        overlong[at] = 0xc0;
+        overlong[at + 1] = 0xaf;
+        let cases: Vec<(&str, Vec<u8>, bool)> = vec![
+            ("trailing comma", item(r#"{"a":1,}"#), false),
+            (
+                "trailing garbage",
+                [item("{}"), b" x".to_vec()].concat(),
+                false,
+            ),
+            ("two values", [item("{}"), b" {}".to_vec()].concat(), false),
+            (
+                "unclosed",
+                br#"{"type":"world_state","payload":{"a":1}"#.to_vec(),
+                false,
+            ),
+            ("out of range", item(r#"{"n":1e400}"#), false),
+            ("out of range negative", item(r#"{"n":-1e309}"#), false),
+            (
+                "long out of range",
+                item(&format!(r#"{{"n":1{}}}"#, "0".repeat(400))),
+                false,
+            ),
+            ("huge exponent", item(r#"{"n":1e99999999999}"#), false),
+            ("zero huge exponent", item(r#"{"n":0e99999999999}"#), true),
+            ("tiny", item(r#"{"n":1e-99999999999}"#), true),
+            ("leading zero", item(r#"{"n":01}"#), false),
+            ("bare fraction", item(r#"{"n":1.}"#), false),
+            ("plus sign", item(r#"{"n":+1}"#), false),
+            ("bad literal", item(r#"{"n":tru}"#), false),
+            ("lone low surrogate", item(r#"{"s":"\udc00"}"#), false),
+            ("lone high surrogate", item(r#"{"s":"\ud800x"}"#), false),
+            ("bad escape", item(r#"{"s":"\q"}"#), false),
+            ("raw control", item("{\"s\":\"a\u{1}b\"}"), false),
+            ("invalid utf-8", invalid_utf8, false),
+            ("overlong utf-8", overlong, false),
+            ("depth 127", item(&nested(126)), true),
+            ("depth 128", item(&nested(127)), false),
+            (
+                "nested objects 128",
+                item(&format!("{}1{}", r#"{"a":"#.repeat(127), "}".repeat(127))),
+                false,
+            ),
+            (
+                "nested objects 127",
+                item(&format!("{}1{}", r#"{"a":"#.repeat(126), "}".repeat(126))),
+                true,
+            ),
+            ("form feed", [item("{}"), b"\x0c".to_vec()].concat(), false),
+            (
+                "non-dialogue garbage",
+                b"{\"type\":\"telemetry\" garbage".to_vec(),
+                true,
+            ),
+            (
+                "bom",
+                [b"\xef\xbb\xbf".to_vec(), item("{}")].concat(),
+                false,
+            ),
+        ];
+        for (name, extra, accepted) in cases {
+            let result = pinned_digest("bad.jsonl", &base(&extra));
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        }
+        // A legacy rollout's header must name the session.
+        for (name, header, accepted) in [
+            ("legacy", r#"{"id":"legacy-eq"}"#, true),
+            ("blank id", r#"{"id":"  "}"#, false),
+            ("number id", r#"{"id":7}"#, false),
+            (
+                "duplicate blanked",
+                r#"{"id":"legacy-eq","id":null}"#,
+                false,
+            ),
+            (
+                "unparsable header",
+                r#"{"id":"legacy-eq","n":1e400}"#,
+                false,
+            ),
+            ("array header", r#"["legacy-eq"]"#, false),
+        ] {
+            let result = pinned_digest("legacy.jsonl", &legacy_rollout(header));
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+        }
+    }
 }

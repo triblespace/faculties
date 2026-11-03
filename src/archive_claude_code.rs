@@ -4468,4 +4468,195 @@ mod tests {
         assert_eq!(projected.stats.missing_source_identity, 1);
         assert_eq!(projected.stats.skipped_records, 1);
     }
+
+    // -----------------------------------------------------------------
+    // Pinned history projection. The prompt log and the transcript lines
+    // it is checked against, spelled the ways a dynamic JSON reader and a
+    // byte scanner could disagree on (duplicate keys, key order of pasted
+    // contents, escapes, floats a lossy decimal reader rounds, nesting
+    // depth, out-of-range numbers, non-UTF-8 strings). The digest was
+    // taken from the importer as it stood before these reads moved to the
+    // scanner; it pins the emitted facts and the summary exactly.
+    // -----------------------------------------------------------------
+
+    fn jsonl(lines: &[&[u8]]) -> Vec<u8> {
+        let mut text = Vec::new();
+        for line in lines {
+            text.extend_from_slice(&unmark(line));
+            text.push(b'\n');
+        }
+        text
+    }
+
+    /// Spell each `~u` as a JSON unicode escape's backslash-u.
+    fn unmark(line: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(line.len());
+        let mut rest = line;
+        while let Some((&byte, tail)) = rest.split_first() {
+            if byte == b'~' && tail.first() == Some(&b'u') {
+                out.extend_from_slice(br"\u");
+                rest = &tail[1..];
+            } else {
+                out.push(byte);
+                rest = tail;
+            }
+        }
+        out
+    }
+
+    fn nested_array(depth: usize) -> String {
+        format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn with_byte(line: &str, needle: &str, byte: u8) -> Vec<u8> {
+        let mut bytes = line.as_bytes().to_vec();
+        let at = line.find(needle).unwrap();
+        bytes[at] = byte;
+        bytes
+    }
+
+    /// Write the log, its paste cache and two sessions' transcripts.
+    fn history_fixture(root: &Path) {
+        fs::create_dir_all(root.join("projects/p")).unwrap();
+        fs::create_dir_all(root.join("projects/q")).unwrap();
+        fs::create_dir_all(root.join("paste-cache")).unwrap();
+        fs::write(root.join("paste-cache/abc.txt"), "cached body\n").unwrap();
+        let too_deep = format!(
+            r#"{{"type":"user","sessionId":"s1","message":{{"role":"user","content":"too deep prompt"}},"x":{}}}"#,
+            nested_array(126)
+        );
+        let deep = format!(
+            r#"{{"type":"user","sessionId":"s1","message":{{"role":"user","content":"deep enough prompt"}},"x":{}}}"#,
+            nested_array(125)
+        );
+        let transcript = jsonl(&[
+            br#"{"type":"user","sessionId":"s1","uuid":"u1","message":{"role":"user","content":"plain prompt"}}"#,
+            br#"{"type":"user","sessionId":"s1","uuid":"u2","message":{"role":"user","content":[{"type":"text","text":"part A "},{"type":"image"},{"type":"text","text":"part B"},{"type":5,"text":"no"},{"type":"text","text":7},"loose"]}}"#,
+            br#"{"type":"attachment","sessionId":"s1","attachment":{"type":"queued_command","prompt":"  queued prompt  "}}"#,
+            br#"{"type":"attachment","sessionId":"s1","attachment":{"type":"queued_command","prompt":7}}"#,
+            br#"{"type":"system","subtype":"local_command","sessionId":"s1","content":"<command-name>/model</command-name> and <command-name>clear</command-name>"}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"role":"user","content":"malformed prompt"},}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"role":"user","content":"out of range prompt"},"n":1e400}"#,
+            too_deep.as_bytes(),
+            deep.as_bytes(),
+            br#"{"type":"user","sessionId":"s1","message":"just a string"}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"content":[{"type":"image"}]}}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"content":"first spelling"},"message":{"content":"dup ~u0077ins"}}"#,
+            "{\"type\":\"user\",\"sessionId\":\"s1\",\"message\":{\"content\":\"crlf prompt\"}}\r".as_bytes(),
+            &with_byte(
+                r#"{"type":"user","sessionId":"s1","message":{"content":"bad utf8 prompt"},"z":"Xy"}"#,
+                "Xy",
+                0xff,
+            ),
+            br#"{"type":"assistant","sessionId":"s1","message":{"content":"assistant text is not a prompt"}}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"content":"<command-name>/compact</command-name>"}}"#,
+            br#"{"type":"user","sessionId":"s1","message":{"content":"escaped ~u00e9 ~ud83d~ude00 prompt"}}"#,
+        ]);
+        fs::write(root.join("projects/p/s1.jsonl"), transcript).unwrap();
+        let mut unterminated = jsonl(&[
+            br#"{"type":"user","sessionId":"s2","message":{"content":"other session prompt"}}"#,
+        ]);
+        unterminated.extend_from_slice(
+            br#"{"type":"user","sessionId":"s2","message":{"content":"last line"}}"#,
+        );
+        fs::write(root.join("projects/q/s2.jsonl"), unterminated).unwrap();
+
+        let deep_entry = format!(
+            r#"{{"display":"deep enough entry","sessionId":"s3","timestamp":1772379250000,"x":{}}}"#,
+            nested_array(126)
+        );
+        let too_deep_entry = format!(
+            r#"{{"display":"too deep entry","sessionId":"s3","timestamp":1772379250000,"x":{}}}"#,
+            nested_array(127)
+        );
+        let mut history = jsonl(&[
+            br#"{"display":"plain prompt","pastedContents":{},"timestamp":1772379241539,"project":"/p","sessionId":"s1"}"#,
+            br#"{"display":"part A part B","pastedContents":{},"timestamp":1772379241540,"sessionId":"s1"}"#,
+            br#"{"display":"queued prompt","timestamp":1772379241541,"sessionId":"s1"}"#,
+            br#"{"display":"/model gpt","timestamp":1772379241542,"sessionId":"s1"}"#,
+            br#"{"display":"/clear","timestamp":1772379241543,"sessionId":"s1"}"#,
+            br#"{"display":"/compact now","timestamp":1772379241544,"sessionId":"s1"}"#,
+            br#"{"display":"/unknown","timestamp":1772379241545,"sessionId":"s1"}"#,
+            br#"{"display":"malformed prompt","timestamp":1772379241546,"sessionId":"s1"}"#,
+            br#"{"display":"out of range prompt","timestamp":1772379241547,"sessionId":"s1"}"#,
+            br#"{"display":"too deep prompt","timestamp":1772379241548,"sessionId":"s1"}"#,
+            br#"{"display":"deep enough prompt","timestamp":1772379241549,"sessionId":"s1"}"#,
+            br#"{"display":"first spelling","timestamp":1772379241550,"sessionId":"s1"}"#,
+            br#"{"display":"dup wins","timestamp":1772379241551,"sessionId":"s1"}"#,
+            br#"{"display":"crlf prompt","timestamp":1772379241552,"sessionId":"s1"}"#,
+            br#"{"display":"bad utf8 prompt","timestamp":1772379241553,"sessionId":"s1"}"#,
+            br#"{"display":"assistant text is not a prompt","timestamp":1772379241554,"sessionId":"s1"}"#,
+            br#"{"display":"escaped ~u00e9 ~ud83d~ude00 prompt","timestamp":1772379241555,"sessionId":"s1"}"#,
+            br#"{"display":"   ","timestamp":1772379241556,"sessionId":"s1"}"#,
+            br#"{"display":"other session prompt","timestamp":1772379241557,"sessionId":"s2"}"#,
+            br#"{"display":"last line","timestamp":1772379241558,"sessionId":"s2"}"#,
+            br#"{"display":"order [Pasted text #10 +1 lines] then [Pasted text #1 +3 lines] and [Pasted text #2]","pastedContents":{"10":{"id":10,"content":"TEN"},"2":{"id":2,"type":"text","content":"TWO"},"1":{"id":1,"content":"ONE"}},"timestamp":1772379241600.5,"sessionId":"s3"}"#,
+            br#"{"display":"hash [Pasted text #1 +3 lines]","pastedContents":{"1":{"contentHash":"abc"}},"timestamp":1772379241601.25,"sessionId":"s3"}"#,
+            br#"{"display":"missing [Pasted text #1]","pastedContents":{"1":{"contentHash":"nope"}},"timestamp":1772379241602,"sessionId":"s3"}"#,
+            br#"{"display":"fallback [Pasted text #1]","pastedContents":{"1":{"content":5,"contentHash":"abc"}},"timestamp":1772379241603,"sessionId":"s3"}"#,
+            br#"{"display":"dup [Pasted text #1]","pastedContents":{"1":{"content":"first"},"1":{"content":"second"}},"timestamp":1772379241604,"sessionId":"s3"}"#,
+            br#"{"display":"raw [Pasted text #1]","pastedContents":{"1":"raw"},"timestamp":1772379241605,"sessionId":"s3"}"#,
+            br#"{"display":"array [Pasted text #1]","pastedContents":[{"content":"x"}],"timestamp":1772379241606,"sessionId":"s3"}"#,
+            br#"{"display":"unclosed [Pasted text #1","pastedContents":{"1":{"content":"never"}},"timestamp":1772379241607,"sessionId":"s3"}"#,
+            br#"{"display":"escaped key [Pasted text #3]","pastedContents":{"~u0033":{"content":"THREE \"q\""}},"timestamp":1772379241608,"sessionId":"s3"}"#,
+            br#"{"display":"lossy float","timestamp":1772379241600.1234567,"sessionId":"s3"}"#,
+            br#"{"display":"lossy float 2","timestamp":1772379241609.0000000000000001,"sessionId":"s3"}"#,
+            br#"{"display":"exponent time","timestamp":1.772379241610e12,"sessionId":"s3"}"#,
+            br#"{"display":"negative time","timestamp":-5,"sessionId":"s3"}"#,
+            br#"{"display":"negative zero time","timestamp":-0,"sessionId":"s3"}"#,
+            br#"{"display":"string time","timestamp":"1772379241611","sessionId":"s3"}"#,
+            br#"{"display":"null time","timestamp":null,"sessionId":"s3"}"#,
+            br#"{"display":"no time","sessionId":"s3"}"#,
+            br#"{"display":"dup time","timestamp":1,"timestamp":1772379241612,"sessionId":"s3"}"#,
+            br#"{"display":"dup session","sessionId":"s1","sessionId":"s3","timestamp":1772379241613}"#,
+            br#"{"display":"blanked session","sessionId":"s3","sessionId":null}"#,
+            br#"{"display":7,"sessionId":"s3"}"#,
+            br#"{"display":"no session"}"#,
+            br#"[{"display":"array entry","sessionId":"s3"}]"#,
+            br#""a string entry""#,
+            br#"{"display":"malformed entry","sessionId":"s3",}"#,
+            br#"{"display":"out of range entry","sessionId":"s3","n":-1e400}"#,
+            deep_entry.as_bytes(),
+            too_deep_entry.as_bytes(),
+            &with_byte(r#"{"display":"bad utf8 entry","sessionId":"s3","z":"Xy"}"#, "Xy", 0xff),
+            br#"{"display":"trailing entry","sessionId":"s3"} x"#,
+            br#"   {"display":"padded entry","sessionId":"s3"}   "#,
+            b"   ",
+            b"",
+            br#"{"display":"unicode ~u2028 entry","sessionId":"s3"}"#,
+        ]);
+        history.extend_from_slice(br#"{"display":"unterminated entry","sessionId":"s3"}"#);
+        fs::write(root.join("history.jsonl"), history).unwrap();
+    }
+
+    fn history_digest(root: &Path) -> String {
+        let mut hasher = blake3::Hasher::new();
+        let summary = project_path(&root.join("history.jsonl"), |projected| {
+            for trible in projected.fragment.facts().iter_ordered() {
+                hasher.update(&trible.data);
+            }
+            hasher.update(b"|fragment|");
+            Ok(())
+        })
+        .unwrap();
+        hasher.update(format!("{summary:?}").as_bytes());
+        hasher.finalize().to_hex()[..32].to_owned()
+    }
+
+    const PINNED_HISTORY: &str = "a1483fd1b0381837756408ac4ffc7be5";
+
+    #[test]
+    fn history_reads_project_exactly_the_pinned_facts() {
+        let first = tempfile::tempdir().unwrap();
+        history_fixture(first.path());
+        let second = tempfile::tempdir().unwrap();
+        history_fixture(second.path());
+        let digest = history_digest(first.path());
+        assert_eq!(
+            history_digest(second.path()),
+            digest,
+            "the projection does not depend on where the log is"
+        );
+        assert_eq!(digest, PINNED_HISTORY);
+    }
 }
