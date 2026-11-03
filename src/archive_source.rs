@@ -275,9 +275,32 @@ pub fn raw_value(bytes: &mut Bytes) -> std::result::Result<Bytes, sc::ScanError>
 /// decoded keys can be sorted; duplicate keys retain their final value. This
 /// deliberately freezes the historical dynamic-tree spelling used by Archive
 /// tool payloads while keeping parsing source-backed and scanner-native.
-pub fn canonical_json(mut bytes: Bytes) -> std::result::Result<String, sc::ScanError> {
+pub fn canonical_json(bytes: Bytes) -> std::result::Result<String, sc::ScanError> {
+    canonical_json_spelled(bytes, Numbers::Exact)
+}
+
+/// [`canonical_json`], with each number spelled as a dynamic JSON tree
+/// holds it ([`json_number`]): the spelling Codex tool payloads were hashed
+/// in when they were canonicalized through such a tree.
+pub fn canonical_dynamic_json(bytes: Bytes) -> std::result::Result<String, sc::ScanError> {
+    canonical_json_spelled(bytes, Numbers::Dynamic)
+}
+
+/// How a canonicalized number is decoded before it is spelled.
+#[derive(Clone, Copy)]
+enum Numbers {
+    /// The nearest double.
+    Exact,
+    /// As [`json_number`] decodes it.
+    Dynamic,
+}
+
+fn canonical_json_spelled(
+    mut bytes: Bytes,
+    numbers: Numbers,
+) -> std::result::Result<String, sc::ScanError> {
     sc::skip_ws(&mut bytes);
-    let canonical = canonical_json_value(&mut bytes)?;
+    let canonical = canonical_json_value(&mut bytes, numbers)?;
     sc::skip_ws(&mut bytes);
     if !bytes.is_empty() {
         return Err(sc::ScanError::Syntax(
@@ -292,12 +315,29 @@ pub fn canonical_json(mut bytes: Bytes) -> std::result::Result<String, sc::ScanE
 /// Used where a record's envelope (ids, times, client state) must not enter
 /// the content it carries. A non-object value is canonicalized whole.
 pub fn canonical_json_without(
+    bytes: Bytes,
+    without: &[&str],
+) -> std::result::Result<String, sc::ScanError> {
+    canonical_json_without_spelled(bytes, without, Numbers::Exact)
+}
+
+/// [`canonical_json_without`], with numbers spelled as
+/// [`canonical_dynamic_json`] spells them.
+pub fn canonical_dynamic_json_without(
+    bytes: Bytes,
+    without: &[&str],
+) -> std::result::Result<String, sc::ScanError> {
+    canonical_json_without_spelled(bytes, without, Numbers::Dynamic)
+}
+
+fn canonical_json_without_spelled(
     mut bytes: Bytes,
     without: &[&str],
+    numbers: Numbers,
 ) -> std::result::Result<String, sc::ScanError> {
     sc::skip_ws(&mut bytes);
     if bytes.first().copied() != Some(b'{') {
-        return canonical_json(bytes);
+        return canonical_json_spelled(bytes, numbers);
     }
     let members = sc::object(
         &mut bytes,
@@ -309,7 +349,10 @@ pub fn canonical_json_without(
             if without.contains(&key.as_ref()) {
                 sc::skip_value(value)?;
             } else {
-                members.insert(key.as_ref().to_owned(), canonical_json_value(value)?);
+                members.insert(
+                    key.as_ref().to_owned(),
+                    canonical_json_value(value, numbers)?,
+                );
             }
             Ok(members)
         },
@@ -333,7 +376,10 @@ pub fn canonical_json_without(
     Ok(out)
 }
 
-fn canonical_json_value(bytes: &mut Bytes) -> std::result::Result<String, sc::ScanError> {
+fn canonical_json_value(
+    bytes: &mut Bytes,
+    numbers: Numbers,
+) -> std::result::Result<String, sc::ScanError> {
     match bytes.first().copied() {
         Some(b'"') => Ok(canonical_json_string(string(bytes)?.as_ref())),
         Some(b'{') => {
@@ -344,7 +390,10 @@ fn canonical_json_value(bytes: &mut Bytes) -> std::result::Result<String, sc::Sc
                     let key = key.view::<str>().map_err(|_| {
                         sc::ScanError::Syntax("JSON object key is not UTF-8".to_owned())
                     })?;
-                    members.insert(key.as_ref().to_owned(), canonical_json_value(value)?);
+                    members.insert(
+                        key.as_ref().to_owned(),
+                        canonical_json_value(value, numbers)?,
+                    );
                     Ok(members)
                 },
             )?;
@@ -365,7 +414,7 @@ fn canonical_json_value(bytes: &mut Bytes) -> std::result::Result<String, sc::Sc
                 if !out.is_empty() {
                     out.push(',');
                 }
-                out.push_str(&canonical_json_value(value)?);
+                out.push_str(&canonical_json_value(value, numbers)?);
                 Ok(out)
             })?;
             Ok(format!("[{values}]"))
@@ -382,7 +431,17 @@ fn canonical_json_value(bytes: &mut Bytes) -> std::result::Result<String, sc::Sc
             sc::expect_literal(bytes, b"null")?;
             Ok("null".to_owned())
         }
-        Some(_) => canonical_json_number(sc::parse_number(bytes)?),
+        Some(_) => {
+            let raw = sc::parse_number(bytes)?;
+            match numbers {
+                Numbers::Exact => canonical_json_number(raw),
+                // The tree's own spelling, canonicalized as that spelling
+                // was when the tree was serialized and read back.
+                Numbers::Dynamic => {
+                    canonical_json_number(Bytes::from_source(json_number_of(&raw)?.spelling()))
+                }
+            }
+        }
         None => Err(sc::ScanError::Syntax("expected JSON value".to_owned())),
     }
 }
@@ -412,6 +471,317 @@ fn canonical_json_number(raw: Bytes) -> std::result::Result<String, sc::ScanErro
         ));
     }
     Ok(zmij::Buffer::new().format_finite(value).to_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Records read as a dynamic JSON tree reads them
+// ---------------------------------------------------------------------------
+//
+// The Codex and Claude Code importers once parsed some records into a
+// `serde_json::Value` (default features: sorted maps, lossy decimal floats).
+// What such a parse accepted, which duplicate member it kept, the order it
+// listed members in and the double it decoded a number to all reached
+// projections and hashed content. These reads reproduce exactly that over
+// the source bytes, without building the tree.
+
+/// Members, arrays and their elements nest at most this deep.
+const JSON_DEPTH: u8 = 127;
+
+/// The one JSON value `raw` holds, if a dynamic JSON reader accepts it: one
+/// value between JSON whitespace, valid UTF-8, nesting at most 127 deep, and
+/// no number out of the range [`json_number`] decodes. The value is a slice
+/// of `raw`; once it is accepted, the reads below cannot fail on it.
+pub fn json_document(raw: Bytes) -> std::result::Result<Bytes, sc::ScanError> {
+    std::str::from_utf8(raw.as_ref())
+        .map_err(|_| sc::ScanError::Syntax("JSON is not UTF-8".to_owned()))?;
+    let mut bytes = raw;
+    sc::skip_ws(&mut bytes);
+    let start = bytes.clone();
+    check_json_value(&mut bytes, JSON_DEPTH)?;
+    let value = start.slice(..start.len() - bytes.len());
+    sc::skip_ws(&mut bytes);
+    if !bytes.is_empty() {
+        return Err(sc::ScanError::Syntax(
+            "trailing bytes after JSON value".to_owned(),
+        ));
+    }
+    Ok(value)
+}
+
+fn check_json_value(bytes: &mut Bytes, depth: u8) -> std::result::Result<(), sc::ScanError> {
+    let nested = || {
+        depth
+            .checked_sub(1)
+            .ok_or_else(|| sc::ScanError::Syntax("JSON nests too deep".to_owned()))
+    };
+    match bytes.first().copied() {
+        Some(b'{') => {
+            let depth = nested()?;
+            sc::object(bytes, (), |(), _key, value| check_json_value(value, depth))
+        }
+        Some(b'[') => {
+            let depth = nested()?;
+            sc::array(bytes, (), |(), value| check_json_value(value, depth))
+        }
+        Some(b'-' | b'0'..=b'9') => json_number_of(&sc::parse_number(bytes)?).map(drop),
+        _ => sc::skip_value(bytes),
+    }
+}
+
+/// The named members of a JSON object, each the last of its name as in a
+/// dynamic tree. A value that is not an object has none.
+pub fn json_members<const N: usize>(value: &Bytes, names: [&str; N]) -> [Option<Bytes>; N] {
+    let mut found = [(); N].map(|_| None);
+    if value.first().copied() != Some(b'{') {
+        return found;
+    }
+    let mut bytes = value.clone();
+    let scanned = sc::object(&mut bytes, (), |(), key, member| {
+        match names
+            .iter()
+            .position(|name| name.as_bytes() == key.as_ref())
+        {
+            Some(index) => found[index] = Some(sc::take_value(member)?),
+            None => sc::skip_value(member)?,
+        }
+        Ok(())
+    });
+    match scanned {
+        Ok(()) => found,
+        Err(_) => [(); N].map(|_| None),
+    }
+}
+
+/// Every member of a JSON object in key order, each the last of its name:
+/// the order a dynamic tree's sorted map lists them in.
+pub fn json_object(value: &Bytes) -> Option<BTreeMap<String, Bytes>> {
+    if value.first().copied() != Some(b'{') {
+        return None;
+    }
+    let mut bytes = value.clone();
+    sc::object(&mut bytes, BTreeMap::new(), |mut members, key, member| {
+        let key = key
+            .view::<str>()
+            .map_err(|_| sc::ScanError::Syntax("JSON object key is not UTF-8".to_owned()))?;
+        members.insert(key.as_ref().to_owned(), sc::take_value(member)?);
+        Ok(members)
+    })
+    .ok()
+}
+
+/// The elements of a JSON array, in order.
+pub fn json_elements(value: &Bytes) -> Option<Vec<Bytes>> {
+    if value.first().copied() != Some(b'[') {
+        return None;
+    }
+    let mut bytes = value.clone();
+    sc::array(&mut bytes, Vec::new(), |mut elements, element| {
+        elements.push(sc::take_value(element)?);
+        Ok(elements)
+    })
+    .ok()
+}
+
+/// The decoded text of a JSON string.
+pub fn json_str(value: &Bytes) -> Option<View<str>> {
+    if value.first().copied() != Some(b'"') {
+        return None;
+    }
+    string(&mut value.clone()).ok()
+}
+
+/// A JSON number as a dynamic tree holds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum JsonNumber {
+    /// A non-negative integer that fits in `u64`.
+    PosInt(u64),
+    /// A negative integer that fits in `i64`.
+    NegInt(i64),
+    /// Anything else, `-0` included.
+    Float(f64),
+}
+
+impl JsonNumber {
+    /// The number as an `i64`, if it is an integer that fits.
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            JsonNumber::PosInt(value) => i64::try_from(value).ok(),
+            JsonNumber::NegInt(value) => Some(value),
+            JsonNumber::Float(_) => None,
+        }
+    }
+
+    /// The number as the nearest `f64`.
+    pub fn as_f64(self) -> f64 {
+        match self {
+            JsonNumber::PosInt(value) => value as f64,
+            JsonNumber::NegInt(value) => value as f64,
+            JsonNumber::Float(value) => value,
+        }
+    }
+
+    /// The tree's own serialization of the number.
+    fn spelling(self) -> String {
+        match self {
+            JsonNumber::PosInt(value) => value.to_string(),
+            JsonNumber::NegInt(value) => value.to_string(),
+            JsonNumber::Float(value) => zmij::Buffer::new().format_finite(value).to_owned(),
+        }
+    }
+}
+
+/// Decode a JSON number as a dynamic tree does (`serde_json` without
+/// `float_roundtrip`): an integer stays exact while it fits, and anything
+/// else becomes the decimal significand's first 19 or 20 digits scaled by a
+/// power of ten, which is not always the nearest double. `None` for a
+/// value that is not a number or that this decoding takes out of range.
+pub fn json_number(value: &Bytes) -> Option<JsonNumber> {
+    if !matches!(value.first().copied(), Some(b'-' | b'0'..=b'9')) {
+        return None;
+    }
+    let raw = sc::parse_number(&mut value.clone()).ok()?;
+    json_number_of(&raw).ok()
+}
+
+fn json_number_of(raw: &Bytes) -> std::result::Result<JsonNumber, sc::ScanError> {
+    decode_json_number(raw.as_ref())
+        .ok_or_else(|| sc::ScanError::Syntax("JSON number is out of range".to_owned()))
+}
+
+/// `significand * 10 + digit` would exceed `limit`.
+fn overflows(significand: u64, digit: u64, limit: u64) -> bool {
+    significand >= limit / 10 && (significand > limit / 10 || digit > limit % 10)
+}
+
+/// The decimal-to-double reduction of [`json_number`], over one complete
+/// number token as `sc::parse_number` returns it.
+fn decode_json_number(token: &[u8]) -> Option<JsonNumber> {
+    let (positive, digits) = match token.split_first() {
+        Some((b'-', rest)) => (false, rest),
+        _ => (true, token),
+    };
+    let digit = |at: usize| digits.get(at).filter(|byte| byte.is_ascii_digit());
+    let mut at = 1;
+    let mut significand = u64::from(*digit(0)? - b'0');
+    if significand != 0 {
+        while let Some(byte) = digit(at) {
+            let value = u64::from(byte - b'0');
+            if overflows(significand, value, u64::MAX) {
+                // Too long for an integer: the rest of its digits only
+                // scale it.
+                let mut exponent = 0i32;
+                while digit(at).is_some() {
+                    at += 1;
+                    exponent += 1;
+                }
+                return json_float(positive, significand, exponent, &digits[at..])
+                    .map(JsonNumber::Float);
+            }
+            significand = significand * 10 + value;
+            at += 1;
+        }
+    }
+    if at < digits.len() {
+        return json_float(positive, significand, 0, &digits[at..]).map(JsonNumber::Float);
+    }
+    Some(if positive {
+        JsonNumber::PosInt(significand)
+    } else {
+        let negated = (significand as i64).wrapping_neg();
+        if negated >= 0 {
+            JsonNumber::Float(-(significand as f64))
+        } else {
+            JsonNumber::NegInt(negated)
+        }
+    })
+}
+
+/// The fraction and exponent after an integer part.
+fn json_float(positive: bool, mut significand: u64, exponent: i32, rest: &[u8]) -> Option<f64> {
+    let mut rest = rest;
+    let mut exponent = exponent;
+    if let Some((b'.', fraction)) = rest.split_first() {
+        rest = fraction;
+        while let Some((&byte, tail)) = rest.split_first().filter(|(b, _)| b.is_ascii_digit()) {
+            let value = u64::from(byte - b'0');
+            if overflows(significand, value, u64::MAX) {
+                // The remaining fraction digits are dropped.
+                while rest.first().is_some_and(u8::is_ascii_digit) {
+                    rest = &rest[1..];
+                }
+                break;
+            }
+            significand = significand * 10 + value;
+            exponent -= 1;
+            rest = tail;
+        }
+    }
+    if let Some((b'e' | b'E', tail)) = rest.split_first() {
+        rest = tail;
+        let positive_exponent = match rest.first() {
+            Some(b'-') => {
+                rest = &rest[1..];
+                false
+            }
+            Some(b'+') => {
+                rest = &rest[1..];
+                true
+            }
+            _ => true,
+        };
+        let mut scale = 0i32;
+        for &byte in rest {
+            let value = i32::from(byte - b'0');
+            if scale >= i32::MAX / 10 && (scale > i32::MAX / 10 || value > i32::MAX % 10) {
+                // An exponent past i32: zero, or out of range when it grows.
+                if significand != 0 && positive_exponent {
+                    return None;
+                }
+                return Some(if positive { 0.0 } else { -0.0 });
+            }
+            scale = scale * 10 + value;
+        }
+        exponent = if positive_exponent {
+            exponent.saturating_add(scale)
+        } else {
+            exponent.saturating_sub(scale)
+        };
+    }
+    json_float_from_parts(positive, significand, exponent)
+}
+
+fn json_float_from_parts(positive: bool, significand: u64, mut exponent: i32) -> Option<f64> {
+    static POW10: std::sync::OnceLock<[f64; 309]> = std::sync::OnceLock::new();
+    let pow10 = POW10.get_or_init(|| {
+        std::array::from_fn(|power| format!("1e{power}").parse().expect("a power of ten parses"))
+    });
+    let mut value = significand as f64;
+    loop {
+        match pow10.get(exponent.wrapping_abs() as usize) {
+            Some(&power) => {
+                if exponent >= 0 {
+                    value *= power;
+                    if value.is_infinite() {
+                        return None;
+                    }
+                } else {
+                    value /= power;
+                }
+                break;
+            }
+            None => {
+                if value == 0.0 {
+                    break;
+                }
+                if exponent >= 0 {
+                    return None;
+                }
+                value /= 1e308;
+                exponent += 308;
+            }
+        }
+    }
+    Some(if positive { value } else { -value })
 }
 
 /// Return the canonical JSON spelling of one decoded string.
@@ -1249,5 +1619,269 @@ mod tests {
             canonical_json_string("quote: \"; slash: \\; line:\n"),
             r#""quote: \"; slash: \\; line:\n""#
         );
+    }
+
+    /// What the dynamic tree these reads replace made of `text`.
+    fn tree(text: &[u8]) -> Option<serde_json::Value> {
+        serde_json::from_slice(text).ok()
+    }
+
+    /// The canonical JSON a tree round trip spelled.
+    fn tree_canonical(value: &serde_json::Value) -> String {
+        canonical_json(Bytes::from_source(serde_json::to_vec(value).unwrap())).unwrap()
+    }
+
+    fn assert_number_matches_tree(token: &str) {
+        let value = tree(token.as_bytes());
+        let decoded = json_number(&Bytes::from_source(token.as_bytes().to_vec()));
+        match (&value, decoded) {
+            (Some(serde_json::Value::Number(number)), Some(decoded)) => {
+                match decoded {
+                    JsonNumber::PosInt(value) => {
+                        assert_eq!(number.as_u64(), Some(value), "{token}")
+                    }
+                    JsonNumber::NegInt(value) => {
+                        assert!(!number.is_u64(), "{token}");
+                        assert_eq!(number.as_i64(), Some(value), "{token}");
+                    }
+                    JsonNumber::Float(value) => {
+                        assert!(number.is_f64(), "{token}");
+                        assert_eq!(
+                            number.as_f64().unwrap().to_bits(),
+                            value.to_bits(),
+                            "{token}"
+                        );
+                    }
+                }
+                assert_eq!(number.as_i64(), decoded.as_i64(), "{token}");
+                assert_eq!(
+                    number.as_f64().unwrap().to_bits(),
+                    decoded.as_f64().to_bits(),
+                    "{token}"
+                );
+                assert_eq!(
+                    canonical_dynamic_json(Bytes::from_source(token.as_bytes().to_vec())).unwrap(),
+                    tree_canonical(value.as_ref().unwrap()),
+                    "{token}"
+                );
+            }
+            (None, None) => assert!(
+                json_document(Bytes::from_source(token.as_bytes().to_vec())).is_err(),
+                "{token}"
+            ),
+            (value, decoded) => panic!("{token}: tree {value:?}, decoded {decoded:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_numbers_decode_as_the_tree_decoded_them() {
+        for token in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "0.0",
+            "-0.0",
+            "1.0",
+            "1e0",
+            "1E+2",
+            "1e-2",
+            "0e999999999999",
+            "-0e-999999999999",
+            "1e-999999999999",
+            "1e999999999999",
+            "1e308",
+            "1e309",
+            "-1e309",
+            "1.7976931348623157e308",
+            "1.7976931348623159e308",
+            "2.2250738585072014e-308",
+            "5e-324",
+            "4.9e-324",
+            "2.4703282292062328e-324",
+            "2.4703282292062327e-324",
+            "1e-400",
+            "0.1",
+            "0.2",
+            "0.30000000000000004",
+            "123456789.12345678",
+            "9007199254740993",
+            "9007199254740993.0",
+            "1.00000000000000011102230246251565404236316680908203125",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "18446744073709551616",
+            "-18446744073709551615",
+            "-18446744073709551616",
+            "123456789012345678901234567890",
+            "1844674407370955161.5",
+            "18446744073709551615.5",
+            "184467440737095516150.25e-3",
+            "0.000000000000000000000000000000000000000000001",
+            "1785747601.5",
+            "1772379241600.1234567",
+        ] {
+            assert_number_matches_tree(token);
+        }
+        // A deterministic sweep over lengths, fractions and exponents.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let mut digits = |count: u64, next: &mut dyn FnMut(u64) -> u64| -> String {
+            (0..count)
+                .map(|_| char::from(b'0' + next(10) as u8))
+                .collect()
+        };
+        for _ in 0..200_000 {
+            let mut token = String::new();
+            if next(2) == 0 {
+                token.push('-');
+            }
+            if next(5) == 0 {
+                token.push('0');
+            } else {
+                token.push(char::from(b'1' + next(9) as u8));
+                let count = next(25);
+                token.push_str(&digits(count, &mut next));
+            }
+            if next(2) == 0 {
+                token.push('.');
+                let count = 1 + next(25);
+                token.push_str(&digits(count, &mut next));
+            }
+            if next(3) == 0 {
+                token.push(if next(2) == 0 { 'e' } else { 'E' });
+                match next(3) {
+                    0 => token.push('-'),
+                    1 => token.push('+'),
+                    _ => {}
+                }
+                let count = if next(20) == 0 {
+                    10 + next(3)
+                } else {
+                    1 + next(3)
+                };
+                token.push_str(&digits(count, &mut next));
+            }
+            assert_number_matches_tree(&token);
+        }
+    }
+
+    #[test]
+    fn json_documents_are_what_the_tree_accepted() {
+        let deep = |depth: usize| format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        let deep_object =
+            |depth: usize| format!("{}0{}", r#"{"a":"#.repeat(depth), "}".repeat(depth));
+        let mut cases: Vec<Vec<u8>> = [
+            r#"{"a":1}"#,
+            r#"  {"a":1}  "#,
+            "{\"a\":1}\r",
+            "{\"a\":1}\x0c",
+            r#"{"a":1,}"#,
+            r#"{"a":1} x"#,
+            r#"{"a":1} {}"#,
+            r#"{"a":1"#,
+            r#"[1,2]"#,
+            r#"[1 2]"#,
+            r#""s""#,
+            "1",
+            " 1 ",
+            "-",
+            "-a",
+            "01",
+            "1.",
+            ".5",
+            "+1",
+            "1e",
+            "1e+",
+            "tru",
+            "true",
+            "nul",
+            "nullx",
+            "[truefalse]",
+            r#"{"a":1e400}"#,
+            r#"{"a":-1e400}"#,
+            r#"["\ud800"]"#,
+            r#"["\udc00"]"#,
+            r#"["\ud800\u0041"]"#,
+            r#"["\ud83d\ude00"]"#,
+            r#"["\q"]"#,
+            "[\"a\u{1}\"]",
+            "[\"a\u{7f}\"]",
+            r#"{"a":1,"a":2}"#,
+            r#"{1:2}"#,
+            "",
+            "   ",
+            "\u{feff}{}",
+        ]
+        .iter()
+        .map(|text| text.as_bytes().to_vec())
+        .collect();
+        cases.push(b"[\"\xff\"]".to_vec());
+        cases.push(b"[\"\xc0\xaf\"]".to_vec());
+        cases.push(b"[\"\xed\xa0\x80\"]".to_vec());
+        cases.push(b"[1]\xff".to_vec());
+        for depth in [126, 127, 128, 129] {
+            cases.push(deep(depth).into_bytes());
+            cases.push(deep_object(depth).into_bytes());
+        }
+        cases.push(format!("1{}", "0".repeat(400)).into_bytes());
+        cases.push(format!("0.{}1", "0".repeat(400)).into_bytes());
+        for case in cases {
+            let accepted = json_document(Bytes::from_source(case.clone()));
+            let value = tree(&case);
+            assert_eq!(
+                accepted.is_ok(),
+                value.is_some(),
+                "{:?}: {accepted:?}",
+                String::from_utf8_lossy(&case)
+            );
+            if let (Ok(document), Some(value)) = (accepted, value) {
+                assert_eq!(
+                    canonical_dynamic_json(document).unwrap(),
+                    tree_canonical(&value),
+                    "{:?}",
+                    String::from_utf8_lossy(&case)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_reads_see_what_the_tree_saw() {
+        let text = br#"{"b":{"x":1},"a":"first","a":"last","n":-0,"s":"\u00e9\"","l":[1,{"k":true}],"z":null}"#;
+        let document = json_document(Bytes::from_source(text.to_vec())).unwrap();
+        let value = tree(text).unwrap();
+        let [a, n, s, l, missing] = json_members(&document, ["a", "n", "s", "l", "missing"]);
+        assert_eq!(
+            json_str(a.as_ref().unwrap()).as_deref().map(|a| a.as_ref()),
+            value["a"].as_str()
+        );
+        assert_eq!(
+            json_number(n.as_ref().unwrap()).unwrap().as_i64(),
+            value["n"].as_i64()
+        );
+        assert_eq!(
+            json_str(s.as_ref().unwrap()).as_deref().map(|s| s.as_ref()),
+            value["s"].as_str()
+        );
+        assert_eq!(json_elements(l.as_ref().unwrap()).unwrap().len(), 2);
+        assert!(missing.is_none());
+        let keys: Vec<String> = json_object(&document).unwrap().into_keys().collect();
+        let tree_keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(keys, tree_keys);
+        assert_eq!(
+            json_members(&json_elements(l.as_ref().unwrap()).unwrap()[0], ["k"]),
+            [None]
+        );
+        assert!(json_str(n.as_ref().unwrap()).is_none());
+        assert!(json_number(s.as_ref().unwrap()).is_none());
     }
 }

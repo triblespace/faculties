@@ -1602,33 +1602,44 @@ where
     let mut sessions: std::collections::BTreeMap<String, Vec<HistoryPrompt>> = Default::default();
     let mut order = Vec::<String>::new();
     let mut stats = ProjectionStats::default();
-    let text = bytes.as_ref();
-    let complete = text
+    let complete = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |end| end + 1);
-    for line in text[..complete].split(|byte| *byte == b'\n') {
+    let mut start = 0;
+    while start < complete {
+        let end = start
+            + memchr::memchr(b'\n', &bytes[start..complete])
+                .expect("the complete prefix ends with a newline");
+        let line = bytes.slice(start..end);
+        start = end + 1;
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         stats.records_seen += 1;
-        let Ok(entry) = serde_json::from_slice::<serde_json::Value>(line) else {
+        let Ok(entry) = archive_source::json_document(line) else {
             stats.skipped_records += 1;
             continue;
         };
+        let [session, display, pasted, timestamp] = archive_source::json_members(
+            &entry,
+            ["sessionId", "display", "pastedContents", "timestamp"],
+        );
         let (Some(session), Some(display)) = (
-            entry.get("sessionId").and_then(serde_json::Value::as_str),
-            entry.get("display").and_then(serde_json::Value::as_str),
+            session.as_ref().and_then(archive_source::json_str),
+            display.as_ref().and_then(archive_source::json_str),
         ) else {
             stats.missing_source_identity += 1;
             stats.skipped_records += 1;
             continue;
         };
+        let (session, display) = (session.as_ref(), display.as_ref());
         stats.history_prompts += 1;
-        let text = expand_pasted(root, display, entry.get("pastedContents"));
-        let timestamp = entry
-            .get("timestamp")
-            .and_then(serde_json::Value::as_f64)
+        let text = expand_pasted(root, display, pasted.as_ref());
+        let timestamp = timestamp
+            .as_ref()
+            .and_then(archive_source::json_number)
+            .map(archive_source::JsonNumber::as_f64)
             .map(Epoch::from_unix_milliseconds)
             .and_then(epoch_interval);
         if !sessions.contains_key(session) {
@@ -1702,19 +1713,23 @@ where
 
 /// Replace `[Pasted text #N ...]` placeholders with the pasted text: inline
 /// `content`, or `paste-cache/<contentHash>.txt` beside the log.
-fn expand_pasted(root: &Path, display: &str, pasted: Option<&serde_json::Value>) -> String {
+///
+/// Entries are taken in key order, each key's last entry winning.
+fn expand_pasted(root: &Path, display: &str, pasted: Option<&Bytes>) -> String {
     let mut text = display.to_owned();
-    let Some(pasted) = pasted.and_then(serde_json::Value::as_object) else {
+    let Some(pasted) = pasted.and_then(archive_source::json_object) else {
         return text;
     };
     for (id, entry) in pasted {
-        let content = match entry.get("content").and_then(serde_json::Value::as_str) {
-            Some(content) => Some(content.to_owned()),
-            None => entry
-                .get("contentHash")
-                .and_then(serde_json::Value::as_str)
+        let [content, hash] = archive_source::json_members(&entry, ["content", "contentHash"]);
+        let content = match content.as_ref().and_then(archive_source::json_str) {
+            Some(content) => Some(content.as_ref().to_owned()),
+            None => hash
+                .as_ref()
+                .and_then(archive_source::json_str)
                 .and_then(|hash| {
-                    fs::read_to_string(root.join("paste-cache").join(format!("{hash}.txt"))).ok()
+                    let file = format!("{}.txt", hash.as_ref());
+                    fs::read_to_string(root.join("paste-cache").join(file)).ok()
                 }),
         };
         let Some(content) = content else {
@@ -1773,25 +1788,36 @@ fn transcript_prompts(root: &Path, session: &str) -> Result<TranscriptPrompts> {
             if !(user || queued || command) {
                 continue;
             }
-            let Ok(record) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            let Ok(record) = archive_source::json_document(Bytes::from_source(line)) else {
                 continue;
             };
-            if let Some(content) = record
-                .get("message")
-                .and_then(|message| message.get("content"))
-            {
-                let text = match content {
-                    serde_json::Value::String(text) => Some(text.clone()),
-                    serde_json::Value::Array(blocks) => {
-                        let texts: Vec<&str> = blocks
+            let [message, attachment, content] =
+                archive_source::json_members(&record, ["message", "attachment", "content"]);
+            let [message_content] = match &message {
+                Some(message) => archive_source::json_members(message, ["content"]),
+                None => [None],
+            };
+            if let Some(message_content) = message_content {
+                let text = match message_content.first() {
+                    Some(b'"') => archive_source::json_str(&message_content)
+                        .map(|text| text.as_ref().to_owned()),
+                    Some(b'[') => {
+                        let blocks = archive_source::json_elements(&message_content);
+                        let texts: Vec<_> = blocks
                             .iter()
-                            .filter(|block| {
-                                block.get("type").and_then(serde_json::Value::as_str)
-                                    == Some("text")
+                            .flatten()
+                            .filter_map(|block| {
+                                let [kind, text] =
+                                    archive_source::json_members(block, ["type", "text"]);
+                                let kind = archive_source::json_str(kind.as_ref()?)?;
+                                if kind.as_ref() != "text" {
+                                    return None;
+                                }
+                                archive_source::json_str(&text?)
                             })
-                            .filter_map(|block| block.get("text")?.as_str())
                             .collect();
-                        (!texts.is_empty()).then(|| texts.concat())
+                        (!texts.is_empty())
+                            .then(|| texts.iter().map(|text| text.as_ref()).collect::<String>())
                     }
                     _ => None,
                 };
@@ -1801,16 +1827,16 @@ fn transcript_prompts(root: &Path, session: &str) -> Result<TranscriptPrompts> {
                     prompts.texts.insert(text);
                 }
             }
-            if let Some(prompt) = record
-                .get("attachment")
-                .and_then(|attachment| attachment.get("prompt"))
-                .and_then(serde_json::Value::as_str)
-            {
-                prompts.texts.insert(prompt.trim().to_owned());
-                prompts.texts.insert(prompt.to_owned());
+            let [prompt] = match &attachment {
+                Some(attachment) => archive_source::json_members(attachment, ["prompt"]),
+                None => [None],
+            };
+            if let Some(prompt) = prompt.as_ref().and_then(archive_source::json_str) {
+                prompts.texts.insert(prompt.as_ref().trim().to_owned());
+                prompts.texts.insert(prompt.as_ref().to_owned());
             }
-            if let Some(content) = record.get("content").and_then(serde_json::Value::as_str) {
-                collect_commands(content, &mut prompts.commands);
+            if let Some(content) = content.as_ref().and_then(archive_source::json_str) {
+                collect_commands(content.as_ref(), &mut prompts.commands);
             }
         }
     }

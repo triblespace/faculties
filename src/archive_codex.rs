@@ -79,9 +79,10 @@ use triblespace::core::inline::{Inline, TryToInline};
 use triblespace::core::trible::Fragment;
 use triblespace::prelude::*;
 
-use serde_json::Value;
-
-use crate::archive_source::{SourceClaims, SourcePart, SourceRecord, ToolLink};
+use crate::archive_source::{
+    json_document, json_elements, json_members, json_number, json_str, JsonNumber, SourceClaims,
+    SourcePart, SourceRecord, ToolLink,
+};
 use crate::schemas::blockdag as schema;
 use crate::{archive_source, files};
 
@@ -373,18 +374,20 @@ impl PlanScan {
         }
         if first && !contains(raw, b"\"payload\"") {
             // The legacy bare format opens with a header naming the session.
-            if let Ok(header) = serde_json::from_slice::<serde_json::Value>(raw) {
-                self.legacy_id = header
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(str::to_owned);
+            if let Ok(header) = json_document(Bytes::from_source(raw.to_vec())) {
+                let [id] = json_members(&header, ["id"]);
+                self.legacy_id = id
+                    .as_ref()
+                    .and_then(json_str)
+                    .filter(|id| !id.as_ref().trim().is_empty())
+                    .map(|id| id.as_ref().to_owned());
             }
         }
         if !contains(raw, b"\"session_meta\"") {
             return Ok(());
         }
-        let record = parse_record(Bytes::from_source(raw.to_vec()), path)?;
+        let raw = Bytes::from_source(raw.to_vec());
+        let record = parse_record(raw.clone(), path)?;
         if record.record_type.as_deref() != Some("session_meta") {
             return Ok(());
         }
@@ -395,14 +398,12 @@ impl PlanScan {
                 .as_deref()
                 .and_then(parse_iso_timestamp)
                 .map(epoch_ms);
-            self.forked = serde_json::from_slice::<serde_json::Value>(raw)
+            self.forked = json_document(raw)
                 .ok()
                 .and_then(|value| {
-                    value
-                        .get("payload")?
-                        .get("forked_from_id")?
-                        .as_str()
-                        .map(|id| !id.trim().is_empty())
+                    let [payload] = json_members(&value, ["payload"]);
+                    let [forked_from] = json_members(&payload?, ["forked_from_id"]);
+                    json_str(&forked_from?).map(|id| !id.as_ref().trim().is_empty())
                 })
                 .unwrap_or(false);
         }
@@ -583,11 +584,11 @@ where
 impl Projector<'_> {
     /// End a fork's replay at its own first turn: a turn that starts at or
     /// after the fork's creation, or a pause the bulk copy never makes.
-    fn observe_replay(&mut self, raw: &[u8]) {
-        if contains(raw, b"\"session_meta\"") {
+    fn observe_replay(&mut self, raw: &Bytes) {
+        if contains(raw.as_ref(), b"\"session_meta\"") {
             return;
         }
-        let at = line_ms(raw);
+        let at = line_ms(raw.as_ref());
         if let Some(at) = at {
             if at > self.last_ms + 3_000 {
                 self.replaying = false;
@@ -595,15 +596,18 @@ impl Projector<'_> {
             }
             self.last_ms = self.last_ms.max(at);
         }
-        let turn_start = if contains(raw, b"\"task_started\"") || contains(raw, b"\"turn_context\"")
+        let turn_start = if contains(raw.as_ref(), b"\"task_started\"")
+            || contains(raw.as_ref(), b"\"turn_context\"")
         {
-            serde_json::from_slice::<Value>(raw).ok().and_then(|value| {
-                let payload = value.get("payload")?;
-                payload
-                    .get("started_at")
-                    .and_then(Value::as_i64)
+            json_document(raw.clone()).ok().and_then(|value| {
+                let [payload] = json_members(&value, ["payload"]);
+                let [started_at, turn_id] = json_members(&payload?, ["started_at", "turn_id"]);
+                started_at
+                    .as_ref()
+                    .and_then(json_number)
+                    .and_then(JsonNumber::as_i64)
                     .map(|seconds| seconds * 1_000)
-                    .or_else(|| payload.get("turn_id")?.as_str().and_then(uuid_v7_ms))
+                    .or_else(|| json_str(&turn_id?).and_then(|id| uuid_v7_ms(id.as_ref())))
             })
         } else {
             None
@@ -615,7 +619,7 @@ impl Projector<'_> {
 
     fn project_record(&mut self, _line: u64, raw: Bytes) -> Result<()> {
         if self.replaying {
-            self.observe_replay(raw.as_ref());
+            self.observe_replay(&raw);
         }
         if self.legacy {
             return self.project_item_line(raw);
@@ -839,51 +843,57 @@ impl Projector<'_> {
             self.stats.skipped_records += 1;
             return Ok(());
         }
-        let value: serde_json::Value = serde_json::from_slice(cheap)
+        let value = json_document(raw)
             .with_context(|| format!("parse Codex record in {}", self.source_path.display()))?;
+        let [kind, payload, timestamp] = json_members(&value, ["type", "payload", "timestamp"]);
+        let kind = kind.as_ref().and_then(json_str);
         let (kind, payload) = if self.legacy {
-            ("response_item", &value)
+            ("response_item", value)
         } else {
             (
-                value.get("type").and_then(Value::as_str).unwrap_or(""),
-                value.get("payload").unwrap_or(&Value::Null),
+                kind.as_ref().map_or("", |kind| kind.as_ref()),
+                payload.unwrap_or_else(|| Bytes::from_source(&b"null"[..])),
             )
         };
-        let timestamp = self.timestamp(
-            value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("timestamp").and_then(Value::as_str)),
-        );
+        let [payload_timestamp] = json_members(&payload, ["timestamp"]);
+        let timestamp = timestamp
+            .as_ref()
+            .and_then(json_str)
+            .or_else(|| payload_timestamp.as_ref().and_then(json_str));
+        let timestamp = self.timestamp(timestamp.as_ref().map(|timestamp| timestamp.as_ref()));
         match kind {
-            "response_item" => self.response_item(payload, timestamp),
+            "response_item" => self.response_item(&payload, timestamp),
             "compacted" => {
                 // A compaction is what the model is shown in place of its
                 // history: its summary and its sealed state are perceived.
                 let mut parts = Vec::new();
-                if let Some(message) = payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .filter(|message| !message.trim().is_empty())
+                let [message, history] = json_members(&payload, ["message", "replacement_history"]);
+                if let Some(message) = message
+                    .as_ref()
+                    .and_then(json_str)
+                    .filter(|message| !message.as_ref().trim().is_empty())
                 {
                     parts.push(text_part(
                         schema::content_fact::modality::TEXT,
                         schema::content_fact::direction::IN,
-                        message,
+                        message.as_ref(),
                     ));
                 }
                 // The sealed compaction tokens; the rest of the replacement
                 // history repeats items the file already holds.
-                for token in payload
-                    .get("replacement_history")
-                    .and_then(Value::as_array)
+                for token in history
+                    .as_ref()
+                    .and_then(json_elements)
                     .into_iter()
                     .flatten()
-                    .filter_map(|item| item.get("encrypted_content")?.as_str())
-                    .filter(|token| !token.is_empty())
+                    .filter_map(|item| {
+                        let [token] = json_members(&item, ["encrypted_content"]);
+                        json_str(&token?)
+                    })
+                    .filter(|token| !token.as_ref().is_empty())
                 {
                     parts.push(sealed(
-                        token,
+                        token.as_ref(),
                         schema::content_fact::sealed::OPENAI_COMPACTION,
                         schema::content_fact::direction::IN,
                     ));
@@ -892,7 +902,10 @@ impl Projector<'_> {
                 Ok(())
             }
             "world_state" => {
-                let parts = event_parts(payload, schema::content_fact::direction::IN)?;
+                let parts = event_parts(
+                    canonical_value(&payload)?,
+                    schema::content_fact::direction::IN,
+                );
                 self.push(parts, Vec::new(), "world_state", timestamp);
                 Ok(())
             }
@@ -905,14 +918,29 @@ impl Projector<'_> {
 
     fn response_item(
         &mut self,
-        payload: &Value,
+        payload: &Bytes,
         timestamp: Option<Inline<NsTAIInterval>>,
     ) -> Result<()> {
         self.response_items = true;
-        let kind = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        let [kind, role, content, summary, encrypted, output, call_id] = json_members(
+            payload,
+            [
+                "type",
+                "role",
+                "content",
+                "summary",
+                "encrypted_content",
+                "output",
+                "call_id",
+            ],
+        );
+        let kind = kind.as_ref().and_then(json_str);
+        let kind = kind.as_ref().map_or("", |kind| kind.as_ref());
+        let call_id = call_id.as_ref().and_then(json_str);
         match kind {
             "message" => {
-                let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
+                let role = role.as_ref().and_then(json_str);
+                let role = role.as_ref().map_or("", |role| role.as_ref());
                 let direction = if role == "assistant" {
                     schema::content_fact::direction::OUT
                 } else {
@@ -927,19 +955,21 @@ impl Projector<'_> {
                 // context around it; developer and system items are
                 // instructions. All of it is what the model saw.
                 if role == "user" {
-                    for entry in payload
-                        .get("content")
-                        .and_then(Value::as_array)
+                    for entry in content
+                        .as_ref()
+                        .and_then(json_elements)
                         .into_iter()
                         .flatten()
                     {
-                        if let Some(text) = entry.get("text").and_then(Value::as_str) {
-                            self.response_prompts.insert(text.trim().to_owned());
+                        let [text] = json_members(&entry, ["text"]);
+                        if let Some(text) = text.as_ref().and_then(json_str) {
+                            self.response_prompts
+                                .insert(text.as_ref().trim().to_owned());
                         }
                     }
                 }
                 let parts = response_content_parts(
-                    payload.get("content"),
+                    content.as_ref(),
                     schema::content_fact::modality::TEXT,
                     direction,
                     &mut self.stats,
@@ -954,35 +984,31 @@ impl Projector<'_> {
                 if !self.has_events {
                     // In a file with events the summary is the events'
                     // reasoning; only the sealed token is new here.
-                    for field in ["summary", "content"] {
-                        for entry in payload
-                            .get(field)
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                        {
-                            let Some(text) = entry
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .filter(|text| !text.trim().is_empty())
+                    for field in [&summary, &content] {
+                        for entry in field.as_ref().and_then(json_elements).into_iter().flatten() {
+                            let [text] = json_members(&entry, ["text"]);
+                            let Some(text) = text
+                                .as_ref()
+                                .and_then(json_str)
+                                .filter(|text| !text.as_ref().trim().is_empty())
                             else {
                                 continue;
                             };
                             parts.push(text_part(
                                 schema::content_fact::modality::THINKING,
                                 schema::content_fact::direction::OUT,
-                                text,
+                                text.as_ref(),
                             ));
                         }
                     }
                 }
-                if let Some(token) = payload
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .filter(|token| !token.is_empty())
+                if let Some(token) = encrypted
+                    .as_ref()
+                    .and_then(json_str)
+                    .filter(|token| !token.as_ref().is_empty())
                 {
                     parts.push(sealed(
-                        token,
+                        token.as_ref(),
                         schema::content_fact::sealed::OPENAI_REASONING,
                         schema::content_fact::direction::OUT,
                     ));
@@ -997,15 +1023,10 @@ impl Projector<'_> {
                 Ok(())
             }
             kind if kind.ends_with("_output") => {
-                let parts = tool_output_parts(payload.get("output"), &mut self.stats)?;
-                let links = match payload.get("call_id").and_then(Value::as_str) {
+                let parts = tool_output_parts(output.as_ref(), &mut self.stats)?;
+                let links = match call_id {
                     Some(call_id) => (0..parts.len())
-                        .map(|index| {
-                            (
-                                index,
-                                ToolLink::Result(archive_source::owned_text(call_id.to_owned())),
-                            )
-                        })
+                        .map(|index| (index, ToolLink::Result(call_id.clone())))
                         .collect(),
                     None => Vec::new(),
                 };
@@ -1013,21 +1034,14 @@ impl Projector<'_> {
                 Ok(())
             }
             kind if kind.ends_with("_call") => {
-                let body = canonical_value(&without(payload, CALL_ENVELOPE))?;
+                let body = canonical_call(payload)?;
                 let parts = vec![text_part(
                     schema::content_fact::modality::TOOL_CALL,
                     schema::content_fact::direction::OUT,
                     &body,
                 )];
-                let links = payload
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .map(|call_id| {
-                        (
-                            0,
-                            ToolLink::Call(archive_source::owned_text(call_id.to_owned())),
-                        )
-                    })
+                let links = call_id
+                    .map(|call_id| (0, ToolLink::Call(call_id)))
                     .into_iter()
                     .collect();
                 self.push(parts, links, kind, timestamp);
@@ -1036,9 +1050,9 @@ impl Projector<'_> {
             // Inter-agent messages and any item kind not named above.
             _ => {
                 let parts = event_parts(
-                    &without(payload, CALL_ENVELOPE),
+                    canonical_call(payload)?,
                     schema::content_fact::direction::IN,
-                )?;
+                );
                 self.push(parts, Vec::new(), kind, timestamp);
                 Ok(())
             }
@@ -1059,16 +1073,10 @@ const CALL_ENVELOPE: &[&str] = &[
     "create_time",
 ];
 
-fn without(value: &Value, keys: &[&str]) -> Value {
-    match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .filter(|(key, _)| !keys.contains(&key.as_str()))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
+/// The canonical JSON of a response item without its envelope.
+fn canonical_call(payload: &Bytes) -> Result<String> {
+    archive_source::canonical_dynamic_json_without(payload.clone(), CALL_ENVELOPE)
+        .map_err(|error| anyhow!("canonicalize Codex JSON: {error}"))
 }
 
 fn text_part(modality: Id, direction: Id, text: &str) -> SourcePart {
@@ -1091,10 +1099,9 @@ fn sealed(token: &str, media_type: &str, direction: Id) -> SourcePart {
     }
 }
 
-/// One EVENT part holding the canonical JSON of `value`.
-fn event_parts(value: &Value, direction: Id) -> Result<Vec<SourcePart>> {
-    let body = canonical_value(value)?;
-    Ok(if body != "{}" && body != "null" {
+/// One EVENT part holding a canonical JSON `body`.
+fn event_parts(body: String, direction: Id) -> Vec<SourcePart> {
+    if body != "{}" && body != "null" {
         vec![text_part(
             schema::content_fact::modality::EVENT,
             direction,
@@ -1102,41 +1109,48 @@ fn event_parts(value: &Value, direction: Id) -> Result<Vec<SourcePart>> {
         )]
     } else {
         Vec::new()
-    })
+    }
 }
 
 /// Text and image items of a response item's `content`, in order.
 fn response_content_parts(
-    content: Option<&Value>,
+    content: Option<&Bytes>,
     modality: Id,
     direction: Id,
     stats: &mut ProjectionStats,
 ) -> Result<Vec<SourcePart>> {
-    let items: Vec<&Value> = match content {
-        Some(Value::Array(items)) => items.iter().collect(),
-        Some(other) => vec![other],
+    let items: Vec<Bytes> = match content {
+        Some(items) if items.first() == Some(&b'[') => json_elements(items).unwrap_or_default(),
+        Some(other) => vec![other.clone()],
         None => Vec::new(),
     };
     let mut parts = Vec::new();
     for item in items {
-        let part = match item {
-            Value::String(text) if !text.trim().is_empty() => {
-                Some(text_part(modality, direction, text))
-            }
-            Value::Object(_) => {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    (!text.trim().is_empty()).then(|| text_part(modality, direction, text))
-                } else if let Some(url) = item
-                    .get("image_url")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("url").and_then(Value::as_str))
+        let part = match item.first() {
+            Some(b'"') => json_str(&item)
+                .filter(|text| !text.as_ref().trim().is_empty())
+                .map(|text| text_part(modality, direction, text.as_ref())),
+            Some(b'{') => {
+                let [text, image_url, url] = json_members(&item, ["text", "image_url", "url"]);
+                if let Some(text) = text.as_ref().and_then(json_str) {
+                    (!text.as_ref().trim().is_empty())
+                        .then(|| text_part(modality, direction, text.as_ref()))
+                } else if let Some(url) = image_url
+                    .as_ref()
+                    .and_then(json_str)
+                    .or_else(|| url.as_ref().and_then(json_str))
                 {
-                    project_asset(url, schema::content_fact::modality::IMAGE, direction, stats)
+                    project_asset(
+                        url.as_ref(),
+                        schema::content_fact::modality::IMAGE,
+                        direction,
+                        stats,
+                    )
                 } else {
                     Some(text_part(
                         schema::content_fact::modality::EVENT,
                         direction,
-                        &canonical_value(item)?,
+                        &canonical_value(&item)?,
                     ))
                 }
             }
@@ -1147,25 +1161,32 @@ fn response_content_parts(
     Ok(parts)
 }
 
-fn canonical_value(value: &Value) -> Result<String> {
-    archive_source::canonical_json(Bytes::from_source(serde_json::to_vec(value)?))
+/// The canonical JSON of one value, its numbers spelled as Codex tool
+/// payloads were always hashed.
+fn canonical_value(value: &Bytes) -> Result<String> {
+    archive_source::canonical_dynamic_json(value.clone())
         .map_err(|error| anyhow!("canonicalize Codex JSON: {error}"))
 }
 
 /// The parts of a tool output: its text and images.
 fn tool_output_parts(
-    output: Option<&Value>,
+    output: Option<&Bytes>,
     stats: &mut ProjectionStats,
 ) -> Result<Vec<SourcePart>> {
     let direction = schema::content_fact::direction::IN;
     let modality = schema::content_fact::modality::TOOL_RESULT;
-    Ok(match output {
-        Some(Value::String(text)) if !text.is_empty() => {
-            vec![text_part(modality, direction, text)]
-        }
-        Some(Value::String(_)) | Some(Value::Null) | None => Vec::new(),
-        Some(Value::Array(_)) => response_content_parts(output, modality, direction, stats)?,
-        Some(other) => vec![text_part(modality, direction, &canonical_value(other)?)],
+    let Some(output) = output else {
+        return Ok(Vec::new());
+    };
+    Ok(match output.first() {
+        Some(b'"') => json_str(output)
+            .filter(|text| !text.as_ref().is_empty())
+            .map(|text| text_part(modality, direction, text.as_ref()))
+            .into_iter()
+            .collect(),
+        Some(b'n') => Vec::new(),
+        Some(b'[') => response_content_parts(Some(output), modality, direction, stats)?,
+        _ => vec![text_part(modality, direction, &canonical_value(output)?)],
     })
 }
 
