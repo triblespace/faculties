@@ -82,6 +82,25 @@ impl Memory {
     pub fn show(&self, selector: &str, out: &mut Out<'_>) -> Result<()> {
         self.show_many(&[selector.to_owned()], out)
     }
+    /// One exact entity's selected text reading, without terminal framing.
+    /// As ordinary recall does, choose the least typed summary handle. Extra
+    /// readings are alternatives, not a cardinality error. Images are not text.
+    pub fn raw(&self, id: Id, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| {
+            let (loaded, unread) = storage.load_read()?;
+            if unread != 0 {
+                out.note(format!(
+                    "{unread} foundation(s) of Memory could not be read, \
+                     so this view omits whatever they hold"
+                ))?;
+            }
+            let handle = chunk_summary_handle(&loaded.memory.facts, id)
+                .with_context(|| format!("memory {id:x} has no text summary"))?;
+            let summary: View<str> = loaded.memory.reader.get(handle)
+                .context("read raw Memory summary")?;
+            out.text(summary.as_ref())
+        })
+    }
     /// All selectors resolve against one frozen Memory view; retain input order.
     ///
     /// A lookup names what it holds, so it answers from the foundations this
@@ -355,6 +374,7 @@ fn build_context_cover(
     let options = CoverOpts {
         budget_chars,
         chunk_overhead,
+        raw_memory: false,
         about: about.map(str::to_owned),
         filter: filter_q.map(str::to_owned),
         remove: remove_q.map(str::to_owned),
@@ -3329,6 +3349,17 @@ mod tests {
             notes[0].starts_with("1 foundation(s) of Memory could not be read"),
             "{notes:?}"
         );
+        // Raw answer bytes stay separate from the same frontend-neutral
+        // incomplete-view evidence; there is no fabricated terminal newline.
+        let mut raw_parts = Vec::new();
+        memory.raw(warm, &mut Out::new(&mut |part| {
+            raw_parts.push(part);
+            Ok(())
+        })).unwrap();
+        assert_eq!(raw_parts, vec![
+            crate::out::Part::Note { text: notes[0].clone() },
+            crate::out::Part::Text { text: "already resident history".into() },
+        ]);
         // A write depends on absence, so it still refuses and names the
         // unread member.
         for summary in [

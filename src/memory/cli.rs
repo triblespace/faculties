@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
     about = "Show compacted context chunks (drill down by narrowing the time range).\n\n\
              Subcommands:\n  \
              memory <from>..<to>              — show best summary covering a time range\n  \
+             memory raw <full-id>             — selected text bytes, without trimming or added newline\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
              memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] [--tag <tag>]... [--without-tag <tag>]... — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). --tag <tag> (repeatable) is the crisp counterpart of --filter: keeps ONLY memories carrying every given tag (AND); --without-tag <tag> (repeatable) drops memories carrying any of them; names are trimmed and lowercased as `create --tag` writes them, and no score or threshold is involved. They all compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
@@ -97,6 +98,12 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         Ok(!args.is_empty())
     };
     match cli.ids[0].as_str() {
+        "raw" => {
+            let input = one("usage: memory raw <full-id>")?;
+            let id = triblespace::prelude::Id::from_hex(input)
+                .context("memory raw requires one full nonzero 32-hex entity id")?;
+            memory.raw(id, out)
+        }
         "create" => cmd_create(&memory, args, out),
         "respan" => cmd_respan(&memory, args, out),
         "respan-instants" => {
@@ -420,6 +427,7 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
     Ok(CoverOpts {
         budget_chars,
         chunk_overhead,
+        raw_memory: false,
         about,
         filter: filter_q,
         remove: remove_q,

@@ -251,6 +251,17 @@ pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     cache: &mut [Option<usize>],
     i: usize,
 ) -> Result<usize> {
+    chunk_cost(ws, space, spans, cache, i, false)
+}
+
+fn chunk_cost<B: BlobStoreGet, P: TriblePattern>(
+    ws: &B,
+    space: &P,
+    spans: &[(i128, i128, Id)],
+    cache: &mut [Option<usize>],
+    i: usize,
+    raw_memory: bool,
+) -> Result<usize> {
     if let Some(c) = cache[i] {
         return Ok(c);
     }
@@ -263,7 +274,8 @@ pub fn context_chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     let body = match chunk_summary_handle(space, id) {
         Some(handle) => {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            Some(summary.trim_end().chars().count())
+            Some(if raw_memory { summary.chars().count() }
+                else { summary.trim_end().chars().count() })
         }
         None if chunk_image_handle(space, id).is_some() => {
             Some(format!("[image memory @ {range}]").chars().count())
@@ -396,6 +408,10 @@ pub struct CoverOpts {
     /// selection accounting only: stored summaries retain their intrinsic
     /// character lengths and rendered cover text is unchanged.
     pub chunk_overhead: usize,
+    /// Preserve selected text bytes for raw wake pairs. Cost counts all raw
+    /// characters, retaining the conservative cover framing charge. Image
+    /// entries keep their existing placeholder and ordinary recall command.
+    pub raw_memory: bool,
     /// `--about <query>`: choose the most relevant recollection whenever
     /// multiple memories have identical temporal coverage.
     pub about: Option<String>,
@@ -420,6 +436,7 @@ impl CoverOpts {
         CoverOpts {
             budget_chars,
             chunk_overhead: 0,
+            raw_memory: false,
             about: None,
             filter: None,
             remove: None,
@@ -688,14 +705,15 @@ fn recollection_class_cost<B: BlobStoreGet, P: TriblePattern>(
     classes: &[Vec<usize>],
     class_costs: &mut [Option<usize>],
     class: usize,
+    raw_memory: bool,
 ) -> Result<usize> {
     if let Some(cost) = class_costs[class] {
         return Ok(cost);
     }
     let mut cost = 0;
     for &raw in &classes[class] {
-        cost = cost.max(context_chunk_cost(
-            reader, space, raw_spans, raw_costs, raw,
+        cost = cost.max(chunk_cost(
+            reader, space, raw_spans, raw_costs, raw, raw_memory,
         )?);
     }
     class_costs[class] = Some(cost);
@@ -833,6 +851,7 @@ pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
                 &classes,
                 &mut class_costs,
                 i,
+                false,
             )?
             .saturating_add(chunk_overhead),
         );
@@ -918,6 +937,7 @@ pub struct CoverEntry {
     /// The selected memory itself (its exact-span class's representative).
     pub chunk: Id,
     /// The recall that prints `body`, and resolves to exactly `chunk`:
+    /// `memory raw <id>` for exact text in raw mode; otherwise
     /// `memory <from>..<to>` when `memory`'s own range lookup, applied to the
     /// printed range, selects `chunk`; otherwise `memory <id>`. A range is
     /// printed at second resolution and looked up by best overlap, so it can
@@ -926,7 +946,7 @@ pub struct CoverEntry {
     /// range with sub-second endpoints or an exact-span twin with a smaller id.
     pub recall: String,
     /// The line(s) printed under the range: the summary without trailing
-    /// whitespace, or the `[image memory @ <range>]` placeholder. `None` when
+    /// whitespace (unchanged bytes in raw mode), or the `[image memory @ <range>]` placeholder. `None` when
     /// the chosen chunk has neither, in which case only the range is printed.
     pub body: Option<String>,
 }
@@ -1182,6 +1202,7 @@ where
                 &classes,
                 &mut class_costs,
                 i,
+                opts.raw_memory,
             )?
             .saturating_add(chunk_overhead),
         );
@@ -1237,9 +1258,11 @@ where
             "{}",
             format_time_range(key_to_epoch(s), key_to_epoch(e)),
         )?;
-        let body = if let Some(handle) = chunk_summary_handle(space, id) {
+        let summary_handle = chunk_summary_handle(space, id);
+        let body = if let Some(handle) = summary_handle {
             let summary: View<str> = reader.get(handle).context("read chunk summary")?;
-            Some(summary.trim_end().to_owned())
+            Some(if opts.raw_memory { summary.to_string() }
+                else { summary.trim_end().to_owned() })
         } else if chunk_image_handle(space, id).is_some() {
             let range = format_time_range(key_to_epoch(s), key_to_epoch(e));
             Some(format!("[image memory @ {range}]"))
@@ -1260,7 +1283,9 @@ where
                     crate::memory::operations::find_chunk_in_spans(&lookup_spans, from, to)
                 })
                 == Some(id);
-        let recall = if range_selects_id {
+        let recall = if opts.raw_memory && summary_handle.is_some() {
+            format!("memory raw {id:x}")
+        } else if range_selects_id {
             format!("memory {range}")
         } else {
             format!("memory {id:x}")
@@ -1300,6 +1325,71 @@ mod recollection_tests {
     const A: Id = id_hex!("C1000000000000000000000000000001");
     const B: Id = id_hex!("C1000000000000000000000000000002");
     const C: Id = id_hex!("C1000000000000000000000000000003");
+
+    #[test]
+    fn raw_memory_cover_preserves_empty_unicode_and_counts_untrimmed_characters() {
+        use triblespace::core::repo::SnapshotSource;
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        for text in ["", "\n\n", " \t", "\nleading\n", "CRLF\r\n",
+            "trailing \t\n", "\u{2003}\u{a0}", "e\u{301} 🐝\n"] {
+            let fragment = entity! {
+                ExclusiveId::force_ref(&A) @
+                metadata::tag: &KIND_CHUNK_ID,
+                ctx::summary: text,
+                ctx::start_at: point(0.0),
+                ctx::end_at: point(100.0),
+            };
+            let mut blobs = fragment.blobs().clone();
+            let reader = blobs.snapshot().unwrap();
+            let spans = collect_chunk_spans(fragment.facts());
+            let ordinary = chunk_cost(&reader, fragment.facts(), &spans,
+                &mut [None], 0, false).unwrap();
+            let raw = chunk_cost(&reader, fragment.facts(), &spans,
+                &mut [None], 0, true).unwrap();
+            assert_eq!(raw - ordinary, text.chars().count() - text.trim_end().chars().count());
+            let mut options = CoverOpts::plain(raw);
+            options.raw_memory = true;
+            let report = render_cover_report(fragment.facts(), &reader, &options,
+                &mut |_| panic!("plain raw recall must not score semantically")).unwrap();
+            assert_eq!(report.entries.len(), 1);
+            assert_eq!(report.entries[0].body.as_deref(), Some(text));
+            assert_eq!(report.entries[0].recall, format!("memory raw {A:x}"));
+            options.budget_chars = raw - 1;
+            assert!(render_cover_report(fragment.facts(), &reader, &options,
+                &mut |_| Ok(None)).unwrap().entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn raw_memory_cover_keeps_images_as_ordinary_placeholders() {
+        use triblespace::core::repo::SnapshotSource;
+        let mut blobs = MemoryBlobStore::new();
+        let handle = blobs.insert(Blob::<blobencodings::RawBytes>::new(
+            anybytes::Bytes::from_source(b"synthetic image, never decoded".to_vec())));
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let facts = entity! {
+            ExclusiveId::force_ref(&A) @
+            metadata::tag: &KIND_CHUNK_ID,
+            ctx::image: handle,
+            ctx::start_at: point(0.0),
+            ctx::end_at: point(100.0),
+        };
+        let reader = blobs.snapshot().unwrap();
+        let mut options = CoverOpts::plain(10_000);
+        let ordinary = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
+        options.raw_memory = true;
+        let raw = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
+        assert_eq!(raw.entries, ordinary.entries);
+        assert_eq!(raw.entries.len(), 1);
+        assert!(!raw.entries[0].recall.starts_with("memory raw "));
+        assert!(raw.entries[0].body.as_ref().unwrap().starts_with("[image memory @ "));
+    }
 
     #[test]
     fn fail_open_diagnostic_names_the_gate_and_exact_unscorable_ids() {

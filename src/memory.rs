@@ -24,6 +24,8 @@ pub mod cli;
 mod cli_cover;
 pub mod mcp;
 pub mod operations;
+#[cfg(test)]
+mod raw_tests;
 pub use crate::memory_cover::{CoverOpts, CoverReport};
 pub use operations::{ChurnOptions, CreatedMemory, Memory, RespanReceipt};
 

@@ -58,6 +58,8 @@ impl Default for WakeOptions {
 pub struct WakePairsOptions {
     pub chars: usize,
     pub chunk_overhead: usize,
+    /// Exact selected Memory text; ordinary image placeholders are unchanged.
+    pub raw_memory: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
 }
@@ -67,6 +69,7 @@ impl Default for WakePairsOptions {
         Self {
             chars: wake.chars,
             chunk_overhead: 0,
+            raw_memory: false,
             doing_limit: wake.doing_limit,
             todo_limit: wake.todo_limit,
         }
@@ -5904,10 +5907,12 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
     for entry in &selection.cover.entries {
         // A range with neither summary nor image prints no recollection; Drive
         // never carried one as a pair, and a recall of it would fail.
-        let Some(body) = entry.body.as_deref().filter(|body| !body.is_empty()) else {
+        let raw = entry.recall.starts_with("memory raw ");
+        let Some(body) = entry.body.as_deref().filter(|body| raw || !body.is_empty()) else {
             continue;
         };
-        // The recall (`memory <range>` or `memory <id>`, whichever resolves
+        // Raw text has no terminal framing, including an empty result. The
+        // ordinary recall (`memory <range>` or `memory <id>`, whichever resolves
         // to exactly this memory) prints the chunk summary (trailing
         // whitespace trimmed) and one newline, as the cover text renders it. An
         // image memory is the one exception: its recall also emits the image,
@@ -5915,7 +5920,8 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         // placeholder line the cover text shows (as Drive always has).
         pairs.push(WakePair {
             range: Some(format!("{}..{}", entry.start, entry.end)),
-            ..WakePair::new(entry.recall.clone(), format!("{body}\n"))
+            ..WakePair::new(entry.recall.clone(), if raw { body.to_owned() }
+                else { format!("{body}\n") })
         });
     }
     let mut shown = BTreeSet::new();
@@ -5960,6 +5966,7 @@ async fn cmd_wake_pairs(
 ) -> Result<Vec<String>> {
     let mut cover_opts = CoverOpts::plain(options.chars);
     cover_opts.chunk_overhead = options.chunk_overhead;
+    cover_opts.raw_memory = options.raw_memory;
     let selection = wake_selection(
         routing,
         storage,
@@ -6054,6 +6061,36 @@ fn test_block_on<F: std::future::Future>(future: F) -> F::Output {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_memory_wake_pairs_preserve_one_result_and_image_placeholder() {
+        use crate::memory_cover::{CoverEntry, CoverReport};
+        for text in ["", "\n\n", " \t", "\nleading\n", "CRLF\r\n",
+            "trailing \t\n", "\u{2003}\u{a0}", "e\u{301} 🐝\n"] {
+            let id = *fucid();
+            let command = format!("memory raw {id:x}");
+            let entry = CoverEntry {
+                start: "2026-01-01T00:00:00".into(), end: "2026-01-01T01:00:00".into(),
+                chunk: id, recall: command.clone(), body: Some(text.into()),
+            };
+            let selection = WakeSelection {
+                cover: CoverReport { text: String::new(), diagnostics: vec![], entries: vec![entry] },
+                beliefs: wiki_model::CoverBeliefs::default(), goals: "Compass:\n".into(),
+                presented: None,
+            };
+            let pairs = wake_pairs(&selection, 5, 5);
+            assert_eq!(pairs.len(), 2); // Exactly one recall plus the existing goals pair.
+            assert_eq!(pairs[0].command, command);
+            assert_eq!(pairs[0].output.as_bytes(), text.as_bytes());
+            assert!(pairs[0].range.is_some());
+            let mut image = selection;
+            image.cover.entries[0].recall = format!("memory {id:x}");
+            image.cover.entries[0].body = Some("[image memory @ synthetic range]".into());
+            let pairs = wake_pairs(&image, 5, 5);
+            assert_eq!(pairs[0].command, format!("memory {id:x}"));
+            assert_eq!(pairs[0].output, "[image memory @ synthetic range]\n");
+        }
+    }
+
     /// Project receipt facts the way the live path does, so tests exercise the
     /// same join rather than a stand-in for it.
     fn receipts_archive(facts: &TribleSet) -> FactArchive {

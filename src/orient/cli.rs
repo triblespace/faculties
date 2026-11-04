@@ -142,6 +142,10 @@ enum Command {
         /// Print the wake as command/result JSON lines instead of a report
         #[arg(long)]
         pairs: bool,
+        /// Preserve Memory text bytes with `memory raw <full-id>` pairs.
+        /// Image recalls remain text placeholders, not raw image payloads.
+        #[arg(long, requires = "pairs")]
+        raw_memory: bool,
         /// Characters the consumer adds around each selected memory (its recall
         /// command), charged by the memory selection as `memory context
         /// --chunk-overhead` charges it. Only with `--pairs`.
@@ -401,6 +405,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             doing_limit,
             todo_limit,
             pairs: true,
+            raw_memory,
             chunk_overhead,
         } => {
             // Diagnostics are about the memory selection, not part of any
@@ -409,6 +414,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 &WakePairsOptions {
                     chars,
                     chunk_overhead,
+                    raw_memory,
                     doing_limit,
                     todo_limit,
                 },
@@ -765,6 +771,21 @@ mod tests {
             missing.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn raw_memory_flag_requires_pairs_and_leaves_default_off() {
+        assert!(Cli::try_parse_from([
+            "orient", "--pile", "unused.pile", "wake", "--raw-memory",
+        ]).is_err());
+        let raw = Cli::try_parse_from([
+            "orient", "--pile", "unused.pile", "wake", "--pairs", "--raw-memory",
+        ]).unwrap();
+        assert!(matches!(raw.command, Some(Command::Wake { pairs: true, raw_memory: true, .. })));
+        let plain = Cli::try_parse_from([
+            "orient", "--pile", "unused.pile", "wake", "--pairs",
+        ]).unwrap();
+        assert!(matches!(plain.command, Some(Command::Wake { pairs: true, raw_memory: false, .. })));
     }
 
     #[test]
