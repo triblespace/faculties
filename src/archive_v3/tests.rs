@@ -885,7 +885,10 @@ fn unrendered_status_and_uri_are_occurrence_claims_not_fact_core() {
     let fact_id = result.root().unwrap();
     let held = node([], result).unwrap();
     let node_id = held.root().unwrap();
-    let w = witness(SOURCE_CLAUDE_CODE, node_id).unwrap().root().unwrap();
+    let w = witness(SOURCE_CLAUDE_CODE, node_id)
+        .unwrap()
+        .root()
+        .unwrap();
     let plain = occurrence(w, WitnessAnnotations::default()).unwrap();
     let claimed = occurrence(
         w,
@@ -896,11 +899,22 @@ fn unrendered_status_and_uri_are_occurrence_claims_not_fact_core() {
         },
     )
     .unwrap();
-    assert_ne!(plain.root(), claimed.root(), "the claims are the record's own");
+    assert_ne!(
+        plain.root(),
+        claimed.root(),
+        "the claims are the record's own"
+    );
     // The fact and node her window held are untouched by what it did not show.
     assert_eq!(
-        node([], fact(text(direction::IN, "permission denied")).unwrap()).unwrap().root(),
+        node([], fact(text(direction::IN, "permission denied")).unwrap())
+            .unwrap()
+            .root(),
         Some(node_id)
     );
-    assert_eq!(fact(text(direction::IN, "permission denied")).unwrap().root(), Some(fact_id));
+    assert_eq!(
+        fact(text(direction::IN, "permission denied"))
+            .unwrap()
+            .root(),
+        Some(fact_id)
+    );
 }

@@ -221,11 +221,19 @@ pub mod fact {
         /// message, `in`, never trained on as hers. Minted with `trible
         /// genid` 2026-11-04.
         pub const REWRITTEN: Id = id_hex!("746E7F7EB21EB35815580EDE3549A653");
+        /// A control token the renderer placed (Drive's
+        /// `RenderSegment::Control`): `payload` holds its spelling, and under
+        /// the window's renderer it is the tokenizer's special token of that
+        /// spelling, never that spelling tokenized as text. Text that merely
+        /// spells a marker is an ordinary fact. Minted with `trible genid`
+        /// 2026-11-04.
+        pub const CONTROL: Id = id_hex!("F85CC959C9B290B355D0C4C023CA2BCB");
 
         pub const SPECS: &[(Id, &str)] = &[
             (INLINE, "inline"),
             (VOICED, "voiced"),
             (REWRITTEN, "rewritten"),
+            (CONTROL, "control"),
         ];
     }
 
