@@ -675,10 +675,26 @@ fn stage_attachments(
                 ) {
                     bail!("unknown Files attachment {id:x}");
                 }
-                if files::content_handle(&views.files.facts, id)?.is_none()
-                    || files::name_handle(&views.files.facts, id)?.is_none()
-                    || files::media_type_name_handle_strict(&views.files.facts, id)?.is_none()
-                {
+                // An attachment needs bytes, a name and a media type to be
+                // sent; a file observed with several of any is still one.
+                if !exists!(
+                    (
+                        content: files::ContentHandle,
+                        name: files::NameHandle,
+                        media: files::NameHandle
+                    ),
+                    pattern!(&views.files.facts, [
+                        { id @
+                            files_schema::file::content: ?content,
+                            files_schema::file::name: ?name,
+                            files_schema::file::media_type: _?media_type,
+                        },
+                        { _?media_type @
+                            metadata::tag: &files_schema::KIND_MEDIA_TYPE,
+                            metadata::name: ?media,
+                        }
+                    ])
+                ) {
                     bail!("incomplete Files attachment {id:x}");
                 }
                 ids.push(id);

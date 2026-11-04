@@ -47,11 +47,6 @@ fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
     clock::point_now()
 }
 
-fn interval_key(interval: Inline<inlineencodings::NsTAIInterval>) -> i128 {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().expect("valid TAI interval");
-    lower.to_tai_duration().total_nanoseconds()
-}
-
 fn format_date(tai_ns: i128) -> String {
     const NANOS_PER_CENTURY: i128 = 3_155_760_000_000_000_000;
     let centuries = (tai_ns / NANOS_PER_CENTURY) as i16;
@@ -85,68 +80,146 @@ fn human_size(bytes: u64) -> String {
 }
 
 // ── query helpers ────────────────────────────────────────────────────────
+//
+// Every reader queries at its point of use and reads the facts as
+// observations: an entity holding two values for one attribute has both, and
+// the commands below print each of them (a row or a line per reading) instead
+// of choosing a winner. A text that is not resident is an error, so an
+// acquiring read fetches it and retries; a value that cannot be decoded (a
+// text that is not UTF-8, an inverted interval) is skipped, as a typed query
+// skips it.
 
-fn read_name<P: TriblePattern, R: BlobStoreGet>(
+/// Every text in `handles`, in text order and without repeats.
+fn texts<R: BlobStoreGet>(
+    reader: &R,
+    handles: impl IntoIterator<Item = TextHandle>,
+    what: &'static str,
+) -> Result<Vec<String>> {
+    let mut texts = std::collections::BTreeSet::new();
+    for handle in handles {
+        let blob: Blob<blobencodings::UTF8String> = reader.get(handle).context(what)?;
+        if let Ok(view) = View::<str>::try_from_blob(blob) {
+            texts.insert(view.as_ref().to_string());
+        }
+    }
+    Ok(texts.into_iter().collect())
+}
+
+fn names_of<P: TriblePattern, R: BlobStoreGet>(
     space: &P,
     reader: &R,
     eid: Id,
-) -> Result<Option<String>> {
-    let Some((h,)) = find!(
-        (h: TextHandle),
-        pattern!(space, [{ eid @ file::name: ?h }])
+) -> Result<Vec<String>> {
+    texts(
+        reader,
+        find!(h: TextHandle, pattern!(space, [{ eid @ file::name: ?h }])),
+        "read file name",
     )
-    .next() else {
-        return Ok(None);
-    };
-    let blob: Blob<blobencodings::UTF8String> = reader.get(h).context("read file name")?;
-    Ok(View::<str>::try_from_blob(blob)
-        .ok()
-        .map(|view| view.as_ref().to_string()))
 }
 
-fn read_mime<P: TriblePattern, R: BlobStoreGet>(
+fn media_types_of<P: TriblePattern, R: BlobStoreGet>(
     space: &P,
     reader: &R,
     eid: Id,
-) -> Result<Option<String>> {
-    let Some(handle) = file_capability::media_type_name_handle(space, eid) else {
-        return Ok(None);
-    };
-    let blob: Blob<blobencodings::UTF8String> =
-        reader.get(handle).context("read file media type")?;
-    Ok(View::<str>::try_from_blob(blob)
-        .ok()
-        .map(|view| view.as_ref().to_string()))
+) -> Result<Vec<String>> {
+    texts(
+        reader,
+        file_capability::media_type_name_handles(space, eid),
+        "read file media type",
+    )
 }
 
-fn content_handle_of<P: TriblePattern>(space: &P, eid: Id) -> Option<FileHandle> {
-    find!(
-        (h: FileHandle),
-        pattern!(space, [{ eid @ file::content: ?h }])
+fn source_paths_of<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    eid: Id,
+) -> Result<Vec<String>> {
+    texts(
+        reader,
+        find!(h: TextHandle, pattern!(space, [{ eid @ file::source_path: ?h }])),
+        "read import source path",
     )
-    .next()
-    .map(|(h,)| h)
 }
+
+/// `values`, or the one placeholder `absent` when nothing was observed.
+fn or_absent(values: Vec<String>, absent: &str) -> Vec<String> {
+    if values.is_empty() {
+        vec![absent.to_owned()]
+    } else {
+        values
+    }
+}
+
+/// One line's worth of `values`: each of them, joined by " / ".
+fn display(values: Vec<String>, absent: &str) -> String {
+    or_absent(values, absent).join(" / ")
+}
+
+/// The node's names, or its id when it has none.
+fn names_or_id<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    eid: Id,
+) -> Result<Vec<String>> {
+    Ok(or_absent(names_of(space, reader, eid)?, &fmt_id(eid)))
+}
+
+/// Every content handle of a file, in handle order.
+fn contents_of<P: TriblePattern>(space: &P, eid: Id) -> Vec<FileHandle> {
+    find!(h: FileHandle, pattern!(space, [{ eid @ file::content: ?h }]))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The one content of a file, for the reads that need one byte string. A
+/// file observed with several contents names more than one; the answer is
+/// the candidates, each of which selects its bytes by hash.
+fn one_content<P: TriblePattern>(space: &P, eid: Id) -> Result<FileHandle> {
+    match contents_of(space, eid).as_slice() {
+        [] => bail!("no content for file"),
+        [one] => Ok(*one),
+        many => bail!(
+            "file {} has {} contents; select one: {}",
+            fmt_id(eid),
+            many.len(),
+            many.iter()
+                .map(|h| format!("files:{}", handle_hex(*h)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The size of each content of a file, in handle order.
+fn sizes_of<P: TriblePattern, R: BlobStoreGet>(
+    space: &P,
+    reader: &R,
+    eid: Id,
+    what: &'static str,
+) -> Result<Vec<String>> {
+    contents_of(space, eid)
+        .into_iter()
+        .map(|h| {
+            let bytes = reader.get::<anybytes::Bytes, _>(h).context(what)?;
+            Ok(human_size(bytes.len() as u64))
+        })
+        .collect()
+}
+
+// An entity's kind is the kind it was observed with; what else it carries is
+// read where it is needed. An entity of several kinds is each of them.
 
 fn is_file<P: TriblePattern>(space: &P, id: Id) -> bool {
-    exists!(
-        (h: FileHandle),
-        pattern!(space, [{ id @ metadata::tag: &KIND_FILE, file::content: ?h }])
-    )
+    exists!(pattern!(space, [{ id @ metadata::tag: &KIND_FILE }]))
 }
 
 fn is_directory<P: TriblePattern>(space: &P, id: Id) -> bool {
-    exists!(
-        (c: Id),
-        pattern!(space, [{ id @ metadata::tag: &KIND_DIRECTORY, file::children: ?c }])
-    )
+    exists!(pattern!(space, [{ id @ metadata::tag: &KIND_DIRECTORY }]))
 }
 
 fn is_import<P: TriblePattern>(space: &P, id: Id) -> bool {
-    exists!(
-        (r: Id),
-        pattern!(space, [{ id @ metadata::tag: &KIND_IMPORT, file::root: ?r }])
-    )
+    exists!(pattern!(space, [{ id @ metadata::tag: &KIND_IMPORT }]))
 }
 
 fn children_of<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
@@ -158,40 +231,27 @@ fn children_of<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
     .collect()
 }
 
-fn root_of<P: TriblePattern>(space: &P, id: Id) -> Option<Id> {
-    find!(
-        (r: Id),
-        pattern!(space, [{ id @ file::root: ?r }])
-    )
-    .next()
-    .map(|(r,)| r)
+fn roots_of<P: TriblePattern>(space: &P, id: Id) -> Vec<Id> {
+    find!(r: Id, pattern!(space, [{ id @ file::root: ?r }]))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
-fn imported_at_of<P: TriblePattern>(space: &P, eid: Id) -> Option<i128> {
+/// The lower bound, in TAI nanoseconds, of each decodable import time, in
+/// time order. A span is read as when it began.
+fn imported_at_of<P: TriblePattern>(space: &P, eid: Id) -> Vec<i128> {
     find!(
-        (ts: Inline<inlineencodings::NsTAIInterval>),
+        ts: Inline<inlineencodings::NsTAIInterval>,
         pattern!(space, [{ eid @ file::imported_at: ?ts }])
     )
-    .next()
-    .map(|(ts,)| interval_key(ts))
-}
-
-fn source_path_of<P: TriblePattern, R: BlobStoreGet>(
-    space: &P,
-    reader: &R,
-    eid: Id,
-) -> Result<Option<String>> {
-    let Some((h,)) = find!(
-        (h: TextHandle),
-        pattern!(space, [{ eid @ file::source_path: ?h }])
-    )
-    .next() else {
-        return Ok(None);
-    };
-    let blob: Blob<blobencodings::UTF8String> = reader.get(h).context("read import source path")?;
-    Ok(View::<str>::try_from_blob(blob)
-        .ok()
-        .map(|view| view.as_ref().to_string()))
+    .filter_map(|ts| {
+        let (lower, _): (i128, i128) = ts.try_from_inline().ok()?;
+        Some(lower)
+    })
+    .collect::<std::collections::BTreeSet<_>>()
+    .into_iter()
+    .collect()
 }
 
 /// The entity's tags as text. A tag whose handle is that of one of `known`
@@ -520,7 +580,7 @@ fn cmd_add(
     };
     let tree = build_tree(&abs_path, mime_override, &mut stats)?;
     let root_id = tree.root().expect("tree has a root");
-    let root_content = content_handle_of(tree.facts(), root_id);
+    let root_content = contents_of(tree.facts(), root_id).first().copied();
 
     // Create import entity, spreading the tree into it.
     let ts = now_tai()?;
@@ -644,7 +704,10 @@ fn cmd_fetch(
 
     let size = bytes.len();
     let (change, file_id, import_id) = stage_byte_import(bytes.into(), &fname, &mime, tags, url)?;
-    let content = content_handle_of(change.facts(), file_id).context("staged file content")?;
+    let content = contents_of(change.facts(), file_id)
+        .first()
+        .copied()
+        .context("staged file content")?;
     pile.commit(collection, signer, change)
         .context("commit fetched file")?;
     ensure_files_after_commit(pile, collection, signer, runtime)?;
@@ -686,6 +749,9 @@ fn stage_byte_import(
     Ok((change, file_id, import_id))
 }
 
+/// One row per reading of each file: a file observed with two names or two
+/// media types has a row for each (content, name, media type) combination,
+/// sorted by name.
 fn cmd_list<P: TriblePattern>(
     space: &P,
     reader: &PileSnapshot,
@@ -705,18 +771,22 @@ fn cmd_list<P: TriblePattern>(
         {
             continue;
         }
-        let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
-
-        if let Some(mp) = filter_mime {
-            if !mime.starts_with(mp) {
-                continue;
-            }
+        let mimes: Vec<String> = or_absent(media_types_of(space, reader, eid)?, "?")
+            .into_iter()
+            .filter(|mime| filter_mime.is_none_or(|prefix| mime.starts_with(prefix)))
+            .collect();
+        if mimes.is_empty() {
+            continue;
         }
-        let fname = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
+        let names = or_absent(names_of(space, reader, eid)?, "?");
         let tags = tags_of(space, reader, eid, filter_tags);
 
         let hash = handle_hex(h);
-        entries.push((hash, fname, mime, tags));
+        for mime in &mimes {
+            for name in &names {
+                entries.push((hash.clone(), name.clone(), mime.clone(), tags.clone()));
+            }
+        }
     }
 
     entries.sort_by(|a, b| a.1.cmp(&b.1));
@@ -738,56 +808,71 @@ fn cmd_list<P: TriblePattern>(
     Ok(output)
 }
 
+/// Every kind the entity was observed with, each with every value observed
+/// for its fields: one line per hash, name, media type, root, time and
+/// source. A file with several contents labels each size with its hash.
 fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Result<String> {
     let eid = file_capability::resolve_selector(space, id)?;
     let mut output = String::new();
+    let mut kinds = 0;
 
     if is_file(space, eid) {
-        let h = content_handle_of(space, eid).unwrap();
-        let size = reader
-            .get::<anybytes::Bytes, _>(h)
-            .context("read selected file size")?
-            .len() as u64;
+        kinds += 1;
+        let contents = contents_of(space, eid);
+        let mut sizes = Vec::with_capacity(contents.len());
+        for &h in &contents {
+            let bytes = reader
+                .get::<anybytes::Bytes, _>(h)
+                .context("read selected file size")?;
+            sizes.push(human_size(bytes.len() as u64));
+        }
         writeln!(output, "Type:     file")?;
-        writeln!(output, "Hash:     {}", handle_hex(h))?;
+        for hash in or_absent(contents.iter().map(|h| handle_hex(*h)).collect(), "?") {
+            writeln!(output, "Hash:     {hash}")?;
+        }
         writeln!(output, "Entity:   {}", fmt_id(eid))?;
-        writeln!(
-            output,
-            "Name:     {}",
-            read_name(space, reader, eid)?.unwrap_or("?".into())
-        )?;
-        writeln!(
-            output,
-            "MIME:     {}",
-            read_mime(space, reader, eid)?.unwrap_or("?".into())
-        )?;
-        writeln!(output, "Size:     {}", human_size(size))?;
-    } else if is_directory(space, eid) {
+        for name in or_absent(names_of(space, reader, eid)?, "?") {
+            writeln!(output, "Name:     {name}")?;
+        }
+        for mime in or_absent(media_types_of(space, reader, eid)?, "?") {
+            writeln!(output, "MIME:     {mime}")?;
+        }
+        match sizes.as_slice() {
+            [] => writeln!(output, "Size:     ?")?,
+            [size] => writeln!(output, "Size:     {size}")?,
+            _ => {
+                for (h, size) in contents.iter().zip(&sizes) {
+                    writeln!(output, "Size:     {size}  ({})", handle_hex(*h))?;
+                }
+            }
+        }
+    }
+    if is_directory(space, eid) {
+        kinds += 1;
         let children = children_of(space, eid);
         writeln!(output, "Type:     directory")?;
         writeln!(output, "Entity:   {}", fmt_id(eid))?;
-        writeln!(
-            output,
-            "Name:     {}",
-            read_name(space, reader, eid)?.unwrap_or("?".into())
-        )?;
+        for name in or_absent(names_of(space, reader, eid)?, "?") {
+            writeln!(output, "Name:     {name}")?;
+        }
         writeln!(output, "Children: {}", children.len())?;
-    } else if is_import(space, eid) {
-        let root = root_of(space, eid);
-        let ts = imported_at_of(space, eid);
-        let src = source_path_of(space, reader, eid)?;
+    }
+    if is_import(space, eid) {
+        kinds += 1;
+        let sources = source_paths_of(space, reader, eid)?;
         writeln!(output, "Type:     import")?;
         writeln!(output, "Entity:   {}", fmt_id(eid))?;
-        if let Some(r) = root {
-            writeln!(output, "Root:     {}", fmt_id(r))?;
+        for root in roots_of(space, eid) {
+            writeln!(output, "Root:     {}", fmt_id(root))?;
         }
-        if let Some(t) = ts {
+        for t in imported_at_of(space, eid) {
             writeln!(output, "Imported: {}", format_date(t))?;
         }
-        if let Some(s) = src {
+        for s in sources {
             writeln!(output, "Source:   {s}")?;
         }
-    } else {
+    }
+    if kinds == 0 {
         bail!("unknown entity kind for '{id}'");
     }
 
@@ -799,32 +884,59 @@ fn cmd_show<P: TriblePattern>(space: &P, reader: &PileSnapshot, id: &str) -> Res
     Ok(output)
 }
 
+/// An extraction being planned: the writes in order, the entity that claimed
+/// each path, and the directories on the branch being walked.
+#[derive(Default)]
+struct ExtractionPlan {
+    writes: Vec<(PathBuf, Option<anybytes::Bytes>)>,
+    claimed: BTreeMap<PathBuf, Id>,
+    branch: Vec<Id>,
+}
+
+/// Plan the writes that put `id` at `dest`. A child named twice is written
+/// under each name. A filesystem holds one thing per path and no cycles, so
+/// two entities under one path, a file with several contents and a directory
+/// that contains itself are answered with what to extract instead; nothing is
+/// written until the whole plan stands.
 fn extract_tree<P: TriblePattern, R: BlobStoreGet>(
     space: &P,
     reader: &R,
     id: Id,
     dest: &Path,
-    stats: &mut TreeStats,
-    writes: &mut Vec<(PathBuf, Option<anybytes::Bytes>)>,
+    plan: &mut ExtractionPlan,
 ) -> Result<()> {
+    match plan.claimed.insert(dest.to_owned(), id) {
+        Some(previous) if previous == id => return Ok(()),
+        Some(previous) => bail!(
+            "cannot extract: {} and {} are both {}; extract each by its id",
+            fmt_id(previous),
+            fmt_id(id),
+            dest.display()
+        ),
+        None => {}
+    }
     if is_file(space, id) {
-        let h =
-            content_handle_of(space, id).ok_or_else(|| anyhow::anyhow!("no content for file"))?;
+        let h = one_content(space, id)?;
         let bytes: anybytes::Bytes = reader
             .get::<anybytes::Bytes, _>(h)
             .context("get extracted file blob")?;
-        stats.files += 1;
-        stats.bytes += bytes.len() as u64;
-        writes.push((dest.to_owned(), Some(bytes)));
+        plan.writes.push((dest.to_owned(), Some(bytes)));
     } else if is_directory(space, id) {
-        writes.push((dest.to_owned(), None));
-        stats.dirs += 1;
-        for cid in children_of(space, id) {
-            let cname = file_capability::leaf_name(
-                &read_name(space, reader, cid)?.unwrap_or_else(|| fmt_id(cid)),
+        if plan.branch.contains(&id) {
+            bail!(
+                "cannot extract: the directory graph has a cycle through {}; extract a subtree that avoids it",
+                fmt_id(id)
             );
-            extract_tree(space, reader, cid, &dest.join(&cname), stats, writes)?;
         }
+        plan.writes.push((dest.to_owned(), None));
+        plan.branch.push(id);
+        for cid in children_of(space, id) {
+            for name in names_or_id(space, reader, cid)? {
+                let cname = file_capability::leaf_name(&name);
+                extract_tree(space, reader, cid, &dest.join(&cname), plan)?;
+            }
+        }
+        plan.branch.pop();
     } else {
         bail!("unknown entity kind during extraction");
     }
@@ -850,7 +962,7 @@ fn cmd_tag<P: TriblePattern>(
     }
 
     let name = runtime.block_on(read(pile, reader, |reader| {
-        Ok(read_name(space, reader, eid)?.unwrap_or_else(|| fmt_id(eid)))
+        Ok(display(names_of(space, reader, eid)?, &fmt_id(eid)))
     }))?;
     let change = entity! { ExclusiveId::force_ref(&eid) @ file::tag: tag_name };
     pile.commit(collection, signer, change)
@@ -861,6 +973,8 @@ fn cmd_tag<P: TriblePattern>(
     Ok(())
 }
 
+/// The readings of [`cmd_list`] whose name, media type or tags contain the
+/// query.
 fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -> Result<String> {
     let needle = query.to_lowercase();
     let mut hits: Vec<(String, String, String, Vec<String>)> = Vec::new();
@@ -869,16 +983,19 @@ fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -
         (eid: Id, h: FileHandle),
         pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
-        let fname = read_name(space, reader, eid)?.unwrap_or_else(|| "?".into());
-        let mime = read_mime(space, reader, eid)?.unwrap_or_else(|| "?".into());
+        let names = or_absent(names_of(space, reader, eid)?, "?");
+        let mimes = or_absent(media_types_of(space, reader, eid)?, "?");
         let tags = tags_of(space, reader, eid, &[]);
 
-        let fname_match = fname.to_lowercase().contains(&needle);
         let tag_match = tags.iter().any(|t| t.to_lowercase().contains(&needle));
-        let mime_match = mime.to_lowercase().contains(&needle);
-
-        if fname_match || tag_match || mime_match {
-            hits.push((handle_hex(h), fname, mime, tags));
+        for mime in &mimes {
+            for fname in &names {
+                let fname_match = fname.to_lowercase().contains(&needle);
+                let mime_match = mime.to_lowercase().contains(&needle);
+                if fname_match || tag_match || mime_match {
+                    hits.push((handle_hex(h), fname.clone(), mime.clone(), tags.clone()));
+                }
+            }
         }
     }
 
@@ -901,6 +1018,8 @@ fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -
     Ok(output)
 }
 
+/// One row per (time, source) reading of each import, newest first. A time
+/// or source never observed (or not decodable) reads as "?".
 fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<String> {
     let mut imports: Vec<(i128, Id, Option<String>, Vec<String>)> = Vec::new();
 
@@ -908,10 +1027,23 @@ fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<Str
         (eid: Id),
         pattern!(space, [{ ?eid @ metadata::tag: &KIND_IMPORT }])
     ) {
-        let ts = imported_at_of(space, eid).unwrap_or(0);
-        let src = source_path_of(space, reader, eid)?;
+        let mut times = imported_at_of(space, eid);
+        if times.is_empty() {
+            times.push(0);
+        }
+        let mut sources: Vec<Option<String>> = source_paths_of(space, reader, eid)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        if sources.is_empty() {
+            sources.push(None);
+        }
         let tags = tags_of(space, reader, eid, &[]);
-        imports.push((ts, eid, src, tags));
+        for ts in &times {
+            for src in &sources {
+                imports.push((*ts, eid, src.clone(), tags.clone()));
+            }
+        }
     }
 
     imports.sort_by(|a, b| b.0.cmp(&a.0));
@@ -946,6 +1078,8 @@ fn cmd_imports<P: TriblePattern>(space: &P, reader: &PileSnapshot) -> Result<Str
     Ok(output)
 }
 
+/// The tree under a node, or under every root of an import, one after
+/// another.
 fn cmd_tree<P: TriblePattern>(
     space: &P,
     reader: &PileSnapshot,
@@ -954,42 +1088,62 @@ fn cmd_tree<P: TriblePattern>(
 ) -> Result<String> {
     let eid = file_capability::resolve_selector(space, id)?;
 
-    // If it's an import, follow to root.
-    let root = if is_import(space, eid) {
-        root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))?
+    // If it's an import, follow to its roots.
+    let roots = if is_import(space, eid) {
+        let roots = roots_of(space, eid);
+        anyhow::ensure!(!roots.is_empty(), "import has no root");
+        roots
     } else {
-        eid
+        vec![eid]
     };
 
     let mut output = String::new();
-    print_tree(space, reader, root, "", "", max_depth, 0, &mut output)?;
+    for root in roots {
+        let name = display(names_of(space, reader, root)?, &fmt_id(root));
+        print_tree(
+            space,
+            reader,
+            root,
+            &name,
+            "",
+            "",
+            max_depth,
+            &mut Vec::new(),
+            &mut output,
+        )?;
+    }
     Ok(output)
 }
 
+/// Print `id` under `name`. A child named twice is listed under each name; a
+/// directory already on `branch` (the directories above it) is a cycle, shown
+/// once and not followed. The depth is the branch's length.
+#[allow(clippy::too_many_arguments)]
 fn print_tree<P: TriblePattern, R: BlobStoreGet>(
     space: &P,
     reader: &R,
     id: Id,
+    name: &str,
     prefix: &str,
     child_prefix: &str,
     max_depth: Option<usize>,
-    depth: usize,
+    branch: &mut Vec<Id>,
     output: &mut String,
 ) -> Result<()> {
-    let name = read_name(space, reader, id)?.unwrap_or_else(|| fmt_id(id));
-
     if is_file(space, id) {
-        let mime = read_mime(space, reader, id)?.unwrap_or_else(|| "?".into());
-        let size_str = content_handle_of(space, id)
-            .map(|h| reader.get::<anybytes::Bytes, _>(h))
-            .transpose()
-            .context("read displayed file size")?
-            .map(|b| human_size(b.len() as u64))
-            .unwrap_or_else(|| "?".into());
+        let mime = display(media_types_of(space, reader, id)?, "?");
+        let size_str = display(
+            sizes_of(space, reader, id, "read displayed file size")?,
+            "?",
+        );
         writeln!(output, "{prefix}{name}  ({mime}, {size_str})")?;
     } else if is_directory(space, id) {
+        if branch.contains(&id) {
+            writeln!(output, "{prefix}{name}/  (cycle)")?;
+            return Ok(());
+        }
         let children = children_of(space, id);
-        if max_depth.is_some_and(|d| depth >= d) {
+        if max_depth.is_some_and(|d| branch.len() >= d) {
             writeln!(output, "{prefix}{name}/  ({} children)", children.len())?;
             return Ok(());
         }
@@ -997,32 +1151,37 @@ fn print_tree<P: TriblePattern, R: BlobStoreGet>(
         let mut dirs: Vec<(String, Id)> = Vec::new();
         let mut files: Vec<(String, Id)> = Vec::new();
         for &cid in &children {
-            let cname = read_name(space, reader, cid)?.unwrap_or_else(|| fmt_id(cid));
-            if is_directory(space, cid) {
-                dirs.push((cname, cid));
-            } else {
-                files.push((cname, cid));
+            let is_dir = is_directory(space, cid);
+            for cname in names_or_id(space, reader, cid)? {
+                if is_dir {
+                    dirs.push((cname, cid));
+                } else {
+                    files.push((cname, cid));
+                }
             }
         }
         dirs.sort_by(|a, b| a.0.cmp(&b.0));
         files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let all: Vec<Id> = dirs.iter().chain(files.iter()).map(|(_, id)| *id).collect();
-        for (i, &cid) in all.iter().enumerate() {
+        let all: Vec<(String, Id)> = dirs.into_iter().chain(files).collect();
+        branch.push(id);
+        for (i, (cname, cid)) in all.iter().enumerate() {
             let last = i == all.len() - 1;
             let connector = if last { "└── " } else { "├── " };
             let continuation = if last { "    " } else { "│   " };
             print_tree(
                 space,
                 reader,
-                cid,
+                *cid,
+                cname,
                 &format!("{child_prefix}{connector}"),
                 &format!("{child_prefix}{continuation}"),
                 max_depth,
-                depth + 1,
+                branch,
                 output,
             )?;
         }
+        branch.pop();
     } else {
         writeln!(output, "{prefix}{name}  (unknown)")?;
     }
@@ -1035,25 +1194,26 @@ fn cmd_diff<P: TriblePattern>(
     left_id: &str,
     right_id: &str,
 ) -> Result<String> {
-    let resolve_root = |raw: &str| -> Result<Id> {
-        let eid = file_capability::resolve_selector(space, raw)?;
-        if is_import(space, eid) {
-            root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))
-        } else {
-            Ok(eid)
-        }
-    };
-
-    let left = resolve_root(left_id)?;
-    let right = resolve_root(right_id)?;
+    let left = selected_target(space, left_id)?;
+    let right = selected_target(space, right_id)?;
 
     if left == right {
         return Ok("Identical (same entity).\n".to_owned());
     }
 
-    let mut stats = DiffStats::default();
-    let mut output = String::new();
-    diff_tree(space, reader, left, right, "", &mut stats, &mut output)?;
+    let mut diff = Diff {
+        space,
+        reader,
+        stats: DiffStats::default(),
+        output: String::new(),
+        branch: Vec::new(),
+    };
+    let left_name = display(names_of(space, reader, left)?, "?");
+    let right_name = display(names_of(space, reader, right)?, "?");
+    diff.tree(left, right, &left_name, &right_name, "")?;
+    let Diff {
+        stats, mut output, ..
+    } = diff;
 
     if stats.is_empty() {
         writeln!(output, "No differences.")?;
@@ -1080,161 +1240,153 @@ impl DiffStats {
     }
 }
 
-fn diff_tree<P: TriblePattern, R: BlobStoreGet>(
-    space: &P,
-    reader: &R,
-    left: Id,
-    right: Id,
-    path: &str,
-    stats: &mut DiffStats,
-    output: &mut String,
-) -> Result<()> {
-    // Merkle shortcut: same id means identical subtree.
-    if left == right {
-        return Ok(());
-    }
+/// A diff being written. Directories are compared child by child under each
+/// name a child was observed with: a name held by exactly one child on each
+/// side compares those two; otherwise every child on only one side of that
+/// name is added or removed and the children on both sides are unchanged.
+/// `branch` holds the directories being compared above the current one, so a
+/// cycle is listed once and not followed.
+struct Diff<'a, P, R> {
+    space: &'a P,
+    reader: &'a R,
+    stats: DiffStats,
+    output: String,
+    branch: Vec<Id>,
+}
 
-    let left_is_dir = is_directory(space, left);
-    let right_is_dir = is_directory(space, right);
+impl<P: TriblePattern, R: BlobStoreGet> Diff<'_, P, R> {
+    fn tree(
+        &mut self,
+        left: Id,
+        right: Id,
+        left_name: &str,
+        right_name: &str,
+        path: &str,
+    ) -> Result<()> {
+        // Merkle shortcut: same id means identical subtree.
+        if left == right {
+            return Ok(());
+        }
 
-    // Both files — content changed.
-    if !left_is_dir && !right_is_dir {
-        let lname = read_name(space, reader, left)?.unwrap_or_else(|| "?".into());
-        let lsize = file_size(space, reader, left)?;
-        let rsize = file_size(space, reader, right)?;
-        writeln!(
-            output,
-            "  ~ {path}{lname}  ({} → {})",
-            human_size(lsize),
-            human_size(rsize)
-        )?;
-        stats.modified += 1;
-        return Ok(());
-    }
+        let left_is_dir = is_directory(self.space, left);
+        let right_is_dir = is_directory(self.space, right);
 
-    // Type mismatch: show as remove + add.
-    if left_is_dir != right_is_dir {
-        print_diff_removed(space, reader, left, path, stats, output)?;
-        print_diff_added(space, reader, right, path, stats, output)?;
-        return Ok(());
-    }
+        // Both files — content changed.
+        if !left_is_dir && !right_is_dir {
+            let lsize = self.size(left)?;
+            let rsize = self.size(right)?;
+            writeln!(self.output, "  ~ {path}{left_name}  ({lsize} → {rsize})")?;
+            self.stats.modified += 1;
+            return Ok(());
+        }
 
-    // Both directories — diff children by name.
-    let left_children = named_children(space, reader, left)?;
-    let right_children = named_children(space, reader, right)?;
+        // Type mismatch: show as remove + add.
+        if left_is_dir != right_is_dir {
+            self.one('-', left, left_name, path)?;
+            self.one('+', right, right_name, path)?;
+            return Ok(());
+        }
 
-    let left_name = read_name(space, reader, left)?.unwrap_or_else(|| "?".into());
-    let sub = if path.is_empty() {
-        format!("{left_name}/")
-    } else {
-        format!("{path}{left_name}/")
-    };
+        // Both directories — diff children by name.
+        if self.branch.contains(&left) || self.branch.contains(&right) {
+            return Ok(());
+        }
+        let left_children = self.named_children(left)?;
+        let right_children = self.named_children(right)?;
+        let sub = format!("{path}{left_name}/");
 
-    let mut li = left_children.iter().peekable();
-    let mut ri = right_children.iter().peekable();
+        self.branch.extend([left, right]);
+        let mut li = left_children.iter().peekable();
+        let mut ri = right_children.iter().peekable();
 
-    // Merge-join on name (BTreeMap is sorted).
-    loop {
-        match (li.peek(), ri.peek()) {
-            (None, None) => break,
-            (Some(_), None) => {
-                let (_lname, lid) = li.next().unwrap();
-                print_diff_removed(space, reader, *lid, &sub, stats, output)?;
-            }
-            (None, Some(_)) => {
-                let (_rname, rid) = ri.next().unwrap();
-                print_diff_added(space, reader, *rid, &sub, stats, output)?;
-            }
-            (Some((lname, _)), Some((rname, _))) => match lname.cmp(rname) {
+        // Merge-join on name (BTreeMap is sorted).
+        loop {
+            let order = match (li.peek(), ri.peek()) {
+                (None, None) => break,
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (Some((lname, _)), Some((rname, _))) => lname.cmp(rname),
+            };
+            match order {
                 std::cmp::Ordering::Less => {
-                    let (lname, lid) = li.next().unwrap();
-                    print_diff_removed(space, reader, *lid, &sub, stats, output)?;
-                    let _ = lname;
+                    let (name, ids) = li.next().expect("peeked");
+                    for id in ids {
+                        self.one('-', *id, name, &sub)?;
+                    }
                 }
                 std::cmp::Ordering::Greater => {
-                    let (rname, rid) = ri.next().unwrap();
-                    print_diff_added(space, reader, *rid, &sub, stats, output)?;
-                    let _ = rname;
+                    let (name, ids) = ri.next().expect("peeked");
+                    for id in ids {
+                        self.one('+', *id, name, &sub)?;
+                    }
                 }
                 std::cmp::Ordering::Equal => {
-                    let (_lname, lid) = li.next().unwrap();
-                    let (_rname, rid) = ri.next().unwrap();
-                    diff_tree(space, reader, *lid, *rid, &sub, stats, output)?;
+                    let (name, lids) = li.next().expect("peeked");
+                    let (_, rids) = ri.next().expect("peeked");
+                    if lids.len() == 1 && rids.len() == 1 {
+                        let lid = *lids.first().expect("one child");
+                        let rid = *rids.first().expect("one child");
+                        self.tree(lid, rid, name, name, &sub)?;
+                    } else {
+                        for id in lids.difference(rids) {
+                            self.one('-', *id, name, &sub)?;
+                        }
+                        for id in rids.difference(lids) {
+                            self.one('+', *id, name, &sub)?;
+                        }
+                    }
                 }
-            },
+            }
         }
+        self.branch.truncate(self.branch.len() - 2);
+        Ok(())
     }
-    Ok(())
-}
 
-fn named_children<P: TriblePattern, R: BlobStoreGet>(
-    space: &P,
-    reader: &R,
-    id: Id,
-) -> Result<BTreeMap<String, Id>> {
-    let mut map = BTreeMap::new();
-    for cid in children_of(space, id) {
-        let name = read_name(space, reader, cid)?.unwrap_or_else(|| fmt_id(cid));
-        map.insert(name, cid);
-    }
-    Ok(map)
-}
-
-fn file_size<P: TriblePattern, R: BlobStoreGet>(space: &P, reader: &R, id: Id) -> Result<u64> {
-    Ok(content_handle_of(space, id)
-        .map(|h| reader.get::<anybytes::Bytes, _>(h))
-        .transpose()
-        .context("read compared file size")?
-        .map(|b| b.len() as u64)
-        .unwrap_or(0))
-}
-
-fn print_diff_added<P: TriblePattern, R: BlobStoreGet>(
-    space: &P,
-    reader: &R,
-    id: Id,
-    path: &str,
-    stats: &mut DiffStats,
-    output: &mut String,
-) -> Result<()> {
-    let name = read_name(space, reader, id)?.unwrap_or_else(|| "?".into());
-    if is_directory(space, id) {
-        writeln!(output, "  + {path}{name}/")?;
-        stats.added += 1;
-        let sub = format!("{path}{name}/");
-        for cid in children_of(space, id) {
-            print_diff_added(space, reader, cid, &sub, stats, output)?;
+    /// Every child of a directory under each of its names (its id when it
+    /// has none).
+    fn named_children(&self, id: Id) -> Result<BTreeMap<String, std::collections::BTreeSet<Id>>> {
+        let mut map: BTreeMap<String, std::collections::BTreeSet<Id>> = BTreeMap::new();
+        for cid in children_of(self.space, id) {
+            for name in names_or_id(self.space, self.reader, cid)? {
+                map.entry(name).or_default().insert(cid);
+            }
         }
-    } else {
-        let size = file_size(space, reader, id)?;
-        writeln!(output, "  + {path}{name}  ({})", human_size(size))?;
-        stats.added += 1;
+        Ok(map)
     }
-    Ok(())
-}
 
-fn print_diff_removed<P: TriblePattern, R: BlobStoreGet>(
-    space: &P,
-    reader: &R,
-    id: Id,
-    path: &str,
-    stats: &mut DiffStats,
-    output: &mut String,
-) -> Result<()> {
-    let name = read_name(space, reader, id)?.unwrap_or_else(|| "?".into());
-    if is_directory(space, id) {
-        writeln!(output, "  - {path}{name}/")?;
-        stats.removed += 1;
-        let sub = format!("{path}{name}/");
-        for cid in children_of(space, id) {
-            print_diff_removed(space, reader, cid, &sub, stats, output)?;
-        }
-    } else {
-        let size = file_size(space, reader, id)?;
-        writeln!(output, "  - {path}{name}  ({})", human_size(size))?;
-        stats.removed += 1;
+    fn size(&self, id: Id) -> Result<String> {
+        Ok(display(
+            sizes_of(self.space, self.reader, id, "read compared file size")?,
+            "0 B",
+        ))
     }
-    Ok(())
+
+    /// List `id` and everything under it as added (`+`) or removed (`-`).
+    fn one(&mut self, sign: char, id: Id, name: &str, path: &str) -> Result<()> {
+        if sign == '+' {
+            self.stats.added += 1;
+        } else {
+            self.stats.removed += 1;
+        }
+        if is_directory(self.space, id) {
+            writeln!(self.output, "  {sign} {path}{name}/")?;
+            if self.branch.contains(&id) {
+                return Ok(());
+            }
+            let sub = format!("{path}{name}/");
+            self.branch.push(id);
+            for cid in children_of(self.space, id) {
+                for cname in names_or_id(self.space, self.reader, cid)? {
+                    self.one(sign, cid, &cname, &sub)?;
+                }
+            }
+            self.branch.pop();
+        } else {
+            let size = self.size(id)?;
+            writeln!(self.output, "  {sign} {path}{name}  ({size})")?;
+        }
+        Ok(())
+    }
 }
 
 // ── main ─────────────────────────────────────────────────────────────────
@@ -1315,12 +1467,14 @@ fn cmd_similar<P: TriblePattern>(
         ),
         (None, Some(selector)) => {
             let entity = file_capability::resolve_selector(space, selector)?;
-            let content = content_handle_of(space, entity).ok_or_else(|| {
-                anyhow::anyhow!("that entity has no content; query with --text instead")
-            })?;
+            anyhow::ensure!(
+                !contents_of(space, entity).is_empty(),
+                "that entity has no content; query with --text instead"
+            );
+            let content = one_content(space, entity)?;
             let bytes: anybytes::Bytes =
                 reader.get(content).context("read the query file's bytes")?;
-            let name = read_name(space, &reader, entity)?.unwrap_or_else(|| "?".into());
+            let name = display(names_of(space, &reader, entity)?, "?");
             let query = Query::Content(bytes.as_ref());
             (
                 session.cosines(store, collection, &attributes, runtime, query)?,
@@ -1362,8 +1516,8 @@ fn cmd_similar<P: TriblePattern>(
     for (cos, content) in hits {
         let held = &holders[&content];
         let eid = *held.first().expect("every hit has a holder");
-        let name = read_name(space, &reader, eid)?.unwrap_or_else(|| "?".into());
-        let mime = read_mime(space, &reader, eid)?.unwrap_or_else(|| "?".into());
+        let name = display(names_of(space, &reader, eid)?, "?");
+        let mime = display(media_types_of(space, &reader, eid)?, "?");
         let hash = handle_hex(content);
         let tags = tags_of(space, &reader, eid, &[]);
         let tagstr = if tags.is_empty() {
@@ -1693,12 +1847,27 @@ impl Files {
     }
 }
 
+/// The node a selector names, following an import to its root. An import
+/// observed with several roots names each of them; the answer is the
+/// candidates, each of which selects one.
 fn selected_target<P: TriblePattern>(space: &P, id: &str) -> Result<Id> {
     let eid = file_capability::resolve_selector(space, id)?;
-    if is_import(space, eid) {
-        root_of(space, eid).ok_or_else(|| anyhow::anyhow!("import has no root"))
-    } else {
-        Ok(eid)
+    if !is_import(space, eid) {
+        return Ok(eid);
+    }
+    match roots_of(space, eid).as_slice() {
+        [] => bail!("import has no root"),
+        [root] => Ok(*root),
+        roots => bail!(
+            "import {} has {} roots; select one: {}",
+            fmt_id(eid),
+            roots.len(),
+            roots
+                .iter()
+                .map(|root| fmt_id(*root))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -1722,7 +1891,7 @@ where
                 is_file(space, target),
                 "get requires a file; use CLI extraction for directories"
             );
-            content_handle_of(space, target).context("no content for file")?
+            one_content(space, target)?
         }
     };
     let bytes = match file_capability::unnamed_content(space, id)? {
@@ -1758,11 +1927,15 @@ where
     }))
 }
 
+fn presentable(mime_type: &str) -> bool {
+    mime_type.starts_with("text/")
+        || mime_type.starts_with("image/")
+        || mime_type.starts_with("audio/")
+}
+
 fn ensure_presentable(mime_type: &str, id: &str) -> Result<()> {
     anyhow::ensure!(
-        mime_type.starts_with("text/")
-            || mime_type.starts_with("image/")
-            || mime_type.starts_with("audio/"),
+        presentable(mime_type),
         "cannot present MIME type {mime_type:?}; use files get {id} to extract it",
     );
     Ok(())
@@ -1792,10 +1965,17 @@ where
         is_file(space, target),
         "view requires a file; use CLI get to extract a directory"
     );
-    let content = content_handle_of(space, target).context("no content for file")?;
+    let content = one_content(space, target)?;
     rt.block_on(read(store, reader, |reader| {
-        let mime_type =
-            read_mime(space, reader, target)?.unwrap_or_else(|| "application/octet-stream".into());
+        // A file typed several ways is presented as the first presentable
+        // type in text order.
+        let mime_types = media_types_of(space, reader, target)?;
+        let mime_type = mime_types
+            .iter()
+            .find(|mime_type| presentable(mime_type))
+            .or(mime_types.first())
+            .cloned()
+            .unwrap_or_else(|| "application/octet-stream".into());
         ensure_presentable(&mime_type, id)?;
         let bytes = reader
             .get::<anybytes::Bytes, _>(content)
@@ -1830,22 +2010,21 @@ where
     }
     let target = selected_target(space, id)?;
     rt.block_on(read(store, reader, |reader| {
+        // One destination is needed; a node named several ways takes the
+        // first name in text order.
         let destination = match destination {
             Some(path) => path.to_owned(),
             None => PathBuf::from(file_capability::leaf_name(
-                &read_name(space, reader, target)?.unwrap_or_else(|| "extracted".into()),
+                names_of(space, reader, target)?
+                    .first()
+                    .map_or("extracted", String::as_str),
             )),
         };
-        let mut stats = TreeStats {
-            files: 0,
-            dirs: 0,
-            bytes: 0,
-        };
-        let mut writes = Vec::new();
-        extract_tree(space, reader, target, &destination, &mut stats, &mut writes)?;
+        let mut plan = ExtractionPlan::default();
+        extract_tree(space, reader, target, &destination, &mut plan)?;
         Ok(Extraction {
             destination,
-            writes,
+            writes: plan.writes,
         })
     }))
 }
@@ -1952,7 +2131,7 @@ mod tests {
             )
             .unwrap();
         let old_facts = observe();
-        assert!(content_handle_of(&old_facts, id).is_some());
+        assert!(!contents_of(&old_facts, id).is_empty());
         let mut discard = |_| Ok(());
         faculty
             .tag(&format!("{id:x}"), "eager", &mut Out::new(&mut discard))
@@ -2055,8 +2234,10 @@ mod tests {
         let bytes = vec![0_u8, 255, 10, 128];
         let selected = file_capability::stage(bytes.clone(), "selected.png", "image/png").unwrap();
         let id = selected.root().unwrap();
-        let content = content_handle_of(selected.facts(), id).unwrap();
-        let mime = file_capability::media_type_name_handle(selected.facts(), id).unwrap();
+        let content = contents_of(selected.facts(), id)[0];
+        let mime = *file_capability::media_type_name_handles(selected.facts(), id)
+            .first()
+            .unwrap();
         let (_source, _target, facts, mut store) = sparse_store(selected);
         store
             .pile
@@ -2089,9 +2270,10 @@ mod tests {
         ] {
             let selected = file_capability::stage(bytes.to_vec(), "selected", mime).unwrap();
             let id = selected.root().unwrap();
-            let content = content_handle_of(selected.facts(), id).unwrap();
-            let mime_handle =
-                file_capability::media_type_name_handle(selected.facts(), id).unwrap();
+            let content = contents_of(selected.facts(), id)[0];
+            let mime_handle = *file_capability::media_type_name_handles(selected.facts(), id)
+                .first()
+                .unwrap();
             let unrelated =
                 file_capability::stage(b"unrelated".to_vec(), "other", "text/plain").unwrap();
             let (_source, _target, facts, mut store) = sparse_store(selected + unrelated);
@@ -2117,7 +2299,9 @@ mod tests {
         let selected =
             file_capability::stage(b"%PDF".to_vec(), "document.pdf", "application/pdf").unwrap();
         let id = selected.root().unwrap();
-        let mime = file_capability::media_type_name_handle(selected.facts(), id).unwrap();
+        let mime = *file_capability::media_type_name_handles(selected.facts(), id)
+            .first()
+            .unwrap();
         let (_source, _target, facts, mut store) = sparse_store(selected);
         let snapshot = store.snapshot().unwrap();
         let error = load_view(
@@ -2179,14 +2363,16 @@ mod tests {
             file_capability::stage(b"unrelated bytes".to_vec(), "other.png", "image/png").unwrap();
         let (_source, target, facts, mut store) = sparse_store(selected + unrelated);
         let snapshot = store.snapshot().unwrap();
-        let content = content_handle_of(&facts, selected_id).unwrap();
+        let content = contents_of(&facts, selected_id)[0];
         let name = find!(
             handle: TextHandle,
             pattern!(&facts, [{ selected_id @ file::name: ?handle }])
         )
         .next()
         .unwrap();
-        let mime = file_capability::media_type_name_handle(&facts, selected_id).unwrap();
+        let mime = *file_capability::media_type_name_handles(&facts, selected_id)
+            .first()
+            .unwrap();
         let rt = runtime().unwrap();
 
         let listed = rt
@@ -2250,9 +2436,18 @@ mod tests {
 
         assert!(output.contains("Name:     ?"));
         assert!(output.contains("MIME:     ?"));
-        assert_eq!(read_name(&facts, &snapshot, id).unwrap(), None);
-        assert_eq!(read_mime(&facts, &snapshot, id).unwrap(), None);
-        assert_eq!(source_path_of(&facts, &snapshot, id).unwrap(), None);
+        assert_eq!(
+            names_of(&facts, &snapshot, id).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            media_types_of(&facts, &snapshot, id).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            source_paths_of(&facts, &snapshot, id).unwrap(),
+            Vec::<String>::new()
+        );
         assert_eq!(store.requests, [content.raw]);
         store.pile.close().unwrap();
     }
@@ -2278,9 +2473,9 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
 
         for error in [
-            read_name(&facts, &snapshot, id).unwrap_err(),
-            read_mime(&facts, &snapshot, id).unwrap_err(),
-            source_path_of(&facts, &snapshot, id).unwrap_err(),
+            names_of(&facts, &snapshot, id).unwrap_err(),
+            media_types_of(&facts, &snapshot, id).unwrap_err(),
+            source_paths_of(&facts, &snapshot, id).unwrap_err(),
         ] {
             assert_eq!(
                 error
@@ -2296,9 +2491,9 @@ mod tests {
         let output = runtime()
             .unwrap()
             .block_on(read(&mut store, &snapshot, |reader| {
-                assert_eq!(read_name(&facts, reader, id)?, None);
-                assert_eq!(read_mime(&facts, reader, id)?, None);
-                assert_eq!(source_path_of(&facts, reader, id)?, None);
+                assert_eq!(names_of(&facts, reader, id)?, Vec::<String>::new());
+                assert_eq!(media_types_of(&facts, reader, id)?, Vec::<String>::new());
+                assert_eq!(source_paths_of(&facts, reader, id)?, Vec::<String>::new());
                 cmd_show(&facts, reader, &format!("{id:x}"))
             }))
             .unwrap();
@@ -2316,7 +2511,7 @@ mod tests {
         let first = file_capability::stage(b"first".to_vec(), "first.txt", "text/plain").unwrap();
         let second =
             file_capability::stage(b"second".to_vec(), "second.txt", "text/plain").unwrap();
-        let second_content = content_handle_of(second.facts(), second.root().unwrap()).unwrap();
+        let second_content = contents_of(second.facts(), second.root().unwrap())[0];
         let mut directory = Fragment::empty();
         let name: TextHandle = directory.put("folder".to_owned());
         directory += entity! {
@@ -2791,6 +2986,336 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read(first_out).unwrap(), b"first file");
         assert_eq!(fs::read(second_out).unwrap(), b"second file");
+    }
+
+    /// A Files collection holding exactly `fragment`, carried into its views.
+    fn committed(fragment: Fragment) -> (TestPile, Files) {
+        let fixture = TestPile::new();
+        let storage = Storage::new(fixture.path.clone(), None);
+        with_files_store(&storage, |store, collection, signer, _| {
+            store
+                .commit(collection, signer, fragment)
+                .context("commit fixture")?;
+            crate::storage::carry_facts(store, collection, signer);
+            Ok(())
+        })
+        .unwrap();
+        (fixture, Files::with_storage(storage))
+    }
+
+    fn point(seconds: f64) -> file_capability::ImportTime {
+        let instant = Epoch::from_tai_seconds(seconds);
+        (instant, instant).try_to_inline().unwrap()
+    }
+
+    /// One staged file and one complete import of it from `path`.
+    fn imported(path: &str) -> (Fragment, Id, Id) {
+        let mut fragment =
+            file_capability::stage(b"imported bytes".to_vec(), "report.txt", "text/plain").unwrap();
+        let root = fragment.root().unwrap();
+        let source_path = fragment.put::<blobencodings::UTF8String, _>(path.to_owned());
+        let import = entity! {
+            metadata::tag: &KIND_IMPORT,
+            file::root: &root,
+            file::imported_at: point(42.0),
+            file::source_path: source_path,
+        };
+        let import_id = import.root().unwrap();
+        fragment += import;
+        (fragment, root, import_id)
+    }
+
+    fn directory(name: &str, children: Fragment) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let name: TextHandle = fragment.put(name.to_owned());
+        fragment += entity! {
+            metadata::tag: &KIND_DIRECTORY,
+            file::name: name,
+            file::children*: children,
+        };
+        fragment
+    }
+
+    #[test]
+    fn open_world_a_file_named_and_typed_twice_reads_every_observation() {
+        let mut fragment =
+            file_capability::stage(b"named".to_vec(), "record.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let alternate = fragment.put::<blobencodings::UTF8String, _>("alternate.txt".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::name: alternate };
+        let png = file_capability::media_type_fragment("image/png").unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::media_type*: png };
+        let (_pile, files) = committed(fragment);
+
+        let shown = files.show(&fmt_id(file_id)).unwrap();
+        for line in [
+            "Name:     alternate.txt\n",
+            "Name:     record.txt\n",
+            "MIME:     image/png\n",
+            "MIME:     text/plain\n",
+        ] {
+            assert!(shown.contains(line), "{line:?} missing from\n{shown}");
+        }
+        // Each (name, media type) reading is its own row, sorted by name.
+        let listed = files.list(&[], None).unwrap();
+        let rows: Vec<&str> = listed.lines().collect();
+        assert_eq!(rows.len(), 4, "{listed}");
+        assert!(rows[0].contains("  alternate.txt  ") && rows[3].contains("  record.txt  "));
+        let images = files.list(&[], Some("image/")).unwrap();
+        assert_eq!(images.lines().count(), 2, "{images}");
+        assert_eq!(files.search("alternate").unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn open_world_a_file_with_two_contents_shows_both_and_get_names_them() {
+        let mut fragment =
+            file_capability::stage(b"first".to_vec(), "record.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let first = contents_of(fragment.facts(), file_id)[0];
+        let second = fragment.put::<blobencodings::RawBytes, _>(b"second!".to_vec());
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::content: second };
+        let (_pile, files) = committed(fragment);
+
+        let shown = files.show(&fmt_id(file_id)).unwrap();
+        for handle in [first, second] {
+            assert!(
+                shown.contains(&format!("Hash:     {}\n", handle_hex(handle))),
+                "{shown}"
+            );
+        }
+        assert_eq!(files.list(&[], None).unwrap().lines().count(), 2);
+
+        // The entity names two byte strings; get does not pick one.
+        let error = format!("{:#}", files.get(&fmt_id(file_id)).unwrap_err());
+        assert!(error.contains("2 contents"), "{error}");
+        assert!(error.contains(&handle_hex(first)) && error.contains(&handle_hex(second)));
+        let exported = files.get(&handle_hex(second)).unwrap();
+        assert_eq!(exported.bytes.as_ref(), b"second!");
+    }
+
+    #[test]
+    fn open_world_imports_read_conflicting_and_partial_observations() {
+        // Two times and two source paths: every combination is a row.
+        let (mut fragment, _, import_id) = imported("/tmp/report.txt");
+        fragment += entity! { ExclusiveId::force_ref(&import_id) @ file::imported_at: point(43.0) };
+        let alternate =
+            fragment.put::<blobencodings::UTF8String, _>("/tmp/alternate.txt".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&import_id) @ file::source_path: alternate };
+        // A second root.
+        let other = file_capability::stage(b"other".to_vec(), "other.txt", "text/plain").unwrap();
+        let other_id = other.root().unwrap();
+        fragment += other;
+        fragment += entity! { ExclusiveId::force_ref(&import_id) @ file::root: &other_id };
+        // A partial import: a root but no time or path.
+        let partial_id = Id::new([0x52; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&partial_id) @
+            metadata::tag: &KIND_IMPORT,
+            file::root: &other_id,
+        };
+        // An import observed only by its kind.
+        let bare_id = Id::new([0x54; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&bare_id) @ metadata::tag: &KIND_IMPORT };
+        let (_pile, files) = committed(fragment);
+
+        let imports = files.imports().unwrap();
+        let rows: Vec<&str> = imports.lines().collect();
+        let short = &fmt_id(import_id)[..12];
+        assert_eq!(
+            rows.iter().filter(|row| row.starts_with(short)).count(),
+            4,
+            "{imports}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with(&fmt_id(partial_id)[..12]) && row.contains("  ?  ?")),
+            "{imports}"
+        );
+
+        let shown = files.show(&fmt_id(import_id)).unwrap();
+        for line in [
+            "Source:   /tmp/alternate.txt\n",
+            "Source:   /tmp/report.txt\n",
+            &format!("Root:     {}\n", fmt_id(other_id)),
+        ] {
+            assert!(shown.contains(line), "{line:?} missing from\n{shown}");
+        }
+        assert_eq!(shown.matches("Root:").count(), 2, "{shown}");
+        assert_eq!(shown.matches("Imported:").count(), 2, "{shown}");
+
+        // tree follows every root.
+        let tree = files.tree(&fmt_id(import_id), None).unwrap();
+        assert!(
+            tree.contains("report.txt") && tree.contains("other.txt"),
+            "{tree}"
+        );
+
+        let bare = files.show(&fmt_id(bare_id)).unwrap();
+        assert!(bare.starts_with("Type:     import\n"), "{bare}");
+    }
+
+    #[test]
+    fn open_world_span_and_undecodable_times_are_read_or_skipped_not_fatal() {
+        // A span on legacy file provenance is a span, not an error.
+        let mut fragment =
+            file_capability::stage(b"legacy".to_vec(), "legacy.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        let span: file_capability::ImportTime = (
+            Epoch::from_tai_seconds(41.0),
+            Epoch::from_tai_seconds(86_400.0 * 400.0),
+        )
+            .try_to_inline()
+            .unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&file_id) @ file::imported_at: span };
+        // A span on an import reads as its lower bound; an inverted interval
+        // cannot be decoded and is skipped like any value a typed read
+        // cannot decode.
+        let (import, _, import_id) = imported("/tmp/report.txt");
+        fragment += import;
+        let inverted = {
+            let late = point(86_400.0 * 800.0);
+            let early = point(41.0);
+            let mut raw = [0u8; 32];
+            raw[..16].copy_from_slice(&late.raw[..16]);
+            raw[16..].copy_from_slice(&early.raw[16..]);
+            Inline::<inlineencodings::NsTAIInterval>::new(raw)
+        };
+        let odd_id = Id::new([0x55; 16]).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&odd_id) @
+            metadata::tag: &KIND_IMPORT,
+            file::imported_at: inverted,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&import_id) @ file::imported_at: span };
+        let (_pile, files) = committed(fragment);
+
+        assert!(files.list(&[], None).unwrap().contains("legacy.txt"));
+        assert!(files
+            .show(&fmt_id(file_id))
+            .unwrap()
+            .contains("Name:     legacy.txt"));
+        let imports = files.imports().unwrap();
+        assert!(
+            imports
+                .lines()
+                .any(|row| row.starts_with(&fmt_id(odd_id)[..12]) && row.contains("  ?  ")),
+            "{imports}"
+        );
+        let shown = files.show(&fmt_id(odd_id)).unwrap();
+        assert!(!shown.contains("Imported:"), "{shown}");
+    }
+
+    #[test]
+    fn open_world_provenance_and_roots_on_untyped_entities_are_ignored() {
+        let mut fragment =
+            file_capability::stage(b"typed".to_vec(), "typed.txt", "text/plain").unwrap();
+        let root = fragment.root().unwrap();
+        let unknown = Id::new([0x53; 16]).unwrap();
+        let path = fragment.put::<blobencodings::UTF8String, _>("unknown:path".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&unknown) @
+            file::source_path: path,
+            file::imported_at: point(43.0),
+            file::root: &root,
+        };
+        let (_pile, files) = committed(fragment);
+
+        assert_eq!(files.list(&[], None).unwrap().lines().count(), 1);
+        assert_eq!(files.imports().unwrap(), "(no imports)\n");
+        assert!(files
+            .show(&fmt_id(root))
+            .unwrap()
+            .contains("Name:     typed.txt"));
+    }
+
+    #[test]
+    fn complete_import_reads_its_root_time_and_source() {
+        let (fragment, root, import_id) = imported("/tmp/report.txt");
+        let (_pile, files) = committed(fragment);
+        assert_eq!(
+            files.show(&fmt_id(import_id)).unwrap(),
+            format!(
+                "Type:     import\nEntity:   {}\nRoot:     {}\nImported: 1900-01-01\nSource:   /tmp/report.txt\n",
+                fmt_id(import_id),
+                fmt_id(root)
+            )
+        );
+        assert_eq!(
+            files.imports().unwrap(),
+            format!(
+                "{}  1900-01-01  /tmp/report.txt\n",
+                &fmt_id(import_id)[..12]
+            )
+        );
+    }
+
+    #[test]
+    fn set_valued_legacy_file_provenance_leaves_one_file_and_no_import() {
+        let mut fragment =
+            file_capability::stage(b"legacy bytes".to_vec(), "legacy.txt", "text/plain").unwrap();
+        let file_id = fragment.root().unwrap();
+        for (path, seconds) in [("mail:first", 41.0), ("mail:second", 42.0)] {
+            let path = fragment.put::<blobencodings::UTF8String, _>(path.to_owned());
+            fragment += entity! { ExclusiveId::force_ref(&file_id) @
+                file::source_path: path,
+                file::imported_at: point(seconds),
+            };
+        }
+        let (_pile, files) = committed(fragment);
+        assert_eq!(files.list(&[], None).unwrap().lines().count(), 1);
+        assert_eq!(files.imports().unwrap(), "(no imports)\n");
+    }
+
+    #[test]
+    fn open_world_an_empty_directory_is_a_directory() {
+        let empty = directory("empty", Fragment::empty());
+        let id = empty.root().unwrap();
+        let (_pile, files) = committed(empty);
+        assert_eq!(
+            files.show(&fmt_id(id)).unwrap(),
+            format!(
+                "Type:     directory\nEntity:   {}\nName:     empty\nChildren: 0\n",
+                fmt_id(id)
+            )
+        );
+        assert_eq!(files.tree(&fmt_id(id), None).unwrap(), "empty/\n");
+    }
+
+    #[test]
+    fn open_world_diff_reads_every_child_under_a_shared_name() {
+        let one = file_capability::stage(b"one".to_vec(), "x.txt", "text/plain").unwrap();
+        let two = file_capability::stage(b"two!".to_vec(), "x.txt", "text/plain").unwrap();
+        let mut both = one.clone();
+        both += two;
+        let left = directory("dir", both);
+        let right = directory("dir", one);
+        let (left_id, right_id) = (left.root().unwrap(), right.root().unwrap());
+        let mut fragment = left;
+        fragment += right;
+        let (_pile, files) = committed(fragment);
+
+        let diff = files.diff(&fmt_id(left_id), &fmt_id(right_id)).unwrap();
+        assert_eq!(
+            diff, "  - dir/x.txt  (4 B)\n\n0 added, 1 removed, 0 modified\n",
+            "{diff}"
+        );
+        let tree = files.tree(&fmt_id(left_id), None).unwrap();
+        assert_eq!(tree.matches("x.txt").count(), 2, "{tree}");
+    }
+
+    #[test]
+    fn cycle_in_the_directory_graph_is_shown_once_not_followed() {
+        let inner = directory("inner", Fragment::empty());
+        let inner_id = inner.root().unwrap();
+        let outer = directory("outer", inner);
+        let outer_id = outer.root().unwrap();
+        let mut fragment = outer;
+        fragment += entity! { ExclusiveId::force_ref(&inner_id) @ file::children: &outer_id };
+        let (_pile, files) = committed(fragment);
+
+        assert_eq!(
+            files.tree(&fmt_id(outer_id), None).unwrap(),
+            "outer/\n└── inner/\n    └── outer/  (cycle)\n"
+        );
+        let error = format!("{:#}", files.extract(&fmt_id(outer_id), None).unwrap_err());
+        assert!(error.contains("cycle"), "{error}");
     }
 
     #[test]

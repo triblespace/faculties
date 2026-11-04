@@ -34,12 +34,10 @@ use triblespace::core::query::TriblePattern;
 use super::storage::WidgetReader as PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
-use triblespace::prelude::*;
 use GORBIE::graph::{self, GraphViewport, KeyedLayout, LayoutParams};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use crate::schemas::files::{file as file_attrs, KIND_FILE};
 use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 use crate::wiki::{EntryRecord, RevisionRecord};
@@ -274,63 +272,8 @@ impl WikiLive {
     /// archive. Ambiguity is local to this explicit open action and never
     /// invalidates unrelated file rows.
     fn resolve_file(files: DatasetView<'_>, hex: &str) -> Result<(FileHandle, String), String> {
-        let reference = crate::files::resolve_reference(files.facts, hex)
+        let resolved = crate::files::resolve_file(files.facts, files.reader, hex)
             .map_err(|error| format!("resolve files:{hex}: {error:#}"))?;
-        let resolved = match reference {
-            crate::files::FileReference::Entity(id) => {
-                let candidates = find!(
-                    (content: FileHandle, name: crate::files::NameHandle),
-                    pattern!(files.facts, [{
-                        id @ metadata::tag: &KIND_FILE,
-                        file_attrs::content: ?content,
-                        file_attrs::name: ?name,
-                    }])
-                )
-                .collect::<BTreeSet<_>>();
-                let contents = candidates
-                    .iter()
-                    .map(|(content, _)| *content)
-                    .collect::<BTreeSet<_>>();
-                let content = match contents.len() {
-                    1 => *contents.first().expect("length checked"),
-                    0 => return Err(format!("files entity {id:x} is not a readable file")),
-                    count => {
-                        return Err(format!(
-                            "files entity {id:x} has {count} content projections"
-                        ));
-                    }
-                };
-                let names = candidates
-                    .into_iter()
-                    .filter(|(candidate, _)| *candidate == content)
-                    .filter_map(|(_, handle)| {
-                        let name: anybytes::View<str> = files.reader.get(handle).ok()?;
-                        Some(name.to_string())
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
-                crate::files::ResolvedFile { content, names }
-            }
-            crate::files::FileReference::Content(content) => {
-                let names = find!(
-                    name: crate::files::NameHandle,
-                    pattern!(files.facts, [{
-                        _?file @ metadata::tag: &KIND_FILE,
-                        file_attrs::content: &content,
-                        file_attrs::name: ?name,
-                    }])
-                )
-                .filter_map(|handle| {
-                    let name: anybytes::View<str> = files.reader.get(handle).ok()?;
-                    Some(name.to_string())
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-                crate::files::ResolvedFile { content, names }
-            }
-        };
         let name = resolved_file_name(&resolved);
         Ok((resolved.content, name))
     }
@@ -1296,6 +1239,7 @@ impl WikiViewer {
 mod tests {
     use super::*;
 
+    use crate::schemas::files::file as file_attrs;
     use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
     use crate::wiki::{self, RevisionDraft};
     use ed25519_dalek::SigningKey;
@@ -1464,10 +1408,12 @@ mod tests {
         fragment += second;
         let mut blobs = fragment.blobs().clone();
         let reader = blobs.snapshot().unwrap();
-        let catalog = crate::files::load_catalog(&reader, fragment.facts()).unwrap();
-        let resolved = catalog
-            .resolve_file(&crate::files::content_hash_hex(content))
-            .unwrap();
+        let resolved = crate::files::resolve_file(
+            fragment.facts(),
+            &reader,
+            &crate::files::content_hash_hex(content),
+        )
+        .unwrap();
 
         assert_eq!(resolved.names, ["alpha.txt", "beta.txt"]);
         assert_eq!(

@@ -2882,18 +2882,29 @@ fn get_attachment(
         let Some(file_id) = attachment_file(&view.facts, row.attachment_id) else {
             continue;
         };
-        let data_handle = file_capability::content_handle(&view.facts, file_id)?
-            .ok_or_else(|| anyhow::anyhow!("attachment file {file_id:x} has no content"))?;
-        candidates.push(AttachmentExportCandidate {
-            attachment_id: row.attachment_id,
-            message_id: row.message_id,
-            chat_id: row.chat_id,
-            source_id: source,
-            source_kind: kind,
-            data_handle,
-            name: row.name,
-            media_type: row.media_type,
-        });
+        // A file observed with several contents is a candidate for each, so
+        // the lookup below reports it as ambiguous instead of choosing.
+        let data_handles: Vec<file_capability::ContentHandle> = find!(
+            content: file_capability::ContentHandle,
+            pattern!(&view.facts, [{ file_id @ file::content: ?content }])
+        )
+        .collect();
+        anyhow::ensure!(
+            !data_handles.is_empty(),
+            "attachment file {file_id:x} has no content"
+        );
+        for data_handle in data_handles {
+            candidates.push(AttachmentExportCandidate {
+                attachment_id: row.attachment_id,
+                message_id: row.message_id,
+                chat_id: row.chat_id,
+                source_id: source.clone(),
+                source_kind: kind.clone(),
+                data_handle,
+                name: row.name.clone(),
+                media_type: row.media_type.clone(),
+            });
+        }
     }
     if candidates.is_empty() {
         return Ok(AttachmentLookup::Missing {
