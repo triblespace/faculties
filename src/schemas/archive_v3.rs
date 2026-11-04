@@ -437,6 +437,14 @@ pub mod witness {
         /// it is the fact's `source_uri`). Minted with `trible genid`
         /// 2026-11-04.
         "3E44A059ADB3476BE9D32593ACB97912" as pub claimed_uri: Handle<UTF8String>;
+        /// OCCURRENCE CORE. The original structured input a fact her window
+        /// held was rendered from, as a json_tree root: a tool definition
+        /// before the renderer trimmed its description and left out members
+        /// it ignores. Provenance and typed validation, never a replay input
+        /// and never part of the fact: two originals that render the same
+        /// text share the fact and node, and keep two occurrences. Minted
+        /// with `trible genid` 2026-11-04.
+        "44DF5EE6A5BF4F766817BF7EDB3B8E1B" as pub rendered_from: GenId;
         /// OCCURRENCE CORE. Why the turn the record closes ended, an
         /// [`super::node::ends`] term, as a claim of a record that holds no
         /// node: Codex's `turn_aborted` (ruling X5). Where she produced

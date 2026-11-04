@@ -271,6 +271,9 @@ pub struct WitnessAnnotations {
     /// Uris the source records for the held item that her window did not
     /// render.
     pub claimed_uri: Vec<String>,
+    /// The original structured input the held fact was rendered from: an
+    /// imported json_tree fragment, rooted at the tree. It rides along.
+    pub rendered_from: Option<Fragment>,
     /// The source marks this occurrence a compaction summary.
     pub compaction_summary: bool,
     /// The source flags the held text as the harness's writing.
@@ -328,6 +331,14 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
     let source_locator = put(&mut fragment, annotations.source_locator);
     let claimed_title = put(&mut fragment, annotations.claimed_title);
     let untruncated = put(&mut fragment, annotations.untruncated);
+    let rendered_from = match &annotations.rendered_from {
+        Some(tree) => {
+            let root = rooted(tree, "rendered-from tree")?;
+            fragment += unexported(tree.clone());
+            Some(root)
+        }
+        None => None,
+    };
     let claimed_uri: Vec<_> = annotations
         .claimed_uri
         .into_iter()
@@ -367,6 +378,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_title?: claimed_title,
         schema::witness::claimed_status?: annotations.claimed_status,
         schema::witness::claimed_uri*: claimed_uri.iter(),
+        schema::witness::rendered_from?: rendered_from,
         schema::witness::untruncated?: untruncated,
         metadata::tag*: tags.iter(),
     };
@@ -417,6 +429,7 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             claimed_title,
             claimed_status,
             claimed_uri,
+            rendered_from,
             compaction_summary,
             harness_written,
             untruncated,
@@ -440,6 +453,8 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             && *claimed_title == b.claimed_title
             && *claimed_status == b.claimed_status
             && set(claimed_uri) == set(&b.claimed_uri)
+            && rendered_from.as_ref().and_then(Fragment::root)
+                == b.rendered_from.as_ref().and_then(Fragment::root)
             && *compaction_summary == b.compaction_summary
             && *harness_written == b.harness_written
             && *untruncated == b.untruncated
