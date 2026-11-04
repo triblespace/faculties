@@ -46,7 +46,7 @@ use super::fields::FieldTable;
 
 pub mod render;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub mod walk;
 
 /// One value as she experienced it, or one annotation of it.

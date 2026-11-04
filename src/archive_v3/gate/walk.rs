@@ -361,6 +361,10 @@ struct Walker<'t> {
 struct Ctx {
     record: Option<usize>,
     scalars: std::rc::Rc<BTreeMap<String, String>>,
+    /// Every record-relative member path present in the record.
+    present: std::rc::Rc<BTreeSet<String>>,
+    /// The record itself, for mirrors that look across it.
+    root: std::rc::Rc<J>,
     index: Vec<usize>,
     line: usize,
 }
@@ -395,9 +399,15 @@ fn is_leaf(value: &J) -> bool {
     is_scalar(value) || is_empty(value)
 }
 
-/// The record's scalar fields by record-relative key path. Arrays are not
-/// entered: a condition names one field.
-fn scalars(value: &J, prefix: &str, out: &mut BTreeMap<String, String>) {
+/// The record's scalar fields by record-relative key path, and the set of
+/// every member path present. Arrays are not entered: a condition names one
+/// field.
+fn scalars(
+    value: &J,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+    present: &mut BTreeSet<String>,
+) {
     if let J::Obj(members) = value {
         for (name, member) in members {
             let path = if prefix.is_empty() {
@@ -405,8 +415,9 @@ fn scalars(value: &J, prefix: &str, out: &mut BTreeMap<String, String>) {
             } else {
                 format!("{prefix}.{name}")
             };
+            present.insert(path.clone());
             match member {
-                J::Obj(_) => scalars(member, &path, out),
+                J::Obj(_) => scalars(member, &path, out, present),
                 J::Arr(_) => {}
                 scalar => {
                     out.insert(path, spelling(scalar).expect("scalar"));
@@ -416,15 +427,31 @@ fn scalars(value: &J, prefix: &str, out: &mut BTreeMap<String, String>) {
     }
 }
 
-fn holds(when: &[Cond], scalars: &BTreeMap<String, String>) -> bool {
+fn holds(
+    when: &[Cond],
+    scalars: &BTreeMap<String, String>,
+    present: &BTreeSet<String>,
+    parent: Option<&J>,
+) -> bool {
+    let sibling = |name: &str| match parent {
+        Some(J::Obj(members)) => members.get(name).and_then(spelling),
+        _ => None,
+    };
     when.iter().all(|cond| match cond {
+        Cond::Sibling(name, value) => sibling(name).is_some_and(|v| v == *value),
+        Cond::SiblingNot(name, value) => sibling(name).is_none_or(|v| v != *value),
         Cond::Is(field, value) => scalars.get(*field).is_some_and(|v| v == value),
         Cond::IsNot(field, value) => scalars.get(*field).is_none_or(|v| v != value),
+        Cond::Prefix(field, prefix) => scalars.get(*field).is_some_and(|v| v.starts_with(prefix)),
+        Cond::Present(field) => present.contains(*field),
+        Cond::Absent(field) => !present.contains(*field),
     })
 }
 
-/// Whether an entry's class can take this value: a scalar decode or a
-/// structure takes only a leaf; anything else takes any value.
+/// Whether an entry's class can take this value. A decode takes the JSON
+/// type it decodes (a text decode a string, a number decode a number, a
+/// vocabulary any scalar, tool JSON and constants anything); a structure
+/// and an empty drop take only a leaf; anything else any value.
 fn applies(entry: &Entry, value: &J) -> bool {
     match entry.class {
         Class::Fact { decode, .. } => decode_applies(decode, value),
@@ -432,12 +459,25 @@ fn applies(entry: &Entry, value: &J) -> bool {
             .iter()
             .all(|(_, decode)| decode_applies(*decode, value)),
         Class::Structure(_) => is_leaf(value),
+        Class::Drop(DropReason::Empty) => is_leaf(value),
         Class::Correlator | Class::Drop(_) | Class::Open(_) => true,
     }
 }
 
 fn decode_applies(decode: Decode, value: &J) -> bool {
-    matches!(decode, Decode::Json) || is_leaf(value)
+    match decode {
+        Decode::Json | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
+        Decode::Text | Decode::Base64 | Decode::MediaType | Decode::Timestamp => {
+            matches!(value, J::Str(_))
+        }
+        Decode::Number | Decode::UnixSeconds => matches!(value, J::Num(_)),
+        Decode::Bool => matches!(value, J::Bool(_)),
+        Decode::Term(_) | Decode::TextMap(_) => is_scalar(value),
+    }
+}
+
+fn is_empty_drop(entry: &Entry) -> bool {
+    matches!(entry.class, Class::Drop(DropReason::Empty))
 }
 
 /// A name safe to print in a path: field names and vocabulary, never
@@ -468,6 +508,8 @@ impl<'t> Walker<'t> {
         let ctx = Ctx {
             record: None,
             scalars: Default::default(),
+            present: Default::default(),
+            root: std::rc::Rc::new(J::Null),
             index: Vec::new(),
             line,
         };
@@ -496,19 +538,46 @@ impl<'t> Walker<'t> {
         let shape = self.discriminator(value);
         let shaped = shape.as_ref().map(|shape| format!("{path}{{{shape}}}"));
 
-        let mut entries: Vec<&Entry> = shaped
-            .as_deref()
-            .map(|shaped| self.table.at(shaped).collect())
-            .unwrap_or_default();
+        let table: &'t FieldTable = self.table;
+        let candidates = |at: &str| -> Vec<&'t Entry> {
+            let mut entries: Vec<&'t Entry> = table
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.path == at
+                        && applies(entry, value)
+                        && holds(entry.when, &ctx.scalars, &ctx.present, parent)
+                })
+                .collect();
+            if entries.len() > 1 && entries.iter().any(|entry| is_empty_drop(entry)) {
+                let valued = entries.iter().any(|entry| {
+                    matches!(
+                        entry.class,
+                        Class::Fact { .. } | Class::Annotation(_) | Class::Structure(_)
+                    )
+                });
+                // An empty drop competes only for an empty value; there it
+                // yields to an entry that holds a value and wins over the
+                // rest.
+                if valued || !is_empty(value) {
+                    entries.retain(|entry| !is_empty_drop(entry));
+                } else {
+                    entries.retain(|entry| is_empty_drop(entry));
+                }
+            }
+            entries
+        };
+        let mut entries: Vec<&Entry> = shaped.as_deref().map(candidates).unwrap_or_default();
         if entries.is_empty() {
-            entries = self.table.at(path).collect();
+            entries = candidates(path);
         }
-        entries.retain(|entry| applies(entry, value) && holds(entry.when, &ctx.scalars));
 
         match entries.as_slice() {
             [entry] => {
                 let entry = *entry;
-                self.apply(entry, value, path, parent, &ctx);
+                // Rows and origins name the path the entry matched, shape
+                // included.
+                self.apply(entry, value, entry.path, parent, &ctx);
                 return;
             }
             [] => {}
@@ -550,7 +619,8 @@ impl<'t> Walker<'t> {
 
     fn start_record(&mut self, value: &J, mut ctx: Ctx) -> Ctx {
         let mut fields = BTreeMap::new();
-        scalars(value, "", &mut fields);
+        let mut present = BTreeSet::new();
+        scalars(value, "", &mut fields, &mut present);
         let Order::Parents { id, parent } = self.table.order;
         let field = |name: &str| fields.get(name).filter(|v| *v != "null").cloned();
         let links = RecordLinks {
@@ -565,6 +635,8 @@ impl<'t> Walker<'t> {
         self.out.records.push(links);
         ctx.record = Some(record);
         ctx.scalars = std::rc::Rc::new(fields);
+        ctx.present = std::rc::Rc::new(present);
+        ctx.root = std::rc::Rc::new(value.clone());
         ctx.index = Vec::new();
         ctx
     }
@@ -584,8 +656,10 @@ impl<'t> Walker<'t> {
                 direction,
                 attribute,
                 decode,
+                with,
             } => match decode_values(decode, value) {
                 Ok(values) => {
+                    let found = !values.is_empty();
                     for value in values {
                         let token = Token {
                             modality: modality.to_owned(),
@@ -594,6 +668,24 @@ impl<'t> Walker<'t> {
                             value,
                         };
                         self.emit(token, path, ctx);
+                    }
+                    // A fixed companion belongs to a fact only when the
+                    // value made one.
+                    for (attribute, decode) in with.iter().filter(|_| found) {
+                        match decode_values(*decode, value) {
+                            Ok(values) => {
+                                for value in values {
+                                    let token = Token {
+                                        modality: modality.to_owned(),
+                                        direction: direction.to_owned(),
+                                        attribute: (*attribute).to_owned(),
+                                        value,
+                                    };
+                                    self.emit(token, path, ctx);
+                                }
+                            }
+                            Err(failure) => self.fail(failure, path, ctx),
+                        }
                     }
                 }
                 Err(failure) => self.fail(failure, path, ctx),
@@ -649,6 +741,36 @@ impl<'t> Walker<'t> {
                     };
                     if !mirrored.is_some_and(|mirrored| same(mirrored, value)) {
                         self.row(path, Kind::Mirror, ctx);
+                    }
+                }
+                DropReason::Mirror(Mirror::Keyed { array, key, member }) => {
+                    let J::Obj(mirrors) = value else {
+                        self.row(path, Kind::Mirror, ctx);
+                        return;
+                    };
+                    let mut elements: &[J] = &[];
+                    let mut at: Option<&J> = Some(&ctx.root);
+                    for step in array.split('.') {
+                        at = match at {
+                            Some(J::Obj(members)) => members.get(step),
+                            _ => None,
+                        };
+                    }
+                    if let Some(J::Arr(found)) = at {
+                        elements = found;
+                    }
+                    for (name, mirror) in mirrors {
+                        let original = elements.iter().find_map(|element| match element {
+                            J::Obj(members)
+                                if matches!(members.get(key), Some(J::Str(id)) if id == name) =>
+                            {
+                                members.get(member)
+                            }
+                            _ => None,
+                        });
+                        if !original.is_some_and(|original| same(original, mirror)) {
+                            self.row(path, Kind::Mirror, ctx);
+                        }
                     }
                 }
                 DropReason::Mirror(Mirror::Children) => {
@@ -725,7 +847,18 @@ fn same(a: &J, b: &J) -> bool {
 fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
     let one = |value: Value| Ok(vec![value]);
     match (decode, value) {
+        // `""` is never stored: it is no value.
+        (Decode::Text, J::Str(text)) if text.is_empty() => Ok(Vec::new()),
         (Decode::Text, J::Str(text)) => one(Value::Text(text.clone())),
+        (Decode::ConstText(text), _) => one(Value::Text(text.to_owned())),
+        (Decode::ConstTerm(term), _) => one(Value::Term(term.to_owned())),
+        (Decode::TextMap(map), value) => {
+            let spelled = spelling(value).ok_or(Failure::Decode)?;
+            match map.iter().find(|(source, _)| *source == spelled) {
+                Some((_, text)) => one(Value::Text((*text).to_owned())),
+                None => Err(Failure::UnknownValue),
+            }
+        }
         (Decode::Base64, J::Str(text)) => {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(text)

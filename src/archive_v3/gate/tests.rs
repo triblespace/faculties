@@ -309,11 +309,19 @@ fn seed_tables_name_only_v3_terms() {
                     direction,
                     attribute,
                     decode,
+                    with,
                 } => {
                     assert!(modalities.contains(modality), "{}", entry.path);
                     assert!(directions.contains(direction), "{}", entry.path);
                     assert!(fact_attributes.contains(attribute), "{}", entry.path);
                     check_term(attribute, decode);
+                    for (attribute, decode) in *with {
+                        assert!(fact_attributes.contains(attribute), "{}", entry.path);
+                        check_term(attribute, decode);
+                        if let Decode::ConstTerm(term) = decode {
+                            assert!(terms_of(attribute).contains(term), "{}: {term}", entry.path);
+                        }
+                    }
                 }
                 Class::Annotation(list) => {
                     for (attribute, decode) in *list {
@@ -323,6 +331,9 @@ fn seed_tables_name_only_v3_terms() {
                             entry.path
                         );
                         check_term(attribute, decode);
+                        if let Decode::ConstTerm(term) = decode {
+                            assert!(terms_of(attribute).contains(term), "{}: {term}", entry.path);
+                        }
                     }
                 }
                 _ => {}
@@ -334,14 +345,14 @@ fn seed_tables_name_only_v3_terms() {
 // ---------------------------------------------------------------------------
 // Synthetic sources.
 
-const RESULT_TEXT: &str = r#"{"type":"text","text":"Found one tool."}"#;
-const RESULT_IMAGE: &str =
+pub(crate) const RESULT_TEXT: &str = r#"{"type":"text","text":"Found one tool."}"#;
+pub(crate) const RESULT_IMAGE: &str =
     r#"{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}"#;
-const RESULT_REFERENCE: &str = r#"{"type":"tool_reference","tool_name":"WebSearch"}"#;
-const RESULT_DOCUMENT: &str = r#"{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}"#;
+pub(crate) const RESULT_REFERENCE: &str = r#"{"type":"tool_reference","tool_name":"WebSearch"}"#;
+pub(crate) const RESULT_DOCUMENT: &str = r#"{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQK"}}"#;
 
 /// A synthetic Claude Code transcript whose one tool result holds `items`.
-fn claude_code_source(items: &[&str]) -> String {
+pub(crate) fn claude_code_source(items: &[&str]) -> String {
     let items = items.join(",");
     [
         r#"{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","cwd":"/synthetic","version":"0.0.0","message":{"role":"user","content":"Which tools can search?"}}"#.to_owned(),

@@ -34,9 +34,16 @@
 //!
 //! # Conditions
 //!
-//! An entry may carry [`Cond`]itions on scalar fields of the enclosing
-//! record, given as record-relative key paths (`message.author.role`). For
-//! one value at one path exactly one entry must apply.
+//! An entry may carry [`Cond`]itions on fields of the enclosing record,
+//! given as record-relative key paths (`message.author.role`). For one value
+//! at one path exactly one entry must apply. An entry applies only to values
+//! its class can take (a text decode takes a string, a structure a leaf).
+//! An empty drop competes with other entries only for an empty value: there
+//! a fact, annotation or structure entry wins (`""` is text that holds no
+//! value) and the empty drop wins over the rest (an open field that is
+//! `null` or `[]` held nothing).
+//! Shaped entries (`path{shape}`) are tried first; when none applies, the
+//! unshaped path's entries are.
 //!
 //! The table is shared by an importer and the gate's source walker ([`super::gate`]).
 //! It is declared data: the walker reads it, and so will the importer, but
@@ -80,15 +87,29 @@ pub struct Entry {
     pub class: Class,
 }
 
-/// A condition on a scalar field of the enclosing record. A scalar is
-/// compared by its spelling: a string as decoded, a number by its exact
-/// token, `true`, `false` or `null`.
+/// A condition on a field of the enclosing record. A scalar is compared by
+/// its spelling: a string as decoded, a number by its exact token, `true`,
+/// `false` or `null`. Fields are record-relative member paths; arrays are not
+/// entered.
 #[derive(Clone, Copy, Debug)]
 pub enum Cond {
-    /// The field is present with this value.
+    /// The field is a scalar with this value.
     Is(&'static str, &'static str),
     /// The field is absent or has another value.
     IsNot(&'static str, &'static str),
+    /// The field is a string that starts with this prefix.
+    Prefix(&'static str, &'static str),
+    /// The field is present with any value (an array or object included).
+    Present(&'static str),
+    /// The field is absent.
+    Absent(&'static str),
+    /// A member of the object that holds the value is a scalar with this
+    /// value (for conditions inside arrays, where record fields cannot
+    /// reach).
+    Sibling(&'static str, &'static str),
+    /// A member of the object that holds the value is absent or has another
+    /// value.
+    SiblingNot(&'static str, &'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +125,11 @@ pub enum Class {
         /// `source_uri`, `title`, `sense`, `detail`, `register` or `form`.
         attribute: &'static str,
         decode: Decode,
+        /// Further attributes of the same fact that a rendering rule fixes
+        /// for this path, each `(attribute, constant decode)`: a sealed
+        /// blob's format media type, `form: voiced` on harness text in her
+        /// slot. They are tokens of the value's own origin.
+        with: &'static [(&'static str, Decode)],
     },
     Structure(Structure),
     /// Annotations of the witness or node, each `(attribute, decode)`:
@@ -157,6 +183,14 @@ pub enum Decode {
     /// A closed vocabulary: source spelling to term name. Any other value
     /// fails.
     Term(&'static [(&'static str, &'static str)]),
+    /// A closed vocabulary: source spelling to an exact text. Any other
+    /// value fails.
+    TextMap(&'static [(&'static str, &'static str)]),
+    /// A constant text the rendering rule fixes, whatever the value.
+    ConstText(&'static str),
+    /// A constant vocabulary term the rendering rule fixes, whatever the
+    /// value.
+    ConstTerm(&'static str),
 }
 
 /// Why a field is left out.
@@ -180,6 +214,15 @@ pub enum Mirror {
     Sibling(&'static str),
     /// The ids of the records whose parent is this record ([`Order::Parents`]).
     Children,
+    /// Members of an object keyed by provider id, each mirroring `member`
+    /// of the element of the record-relative array `array` whose `key`
+    /// member equals the member name: Claude Code's `wireToolInputs`.
+    /// JSON values compare order-free, numbers by token.
+    Keyed {
+        array: &'static str,
+        key: &'static str,
+        member: &'static str,
+    },
 }
 
 impl Entry {
@@ -190,6 +233,17 @@ impl Entry {
         attribute: &'static str,
         decode: Decode,
     ) -> Self {
+        Self::fact_with(path, modality, direction, attribute, decode, &[])
+    }
+
+    pub const fn fact_with(
+        path: &'static str,
+        modality: &'static str,
+        direction: &'static str,
+        attribute: &'static str,
+        decode: Decode,
+        with: &'static [(&'static str, Decode)],
+    ) -> Self {
         Entry {
             path,
             when: &[],
@@ -198,6 +252,7 @@ impl Entry {
                 direction,
                 attribute,
                 decode,
+                with,
             },
         }
     }

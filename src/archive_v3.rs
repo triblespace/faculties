@@ -23,6 +23,7 @@ use triblespace::prelude::*;
 use crate::blockdag;
 use crate::schemas::archive_v3 as schema;
 
+pub mod claude_code;
 pub mod fields;
 pub mod gate;
 pub mod media_type;
@@ -212,7 +213,8 @@ pub struct WitnessAnnotations {
     pub generated_by: Vec<String>,
     pub raw_model: Option<String>,
     pub raw_role: Option<String>,
-    pub raw_author: Option<String>,
+    /// Who wrote what the node holds, as the source spells it.
+    pub raw_author: Vec<String>,
     pub author: Option<Id>,
     pub experiencer: Option<Id>,
     /// The session id, on leaves only.
@@ -253,7 +255,11 @@ pub fn annotate_witness(witness: Id, annotations: WitnessAnnotations) -> Result<
     };
     let raw_model = put(&mut fragment, annotations.raw_model);
     let raw_role = put(&mut fragment, annotations.raw_role);
-    let raw_author = put(&mut fragment, annotations.raw_author);
+    let raw_author: Vec<_> = annotations
+        .raw_author
+        .into_iter()
+        .map(|author| fragment.put::<UTF8String, _>(author))
+        .collect();
     let source_locator = put(&mut fragment, annotations.source_locator);
     let claimed_title = put(&mut fragment, annotations.claimed_title);
     let pointer: Vec<_> = annotations
@@ -268,7 +274,7 @@ pub fn annotate_witness(witness: Id, annotations: WitnessAnnotations) -> Result<
         schema::witness::generated_by*: generated_by.iter(),
         schema::witness::raw_model?: raw_model,
         schema::witness::raw_role?: raw_role,
-        schema::witness::raw_author?: raw_author,
+        schema::witness::raw_author*: raw_author.iter(),
         schema::witness::author?: annotations.author,
         schema::witness::experiencer?: annotations.experiencer,
         schema::witness::source_locator?: source_locator,
