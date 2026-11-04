@@ -78,6 +78,17 @@ fn walker_rows(source: &[u8]) -> Vec<(String, String)> {
 /// The grammar's findings for a unit, or none when it has one cover. The
 /// unit is its lines as one JSON array; a line that is not JSON is `None`.
 fn grammar_findings(grammar: &Grammar<Cat>, source: &[u8]) -> Option<Vec<String>> {
+    grammar_findings_timed(grammar, source, &mut std::time::Duration::ZERO)
+}
+
+/// [`grammar_findings`], adding the time spent importing the unit to
+/// `importing`.
+fn grammar_findings_timed(
+    grammar: &Grammar<Cat>,
+    source: &[u8],
+    importing: &mut std::time::Duration,
+) -> Option<Vec<String>> {
+    let started = std::time::Instant::now();
     let text = std::str::from_utf8(source).ok()?;
     let records: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let array = format!("[{}]", records.join(","));
@@ -87,6 +98,7 @@ fn grammar_findings(grammar: &Grammar<Cat>, source: &[u8]) -> Option<Vec<String>
         .ok()?;
     let root = fragment.root()?;
     let blobs = fragment.blobs().clone().snapshot().ok()?;
+    *importing += started.elapsed();
     match grammar.cover(Unit::new(fragment.facts(), &blobs), root, &lines()) {
         Ok(_) => Some(Vec::new()),
         // Only the normalized path and the kind of problem: an unclaimed
@@ -186,12 +198,19 @@ fn real_sample_parity() {
     let mut walker_only: BTreeMap<String, usize> = BTreeMap::new();
     let mut grammar_only: BTreeMap<String, usize> = BTreeMap::new();
     let mut unreadable = 0;
+    let (mut walking, mut covering) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+    let mut importing = std::time::Duration::ZERO;
     for file in &files {
         let Ok(bytes) = std::fs::read(file) else {
             continue;
         };
+        let started = std::time::Instant::now();
         let rows = walker_rows(&bytes);
-        let Some(findings) = grammar_findings(&g, &bytes) else {
+        walking += started.elapsed();
+        let started = std::time::Instant::now();
+        let findings = grammar_findings_timed(&g, &bytes, &mut importing);
+        covering += started.elapsed();
+        let Some(findings) = findings else {
             unreadable += 1;
             continue;
         };
@@ -212,6 +231,14 @@ fn real_sample_parity() {
         }
     }
     println!("files {} unreadable-as-json {unreadable}", files.len());
+    // Wall time on this machine, summed over the files: the walker, and the
+    // grammar including the json_tree import of each unit.
+    println!(
+        "walker {:.1} s, grammar with import {:.1} s, of which import {:.1} s",
+        walking.as_secs_f64(),
+        covering.as_secs_f64(),
+        importing.as_secs_f64()
+    );
     for ((w, gr), n) in &table {
         println!("walker-fails {w} grammar-fails {gr}: {n}");
     }
