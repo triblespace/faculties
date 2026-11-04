@@ -62,11 +62,32 @@ fn name(text: &str) -> Name {
     blob.get_handle()
 }
 
+thread_local! {
+    /// Node kinds by node. A json_tree id derives from its content, kind
+    /// included, so an answer holds in every unit; the cache is only ever
+    /// emptied to bound its size.
+    static KINDS: std::cell::RefCell<HashMap<Id, Option<Id>>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// The most node kinds [`KINDS`] keeps before it starts over.
+const KIND_CACHE: usize = 1 << 22;
+
 fn kind(unit: &Unit, e: Id) -> Option<Id> {
+    if let Some(k) = KINDS.with(|kinds| kinds.borrow().get(&e).copied()) {
+        return k;
+    }
     let facts = unit.facts;
-    find!((k: Id), pattern!(facts, [{ e @ json_tree::kind: ?k }]))
+    let k = find!((k: Id), pattern!(facts, [{ e @ json_tree::kind: ?k }]))
         .map(|(k,)| k)
-        .next()
+        .next();
+    KINDS.with(|kinds| {
+        let mut kinds = kinds.borrow_mut();
+        if kinds.len() >= KIND_CACHE {
+            kinds.clear();
+        }
+        kinds.insert(e, k);
+    });
+    k
 }
 
 fn text_of(unit: &Unit, e: Id) -> Option<String> {
@@ -249,18 +270,6 @@ fn known_paths(table: &FieldTable) -> HashSet<String> {
     known
 }
 
-/// A path without the shapes that end it: the family its values sit in.
-fn unshaped(path: &str) -> &str {
-    let mut at = path;
-    while let Some(rest) = at.strip_suffix('}') {
-        match rest.rfind('{') {
-            Some(open) => at = &rest[..open],
-            None => break,
-        }
-    }
-    at
-}
-
 struct Table {
     table: &'static FieldTable,
     known: HashSet<String>,
@@ -441,22 +450,24 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
         .collect();
     families.sort();
     for family in families {
-        for entry in table.entries.iter().filter(|e| unshaped(e.path) == family) {
-            let t = Arc::clone(&t);
-            constructions.push(Construction {
-                name: entry.path,
-                category: family.clone(),
-                anchor: Box::new(move |unit: &Unit, v, cat: &Cat| {
-                    let chosen = t.chosen(unit, v, cat);
-                    chosen.len() == 1 && std::ptr::eq(chosen[0], entry) && accepts(entry, unit, v)
-                }),
-                constituents: vec![
-                    Constituent::new(Step::EachField, Role::Value),
-                    Constituent::new(Step::Each, Role::Value),
-                ],
-                emit: Box::new(|inst| nothing(inst.anchor)),
-            });
-        }
+        // One construction covers a value with the entry chosen for it: the
+        // walk's rule is that exactly one entry applies and accepts, so a
+        // family needs no construction per entry, and its anchor asks the
+        // question once.
+        let entry_table = Arc::clone(&t);
+        constructions.push(Construction {
+            name: "entry",
+            category: family.clone(),
+            anchor: Box::new(move |unit: &Unit, v, cat: &Cat| {
+                let chosen = entry_table.chosen(unit, v, cat);
+                chosen.len() == 1 && accepts(chosen[0], unit, v)
+            }),
+            constituents: vec![
+                Constituent::new(Step::EachField, Role::Value),
+                Constituent::new(Step::Each, Role::Value),
+            ],
+            emit: Box::new(|inst| nothing(inst.anchor)),
+        });
         let anchor_table = Arc::clone(&t);
         let field_table = Arc::clone(&t);
         let entry_table = Arc::clone(&t);
