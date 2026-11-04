@@ -2710,9 +2710,8 @@ fn render_native_compass_goals(
     use std::fmt::Write as _;
 
     let goals = ids_of_kind(query.compass, KIND_GOAL_ID);
-    // The same priority relation the Compass board reads: pairwise events
-    // and the current priority snapshots side by side, plus child before
-    // parent. A cycle shares the final tier; the board notes it, wake does
+    // The same priority relation the Compass board reads: the current
+    // priority snapshots, plus child before parent. A cycle shares the final tier; the board notes it, wake does
     // not repeat that here.
     let ranks = compass::priority_ranks(
         goals.iter().copied(),

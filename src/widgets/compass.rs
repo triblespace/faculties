@@ -10,9 +10,8 @@
 //!
 //! - Parent/child indentation with a collapse toggle per subtree
 //! - Priority arrows: goal-level edges read by
-//!   `crate::compass::active_priority_edges` (pairwise events and the
-//!   current priority snapshots; never every `over` link projected onto
-//!   goal labels) rendered as `> over <id_str>` badges on the card
+//!   `crate::compass::active_priority_edges` (the current priority
+//!   snapshots; never every `over` link projected onto goal labels) rendered as `> over <id_str>` badges on the card
 //! - Tag chips colored via `GORBIE::themes::colorhash::ral_categorical`.
 //!
 //! ```ignore
@@ -496,8 +495,8 @@ impl CompassBoard {
                 .unwrap_or_else(|| ("todo".to_string(), created.0));
             goals.push((gid, status, sort_at));
         }
-        // Goal-level edges from the current priority snapshots and the
-        // pairwise events; a cycle two writers asserted is drawn as such.
+        // Goal-level edges from the current priority snapshots; a cycle two
+        // writers asserted is drawn as such.
         let active_priority_edges = crate::compass::active_priority_edges(space);
 
         // Per-status counts for the section header chips.

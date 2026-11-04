@@ -1322,10 +1322,20 @@ fn prioritize(
                 bail!("cannot prioritize a goal over itself");
             }
 
-            // Build full edge set (explicit + implicit child→parent)
-            let edges = compass::goal_priority_edges(space);
-
-            if compass::would_create_priority_cycle(&edges, higher_id, lower_id) {
+            // The order as it would read after this write, child before
+            // parent included. Ranking B over A while A > B is a flip: B's
+            // new snapshot reaches A's current one, so A's claim over B's
+            // replaced snapshot lapses and no cycle is left. A write is
+            // refused only when a cycle through the higher goal would remain:
+            // a parent ranked over its own descendant, or a cycle closed
+            // through a claim the new snapshot does not reach.
+            let plan = priority_plan(space, higher_id, Some(lower_id), None);
+            let edges =
+                compass::goal_priority_edges_after(space, higher_id, plan.over.keys().copied());
+            let on_cycle = edges.iter().any(|&(from, to)| {
+                from == higher_id && compass::would_create_priority_cycle(&edges, higher_id, to)
+            });
+            if on_cycle {
                 let paths = parent_paths(space)?;
                 if is_ancestor(&paths, higher_id, lower_id)
                     || is_ancestor(&paths, lower_id, higher_id)
@@ -1340,7 +1350,7 @@ fn prioritize(
                 lower_id,
                 task_title(reader, space, higher_id)?,
                 task_title(reader, space, lower_id)?,
-                priority_plan(space, higher_id, Some(lower_id), None),
+                plan,
             ))
         },
         |(higher_id, lower_id, higher_title, lower_title, plan)| {
@@ -1364,21 +1374,18 @@ fn prioritize(
 
 /// What one priority write says about `goal`: the goals its new snapshot
 /// ranks over, each with its current snapshots (none yet: the write mints a
-/// bottom one), and the pairwise edges from `goal` it retracts.
+/// bottom one).
 struct PriorityPlan {
     over: BTreeMap<Id, BTreeSet<Id>>,
-    retract: BTreeSet<Id>,
 }
 
 /// Plan a new priority snapshot of `goal`: every goal it is explicitly above
-/// now (pairwise or snapshot), with `add` and without `remove`.
+/// now, with `add` and without `remove`.
 ///
 /// The new snapshot ranks over each of those goals' CURRENT snapshots, so a
 /// claim a goal kept over an older snapshot of another is refreshed, and a
 /// claim that has lapsed (the other goal re-ranked itself above this one) is
-/// not revived by being copied. The goal's pairwise edges are carried into
-/// the snapshot and retracted in the pairwise form, so after the write the
-/// two forms agree.
+/// not revived by being copied.
 fn priority_plan<P: TriblePattern>(
     space: &P,
     goal: Id,
@@ -1386,11 +1393,9 @@ fn priority_plan<P: TriblePattern>(
     remove: Option<Id>,
 ) -> PriorityPlan {
     let reading = compass::priority_reading(space);
-    let legacy = compass::legacy_priority_edges(space);
     let mut lowers: BTreeSet<Id> = reading
         .edges
         .iter()
-        .chain(legacy.iter())
         .filter(|(higher, lower)| *higher == goal && *lower != goal)
         .map(|(_, lower)| *lower)
         .collect();
@@ -1405,11 +1410,6 @@ fn priority_plan<P: TriblePattern>(
                 let current = reading.current.get(&lower).cloned().unwrap_or_default();
                 (lower, current)
             })
-            .collect(),
-        retract: legacy
-            .iter()
-            .filter(|(higher, _)| *higher == goal)
-            .map(|(_, lower)| *lower)
             .collect(),
     }
 }
@@ -1426,9 +1426,6 @@ fn author_priority(plan: PriorityPlan, goal: Id, at: IntervalValue) -> (Fragment
         } else {
             over.extend(current);
         }
-    }
-    for lower in plan.retract {
-        fragment += compass::priority_fragment(goal, lower, false, at);
     }
     let (record, snapshot) = compass::priority_snapshot_fragment(goal, over, at);
     fragment += record;
@@ -2299,7 +2296,9 @@ mod tests {
         .unwrap()
         .0;
         fragment += compass::status_fragment(absent, "doing", None, point(2.0)).unwrap();
-        fragment += compass::priority_fragment(absent, goal, true, point(2.0));
+        let (bottom, bottom_id) = compass::priority_snapshot_fragment(goal, [], point(2.0));
+        fragment += bottom;
+        fragment += compass::priority_snapshot_fragment(absent, [bottom_id], point(2.0)).0;
         let (_directory, storage) = raw_pile(fragment);
         let handle = CompassStorage { storage: &storage };
 
@@ -2357,35 +2356,43 @@ mod tests {
         .collect()
     }
 
-    /// `prioritize` writes a priority snapshot, not a pairwise event. The
-    /// goal's still-active pairwise edges are carried into that snapshot's
-    /// over-set and retracted in the pairwise form, so the two forms never
-    /// disagree; `deprioritize` writes a snapshot without the lower goal.
+    /// A pairwise priority event as Compass wrote them before snapshots.
+    fn pairwise(fragment: &mut Fragment, higher: Id, lower: Id, seconds: f64) {
+        *fragment += entity! {
+            metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
+            board::higher: &higher,
+            board::lower: &lower,
+            metadata::created_at: point(seconds),
+        };
+    }
+
+    /// `prioritize` writes a priority snapshot over the current snapshots of
+    /// every goal the higher goal is above, plus the new one; `deprioritize`
+    /// writes one without the lower goal. A pairwise event in the pile is
+    /// neither read nor carried over, nor retracted.
     #[test]
-    fn prioritize_writes_a_snapshot_and_carries_pairwise_edges_into_it() {
+    fn prioritize_writes_a_snapshot_and_leaves_pairwise_events_unread() {
         let mut fragment = Fragment::empty();
         let a = plain_goal(&mut fragment, "alpha", 1.0);
         let b = plain_goal(&mut fragment, "beta", 2.0);
         let x = plain_goal(&mut fragment, "chi", 3.0);
-        fragment += compass::priority_fragment(a, x, true, point(4.0));
+        pairwise(&mut fragment, a, x, 4.0);
         let (_directory, storage) = raw_pile(fragment);
         let handle = CompassStorage { storage: &storage };
 
         let change = prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
         assert!(change.active);
+        let second = prioritize(handle, format!("{a:x}"), format!("{x:x}")).unwrap();
         handle
             .with_view(|facts, _, _| {
                 assert!(!exists!(pattern!(facts, [{ _?event @
-                    metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
-                    board::higher: &a,
-                    board::lower: &b,
+                    metadata::tag: &crate::schemas::compass::KIND_DEPRIORITIZE_ID,
                 }])));
-                assert_eq!(compass::legacy_priority_edges(facts), BTreeSet::new());
                 let reading = compass::priority_reading(facts);
-                assert_eq!(reading.current[&a], BTreeSet::from([change.event]));
+                assert_eq!(reading.current[&a], BTreeSet::from([second.event]));
                 let mut expected = reading.current[&b].clone();
                 expected.extend(reading.current[&x].iter().copied());
-                assert_eq!(over_set(facts, change.event), expected);
+                assert_eq!(over_set(facts, second.event), expected);
                 assert_eq!(
                     compass::active_priority_edges(facts),
                     BTreeSet::from([(a, b), (a, x)])
@@ -2393,10 +2400,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(
-            prioritize(handle, format!("{b:x}"), format!("{a:x}")).is_err(),
-            "a goal-level cycle is still refused at the write"
-        );
 
         let removed = deprioritize(handle, format!("{a:x}"), format!("{x:x}")).unwrap();
         assert!(!removed.active);
@@ -2418,6 +2421,118 @@ mod tests {
         assert!(board.notes.is_empty(), "{:?}", board.notes);
         let alpha = board.text.find("alpha").unwrap();
         assert!(alpha < board.text.find("beta").unwrap(), "{}", board.text);
+    }
+
+    /// A board whose only priority data is pairwise events shows no priority
+    /// relation: the goals are in recency order, as with no priorities.
+    #[test]
+    fn a_pairwise_only_board_shows_no_priority_relation() {
+        let mut fragment = Fragment::empty();
+        let older = plain_goal(&mut fragment, "older", 1.0);
+        let newer = plain_goal(&mut fragment, "newer", 2.0);
+        pairwise(&mut fragment, older, newer, 3.0);
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+        assert_eq!(
+            board(handle, vec![], vec![], false).unwrap(),
+            Board {
+                text: format!("\n== TODO (2) ==\n- [{newer:x}] newer\n- [{older:x}] older\n\n"),
+                notes: vec![],
+            }
+        );
+        handle
+            .with_view(|facts, _, _| {
+                assert!(compass::active_priority_edges(facts).is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// `prioritize B A` while A > B is a flip, not a cycle: B's new snapshot
+    /// ranks over A's current one, so A's claim over B's replaced snapshot
+    /// lapses and the board reads B > A only.
+    #[test]
+    fn prioritize_flips_an_existing_order() {
+        let mut fragment = Fragment::empty();
+        let b = plain_goal(&mut fragment, "beta", 1.0);
+        let a = plain_goal(&mut fragment, "alpha", 2.0);
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
+        let flipped = prioritize(handle, format!("{b:x}"), format!("{a:x}")).unwrap();
+        assert_eq!((flipped.higher, flipped.lower), (b, a));
+        handle
+            .with_view(|facts, _, _| {
+                assert_eq!(
+                    compass::active_priority_edges(facts),
+                    BTreeSet::from([(b, a)])
+                );
+                Ok(())
+            })
+            .unwrap();
+        let board = board(handle, vec![], vec![], false).unwrap();
+        assert!(board.notes.is_empty(), "{:?}", board.notes);
+        assert!(
+            board.text.find("beta").unwrap() < board.text.find("alpha").unwrap(),
+            "{}",
+            board.text
+        );
+        // Flipping back is a flip too.
+        prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
+        handle
+            .with_view(|facts, _, _| {
+                assert_eq!(
+                    compass::active_priority_edges(facts),
+                    BTreeSet::from([(a, b)])
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A flip lapses only claims over the flipped goal's replaced snapshot
+    /// that its new snapshot reaches. A cycle closed through a claim it does
+    /// not reach would still be on the board after the write, so the write
+    /// is refused; so is ranking a parent over its own child.
+    #[test]
+    fn a_write_that_would_leave_a_cycle_is_still_refused() {
+        let mut fragment = Fragment::empty();
+        let a = plain_goal(&mut fragment, "alpha", 1.0);
+        let b = plain_goal(&mut fragment, "beta", 2.0);
+        let c = plain_goal(&mut fragment, "gamma", 3.0);
+        let (b0, b0_id) = compass::priority_snapshot_fragment(b, [], point(4.0));
+        let (c0, c0_id) = compass::priority_snapshot_fragment(c, [], point(4.0));
+        fragment += b0;
+        fragment += c0;
+        // A over C's first snapshot; C, re-prioritised later, over B.
+        fragment += compass::priority_snapshot_fragment(a, [c0_id], point(5.0)).0;
+        fragment += compass::priority_snapshot_fragment(c, [b0_id], point(6.0)).0;
+        let (child_record, child) =
+            compass::goal_fragment("child", vec![], Some(a), point(7.0)).unwrap();
+        fragment += child_record;
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+        handle
+            .with_view(|facts, _, _| {
+                assert_eq!(
+                    compass::active_priority_edges(facts),
+                    BTreeSet::from([(a, c), (c, b)])
+                );
+                Ok(())
+            })
+            .unwrap();
+
+        let refused = prioritize(handle, format!("{b:x}"), format!("{a:x}")).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("priority cycle"),
+            "{refused:#}"
+        );
+        let refused = prioritize(handle, format!("{a:x}"), format!("{child:x}")).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("children are implicitly prioritized"),
+            "{refused:#}"
+        );
     }
 
     /// Concurrent mutual rankings reach the board as a cycle: it is listed,

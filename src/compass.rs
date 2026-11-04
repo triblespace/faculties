@@ -15,7 +15,8 @@
 //! entity brings it. Which snapshot of a goal is current is a register over
 //! `(priority_of, created_at)`, like status. The pairwise
 //! `prioritize`/`deprioritize` events written before snapshots existed stay
-//! readable beside them ([`active_priority_edges`]).
+//! in the pile (open world) and are not read: only snapshots make priority
+//! edges ([`active_priority_edges`]).
 
 pub mod cli;
 pub mod mcp;
@@ -48,8 +49,8 @@ use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::compass::{
-    board, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_PRIORITY_ID, KIND_SPECS, KIND_STATUS_ID,
+    board, DEFAULT_SCOPE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITY_ID, KIND_SPECS,
+    KIND_STATUS_ID,
 };
 use crate::storage::FactArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -396,31 +397,6 @@ pub mod replay {
     }
 }
 
-/// One intrinsic priority assertion or retraction event of the pairwise form.
-///
-/// Compass no longer writes assertions in this form; `prioritize` writes a
-/// [`priority_snapshot_fragment`]. The pairwise events remain readable (see
-/// [`legacy_priority_edges`]) and the writer retracts one of them, with a
-/// pairwise `deprioritize`, when it carries the edge into a snapshot.
-pub fn priority_fragment(
-    higher: Id,
-    lower: Id,
-    active: bool,
-    created_at: IntervalValue,
-) -> Fragment {
-    let kind = if active {
-        KIND_PRIORITIZE_ID
-    } else {
-        KIND_DEPRIORITIZE_ID
-    };
-    entity! {
-        metadata::tag: &kind,
-        board::higher: &higher,
-        board::lower: &lower,
-        metadata::created_at: created_at,
-    }
-}
-
 pub fn goal_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     find!(
         goal: Id,
@@ -439,59 +415,6 @@ pub fn note_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
         }])
     )
     .collect()
-}
-
-/// Active pairwise priority edges after deterministic last-event reduction.
-///
-/// These are the `prioritize`/`deprioritize` events written before priority
-/// snapshots existed. Every complete reading of an event counts: an event
-/// naming two higher goals speaks for both edges. An event whose time does
-/// not decode is not one this reader can order, so it is skipped.
-pub fn legacy_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
-    let mut latest: BTreeMap<(Id, Id), ((i128, Id), bool)> = BTreeMap::new();
-    let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
-        let Ok((lower_bound, _)): Result<(i128, i128), _> = at.try_from_inline() else {
-            return;
-        };
-        let order = (lower_bound, event);
-        latest
-            .entry((higher, lower))
-            .and_modify(|(current, value)| {
-                if order > *current {
-                    *current = order;
-                    *value = active;
-                }
-            })
-            .or_insert((order, active));
-    };
-
-    for (event, higher, lower, at) in find!(
-        (event: Id, higher: Id, lower: Id, at: IntervalValue),
-        pattern!(facts, [{ ?event @
-            metadata::tag: &KIND_PRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        absorb(event, higher, lower, at, true);
-    }
-    for (event, higher, lower, at) in find!(
-        (event: Id, higher: Id, lower: Id, at: IntervalValue),
-        pattern!(facts, [{ ?event @
-            metadata::tag: &KIND_DEPRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        absorb(event, higher, lower, at, false);
-    }
-
-    latest
-        .into_iter()
-        .filter_map(|(edge, (_, active))| active.then_some(edge))
-        .collect()
 }
 
 /// One intrinsic priority snapshot: goal `goal`'s place in the priority
@@ -560,6 +483,25 @@ pub struct PriorityReading {
 /// which two concurrent writers can produce honestly, is left for
 /// [`priority_ranks`] to place in its final shared tier.
 pub fn priority_reading<P: TriblePattern>(facts: &P) -> PriorityReading {
+    read_priorities(facts, None)
+}
+
+/// The reading as it would be after `goal` gets a new snapshot ranking over
+/// the current snapshots of `lowers` (a bottom snapshot for a lower goal that
+/// has none), which is what the writer is about to commit. The hypothetical
+/// snapshots carry fresh ids, which a reader never interprets.
+pub fn priority_reading_after<P: TriblePattern>(
+    facts: &P,
+    goal: Id,
+    lowers: impl IntoIterator<Item = Id>,
+) -> PriorityReading {
+    read_priorities(facts, Some((goal, lowers.into_iter().collect())))
+}
+
+fn read_priorities<P: TriblePattern>(
+    facts: &P,
+    write: Option<(Id, BTreeSet<Id>)>,
+) -> PriorityReading {
     // Complete states only, as the status register's positive membership:
     // a snapshot with no creation time is in no register.
     let mut goals_of = BTreeMap::<Id, BTreeSet<Id>>::new();
@@ -592,11 +534,28 @@ pub fn priority_reading<P: TriblePattern>(facts: &P) -> PriorityReading {
         metadata::created_at.id(),
     )
     .tiebreak_by_id();
-    let current: BTreeMap<Id, BTreeSet<Id>> = snapshots_of
+    let mut current: BTreeMap<Id, BTreeSet<Id>> = snapshots_of
         .iter()
         .map(|(&goal, candidates)| (goal, resolve(&register, candidates.iter().copied())))
         .filter(|(_, winners)| !winners.is_empty())
         .collect();
+    if let Some((goal, lowers)) = write {
+        let mut ranked = BTreeSet::new();
+        for lower in lowers {
+            if let Some(lower_current) = current.get(&lower) {
+                ranked.extend(lower_current.iter().copied());
+            } else {
+                let bottom = genid().id;
+                goals_of.insert(bottom, BTreeSet::from([lower]));
+                current.insert(lower, BTreeSet::from([bottom]));
+                ranked.insert(bottom);
+            }
+        }
+        let snapshot = genid().id;
+        goals_of.insert(snapshot, BTreeSet::from([goal]));
+        over.insert(snapshot, ranked);
+        current.insert(goal, BTreeSet::from([snapshot]));
+    }
 
     let reaches = |from: &BTreeSet<Id>, target: Id| -> bool {
         let mut visited = BTreeSet::new();
@@ -677,16 +636,14 @@ fn fmt_id_list(ids: &BTreeSet<Id>) -> String {
         .join(", ")
 }
 
-/// Active explicit priority edges: the pairwise events and the priority
-/// snapshots, read side by side.
+/// Active explicit priority edges: those the current priority snapshots
+/// make ([`priority_reading`]).
 ///
-/// Both forms stay readable (open world) and their edges are united. Where
-/// they disagree into a cycle, [`priority_ranks`] places the cycle in its
-/// final shared tier, as it does for any cycle.
+/// The pairwise `prioritize`/`deprioritize` events of the earlier form stay
+/// in the pile and are not read; a board that held them is re-prioritised
+/// or migrated, never interpreted beside the snapshots.
 pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
-    let mut edges = legacy_priority_edges(facts);
-    edges.extend(priority_reading(facts).edges);
-    edges
+    priority_reading(facts).edges
 }
 
 /// Advisory notes about the priority order of `goals` under `edges`: the
@@ -714,8 +671,24 @@ pub fn priority_notes<P: TriblePattern>(
 /// child precedes its parent. Keeping this interpretation here makes every
 /// presentation of the board read the same partial order.
 pub fn goal_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
+    with_structure(facts, active_priority_edges(facts))
+}
+
+/// [`goal_priority_edges`] as it would be after the write
+/// [`priority_reading_after`] describes.
+pub fn goal_priority_edges_after<P: TriblePattern>(
+    facts: &P,
+    goal: Id,
+    lowers: impl IntoIterator<Item = Id>,
+) -> BTreeSet<(Id, Id)> {
+    with_structure(facts, priority_reading_after(facts, goal, lowers).edges)
+}
+
+fn with_structure<P: TriblePattern>(
+    facts: &P,
+    mut edges: BTreeSet<(Id, Id)>,
+) -> BTreeSet<(Id, Id)> {
     let goals = goal_ids(facts);
-    let mut edges = active_priority_edges(facts);
     for (child, parent) in find!(
         (child: Id, parent: Id),
         pattern!(facts, [{
@@ -1432,7 +1405,7 @@ mod tests {
         let event = genid().id;
         let goal = genid().id;
         let mut reflexive = entity! { ExclusiveId::force_ref(&event) @
-            metadata::tag: &KIND_PRIORITIZE_ID,
+            metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
             board::higher: &goal,
             board::lower: &goal,
             metadata::created_at: at(1),
@@ -1471,50 +1444,6 @@ mod tests {
             pile.close().unwrap();
         }
         assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
-    }
-
-    /// A priority event whose time does not decode is not an event this
-    /// reader can order, so it is skipped instead of panicking the board.
-    #[test]
-    fn a_priority_event_whose_time_does_not_decode_is_skipped() {
-        let mut raw = at(2_000).raw;
-        raw[16..].copy_from_slice(&at(1_000).raw[16..]);
-        let inverted = IntervalValue::new(raw);
-        let decoded: Result<(i128, i128), _> = inverted.try_from_inline();
-        assert!(decoded.is_err());
-        let (high, low) = (genid().id, genid().id);
-        let mut facts = TribleSet::new();
-        facts += entity! {
-            metadata::tag: &KIND_PRIORITIZE_ID,
-            board::higher: &high,
-            board::lower: &low,
-            metadata::created_at: inverted,
-        };
-        facts += priority_fragment(low, high, true, at(1));
-        assert_eq!(active_priority_edges(&facts), BTreeSet::from([(low, high)]));
-    }
-
-    #[test]
-    fn equal_time_priority_events_use_entity_id_not_insertion_order() {
-        let high = genid().id;
-        let low = genid().id;
-        let activate = priority_fragment(high, low, true, at(7));
-        let deactivate = priority_fragment(high, low, false, at(7));
-        let activate_id = activate.root().unwrap();
-        let deactivate_id = deactivate.root().unwrap();
-
-        let mut left = TribleSet::new();
-        left += activate.clone();
-        left += deactivate.clone();
-        let mut right = TribleSet::new();
-        right += deactivate;
-        right += activate;
-
-        assert_eq!(active_priority_edges(&left), active_priority_edges(&right));
-        assert_eq!(
-            active_priority_edges(&left).contains(&(high, low)),
-            activate_id > deactivate_id
-        );
     }
 
     #[test]
@@ -1845,22 +1774,23 @@ mod tests {
         assert_eq!(ranks[&a], ranks[&b]);
     }
 
-    /// The pairwise events written before snapshots existed stay readable
-    /// beside them, and their edges are united. A link to a snapshot this
-    /// view does not hold is ignored until it arrives.
+    /// The pairwise events written before snapshots existed stay in the
+    /// pile and are not read: only snapshots make priority edges. A link to
+    /// a snapshot this view does not hold is ignored until it arrives.
     #[test]
-    fn pairwise_priority_events_are_read_beside_snapshots() {
+    fn pairwise_priority_events_are_not_read() {
         let (a, b, c) = (genid().id, genid().id, genid().id);
         let mut facts = TribleSet::new();
-        facts += priority_fragment(a, c, true, at(1));
+        facts += entity! {
+            metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
+            board::higher: &a,
+            board::lower: &c,
+            metadata::created_at: at(1),
+        };
         let (b0_record, b0) = snapshot(b, &[], 1);
         facts += b0_record;
         facts += snapshot(a, &[b0, genid().id], 2).0;
-        assert_eq!(legacy_priority_edges(&facts), BTreeSet::from([(a, c)]));
         assert_eq!(priority_reading(&facts).edges, BTreeSet::from([(a, b)]));
-        assert_eq!(
-            active_priority_edges(&facts),
-            BTreeSet::from([(a, b), (a, c)])
-        );
+        assert_eq!(active_priority_edges(&facts), BTreeSet::from([(a, b)]));
     }
 }
