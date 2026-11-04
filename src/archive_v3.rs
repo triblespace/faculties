@@ -266,6 +266,11 @@ pub struct WitnessAnnotations {
     pub claimed_size: Option<u128>,
     pub claimed_media_type: Option<MediaType>,
     pub claimed_title: Option<String>,
+    /// A result status the source records but her window did not render.
+    pub claimed_status: Option<Id>,
+    /// Uris the source records for the held item that her window did not
+    /// render.
+    pub claimed_uri: Vec<String>,
     /// The source marks this occurrence a compaction summary.
     pub compaction_summary: bool,
     /// The source flags the held text as the harness's writing.
@@ -323,6 +328,11 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
     let source_locator = put(&mut fragment, annotations.source_locator);
     let claimed_title = put(&mut fragment, annotations.claimed_title);
     let untruncated = put(&mut fragment, annotations.untruncated);
+    let claimed_uri: Vec<_> = annotations
+        .claimed_uri
+        .into_iter()
+        .map(|uri| fragment.put::<UTF8String, _>(uri))
+        .collect();
     let pointer: Vec<_> = annotations
         .pointer
         .into_iter()
@@ -355,6 +365,8 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
+        schema::witness::claimed_status?: annotations.claimed_status,
+        schema::witness::claimed_uri*: claimed_uri.iter(),
         schema::witness::untruncated?: untruncated,
         metadata::tag*: tags.iter(),
     };
@@ -403,6 +415,8 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             claimed_size,
             claimed_media_type,
             claimed_title,
+            claimed_status,
+            claimed_uri,
             compaction_summary,
             harness_written,
             untruncated,
@@ -424,6 +438,8 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             && claimed_media_type.as_ref().map(MediaType::canonical)
                 == b.claimed_media_type.as_ref().map(MediaType::canonical)
             && *claimed_title == b.claimed_title
+            && *claimed_status == b.claimed_status
+            && set(claimed_uri) == set(&b.claimed_uri)
             && *compaction_summary == b.compaction_summary
             && *harness_written == b.harness_written
             && *untruncated == b.untruncated

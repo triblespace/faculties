@@ -419,6 +419,16 @@ pub mod witness {
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
         /// OCCURRENCE CORE. A title the source gives that her window did not show.
         "7AB9F2216ED53D98D7DF446DE4DF63A1" as pub claimed_title: Handle<UTF8String>;
+        /// OCCURRENCE CORE. A result status (a [`super::fact::status`] term)
+        /// the source records but her window did not render: Drive knows
+        /// whether a call failed even where its codec shows only the
+        /// content. Minted with `trible genid` 2026-11-04.
+        "51819E1707DBE1CC9C958450427514C2" as pub claimed_status: GenId;
+        /// OCCURRENCE CORE, repeatable. A uri the source records for the
+        /// held item that her window did not render (where it rendered one,
+        /// it is the fact's `source_uri`). Minted with `trible genid`
+        /// 2026-11-04.
+        "3E44A059ADB3476BE9D32593ACB97912" as pub claimed_uri: Handle<UTF8String>;
         /// OCCURRENCE CORE. Why the turn the record closes ended, an
         /// [`super::node::ends`] term, as a claim of a record that holds no
         /// node: Codex's `turn_aborted` (ruling X5). Where she produced
