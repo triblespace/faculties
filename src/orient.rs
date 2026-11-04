@@ -22,7 +22,8 @@ mod operations;
 #[cfg(all(test, unix))]
 mod process_tests;
 pub use operations::{
-    BaselineReceipt, NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions, WakePairsOptions,
+    BaselineReceipt, NewsForm, Next, NextKind, Orient, PendingNext, PreparedReport, ShowOptions, WaitOptions,
+    WakeOptions, WakePairsOptions,
 };
 
 /// Receipt facts for a key-private source collection. Event identity is stable

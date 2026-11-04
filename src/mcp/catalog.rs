@@ -4,8 +4,10 @@
 //! discovery do not read environment variables, open a pile or signing key,
 //! load a model, or contact an external service.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use super::Faculty;
 use crate::storage::Storage;
@@ -49,8 +51,9 @@ impl Config {
 /// Owned native adapters in the aggregate's stable registration order.
 /// Protocol/session state belongs to a transport's [`super::Server`], not here.
 pub struct Catalog {
-    faculties: Vec<Box<dyn Faculty + Sync>>,
+    faculties: Vec<Box<dyn Faculty + Send + Sync>>,
     storage: Storage,
+    orient: Arc<orient::mcp::Orient>,
 }
 
 impl Catalog {
@@ -77,7 +80,8 @@ impl Catalog {
             Some(token) => linkedin.with_token(token),
             None => linkedin,
         };
-        let faculties: Vec<Box<dyn Faculty + Sync>> = vec![
+        let orient = Arc::new(orient::mcp::Orient::with_storage(storage.clone()));
+        let faculties: Vec<Box<dyn Faculty + Send + Sync>> = vec![
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),
@@ -99,7 +103,7 @@ impl Catalog {
             Box::new(mail::mcp::Mail::with_storage(storage.clone())),
             Box::new(memory::mcp::Memory::with_storage(storage.clone())),
             Box::new(message::mcp::Message::with_storage(storage.clone())),
-            Box::new(orient::mcp::Orient::with_storage(storage.clone())),
+            Box::new(orient.clone()),
             Box::new(patience::mcp::Patience::with_storage(storage.clone())),
             Box::new(planner::mcp::Planner::with_storage(storage.clone())),
             Box::new(posture::mcp::Posture::with_storage(storage.clone())),
@@ -116,7 +120,7 @@ impl Catalog {
             Box::new(wiki::mcp::Wiki::with_storage(storage.clone())),
             Box::new(world::mcp::WorldTools::new(world_url, world_session)),
         ];
-        Self { faculties, storage }
+        Self { faculties, storage, orient }
     }
 
     /// Flush and close the application-owned store after transport shutdown.
@@ -128,6 +132,41 @@ impl Catalog {
     /// Close storage without losing a transport's error, if it also failed.
     pub fn finish<T>(&self, result: Result<T>) -> Result<T> {
         self.storage.finish(result)
+    }
+
+    /// Project the actual registered schemas before preparing a model prompt.
+    /// No second registration table or transport initialization is needed.
+    pub fn tools(&self) -> impl Iterator<Item = (&super::Tool, &str)> {
+        self.faculties.iter().flat_map(|faculty| {
+            faculty.tools().iter().map(move |tool| (tool, faculty.input_schema(tool)))
+        })
+    }
+
+    /// Invoke the registered adapter directly on an application-owned worker.
+    /// Generic operations retain their usual side-effect/Out acceptance rules.
+    pub fn invoke(
+        &self,
+        name: &str,
+        arguments: super::Bytes,
+        limits: super::Limits,
+        cancelled: &AtomicBool,
+    ) -> Result<super::NativeResult> {
+        if name == "orient_next" {
+            bail!("native orient_next requires prepare_next and acknowledgment after publication");
+        }
+        super::native_argument_budget(&arguments, limits)?;
+        let faculty = self.faculties.iter()
+            .find(|faculty| faculty.tools().iter().any(|tool| tool.name == name))
+            .ok_or_else(|| anyhow::anyhow!("unknown registered faculty tool {name:?}"))?;
+        super::invoke_native(faculty.as_ref(), name, arguments, limits.response_bytes, cancelled)
+    }
+
+    /// The registered Orient adapter, with deferred native acceptance. Its
+    /// continuation shares this Catalog's store; close only after workers join
+    /// and every published result has either acknowledged or reported failure.
+    pub fn prepare_next(&self, arguments: super::Bytes) -> Result<orient::Next> {
+        super::native_argument_budget(&arguments, super::Limits::default())?;
+        self.orient.prepare_next(arguments)
     }
 
     /// Borrow the same adapters for an HTTP listener.
@@ -143,7 +182,7 @@ impl Catalog {
     pub fn sync_registrations(&self) -> Vec<&(dyn Faculty + Sync)> {
         self.faculties
             .iter()
-            .map(|faculty| faculty.as_ref())
+            .map(|faculty| faculty.as_ref() as &(dyn Faculty + Sync))
             .collect()
     }
 }

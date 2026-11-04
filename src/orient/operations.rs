@@ -12,6 +12,9 @@ use health::HealthSources;
 mod receipt_import;
 #[path = "service_events.rs"]
 mod service_events;
+#[path = "next.rs"]
+mod next;
+pub use next::{Next, NextKind, PendingNext, PreparedReport};
 
 #[derive(Clone, Debug)]
 pub struct Orient {
@@ -243,17 +246,8 @@ impl Orient {
     /// No permanent process or competing observer is started by constructing Orient.
     pub fn wait(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
-            runtime.block_on(cmd_wait(
-                &self.storage,
-                pile,
-                signer,
-                self.storage.path(),
-                Some(persona),
-                options,
-                self.health_max_age,
-                self.service_events_collection,
-                out,
-            ))
+            runtime.block_on(cmd_wait(&self.storage, pile, signer, self.storage.path(),
+                Some(persona), options, self.health_max_age, self.service_events_collection, out))
         })
     }
 
@@ -353,7 +347,7 @@ use crate::storage::FactView;
 use crate::storage::FacultySnapshot;
 #[cfg(test)]
 use crate::storage::{open_store, open_store_as, runtime};
-use crate::storage::{read, FactArchive, FacultyStore, Storage};
+use crate::storage::{read, FactArchive, FacultyAccess, FacultyStore, Storage};
 use crate::{
     clock, compass, discord as discord_model, habits, mail as mail_model, message,
     orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
@@ -742,7 +736,7 @@ struct OrientSource {
 impl OrientSource {
     async fn open(
         routing: &Storage,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         scope: Id,
         label: &'static str,
@@ -792,7 +786,7 @@ impl OrientSource {
     /// before selecting the immutable query views. Attached collections need
     /// no WRITE: the store is opened as this signer, whose MAPs are the ones
     /// believed. A foundation left unattached is read from its own bytes.
-    async fn maintain(&self, pile: &mut FacultyStore, signer: &SigningKey) -> Result<()> {
+    async fn maintain(&self, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<()> {
         crate::storage::tolerate_own_lag(pile.maintain_attached(self.succinct, signer).await)
             .with_context(|| format!("maintain {} Succinct collection", self.label))?;
         crate::storage::tolerate_own_lag(pile.maintain_attached(self.rank9, signer).await)
@@ -829,7 +823,7 @@ struct ReceiptSource {
 }
 
 impl ReceiptSource {
-    async fn open(routing: &Storage, pile: &mut FacultyStore, signer: &SigningKey) -> Result<Self> {
+    async fn open(routing: &Storage, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<Self> {
         if routing.collection_routes().is_none() {
             return Self::register(pile, signer);
         }
@@ -905,7 +899,7 @@ impl ReceiptSource {
 /// — see `observe_snapshot`, where projection lag may repeat an event and never
 /// blocks one.
 async fn refresh_receipts_before_observation(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     sources: &OrientSources,
     output: &mut Out<'_>,
@@ -973,7 +967,7 @@ struct OrientSources {
 impl OrientSources {
     async fn open(
         routing: &Storage,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         include_habits: bool,
     ) -> Result<Self> {
@@ -1118,7 +1112,7 @@ impl OrientObservation {
 /// Receipt upkeep has its own best-effort boundary so a failure to refresh
 /// presentation membership cannot suppress otherwise readable attention.
 async fn maintain_inputs(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     sources: &OrientSources,
 ) -> Result<()> {
@@ -1144,7 +1138,7 @@ async fn maintain_inputs(
 
 #[cfg(test)]
 async fn maintain_sources(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     sources: &OrientSources,
 ) -> Result<()> {
@@ -1223,7 +1217,7 @@ fn observe_snapshot(
 
 #[cfg(test)]
 fn observe_current_sources(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
     let snapshot = pile
@@ -1241,6 +1235,16 @@ async fn observe_snapshot_acquiring(
     sources: &OrientSources,
     receipts: bool,
 ) -> Result<OrientObservation> {
+    start_observation(snapshot, sources, receipts, None)
+        .await.context("join frozen Orient input selection")?
+}
+
+fn start_observation(
+    snapshot: FacultySnapshot,
+    sources: &OrientSources,
+    receipts: bool,
+    control: Option<triblespace::core::repo::async_store::AcquiringReadControl>,
+) -> tokio::task::JoinHandle<Result<OrientObservation>> {
     #[cfg(test)]
     sources
         .observations
@@ -1259,10 +1263,12 @@ async fn observe_snapshot_acquiring(
     let status_target = sources.compass_status;
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+        let mut reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+        if let Some(control) = &control { reader = reader.with_control(control.clone()); }
         // The stage lines are the refresh probe's evidence of which targets a
         // refresh attached again; the acquiring reader must keep emitting them.
         let observe = |source: OrientSource| -> Result<OrientFact> {
+            if let Some(control) = &control { control.check()?; }
             let collection = trace_refresh_call(source.label, "attach", || {
                 reader.attached_acquiring(source.rank9)
             })?;
@@ -1322,12 +1328,10 @@ async fn observe_snapshot_acquiring(
             compass_status_collection: status_collection.into_frozen(),
         })
     })
-    .await
-    .context("join frozen Orient input selection")?
 }
 
 async fn observe_current_sources_acquiring(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
     observe_snapshot_acquiring(pile.snapshot()?, sources, true).await
@@ -3662,7 +3666,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
 }
 
 fn presentation_collection_for_write(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
 ) -> Result<Collection<SimpleArchive>> {
@@ -3687,7 +3691,7 @@ fn require_presentation_write(
 }
 
 fn save_presentations(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
     events: impl IntoIterator<Item = Id>,
@@ -3704,7 +3708,7 @@ fn save_presentations(
 
 async fn cmd_baseline(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     persona: Option<&str>,
     health_max_age: Duration,
@@ -3753,7 +3757,7 @@ async fn cmd_baseline(
 
 async fn cmd_show(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     pile_path: &Path,
     persona: Option<&str>,
@@ -3892,7 +3896,7 @@ async fn cmd_show(
 /// a failed read is one line rather than a failed overview.
 fn quota_section(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
 ) -> String {
@@ -4378,7 +4382,7 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
 /// than folded into one fragment. What it DOES acknowledge is itself: the due
 /// events it just displayed, so a rearmed watcher does not display them again.
 fn commit_habit_receipts(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
     due: &[(Id, i64)],
@@ -4400,8 +4404,8 @@ fn commit_habit_receipts(
     Ok(())
 }
 
-async fn apply_prepared_news(
-    pile: &mut FacultyStore,
+async fn apply_prepared_news<S: FacultyAccess>(
+    pile: &mut S,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
     peek: bool,
@@ -4409,7 +4413,7 @@ async fn apply_prepared_news(
     prefix: &str,
     form: NewsForm,
     output: &mut Out<'_>,
-    on_delivery: &mut dyn FnMut(&mut FacultyStore, &SigningKey, super::delivery::DeliveryNotice),
+    on_delivery: &mut dyn FnMut(&mut S, &SigningKey, super::delivery::DeliveryNotice),
 ) -> Result<()> {
     match prepared {
         News::Report {
@@ -4461,7 +4465,7 @@ async fn apply_prepared_news(
 /// not acknowledgment of a body the recipient never saw.
 async fn cmd_poll(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     persona: Option<&str>,
     peek: bool,
@@ -4535,6 +4539,15 @@ struct WaitFrame {
     persona: Id,
     habits: HabitObservation,
     news: News,
+}
+
+/// One exact in-flight selection. Clock boundaries poll this handle again;
+/// they never replace it with another blocking worker. The owning wait joins
+/// it before returning, including on cancellation and publication failure.
+struct WaitSelection {
+    snapshot: FacultySnapshot,
+    control: triblespace::core::repo::async_store::AcquiringReadControl,
+    task: tokio::task::JoinHandle<Result<OrientObservation>>,
 }
 
 struct PendingWaitFrame {
@@ -4622,17 +4635,27 @@ impl WaitFrameLoad {
 }
 
 async fn load_wait_frame(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     sources: &OrientSources,
     snapshot: FacultySnapshot,
     pending: &mut Option<PendingWaitFrame>,
+    selection: &mut Option<WaitSelection>,
     pile_path: &Path,
     persona_input: &str,
     evaluated_at: Epoch,
 ) -> Result<WaitFrameLoad> {
     // The observation and polling baseline are the same immutable prefix.
     // Later selected-payload acquisition cannot swallow a concurrent append.
-    let observation = match observe_snapshot_acquiring(snapshot.clone(), sources, true).await {
+    let selected = selection.get_or_insert_with(|| {
+        let control = pile.read_control().unwrap_or_else(||
+            triblespace::core::repo::async_store::AcquiringReadControl::new(None));
+        WaitSelection { snapshot: snapshot.clone(), task: start_observation(
+            snapshot.clone(), sources, true, Some(control.clone()),
+        ), control }
+    });
+    let result = (&mut selected.task).await.context("join frozen Orient wait selection");
+    let snapshot = selection.take().expect("owned selection").snapshot;
+    let observation = match result? {
         Ok(observation) => observation,
         Err(error) if is_preparation_pending(&error) => {
             let mut fresh =
@@ -4806,16 +4829,17 @@ fn sweep_wait_habits(
 /// validity boundary. Completed cache work remains reusable when the caller
 /// re-observes health before resuming this attention view.
 async fn load_wait_frame_before_health_deadline(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     sources: &OrientSources,
     mut snapshot: FacultySnapshot,
     pending: &mut Option<PendingWaitFrame>,
+    selection: &mut Option<WaitSelection>,
     pile_path: &Path,
     persona_input: &str,
     next_health_change: Option<Epoch>,
     mut evaluated_at: Epoch,
 ) -> Result<Option<WaitFrameLoad>> {
-    let unchanged = pending.as_ref().is_some_and(|pending| {
+    let unchanged = selection.is_none() && pending.as_ref().is_some_and(|pending| {
         pending.observation.as_ref().map_or_else(
             || !wait_storage_changed(&snapshot, &pending.watermark),
             |observation| observation.is_current(&snapshot),
@@ -4875,7 +4899,7 @@ async fn load_wait_frame_before_health_deadline(
             boundary?;
             Ok(None)
         }
-        frame = load_wait_frame(pile, sources, snapshot, pending, pile_path, persona_input, evaluated_at) => frame.map(Some),
+        frame = load_wait_frame(pile, sources, snapshot, pending, selection, pile_path, persona_input, evaluated_at) => frame.map(Some),
     }
 }
 
@@ -4884,13 +4908,14 @@ async fn load_wait_frame_before_health_deadline(
 /// earlier input during upkeep must still be noticed on the next poll. Our own
 /// equations can consequently cause one extra, quiet upkeep pass.
 async fn prepare_wait_frame_before_health_deadline(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     sources: &OrientSources,
     mut snapshot: FacultySnapshot,
     maintained_from: &mut Option<FacultySnapshot>,
     upkeep_interrupted: &mut bool,
     pending: &mut Option<PendingWaitFrame>,
+    selection: &mut Option<WaitSelection>,
     current: Option<&OrientObservation>,
     pile_path: &Path,
     persona_input: &str,
@@ -4899,7 +4924,7 @@ async fn prepare_wait_frame_before_health_deadline(
     mut evaluated_at: Epoch,
     output: &mut Out<'_>,
 ) -> Result<Option<WaitFrameLoad>> {
-    if maintained_from
+    if selection.is_none() && maintained_from
         .as_ref()
         .is_none_or(|previous| wait_storage_changed(&snapshot, previous))
     {
@@ -4941,7 +4966,7 @@ async fn prepare_wait_frame_before_health_deadline(
     tokio::select! {
         _ = wait_timeout_deadline(timeout_at) => Ok(None),
         frame = load_wait_frame_before_health_deadline(
-            pile, sources, snapshot, pending, pile_path, persona_input,
+            pile, sources, snapshot, pending, selection, pile_path, persona_input,
             next_health_change, evaluated_at,
         ) => frame,
     }
@@ -4988,7 +5013,7 @@ async fn wait_timeout_deadline(timeout_at: Option<tokio::time::Instant>) {
 
 async fn cmd_wait(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     pile_path: &Path,
     persona: Option<&str>,
@@ -5018,7 +5043,7 @@ async fn cmd_wait(
 /// a delivery. Successful output still precedes the existing receipt COMMIT.
 async fn cmd_observe(
     routing: &Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     pile_path: &Path,
     persona: Option<&str>,
@@ -5029,6 +5054,30 @@ async fn cmd_observe(
     deadline: Option<Instant>,
     output: &mut Out<'_>,
 ) -> Result<()> {
+    let outcome = observe_wait(
+        routing, pile, signer, pile_path, persona, options, health_max_age,
+        service_events_collection, continuous, deadline, output,
+    ).await?;
+    if !continuous && !outcome.news_printed {
+        output.line(outcome.timeout_text())?;
+    }
+    Ok(())
+}
+
+async fn observe_wait(
+    routing: &Storage,
+    pile: &mut impl FacultyAccess,
+    signer: &SigningKey,
+    pile_path: &Path,
+    persona: Option<&str>,
+    options: &WaitOptions,
+    health_max_age: Duration,
+    service_events_collection: Option<CollectionHandle>,
+    continuous: bool,
+    deadline: Option<Instant>,
+    output: &mut Out<'_>,
+) -> Result<WaitOutcome> {
+    use futures_util::FutureExt;
     let Some(persona_input) = persona else {
         bail!("wait requires a persona (pass --persona <label-or-hex> or set $PERSONA)");
     };
@@ -5045,7 +5094,8 @@ async fn cmd_observe(
         // one-shot wait is not one.
         health.start_beating();
     }
-    let result: Result<WaitOutcome> = async {
+    let mut selection = None;
+    let result = std::panic::AssertUnwindSafe(async {
         let poll = options.poll_interval.max(Duration::from_millis(1));
         let start = Instant::now();
         let timeout_at = deadline
@@ -5143,6 +5193,7 @@ async fn cmd_observe(
                 &mut maintained_from,
                 &mut upkeep_interrupted,
                 &mut pending_frame,
+                &mut selection,
                 None,
                 pile_path,
                 persona_input,
@@ -5462,6 +5513,7 @@ async fn cmd_observe(
                     &mut maintained_from,
                     &mut upkeep_interrupted,
                     &mut pending_frame,
+                    &mut selection,
                     Some(&current),
                     pile_path,
                     persona_input,
@@ -5611,8 +5663,19 @@ async fn cmd_observe(
                 });
             }
         }
+    }).catch_unwind().await;
+    if let Some(selected) = selection.take() {
+        selected.control.cancel();
+        // A deadline does not preempt synchronous decoding/query work. This
+        // join can therefore outlast the logical deadline, and must remain
+        // owned rather than being reported as already settled.
+        let joined = selected.task.await.context("settle frozen Orient selection");
+        if matches!(&result, Ok(Ok(_))) { let _ = joined?; }
     }
-    .await;
+    let result: Result<WaitOutcome> = match result {
+        Ok(result) => result,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     match &result {
         // A run-for deadline reached with a report still unsent is a
         // deliberate stop the daemon maps to Ok, not a failed exit.
@@ -5625,30 +5688,17 @@ async fn cmd_observe(
         }
         Ok(_) => {}
     }
-    let outcome = result?;
-    if continuous {
-        // Timeout/shutdown is not news and must never invoke the delivery sink.
-        return Ok(());
-    }
-    if outcome.news_printed {
-        // Terse path: the News: lines, each item whole, were already
-        // printed inside the wait loop — don't re-dump the full snapshot.
-        return Ok(());
-    }
-    if outcome.view_pending {
-        if outcome.had_ready_frame {
-            output.line(format!(
-                "The latest pile prefix does not yet provide a readable attention view; the watcher retained its last readable snapshot."
-            ))?;
-        } else {
-            output.line(format!(
-                "No fully readable attention view became available before wait ended."
-            ))?;
+    result
+}
+
+impl WaitOutcome {
+    fn timeout_text(&self) -> &'static str {
+        match (self.view_pending, self.had_ready_frame) {
+            (true, true) => "The latest pile prefix does not yet provide a readable attention view; the watcher retained its last readable snapshot.",
+            (true, false) => "No fully readable attention view became available before wait ended.",
+            (false, _) => "No change detected since wait started.",
         }
-        return Ok(());
     }
-    output.line(format!("No change detected since wait started."))?;
-    Ok(())
 }
 
 fn render_tags(tags: &[String]) -> String {
@@ -7498,6 +7548,7 @@ mod tests {
                 &sources,
                 watermark.clone(),
                 &mut pending,
+                &mut None,
                 &fixture.path,
                 &fmt_id(persona),
                 None,
@@ -7567,6 +7618,7 @@ mod tests {
                     &sources,
                     sampled,
                     &mut pending,
+                    &mut None,
                     &fixture.path,
                     "waiting-reader",
                     None,
@@ -7610,6 +7662,7 @@ mod tests {
                 &sources,
                 sampled,
                 &mut pending,
+                &mut None,
                 &fixture.path,
                 "waiting-reader",
                 None,
@@ -8119,6 +8172,7 @@ mod tests {
                 &mut pile,
                 &sources,
                 watermark,
+                &mut None,
                 &mut None,
                 &fixture.path,
                 "gpt",
@@ -9157,6 +9211,7 @@ mod tests {
                 &sources,
                 snapshot,
                 &mut None,
+                &mut None,
                 &fixture.path,
                 "ready-first",
                 Epoch::from_tai_seconds(100.0),
@@ -9734,6 +9789,7 @@ mod tests {
             &sources,
             watermark.clone(),
             &mut None,
+            &mut None,
             &fixture.path,
             "test-persona",
             Epoch::from_tai_seconds(42.0),
@@ -9780,6 +9836,7 @@ mod tests {
             &mut pile,
             &sources,
             sampled,
+            &mut None,
             &mut None,
             &fixture.path,
             "test-persona",
@@ -10084,6 +10141,7 @@ mod tests {
             &mut pile,
             &sources,
             watermark.clone(),
+            &mut None,
             &mut None,
             &fixture.path,
             "not-yet-resident",

@@ -28,6 +28,11 @@ impl Memory {
 
 static TOOLS: &[Tool] = &[
     Tool {
+        name: "memory_raw",
+        description: "Read the exact selected UTF-8 summary of one immutable memory by its full id, including empty text and whitespace. Diagnostic notes remain separate; no formatted show wrapper.",
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string","minLength":32,"maxLength":32}},"required":["id"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "memory_show",
         description: "Show one immutable episode by id/alias prefix or range. Images are native bounded derived image content, never host paths.",
         input_schema: r#"{"type":"object","properties":{"selector":{"type":"string","description":"Immutable chunk id/alias prefix or TAI from..to range."}},"required":["selector"],"additionalProperties":false}"#,
@@ -195,6 +200,12 @@ impl Faculty for Memory {
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
         let memory = &self.operations;
         match name {
+            "memory_raw" => {
+                let args: Id = decode_arguments(arguments)?;
+                let id = triblespace::prelude::Id::from_hex(&args.id)
+                    .ok_or_else(|| invalid_arguments("id must be a full nonzero 32-hex memory id"))?;
+                memory.raw(id, out)
+            }
             "memory_show" => {
                 let args: Selector = decode_arguments(arguments)?;
                 memory.show(&args.selector, out)

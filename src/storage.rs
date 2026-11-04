@@ -96,6 +96,9 @@ pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 
 pub use triblespace::core::repo::async_store::AcquiringReader;
 
+mod borrowed;
+pub(crate) use borrowed::{BorrowedStore, FacultyAccess};
+
 /// Explicit application bindings from a faculty role to one exact descriptor.
 /// Roles are the schema IDs in [`crate::collection_names::table`], not names
 /// discovered from the pile. An absent role is unconfigured, never a default.
@@ -516,12 +519,21 @@ impl Storage {
         host: VerifyingKey,
         operation: impl FnOnce(&mut Session) -> Result<T>,
     ) -> Result<T> {
-        let mut session = self
+        let session = self
             .shared
             .as_ref()
             .expect("shared storage owner")
             .lock()
             .map_err(|_| anyhow!("shared faculty store is poisoned"))?;
+        self.with_session_guard(session, host, operation)
+    }
+
+    fn with_session_guard<T>(
+        &self,
+        mut session: std::sync::MutexGuard<'_, Option<Session>>,
+        host: VerifyingKey,
+        operation: impl FnOnce(&mut Session) -> Result<T>,
+    ) -> Result<T> {
         if session.is_none() {
             let runtime = Arc::new(runtime()?);
             let store = self.open_owned_store(host)?;
@@ -578,6 +590,37 @@ impl Storage {
         let mut store = self.open_owned_store(signer.verifying_key())?;
         let result = operation(&mut store, &signer, &runtime);
         finish_close(result, store.close().context("close faculty store"))
+    }
+
+    /// One observation step over an existing shared owner. A busy owner is
+    /// not an error and does not wait on the mutex: the caller can check its
+    /// cancellation/deadline before retrying. This never creates a second store.
+    /// First opening and synchronous work inside the callback are not preempted.
+    pub fn try_with_store<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut FacultyStore,
+            &SigningKey,
+            &Arc<tokio::runtime::Runtime>,
+        ) -> Result<T>,
+    ) -> Result<Option<T>> {
+        let shared = self.shared.as_ref()
+            .ok_or_else(|| anyhow!("observation steps require a retained storage owner"))?;
+        let session = match shared.try_lock() {
+            Ok(session) => session,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                anyhow::bail!("shared faculty store is poisoned");
+            }
+        };
+        let signer = self.load_signer()?;
+        self.with_session_guard(session, signer.verifying_key(), |session| {
+            operation(
+                session.store.as_mut().expect("open store"),
+                &signer,
+                &session.runtime,
+            )
+        }).map(Some)
     }
 
     /// Borrow the same local backend for operations which use resident-only

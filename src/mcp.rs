@@ -62,6 +62,14 @@ pub trait Faculty {
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()>;
 }
 
+impl<T: Faculty + ?Sized> Faculty for Arc<T> {
+    fn tools(&self) -> &[Tool] { (**self).tools() }
+    fn input_schema<'a>(&'a self, tool: &'a Tool) -> &'a str { (**self).input_schema(tool) }
+    fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
+        (**self).call(name, arguments, out)
+    }
+}
+
 /// Typed argument-decoding failure, reported as JSON-RPC invalid params rather
 /// than as a failed tool operation. An anyhow context preserves this marker.
 #[derive(Debug)]
@@ -505,15 +513,26 @@ impl<'a> Server<'a> {
     }
 }
 
-/// Run one validated tool call, bounding its encoded content to `budget`.
-fn invoke(
+/// Native output from one finite invocation. The same handler, cancellation,
+/// panic and encoded-size policy serves native callers and MCP transports.
+/// Acceptance here is buffering only; it is not remote or model consumption.
+pub struct NativeResult {
+    pub parts: Vec<Part>,
+    pub is_error: bool,
+}
+
+pub fn invoke_native(
     faculty: &dyn Faculty,
     name: &str,
     arguments: Bytes,
     budget: usize,
     cancelled: &AtomicBool,
-) -> std::result::Result<String, RpcError> {
-    let mut content = String::new();
+) -> Result<NativeResult> {
+    if budget < ERROR_RESERVE + 64 {
+        bail!("native faculty output budget cannot hold its error reserve");
+    }
+    let mut parts = Vec::new();
+    let mut encoded_bytes = 0;
     let content_budget = budget.saturating_sub(ERROR_RESERVE + 64);
     let mut rejected = false;
     let result = {
@@ -524,16 +543,14 @@ fn invoke(
             if cancelled.load(Ordering::Relaxed) {
                 bail!("MCP request was cancelled");
             }
-            let separator = usize::from(!content.is_empty());
+            let separator = usize::from(!parts.is_empty());
             match encode_part(
-                part,
-                content_budget.saturating_sub(content.len() + separator),
+                part.clone(),
+                content_budget.saturating_sub(encoded_bytes + separator),
             ) {
                 Ok(encoded) => {
-                    if separator != 0 {
-                        content.push(',');
-                    }
-                    content.push_str(&encoded);
+                    encoded_bytes += encoded.len() + separator;
+                    parts.push(part);
                     Ok(())
                 }
                 Err(error) => {
@@ -547,6 +564,9 @@ fn invoke(
         // accepted output. This does not recover process aborts/OOM, undo
         // effects, repair backend state, or permit automatic retries.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("MCP request was cancelled before invocation");
+            }
             faculty.call(name, arguments, &mut Out::new(&mut emit))
         }))
         .unwrap_or_else(|_| Err(anyhow!(
@@ -555,7 +575,7 @@ fn invoke(
     };
     if let Err(error) = &result {
         if error.is::<InvalidArguments>() {
-            return Err(RpcError::params(&brief(error)));
+            return Err(result.expect_err("invalid argument result"));
         }
     }
     let failed = result.is_err() || rejected;
@@ -565,14 +585,25 @@ fn invoke(
         } else {
             brief(&result.expect_err("failed invocation"))
         };
-        let error_part = encode_part(Part::Text { text: message }, ERROR_RESERVE)
-            .expect("bounded diagnostic fits its reserved space");
-        if !content.is_empty() {
-            content.push(',');
-        }
-        content.push_str(&error_part);
+        parts.push(Part::Text { text: message });
     }
-    Ok(format!("{{\"content\":[{content}],\"isError\":{failed}}}"))
+    Ok(NativeResult { parts, is_error: failed })
+}
+
+/// Run one validated tool call, bounding its encoded content to `budget`.
+fn invoke(
+    faculty: &dyn Faculty,
+    name: &str,
+    arguments: Bytes,
+    budget: usize,
+    cancelled: &AtomicBool,
+) -> std::result::Result<String, RpcError> {
+    let result = invoke_native(faculty, name, arguments, budget, cancelled)
+        .map_err(|error| RpcError::params(&brief(&error)))?;
+    let content = result.parts.into_iter()
+        .map(|part| encode_part(part, budget).expect("native collector checked encoded extent"))
+        .collect::<Vec<_>>().join(",");
+    Ok(format!("{{\"content\":[{content}],\"isError\":{}}}", result.is_error))
 }
 
 fn result_response(limits: Limits, id: &str, result: &str) -> Result<String> {
@@ -655,7 +686,7 @@ struct Envelope {
     duplicate: bool,
 }
 
-fn envelope(mut bytes: Bytes, depth_limit: usize) -> std::result::Result<Envelope, RpcError> {
+fn check_json_depth(bytes: &Bytes, depth_limit: usize) -> std::result::Result<(), RpcError> {
     let invalid = || RpcError::new(-32700, "Parse error");
     std::str::from_utf8(bytes.as_ref()).map_err(|_| invalid())?;
     let mut depth = 0_usize;
@@ -689,6 +720,19 @@ fn envelope(mut bytes: Bytes, depth_limit: usize) -> std::result::Result<Envelop
             }
         }
     }
+    Ok(())
+}
+
+fn native_argument_budget(bytes: &Bytes, limits: Limits) -> Result<()> {
+    if bytes.len() > limits.request_bytes || limits.json_depth == 0 || limits.json_depth > 64 {
+        bail!("native faculty arguments exceed the input/depth budget");
+    }
+    check_json_depth(bytes, limits.json_depth).map_err(|error| invalid_arguments(&error.message))
+}
+
+fn envelope(mut bytes: Bytes, depth_limit: usize) -> std::result::Result<Envelope, RpcError> {
+    let invalid = || RpcError::new(-32700, "Parse error");
+    check_json_depth(&bytes, depth_limit)?;
     sc::skip_ws(&mut bytes);
     let raw = sc::take_value(&mut bytes).map_err(|_| invalid())?;
     sc::skip_ws(&mut bytes);
@@ -909,4 +953,50 @@ fn brief(error: &anyhow::Error) -> String {
     let mut message = Truncated(String::new());
     let _ = write!(&mut message, "{error:#}");
     message.0
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+
+    #[test]
+    fn native_arguments_use_the_existing_nonrecursive_depth_bound() {
+        let deep = Bytes::from(format!("{}0{}", "[".repeat(65), "]".repeat(65)).into_bytes());
+        assert!(native_argument_budget(&deep, Limits::default()).is_err());
+        let quoted = Bytes::from(br#"{"text":"[[[[\\\"{ not nesting"}"#.to_vec());
+        native_argument_budget(&quoted, Limits::default()).unwrap();
+    }
+
+    struct Ordered;
+    impl Faculty for Ordered {
+        fn tools(&self) -> &[Tool] { &[] }
+        fn call(&self, _: &str, _: Bytes, out: &mut Out<'_>) -> Result<()> {
+            out.text("first")?;
+            out.note("second")?;
+            bail!("third: operation failed")
+        }
+    }
+
+    #[test]
+    fn native_invocation_preserves_part_order_and_operation_failure() {
+        let result = invoke_native(&Ordered, "test", Bytes::from(b"{}".to_vec()), 4096, &AtomicBool::new(false)).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.parts, vec![
+            Part::Text { text: "first".to_owned() },
+            Part::Note { text: "second".to_owned() },
+            Part::Text { text: "third: operation failed".to_owned() },
+        ]);
+    }
+
+    #[test]
+    fn native_invocation_cancellation_precedes_handler_side_effects() {
+        struct MustNotRun;
+        impl Faculty for MustNotRun {
+            fn tools(&self) -> &[Tool] { &[] }
+            fn call(&self, _: &str, _: Bytes, _: &mut Out<'_>) -> Result<()> { panic!("handler ran") }
+        }
+        let result = invoke_native(&MustNotRun, "test", Bytes::from(b"{}".to_vec()), 4096, &AtomicBool::new(true)).unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.parts, vec![Part::Text { text: "MCP request was cancelled before invocation".to_owned() }]);
+    }
 }

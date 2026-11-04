@@ -1,4 +1,4 @@
-//! Finite explicit Orient tools; no watcher, wall-clock wait or ambient persona.
+//! Finite explicit Orient tools; no persistent watcher or ambient persona.
 //! Persona selects routing; receipt history belongs to the storage signing key.
 //! Admitted reporting calls maintain the receipt ID-set before selecting it.
 use super::{ShowOptions, WakeOptions};
@@ -24,9 +24,24 @@ impl Orient {
             operations: super::Orient::with_storage(storage),
         }
     }
+
+    /// Native callers retain the report's acknowledgment until publication.
+    pub fn prepare_next(&self, arguments: Bytes) -> Result<super::Next> {
+        let a: NextArguments = decode_arguments(arguments)?;
+        if !(1..=300).contains(&a.timeout_secs) {
+            return Err(crate::mcp::invalid_arguments("timeout_secs must be between 1 and 300"));
+        }
+        self.operations.clone().with_health_max_age(Duration::from_secs(
+            a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
+        )).begin_next(&a.persona, &super::WaitOptions {
+            timeout: Some(Duration::from_secs(a.timeout_secs)),
+            ..Default::default()
+        })
+    }
 }
 
 const TOOLS: &[Tool] = &[
+    Tool { name: "orient_next", description: "Wait for the next directed Orient report for an explicit persona, or a finite timeout. Reuses selected news and Habit clocks, yielding the shared store between observation steps. No permanent watcher. Presented means frontend acceptance of the complete report, never model consumption or handled work. Native Drive defers that acknowledgment until its correlated result publication succeeds. Cooperative cancellation; synchronous Habit scripts retain their existing execution limits.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"timeout_secs":{"type":"integer","minimum":1,"maximum":300,"default":30},"health_max_age_secs":{"type":"integer","minimum":0,"default":180}},"required":["persona"],"additionalProperties":false}"# },
     Tool { name: "orient_show", description: "Observe resident local swarm health first, then messages, mail, goals, window status and current Habit labels from frozen source collections, then the latest Quota reading per provider, account, window and bucket when a Quota collection is routed. Health freshness is reader policy over created_at: health_max_age_secs defaults to 180. No health network probes or blob availability claim. No memory or Wiki. Habit conditions are passive by default; evaluate_habits=true explicitly executes stored local conditions/scripts. Records exact shown attention events only after output acceptance, when persona is supplied.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"health_max_age_secs":{"type":"integer","minimum":0,"default":180},"message_limit":{"type":"integer","minimum":0,"default":10},"doing_limit":{"type":"integer","minimum":0,"default":5},"todo_limit":{"type":"integer","minimum":0,"default":5},"evaluate_habits":{"type":"boolean","default":false}},"additionalProperties":false}"# },
     Tool { name: "orient_wake", description: "Assemble the unchanged charged memory cover, cover-tagged Wiki beliefs and goals. No Habit evaluation. A supplied persona records exact shown attention events after output acceptance.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"chars":{"type":"integer","minimum":0,"default":800000},"doing_limit":{"type":"integer","minimum":0,"default":5},"todo_limit":{"type":"integer","minimum":0,"default":5}},"additionalProperties":false}"# },
     Tool { name: "orient_poll", description: "One finite directed-news observation for an explicit persona. Actionable local health alerts and reports older than health_max_age_secs (default 180) take priority over ordinary payload acquisition; routine progress, healthy heartbeats and recoveries are quiet. Health news contains only the changed alerts requiring attention; use orient_show for the full local snapshot. Defaults to non-consuming peek=true. peek=false records exact reported event IDs after output acceptance; unavailable selected payloads remain pending. No health network probes, Habit scripts or server wait.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"health_max_age_secs":{"type":"integer","minimum":0,"default":180},"peek":{"type":"boolean","default":true}},"required":["persona"],"additionalProperties":false}"# },
@@ -43,6 +58,15 @@ fn chars() -> usize {
 }
 fn yes() -> bool {
     true
+}
+fn thirty() -> u64 { 30 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NextArguments {
+    persona: String,
+    #[serde(default = "thirty")]
+    timeout_secs: u64,
+    health_max_age_secs: Option<u64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +113,19 @@ impl Faculty for Orient {
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
         match name {
+            "orient_next" => {
+                // The ordinary MCP sink retains its existing acceptance
+                // semantics. Drive uses prepare_next instead of this branch.
+                let mut next = self.prepare_next(arguments)?.start()?;
+                loop {
+                    if let Some(report) = next.poll()? {
+                        for part in report.parts() { out.emit(part.clone())?; }
+                        return next.acknowledge(report);
+                    }
+                    if next.is_settled() { bail!("Orient next ended without a complete result"); }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             "orient_show" => {
                 let a: Show = decode_arguments(arguments)?;
                 self.operations

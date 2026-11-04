@@ -49,6 +49,14 @@ fn raw_memory_cli_and_library_preserve_bytes_and_default_framing() {
         let mut parts = Vec::new();
         memory.raw(id, &mut Out::new(&mut |part| { parts.push(part); Ok(()) })).unwrap();
         assert!(matches!(parts.as_slice(), [Part::Text { text: actual }] if actual == text));
+        // The registered native operation is the same exact reader; its
+        // output is not memory_show's formatted projection.
+        let adapter = crate::memory::mcp::Memory::with_storage(storage.clone());
+        let arguments = anybytes::Bytes::from(format!("{{\"id\":\"{id:X}\"}}").into_bytes());
+        let native = crate::mcp::invoke_native(&adapter, "memory_raw", arguments,
+            4096, &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        assert!(!native.is_error);
+        assert!(matches!(native.parts.as_slice(), [Part::Text { text: actual }] if actual == text));
     }
 }
 

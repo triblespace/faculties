@@ -5,7 +5,7 @@ use crate::schemas::service_events::{ServiceCode, ServicePhase, KIND_SERVICE_EVE
 use triblespace_net::{health_record, telemetry};
 
 pub(super) async fn open(
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     handle: CollectionHandle,
 ) -> Result<OrientSource> {

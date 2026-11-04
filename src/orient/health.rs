@@ -44,7 +44,7 @@ pub(super) struct HealthSources {
 impl HealthSources {
     pub(super) async fn open(
         routing: &Storage,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         max_age: Duration,
     ) -> Result<Self> {
@@ -59,12 +59,9 @@ impl HealthSources {
         let relations =
             OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let presentations = ReceiptSource::open(routing, pile, signer).await?;
-        let mut local = pile.store();
-        let latest = local.attach::<LwwRegisterBlob>(
-            health.source,
-            (attrs::node.id(), metadata::created_at.id()),
-        )?;
-        drop(local);
+        let latest = pile.with_local(|local| Ok(local.attach::<LwwRegisterBlob>(
+            health.source, (attrs::node.id(), metadata::created_at.id()),
+        )?))?;
         Ok(Self {
             health,
             latest,
@@ -85,7 +82,7 @@ impl HealthSources {
 
     pub(super) async fn with_service_events(
         mut self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         handle: Option<CollectionHandle>,
     ) -> Result<Self> {
@@ -95,15 +92,14 @@ impl HealthSources {
         Ok(self)
     }
 
-    fn maintain(&self, pile: &FacultyStore, signer: &SigningKey) -> Result<Option<String>> {
+    fn maintain(&self, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<Option<String>> {
         #[cfg(test)]
         self.maintenance_passes
             .set(self.maintenance_passes.get() + 1);
-        let mut local = pile.store();
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
-        pollster::block_on(async {
+        pile.with_local(|local| pollster::block_on(async {
             for source in [&self.health, &self.relations]
                 .into_iter()
                 .chain(self.service_events.as_ref())
@@ -124,18 +120,18 @@ impl HealthSources {
             // is the ordinary path's own upkeep on the resident-only store,
             // so a receipt left unattached is read from its own bytes here
             // too.
-            let receipt_result = self.presentations.maintain(&mut *local, signer).await;
+            let receipt_result = self.presentations.maintain(local, signer).await;
             Ok(receipt_result.err().map(|error| {
                 format!(
                     "Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
                 )
             }))
-        })
+        }))
     }
 
     pub(super) fn observe(
         &self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
     ) -> Result<HealthObservation> {
         // Baseline/show select health, not presentation freshness. Poll has an
@@ -150,7 +146,7 @@ impl HealthSources {
     /// records and proofs throughout; passive attention uses `at` instead.
     pub(super) async fn observe_acquiring(
         &self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
     ) -> Result<HealthObservation> {
         let _receipt_note = self.maintain(pile, signer)?;
@@ -211,7 +207,7 @@ impl HealthSources {
 
     fn maintain_if_changed(
         &mut self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
     ) -> Result<bool> {
         let before = pile.snapshot()?;
@@ -238,7 +234,7 @@ impl HealthSources {
     /// An unresolved resident persona leaves the normal resolution path intact.
     pub(super) async fn poll(
         &mut self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         input: &str,
         peek: bool,
@@ -251,13 +247,40 @@ impl HealthSources {
     /// [`Self::poll`], writing any report in `form`.
     pub(super) async fn poll_in(
         &mut self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         input: &str,
         peek: bool,
         form: NewsForm,
         output: &mut Out<'_>,
     ) -> Result<(bool, Option<Epoch>)> {
+        let (news, next_change) = self.prepare(pile, signer, input, output)?;
+        let fired = matches!(news, News::Report { .. });
+        apply_prepared_news(
+            pile,
+            signer,
+            self.presentations.source,
+            peek,
+            &news,
+            "",
+            form,
+            output,
+            &mut path_observer(self.news_path_target()),
+        )
+        .await?;
+        Ok((fired, next_change))
+    }
+
+    /// Select the same resident health report without accepting its delivery.
+    /// Native callers retain the existing Presented acknowledgment with the
+    /// prepared report until their result publication has succeeded.
+    pub(super) fn prepare(
+        &mut self,
+        pile: &mut impl FacultyAccess,
+        signer: &SigningKey,
+        input: &str,
+        output: &mut Out<'_>,
+    ) -> Result<(News, Option<Epoch>)> {
         self.maintain_if_changed(pile, signer)?;
         if let Some(note) = &self.receipt_maintenance_note {
             output.note(note.clone())?;
@@ -272,30 +295,16 @@ impl HealthSources {
             .expect("poll selected a health view");
         let report = observation.attention();
         if report.attention.is_empty() {
-            return Ok((false, report.next_change));
+            return Ok((News::Quiet, report.next_change));
         }
         let persona = match observation.persona(input) {
             Ok(persona) => persona,
             Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {
-                return Ok((false, report.next_change));
+                return Ok((News::Quiet, report.next_change));
             }
             Err(error) => return Err(error),
         };
-        let news = observation.news(persona, &report);
-        let fired = matches!(news, News::Report { .. });
-        apply_prepared_news(
-            pile,
-            signer,
-            self.presentations.source,
-            peek,
-            &news,
-            "",
-            form,
-            output,
-            &mut path_observer(self.news_path_target()),
-        )
-        .await?;
-        Ok((fired, report.next_change))
+        Ok((observation.news(persona, &report), report.next_change))
     }
 
     fn refresh_poll_view(&mut self, sampled: FacultySnapshot, now: Epoch) -> Result<()> {
@@ -467,7 +476,7 @@ pub(super) struct NewsPathTarget {
 /// Record one deferred attempt before its backoff. Called by the delivery
 /// seam with the store it already owns; writes nothing else and polls nothing.
 pub(super) fn record_news_path_retry(
-    store: &mut FacultyStore,
+    store: &mut impl FacultyAccess,
     signer: &SigningKey,
     path: &NewsPathTarget,
     attempt: u64,
@@ -520,7 +529,7 @@ pub(super) enum NewsPathNotice<'a> {
 /// The single wiring point for the delivery seam: each notice maps to exactly
 /// one of the two record functions.
 pub(super) fn on_delivery_notice(
-    store: &mut FacultyStore,
+    store: &mut impl FacultyAccess,
     signer: &SigningKey,
     path: &NewsPathTarget,
     notice: NewsPathNotice<'_>,
@@ -539,11 +548,11 @@ pub(super) fn on_delivery_notice(
 /// It captures only a clone of health state (no Storage owner), maps each
 /// notice to its record, and never fails or delays the delivery: a record
 /// that cannot be written is noted on stderr. No news path, no records.
-pub(super) fn path_observer(
+pub(super) fn path_observer<S: FacultyAccess>(
     target: Option<NewsPathTarget>,
-) -> impl FnMut(&mut FacultyStore, &SigningKey, crate::orient::delivery::DeliveryNotice) {
+) -> impl FnMut(&mut S, &SigningKey, crate::orient::delivery::DeliveryNotice) {
     use crate::orient::delivery::DeliveryNotice;
-    move |store: &mut FacultyStore, signer: &SigningKey, notice: DeliveryNotice| {
+    move |store: &mut S, signer: &SigningKey, notice: DeliveryNotice| {
         let Some(target) = target.as_ref() else {
             return;
         };
@@ -564,7 +573,7 @@ pub(super) fn path_observer(
 /// Record an accepted delivery, but only on a transition: the first in the
 /// session, or the first after a retry. Any complete accepted report counts.
 pub(super) fn record_news_path_delivered(
-    store: &mut FacultyStore,
+    store: &mut impl FacultyAccess,
     signer: &SigningKey,
     path: &NewsPathTarget,
 ) -> Result<()> {
@@ -593,7 +602,7 @@ pub(super) fn record_news_path_delivered(
 /// Commit one news-path record, refusing first when this key is not admitted
 /// to WRITE: a record readers would ignore is not a publication.
 fn publish(
-    store: &mut FacultyStore,
+    store: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
     record: Fragment,
@@ -639,7 +648,7 @@ impl HealthSources {
     /// exit, it never decides or alters one.
     pub(super) fn record_exit(
         &self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         error: &anyhow::Error,
         output: &mut Out<'_>,
@@ -674,7 +683,7 @@ impl HealthSources {
     /// observer already runs; no timer, task or retry of its own.
     fn beat_if_due(
         &mut self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         signer: &SigningKey,
         input: &str,
         now: Epoch,
@@ -1391,7 +1400,7 @@ impl HealthObservation {
 
     pub(super) async fn persona_acquiring(
         &self,
-        pile: &mut FacultyStore,
+        pile: &mut impl FacultyAccess,
         input: &str,
     ) -> Result<Id> {
         read(pile, &self.snapshot, |reader| {

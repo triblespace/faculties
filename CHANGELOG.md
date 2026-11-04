@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Native applications can invoke the actual Faculty catalog with ordered resident
+  output and the same bounded MCP error/cancellation policy. `orient_next` is a
+  finite explicit-persona wait: observation steps release the existing shared
+  store, retain selected payload/Habit context, and can return an opaque report
+  whose existing Presented acknowledgment follows result publication. Buffering
+  or dropping that report never records presentation; receipt/close errors remain
+  visible. This is delivery acceptance, not model consumption or handled work.
+
 - **Quota: provider-reported subscription usage in the pile.** A new `quota`
   faculty and collection (scope `6B6C08A47B334284A56279D961255250`, name
   `quota`) records one immutable observation per reading: provider (`claude`
