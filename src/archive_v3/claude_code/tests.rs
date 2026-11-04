@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 use anybytes::View;
 use serde_json::{json, Value};
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::Handle;
-use triblespace::core::repo::BlobStoreGet;
 
 use super::*;
 use crate::archive_v3::gate::{self, Kind, Report};
@@ -230,7 +230,10 @@ fn every_tool_result_item_passes_the_gate() {
         window[..2],
         [
             (v3::fact::modality::SYSTEM, Some(v3::fact::absent::BODY)),
-            (v3::fact::modality::TOOL_DEFINITION, Some(v3::fact::absent::SPAN)),
+            (
+                v3::fact::modality::TOOL_DEFINITION,
+                Some(v3::fact::absent::SPAN)
+            ),
         ]
     );
 }
@@ -238,13 +241,32 @@ fn every_tool_result_item_passes_the_gate() {
 #[test]
 fn text_images_documents_and_calls_pass() {
     let source = jsonl(&[
-        user("u1", None, 0, json!([
-            said("Look at these."),
-            {"type": "image", "source": {"type": "base64", "media_type": "image/PNG", "data": PNG}},
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": PDF}},
-        ])),
-        assistant("a1", "u1", 1, "m1", said("I see a picture and a file."), json!(null)),
-        assistant("a2", "a1", 2, "m1", call("t1", "Read", json!({"file_path": "/x", "limit": 1.50})), json!("tool_use")),
+        user(
+            "u1",
+            None,
+            0,
+            json!([
+                said("Look at these."),
+                {"type": "image", "source": {"type": "base64", "media_type": "image/PNG", "data": PNG}},
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": PDF}},
+            ]),
+        ),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            said("I see a picture and a file."),
+            json!(null),
+        ),
+        assistant(
+            "a2",
+            "a1",
+            2,
+            "m1",
+            call("t1", "Read", json!({"file_path": "/x", "limit": 1.50})),
+            json!("tool_use"),
+        ),
         user("u2", Some("a2"), 3, result("t1", json!("  \n"))),
         assistant("a3", "u2", 4, "m2", said("Done."), json!("end_turn")),
     ]);
@@ -259,7 +281,14 @@ fn text_images_documents_and_calls_pass() {
 fn sealed_thinking_is_bytes_and_its_readable_text_a_gloss() {
     let source = jsonl(&[
         user("u1", None, 0, json!("Think first.")),
-        assistant("a1", "u1", 1, "m1", thinking("A summary of my thinking."), json!(null)),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            thinking("A summary of my thinking."),
+            json!(null),
+        ),
         assistant("a2", "a1", 2, "m1", thinking(""), json!(null)),
         assistant("a3", "a2", 3, "m1", said("Thought."), json!("end_turn")),
     ]);
@@ -283,13 +312,22 @@ fn sealed_thinking_is_bytes_and_its_readable_text_a_gloss() {
     assert!(import(unknown.as_bytes()).is_err());
     // Only the empty drop names the path for that model, so readable text
     // there is a finding.
-    assert!(walk_rows(&unknown)
-        .contains(&("{assistant}.message{message}.content[]{thinking}.thinking".to_owned(), Kind::Empty)));
+    assert!(walk_rows(&unknown).contains(&(
+        "{assistant}.message{message}.content[]{thinking}.thinking".to_owned(),
+        Kind::Empty
+    )));
 }
 
 #[test]
 fn harness_text_in_her_slot_is_voiced_input() {
-    let mut error = assistant("a1", "u1", 1, "m1", said("API Error: synthetic"), json!("stop_sequence"));
+    let mut error = assistant(
+        "a1",
+        "u1",
+        1,
+        "m1",
+        said("API Error: synthetic"),
+        json!("stop_sequence"),
+    );
     error["message"]["model"] = json!("<synthetic>");
     error["message"]["stop_sequence"] = json!("");
     error["isApiErrorMessage"] = json!(true);
@@ -313,7 +351,12 @@ fn harness_text_in_her_slot_is_voiced_input() {
 
 #[test]
 fn interruptions_end_the_message_they_interrupt() {
-    let mut stop = user("u2", Some("a1"), 2, json!([said("[Request interrupted by user]")]));
+    let mut stop = user(
+        "u2",
+        Some("a1"),
+        2,
+        json!([said("[Request interrupted by user]")]),
+    );
     stop["interruptedMessageId"] = json!("m1");
     let source = jsonl(&[
         user("u1", None, 0, json!("Go.")),
@@ -324,20 +367,35 @@ fn interruptions_end_the_message_they_interrupt() {
     let going = nodes_saying(&imported, "Going")[0];
     assert_eq!(ends_of(&imported, going), vec![v3::node::ends::INTERRUPTED]);
     // The notice she was shown is an `in` fact of its own.
-    assert_eq!(nodes_saying(&imported, "[Request interrupted by user]").len(), 1);
+    assert_eq!(
+        nodes_saying(&imported, "[Request interrupted by user]").len(),
+        1
+    );
 }
 
 #[test]
 fn transcript_only_records_and_tool_originals_are_dropped() {
     let mut hidden = user("u2", Some("u1"), 1, json!("Shown in the transcript only."));
     hidden["isVisibleInTranscriptOnly"] = json!(true);
-    let mut answer = user("u3", Some("a1"), 3, result("t1", json!([said("one result")])));
+    let mut answer = user(
+        "u3",
+        Some("a1"),
+        3,
+        result("t1", json!([said("one result")])),
+    );
     answer["toolUseResult"] = json!({"stdout": "the full original", "originalFile": "x"});
     answer["sourceToolAssistantUUID"] = json!("a1");
     let source = jsonl(&[
         user("u1", None, 0, json!("Start.")),
         hidden,
-        assistant("a1", "u2", 2, "m1", call("t1", "Bash", json!({"command": "true"})), json!("tool_use")),
+        assistant(
+            "a1",
+            "u2",
+            2,
+            "m1",
+            call("t1", "Bash", json!({"command": "true"})),
+            json!("tool_use"),
+        ),
         answer,
     ]);
     let imported = passes(&source);
@@ -401,11 +459,19 @@ fn shape(second: u32, system: &str, tools: &[(&str, &str)]) -> Value {
 #[test]
 fn recorded_system_prompts_and_tools_open_the_window() {
     let source = jsonl(&[
-        shape(0, "You are synthetic.", &[("Search", "Search the web."), ("Read", "Read a file.")]),
+        shape(
+            0,
+            "You are synthetic.",
+            &[("Search", "Search the web."), ("Read", "Read a file.")],
+        ),
         user("u1", None, 1, json!("Search for it.")),
         assistant("a1", "u1", 2, "m1", said("Searching."), json!("end_turn")),
         // A new shape: later windows are rebuilt on it, with copies.
-        shape(3, "You are synthetic, again.", &[("Search", "Search the web.")]),
+        shape(
+            3,
+            "You are synthetic, again.",
+            &[("Search", "Search the web.")],
+        ),
         user("u2", Some("a1"), 4, json!("Again.")),
         assistant("a2", "u2", 5, "m2", said("Again."), json!("end_turn")),
     ]);
@@ -457,7 +523,10 @@ fn compaction_starts_a_root_that_continues_and_recalls() {
     let continues = annotated!(imported, v3::node::continues);
     assert_eq!(continues.len(), 1);
     assert_eq!(continues[0].0, summary);
-    assert!(two.contains(&continues[0].1), "it continues from the old tail");
+    assert!(
+        two.contains(&continues[0].1),
+        "it continues from the old tail"
+    );
     let recalls = annotated!(imported, v3::node::recalls);
     assert_eq!(recalls.len(), 1);
     assert!(two.contains(&recalls[0].0) && two.contains(&recalls[0].1));
@@ -469,7 +538,14 @@ fn compaction_starts_a_root_that_continues_and_recalls() {
 
 #[test]
 fn dropped_thinking_leaves_her_window() {
-    let mut second = assistant("a3", "u2", 4, "m2", said("Second answer."), json!("end_turn"));
+    let mut second = assistant(
+        "a3",
+        "u2",
+        4,
+        "m2",
+        said("Second answer."),
+        json!("end_turn"),
+    );
     second["message"]["input_transformations"] = json!([
         {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}
     ]);
@@ -482,7 +558,14 @@ fn dropped_thinking_leaves_her_window() {
     let source = jsonl(&[
         user("u1", None, 0, json!("First.")),
         assistant("a1", "u1", 1, "m1", thinking("first thoughts"), json!(null)),
-        assistant("a2", "a1", 2, "m1", said("First answer."), json!("end_turn")),
+        assistant(
+            "a2",
+            "a1",
+            2,
+            "m1",
+            said("First answer."),
+            json!("end_turn"),
+        ),
         user("u2", Some("a2"), 3, json!("Second.")),
         second,
         drop,
@@ -491,7 +574,9 @@ fn dropped_thinking_leaves_her_window() {
     let answer = nodes_saying(&imported, "Second answer.")[0];
     let window = window_before(&imported, answer);
     assert!(
-        !window.iter().any(|(m, _)| *m == v3::fact::modality::THINKING),
+        !window
+            .iter()
+            .any(|(m, _)| *m == v3::fact::modality::THINKING),
         "the dropped block is not in the window she was sampled from"
     );
     // The first answer and the prompt after it are copies.
@@ -513,8 +598,20 @@ fn cleared_results_are_body_gaps_in_her_window() {
     ]});
     let source = jsonl(&[
         user("u1", None, 0, json!("Run it.")),
-        assistant("a1", "u1", 1, "m1", call("t1", "Bash", json!({"command": "ls"})), json!("tool_use")),
-        user("u2", Some("a1"), 2, result("t1", json!([said("a long listing")]))),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            call("t1", "Bash", json!({"command": "ls"})),
+            json!("tool_use"),
+        ),
+        user(
+            "u2",
+            Some("a1"),
+            2,
+            result("t1", json!([said("a long listing")])),
+        ),
         assistant("a2", "u2", 3, "m2", said("Listed."), json!("end_turn")),
         user("u3", Some("a2"), 4, json!("And now?")),
         later,
@@ -525,7 +622,11 @@ fn cleared_results_are_body_gaps_in_her_window() {
     assert!(window.contains(&(v3::fact::modality::TEXT, Some(v3::fact::absent::BODY))));
     assert!(window.contains(&(v3::fact::modality::TOOL_RESULT, None)));
     let listing = nodes_saying(&imported, "a long listing");
-    assert_eq!(listing.len(), 1, "the cleared text is only in the earlier window");
+    assert_eq!(
+        listing.len(),
+        1,
+        "the cleared text is only in the earlier window"
+    );
 }
 
 #[test]
@@ -543,18 +644,34 @@ fn titles_and_recaps_are_glosses() {
         recap,
     ]);
     let imported = passes(&source);
-    assert_eq!(glosses(&imported, v3::gloss::category::TITLE), vec!["A synthetic chat"]);
-    assert_eq!(glosses(&imported, v3::gloss::category::RECAP), vec!["While away: one answer."]);
+    assert_eq!(
+        glosses(&imported, v3::gloss::category::TITLE),
+        vec!["A synthetic chat"]
+    );
+    assert_eq!(
+        glosses(&imported, v3::gloss::category::RECAP),
+        vec!["While away: one answer."]
+    );
 }
 
 #[test]
 fn wire_inputs_must_mirror_the_call() {
-    let mut a1 = assistant("a1", "u1", 1, "m1", call("t1", "Bash", json!({"command": "ls"})), json!("tool_use"));
+    let mut a1 = assistant(
+        "a1",
+        "u1",
+        1,
+        "m1",
+        call("t1", "Bash", json!({"command": "ls"})),
+        json!("tool_use"),
+    );
     a1["wireToolInputs"] = json!({"t1": {"command": "ls"}});
     let source = jsonl(&[user("u1", None, 0, json!("Run.")), a1]);
     passes(&source);
 
-    let differs = source.replace("\"wireToolInputs\":{\"t1\":{\"command\":\"ls\"}}", "\"wireToolInputs\":{\"t1\":{\"command\":\"ls -l\"}}");
+    let differs = source.replace(
+        "\"wireToolInputs\":{\"t1\":{\"command\":\"ls\"}}",
+        "\"wireToolInputs\":{\"t1\":{\"command\":\"ls -l\"}}",
+    );
     assert_ne!(differs, source);
     assert_eq!(refused(&differs).path, "{assistant}.wireToolInputs");
     assert!(walk_rows(&differs).contains(&("{assistant}.wireToolInputs".to_owned(), Kind::Mirror)));
@@ -628,7 +745,9 @@ fn real_sample() {
     let mut walk_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut gate_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     for file in &files {
-        let Ok(bytes) = std::fs::read(file) else { continue };
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
         let walked = gate::walk::walk(&TABLE, &bytes);
         let mut seen = std::collections::BTreeSet::new();
         for (path, kind, _) in &walked.rows {
@@ -641,7 +760,9 @@ fn real_sample() {
         match import(&bytes) {
             Err(failure) => {
                 import_failed += 1;
-                *first_failures.entry((failure.path, failure.reason)).or_default() += 1;
+                *first_failures
+                    .entry((failure.path, failure.reason))
+                    .or_default() += 1;
             }
             Ok(mut fragment) => {
                 let blobs = fragment.blobs_mut().snapshot().unwrap();
@@ -651,13 +772,21 @@ fn real_sample() {
                 } else {
                     gate_failed += 1;
                     for row in report.rows {
-                        *gate_failures.entry((row.path, row.kind.to_string())).or_default() += 1;
+                        *gate_failures
+                            .entry((row.path, row.kind.to_string()))
+                            .or_default() += 1;
                     }
                 }
             }
         }
     }
-    println!("files {} passed {} import-failed {} gate-failed {}", files.len(), passed, import_failed, gate_failed);
+    println!(
+        "files {} passed {} import-failed {} gate-failed {}",
+        files.len(),
+        passed,
+        import_failed,
+        gate_failed
+    );
     println!("-- importer's first failure: files, path, reason");
     for ((path, reason), count) in &first_failures {
         println!("{count}\t{path}\t{reason}");
