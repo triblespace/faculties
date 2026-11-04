@@ -1,4 +1,4 @@
-//! Collection-native Wiki values and strict revision-DAG reads.
+//! Collection-native Wiki values and open-world revision-DAG reads.
 //!
 //! Native revision identity is the authored artifact
 //! (author, title, content, tags, supersedes). Legacy version entities remain
@@ -7,6 +7,16 @@
 //! to publish the artifact, but is not thereby asserted to be its author. No
 //! fragment anchor, alias entity, mutable head, or migration marker
 //! participates in either model.
+//!
+//! Every read is a typed query at its point of use; nothing loads the
+//! collection into a catalog first. A fact a reader does not model is ignored,
+//! an incomplete or undecodable row matches no pattern, and several values
+//! for one attribute are each read: [`revision_records`] returns one reading
+//! per complete combination under the one id. Supersession is read as the
+//! maintained latest index reads it: every target of a supersedes fact is
+//! superseded, whatever asserts it, so every member of a supersedes cycle is
+//! retired and its entry has no current state. Writes validate their own
+//! inputs ([`revision_record`], [`tag_record`]); no read refuses a union.
 
 pub mod cli;
 pub mod mcp;
@@ -26,7 +36,6 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::metadata;
-use triblespace::core::query::register::{resolve, ObservationOrder, RegisterOrder};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
@@ -34,9 +43,8 @@ use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::wiki::{
-    attrs, authorship_fragment, extract_link_targets, revision_fragment,
-    revision_fragment_from_handles, TextHandle, DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION,
-    KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
+    attrs, authorship_fragment, extract_link_targets, revision_fragment, TextHandle,
+    DEFAULT_SCOPE_ID, KIND_AUTHORSHIP, KIND_REVISION, KIND_VERSION_ID, TAG_ARCHIVED_ID, TAG_SPECS,
 };
 use crate::storage::FactArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -104,96 +112,17 @@ pub struct EntryRecord {
     pub frontier: Vec<RevisionRecord>,
 }
 
-// TODO: Shadowmodel 👻
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RevisionReadModel {
-    revisions: BTreeMap<Id, RevisionRecord>,
-    entries: Vec<EntryRecord>,
-}
-
-impl RevisionReadModel {
-    pub fn revision_records(&self) -> impl ExactSizeIterator<Item = &RevisionRecord> {
-        self.revisions.values()
+impl EntryRecord {
+    /// The entry's stable name: its least root, or, when every member
+    /// supersedes another member (a supersedes cycle has no root), its least
+    /// member.
+    pub fn label(&self) -> Id {
+        *self
+            .roots
+            .first()
+            .or_else(|| self.members.first())
+            .expect("an entry has at least one member")
     }
-
-    pub fn revision(&self, id: Id) -> Option<&RevisionRecord> {
-        self.revisions.get(&id)
-    }
-
-    pub fn all_entries(&self) -> Vec<EntryRecord> {
-        self.entries.clone()
-    }
-
-    pub fn list_entries(&self) -> Vec<EntryRecord> {
-        self.entries
-            .iter()
-            .filter(|entry| {
-                !entry
-                    .frontier
-                    .iter()
-                    .all(|revision| revision.tags.contains(&TAG_ARCHIVED_ID))
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub fn cover_entries(&self, cover: Id) -> Vec<EntryRecord> {
-        self.entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .frontier
-                    .iter()
-                    .any(|revision| revision.tags.contains(&cover))
-            })
-            .cloned()
-            .collect()
-    }
-
-    pub fn entry_containing(&self, revision: Id) -> Option<&EntryRecord> {
-        self.entries
-            .iter()
-            .find(|entry| entry.members.binary_search(&revision).is_ok())
-    }
-
-    /// Causal history, dependencies first. Timestamp and id only order
-    /// concurrently-ready revisions; they never override supersedes.
-    pub fn history(&self, entry: &EntryRecord) -> Vec<RevisionRecord> {
-        let members: BTreeSet<Id> = entry.members.iter().copied().collect();
-        let mut emitted = BTreeSet::new();
-        let mut output = Vec::with_capacity(members.len());
-        while emitted.len() < members.len() {
-            let mut ready: Vec<&RevisionRecord> = members
-                .iter()
-                .filter(|id| !emitted.contains(*id))
-                .filter_map(|id| self.revisions.get(id))
-                .filter(|record| {
-                    record
-                        .supersedes
-                        .iter()
-                        .filter(|id| members.contains(*id))
-                        .all(|id| emitted.contains(id))
-                })
-                .collect();
-            ready.sort_by_key(|record| (record.authored_at().map(|value| value.raw), record.id));
-            if ready.is_empty() {
-                break;
-            }
-            for record in ready {
-                emitted.insert(record.id);
-                output.push(record.clone());
-            }
-        }
-        output
-    }
-}
-
-// TODO: Shadowmodel 👻
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WikiCatalog {
-    pub revisions: RevisionReadModel,
-    pub tag_names: BTreeMap<Id, TextHandle>,
-    pub author_keys: BTreeMap<Id, PublicKeyValue>,
 }
 
 /// One coherent, shard-preserving Wiki query snapshot and its maintained
@@ -225,48 +154,6 @@ impl WikiQuerySnapshot {
         (self.facts, self.store_snapshot, self.latest)
     }
 }
-// TODO: If a migration needs this it should move there, import shouldn't need it.
-/// Strict detached Wiki projection retained for migrations and import
-/// preflight. Ordinary readers use [`WikiQuerySnapshot`] instead.
-pub struct WikiSnapshot {
-    facts: TribleSet,
-    store_snapshot: PileSnapshot,
-    latest: LatestIndex,
-    latest_lag: usize,
-    catalog: WikiCatalog,
-}
-
-impl WikiSnapshot {
-    pub fn facts(&self) -> &TribleSet {
-        &self.facts
-    }
-
-    pub fn store_snapshot(&self) -> &PileSnapshot {
-        &self.store_snapshot
-    }
-
-    pub fn latest(&self) -> &LatestIndex {
-        &self.latest
-    }
-
-    /// Source foundations the supersession index does not answer for in
-    /// this snapshot: none it has an attachment for, and none whose bytes are
-    /// here to build one from in memory. A revision can be in the facts
-    /// before the index is attached to it; the index then reads it from its
-    /// bytes, and only a revision whose bytes are not here is lag.
-    pub fn latest_lag(&self) -> usize {
-        self.latest_lag
-    }
-
-    pub fn catalog(&self) -> &WikiCatalog {
-        &self.catalog
-    }
-
-    pub fn into_parts(self) -> (TribleSet, PileSnapshot, LatestIndex, WikiCatalog) {
-        (self.facts, self.store_snapshot, self.latest, self.catalog)
-    }
-}
-
 /// Maintained positive latest-state projection used for Wiki frontiers.
 pub fn latest_collection<S>(
     store: &mut S,
@@ -300,10 +187,6 @@ pub struct RevisionDraft {
     pub predecessors: BTreeSet<Id>,
     pub author: Id,
     pub authored_at: IntervalValue,
-}
-
-fn ids_of_kind<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
-    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &kind }])).collect()
 }
 
 fn id_values<P: TriblePattern>(
@@ -340,26 +223,6 @@ fn interval_values<P: TriblePattern>(
         pattern!(space, [{ entity @ attribute: ?value }])
     )
     .collect()
-}
-
-fn exactly_one<T: Copy + Ord>(values: BTreeSet<T>, entity: Id, field: &str) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "Wiki entity {entity:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(*values.first().expect("cardinality checked"))
-}
-
-fn at_most_one<T: Copy + Ord>(values: BTreeSet<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "Wiki entity {entity:x} has {} values for {field}; expected at most one",
-            values.len()
-        );
-    }
-    Ok(values.first().copied())
 }
 
 fn require_point(field: &str, value: IntervalValue) -> Result<()> {
@@ -503,6 +366,26 @@ pub fn revision_records<P: TriblePattern>(space: &P, id: Id) -> Vec<RevisionReco
     records
 }
 
+/// True when `id` matches either typed revision pattern [`revision_ids`] uses.
+fn is_revision<P: TriblePattern>(space: &P, id: Id) -> bool {
+    exists!(
+        (),
+        pattern!(space, [{
+            id @ metadata::tag: &KIND_REVISION,
+            attrs::title: _?title,
+            attrs::content: _?content,
+            attrs::author: _?author,
+        }])
+    ) || exists!(
+        (),
+        pattern!(space, [{
+            id @ metadata::tag: &KIND_VERSION_ID,
+            attrs::title: _?title,
+            attrs::content: _?content,
+        }])
+    )
+}
+
 fn adjacent_revisions<P: TriblePattern>(space: &P, revision: Id) -> BTreeSet<Id> {
     let predecessors = find!(
         id: Id,
@@ -514,15 +397,15 @@ fn adjacent_revisions<P: TriblePattern>(space: &P, revision: Id) -> BTreeSet<Id>
     );
     predecessors
         .chain(successors)
-        .filter(|id| !revision_records(space, *id).is_empty())
+        .filter(|id| is_revision(space, *id))
         .collect()
 }
 
-/// The connected revision entry containing `seed`, projected at the point of
-/// use. Only the supersession relation is traversed; no whole-Wiki catalog is
-/// constructed.
-pub fn entry<P: TriblePattern>(space: &P, latest: &LatestIndex, seed: Id) -> Option<EntryRecord> {
-    if revision_records(space, seed).is_empty() {
+/// Every revision connected to `seed` through supersedes facts in either
+/// direction, `seed` included; None when `seed` is not a revision. A
+/// supersedes fact naming something that is not a revision connects nothing.
+pub fn entry_members<P: TriblePattern>(space: &P, seed: Id) -> Option<BTreeSet<Id>> {
+    if !is_revision(space, seed) {
         return None;
     }
     let mut members = BTreeSet::from([seed]);
@@ -534,6 +417,20 @@ pub fn entry<P: TriblePattern>(space: &P, latest: &LatestIndex, seed: Id) -> Opt
             }
         }
     }
+    Some(members)
+}
+
+/// The connected revision entry containing `seed`, projected at the point of
+/// use. Only the supersession relation is traversed; no whole-Wiki catalog is
+/// constructed.
+///
+/// Roots are the members superseding no other member; a revision whose
+/// predecessor is absent is therefore a root. The frontier is the members the
+/// latest index holds: empty when every member is superseded (a cycle, or a
+/// supersedes claim from outside the Wiki), or when a detached index has not
+/// yet seen the entry.
+pub fn entry<P: TriblePattern>(space: &P, latest: &LatestIndex, seed: Id) -> Option<EntryRecord> {
+    let members = entry_members(space, seed)?;
     let roots = members
         .iter()
         .copied()
@@ -567,11 +464,17 @@ pub fn entries<P: TriblePattern>(space: &P, latest: &LatestIndex) -> Vec<EntryRe
             entries.push(entry);
         }
     }
-    entries.sort_by_key(|entry| entry.roots.first().copied());
+    entries.sort_by_key(EntryRecord::label);
     entries
 }
 
 /// Causal history for one already-scoped entry, dependencies first.
+///
+/// A revision is ready once every predecessor it names inside the entry has
+/// been emitted; ready revisions are ordered by earliest authored time, then
+/// id. A supersedes cycle leaves no member ready, and the reading breaks it at
+/// its earliest remaining member by the same order, so history names every
+/// member exactly once.
 pub fn entry_history<P: TriblePattern>(space: &P, entry: &EntryRecord) -> Vec<RevisionRecord> {
     let members: BTreeSet<Id> = entry.members.iter().copied().collect();
     let mut emitted = BTreeSet::new();
@@ -587,529 +490,29 @@ pub fn entry_history<P: TriblePattern>(space: &P, entry: &EntryRecord) -> Vec<Re
                     .all(|predecessor| emitted.contains(predecessor))
             })
             .collect();
-        ready.sort_by_key(|id| {
+        let order = |id: &Id| {
             let authored_at = revision_records(space, *id)
                 .into_iter()
                 .filter_map(|record| record.authored_at().map(|value| value.raw))
                 .min();
             (authored_at, *id)
-        });
+        };
         if ready.is_empty() {
-            break;
+            let stuck = members
+                .iter()
+                .copied()
+                .filter(|id| !emitted.contains(id))
+                .min_by_key(order)
+                .expect("an unemitted member remains");
+            ready.push(stuck);
         }
+        ready.sort_by_key(order);
         for id in ready {
             emitted.insert(id);
             output.extend(revision_records(space, id));
         }
     }
     output
-}
-
-fn entity_fact_index(space: &TribleSet) -> BTreeMap<Id, TribleSet> {
-    let mut index = BTreeMap::new();
-    for fact in space {
-        index
-            .entry(*fact.e())
-            .or_insert_with(TribleSet::new)
-            .insert(fact);
-    }
-    index
-}
-
-fn check_exact_entity(
-    index: &BTreeMap<Id, TribleSet>,
-    entity: Id,
-    expected: &Fragment,
-    label: &str,
-) -> Result<()> {
-    if index.get(&entity) != Some(expected.facts()) {
-        bail!("Wiki {label} {entity:x} is not canonical");
-    }
-    Ok(())
-}
-
-fn successor_index(revisions: &BTreeMap<Id, RevisionRecord>) -> BTreeMap<Id, BTreeSet<Id>> {
-    let mut successors: BTreeMap<Id, BTreeSet<Id>> =
-        revisions.keys().map(|id| (*id, BTreeSet::new())).collect();
-    for record in revisions.values() {
-        for predecessor in &record.supersedes {
-            if let Some(children) = successors.get_mut(predecessor) {
-                children.insert(record.id);
-            }
-        }
-    }
-    successors
-}
-
-fn reaches(successors: &BTreeMap<Id, BTreeSet<Id>>, start: Id, target: Id) -> bool {
-    let mut seen = BTreeSet::new();
-    let mut stack = vec![start];
-    while let Some(current) = stack.pop() {
-        if let Some(children) = successors.get(&current) {
-            for child in children {
-                if *child == target {
-                    return true;
-                }
-                if seen.insert(*child) {
-                    stack.push(*child);
-                }
-            }
-        }
-    }
-    false
-}
-
-fn validate_graph(revisions: &BTreeMap<Id, RevisionRecord>) -> Result<()> {
-    for record in revisions.values() {
-        for predecessor in &record.supersedes {
-            if !revisions.contains_key(predecessor) {
-                bail!(
-                    "Wiki revision {:x} supersedes missing revision {predecessor:x}",
-                    record.id
-                );
-            }
-            if *predecessor == record.id {
-                bail!("Wiki supersedes graph contains a cycle at {:x}", record.id);
-            }
-        }
-    }
-
-    let successors = successor_index(revisions);
-    let mut remaining: BTreeMap<Id, usize> = revisions
-        .iter()
-        .map(|(&id, record)| (id, record.supersedes.len()))
-        .collect();
-    let mut ready: BTreeSet<Id> = remaining
-        .iter()
-        .filter_map(|(&id, &count)| (count == 0).then_some(id))
-        .collect();
-    let mut emitted = 0usize;
-    while let Some(current) = ready.pop_first() {
-        emitted += 1;
-        for successor in &successors[&current] {
-            let count = remaining
-                .get_mut(successor)
-                .expect("successor belongs to revision graph");
-            *count -= 1;
-            if *count == 0 {
-                ready.insert(*successor);
-            }
-        }
-    }
-    if emitted != revisions.len() {
-        let member = remaining
-            .into_iter()
-            .find_map(|(id, count)| (count > 0).then_some(id))
-            .expect("unemitted graph has a member");
-        bail!("Wiki supersedes graph contains a cycle at {member:x}");
-    }
-
-    for record in revisions.values().filter(|record| record.is_native()) {
-        for ancestor in &record.supersedes {
-            for descendant in &record.supersedes {
-                if ancestor != descendant && reaches(&successors, *ancestor, *descendant) {
-                    bail!(
-                        "Wiki revision {:x} has redundant predecessors {ancestor:x} and {descendant:x}",
-                        record.id
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Group revisions into entries by `metadata::supersedes` connectivity alone.
-///
-/// The legacy `attrs::fragment` anchor was an edge here until 2026-08-18, when
-/// it became redundant: the additive migration synthesized the supersedes chain
-/// FROM the anchor groups, so every anchor group is already a connected
-/// component. Verified over the live corpus before removal — 11231 revisions
-/// across 3035 anchors partition into the same 3095 entries, with identical
-/// membership, with and without it. Since then the anchor is not read at all:
-/// an id names a REVISION or it names nothing. The facts remain in the store —
-/// it is append-only — and the additive migration still consumes them as legacy
-/// input, but no read path in the wiki resolves one.
-///
-/// Each entry's frontier is [`resolve`] over `order` — the shared query-layer
-/// operation, not a local rule. Asking it per component rather than once over
-/// every revision is only a scoping convenience: a supersedes edge always
-/// unites its endpoints above, so no revision can be observed from outside its
-/// own component and the two framings agree by construction.
-fn entry_records<O>(order: &O, revisions: &BTreeMap<Id, RevisionRecord>) -> Vec<EntryRecord>
-where
-    O: RegisterOrder + ?Sized,
-{
-    let mut parent: BTreeMap<Id, Id> = revisions.keys().map(|id| (*id, *id)).collect();
-
-    fn root(parent: &mut BTreeMap<Id, Id>, id: Id) -> Id {
-        let mut cursor = id;
-        while parent[&cursor] != cursor {
-            cursor = parent[&cursor];
-        }
-        let result = cursor;
-        let mut cursor = id;
-        while parent[&cursor] != result {
-            let next = parent[&cursor];
-            parent.insert(cursor, result);
-            cursor = next;
-        }
-        result
-    }
-
-    let mut unite = |left: Id, right: Id| {
-        let left = root(&mut parent, left);
-        let right = root(&mut parent, right);
-        if left != right {
-            let (smaller, larger) = (left.min(right), left.max(right));
-            parent.insert(larger, smaller);
-        }
-    };
-    for record in revisions.values() {
-        for predecessor in &record.supersedes {
-            unite(record.id, *predecessor);
-        }
-    }
-
-    let mut components: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
-    for id in revisions.keys().copied() {
-        components
-            .entry(root(&mut parent, id))
-            .or_default()
-            .push(id);
-    }
-    let mut entries = Vec::new();
-    for mut members in components.into_values() {
-        members.sort_unstable();
-        let member_set: BTreeSet<Id> = members.iter().copied().collect();
-        let mut roots: Vec<Id> = members
-            .iter()
-            .copied()
-            .filter(|id| {
-                revisions[id]
-                    .supersedes
-                    .iter()
-                    .all(|predecessor| !member_set.contains(predecessor))
-            })
-            .collect();
-        roots.sort_unstable();
-        let frontier_ids: Vec<Id> = resolve(order, members.iter().copied())
-            .into_iter()
-            .collect();
-        let frontier = frontier_ids
-            .iter()
-            .filter_map(|id| revisions.get(id).cloned())
-            .collect();
-        entries.push(EntryRecord {
-            roots,
-            members,
-            frontier,
-        });
-    }
-    entries.sort_by_key(|entry| entry.roots.first().copied());
-    entries
-}
-
-/// Load both immutable native revisions and preserved legacy version entities
-/// using a caller-supplied supersession order.
-pub fn load_catalog_with_order<O>(space: &TribleSet, order: &O) -> Result<WikiCatalog>
-where
-    O: RegisterOrder + ?Sized,
-{
-    let fact_index = entity_fact_index(space);
-    let native = ids_of_kind(space, KIND_REVISION);
-    let legacy = ids_of_kind(space, KIND_VERSION_ID);
-    if let Some(id) = native.intersection(&legacy).next() {
-        bail!("Wiki entity {id:x} is both a native revision and a legacy version");
-    }
-
-    let mut revisions = BTreeMap::new();
-    for id in native.iter().copied().chain(legacy.iter().copied()) {
-        let is_native = native.contains(&id);
-        let title = exactly_one(text_values(space, id, &attrs::title), id, "wiki::title")?;
-        let content = exactly_one(text_values(space, id, &attrs::content), id, "wiki::content")?;
-        let mut tags = id_values(space, id, &metadata::tag);
-        tags.remove(if is_native {
-            &KIND_REVISION
-        } else {
-            &KIND_VERSION_ID
-        });
-        let supersedes = id_values(space, id, &metadata::supersedes);
-        let author = if is_native {
-            Some(exactly_one(
-                id_values(space, id, &attrs::author),
-                id,
-                "wiki::author",
-            )?)
-        } else {
-            at_most_one(id_values(space, id, &attrs::author), id, "wiki::author")?
-        };
-        let legacy_created_at = if is_native {
-            BTreeSet::new()
-        } else {
-            let values = interval_values(space, id, &metadata::created_at);
-            if values.is_empty() {
-                bail!(
-                    "Wiki entity {id:x} has 0 values for metadata::created_at; expected at least one"
-                );
-            }
-            for value in &values {
-                require_point(&format!("legacy Wiki version {id:x} created-at"), *value)?;
-            }
-            values
-        };
-        if is_native {
-            let expected = revision_fragment_from_handles(
-                author.expect("native author"),
-                title,
-                content,
-                &tags.iter().copied().collect::<Vec<_>>(),
-                &supersedes.iter().copied().collect::<Vec<_>>(),
-            );
-            let canonical = expected.root().expect("native revision root");
-            if canonical != id {
-                bail!("Wiki revision {id:x} is non-canonical; canonical identity is {canonical:x}");
-            }
-            check_exact_entity(&fact_index, id, &expected, "revision")?;
-        }
-        revisions.insert(
-            id,
-            RevisionRecord {
-                id,
-                title,
-                content,
-                tags,
-                supersedes,
-                author,
-                native: is_native,
-                legacy_created_at,
-                authorships: Vec::new(),
-            },
-        );
-    }
-
-    let mut authorships = BTreeMap::new();
-    for id in ids_of_kind(space, KIND_AUTHORSHIP) {
-        let revision = exactly_one(id_values(space, id, &attrs::revision), id, "wiki::revision")?;
-        if !revisions.contains_key(&revision) {
-            bail!("Wiki authorship {id:x} names missing revision {revision:x}");
-        }
-        let author = at_most_one(id_values(space, id, &attrs::author), id, "wiki::author")?;
-        let authored_at = at_most_one(
-            interval_values(space, id, &metadata::created_at),
-            id,
-            "metadata::created_at",
-        )?;
-        if author.is_none() && authored_at.is_none() {
-            bail!("Wiki authorship {id:x} carries neither author nor created-at");
-        }
-        if let Some(value) = authored_at {
-            require_point(&format!("Wiki authorship {id:x} created-at"), value)?;
-        }
-        let expected =
-            authorship_fragment(revision, author, authored_at).expect("non-empty authorship");
-        let canonical = expected.root().expect("authorship root");
-        if canonical != id {
-            bail!("Wiki authorship {id:x} is non-canonical; canonical identity is {canonical:x}");
-        }
-        check_exact_entity(&fact_index, id, &expected, "authorship")?;
-        authorships.insert(
-            id,
-            (
-                revision,
-                AuthorshipRecord {
-                    id,
-                    author,
-                    authored_at,
-                },
-            ),
-        );
-    }
-    for (_, (revision, authorship)) in authorships {
-        revisions
-            .get_mut(&revision)
-            .expect("authorship target checked")
-            .authorships
-            .push(authorship);
-    }
-    for revision in revisions.values_mut() {
-        revision.authorships.sort_by_key(|record| record.id);
-    }
-
-    for fact in space
-        .iter()
-        .filter(|fact| fact.a() == &metadata::supersedes.id())
-    {
-        let successor = *fact.e();
-        let predecessor: Id = fact
-            .v::<inlineencodings::GenId>()
-            .try_from_inline()
-            .map_err(|error| {
-                anyhow!("Wiki supersedes target on {successor:x} is not an id: {error:?}")
-            })?;
-        if !revisions.contains_key(&successor) {
-            bail!("Wiki supersedes source {successor:x} is not a known Wiki revision");
-        }
-        if !revisions.contains_key(&predecessor) {
-            bail!("Wiki supersedes target {predecessor:x} is not a known Wiki revision");
-        }
-    }
-    validate_graph(&revisions)?;
-
-    let mut author_keys: BTreeMap<Id, PublicKeyValue> = BTreeMap::new();
-    for (author, key) in find!(
-        (author: Id, key: PublicKeyValue),
-        pattern!(space, [{ ?author @ attestation::signed_by: ?key }])
-    ) {
-        let canonical = entity! { attestation::signed_by: key }
-            .root()
-            .expect("author description root");
-        if canonical == author {
-            if let Some(previous) = author_keys.insert(author, key) {
-                if previous != key {
-                    bail!("Wiki author {author:x} has conflicting public keys");
-                }
-            }
-        }
-    }
-    let mut checked_authors = BTreeSet::new();
-    for revision in revisions.values().filter(|record| record.is_native()) {
-        let author = revision.author.expect("native author");
-        let key = author_keys.get(&author).ok_or_else(|| {
-            anyhow!(
-                "Wiki revision {:x} has no cryptographic author description",
-                revision.id
-            )
-        })?;
-        if checked_authors.insert(author) {
-            let expected = entity! { attestation::signed_by: *key };
-            check_exact_entity(&fact_index, author, &expected, "author")?;
-        }
-        if !revision
-            .authorships
-            .iter()
-            .any(|record| record.author == Some(author))
-        {
-            bail!(
-                "Wiki revision {:x} has no matching queryable authorship",
-                revision.id
-            );
-        }
-        if revision
-            .authorships
-            .iter()
-            .any(|record| record.author.is_some_and(|observed| observed != author))
-        {
-            bail!(
-                "Wiki revision {:x} has authorship conflicting with its identity author",
-                revision.id
-            );
-        }
-    }
-
-    let mut tag_names = BTreeMap::new();
-    for (tag, name) in find!(
-        (tag: Id, name: TextHandle),
-        pattern!(space, [{ ?tag @ metadata::name: ?name }])
-    ) {
-        if let Some(previous) = tag_names.insert(tag, name) {
-            if previous != name {
-                bail!("Wiki tag {tag:x} has conflicting names");
-            }
-        }
-    }
-    for revision in revisions.values() {
-        for tag in &revision.tags {
-            if !tag_names.contains_key(tag) && !TAG_SPECS.iter().any(|(id, _)| id == tag) {
-                bail!("Wiki revision {:x} uses unnamed tag {tag:x}", revision.id);
-            }
-        }
-    }
-
-    let entries = entry_records(order, &revisions);
-    Ok(WikiCatalog {
-        revisions: RevisionReadModel { revisions, entries },
-        tag_names,
-        author_keys,
-    })
-}
-
-/// Reference implementation that derives the supersession order directly.
-///
-/// Migrations, detached fact-set validation, and tests use this as an oracle.
-/// Ordinary application reads use [`query_snapshot`] and query resident facts
-/// and the maintained positive supersession relation directly.
-pub fn load_catalog(space: &TribleSet) -> Result<WikiCatalog> {
-    let order = ObservationOrder::new(space, metadata::supersedes.id());
-    load_catalog_with_order(space, &order)
-}
-
-fn validate_payloads(reader: &impl BlobStoreGet, catalog: &WikiCatalog) -> Result<()> {
-    for revision in catalog.revisions.revision_records() {
-        let title = read_text(reader, revision.title)
-            .with_context(|| format!("read Wiki revision {:x} title", revision.id))?;
-        if title.trim().is_empty() {
-            bail!("Wiki revision {:x} has an empty title", revision.id);
-        }
-        read_text(reader, revision.content)
-            .with_context(|| format!("read Wiki revision {:x} content", revision.id))?;
-    }
-    for (&tag, &handle) in &catalog.tag_names {
-        let name =
-            read_text(reader, handle).with_context(|| format!("read Wiki tag {tag:x} name"))?;
-        if name.trim().is_empty() {
-            bail!("Wiki tag {tag:x} has an empty name");
-        }
-        if name != name.trim().to_lowercase() {
-            bail!("Wiki tag {tag:x} name is not normalized");
-        }
-        if let Some((_, expected)) = TAG_SPECS.iter().find(|(known, _)| known == &tag) {
-            if name != *expected {
-                bail!("Wiki built-in tag {tag:x} must be named {expected:?}");
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
-    for fact in facts {
-        if fact.a() == &attrs::title.id()
-            || fact.a() == &attrs::content.id()
-            || fact.a() == &metadata::name.id()
-        {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let _: View<str> = reader.get(handle).with_context(|| {
-                format!("read Wiki text payload {}", hex::encode_upper(handle.raw))
-            })?;
-        }
-    }
-    Ok(())
-}
-
-/// Strictly validate a detached Wiki snapshot with the reference resolver.
-///
-/// This is the migration/import and test-oracle boundary. Durable application
-/// reads should use [`query_snapshot`].
-pub fn validate_catalog(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<WikiCatalog> {
-    let catalog = load_catalog(facts)?;
-    validate_payloads(reader, &catalog)?;
-    Ok(catalog)
-}
-
-/// Validate one Wiki fact snapshot using an already attached supersession
-/// order for exactly that snapshot's source cover.
-pub fn validate_catalog_with_order<O>(
-    reader: &impl BlobStoreGet,
-    facts: &TribleSet,
-    order: &O,
-) -> Result<WikiCatalog>
-where
-    O: RegisterOrder + ?Sized,
-{
-    let catalog = load_catalog_with_order(facts, order)?;
-    validate_payloads(reader, &catalog)?;
-    Ok(catalog)
 }
 
 pub fn author_record(key: &VerifyingKey) -> (Fragment, Id) {
@@ -1163,6 +566,24 @@ pub fn tag_record(name: &str) -> Result<(Fragment, Id, String)> {
 pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let value: View<str> = reader.get(handle)?;
     Ok(value.to_string())
+}
+
+/// Every title, content and tag name in `facts` is readable from `reader`.
+///
+/// A write-boundary check over facts the caller itself authored, such as an
+/// import's own seed; never a check over a collection, whose other texts are
+/// read open-world by whichever reader asks for them.
+pub fn require_text_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
+    let texts = [attrs::title.id(), attrs::content.id(), metadata::name.id()];
+    for fact in facts {
+        if texts.contains(fact.a()) {
+            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
+            let _: View<str> = reader.get(handle).with_context(|| {
+                format!("read Wiki text payload {}", hex::encode_upper(handle.raw))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// One cover-tagged maximal Wiki revision, as `orient wake` presents it.
@@ -1334,21 +755,11 @@ pub fn cover_fragments<P: TriblePattern>(
 // `wiki` CLI and gauge's metrics share one model instead of growing a second
 // extractor that drifts from the first.
 
-/// Display name for a tag id, falling back to the built-in vocabulary and
-/// then to hex, so an unnamed tag still prints something addressable.
-pub fn tag_display_name(catalog: &WikiCatalog, reader: &PileSnapshot, id: Id) -> Result<String> {
-    match catalog.tag_names.get(&id) {
-        Some(handle) => read_text(reader, *handle),
-        None => Ok(TAG_SPECS
-            .iter()
-            .find_map(|(known, label)| (*known == id).then_some((*label).to_owned()))
-            .unwrap_or_else(|| format!("{id:x}"))),
-    }
-}
-
-/// Display every name asserted for a tag directly from a query substrate.
-/// Multiplicity stays visible instead of becoming a collection-wide error or
-/// an iteration-order winner.
+/// Display every name asserted for a tag directly from a query substrate:
+/// several names sorted and joined by " / ", exactly as stored (an
+/// unnormalized name is shown as it is). An unnamed tag falls back to the
+/// built-in vocabulary and then to hex, so it still prints something
+/// addressable.
 pub fn tag_display_name_from_facts<P: TriblePattern>(
     facts: &P,
     reader: &impl BlobStoreGet,
@@ -1439,7 +850,7 @@ impl FrontierModel {
         let mut selectors: BTreeMap<Id, BTreeSet<usize>> = BTreeMap::new();
 
         for (index, entry) in records.iter().enumerate() {
-            let label = *entry.roots.first().expect("admitted Wiki entry has a root");
+            let label = entry.label();
             let mut states = Vec::with_capacity(entry.frontier.len());
             for revision in &entry.frontier {
                 let title = read_text(reader, revision.title)?;
@@ -1491,12 +902,11 @@ impl FrontierModel {
         ) {
             kinds.insert(id, OtherKind::Author);
         }
-        for id in revision_ids(facts) {
-            for record in revision_records(facts, id) {
-                for authorship in &record.authorships {
-                    kinds.insert(authorship.id, OtherKind::Authorship);
-                }
-            }
+        for id in find!(
+            id: Id,
+            pattern!(facts, [{ ?id @ metadata::tag: &KIND_AUTHORSHIP }])
+        ) {
+            kinds.insert(id, OtherKind::Authorship);
         }
 
         Ok(Self {
@@ -1727,11 +1137,10 @@ impl FrontierModel {
     }
 }
 
-/// Strict reference materialization for migrations and tests.
-///
-/// This deliberately resolves the supersession order from the complete fact
-/// set. Durable application readers should use
-/// [`query_snapshot`] instead.
+/// The complete Wiki collection's facts, as they are, for migrations and
+/// tests: nothing is checked against a closed shape, and a text that is not
+/// resident is only a missing blob for whichever reader later asks for it.
+/// Durable application readers use [`query_snapshot`] instead.
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1743,7 +1152,6 @@ pub fn materialize_collection(
         .context("attach Wiki collection")?
         .view::<TribleSet>()
         .context("read Wiki collection")?;
-    validate_catalog(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
 }
 
@@ -1778,54 +1186,6 @@ pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<Wiki
     })
 }
 
-/// Strictly project and validate a complete Wiki snapshot.
-///
-/// This remains an explicit migration/import boundary for callers that need a
-/// closed-world diagnostic oracle over the facts. It is deliberately not the
-/// ordinary query path; normal commands use [`query_snapshot`] and query its
-/// [`FactArchive`] directly. Because it is an import's preparation and not a
-/// read, it first attaches the Wiki's current frontier into its views. A
-/// revision the index cannot answer for is its lag, and the snapshot says
-/// how much ([`WikiSnapshot::latest_lag`]) instead of refusing.
-pub async fn materialize_indexed_collection(
-    pile: &mut Pile,
-    signer: &SigningKey,
-) -> Result<WikiSnapshot> {
-    let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
-    let target = latest_collection(pile, signer.verifying_key())?;
-    crate::storage::seed_attached(pile, target, signer)
-        .await
-        .context("seed the Wiki supersession index")?;
-    drop(
-        crate::storage::ensure_downstream(pile, collection, signer)
-            .await
-            .context("ensure the Wiki views before materializing")?,
-    );
-    let store_snapshot = pile.snapshot().context("freeze Wiki store snapshot")?;
-    let source = store_snapshot
-        .collection(collection)
-        .context("attach Wiki collection")?;
-    let facts = source.view::<TribleSet>().context("read Wiki collection")?;
-    let (latest, unread) = store_snapshot
-        .attached(target)
-        .map_err(|error| anyhow!("observe Wiki supersession index: {error}"))?
-        .read::<LatestIndex>()
-        .map_err(|error| anyhow!("read Wiki supersession index: {error}"))?
-        .into_parts();
-    let latest_lag = unread.len();
-    drop(source);
-    // This explicit migration/import projection retains the complete-facts
-    // reference oracle; ordinary readers join the positive index directly.
-    let catalog = validate_catalog(&store_snapshot, &facts)?;
-    Ok(WikiSnapshot {
-        facts,
-        store_snapshot,
-        latest,
-        latest_lag,
-        catalog,
-    })
-}
-
 pub fn commit_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1837,6 +1197,17 @@ pub fn commit_collection(
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Wiki collection fragment: {error}"))
+}
+
+/// The latest index a maintained Wiki would hold over exactly `facts`.
+#[cfg(test)]
+pub(crate) fn latest_index_for_tests(facts: &TribleSet) -> LatestIndex {
+    let observed = triblespace::core::collection::latest::derive_element(
+        &facts.clone().to_blob(),
+        metadata::supersedes.id(),
+    )
+    .unwrap();
+    LatestIndex::decode(&observed).unwrap()
 }
 
 /// The worker's carry for tests: the fact chain and the supersession index.
@@ -1903,13 +1274,26 @@ mod tests {
     }
 
     fn latest_index(facts: &TribleSet) -> LatestIndex {
-        let archive = facts.clone().to_blob();
-        let observed = triblespace::core::collection::latest::derive_element(
-            &archive,
-            metadata::supersedes.id(),
-        )
-        .unwrap();
-        LatestIndex::decode(&observed).unwrap()
+        latest_index_for_tests(facts)
+    }
+
+    /// The pure query-layer answer the maintained index must agree with:
+    /// each entry's members that no fact in `facts` supersedes.
+    fn jit_frontiers(facts: &TribleSet) -> BTreeSet<BTreeSet<Id>> {
+        let mut remaining = revision_ids(facts);
+        let mut frontiers = BTreeSet::new();
+        while let Some(seed) = remaining.pop_first() {
+            let members = entry_members(facts, seed).unwrap();
+            for member in &members {
+                remaining.remove(member);
+            }
+            frontiers.insert(triblespace::core::query::frontier::latest(
+                facts,
+                metadata::supersedes.id(),
+                members,
+            ));
+        }
+        frontiers
     }
 
     #[test]
@@ -1926,8 +1310,7 @@ mod tests {
         facts += right_fragment;
         facts += join_fragment;
 
-        let catalog = load_catalog(&facts).unwrap();
-        let entries = catalog.revisions.all_entries();
+        let entries = entries(&facts, &latest_index(&facts));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].frontier[0].id, join);
         assert!(find!(
@@ -1963,11 +1346,10 @@ mod tests {
         facts += right_fragment;
         facts += root_fragment;
         facts += left_fragment;
-        let model = load_catalog(&facts).unwrap().revisions;
-        let entry = &model.all_entries()[0];
+        let entry = &entries(&facts, &latest_index(&facts))[0];
         let frontier: BTreeSet<Id> = entry.frontier.iter().map(|record| record.id).collect();
         assert_eq!(frontier, BTreeSet::from([left, right]));
-        let history = model.history(entry);
+        let history = entry_history(&facts, entry);
         assert_eq!(history.first().map(|record| record.id), Some(root));
         assert_eq!(history.len(), 3);
     }
@@ -1985,8 +1367,11 @@ mod tests {
         let mut fork = author_fragment + root_fragment + left_fragment + right_fragment;
         let fork_index = latest_index(fork.facts());
         assert_eq!(
-            entries(fork.facts(), &fork_index),
-            load_catalog(fork.facts()).unwrap().revisions.all_entries()
+            entries(fork.facts(), &fork_index)
+                .iter()
+                .map(|entry| entry.frontier.iter().map(|record| record.id).collect())
+                .collect::<BTreeSet<BTreeSet<Id>>>(),
+            jit_frontiers(fork.facts())
         );
         assert_eq!(
             find!(id: Id, and!(fork_index.has(id),
@@ -1999,8 +1384,11 @@ mod tests {
         fork += merge_fragment;
         let merge_index = latest_index(fork.facts());
         assert_eq!(
-            entries(fork.facts(), &merge_index),
-            load_catalog(fork.facts()).unwrap().revisions.all_entries()
+            entries(fork.facts(), &merge_index)
+                .iter()
+                .map(|entry| entry.frontier.iter().map(|record| record.id).collect())
+                .collect::<BTreeSet<BTreeSet<Id>>>(),
+            jit_frontiers(fork.facts())
         );
         assert_eq!(
             find!(id: Id, and!(merge_index.has(id),
@@ -2131,38 +1519,6 @@ mod tests {
     }
 
     #[test]
-    fn supersedes_rejects_non_revision_sources_and_targets() {
-        let legacy = genid().id;
-        let outsider = genid().id;
-        let base = entity! { ExclusiveId::force_ref(&legacy) @
-            metadata::tag: &KIND_VERSION_ID,
-            attrs::title: "legacy".to_blob().get_handle(),
-            attrs::content: "body".to_blob().get_handle(),
-            metadata::created_at: at(1.0),
-        };
-
-        let mut bad_source = base.facts().clone();
-        bad_source += entity! { ExclusiveId::force_ref(&outsider) @
-            metadata::supersedes: legacy,
-        }
-        .into_facts();
-        assert!(load_catalog(&bad_source)
-            .unwrap_err()
-            .to_string()
-            .contains("supersedes source"));
-
-        let mut bad_target = base.into_facts();
-        bad_target += entity! { ExclusiveId::force_ref(&legacy) @
-            metadata::supersedes: outsider,
-        }
-        .into_facts();
-        assert!(load_catalog(&bad_target)
-            .unwrap_err()
-            .to_string()
-            .contains("supersedes target"));
-    }
-
-    #[test]
     fn exact_snapshot_index_does_not_advance_authority() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
@@ -2177,8 +1533,11 @@ mod tests {
             open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_before = collection.admitted(&store_snapshot).unwrap();
-        let snapshot =
-            pollster::block_on(materialize_indexed_collection(&mut pile, &signer)).unwrap();
+        carry_for_tests(&mut pile, &signer);
+        let store_snapshot = pile.snapshot().unwrap();
+        let carried = collection.admitted(&store_snapshot).unwrap();
+        assert_eq!(carried, cover_before);
+        let snapshot = pollster::block_on(query_snapshot(&mut pile, &signer)).unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_after_index = collection.admitted(&store_snapshot).unwrap();
         assert_eq!(cover_after_index, cover_before);
@@ -2288,8 +1647,8 @@ mod tests {
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
-        // Not `materialize_collection`: its closed-world catalog check would
-        // refuse this collection before the cover is ever asked for.
+        // The facts as they are; their missing blobs matter only to the
+        // cover read below.
         let reader = pile.snapshot().unwrap();
         let facts = reader
             .collection(collection)
@@ -2330,23 +1689,6 @@ mod tests {
     }
 
     #[test]
-    fn native_authorship_cannot_claim_a_different_author() {
-        let signer = SigningKey::from_bytes(&[10; 32]);
-        let (author_fragment, author) = author_record(&signer.verifying_key());
-        let (revision_fragment, revision) = revision_record(draft(author, "authored", [])).unwrap();
-        let impostor = genid().id;
-        let conflicting = authorship_fragment(revision, Some(impostor), Some(at(2.0))).unwrap();
-        let mut facts = TribleSet::new();
-        facts += author_fragment;
-        facts += revision_fragment;
-        facts += conflicting;
-        assert!(load_catalog(&facts)
-            .unwrap_err()
-            .to_string()
-            .contains("conflicting with its identity author"));
-    }
-
-    #[test]
     fn curator_can_publish_another_authors_revision() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki.pile");
@@ -2360,72 +1702,12 @@ mod tests {
         let mut pile =
             crate::storage::open_pile_strict_as(&path, curator_key.verifying_key()).unwrap();
         commit_collection(&mut pile, &curator_key, author_fragment + revision_fragment).unwrap();
-        let snapshot =
-            pollster::block_on(materialize_indexed_collection(&mut pile, &curator_key)).unwrap();
-        assert_eq!(
-            snapshot
-                .catalog()
-                .revisions
-                .revision(revision)
-                .unwrap()
-                .author,
-            Some(author)
-        );
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn read_model_ignores_unrelated_facts_but_rejects_unnormalized_tags() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("wiki.pile");
-        File::create(&path).unwrap();
-
-        let signer = SigningKey::from_bytes(&[11; 32]);
-        let (author_fragment, author) = author_record(&signer.verifying_key());
-        let (revision_fragment, _) = revision_record(draft(author, "strict", [])).unwrap();
-        let mut unexpected = author_fragment + revision_fragment;
-        unexpected += entity! { metadata::description: "not Wiki state" };
-        assert!(load_catalog(unexpected.facts()).is_ok());
-
-        let mut bad_tag = Fragment::empty();
-        let handle = bad_tag.put::<blobencodings::UTF8String, _>(" Mixed ".to_owned());
-        bad_tag += entity! { metadata::name: handle };
-        let tag = bad_tag.root().unwrap();
-        let mut tagged = draft(author, "tagged", []);
-        tagged.tags.insert(tag);
-        let (revision, _) = revision_record(tagged).unwrap();
-        bad_tag += author_record(&signer.verifying_key()).0;
-        bad_tag += revision;
-        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
-        commit_collection(&mut pile, &signer, bad_tag).unwrap();
-        let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
-            Ok(_) => panic!("unnormalized tag unexpectedly materialized"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("not normalized"));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn strict_durable_read_rejects_missing_revision_payloads() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("wiki.pile");
-        File::create(&path).unwrap();
-
-        let signer = SigningKey::from_bytes(&[12; 32]);
-        let (author_fragment, author) = author_record(&signer.verifying_key());
-        let (revision_fragment, _) = revision_record(draft(author, "missing", [])).unwrap();
-        let complete = author_fragment + revision_fragment;
-        let missing =
-            Fragment::from_facts_and_blobs(complete.facts().clone(), MemoryBlobStore::new());
-
-        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
-        commit_collection(&mut pile, &signer, missing).unwrap();
-        let error = match pollster::block_on(materialize_indexed_collection(&mut pile, &signer)) {
-            Ok(_) => panic!("missing revision payload unexpectedly materialized"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("read Wiki revision"));
+        let (facts, _) = materialize_collection(&mut pile, &curator_key).unwrap();
+        let authors: Vec<Option<Id>> = revision_records(&facts, revision)
+            .iter()
+            .map(|record| record.author)
+            .collect();
+        assert_eq!(authors, vec![Some(author)]);
         pile.close().unwrap();
     }
 
@@ -2457,18 +1739,18 @@ mod tests {
             metadata::created_at: at(2.0),
         }
         .into_facts();
-        let model = load_catalog(&facts).unwrap().revisions;
-        assert_eq!(model.all_entries().len(), 2);
+        let latest = latest_index(&facts);
+        assert_eq!(entries(&facts, &latest).len(), 2);
         assert_ne!(
-            model.entry_containing(first).unwrap().members,
-            model.entry_containing(second).unwrap().members
+            entry(&facts, &latest, first).unwrap().members,
+            entry(&facts, &latest, second).unwrap().members
         );
         assert!(
-            model.revision(fragment).is_none(),
+            revision_records(&facts, fragment).is_empty(),
             "an anchor id must resolve to no revision"
         );
         assert!(
-            model.entry_containing(fragment).is_none(),
+            entry(&facts, &latest, fragment).is_none(),
             "an anchor id must belong to no entry"
         );
     }
@@ -2495,21 +1777,19 @@ mod tests {
             metadata::supersedes: first,
         }
         .into_facts();
-        let model = load_catalog(&facts).unwrap().revisions;
+        let latest = latest_index(&facts);
         // Both legacy ids keep their identity and their lineage...
-        assert!(model.revision(first).is_some());
+        assert_eq!(revision_records(&facts, first).len(), 1);
         assert_eq!(
-            model
-                .revision(second)
-                .unwrap()
+            revision_records(&facts, second)[0]
                 .supersedes
                 .iter()
                 .copied()
                 .collect::<Vec<_>>(),
             vec![first]
         );
-        assert!(!model.revision(first).unwrap().is_native());
-        let entry = model.entry_containing(second).unwrap();
+        assert!(!revision_records(&facts, first)[0].is_native());
+        let entry = entry(&facts, &latest, second).unwrap();
         assert_eq!(
             entry
                 .frontier
@@ -2519,7 +1799,7 @@ mod tests {
             vec![second]
         );
         // ...and the anchor they were written under names nothing.
-        assert!(model.revision(fragment).is_none());
+        assert!(revision_records(&facts, fragment).is_empty());
     }
 
     #[test]
@@ -2536,8 +1816,8 @@ mod tests {
         }
         .into_facts();
 
-        let model = load_catalog(&facts).unwrap().revisions;
-        let record = model.revision(version).unwrap();
+        let records = revision_records(&facts, version);
+        let record = &records[0];
         assert_eq!(
             record.legacy_created_at,
             BTreeSet::from(observed),
@@ -2548,75 +1828,6 @@ mod tests {
             Some(observed[1]),
             "legacy current-state semantics use the latest reassertion"
         );
-    }
-
-    #[test]
-    fn every_legacy_timestamp_observation_must_remain_a_point() {
-        let fragment = genid().id;
-        let version = genid().id;
-        let observed = [at(1.0), span(2.0, 3.0)];
-        let facts = entity! { ExclusiveId::force_ref(&version) @
-            metadata::tag: &KIND_VERSION_ID,
-            attrs::fragment: fragment,
-            attrs::title: "T".to_blob().get_handle(),
-            attrs::content: "state".to_blob().get_handle(),
-            metadata::created_at*: observed.iter(),
-        }
-        .into_facts();
-
-        assert!(load_catalog(&facts)
-            .unwrap_err()
-            .to_string()
-            .contains("must be a point interval"));
-    }
-
-    #[test]
-    fn supersedes_cycles_are_rejected() {
-        let fragment = genid().id;
-        let first = genid().id;
-        let second = genid().id;
-        let mut facts = entity! { ExclusiveId::force_ref(&first) @
-            metadata::tag: &KIND_VERSION_ID,
-            attrs::fragment: fragment,
-            attrs::title: "T".to_blob().get_handle(),
-            attrs::content: "one".to_blob().get_handle(),
-            metadata::created_at: at(1.0),
-            metadata::supersedes: second,
-        }
-        .into_facts();
-        facts += entity! { ExclusiveId::force_ref(&second) @
-            metadata::tag: &KIND_VERSION_ID,
-            attrs::fragment: fragment,
-            attrs::title: "T".to_blob().get_handle(),
-            attrs::content: "two".to_blob().get_handle(),
-            metadata::created_at: at(2.0),
-            metadata::supersedes: first,
-        }
-        .into_facts();
-
-        assert!(load_catalog(&facts)
-            .unwrap_err()
-            .to_string()
-            .contains("supersedes graph contains a cycle"));
-    }
-
-    #[test]
-    fn native_revision_rejects_redundant_predecessors() {
-        let signer = SigningKey::from_bytes(&[12; 32]);
-        let (author_fragment, author) = author_record(&signer.verifying_key());
-        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
-        let (child_fragment, child) = revision_record(draft(author, "child", [root])).unwrap();
-        let (redundant_fragment, redundant) =
-            revision_record(draft(author, "redundant", [root, child])).unwrap();
-        let mut facts = TribleSet::new();
-        facts += author_fragment;
-        facts += root_fragment;
-        facts += child_fragment;
-        facts += redundant_fragment;
-
-        let error = load_catalog(&facts).unwrap_err().to_string();
-        assert!(error.contains(&format!("Wiki revision {redundant:x}")));
-        assert!(error.contains("has redundant predecessors"));
     }
 
     /// THE NEGATIVE CONTROL. A checker that reports zero problems on a real
@@ -2742,6 +1953,547 @@ mod tests {
         assert!(unreferenced.contains(&citer));
         assert!(!unreferenced.contains(&live));
         pile.close().unwrap();
+    }
+
+    /// Commit `fragment` to a fresh pile and read it the way a migration or a
+    /// bootstrap test does: the facts as they are, plus their latest index.
+    fn read_committed<T>(
+        seed: u8,
+        fragment: Fragment,
+        read: impl FnOnce(&TribleSet, &PileSnapshot, &LatestIndex) -> T,
+    ) -> Result<T> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("open-world.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[seed; 32]);
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
+        commit_collection(&mut pile, &signer, fragment).unwrap();
+        let result = materialize_collection(&mut pile, &signer).map(|(facts, reader)| {
+            let latest = latest_index(&facts);
+            read(&facts, &reader, &latest)
+        });
+        pile.close().unwrap();
+        result
+    }
+
+    fn without_blobs(fragment: Fragment) -> Fragment {
+        let (_, facts, metafacts, _) = fragment.into_parts();
+        Fragment::from_parts(facts, metafacts, MemoryBlobStore::new())
+    }
+
+    fn legacy_version(id: Id, title: &str, content: &str) -> Fragment {
+        let mut fragment = Fragment::empty();
+        let title: TextHandle = fragment.put(title.to_owned());
+        let content: TextHandle = fragment.put(content.to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::title: title,
+            attrs::content: content,
+            metadata::created_at: at(1.0),
+        };
+        fragment
+    }
+
+    fn frontier_ids(entry: &EntryRecord) -> BTreeSet<Id> {
+        entry.frontier.iter().map(|record| record.id).collect()
+    }
+
+    /// One refusal case: committed, read, and checked, or named in `refused`.
+    fn case(
+        refused: &mut Vec<String>,
+        name: &str,
+        fragment: Fragment,
+        check: impl FnOnce(&TribleSet, &PileSnapshot, &LatestIndex),
+    ) {
+        if let Err(error) = read_committed(41, fragment, check) {
+            refused.push(format!("{name}: {error:#}"));
+        }
+    }
+
+    /// Every fact the strict catalog used to refuse is an ordinary fact of an
+    /// open-world union. Each case here is one refusal the catalog made,
+    /// committed to a real pile; the facts are read as they are, and the
+    /// reading the Wiki gives each is pinned beside it.
+    #[test]
+    fn open_world_wiki_facts_are_read_not_refused() {
+        let signer = SigningKey::from_bytes(&[41; 32]);
+        let (author_fragment, author) = author_record(&signer.verifying_key());
+        let (other_fragment, other_author) =
+            author_record(&SigningKey::from_bytes(&[42; 32]).verifying_key());
+        let base = |title: &str| {
+            let (fragment, id) = revision_record(draft(author, title, [])).unwrap();
+            (author_fragment.clone() + fragment, id)
+        };
+        let mut refused = Vec::new();
+
+        // Several values for one attribute: each complete combination is its
+        // own reading under the one id.
+        let (mut fragment, revision) = base("one");
+        let second: TextHandle = fragment.put("another title".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&revision) @ attrs::title: second };
+        case(
+            &mut refused,
+            "two titles",
+            fragment,
+            |facts, reader, latest| {
+                let records = revision_records(facts, revision);
+                assert_eq!(records.len(), 2);
+                let titles: BTreeSet<String> = records
+                    .iter()
+                    .map(|record| read_text(reader, record.title).unwrap())
+                    .collect();
+                assert_eq!(
+                    titles,
+                    BTreeSet::from(["one".to_owned(), "another title".to_owned()])
+                );
+                assert_eq!(entries(facts, latest).len(), 1);
+            },
+        );
+
+        let (mut fragment, revision) = base("one");
+        let second: TextHandle = fragment.put("another body".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&revision) @ attrs::content: second };
+        case(&mut refused, "two contents", fragment, |facts, _, _| {
+            assert_eq!(revision_records(facts, revision).len(), 2);
+        });
+
+        let (mut fragment, revision) = base("one");
+        fragment += other_fragment.clone();
+        fragment += entity! { ExclusiveId::force_ref(&revision) @ attrs::author: other_author };
+        case(
+            &mut refused,
+            "two authors on a native revision",
+            fragment,
+            |facts, _, _| {
+                let authors: BTreeSet<Option<Id>> = revision_records(facts, revision)
+                    .iter()
+                    .map(|record| record.author)
+                    .collect();
+                assert_eq!(authors, BTreeSet::from([Some(author), Some(other_author)]));
+            },
+        );
+
+        let legacy = genid().id;
+        let mut fragment = legacy_version(legacy, "legacy", "body");
+        fragment += entity! { ExclusiveId::force_ref(&legacy) @
+            attrs::author: author,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&legacy) @
+            attrs::author: other_author,
+        };
+        case(
+            &mut refused,
+            "two authors on a legacy version",
+            fragment,
+            |facts, _, _| {
+                assert_eq!(revision_records(facts, legacy).len(), 2);
+            },
+        );
+
+        let (mut fragment, revision) = base("both kinds");
+        fragment += entity! { ExclusiveId::force_ref(&revision) @ metadata::tag: &KIND_VERSION_ID };
+        case(
+            &mut refused,
+            "native and legacy kind on one id",
+            fragment,
+            |facts, _, _| {
+                let kinds: BTreeSet<bool> = revision_records(facts, revision)
+                    .iter()
+                    .map(|record| record.native)
+                    .collect();
+                assert_eq!(kinds, BTreeSet::from([false, true]));
+                assert!(revision_records(facts, revision)
+                    .iter()
+                    .all(|record| record.tags.is_empty()));
+            },
+        );
+
+        let legacy = genid().id;
+        let mut fragment = Fragment::empty();
+        let title: TextHandle = fragment.put("untimed".to_owned());
+        let content: TextHandle = fragment.put("body".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&legacy) @
+            metadata::tag: &KIND_VERSION_ID,
+            attrs::title: title,
+            attrs::content: content,
+        };
+        case(
+            &mut refused,
+            "legacy version without created_at",
+            fragment,
+            |facts, _, _| {
+                let records = revision_records(facts, legacy);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].authored_at(), None);
+            },
+        );
+
+        let legacy = genid().id;
+        let mut fragment = legacy_version(legacy, "spanned", "body");
+        fragment += entity! { ExclusiveId::force_ref(&legacy) @
+            metadata::created_at: span(2.0, 3.0),
+        };
+        case(
+            &mut refused,
+            "legacy created_at that is not a point",
+            fragment,
+            |facts, _, _| {
+                let records = revision_records(facts, legacy);
+                assert_eq!(
+                    records[0].legacy_created_at,
+                    BTreeSet::from([at(1.0), span(2.0, 3.0)])
+                );
+            },
+        );
+
+        let (mut fragment, revision) = base("annotated");
+        fragment += entity! { ExclusiveId::force_ref(&revision) @
+            metadata::description: "an annotation the Wiki does not model",
+        };
+        case(
+            &mut refused,
+            "a fact outside a revision's core",
+            fragment,
+            |facts, _, _| {
+                assert_eq!(revision_records(facts, revision).len(), 1);
+            },
+        );
+
+        let forced = genid().id;
+        let mut fragment = author_fragment.clone();
+        let title: TextHandle = fragment.put("forced".to_owned());
+        let content: TextHandle = fragment.put("body".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&forced) @
+            metadata::tag: &KIND_REVISION,
+            attrs::author: author,
+            attrs::title: title,
+            attrs::content: content,
+        };
+        case(
+            &mut refused,
+            "a native revision under a non-intrinsic id",
+            fragment,
+            |facts, _, latest| {
+                let records = revision_records(facts, forced);
+                assert_eq!(records.len(), 1);
+                assert!(records[0].native);
+                assert_eq!(records[0].authored_at(), None, "it has no authorship");
+                assert_eq!(
+                    frontier_ids(&entry(facts, latest, forced).unwrap()),
+                    BTreeSet::from([forced])
+                );
+            },
+        );
+
+        let (mut fragment, revision) = base("present");
+        let absent = genid().id;
+        let stray = authorship_fragment(absent, Some(author), Some(at(1.0))).unwrap();
+        let stray_id = stray.root().unwrap();
+        fragment += stray;
+        case(
+            &mut refused,
+            "an authorship naming a missing revision",
+            fragment,
+            |facts, reader, latest| {
+                assert_eq!(revision_ids(facts), BTreeSet::from([revision]));
+                let model = FrontierModel::load(reader, facts, latest).unwrap();
+                assert_eq!(
+                    model.classify(stray_id),
+                    LinkClass::Unwritten(Some(OtherKind::Authorship))
+                );
+            },
+        );
+
+        let (mut fragment, revision) = base("timed twice");
+        let authorship = authorship_fragment(revision, Some(author), Some(at(1.0)))
+            .unwrap()
+            .root()
+            .unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&authorship) @ metadata::created_at: at(5.0) };
+        case(
+            &mut refused,
+            "an authorship with two times",
+            fragment,
+            |facts, _, _| {
+                let records = revision_records(facts, revision);
+                assert_eq!(records[0].authorships.len(), 2);
+                assert_eq!(
+                    records[0].authored_at(),
+                    Some(at(1.0)),
+                    "the earliest time reads"
+                );
+            },
+        );
+
+        let (mut fragment, revision) = base("bare authorship");
+        fragment += entity! {
+            metadata::tag: &KIND_AUTHORSHIP,
+            attrs::revision: revision,
+        };
+        fragment += entity! {
+            metadata::tag: &KIND_AUTHORSHIP,
+            attrs::revision: revision,
+            metadata::created_at: span(0.5, 3.0),
+        };
+        case(
+            &mut refused,
+            "authorships with neither author nor a point time",
+            fragment,
+            |facts, _, _| {
+                let records = revision_records(facts, revision);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].authorships.len(), 3);
+            },
+        );
+
+        let (mut fragment, revision) = base("claimed");
+        fragment += authorship_fragment(revision, Some(other_author), Some(at(2.0))).unwrap();
+        case(
+            &mut refused,
+            "an authorship naming another author",
+            fragment,
+            |facts, _, _| {
+                let records = revision_records(facts, revision);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].author, Some(author), "identity author stays");
+                let claimed: BTreeSet<Option<Id>> = records[0]
+                    .authorships
+                    .iter()
+                    .map(|record| record.author)
+                    .collect();
+                assert_eq!(claimed, BTreeSet::from([Some(author), Some(other_author)]));
+            },
+        );
+
+        let bare = revision_fragment(author, "unattested", "body", &[], &[]);
+        let bare_id = bare.root().unwrap();
+        case(
+            &mut refused,
+            "a native revision with no authorship or author description",
+            bare,
+            |facts, _, latest| {
+                assert_eq!(revision_records(facts, bare_id).len(), 1);
+                assert_eq!(entries(facts, latest).len(), 1);
+            },
+        );
+
+        let (mut fragment, _) = base("rekeyed");
+        let stray_key: PublicKeyValue = SigningKey::from_bytes(&[43; 32])
+            .verifying_key()
+            .to_inline();
+        fragment += entity! { ExclusiveId::force_ref(&author) @ attestation::signed_by: stray_key };
+        case(
+            &mut refused,
+            "an author description with two keys",
+            fragment,
+            |facts, _, latest| {
+                assert_eq!(entries(facts, latest).len(), 1);
+            },
+        );
+
+        let (mut fragment, revision) = base("claimed by an outsider");
+        let outsider = genid().id;
+        fragment += entity! { ExclusiveId::force_ref(&outsider) @ metadata::supersedes: revision };
+        case(
+            &mut refused,
+            "a supersedes fact from a non-revision",
+            fragment,
+            |facts, reader, latest| {
+                // The index reads every supersedes target as superseded, whatever
+                // claims it, so the entry has no current state.
+                let entry = entry(facts, latest, revision).unwrap();
+                assert_eq!(entry.members, vec![revision]);
+                assert!(entry.frontier.is_empty());
+                assert_eq!(entry_history(facts, &entry).len(), 1);
+                let model = FrontierModel::load(reader, facts, latest).unwrap();
+                assert_eq!(model.entries.len(), 1);
+                assert!(!model.entries[0].active);
+            },
+        );
+
+        let missing = genid().id;
+        let (orphan_fragment, orphan) =
+            revision_record(draft(author, "orphan", [missing])).unwrap();
+        case(
+            &mut refused,
+            "a revision whose predecessor is absent",
+            author_fragment.clone() + orphan_fragment,
+            |facts, _, latest| {
+                let entry = entry(facts, latest, orphan).unwrap();
+                assert_eq!(entry.members, vec![orphan]);
+                assert_eq!(entry.roots, vec![orphan]);
+                assert_eq!(frontier_ids(&entry), BTreeSet::from([orphan]));
+                assert_eq!(entry_history(facts, &entry).len(), 1);
+            },
+        );
+
+        let (first, second) = (genid().id, genid().id);
+        let mut fragment = legacy_version(first, "T", "one");
+        fragment += legacy_version(second, "T", "two");
+        fragment += entity! { ExclusiveId::force_ref(&first) @ metadata::supersedes: second };
+        fragment += entity! { ExclusiveId::force_ref(&second) @ metadata::supersedes: first };
+        case(
+            &mut refused,
+            "a supersedes cycle",
+            fragment,
+            |facts, reader, latest| {
+                let entry = entry(facts, latest, first).unwrap();
+                assert_eq!(entry.members.len(), 2);
+                assert!(entry.roots.is_empty(), "every member supersedes another");
+                assert!(entry.frontier.is_empty(), "every cycle member is retired");
+                let history: Vec<Id> = entry_history(facts, &entry).iter().map(|r| r.id).collect();
+                assert_eq!(history.len(), 2, "a cycle drops no member from history");
+                let model = FrontierModel::load(reader, facts, latest).unwrap();
+                assert_eq!(model.entries[0].label, *entry.members.first().unwrap());
+            },
+        );
+
+        let looped = genid().id;
+        let mut fragment = legacy_version(looped, "T", "self");
+        fragment += entity! { ExclusiveId::force_ref(&looped) @ metadata::supersedes: looped };
+        case(
+            &mut refused,
+            "a revision superseding itself",
+            fragment,
+            |facts, reader, latest| {
+                let entry = entry(facts, latest, looped).unwrap();
+                assert_eq!(entry_history(facts, &entry).len(), 1);
+                FrontierModel::load(reader, facts, latest).unwrap();
+            },
+        );
+
+        let (root_fragment, root) = revision_record(draft(author, "root", [])).unwrap();
+        let (child_fragment, child) = revision_record(draft(author, "child", [root])).unwrap();
+        let (redundant_fragment, redundant) =
+            revision_record(draft(author, "redundant", [root, child])).unwrap();
+        case(
+            &mut refused,
+            "redundant predecessors",
+            author_fragment.clone() + root_fragment + child_fragment + redundant_fragment,
+            |facts, _, latest| {
+                let entry = entry(facts, latest, root).unwrap();
+                assert_eq!(frontier_ids(&entry), BTreeSet::from([redundant]));
+                let history: Vec<Id> = entry_history(facts, &entry).iter().map(|r| r.id).collect();
+                assert_eq!(history, vec![root, child, redundant]);
+            },
+        );
+
+        let tag = genid().id;
+        let mut tagged = draft(author, "two names", []);
+        tagged.tags.insert(tag);
+        let (tagged_fragment, _) = revision_record(tagged).unwrap();
+        let mut fragment = author_fragment.clone() + tagged_fragment;
+        let alpha: TextHandle = fragment.put("alpha".to_owned());
+        let beta: TextHandle = fragment.put("beta".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&tag) @ metadata::name: alpha };
+        fragment += entity! { ExclusiveId::force_ref(&tag) @ metadata::name: beta };
+        case(
+            &mut refused,
+            "a tag with two names",
+            fragment,
+            |facts, reader, _| {
+                assert_eq!(
+                    tag_display_name_from_facts(facts, reader, tag).unwrap(),
+                    "alpha / beta"
+                );
+            },
+        );
+
+        let unnamed = genid().id;
+        let mut tagged = draft(author, "unnamed tag", []);
+        tagged.tags.insert(unnamed);
+        let (tagged_fragment, _) = revision_record(tagged).unwrap();
+        case(
+            &mut refused,
+            "an unnamed tag",
+            author_fragment.clone() + tagged_fragment,
+            |facts, reader, _| {
+                assert_eq!(
+                    tag_display_name_from_facts(facts, reader, unnamed).unwrap(),
+                    format!("{unnamed:x}")
+                );
+            },
+        );
+
+        let mut fragment = author_fragment.clone();
+        let mixed: TextHandle = fragment.put(" Mixed ".to_owned());
+        let named = entity! { metadata::name: mixed };
+        let mixed_tag = named.root().unwrap();
+        fragment += named;
+        let mut tagged = draft(author, "mixed", []);
+        tagged.tags.insert(mixed_tag);
+        fragment += revision_record(tagged).unwrap().0;
+        case(
+            &mut refused,
+            "a tag name that is not normalized",
+            fragment,
+            |facts, reader, _| {
+                assert_eq!(
+                    tag_display_name_from_facts(facts, reader, mixed_tag).unwrap(),
+                    " Mixed "
+                );
+            },
+        );
+
+        let mut fragment = author_fragment.clone();
+        let retired: TextHandle = fragment.put("retired".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&TAG_ARCHIVED_ID) @ metadata::name: retired };
+        let mut archived = draft(author, "archived by id", []);
+        archived.tags.insert(TAG_ARCHIVED_ID);
+        fragment += revision_record(archived).unwrap().0;
+        case(
+            &mut refused,
+            "a built-in tag under another name",
+            fragment,
+            |facts, reader, latest| {
+                assert_eq!(
+                    tag_display_name_from_facts(facts, reader, TAG_ARCHIVED_ID).unwrap(),
+                    "retired"
+                );
+                let model = FrontierModel::load(reader, facts, latest).unwrap();
+                assert!(!model.entries[0].active, "archived is the id, not the name");
+            },
+        );
+
+        let mut untitled = revision_fragment(author, "", "body", &[], &[]);
+        let untitled_id = untitled.root().unwrap();
+        untitled += authorship_fragment(untitled_id, Some(author), Some(at(1.0))).unwrap();
+        case(
+            &mut refused,
+            "an empty title",
+            author_fragment.clone() + untitled,
+            |facts, reader, _| {
+                let records = revision_records(facts, untitled_id);
+                assert_eq!(read_text(reader, records[0].title).unwrap(), "");
+            },
+        );
+
+        let (absent_fragment, absent_revision) =
+            revision_record(draft(author, "elsewhere", [])).unwrap();
+        let mut fragment = author_fragment.clone() + without_blobs(absent_fragment);
+        let (tag_fragment, tag_id, _) = tag_record("held elsewhere").unwrap();
+        fragment += without_blobs(tag_fragment);
+        case(
+            &mut refused,
+            "texts that are not resident",
+            fragment,
+            |facts, reader, latest| {
+                assert_eq!(revision_ids(facts), BTreeSet::from([absent_revision]));
+                assert_eq!(entries(facts, latest).len(), 1);
+                let record = &revision_records(facts, absent_revision)[0];
+                assert!(
+                    read_text(reader, record.title).is_err(),
+                    "unreadable only when asked"
+                );
+                assert!(tag_display_name_from_facts(facts, reader, tag_id).is_err());
+            },
+        );
+
+        assert!(
+            refused.is_empty(),
+            "refused open-world facts:\n{}",
+            refused.join("\n")
+        );
     }
 
     /// A page citing ITSELF is not a page anyone linked to.

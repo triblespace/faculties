@@ -409,11 +409,7 @@ fn now_interval() -> Result<Inline<inlineencodings::NsTAIInterval>> {
 }
 
 fn entry_label(entry: &EntryRecord) -> String {
-    entry
-        .roots
-        .first()
-        .map(|id| format!("{id:x}"))
-        .unwrap_or_else(|| "<empty>".to_owned())
+    format!("{:x}", entry.label())
 }
 
 /// Every id the CLI accepts. A revision, and nothing else: the legacy anchor
@@ -447,6 +443,10 @@ fn resolve_prefix<P: TriblePattern>(facts: &P, raw: &str) -> Result<Id> {
 /// revision. Mutations resolve exact here and then join the whole frontier
 /// through [`mutation_entry`], so a write already follows the entry no matter
 /// which member id it is handed.
+///
+/// An entry the latest index names no current state for (every member is
+/// superseded: a supersedes cycle, or a claim from outside the Wiki) has
+/// nothing to follow to, so the named revision itself is the answer.
 fn selector_revisions(
     view: &WikiView,
     selector: Id,
@@ -465,13 +465,18 @@ fn selector_revisions_in<P: TriblePattern>(
     if revisions.is_empty() {
         bail!("unknown Wiki selector {selector:x}");
     }
-    if follow_frontier {
-        Ok(wiki_model::entry(facts, latest, selector)
+    let frontier = if follow_frontier {
+        wiki_model::entry(facts, latest, selector)
             .expect("queryable revision belongs to one entry")
-            .frontier)
+            .frontier
     } else {
-        Ok(revisions)
-    }
+        Vec::new()
+    };
+    Ok(if frontier.is_empty() {
+        revisions
+    } else {
+        frontier
+    })
 }
 
 fn mutation_entry(view: &WikiView, raw: &str) -> Result<EntryRecord> {
@@ -1062,7 +1067,11 @@ pub(crate) fn render_show<P: TriblePattern>(
 fn cmd_export(storage: WikiStorage<'_>, id: String, exact: bool) -> Result<Export> {
     let content = storage.view(|view| {
         let selector = resolve_prefix(&view.facts, &id)?;
-        let revisions = selector_revisions(view, selector, !exact)?;
+        let mut revisions = selector_revisions(view, selector, !exact)?;
+        // Several readings of one revision that agree on its content export
+        // that content; only disagreeing revisions are a fork to choose from.
+        let mut seen = BTreeSet::new();
+        revisions.retain(|revision| seen.insert((revision.id, revision.content)));
         let [revision] = revisions.as_slice() else {
             bail!(
                 "selector resolves to a fork ({}); choose one with --exact",
@@ -1804,15 +1813,26 @@ fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool)
 /// breakage; a legacy anchor and an unwritten target are reported separately
 /// and counted as neither. `wiki links` is the full classified report.
 fn cmd_check(storage: WikiStorage<'_>, compile: bool, out: &mut Out<'_>) -> Result<()> {
-    let (summary, diagnostics, issues) = storage.view(|view| {
+    let (summary, diagnostics, issues, observations) = storage.view(|view| {
         let model = FrontierModel::load(&view.reader, &view.facts, &view.latest)?;
         let mut diagnostics = String::new();
         let mut issues = 0usize;
         let mut legacy = 0usize;
         let mut unwritten = 0usize;
         let mut archived = 0usize;
+        let mut stateless = 0usize;
+        let mut several = BTreeSet::new();
         let entries = wiki_model::entries(&view.facts, &view.latest);
         for entry in &entries {
+            if entry.frontier.is_empty() {
+                stateless += 1;
+            }
+            let mut heads = BTreeSet::new();
+            for head in &entry.frontier {
+                if !heads.insert(head.id) {
+                    several.insert(head.id);
+                }
+            }
             // An archived page citing an archived page is not actionable, and
             // scoping links to the LIVE frontier is what keeps this command and
             // `wiki links` from reporting two different numbers for one corpus.
@@ -1861,12 +1881,30 @@ fn cmd_check(storage: WikiStorage<'_>, compile: bool, out: &mut Out<'_>) -> Resu
          {issues} issues ({legacy} legacy anchor, {unwritten} unwritten target)",
             entries - archived
         );
-        Ok((summary, diagnostics, issues))
+        let mut observations = Vec::new();
+        if stateless > 0 {
+            observations.push(format!(
+                "{stateless} entries have no current state: every member is superseded \
+                 (a supersedes cycle, or a claim from outside the Wiki); wiki history \
+                 reads them"
+            ));
+        }
+        if !several.is_empty() {
+            observations.push(format!(
+                "{} current revisions carry several titles, contents or authors; \
+                 wiki show prints each reading",
+                several.len()
+            ));
+        }
+        Ok((summary, diagnostics, issues, observations))
     })?;
     out.text(format!("{diagnostics}"))?;
     out.line(format!("{summary}"))?;
     if issues == 0 {
         out.line(format!("All clear!"))?;
+    }
+    for observation in observations {
+        out.note(observation)?;
     }
     Ok(())
 }
@@ -1911,7 +1949,7 @@ fn cmd_fix_truncated(storage: WikiStorage<'_>, input: String, out: &mut Out<'_>)
 }
 
 fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>) -> Result<()> {
-    let (report, changed, revisions) =
+    let (report, changed, revisions, unfixed) =
         storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let resolver = ReferenceResolver {
                 wiki: &view.facts,
@@ -1919,6 +1957,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
             };
             let mut report = String::new();
             let mut revisions = Vec::new();
+            let mut unfixed = Vec::new();
             let mut changed = 0usize;
             for entry in wiki_model::entries(&view.facts, &view.latest) {
                 for head in &entry.frontier {
@@ -1938,11 +1977,12 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
                         .unwrap();
                     }
                     if fix {
+                        // A fork, or one revision read several ways, has no
+                        // single text to fix; it is named, and the rest of
+                        // the Wiki is still fixed.
                         if entry.frontier.len() != 1 {
-                            bail!(
-                        "cannot lint-fix forked entry {} without an explicit content resolution",
-                        entry_label(&entry)
-                    );
+                            unfixed.push(entry_label(&entry));
+                            break;
                         }
                         let title = revision_title(&view.reader, head)?;
                         let tags = head.tags.iter().copied().collect();
@@ -1951,7 +1991,7 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
                     }
                 }
             }
-            Ok((report, changed, revisions))
+            Ok((report, changed, revisions, unfixed))
         })?;
     let mut fragment = Fragment::empty();
     for (entry, title, content, tags) in revisions {
@@ -1962,6 +2002,12 @@ fn cmd_lint(storage: WikiStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>)
     }
     out.text(format!("{report}"))?;
     out.line(format!("{changed} revision(s) need lint fixes"))?;
+    for label in unfixed {
+        out.note(format!(
+            "not fixed: entry {label} has several current revisions or readings; \
+             resolve it with wiki edit"
+        ))?;
+    }
     if check && changed > 0 {
         bail!("lint check failed")
     }
@@ -1976,6 +2022,9 @@ fn cmd_batch_export(storage: WikiStorage<'_>) -> Result<Vec<(Id, String)>> {
                 exports.push((head.id, revision_content(&view.reader, head)?));
             }
         }
+        // One file per revision and content, however many readings carry it.
+        let mut seen = BTreeSet::new();
+        exports.retain(|export| seen.insert(export.clone()));
         Ok(exports)
     })?;
     Ok(exports)
@@ -3355,6 +3404,125 @@ mod tests {
         assert_eq!(
             read_string(&after.reader, head.content).unwrap(),
             format!("see #link(\"wiki:{target:x}\")[the page]")
+        );
+    }
+
+    /// Every read command answers over facts the strict catalog used to
+    /// refuse: one revision id with two titles, a supersedes cycle, and a
+    /// revision whose predecessor is absent. Each command gives the reading
+    /// documented on it; none refuses the collection.
+    #[test]
+    fn every_read_answers_over_open_world_facts() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let mut fragment = Fragment::empty();
+        let (author_fragment, author) = storage.author_fragment().unwrap();
+        fragment += author_fragment;
+        let (record, orphan) = wiki_model::revision_record(RevisionDraft {
+            title: "orphan".to_owned(),
+            content: "its predecessor never arrived".to_owned(),
+            tags: BTreeSet::new(),
+            predecessors: BTreeSet::from([genid().id]),
+            author,
+            authored_at: point(3.0),
+        })
+        .unwrap();
+        fragment += record;
+        // A truncated citation, so lint has something to fix here.
+        let cited = format!("see wiki:{}", &format!("{orphan:x}")[..12]);
+        let doubled = stage_revision(
+            storage,
+            &mut fragment,
+            None,
+            "first title".to_owned(),
+            cited.clone(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let other_title: schema::TextHandle = fragment.put("second title".to_owned());
+        fragment +=
+            entity! { ExclusiveId::force_ref(&doubled) @ schema::attrs::title: other_title };
+        let (first, second) = (genid().id, genid().id);
+        for (id, other, body, at) in [(first, second, "one", 1.0), (second, first, "two", 2.0)] {
+            let title: schema::TextHandle = fragment.put("cycle".to_owned());
+            let content: schema::TextHandle = fragment.put(body.to_owned());
+            fragment += entity! { ExclusiveId::force_ref(&id) @
+                metadata::tag: &schema::KIND_VERSION_ID,
+                schema::attrs::title: title,
+                schema::attrs::content: content,
+                metadata::created_at: point(at),
+                metadata::supersedes: other,
+            };
+        }
+        storage.publish(fragment).unwrap();
+        let mut notes = Vec::new();
+        let mut sink = |part| {
+            if let crate::out::Part::Note { text } = part {
+                notes.push(text);
+            }
+            Ok(())
+        };
+        let mut out = Out::new(&mut sink);
+
+        // Several titles under one id: show prints each reading, export
+        // answers because they agree on the content it exports.
+        let shown = cmd_show(storage, format!("{doubled:x}"), true).unwrap();
+        assert!(shown.contains("# first title") && shown.contains("# second title"));
+        let exported = cmd_export(storage, format!("{doubled:x}"), true).unwrap();
+        assert_eq!(exported.bytes.as_ref(), cited.as_bytes());
+        let listed = cmd_list(storage, vec![], vec![], vec![], vec![], vec![], false).unwrap();
+        assert!(listed.contains("first title") && listed.contains("second title"));
+        assert!(listed.contains("orphan"));
+
+        // An absent predecessor: the revision is its entry's root.
+        let history = cmd_history(storage, format!("{orphan:x}")).unwrap();
+        assert!(
+            history.contains(&format!("v1  {orphan:x}  orphan")),
+            "{history}"
+        );
+        assert!(history.contains("[head]"));
+
+        // A cycle: every member is retired by the index, so the entry has no
+        // current state. History reads every member, earliest first; show
+        // follows to the named revision itself.
+        let history = cmd_history(storage, format!("{first:x}")).unwrap();
+        assert!(history.contains(&format!("v1  {first:x}")), "{history}");
+        assert!(history.contains(&format!("v2  {second:x}")), "{history}");
+        let shown = cmd_show(storage, format!("{second:x}"), false).unwrap();
+        assert!(shown.starts_with("# cycle\n"), "{shown}");
+        assert!(shown.ends_with("two"), "{shown}");
+        let diff = cmd_diff(storage, format!("{first:x}"), None, None).unwrap();
+        assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
+
+        cmd_links(storage, None, 10, false, &mut out).unwrap();
+        cmd_links(storage, Some(format!("{first:x}")), 10, false, &mut out).unwrap();
+        cmd_tag_list(storage, &mut out).unwrap();
+        cmd_search(storage, "title".to_owned(), true, true).unwrap();
+        // One export per revision, however many readings it has.
+        assert_eq!(cmd_batch_export(storage).unwrap().len(), 2);
+
+        // Check observes and reports; it calls nothing invalid.
+        cmd_check(storage, false, &mut out).unwrap();
+        // Lint names the entry it cannot fix and still finishes.
+        cmd_lint(storage, true, false, &mut out).unwrap();
+        drop(out);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("1 entries have no current state")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with("1 current revisions carry several")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains(&format!("not fixed: entry {doubled:x}"))),
+            "{notes:?}"
         );
     }
 

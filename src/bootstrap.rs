@@ -15,9 +15,10 @@ use anyhow::{bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::id::Id;
+use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
-use triblespace::core::trible::Fragment;
+use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
 
@@ -343,9 +344,16 @@ fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
     output
 }
 
-fn wiki_fragment<R: BlobStoreGet>(
+/// The seed's Wiki fragment, advancing only its own source strand over
+/// `current`, the collection's facts as they are and a reader for their texts.
+///
+/// The strand is recognized by query at its point of use: revisions in the
+/// root's entry whose identity author is this key and which carry this key's
+/// fixed source authorship. A revision read several ways is a source revision
+/// when any reading is, and replays exactly when any reading matches the seed.
+fn wiki_fragment<P: TriblePattern, R: BlobStoreGet>(
     key: &ed25519_dalek::VerifyingKey,
-    current: Option<(&wiki_model::WikiCatalog, &R)>,
+    current: Option<(&P, &R)>,
 ) -> Result<(Fragment, Vec<Id>)> {
     let (mut out, author) = wiki_model::author_record(key);
 
@@ -364,13 +372,11 @@ fn wiki_fragment<R: BlobStoreGet>(
         // One fixed provenance coordinate marks generated successors. It is
         // deliberately independent of manifest ordering and mutable payload.
         let source_time = wiki_time(1);
-        let predecessors = match current.and_then(|(catalog, reader)| {
-            catalog
-                .revisions
-                .entry_containing(root_ids[index])
-                .map(|entry| (catalog, reader, entry))
+        let predecessors = match current.and_then(|(facts, reader)| {
+            wiki_model::entry_members(facts, root_ids[index])
+                .map(|members| (facts, reader, members))
         }) {
-            Some((catalog, reader, entry)) => {
+            Some((facts, reader, members)) => {
                 let is_source = |revision: &wiki_model::RevisionRecord| {
                     revision.author == Some(author)
                         && revision.authorships.iter().any(|authorship| {
@@ -378,42 +384,43 @@ fn wiki_fragment<R: BlobStoreGet>(
                                 && authorship.authored_at == Some(source_time)
                         })
                 };
-                let mut sources: Vec<_> = entry
-                    .members
+                let sources: BTreeMap<Id, Vec<wiki_model::RevisionRecord>> = members
                     .iter()
-                    .filter_map(|id| catalog.revisions.revision(*id))
-                    .filter(|revision| is_source(revision))
+                    .map(|id| (*id, wiki_model::revision_records(facts, *id)))
+                    .filter(|(_, readings)| readings.iter().any(is_source))
                     .collect();
-                sources.sort_by_key(|revision| revision.id);
 
-                let source_ids: BTreeSet<_> = sources.iter().map(|revision| revision.id).collect();
-                let referenced: BTreeSet<_> = sources
-                    .iter()
+                let referenced: BTreeSet<Id> = sources
+                    .values()
+                    .flatten()
                     .flat_map(|revision| revision.supersedes.iter().copied())
-                    .filter(|id| source_ids.contains(id))
+                    .filter(|id| sources.contains_key(id))
                     .collect();
-                let source_heads: BTreeSet<_> =
-                    source_ids.difference(&referenced).copied().collect();
+                let source_heads: BTreeSet<Id> = sources
+                    .keys()
+                    .copied()
+                    .filter(|id| !referenced.contains(id))
+                    .collect();
 
                 // Replay an exact revision only when it is already the sole
                 // maximal source revision. It may sit below recipient-only
                 // successors; those are an independent lane. Reverting A -> B
                 // -> A or reconciling source forks instead mints a successor
                 // over every current source head.
-                let exact_source_head = if source_heads.len() == 1 {
-                    let head = catalog
-                        .revisions
-                        .revision(*source_heads.first().expect("one source head"))
-                        .expect("source head came from the catalog");
-                    (head.tags == tags
-                        && wiki_model::read_text(reader, head.title)? == spec.title
-                        && wiki_model::read_text(reader, head.content)? == content)
-                        .then_some(head)
-                } else {
-                    None
-                };
-                if let Some(revision) = exact_source_head {
-                    revision.supersedes.clone()
+                let mut exact_source_head = None;
+                if let [head] = source_heads.iter().collect::<Vec<_>>().as_slice() {
+                    for reading in &sources[*head] {
+                        if reading.tags == tags
+                            && wiki_model::read_text(reader, reading.title)? == spec.title
+                            && wiki_model::read_text(reader, reading.content)? == content
+                        {
+                            exact_source_head = Some(reading.supersedes.clone());
+                            break;
+                        }
+                    }
+                }
+                if let Some(supersedes) = exact_source_head {
+                    supersedes
                 } else if source_heads.is_empty() {
                     BTreeSet::from([root_ids[index]])
                 } else {
@@ -465,7 +472,7 @@ fn compass_fragment() -> Result<Fragment> {
 
 /// Build the exact self-contained logical seed for one recipient author.
 pub fn build(key: &ed25519_dalek::VerifyingKey) -> Result<PortableSeed> {
-    let (wiki, wiki_roots) = wiki_fragment(key, None::<(&wiki_model::WikiCatalog, &PileSnapshot)>)?;
+    let (wiki, wiki_roots) = wiki_fragment(key, None::<(&TribleSet, &PileSnapshot)>)?;
     Ok(PortableSeed {
         wiki,
         compass: compass_fragment()?,
@@ -544,9 +551,10 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             })
             .context("ensure Wiki before bootstrap import")?;
 
-        // Bootstrap is an explicit whole-catalog import oracle. Read every
-        // admitted foundation through one fixed snapshot, even if its payload
-        // has not arrived locally. Validation below keeps its strict contract.
+        // Read every admitted foundation through one fixed snapshot, even if
+        // its payload has not arrived locally. The facts are read as they
+        // are: only the seed's own lineage is queried, and only the seed's own
+        // texts are required to be readable.
         let read_all =
             |source: triblespace::core::collection::Collection<
                 triblespace::prelude::blobencodings::SimpleArchive,
@@ -561,8 +569,8 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             };
         let before = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
         let wiki_before = read_all(wiki_source, &before)?;
-        let catalog = wiki_model::validate_catalog(&before, &wiki_before)?;
-        let (wiki, wiki_roots) = wiki_fragment(&signer.verifying_key(), Some((&catalog, &before)))?;
+        let (wiki, wiki_roots) =
+            wiki_fragment(&signer.verifying_key(), Some((&wiki_before, &before)))?;
         let seed = PortableSeed {
             wiki,
             compass: compass_fragment()?,
@@ -592,7 +600,9 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
 
         let after = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
         let wiki_after = read_all(wiki_source, &after)?;
-        wiki_model::validate_catalog(&after, &wiki_after)?;
+        // The seed's own texts must be readable; whatever else the collection
+        // holds is read open-world by its readers, never checked here.
+        wiki_model::require_text_payloads(&after, &expected_wiki)?;
         if !expected_wiki.difference(&wiki_after).is_empty() {
             bail!("Wiki collection omitted portable bootstrap facts after publication");
         }
@@ -658,13 +668,25 @@ mod tests {
         (wiki, compass)
     }
 
+    /// The entry containing `root` in `facts`, under their own latest index.
+    fn entry_of(facts: &triblespace::prelude::TribleSet, root: Id) -> wiki_model::EntryRecord {
+        wiki_model::entry(facts, &wiki_model::latest_index_for_tests(facts), root).unwrap()
+    }
+
+    /// The one reading of a revision these fixtures hold.
+    fn record_of(facts: &triblespace::prelude::TribleSet, id: Id) -> wiki_model::RevisionRecord {
+        let mut records = wiki_model::revision_records(facts, id);
+        assert_eq!(records.len(), 1);
+        records.remove(0)
+    }
+
     #[test]
     fn declared_seed_shape_is_complete_without_alias_entities() {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let seed = build(&signer.verifying_key()).unwrap();
-        let wiki = wiki_model::load_catalog(seed.wiki.facts()).unwrap();
-        assert_eq!(wiki.revisions.all_entries().len(), 21);
-        assert_eq!(wiki.revisions.revision_records().count(), 42);
+        let latest = wiki_model::latest_index_for_tests(seed.wiki.facts());
+        assert_eq!(wiki_model::entries(seed.wiki.facts(), &latest).len(), 21);
+        assert_eq!(wiki_model::revision_ids(seed.wiki.facts()).len(), 42);
         assert_eq!(seed.wiki_roots.len(), 21);
         assert_eq!(compass::goal_ids(seed.compass.facts()).len(), 7);
         assert_eq!(compass::note_ids(seed.compass.facts()).len(), 7);
@@ -735,23 +757,14 @@ mod tests {
         assert_ne!(left_wiki, right_wiki, "Wiki authorship is part of identity");
         assert_eq!(left_compass, right_compass);
 
-        let left_catalog = wiki_model::load_catalog(&left_wiki).unwrap();
-        let right_catalog = wiki_model::load_catalog(&right_wiki).unwrap();
-        let left_titles: BTreeSet<_> = left_catalog
-            .revisions
-            .list_entries()
-            .into_iter()
-            .flat_map(|entry| entry.frontier)
-            .map(|revision| revision.title)
-            .collect();
-        let right_titles: BTreeSet<_> = right_catalog
-            .revisions
-            .list_entries()
-            .into_iter()
-            .flat_map(|entry| entry.frontier)
-            .map(|revision| revision.title)
-            .collect();
-        assert_eq!(left_titles, right_titles);
+        let titles = |facts: &triblespace::prelude::TribleSet| -> BTreeSet<_> {
+            wiki_model::entries(facts, &wiki_model::latest_index_for_tests(facts))
+                .into_iter()
+                .flat_map(|entry| entry.frontier)
+                .map(|revision| revision.title)
+                .collect()
+        };
+        assert_eq!(titles(&left_wiki), titles(&right_wiki));
     }
 
     #[test]
@@ -872,11 +885,10 @@ mod tests {
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&after).unwrap();
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = entry_of(&after, root);
         let frontier: BTreeSet<_> = entry.frontier.iter().map(|revision| revision.id).collect();
         assert_eq!(frontier, BTreeSet::from([local_edit_id, bundled_source_id]));
-        let bundled = catalog.revisions.revision(bundled_source_id).unwrap();
+        let bundled = record_of(&after, bundled_source_id);
         assert_eq!(bundled.supersedes, BTreeSet::from([prior_source_id]));
         assert_eq!(
             wiki_model::read_text(&reader, bundled.content).unwrap(),
@@ -891,9 +903,8 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (before, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&before).unwrap();
         let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
-        let source_a = catalog.revisions.entry_containing(root).unwrap().frontier[0].clone();
+        let source_a = entry_of(&before, root).frontier[0].clone();
         let (_, author) = wiki_model::author_record(&signer.verifying_key());
 
         let (source_b, source_b_id) = wiki::revision_record(RevisionDraft {
@@ -912,8 +923,7 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&after).unwrap();
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         let reverted_a = &entry.frontier[0];
         assert_ne!(reverted_a.id, source_a.id);
@@ -931,9 +941,8 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (before, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&before).unwrap();
         let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
-        let source_a = catalog.revisions.entry_containing(root).unwrap().frontier[0].clone();
+        let source_a = entry_of(&before, root).frontier[0].clone();
         let (_, author) = wiki_model::author_record(&signer.verifying_key());
         let mut forks = Fragment::empty();
         let mut fork_ids = BTreeSet::new();
@@ -957,8 +966,7 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&after).unwrap();
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         let reconciled = &entry.frontier[0];
         assert_eq!(reconciled.supersedes, fork_ids);
@@ -1001,9 +1009,9 @@ mod tests {
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
         let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&after).unwrap();
-        assert_eq!(catalog.revisions.all_entries().len(), WIKI_SEED.len());
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let latest = wiki_model::latest_index_for_tests(&after);
+        assert_eq!(wiki_model::entries(&after, &latest).len(), WIKI_SEED.len());
+        let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         assert_eq!(
             entry.frontier[0].supersedes,
@@ -1015,7 +1023,7 @@ mod tests {
         );
         assert_ne!(
             entry.frontier[0].tags,
-            catalog.revisions.revision(old_source_id).unwrap().tags
+            record_of(&after, old_source_id).tags
         );
         pile.close().unwrap();
     }
@@ -1026,9 +1034,8 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (before, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&before).unwrap();
         let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
-        let head = catalog.revisions.entry_containing(root).unwrap().frontier[0].clone();
+        let head = entry_of(&before, root).frontier[0].clone();
         let title = wiki_model::read_text(&reader, head.title).unwrap();
         let content = wiki_model::read_text(&reader, head.content).unwrap();
         drop(reader);
@@ -1056,8 +1063,7 @@ mod tests {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
         let (after, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let catalog = wiki_model::load_catalog(&after).unwrap();
-        let entry = catalog.revisions.entry_containing(root).unwrap();
+        let entry = entry_of(&after, root);
         assert_eq!(
             entry
                 .frontier
@@ -1111,5 +1117,80 @@ mod tests {
         pile.close().unwrap();
 
         import(&pile_path, Some(&key)).unwrap();
+    }
+
+    /// Import adds the seed beside whatever the Wiki collection already
+    /// holds: a revision with two titles, a supersedes cycle, a revision whose
+    /// predecessor is absent, an unnamed tag, a tag name that is not
+    /// normalized, and a revision whose texts are not resident here. None of
+    /// those is the seed's, and none is a reason to refuse it.
+    #[test]
+    fn import_beside_an_open_world_wiki_collection_does_not_refuse() {
+        use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
+        use triblespace::core::metadata;
+        use triblespace::macros::entity;
+        use triblespace::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("open-wiki.pile");
+        let key = directory.path().join("open-wiki.key");
+        File::create(&pile_path).unwrap();
+        let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
+        let (mut fragment, author) = wiki_model::author_record(&signer.verifying_key());
+
+        let mut unnamed = RevisionDraft {
+            title: "two titles".to_owned(),
+            content: "body".to_owned(),
+            tags: BTreeSet::from([genid().id]),
+            predecessors: BTreeSet::from([genid().id]),
+            author,
+            authored_at: wiki_time(7),
+        };
+        let (record, doubled) = wiki::revision_record(unnamed.clone()).unwrap();
+        fragment += record;
+        let other: wiki::IntervalValue = wiki_time(8);
+        let title = fragment.put::<blobencodings::UTF8String, _>("another title".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&doubled) @ attrs::title: title };
+
+        let mixed = fragment.put::<blobencodings::UTF8String, _>(" Mixed ".to_owned());
+        let named = entity! { metadata::name: mixed };
+        unnamed.tags = BTreeSet::from([named.root().unwrap()]);
+        unnamed.title = "mixed tag".to_owned();
+        unnamed.authored_at = other;
+        fragment += named;
+        fragment += wiki::revision_record(unnamed.clone()).unwrap().0;
+
+        let (first, second) = (genid().id, genid().id);
+        for (id, predecessor) in [(first, second), (second, first)] {
+            let title = fragment.put::<blobencodings::UTF8String, _>("cycle".to_owned());
+            fragment += entity! { ExclusiveId::force_ref(&id) @
+                metadata::tag: &KIND_VERSION_ID,
+                attrs::title: title,
+                attrs::content: title,
+                metadata::supersedes: predecessor,
+            };
+        }
+
+        unnamed.title = "held elsewhere".to_owned();
+        unnamed.tags = BTreeSet::new();
+        let (mut absent, _) = wiki::revision_record(unnamed).unwrap();
+        absent.blobs_mut().keep([]);
+        fragment += absent;
+
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        wiki_model::commit_collection(&mut pile, &signer, fragment).unwrap();
+        pile.close().unwrap();
+
+        import(&pile_path, Some(&key)).unwrap();
+        let replay = import(&pile_path, Some(&key)).unwrap();
+        let fresh = build(&signer.verifying_key()).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        let (wiki, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        pile.close().unwrap();
+        assert!(fresh.wiki.facts().difference(&wiki).is_empty());
+        assert_eq!(
+            import(&pile_path, Some(&key)).unwrap().wiki_commit,
+            replay.wiki_commit
+        );
     }
 }
