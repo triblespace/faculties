@@ -3297,8 +3297,16 @@ mod tests {
             })
             .unwrap();
 
+        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(source.handle())]);
+        let before = fixture
+            .storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
+            .unwrap();
+        // A lookup answers from the foundations it could read (0f6f19e2): the
+        // resident memory is still shown, and the omission is reported beside
+        // it rather than refusing the whole view.
         shown.clear();
-        let error = memory
+        memory
             .show(
                 &format!("{warm:x}"),
                 &mut Out::new(&mut |part| {
@@ -3309,22 +3317,10 @@ mod tests {
                     Ok(())
                 }),
             )
-            .unwrap_err();
-        assert!(
-            shown.is_empty(),
-            "an incomplete observation must not be presented"
-        );
-        let incomplete = error
-            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
             .unwrap();
-        assert_eq!(incomplete.unread.collection(), source);
-        assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
-
-        let selectors = BTreeSet::from([CollectionRecordSelector::Collection(source.handle())]);
-        let before = fixture
-            .storage
-            .with_pile(|pile, _| Ok(pile.snapshot()?.select_records(&selectors)?))
-            .unwrap();
+        assert_eq!(shown, "already resident history\n");
+        // A write depends on absence, so it still refuses and names the
+        // unread member.
         for summary in [
             "a later journal entry".to_owned(),
             format!("[earlier](memory:{warm:x})"),
