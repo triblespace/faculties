@@ -14,7 +14,7 @@
 //! a unit this accepts may still fail the importer for one of those.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use triblespace::core::import::json_tree;
 use triblespace::prelude::blobencodings::UTF8String;
@@ -265,7 +265,16 @@ struct Table {
     table: &'static FieldTable,
     known: HashSet<String>,
     by_path: HashMap<&'static str, Vec<&'static Entry>>,
+    /// The entries chosen for a value, by (value, category). Every entry
+    /// anchor of a family asks the same question, so it is answered once.
+    /// json_tree ids derive from content, and so do the record and parent
+    /// ids in a category, so an answer holds in every unit; the cache is
+    /// only ever emptied to bound its size.
+    chosen: Mutex<HashMap<(Id, Cat), Vec<&'static Entry>>>,
 }
+
+/// The most answers the chosen-entry cache keeps before it starts over.
+const CHOSEN_CACHE: usize = 1 << 20;
 
 impl Table {
     fn new(table: &'static FieldTable) -> Self {
@@ -277,6 +286,7 @@ impl Table {
             table,
             known: known_paths(table),
             by_path,
+            chosen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -347,6 +357,20 @@ impl Table {
     /// The entries that apply to the value: at its shaped path first, and
     /// at its own path when none does there.
     fn chosen(&self, unit: &Unit, v: Id, cat: &Cat) -> Vec<&'static Entry> {
+        let key = (v, cat.clone());
+        if let Some(entries) = self.chosen.lock().unwrap().get(&key) {
+            return entries.clone();
+        }
+        let entries = self.choose(unit, v, cat);
+        let mut cache = self.chosen.lock().unwrap();
+        if cache.len() >= CHOSEN_CACHE {
+            cache.clear();
+        }
+        cache.insert(key, entries.clone());
+        entries
+    }
+
+    fn choose(&self, unit: &Unit, v: Id, cat: &Cat) -> Vec<&'static Entry> {
         if let Some(shape) = self.shape(unit, v, &cat.path) {
             let shaped = format!("{}{{{shape}}}", cat.path);
             let entries = self.candidates(&shaped, unit, v, cat);
