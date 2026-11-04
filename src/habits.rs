@@ -472,8 +472,10 @@ fn load_script<Reader>(reader: &Reader, handle: ScriptHandle, habit: Id) -> Resu
 where
     Reader: BlobStoreGet + ?Sized,
 {
-    let bytes: anybytes::Bytes = reader.get(handle).map_err(|_| {
-        anyhow!(
+    // Keep the reader's error as the source: a caller that acquires missing
+    // payloads recognizes the absent blob through it.
+    let bytes: anybytes::Bytes = reader.get(handle).with_context(|| {
+        format!(
             "Habit {habit:x} script blob {} is not in this snapshot",
             hex::encode(handle.raw)
         )
@@ -691,13 +693,43 @@ where
     Reader: BlobStoreGet + ?Sized,
     P: TriblePattern + ?Sized,
 {
+    live_definitions_where(reader, facts, |_| true)
+}
+
+/// [`live_definitions`] restricted to the ids `keep` admits. `keep` is asked
+/// before any payload of a definition is read, so a definition it refuses
+/// can neither fail the read nor make it wait for bytes.
+fn live_definitions_where<Reader, P>(
+    reader: &Reader,
+    facts: &P,
+    keep: impl Fn(Id) -> bool,
+) -> Result<Vec<Habit>>
+where
+    Reader: BlobStoreGet + ?Sized,
+    P: TriblePattern + ?Sized,
+{
     let superseded = superseded_definition_ids(facts);
     decode_definitions(
         reader,
         projected_definitions(facts)
             .into_iter()
-            .filter(|habit| !superseded.contains(&habit.id)),
+            .filter(|habit| !superseded.contains(&habit.id) && keep(habit.id)),
     )
+}
+
+/// Every definition no complete successor supersedes, read from facts alone.
+///
+/// This is the liveness [`rows`] uses, without reading any payload, for a
+/// reader that must not fetch or evaluate anything.
+pub fn live_definition_ids<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    let superseded = superseded_definition_ids(facts);
+    definition_ids(facts)
+        .into_iter()
+        .filter(|id| !superseded.contains(id))
+        .collect()
 }
 
 /// Project the recognized state assertions governing one Habit.
@@ -885,14 +917,35 @@ where
 /// one id. Each row is a reading of the same intention and is evaluated on its
 /// own; the intention is due when any of its readings is. That needs no rule
 /// for choosing between values, so no window can disagree about which won.
+///
+/// Rows come sorted by label and id, and the readings of one id in a fixed
+/// order after that. Where one reading has to speak for a due intention, it
+/// is the first due one in this order, for every reader.
 pub fn rows<Reader, P>(reader: &Reader, facts: &P) -> Result<Vec<HabitRow>>
+where
+    Reader: BlobStoreGet + ?Sized,
+    P: TriblePattern + ?Sized,
+{
+    rows_where(reader, facts, |_| true)
+}
+
+/// [`rows`] for the live definitions `keep` admits, each row exactly as
+/// [`rows`] builds it. `keep` sees only the definition id and is asked before
+/// any payload is read, so a reader selecting by its own concern (who an
+/// intention addresses, say) never fetches or waits on a definition it will
+/// not show.
+pub fn rows_where<Reader, P>(
+    reader: &Reader,
+    facts: &P,
+    keep: impl Fn(Id) -> bool,
+) -> Result<Vec<HabitRow>>
 where
     Reader: BlobStoreGet + ?Sized,
     P: TriblePattern + ?Sized,
 {
     let ancestry = revision_ancestry(facts)?;
     let mut rows = Vec::new();
-    for habit in live_definitions(reader, facts)? {
+    for habit in live_definitions_where(reader, facts, keep)? {
         let mut completed_at: Vec<i64> = standing_completions(facts, &ancestry, habit.id)
             .into_iter()
             .filter_map(|completion| interval_second(completion.completed_at))

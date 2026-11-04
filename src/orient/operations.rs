@@ -322,11 +322,8 @@ use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
 use crate::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID};
 use crate::schemas::files::file;
+use crate::schemas::habit::attrs as habit_attrs;
 use crate::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
-use crate::schemas::habit::{
-    attrs as habit_attrs, KIND_HABIT_ID, KIND_STATE_ID as KIND_HABIT_STATE_ID, STATE_ACTIVE,
-    STATE_PAUSED,
-};
 use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::mail::{
     imported as imported_mail, observation as mail_observation, projection as mail_projection,
@@ -2959,144 +2956,44 @@ struct HabitObservation {
     next_cooldown_at: Option<i64>,
 }
 
+/// Whether an intention addresses the observer. Attention routing is a fact
+/// on the intention, not its author: an intention with no target addresses
+/// everyone, and one with targets addresses exactly those. Without an
+/// observer, only global intentions apply.
+fn habit_addresses(facts: &FactArchive, habit: Id, persona: Option<Id>) -> bool {
+    !habit_is_targeted(facts, habit)
+        || persona.is_some_and(|persona| {
+            exists!(pattern!(facts, [{ habit @ habit_attrs::persona: &persona }]))
+        })
+}
+
+fn habit_is_targeted(facts: &FactArchive, habit: Id) -> bool {
+    exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]))
+}
+
 /// Prepare only the selected Habit evaluation inputs. No scripts run here:
 /// a missing payload can safely retry this read against the same frozen facts.
+///
+/// The rows are [`habits::rows`]' own, for the intentions addressing this
+/// observer, so the watcher, `habit list` and `habit due` read one liveness,
+/// state, completion history and set of readings. Targeting is decided before
+/// any payload is read.
 fn prepare_habits(
     snapshot: &FacultySnapshot,
     facts: &FactArchive,
     persona: Option<Id>,
 ) -> Result<(Vec<habits::HabitRow>, HabitObservation)> {
-    let mut rows = Vec::new();
-    let mut observation = HabitObservation::default();
-    let definitions: Vec<(Id, habits::TextHandle, habits::TextHandle, habits::TextHandle)> = find!(
-        (habit: Id, label: habits::TextHandle, condition: habits::TextHandle, nudge: habits::TextHandle),
-        pattern!(facts, [{ ?habit @
-            metadata::tag: &KIND_HABIT_ID,
-            habit_attrs::label: ?label,
-            habit_attrs::condition: ?condition,
-            habit_attrs::nudge: ?nudge,
-        }])
-    )
-    .collect();
-    // Liveness has one definition, in habits: only a complete successor
-    // retires what it supersedes, so a tag and an edge alone retire nothing.
-    let superseded = habits::superseded_definition_ids(facts);
-
-    // A revision inherits the completion history of what it supersedes.
-    let ancestry = habits::revision_ancestry(facts)?;
-
-    for (habit, label, condition_handle, nudge_handle) in definitions {
-        if superseded.contains(&habit) {
-            continue;
-        }
-        // Attention routing is a fact on the intention, not its author. Check
-        // before fetching payloads or executing any predicate. Without an
-        // observer, only global intentions apply.
-        let targeted = exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]));
-        if targeted
-            && !persona.is_some_and(|persona| {
-                exists!(pattern!(facts, [{ habit @ habit_attrs::persona: &persona }]))
-            })
-        {
-            continue;
-        }
-        if targeted {
-            observation.targeted.insert(habit);
-        }
-        let label = read_utf8(snapshot, label, "Habit label")?;
-        let condition = read_utf8(snapshot, condition_handle, "Habit condition")?;
-        let nudge = read_utf8(snapshot, nudge_handle, "Habit nudge")?;
-        let script_handle = find!(
-            handle: habits::ScriptHandle,
-            pattern!(facts, [{ habit @ habit_attrs::script: ?handle }])
-        )
-        .min_by_key(|handle| handle.raw);
-        let script = match script_handle {
-            Some(handle) => Some(habits::Script {
-                handle,
-                bytes: read_bytes(snapshot, handle, "Habit script")?,
-            }),
-            None => None,
-        };
-
-        let mut completed_at: Vec<i64> = habits::standing_completions(facts, &ancestry, habit)
-            .into_iter()
-            .filter_map(|completion| habits::interval_second(completion.completed_at))
-            .collect();
-        completed_at.sort_unstable();
-        completed_at.dedup();
-
-        let state_rows: Vec<(Id, habits::TextHandle, IntervalValue)> = find!(
-            (id: Id, state: habits::TextHandle, at: IntervalValue),
-            pattern!(facts, [{ ?id @
-                metadata::tag: &KIND_HABIT_STATE_ID,
-                habit_attrs::of: &habit,
-                habit_attrs::state: ?state,
-                metadata::created_at: ?at,
-            }])
-        )
-        .collect();
-        let state_superseded: BTreeSet<Id> = find!(
-            old: Id,
-            pattern!(facts, [{ _?new @
-                metadata::tag: &KIND_HABIT_STATE_ID,
-                habit_attrs::of: &habit,
-                metadata::supersedes: ?old,
-            }])
-        )
-        .collect();
-        let mut heads = Vec::new();
-        for (id, state, asserted_at) in state_rows {
-            if state_superseded.contains(&id) {
-                continue;
-            }
-            let state = match read_utf8(snapshot, state, "Habit state")?.as_str() {
-                STATE_ACTIVE => habits::DeclaredState::Active,
-                STATE_PAUSED => habits::DeclaredState::Paused,
-                other => {
-                    observation.attention.insert(
-                        habit,
-                        format!("{label} [{habit:x}] has unknown state {other:?}"),
-                    );
-                    continue;
-                }
-            };
-            heads.push(habits::StateAssertion {
-                id,
-                habit,
-                state,
-                predecessors: find!(
-                    predecessor: Id,
-                    pattern!(facts, [{ id @ metadata::supersedes: ?predecessor }])
-                )
-                .collect(),
-                asserted_at,
-            });
-        }
-        let activation = if heads.is_empty()
-            || heads
-                .iter()
-                .all(|head| head.state == habits::DeclaredState::Active)
-        {
-            habits::Activation::Active(heads)
-        } else if heads
+    let rows = habits::rows_where(snapshot, facts, |habit| {
+        habit_addresses(facts, habit, persona)
+    })?;
+    let observation = HabitObservation {
+        targeted: rows
             .iter()
-            .all(|head| head.state == habits::DeclaredState::Paused)
-        {
-            habits::Activation::Paused(heads)
-        } else {
-            habits::Activation::Forked(heads)
-        };
-        rows.push(habits::HabitRow {
-            id: habit,
-            label,
-            condition,
-            nudge,
-            script,
-            activation,
-            completed_at,
-        });
-    }
+            .map(|row| row.id)
+            .filter(|habit| habit_is_targeted(facts, *habit))
+            .collect(),
+        ..HabitObservation::default()
+    };
     Ok((rows, observation))
 }
 
@@ -3118,7 +3015,8 @@ fn observe_habits(
                     .map_err(anyhow::Error::msg)?
                     .unwrap_or(0);
                 // Several readings of one definition: it is due when any is,
-                // and the first due reading speaks for it.
+                // and the first due reading in `habits::rows` order speaks for
+                // it, the same one `habit due` announces.
                 observation.due.entry(row.id).or_insert(DueHabit {
                     label: row.label.clone(),
                     nudge: row.nudge.clone(),
@@ -3166,28 +3064,29 @@ fn observe_habits(
     Ok(observation)
 }
 
+/// List the live intentions addressing the observer without evaluating any
+/// condition. Liveness is habits' own; only labels are read, and a label that
+/// cannot be read is named as such rather than failing the overview.
 fn render_passive_habits<R: BlobStoreList + BlobStoreGet>(
     reader: &R,
     facts: &FactArchive,
     persona: Option<Id>,
 ) -> String {
     use std::fmt::Write as _;
-    let superseded = habits::superseded_definition_ids(facts);
     let mut text = String::from("Habits (passive; conditions not evaluated):\n");
     let mut count = 0;
-    for (habit, label) in find!((habit: Id, label: habits::TextHandle), pattern!(facts, [{ ?habit @ metadata::tag: &KIND_HABIT_ID, habit_attrs::label: ?label }]))
-    {
-        let label = read_utf8(reader, label, "Habit label")
-            .unwrap_or_else(|_| "(label unavailable)".to_owned());
-        let targeted = exists!(pattern!(facts, [{ habit @ habit_attrs::persona: _?target }]));
-        if targeted
-            && !persona.is_some_and(|persona| {
-                exists!(pattern!(facts, [{ habit @ habit_attrs::persona: &persona }]))
-            })
-        {
+    for habit in habits::live_definition_ids(facts) {
+        if !habit_addresses(facts, habit, persona) {
             continue;
         }
-        if !superseded.contains(&habit) {
+        let labels: BTreeSet<habits::TextHandle> = find!(
+            label: habits::TextHandle,
+            pattern!(facts, [{ habit @ habit_attrs::label: ?label }])
+        )
+        .collect();
+        for label in labels {
+            let label = read_utf8(reader, label, "Habit label")
+                .unwrap_or_else(|_| "(label unavailable)".to_owned());
             writeln!(text, "- [{}] {label} (not evaluated)", fmt_id(habit)).unwrap();
             count += 1;
         }
@@ -6353,6 +6252,9 @@ mod tests {
 
     use super::super::cli::{parse_wait_target, WaitTarget};
     use super::*;
+    use crate::schemas::habit::{
+        KIND_HABIT_ID, KIND_STATE_ID as KIND_HABIT_STATE_ID, STATE_PAUSED,
+    };
     use std::fs;
     use std::io::{self, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7794,9 +7696,44 @@ mod tests {
                 !render_passive_habits(&snapshot, &facts, observer).contains("other-persona-clock")
             );
         }
-        assert!(prepare_habits(&snapshot, &facts, Some(owner)).is_err());
+        let missing = prepare_habits(&snapshot, &facts, Some(owner)).unwrap_err();
+        assert!(is_payload_pending(&missing), "{missing:#}");
+        assert_eq!(pending_blob(&missing).unwrap().handle.raw, absent.raw);
         assert!(
             render_passive_habits(&snapshot, &facts, Some(owner)).contains("other-persona-clock")
+        );
+        pile.close().unwrap();
+    }
+
+    /// A script this view does not hold yet is a payload to acquire, like
+    /// any text: the watcher waits for it rather than failing.
+    #[test]
+    fn an_absent_habit_script_is_a_pending_payload() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let habit = id(27);
+        let absent_script = habits::ScriptHandle::new([28; 32]);
+        let mut texts = Vec::new();
+        for text in ["scripted-clock", "when @script", "run it"] {
+            texts.push(
+                pile.put::<blobencodings::UTF8String, _>(text.to_owned())
+                    .unwrap(),
+            );
+        }
+        let snapshot = pile.snapshot().unwrap();
+        let fragment = entity! { ExclusiveId::force_ref(&habit) @
+            metadata::tag: &KIND_HABIT_ID,
+            habit_attrs::label: texts[0],
+            habit_attrs::condition: texts[1],
+            habit_attrs::nudge: texts[2],
+            habit_attrs::script: absent_script,
+        };
+        let facts = archive(fragment.facts());
+        let missing = prepare_habits(&snapshot, &facts, None).unwrap_err();
+        assert!(is_payload_pending(&missing), "{missing:#}");
+        assert_eq!(
+            pending_blob(&missing).unwrap().handle.raw,
+            absent_script.raw
         );
         pile.close().unwrap();
     }
@@ -7924,6 +7861,181 @@ mod tests {
         assert_eq!(listed, [original_id]);
         assert_eq!(oriented, listed);
         assert!(render_passive_habits(&snapshot, &facts, None).contains("kept"));
+        pile.close().unwrap();
+    }
+
+    /// A state assertion names its state by content handle. Habits matches
+    /// the handle; the watcher must too, rather than fetch the text, so an
+    /// assertion whose text this view never received still pauses the
+    /// intention instead of leaving the watcher waiting on a payload.
+    #[test]
+    fn orient_reads_habit_state_by_content_handle_like_habit_list() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (definition, habit) =
+            habits::habit_fragment("rest", "every 1h", "rest now", None, &[], &[]).unwrap();
+        pile.commit(collection, &fixture.signer, definition.clone())
+            .unwrap();
+        let paused: habits::TextHandle = STATE_PAUSED.to_owned().to_blob().get_handle();
+        let assertion = id(23);
+        let state = entity! { ExclusiveId::force_ref(&assertion) @
+            metadata::tag: &KIND_HABIT_STATE_ID,
+            habit_attrs::of: &habit,
+            habit_attrs::state: paused,
+            metadata::created_at: clock::point(Epoch::from_tai_seconds(500.0)).unwrap(),
+        };
+        let facts = archive((definition + state).facts());
+        let snapshot = pile.snapshot().unwrap();
+        assert!(!snapshot.contains_blob(paused).unwrap());
+        let listed = habits::rows(&snapshot, &facts).unwrap();
+        assert!(matches!(
+            listed[0].activation,
+            habits::Activation::Paused(_)
+        ));
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(prepared.0, listed);
+        let observed = observe_habits(prepared, &fixture.path, 100).unwrap();
+        assert!(observed.due.is_empty());
+        assert!(observed.attention.is_empty());
+        pile.close().unwrap();
+    }
+
+    /// Only a complete, understood state assertion supersedes another. A
+    /// tagged entity carrying an edge but no state or time is not an
+    /// assertion, so it cannot unpause what `habit list` shows paused.
+    #[test]
+    fn orient_counts_state_edges_only_from_complete_assertions_like_habit_list() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (definition, habit) =
+            habits::habit_fragment("stretch", "every 1h", "stretch now", None, &[], &[]).unwrap();
+        let (pause, pause_id) = habits::state_fragment(
+            habit,
+            habits::DeclaredState::Paused,
+            &[],
+            clock::point(Epoch::from_tai_seconds(500.0)).unwrap(),
+        )
+        .unwrap();
+        let edge = id(24);
+        let incomplete = entity! { ExclusiveId::force_ref(&edge) @
+            metadata::tag: &KIND_HABIT_STATE_ID,
+            habit_attrs::of: &habit,
+            metadata::supersedes: &pause_id,
+        };
+        let fragment = definition + pause + incomplete;
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let listed = habits::rows(&snapshot, &facts).unwrap();
+        assert_eq!(listed[0].activation.head_ids(), [pause_id]);
+        assert!(matches!(
+            listed[0].activation,
+            habits::Activation::Paused(_)
+        ));
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(prepared.0, listed);
+        let observed = observe_habits(prepared, &fixture.path, 100).unwrap();
+        assert!(observed.due.is_empty());
+        pile.close().unwrap();
+    }
+
+    /// Several scripts on one definition are several readings, each read;
+    /// none is chosen by handle order.
+    #[test]
+    fn orient_reads_every_script_of_a_definition_like_habit_list() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let habit = id(25);
+        let mut fragment = Fragment::empty();
+        let label = fragment.put("two-scripts".to_owned());
+        let condition = fragment.put("when @script".to_owned());
+        let nudge = fragment.put("check both".to_owned());
+        let first = fragment.put::<blobencodings::RawBytes, _>(b"#!/bin/sh\nexit 0\n".to_vec());
+        let second = fragment.put::<blobencodings::RawBytes, _>(b"#!/bin/sh\nexit 1\n".to_vec());
+        for script in [first, second] {
+            fragment += entity! { ExclusiveId::force_ref(&habit) @
+                metadata::tag: &KIND_HABIT_ID,
+                habit_attrs::label: label,
+                habit_attrs::condition: condition,
+                habit_attrs::nudge: nudge,
+                habit_attrs::script: script,
+            };
+        }
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let listed = habits::rows(&snapshot, &facts).unwrap();
+        assert_eq!(listed.len(), 2);
+        let (prepared, _) = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(prepared, listed);
+        pile.close().unwrap();
+    }
+
+    /// An intention is due when any reading is, and the reading that speaks
+    /// is the one `habit due` announces: the first due row in
+    /// [`habits::rows`] order, never an order of content handles.
+    #[test]
+    fn orient_announces_the_due_reading_habit_due_announces() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        // Two nudges whose content handles sort opposite to their text, so
+        // a handle-ordered reader and the rows order cannot agree by luck.
+        let handle = |text: &str| -> habits::TextHandle { text.to_owned().to_blob().get_handle() };
+        let (early, late) = (0..)
+            .map(|n| (format!("a nudge {n}"), format!("b nudge {n}")))
+            .find(|(a, b)| handle(a).raw > handle(b).raw)
+            .unwrap();
+        let habit = id(26);
+        let mut fragment = Fragment::empty();
+        let label = fragment.put("two-nudges".to_owned());
+        let condition = fragment.put("every 1h".to_owned());
+        for text in [&late, &early] {
+            let nudge = fragment.put(text.clone());
+            fragment += entity! { ExclusiveId::force_ref(&habit) @
+                metadata::tag: &KIND_HABIT_ID,
+                habit_attrs::label: label,
+                habit_attrs::condition: condition,
+                habit_attrs::nudge: nudge,
+            };
+        }
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let listed = habits::rows(&snapshot, &facts).unwrap();
+        let at = habits::evaluation_dir(&fixture.path);
+        let announced = listed
+            .iter()
+            .find(|row| habits::evaluate(row, 100, &at).is_due())
+            .unwrap();
+        assert_eq!(announced.nudge, early);
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(prepared.0, listed);
+        let observed = observe_habits(prepared, &fixture.path, 100).unwrap();
+        assert_eq!(observed.due[&habit].nudge, announced.nudge);
         pile.close().unwrap();
     }
 
