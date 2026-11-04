@@ -6,6 +6,16 @@
 //! set union. Reads derive the current view with one deterministic rule:
 //! timestamp first, event id second. Replica merge therefore cannot make the
 //! visible board depend on insertion or iteration order.
+//!
+//! Priorities are reified as priority snapshots
+//! ([`priority_snapshot_fragment`]): one goal's place in the order at one
+//! time, ranking over a set of other snapshots. The snapshot id is derived
+//! from the ids it ranks over, so a well-behaved writer cannot build a
+//! cycle; a reader still reads one, and notes it, when a bug or a hand-written
+//! entity brings it. Which snapshot of a goal is current is a register over
+//! `(priority_of, created_at)`, like status. The pairwise
+//! `prioritize`/`deprioritize` events written before snapshots existed stay
+//! readable beside them ([`active_priority_edges`]).
 
 pub mod cli;
 pub mod mcp;
@@ -13,7 +23,8 @@ pub mod operations;
 mod render;
 
 pub use operations::{
-    AddOptions, AddedGoal, AddedNote, Compass, ListOptions, MovedGoal, NoteOptions, PriorityChange,
+    AddOptions, AddedGoal, AddedNote, Board, Compass, ListOptions, MovedGoal, NoteOptions,
+    PriorityChange,
 };
 
 use crate::storage::FactRead;
@@ -27,6 +38,7 @@ use triblespace::core::collection::{
     CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
 };
 use triblespace::core::metadata;
+use triblespace::core::query::register::{resolve, StatedOrder};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace::core::repo::pile::{Pile, PileSnapshot};
@@ -37,7 +49,7 @@ use triblespace::prelude::*;
 use crate::collection_names::open_configured;
 use crate::schemas::compass::{
     board, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
-    KIND_SPECS, KIND_STATUS_ID,
+    KIND_PRIORITY_ID, KIND_SPECS, KIND_STATUS_ID,
 };
 use crate::storage::FactArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -384,7 +396,12 @@ pub mod replay {
     }
 }
 
-/// One intrinsic priority assertion or retraction event.
+/// One intrinsic priority assertion or retraction event of the pairwise form.
+///
+/// Compass no longer writes assertions in this form; `prioritize` writes a
+/// [`priority_snapshot_fragment`]. The pairwise events remain readable (see
+/// [`legacy_priority_edges`]) and the writer retracts one of them, with a
+/// pairwise `deprioritize`, when it carries the edge into a snapshot.
 pub fn priority_fragment(
     higher: Id,
     lower: Id,
@@ -424,12 +441,13 @@ pub fn note_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     .collect()
 }
 
-/// Active explicit priority edges after deterministic last-event reduction.
+/// Active pairwise priority edges after deterministic last-event reduction.
 ///
-/// Every complete reading of an event counts: an event naming two higher
-/// goals speaks for both edges. An event whose time does not decode is not
-/// one this reader can order, so it is skipped.
-pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
+/// These are the `prioritize`/`deprioritize` events written before priority
+/// snapshots existed. Every complete reading of an event counts: an event
+/// naming two higher goals speaks for both edges. An event whose time does
+/// not decode is not one this reader can order, so it is skipped.
+pub fn legacy_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
     let mut latest: BTreeMap<(Id, Id), ((i128, Id), bool)> = BTreeMap::new();
     let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
         let Ok((lower_bound, _)): Result<(i128, i128), _> = at.try_from_inline() else {
@@ -476,6 +494,220 @@ pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> 
         .collect()
 }
 
+/// One intrinsic priority snapshot: goal `goal`'s place in the priority
+/// order, ranking over the priority snapshots `over`.
+///
+/// The identity core is the kind, the goal (`board::priority_of`), every
+/// snapshot it ranks over (`board::over`) and the creation time, so the id is
+/// derived from the ids it ranks over. A snapshot can therefore only name
+/// snapshots that already exist, and no sequence of calls to this constructor
+/// builds a cycle. That is a property of well-behaved writers only: a hand
+/// written entity can still close one, and [`priority_reading`] reads it.
+///
+/// Re-prioritising a goal writes a new snapshot of it; which one is current is
+/// the `(priority_of, created_at)` register, latest `(created_at, id)` wins,
+/// exactly the register Compass reads for status. A snapshot with no `over`
+/// is a bottom priority: the goal is ranked, and ranks over nothing.
+pub fn priority_snapshot_fragment(
+    goal: Id,
+    over: impl IntoIterator<Item = Id>,
+    created_at: IntervalValue,
+) -> (Fragment, Id) {
+    let over = sorted_ids(over);
+    let record = entity! {
+        metadata::tag: &KIND_PRIORITY_ID,
+        board::priority_of: &goal,
+        board::over*: over.iter(),
+        metadata::created_at: created_at,
+    };
+    let snapshot = record.root().expect("priority snapshot exports one root");
+    (record, snapshot)
+}
+
+/// What one view's priority snapshots say, read the same way on every read.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PriorityReading {
+    /// Goal-level `(higher, lower)` edges read from current snapshots.
+    pub edges: BTreeSet<(Id, Id)>,
+    /// Each goal's current snapshots under its register: one, unless the
+    /// data holds a snapshot no intrinsic writer produces.
+    pub current: BTreeMap<Id, BTreeSet<Id>>,
+    /// Advisory notes about such data, sorted; never a refusal.
+    pub notes: Vec<String>,
+}
+
+/// Read the goal-level priority edges from the priority snapshots.
+///
+/// Edges are read from snapshots, never from goal labels: projecting every
+/// `over` link onto its goals would invent orders nobody asserted (B1 over
+/// A0, then A2 over B1, is acyclic, but read as goals it says A > B > A).
+///
+/// For each goal G, each current snapshot P of G, and each snapshot Q that P
+/// ranks over, with H a goal Q is a priority of (H not G):
+/// - if Q is a current snapshot of H, G > H;
+/// - if Q has been replaced, G > H still holds unless a current snapshot of H
+///   reaches P through `over`: H then re-ranked itself above G knowing P, and
+///   the older claim lapses (causal override). No writer cascade is needed.
+///
+/// Only direct links of current snapshots make edges; the order between
+/// goals further down is whatever their own current snapshots say. A link to
+/// a snapshot this view does not hold is ignored until it arrives.
+///
+/// Data no intrinsic writer produces is read, not refused, and noted:
+/// a snapshot that reaches itself (a hand-built cycle) is read link by link
+/// like any other; a goal with several current snapshots reads each; a
+/// snapshot naming several goals is a snapshot of each. A goal-level cycle,
+/// which two concurrent writers can produce honestly, is left for
+/// [`priority_ranks`] to place in its final shared tier.
+pub fn priority_reading<P: TriblePattern>(facts: &P) -> PriorityReading {
+    // Complete states only, as the status register's positive membership:
+    // a snapshot with no creation time is in no register.
+    let mut goals_of = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut snapshots_of = BTreeMap::<Id, BTreeSet<Id>>::new();
+    for (snapshot, goal) in find!(
+        (snapshot: Id, goal: Id),
+        pattern!(facts, [{ ?snapshot @
+            metadata::tag: &KIND_PRIORITY_ID,
+            board::priority_of: ?goal,
+            metadata::created_at: _?at,
+        }])
+    ) {
+        goals_of.entry(snapshot).or_default().insert(goal);
+        snapshots_of.entry(goal).or_default().insert(snapshot);
+    }
+    let mut over = BTreeMap::<Id, BTreeSet<Id>>::new();
+    for (snapshot, lower) in find!(
+        (snapshot: Id, lower: Id),
+        pattern!(facts, [{ ?snapshot @
+            metadata::tag: &KIND_PRIORITY_ID,
+            board::over: ?lower,
+        }])
+    ) {
+        over.entry(snapshot).or_default().insert(lower);
+    }
+
+    let register = StatedOrder::<_, inlineencodings::NsTAIInterval>::new(
+        facts,
+        board::priority_of.id(),
+        metadata::created_at.id(),
+    )
+    .tiebreak_by_id();
+    let current: BTreeMap<Id, BTreeSet<Id>> = snapshots_of
+        .iter()
+        .map(|(&goal, candidates)| (goal, resolve(&register, candidates.iter().copied())))
+        .filter(|(_, winners)| !winners.is_empty())
+        .collect();
+
+    let reaches = |from: &BTreeSet<Id>, target: Id| -> bool {
+        let mut visited = BTreeSet::new();
+        let mut pending: Vec<Id> = from
+            .iter()
+            .flat_map(|start| over.get(start).into_iter().flatten().copied())
+            .collect();
+        while let Some(node) = pending.pop() {
+            if node == target {
+                return true;
+            }
+            if visited.insert(node) {
+                pending.extend(over.get(&node).into_iter().flatten().copied());
+            }
+        }
+        false
+    };
+
+    let mut edges = BTreeSet::new();
+    for (&goal, snapshots) in &current {
+        for &snapshot in snapshots {
+            for &lower in over.get(&snapshot).into_iter().flatten() {
+                for &lower_goal in goals_of.get(&lower).into_iter().flatten() {
+                    if lower_goal == goal {
+                        continue;
+                    }
+                    let lower_current = current.get(&lower_goal);
+                    let holds = match lower_current {
+                        Some(lower_current) if lower_current.contains(&lower) => true,
+                        Some(lower_current) => !reaches(lower_current, snapshot),
+                        None => true,
+                    };
+                    if holds {
+                        edges.insert((goal, lower_goal));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    for &snapshot in goals_of.keys() {
+        if reaches(&BTreeSet::from([snapshot]), snapshot) {
+            notes.push(format!(
+                "priority snapshot {snapshot:x} ranks over itself through a cycle no intrinsic writer builds; its links are read as written"
+            ));
+        }
+    }
+    for (snapshot, goals) in &goals_of {
+        if goals.len() > 1 {
+            notes.push(format!(
+                "priority snapshot {snapshot:x} is a priority of {} goals ({}); it is read for each",
+                goals.len(),
+                fmt_id_list(goals),
+            ));
+        }
+    }
+    for (goal, snapshots) in &current {
+        if snapshots.len() > 1 {
+            notes.push(format!(
+                "goal {goal:x} has {} current priority snapshots ({}); each is read",
+                snapshots.len(),
+                fmt_id_list(snapshots),
+            ));
+        }
+    }
+    PriorityReading {
+        edges,
+        current,
+        notes,
+    }
+}
+
+fn fmt_id_list(ids: &BTreeSet<Id>) -> String {
+    ids.iter()
+        .map(|id| format!("{id:x}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Active explicit priority edges: the pairwise events and the priority
+/// snapshots, read side by side.
+///
+/// Both forms stay readable (open world) and their edges are united. Where
+/// they disagree into a cycle, [`priority_ranks`] places the cycle in its
+/// final shared tier, as it does for any cycle.
+pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
+    let mut edges = legacy_priority_edges(facts);
+    edges.extend(priority_reading(facts).edges);
+    edges
+}
+
+/// Advisory notes about the priority order of `goals` under `edges`: the
+/// snapshot reading's own notes, then one naming the goals left on a cycle,
+/// which share the final tier. Empty for every order a well-behaved,
+/// sequential writer produces.
+pub fn priority_notes<P: TriblePattern>(
+    facts: &P,
+    goals: impl IntoIterator<Item = Id>,
+    edges: &BTreeSet<(Id, Id)>,
+) -> Vec<String> {
+    let mut notes = priority_reading(facts).notes;
+    let (_, cyclic) = priority_tiers(goals, edges);
+    if !cyclic.is_empty() {
+        notes.push(format!(
+            "goals {} are on or below a priority cycle; they share the last priority tier",
+            fmt_id_list(&cyclic),
+        ));
+    }
+    notes
+}
 /// The complete priority relation used by Compass views.
 ///
 /// Explicit priority assertions are joined with the structural rule that a
@@ -529,6 +761,15 @@ pub fn priority_ranks(
     goal_ids: impl IntoIterator<Item = Id>,
     edges: &BTreeSet<(Id, Id)>,
 ) -> BTreeMap<Id, usize> {
+    priority_tiers(goal_ids, edges).0
+}
+
+/// [`priority_ranks`], and the goals its final shared tier holds because
+/// they are on or below a cycle (empty when the order is acyclic).
+fn priority_tiers(
+    goal_ids: impl IntoIterator<Item = Id>,
+    edges: &BTreeSet<(Id, Id)>,
+) -> (BTreeMap<Id, usize>, BTreeSet<Id>) {
     let goals: BTreeSet<Id> = goal_ids.into_iter().collect();
     let mut outgoing = BTreeMap::<Id, BTreeSet<Id>>::new();
     let mut incoming = goals
@@ -571,10 +812,14 @@ pub fn priority_ranks(
         rank += 1;
     }
 
+    let mut cyclic = BTreeSet::new();
     for goal in goals {
-        ranks.entry(goal).or_insert(rank);
+        if let std::collections::btree_map::Entry::Vacant(entry) = ranks.entry(goal) {
+            entry.insert(rank);
+            cyclic.insert(goal);
+        }
     }
-    ranks
+    (ranks, cyclic)
 }
 
 pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
@@ -1396,6 +1641,226 @@ mod tests {
             find!(task: Id, pattern!(records.facts(), [{ note @ board::task: ?task }]))
                 .collect::<Vec<_>>(),
             vec![goal]
+        );
+    }
+
+    fn snapshot(goal: Id, over: &[Id], time: i128) -> (Fragment, Id) {
+        priority_snapshot_fragment(goal, over.iter().copied(), at(time))
+    }
+
+    /// The same facts inserted in the opposite order.
+    fn reversed(fragments: &[Fragment]) -> (TribleSet, TribleSet) {
+        let mut forward = TribleSet::new();
+        let mut backward = TribleSet::new();
+        for fragment in fragments {
+            forward += fragment.clone();
+        }
+        for fragment in fragments.iter().rev() {
+            backward += fragment.clone();
+        }
+        (forward, backward)
+    }
+
+    /// A snapshot's id is derived from the ids it ranks over, so a writer
+    /// using the intrinsic constructor can only name snapshots that exist
+    /// already: however it builds, no snapshot reaches itself.
+    #[test]
+    fn a_writer_built_priority_chain_is_acyclic_by_construction() {
+        let (a, b, c) = (genid().id, genid().id, genid().id);
+        let (c0_record, c0) = snapshot(c, &[], 1);
+        let (b1_record, b1) = snapshot(b, &[c0], 2);
+        let (a2_record, a2) = snapshot(a, &[b1, c0], 3);
+        assert_eq!(snapshot(a, &[c0, b1], 3).1, a2, "exact replay converges");
+        assert_ne!(snapshot(a, &[b1], 3).1, a2, "the over-set is identity");
+        let mut facts = TribleSet::new();
+        for record in [c0_record, b1_record, a2_record] {
+            facts += record;
+        }
+        let reading = priority_reading(&facts);
+        assert_eq!(reading.edges, BTreeSet::from([(a, b), (a, c), (b, c)]));
+        assert!(reading.notes.is_empty(), "{:?}", reading.notes);
+
+        // Many re-prioritisations, each over snapshots that already exist.
+        let goals: Vec<Id> = (0..5).map(|_| genid().id).collect();
+        let mut built: Vec<Id> = Vec::new();
+        let mut facts = TribleSet::new();
+        for step in 0..40usize {
+            let goal = goals[step % goals.len()];
+            let over: Vec<Id> = built
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| (index * 7 + step) % 3 == 0)
+                .map(|(_, id)| *id)
+                .collect();
+            let (record, id) = snapshot(goal, &over, step as i128);
+            facts += record;
+            built.push(id);
+        }
+        let reading = priority_reading(&facts);
+        assert!(
+            !reading
+                .notes
+                .iter()
+                .any(|note| note.contains("ranks over itself")),
+            "{:?}",
+            reading.notes
+        );
+    }
+
+    /// A buggy or hand-written pair of snapshots that rank over each other is
+    /// read link by link, the same whatever order it arrived in, and noted.
+    #[test]
+    fn a_hand_built_cyclic_snapshot_pair_is_read_deterministically() {
+        let (a, b) = (Id::new([1; 16]).unwrap(), Id::new([2; 16]).unwrap());
+        let (p, q) = (Id::new([3; 16]).unwrap(), Id::new([4; 16]).unwrap());
+        let first = entity! { ExclusiveId::force_ref(&p) @
+            metadata::tag: &KIND_PRIORITY_ID,
+            board::priority_of: &a,
+            board::over: &q,
+            metadata::created_at: at(1),
+        };
+        let second = entity! { ExclusiveId::force_ref(&q) @
+            metadata::tag: &KIND_PRIORITY_ID,
+            board::priority_of: &b,
+            board::over: &p,
+            metadata::created_at: at(1),
+        };
+        let (forward, backward) = reversed(&[first, second]);
+        let reading = priority_reading(&forward);
+        assert_eq!(reading, priority_reading(&backward));
+        assert_eq!(reading.edges, BTreeSet::from([(a, b), (b, a)]));
+        assert!(reading
+            .notes
+            .iter()
+            .any(|note| note.contains(&format!("{p:x} ranks over itself"))));
+        assert!(reading
+            .notes
+            .iter()
+            .any(|note| note.contains(&format!("{q:x} ranks over itself"))));
+        let edges = goal_priority_edges(&forward);
+        let notes = priority_notes(&forward, [a, b], &edges);
+        assert!(notes.iter().any(|note| note.contains("priority cycle")));
+        let ranks = priority_ranks([a, b], &edges);
+        assert_eq!(ranks[&a], ranks[&b]);
+    }
+
+    /// Astra's case: B1 ranks over A0, then A2 ranks over B1. The snapshot
+    /// graph is acyclic; projecting it onto goal labels would invent
+    /// A > B > A. Read from the current snapshots it says only A > B.
+    #[test]
+    fn current_snapshots_do_not_project_into_a_goal_cycle_nobody_asserted() {
+        let (a, b) = (genid().id, genid().id);
+        let (a0_record, a0) = snapshot(a, &[], 1);
+        let (b1_record, b1) = snapshot(b, &[a0], 2);
+        let (a2_record, a2) = snapshot(a, &[b1], 3);
+        let (forward, backward) = reversed(&[a0_record, b1_record, a2_record]);
+        let reading = priority_reading(&forward);
+        assert_eq!(reading, priority_reading(&backward));
+        assert_eq!(reading.edges, BTreeSet::from([(a, b)]));
+        assert_eq!(reading.current[&a], BTreeSet::from([a2]));
+        assert_eq!(reading.current[&b], BTreeSet::from([b1]));
+        let edges = goal_priority_edges(&forward);
+        assert!(priority_notes(&forward, [a, b], &edges).is_empty());
+    }
+
+    /// Re-prioritising writes a new snapshot; the register's latest
+    /// `(created_at, id)` is current, and an equal time falls to the id.
+    #[test]
+    fn reprioritisation_goes_through_the_priority_register() {
+        let (a, b, c) = (genid().id, genid().id, genid().id);
+        let (b0_record, b0) = snapshot(b, &[], 1);
+        let (c0_record, c0) = snapshot(c, &[], 1);
+        let (a1_record, _) = snapshot(a, &[b0], 2);
+        let (a2_record, a2) = snapshot(a, &[c0], 3);
+        let (forward, backward) = reversed(&[b0_record, c0_record, a1_record, a2_record]);
+        let reading = priority_reading(&forward);
+        assert_eq!(reading, priority_reading(&backward));
+        assert_eq!(reading.current[&a], BTreeSet::from([a2]));
+        assert_eq!(reading.edges, BTreeSet::from([(a, c)]));
+
+        let (over_b, over_b_id) = snapshot(a, &[b0], 4);
+        let (over_c, over_c_id) = snapshot(a, &[c0], 4);
+        let mut tied = forward.clone();
+        tied += over_b;
+        tied += over_c;
+        let reading = priority_reading(&tied);
+        let winner = over_b_id.max(over_c_id);
+        assert_eq!(reading.current[&a], BTreeSet::from([winner]));
+        let expected = if winner == over_b_id { (a, b) } else { (a, c) };
+        assert_eq!(reading.edges, BTreeSet::from([expected]));
+    }
+
+    /// Sequential (2b): A over B, then B re-ranked over A's CURRENT snapshot.
+    /// A's link is to B's replaced snapshot and B's current one reaches A's,
+    /// so A > B lapses: B > A only, no cycle.
+    #[test]
+    fn re_ranking_over_the_current_snapshot_lapses_the_older_claim() {
+        let (a, b) = (genid().id, genid().id);
+        let (b0_record, b0) = snapshot(b, &[], 1);
+        let (a1_record, a1) = snapshot(a, &[b0], 2);
+        let (b2_record, _) = snapshot(b, &[a1], 3);
+        let facts = reversed(&[b0_record, a1_record, b2_record]).0;
+        assert_eq!(priority_reading(&facts).edges, BTreeSet::from([(b, a)]));
+        let edges = goal_priority_edges(&facts);
+        assert!(priority_notes(&facts, [a, b], &edges).is_empty());
+    }
+
+    /// (2b): B re-prioritised over an unrelated C does not reach A, so A's
+    /// claim over B's replaced snapshot still holds.
+    #[test]
+    fn re_prioritising_over_an_unrelated_goal_keeps_the_older_claim() {
+        let (a, b, c) = (genid().id, genid().id, genid().id);
+        let (b0_record, b0) = snapshot(b, &[], 1);
+        let (c0_record, c0) = snapshot(c, &[], 1);
+        let (a1_record, _) = snapshot(a, &[b0], 2);
+        let (b2_record, _) = snapshot(b, &[c0], 3);
+        let facts = reversed(&[b0_record, c0_record, a1_record, b2_record]).0;
+        assert_eq!(
+            priority_reading(&facts).edges,
+            BTreeSet::from([(a, b), (b, c)])
+        );
+    }
+
+    /// Two writers, neither having seen the other's new snapshot, write A
+    /// over B and B over A, each over the other's OLD snapshot. Neither
+    /// override applies, so the board holds a goal-level cycle both of them
+    /// asserted: read deterministically and noted, never refused.
+    #[test]
+    fn concurrent_mutual_rankings_are_a_noted_cycle_not_a_refusal() {
+        let (a, b) = (genid().id, genid().id);
+        let (a0_record, a0) = snapshot(a, &[], 1);
+        let (b0_record, b0) = snapshot(b, &[], 1);
+        let (a1_record, _) = snapshot(a, &[b0], 2);
+        let (b1_record, _) = snapshot(b, &[a0], 2);
+        let (forward, backward) = reversed(&[a0_record, b0_record, a1_record, b1_record]);
+        let reading = priority_reading(&forward);
+        assert_eq!(reading, priority_reading(&backward));
+        assert_eq!(reading.edges, BTreeSet::from([(a, b), (b, a)]));
+        let edges = goal_priority_edges(&forward);
+        let notes = priority_notes(&forward, [a, b], &edges);
+        assert_eq!(notes, priority_notes(&backward, [a, b], &edges));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("priority cycle"), "{notes:?}");
+        let ranks = priority_ranks([a, b], &edges);
+        assert_eq!(ranks[&a], ranks[&b]);
+    }
+
+    /// The pairwise events written before snapshots existed stay readable
+    /// beside them, and their edges are united. A link to a snapshot this
+    /// view does not hold is ignored until it arrives.
+    #[test]
+    fn pairwise_priority_events_are_read_beside_snapshots() {
+        let (a, b, c) = (genid().id, genid().id, genid().id);
+        let mut facts = TribleSet::new();
+        facts += priority_fragment(a, c, true, at(1));
+        let (b0_record, b0) = snapshot(b, &[], 1);
+        facts += b0_record;
+        facts += snapshot(a, &[b0, genid().id], 2).0;
+        assert_eq!(legacy_priority_edges(&facts), BTreeSet::from([(a, c)]));
+        assert_eq!(priority_reading(&facts).edges, BTreeSet::from([(a, b)]));
+        assert_eq!(
+            active_priority_edges(&facts),
+            BTreeSet::from([(a, b), (a, c)])
         );
     }
 }

@@ -162,11 +162,14 @@ impl Faculty for Compass {
             }
             "compass_list" => {
                 let args: ListArguments = decode_arguments(arguments)?;
-                output.text(self.operations.list(ListOptions {
-                    statuses: &args.statuses,
-                    tags: &args.tags,
-                    all: args.all,
-                })?)
+                render::board(
+                    &self.operations.board(ListOptions {
+                        statuses: &args.statuses,
+                        tags: &args.tags,
+                        all: args.all,
+                    })?,
+                    output,
+                )
             }
             "compass_move" => {
                 let args: MoveArguments = decode_arguments(arguments)?;

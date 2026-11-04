@@ -162,11 +162,14 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             )?;
             render::added(&receipt, output)
         }
-        Command::List { status, tag, all } => output.text(compass.list(ListOptions {
-            statuses: &status,
-            tags: &tag,
-            all,
-        })?),
+        Command::List { status, tag, all } => render::board(
+            &compass.board(ListOptions {
+                statuses: &status,
+                tags: &tag,
+                all,
+            })?,
+            output,
+        ),
         Command::Move { id, status } => {
             render::moved(&compass.move_goal(&id, &status, persona)?, output)
         }

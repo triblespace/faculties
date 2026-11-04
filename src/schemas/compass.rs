@@ -23,19 +23,24 @@ pub const KIND_STATUS_LABEL: &str = "status";
 pub const KIND_NOTE_LABEL: &str = "note";
 pub const KIND_PRIORITIZE_LABEL: &str = "prioritize";
 pub const KIND_DEPRIORITIZE_LABEL: &str = "deprioritize";
+pub const KIND_PRIORITY_LABEL: &str = "priority";
 
 pub const KIND_GOAL_ID: Id = id_hex!("83476541420F46402A6A9911F46FBA3B");
 pub const KIND_STATUS_ID: Id = id_hex!("89602B3277495F4E214D4A417C8CF260");
 pub const KIND_NOTE_ID: Id = id_hex!("D4E49A6F02A14E66B62076AE4C01715F");
 pub const KIND_PRIORITIZE_ID: Id = id_hex!("6907A81922DA6DF79966616EA60DEC70");
 pub const KIND_DEPRIORITIZE_ID: Id = id_hex!("86C4621538FB0E30CD63BB7A3B847E8B");
+/// A priority snapshot: one goal's place in the priority order at one time.
+/// Minted with `trible genid` on 2026-11-04.
+pub const KIND_PRIORITY_ID: Id = id_hex!("8FF1AEF220E2451F1F5FC90C5306F57D");
 
-pub const KIND_SPECS: [(Id, &str); 5] = [
+pub const KIND_SPECS: [(Id, &str); 6] = [
     (KIND_GOAL_ID, KIND_GOAL_LABEL),
     (KIND_STATUS_ID, KIND_STATUS_LABEL),
     (KIND_NOTE_ID, KIND_NOTE_LABEL),
     (KIND_PRIORITIZE_ID, KIND_PRIORITIZE_LABEL),
     (KIND_DEPRIORITIZE_ID, KIND_DEPRIORITIZE_LABEL),
+    (KIND_PRIORITY_ID, KIND_PRIORITY_LABEL),
 ];
 
 pub const DEFAULT_STATUSES: [&str; 4] = ["todo", "doing", "blocked", "done"];
@@ -78,6 +83,18 @@ pub mod board {
         "8D328575788173EDF8D4CA9373B5BB6F" as mention: inlineencodings::GenId;
         "B88842D9D00361A0F2728C478C79D75C" unsafe as higher: inlineencodings::GenId;
         "18F3446C9E9281A248D370A56395A3F0" unsafe as lower: inlineencodings::GenId;
+        // The register a priority snapshot is a state OF: "the priority of
+        // goal G", as `status_of` is for status. Re-prioritising a goal
+        // writes a new snapshot; the register's latest `(created_at, id)`
+        // is the goal's current one. Minted with `trible genid` on
+        // 2026-11-04.
+        "EE948F80ADFC868B199CB08CD5CABB8E" as priority_of: inlineencodings::GenId;
+        // Repeated: a priority snapshot this snapshot ranks over. It is
+        // part of the snapshot's identity core, so a snapshot can only
+        // name snapshots that already exist, and a writer using the
+        // intrinsic constructor cannot close a cycle. Minted with
+        // `trible genid` on 2026-11-04.
+        "BB7B76202D661BC6B637F220DAA4CD55" as over: inlineencodings::GenId;
     }
 }
 

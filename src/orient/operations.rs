@@ -2694,58 +2694,6 @@ fn latest_goal_status(
     .transpose()
 }
 
-fn goal_priority_edges(query: &OrientQuery<'_>, goals: &BTreeSet<Id>) -> BTreeSet<(Id, Id)> {
-    let mut latest = BTreeMap::<(Id, Id), ((i128, Id), bool)>::new();
-    let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
-        let Some(at) = interval_key(at) else {
-            return;
-        };
-        let order = (at, event);
-        let entry = latest.entry((higher, lower)).or_insert((order, active));
-        if order > entry.0 {
-            *entry = (order, active);
-        }
-    };
-    for (event, higher, lower, at) in find!(
-        (event: Id, higher: Id, lower: Id, at: IntervalValue),
-        pattern!(query.compass, [{ ?event @
-            metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        absorb(event, higher, lower, at, true);
-    }
-    for (event, higher, lower, at) in find!(
-        (event: Id, higher: Id, lower: Id, at: IntervalValue),
-        pattern!(query.compass, [{ ?event @
-            metadata::tag: &crate::schemas::compass::KIND_DEPRIORITIZE_ID,
-            board::higher: ?higher,
-            board::lower: ?lower,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        absorb(event, higher, lower, at, false);
-    }
-    let mut edges: BTreeSet<(Id, Id)> = latest
-        .into_iter()
-        .filter_map(|(edge, (_, active))| active.then_some(edge))
-        .collect();
-    for (child, parent) in find!(
-        (child: Id, parent: Id),
-        pattern!(query.compass, [{ ?child @
-            metadata::tag: &KIND_GOAL_ID,
-            board::parent: ?parent,
-        }])
-    ) {
-        if goals.contains(&parent) {
-            edges.insert((child, parent));
-        }
-    }
-    edges
-}
-
 /// The Compass section of `orient wake`, `orient goals` and `orient show`.
 ///
 /// A payload read that `unreadable` accepts (one that cannot be had in this
@@ -2762,7 +2710,14 @@ fn render_native_compass_goals(
     use std::fmt::Write as _;
 
     let goals = ids_of_kind(query.compass, KIND_GOAL_ID);
-    let ranks = compass::priority_ranks(goals.iter().copied(), &goal_priority_edges(query, &goals));
+    // The same priority relation the Compass board reads: pairwise events
+    // and the current priority snapshots side by side, plus child before
+    // parent. A cycle shares the final tier; the board notes it, wake does
+    // not repeat that here.
+    let ranks = compass::priority_ranks(
+        goals.iter().copied(),
+        &compass::goal_priority_edges(query.compass),
+    );
     let mut doing = Vec::<(usize, i128, Id, Option<Id>)>::new();
     let mut todo = Vec::<(usize, i128, Id, Option<Id>)>::new();
     let mut unplaced = Vec::<String>::new();

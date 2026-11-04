@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use super::{AddedGoal, AddedNote, MovedGoal, PriorityChange};
+use super::{AddedGoal, AddedNote, Board, MovedGoal, PriorityChange};
 use crate::out::Out;
 
 pub(super) fn added(receipt: &AddedGoal, output: &mut Out<'_>) -> Result<()> {
@@ -52,4 +52,13 @@ pub(super) fn prioritized(receipt: &PriorityChange, output: &mut Out<'_>) -> Res
             &receipt.lower_title
         },
     ))
+}
+
+/// The board as the answer, then each note beside it.
+pub(super) fn board(board: &Board, output: &mut Out<'_>) -> Result<()> {
+    output.text(board.text.clone())?;
+    for note in &board.notes {
+        output.note(note.clone())?;
+    }
+    Ok(())
 }

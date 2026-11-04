@@ -103,10 +103,22 @@ pub struct AddedNote {
     pub unresolved_mentions: Vec<String>,
 }
 
+/// A rendered board and the advisory notes about it.
+///
+/// `notes` is empty for every board a well-behaved, sequential writer
+/// produces. It speaks only of priority data such writers do not make (a
+/// cycle, a snapshot that ranks over itself); the board is read regardless.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Board {
+    pub text: String,
+    pub notes: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriorityChange {
     pub higher: Id,
     pub lower: Id,
+    /// The new priority snapshot of `higher`.
     pub event: Id,
     pub active: bool,
     pub higher_title: String,
@@ -142,7 +154,12 @@ impl Compass {
 
     /// Render only the selected goals; hidden goals' text is not acquired.
     pub fn list(&self, options: ListOptions<'_>) -> Result<String> {
-        list(
+        self.board(options).map(|board| board.text)
+    }
+
+    /// [`Self::list`], with the advisory notes a frontend delivers beside it.
+    pub fn board(&self, options: ListOptions<'_>) -> Result<Board> {
+        board(
             self.storage(),
             options.statuses.to_vec(),
             options.tags.to_vec(),
@@ -984,26 +1001,42 @@ fn add_goal(
     )
 }
 
+#[cfg(test)]
 fn list(
     storage: CompassStorage<'_>,
     status_filter: Vec<String>,
     tag_filter: Vec<String>,
     show_done: bool,
 ) -> Result<String> {
+    board(storage, status_filter, tag_filter, show_done).map(|board| board.text)
+}
+
+fn board(
+    storage: CompassStorage<'_>,
+    status_filter: Vec<String>,
+    tag_filter: Vec<String>,
+    show_done: bool,
+) -> Result<Board> {
     let status_filter: Vec<String> = status_filter.into_iter().map(normalize_status).collect();
     for status in &status_filter {
         validate_label("status", status)?;
     }
 
     storage.with_view(|space, reader, status_register| {
-        render_board(
+        let text = render_board(
             reader,
             space,
             status_register,
             &status_filter,
             &tag_filter,
             show_done,
-        )
+        )?;
+        let notes = compass::priority_notes(
+            space,
+            all_goal_ids(space),
+            &compass::goal_priority_edges(space),
+        );
+        Ok(Board { text, notes })
     })
 }
 
@@ -1307,12 +1340,12 @@ fn prioritize(
                 lower_id,
                 task_title(reader, space, higher_id)?,
                 task_title(reader, space, lower_id)?,
+                priority_plan(space, higher_id, Some(lower_id), None),
             ))
         },
-        |(higher_id, lower_id, higher_title, lower_title)| {
+        |(higher_id, lower_id, higher_title, lower_title, plan)| {
             let mut change = compass::kind_catalog_fragment();
-            let record = compass::priority_fragment(higher_id, lower_id, true, clock::point_now()?);
-            let event = record.root().expect("priority event exports one root");
+            let (record, event) = author_priority(plan, higher_id, clock::point_now()?);
             change += record;
             Ok((
                 Some(change),
@@ -1327,6 +1360,79 @@ fn prioritize(
             ))
         },
     )
+}
+
+/// What one priority write says about `goal`: the goals its new snapshot
+/// ranks over, each with its current snapshots (none yet: the write mints a
+/// bottom one), and the pairwise edges from `goal` it retracts.
+struct PriorityPlan {
+    over: BTreeMap<Id, BTreeSet<Id>>,
+    retract: BTreeSet<Id>,
+}
+
+/// Plan a new priority snapshot of `goal`: every goal it is explicitly above
+/// now (pairwise or snapshot), with `add` and without `remove`.
+///
+/// The new snapshot ranks over each of those goals' CURRENT snapshots, so a
+/// claim a goal kept over an older snapshot of another is refreshed, and a
+/// claim that has lapsed (the other goal re-ranked itself above this one) is
+/// not revived by being copied. The goal's pairwise edges are carried into
+/// the snapshot and retracted in the pairwise form, so after the write the
+/// two forms agree.
+fn priority_plan<P: TriblePattern>(
+    space: &P,
+    goal: Id,
+    add: Option<Id>,
+    remove: Option<Id>,
+) -> PriorityPlan {
+    let reading = compass::priority_reading(space);
+    let legacy = compass::legacy_priority_edges(space);
+    let mut lowers: BTreeSet<Id> = reading
+        .edges
+        .iter()
+        .chain(legacy.iter())
+        .filter(|(higher, lower)| *higher == goal && *lower != goal)
+        .map(|(_, lower)| *lower)
+        .collect();
+    lowers.extend(add);
+    if let Some(remove) = remove {
+        lowers.remove(&remove);
+    }
+    PriorityPlan {
+        over: lowers
+            .into_iter()
+            .map(|lower| {
+                let current = reading.current.get(&lower).cloned().unwrap_or_default();
+                (lower, current)
+            })
+            .collect(),
+        retract: legacy
+            .iter()
+            .filter(|(higher, _)| *higher == goal)
+            .map(|(_, lower)| *lower)
+            .collect(),
+    }
+}
+
+/// The facts of a planned priority write, and the new snapshot's id.
+fn author_priority(plan: PriorityPlan, goal: Id, at: IntervalValue) -> (Fragment, Id) {
+    let mut fragment = Fragment::empty();
+    let mut over = BTreeSet::new();
+    for (lower, current) in plan.over {
+        if current.is_empty() {
+            let (bottom, snapshot) = compass::priority_snapshot_fragment(lower, [], at);
+            fragment += bottom;
+            over.insert(snapshot);
+        } else {
+            over.extend(current);
+        }
+    }
+    for lower in plan.retract {
+        fragment += compass::priority_fragment(goal, lower, false, at);
+    }
+    let (record, snapshot) = compass::priority_snapshot_fragment(goal, over, at);
+    fragment += record;
+    (fragment, snapshot)
 }
 
 fn deprioritize(
@@ -1351,13 +1457,12 @@ fn deprioritize(
                 lower_id,
                 task_title(reader, space, higher_id)?,
                 task_title(reader, space, lower_id)?,
+                priority_plan(space, higher_id, None, Some(lower_id)),
             ))
         },
-        |(higher_id, lower_id, higher_title, lower_title)| {
+        |(higher_id, lower_id, higher_title, lower_title, plan)| {
             let mut change = compass::kind_catalog_fragment();
-            let record =
-                compass::priority_fragment(higher_id, lower_id, false, clock::point_now()?);
-            let event = record.root().expect("priority event exports one root");
+            let (record, event) = author_priority(plan, higher_id, clock::point_now()?);
             change += record;
             Ok((
                 Some(change),
@@ -2240,6 +2345,123 @@ mod tests {
         assert!(
             shown.contains(&format!("supersedes: {early_id:x}")),
             "{shown}"
+        );
+    }
+
+    /// The over-set of a priority snapshot, sorted.
+    fn over_set<P: TriblePattern>(facts: &P, snapshot: Id) -> BTreeSet<Id> {
+        find!(
+            lower: Id,
+            pattern!(facts, [{ snapshot @ board::over: ?lower }])
+        )
+        .collect()
+    }
+
+    /// `prioritize` writes a priority snapshot, not a pairwise event. The
+    /// goal's still-active pairwise edges are carried into that snapshot's
+    /// over-set and retracted in the pairwise form, so the two forms never
+    /// disagree; `deprioritize` writes a snapshot without the lower goal.
+    #[test]
+    fn prioritize_writes_a_snapshot_and_carries_pairwise_edges_into_it() {
+        let mut fragment = Fragment::empty();
+        let a = plain_goal(&mut fragment, "alpha", 1.0);
+        let b = plain_goal(&mut fragment, "beta", 2.0);
+        let x = plain_goal(&mut fragment, "chi", 3.0);
+        fragment += compass::priority_fragment(a, x, true, point(4.0));
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let change = prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
+        assert!(change.active);
+        handle
+            .with_view(|facts, _, _| {
+                assert!(!exists!(pattern!(facts, [{ _?event @
+                    metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
+                    board::higher: &a,
+                    board::lower: &b,
+                }])));
+                assert_eq!(compass::legacy_priority_edges(facts), BTreeSet::new());
+                let reading = compass::priority_reading(facts);
+                assert_eq!(reading.current[&a], BTreeSet::from([change.event]));
+                let mut expected = reading.current[&b].clone();
+                expected.extend(reading.current[&x].iter().copied());
+                assert_eq!(over_set(facts, change.event), expected);
+                assert_eq!(
+                    compass::active_priority_edges(facts),
+                    BTreeSet::from([(a, b), (a, x)])
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            prioritize(handle, format!("{b:x}"), format!("{a:x}")).is_err(),
+            "a goal-level cycle is still refused at the write"
+        );
+
+        let removed = deprioritize(handle, format!("{a:x}"), format!("{x:x}")).unwrap();
+        assert!(!removed.active);
+        handle
+            .with_view(|facts, _, _| {
+                let reading = compass::priority_reading(facts);
+                assert_eq!(reading.current[&a], BTreeSet::from([removed.event]));
+                assert_eq!(over_set(facts, removed.event), reading.current[&b].clone());
+                assert_eq!(
+                    compass::active_priority_edges(facts),
+                    BTreeSet::from([(a, b)])
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(deprioritize(handle, format!("{a:x}"), format!("{x:x}")).is_err());
+
+        let board = board(handle, vec![], vec![], false).unwrap();
+        assert!(board.notes.is_empty(), "{:?}", board.notes);
+        let alpha = board.text.find("alpha").unwrap();
+        assert!(alpha < board.text.find("beta").unwrap(), "{}", board.text);
+    }
+
+    /// Concurrent mutual rankings reach the board as a cycle: it is listed,
+    /// the same on every read, with a note beside it, never refused.
+    #[test]
+    fn a_priority_cycle_on_the_board_is_listed_and_noted() {
+        let mut fragment = Fragment::empty();
+        let a = plain_goal(&mut fragment, "alpha", 1.0);
+        let b = plain_goal(&mut fragment, "beta", 2.0);
+        let (a0, a0_id) = compass::priority_snapshot_fragment(a, [], point(3.0));
+        let (b0, b0_id) = compass::priority_snapshot_fragment(b, [], point(3.0));
+        fragment += a0;
+        fragment += b0;
+        fragment += compass::priority_snapshot_fragment(a, [b0_id], point(4.0)).0;
+        fragment += compass::priority_snapshot_fragment(b, [a0_id], point(4.0)).0;
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let first = board(handle, vec![], vec![], false).unwrap();
+        assert_eq!(first, board(handle, vec![], vec![], false).unwrap());
+        assert!(first.text.contains("alpha") && first.text.contains("beta"));
+        assert_eq!(first.notes.len(), 1, "{:?}", first.notes);
+        assert!(
+            first.notes[0].contains("priority cycle"),
+            "{:?}",
+            first.notes
+        );
+    }
+
+    /// Where no priorities are involved the board is exactly what it was,
+    /// and carries no note.
+    #[test]
+    fn a_board_without_priorities_is_unchanged_and_unnoted() {
+        let mut fragment = Fragment::empty();
+        let first = plain_goal(&mut fragment, "first", 1.0);
+        let second = plain_goal(&mut fragment, "second", 2.0);
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+        assert_eq!(
+            board(handle, vec![], vec![], false).unwrap(),
+            Board {
+                text: format!("\n== TODO (2) ==\n- [{second:x}] second\n- [{first:x}] first\n\n"),
+                notes: vec![],
+            }
         );
     }
 }
