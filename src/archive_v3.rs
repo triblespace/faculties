@@ -265,9 +265,15 @@ pub struct WitnessAnnotations {
     pub pointer: Vec<String>,
     pub claimed_size: Option<u128>,
     pub claimed_media_type: Option<MediaType>,
+    /// A media type exactly as the source spells it, where it does not
+    /// parse.
+    pub raw_media_type: Option<String>,
     pub claimed_title: Option<String>,
     /// A result status the source records but her window did not render.
     pub claimed_status: Option<Id>,
+    /// A result's exit code the source records but her window did not
+    /// render.
+    pub claimed_exit_code: Option<i64>,
     /// Uris the source records for the held item that her window did not
     /// render.
     pub claimed_uri: Vec<String>,
@@ -330,6 +336,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         .collect();
     let source_locator = put(&mut fragment, annotations.source_locator);
     let claimed_title = put(&mut fragment, annotations.claimed_title);
+    let raw_media_type = put(&mut fragment, annotations.raw_media_type);
     let untruncated = put(&mut fragment, annotations.untruncated);
     let rendered_from = match &annotations.rendered_from {
         Some(tree) => {
@@ -375,8 +382,10 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::pointer*: pointer.iter(),
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
+        schema::witness::raw_media_type?: raw_media_type,
         schema::witness::claimed_title?: claimed_title,
         schema::witness::claimed_status?: annotations.claimed_status,
+        schema::witness::claimed_exit_code?: annotations.claimed_exit_code,
         schema::witness::claimed_uri*: claimed_uri.iter(),
         schema::witness::rendered_from?: rendered_from,
         schema::witness::untruncated?: untruncated,
@@ -426,8 +435,10 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             pointer,
             claimed_size,
             claimed_media_type,
+            raw_media_type,
             claimed_title,
             claimed_status,
+            claimed_exit_code,
             claimed_uri,
             rendered_from,
             compaction_summary,
@@ -450,8 +461,10 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             && *claimed_size == b.claimed_size
             && claimed_media_type.as_ref().map(MediaType::canonical)
                 == b.claimed_media_type.as_ref().map(MediaType::canonical)
+            && *raw_media_type == b.raw_media_type
             && *claimed_title == b.claimed_title
             && *claimed_status == b.claimed_status
+            && *claimed_exit_code == b.claimed_exit_code
             && set(claimed_uri) == set(&b.claimed_uri)
             && rendered_from.as_ref().and_then(Fragment::root)
                 == b.rendered_from.as_ref().and_then(Fragment::root)

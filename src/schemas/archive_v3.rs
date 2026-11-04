@@ -425,6 +425,12 @@ pub mod witness {
         /// OCCURRENCE CORE. A media type the source claims but her window did not
         /// render.
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
+        /// OCCURRENCE CORE. A media type exactly as the source spells it,
+        /// where it does not parse as one (`claimed_media_type` holds the
+        /// parsed form of one that does). The record's own claim, kept so a
+        /// malformed spelling never costs the bytes it labels. Minted with
+        /// `trible genid` 2026-11-04.
+        "2E7CC61A930F8A142F9E65BB77D1D7AD" as pub raw_media_type: Handle<UTF8String>;
         /// OCCURRENCE CORE. A title the source gives that her window did not show.
         "7AB9F2216ED53D98D7DF446DE4DF63A1" as pub claimed_title: Handle<UTF8String>;
         /// OCCURRENCE CORE. A result status (a [`super::fact::status`] term)
@@ -432,6 +438,11 @@ pub mod witness {
         /// whether a call failed even where its codec shows only the
         /// content. Minted with `trible genid` 2026-11-04.
         "51819E1707DBE1CC9C958450427514C2" as pub claimed_status: GenId;
+        /// OCCURRENCE CORE. A result's exit code the source records but her
+        /// window did not render, signed exactly as the process returned it.
+        /// Where the window rendered one, it is the fact's `exit_code`.
+        /// Minted with `trible genid` 2026-11-04.
+        "2906E6B2DA07067C59B411B67BB803FE" as pub claimed_exit_code: I256BE;
         /// OCCURRENCE CORE, repeatable. A uri the source records for the
         /// held item that her window did not render (where it rendered one,
         /// it is the fact's `source_uri`). Minted with `trible genid`

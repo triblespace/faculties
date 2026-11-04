@@ -894,6 +894,8 @@ fn unrendered_status_and_uri_are_occurrence_claims_not_fact_core() {
         w,
         WitnessAnnotations {
             claimed_status: Some(status::ERROR),
+            claimed_exit_code: Some(-9),
+            raw_media_type: Some("image/png;;".to_owned()),
             claimed_uri: vec!["file:///tmp/x".to_owned()],
             ..WitnessAnnotations::default()
         },
