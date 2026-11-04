@@ -580,3 +580,128 @@ fn an_occurrence_keeps_its_id_when_its_end_is_learned() {
     .collect();
     assert_eq!(ended_by, vec![ends::INTERRUPTED]);
 }
+
+/// P1: the M2 refusal compares the records' own claim values, as the store
+/// would merge their occurrences: the same node and the same claims, with
+/// repeated claims as sets. Each verdict agrees with whether the store
+/// would merge the two (checked here, in the test only, by their ids).
+#[test]
+fn p1_ends_disagree_compares_the_records_own_claims() {
+    // Minted with `trible genid`; they name nothing outside this test.
+    let node = triblespace::macros::id_hex!("B8384CF1C78653D455C40AFCD841CD67");
+    let other_node = triblespace::macros::id_hex!("6E3430BD7CBE3047A3EAA581CF538AAF");
+    let at = |second: f64| -> Inline<NsTAIInterval> {
+        let epoch = hifitime::Epoch::from_unix_seconds(1.0e9 + second);
+        (epoch, epoch).try_to_inline().unwrap()
+    };
+    let base = WitnessAnnotations {
+        raw_role: Some("assistant".to_owned()),
+        raw_author: vec!["one".to_owned(), "two".to_owned()],
+        source_locator: Some("synthetic-session".to_owned()),
+        timestamp: vec![at(1.0)],
+        ..WitnessAnnotations::default()
+    };
+    let ended = |claims: &WitnessAnnotations, by: Vec<Id>, turn_by: Vec<Id>| WitnessAnnotations {
+        ends: by,
+        turn_ends: turn_by,
+        ..claims.clone()
+    };
+    let merged = |a: &(Id, WitnessAnnotations), b: &(Id, WitnessAnnotations)| {
+        let id = |(node, claims): &(Id, WitnessAnnotations)| {
+            let witness_id = witness(SOURCE_CLAUDE_CODE, *node).unwrap().root().unwrap();
+            occurrence(witness_id, claims.clone())
+                .unwrap()
+                .root()
+                .unwrap()
+        };
+        id(a) == id(b)
+    };
+    let reordered = WitnessAnnotations {
+        raw_author: vec!["two".to_owned(), "one".to_owned(), "two".to_owned()],
+        ..base.clone()
+    };
+    let later = WitnessAnnotations {
+        timestamp: vec![at(2.0)],
+        ..base.clone()
+    };
+    let other_role = WitnessAnnotations {
+        raw_role: Some("user".to_owned()),
+        ..base.clone()
+    };
+    let end_turn = vec![ends::END_TURN];
+    let max_tokens = vec![ends::MAX_TOKENS];
+    // (first, second, whether they disagree)
+    let cases = [
+        // One occurrence, two ends: refused.
+        (
+            (node, ended(&base, end_turn.clone(), vec![])),
+            (node, ended(&base, max_tokens.clone(), vec![])),
+            true,
+        ),
+        // Repeated claims are sets, as in the store.
+        (
+            (node, ended(&base, end_turn.clone(), vec![])),
+            (node, ended(&reordered, max_tokens.clone(), vec![])),
+            true,
+        ),
+        // A turn end learned for one of them only.
+        (
+            (node, ended(&base, vec![], vec![ends::INTERRUPTED])),
+            (node, base.clone()),
+            true,
+        ),
+        // The same ends, in another order: one occurrence, no conflict.
+        (
+            (
+                node,
+                ended(&base, vec![ends::END_TURN, ends::ERROR], vec![]),
+            ),
+            (
+                node,
+                ended(&base, vec![ends::ERROR, ends::END_TURN], vec![]),
+            ),
+            false,
+        ),
+        // Another time, another role or another node: two occurrences.
+        (
+            (node, ended(&base, end_turn.clone(), vec![])),
+            (node, ended(&later, max_tokens.clone(), vec![])),
+            false,
+        ),
+        (
+            (node, ended(&base, end_turn.clone(), vec![])),
+            (node, ended(&other_role, max_tokens.clone(), vec![])),
+            false,
+        ),
+        (
+            (node, ended(&base, end_turn.clone(), vec![])),
+            (other_node, ended(&base, max_tokens.clone(), vec![])),
+            false,
+        ),
+    ];
+    for (at, (first, second, disagree)) in cases.into_iter().enumerate() {
+        let one = merged(&first, &second);
+        let same_ends = {
+            let set = |ids: &[Id]| ids.iter().copied().collect::<BTreeSet<Id>>();
+            set(&first.1.ends) == set(&second.1.ends)
+                && set(&first.1.turn_ends) == set(&second.1.turn_ends)
+        };
+        assert_eq!(
+            disagree,
+            one && !same_ends,
+            "case {at}: the store's verdict"
+        );
+        assert_eq!(
+            ends_disagree(&[first.clone(), second.clone()]),
+            disagree,
+            "case {at}"
+        );
+        // Among others, in either order.
+        let filler = (other_node, ended(&later, end_turn.clone(), vec![]));
+        assert_eq!(
+            ends_disagree(&[second, filler, first]),
+            disagree,
+            "case {at}, among others"
+        );
+    }
+}

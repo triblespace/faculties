@@ -2056,17 +2056,17 @@ fn r1p_a_beside_mark_after_a_call_or_spelled_as_a_string_fails() {
         refused(&source).path,
         "{attachment}.renderedBesideToolResult"
     );
-    // After her text and after his prompt it still builds.
+    // After his prompt it still builds (after her text it fails since
+    // R1'', below).
     let source = jsonl(&[
         user("u1", None, 0, json!("Hi.")),
         assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
-        moved("x1", "a1", 2),
-        user("u2", Some("x1"), 3, json!("Next.")),
+        user("u2", Some("a1"), 3, json!("Next.")),
         moved("x2", "u2", 4),
         assistant("a2", "x2", 5, "m2", said("Ok."), json!("end_turn")),
     ]);
     let imported = passes(&source);
-    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
+    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 1);
     // The mark spelled as a string.
     let mut spelled = moved("x1", "u1", 1);
     spelled["renderedBesideToolResult"] = json!("true");
@@ -2079,4 +2079,132 @@ fn r1p_a_beside_mark_after_a_call_or_spelled_as_a_string_fails() {
         refused(&source).path,
         "{attachment}.renderedBesideToolResult"
     );
+}
+
+/// R1'': a beside-mark is built only directly after a typed prompt of his,
+/// past the renderings of the attachments before it. A mark after her
+/// text, after harness text (`isMeta`), or in the middle of one message
+/// fails. (Real marks after harness text exist, 4 of 727, but what her
+/// window held there is unverified, so they stay open.)
+#[test]
+fn r1pp_a_beside_mark_stands_only_after_his_typed_prompt() {
+    let moved = |uuid: &str, parent: &str, second: u32| {
+        json!({
+            "type": "attachment", "sessionId": "s-1", "uuid": uuid, "parentUuid": parent,
+            "timestamp": stamp(second), "cwd": "/synthetic", "version": "0.0.0",
+            "attachment": {"type": "remote_session_change", "url": "https://example.invalid/r"},
+            "rendered": [{"content": "Moved."}],
+            "renderedRole": "user",
+            "renderedBesideToolResult": true,
+        })
+    };
+    let path = "{attachment}.renderedBesideToolResult";
+    // After her text.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        moved("x1", "a1", 2),
+        user("u2", Some("x1"), 3, json!("Next.")),
+        assistant("a2", "u2", 4, "m2", said("Ok."), json!("end_turn")),
+    ]);
+    assert_eq!(refused(&source).path, path);
+    // After harness text.
+    let mut meta = user(
+        "u2",
+        Some("a1"),
+        2,
+        json!([said("<system-reminder>x</system-reminder>")]),
+    );
+    meta["isMeta"] = json!(true);
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        meta,
+        moved("x1", "u2", 3),
+        assistant("a2", "x1", 4, "m2", said("Ok."), json!("end_turn")),
+    ]);
+    let failure = refused(&source);
+    assert_eq!(failure.path, path);
+    assert!(failure.reason.contains("harness text"), "{failure}");
+    // In the middle of one message: after its thinking, on its line.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", thinking(""), json!(null)),
+        moved("x1", "a1", 2),
+        assistant("a2", "x1", 3, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    assert_eq!(refused(&source).path, path);
+    // In the middle of one message: after his prompt, but the message began
+    // before the mark and continues after it.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", thinking(""), json!(null)),
+        moved("x1", "u1", 2),
+        assistant("a2", "x1", 3, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    assert_eq!(refused(&source).path, path);
+    // After his prompt, as a string or as text blocks, past another marked
+    // rendering: built.
+    for prompt in [json!("Hi."), json!([said("Hi.")])] {
+        let source = jsonl(&[
+            user("u1", None, 0, prompt),
+            moved("x1", "u1", 1),
+            moved("x2", "x1", 2),
+            assistant("a1", "x2", 3, "m1", said("Hello."), json!("end_turn")),
+        ]);
+        let imported = passes(&source);
+        assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
+    }
+}
+
+/// C8: an empty sealed token holds nothing. The thinking happened and its
+/// body is unknown: a body gap, never a 0-byte blob, as Codex's empty token
+/// is (X12).
+#[test]
+fn c8_an_empty_signature_is_a_body_gap() {
+    let build = |block: Value| {
+        jsonl(&[
+            user("u1", None, 0, json!("Think.")),
+            assistant("a1", "u1", 1, "m1", block, json!(null)),
+            assistant("a2", "a1", 2, "m1", said("Thought."), json!("end_turn")),
+        ])
+    };
+    let empty = build(json!({"type": "thinking", "thinking": "", "signature": ""}));
+    let sealed = build(thinking(""));
+    for source in [
+        &empty,
+        &build(json!({"type": "redacted_thinking", "data": ""})),
+    ] {
+        let imported = passes(source);
+        let done = witnessed_saying(&imported, "Thought.");
+        let window = window_before(&imported, done);
+        assert!(
+            window.contains(&(v3::fact::modality::THINKING, Some(v3::fact::absent::BODY))),
+            "{window:?}"
+        );
+        let facts = imported.fragment.facts();
+        let thinking_term = v3::fact::modality::THINKING;
+        let blobs: Vec<Id> = find!(
+            fact: Id,
+            pattern!(facts, [{ ?fact @ v3::fact::modality: thinking_term, v3::fact::blob: _?blob }])
+        )
+        .collect();
+        assert!(blobs.is_empty(), "an empty token became a blob");
+    }
+    // The gate holds both ways: a gap is not the sealed bytes, and the
+    // sealed bytes are not a gap.
+    assert!(!gate(&sealed, &import_ok(&empty)).passed());
+    assert!(!gate(&empty, &import_ok(&sealed)).passed());
+    // Readable thinking beside an empty signature stays a gloss on the gap.
+    let source = build(json!({"type": "thinking", "thinking": "A summary.", "signature": ""}));
+    let imported = passes(&source);
+    assert_eq!(
+        glosses(&imported, v3::gloss::category::REASONING_SUMMARY),
+        vec!["A summary."]
+    );
+    // A missing or non-string signature still fails.
+    let source = build(json!({"type": "thinking", "thinking": ""}));
+    assert!(import(source.as_bytes()).is_err());
+    let source = build(json!({"type": "thinking", "thinking": "", "signature": null}));
+    assert!(import(source.as_bytes()).is_err());
 }

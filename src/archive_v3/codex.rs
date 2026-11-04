@@ -82,8 +82,8 @@ use crate::archive_v3::claude_code::json::{self, Json};
 use crate::archive_v3::claude_code::Failure;
 use crate::archive_v3::fields::codex::{OPENAI_ENCRYPTED_CONTENT, TABLE};
 use crate::archive_v3::{
-    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
-    NodeAnnotations, WitnessAnnotations,
+    annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
+    MediaType, NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -1511,12 +1511,19 @@ impl Builder {
             ));
         }
         occurrences.extend(std::mem::take(&mut self.extra));
-        let mut witnesses: HashMap<Id, Id> = HashMap::new();
         // Why a sampling or turn ended annotates its occurrence and is no
         // part of its id (M2). Two records whose own claims are the same
         // converge on one occurrence; if they ended differently, which
-        // stopped which way would be lost, so the unit fails instead.
-        let mut ended: HashMap<Id, (Vec<Id>, Vec<Id>)> = HashMap::new();
+        // stopped which way would be lost, so the unit fails instead. Their
+        // claim values are compared where they are made (P1), shared with
+        // Claude Code.
+        if ends_disagree(&occurrences) {
+            return Err(Failure::new(
+                "{event_msg}.payload",
+                "two records with the same claims end differently",
+            ));
+        }
+        let mut witnesses: HashMap<Id, Id> = HashMap::new();
         for (node, claims) in occurrences {
             let id = match witnesses.get(&node) {
                 Some(id) => *id,
@@ -1529,22 +1536,8 @@ impl Builder {
                     id
                 }
             };
-            let mut how = (claims.ends.clone(), claims.turn_ends.clone());
-            how.0.sort();
-            how.1.sort();
             let built = occurrence(id, claims)
                 .map_err(|_| Failure::new("<witness>", "a witness occurrence does not build"))?;
-            // The id only tells whether the store would merge the two
-            // (idempotence); nothing is looked up by it.
-            let at = built.root().expect("an occurrence is rooted");
-            if let Some(earlier) = ended.insert(at, how.clone()) {
-                if earlier != how {
-                    return Err(Failure::new(
-                        "{event_msg}.payload",
-                        "two records with the same claims end differently",
-                    ));
-                }
-            }
             self.out += unexported(built);
         }
         // Reasoning summaries: the source names no model that wrote them.

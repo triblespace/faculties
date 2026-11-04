@@ -298,6 +298,13 @@ macro_rules! items {
                 "tool_namespace",
                 Decode::Text,
             ),
+            // Her call arguments, parsed into a json_tree. Accepted by JP's
+            // rule (2026-11-03, "Lossless means information, not bytes ...
+            // whitespace, escape spelling and member order do not count"),
+            // a decision and not a defect: the order of an object's
+            // members, whitespace and the spelling of escapes are not kept.
+            // Number spellings, array order and `{}` against `[]` are kept;
+            // duplicate keys and lone surrogates are refused.
             Entry::fact(
                 concat!($p, "{function_call}.arguments"),
                 "tool-call",

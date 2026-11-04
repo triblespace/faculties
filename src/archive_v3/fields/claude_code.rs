@@ -986,6 +986,9 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         "{assistant}.message{message}.content[]{thinking}.type",
         Class::Structure(Structure::Discriminator),
     ),
+    // An empty token holds nothing (C8): its empty drop, and the thinking
+    // is a body gap ([`EMPTY_SEALED_THINKING`]), as Codex's empty token is
+    // (X12). The same holds for redacted thinking's `data`.
     Entry::fact_with(
         "{assistant}.message{message}.content[]{thinking}.signature",
         "thinking",
@@ -993,6 +996,11 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         "blob",
         Decode::Base64,
         SIGNATURE,
+    )
+    .when(&[Cond::SiblingNot("signature", "")]),
+    Entry::new(
+        "{assistant}.message{message}.content[]{thinking}.signature",
+        Class::Drop(DropReason::Empty),
     ),
     Entry::new(
         "{assistant}.message{message}.content[]{redacted_thinking}.type",
@@ -1005,6 +1013,11 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         "blob",
         Decode::Base64,
         REDACTED,
+    )
+    .when(&[Cond::SiblingNot("data", "")]),
+    Entry::new(
+        "{assistant}.message{message}.content[]{redacted_thinking}.data",
+        Class::Drop(DropReason::Empty),
     ),
     Entry::new(
         "{assistant}.message{message}.content[]{tool_use}.type",
@@ -1021,6 +1034,12 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         "tool_name",
         Decode::Text,
     ),
+    // Her call input as a json_tree. Accepted by JP's rule (2026-11-03,
+    // "Lossless means information, not bytes ... whitespace, escape
+    // spelling and member order do not count"), a decision and not a
+    // defect: the order of an object's members, whitespace and the spelling
+    // of escapes are not kept. Number spellings, array order and `{}`
+    // against `[]` are kept; duplicate keys and lone surrogates are refused.
     Entry::fact(
         "{assistant}.message{message}.content[]{tool_use}.input",
         "tool-call",
@@ -1656,6 +1675,10 @@ pub const TABLE: FieldTable = FieldTable {
                 },
                 held: true,
             },
+            // Her thinking happened; its sealed token is the empty string
+            // (C8).
+            EMPTY_SEALED_THINKING,
+            EMPTY_SEALED_REDACTED,
         ],
     },
     links: &[Link {
@@ -1681,4 +1704,28 @@ const SYSTEM_GAP: Gap = Gap {
     modality: "system",
     direction: "in",
     kind: "body",
+};
+
+/// Her thinking, whose body is unknown.
+const THINKING_GAP: Gap = Gap {
+    modality: "thinking",
+    direction: "out",
+    kind: "body",
+};
+
+/// A thinking block whose signature is the empty string: a body gap (C8).
+const EMPTY_SEALED_THINKING: GapRule = GapRule {
+    path: "{assistant}.message{message}.content[]{thinking}.type",
+    when: &[Cond::Sibling("signature", "")],
+    at: Beside::Same,
+    gap: THINKING_GAP,
+    held: true,
+};
+
+/// A redacted thinking block whose data is the empty string: a body gap
+/// (C8).
+const EMPTY_SEALED_REDACTED: GapRule = GapRule {
+    path: "{assistant}.message{message}.content[]{redacted_thinking}.type",
+    when: &[Cond::Sibling("data", "")],
+    ..EMPTY_SEALED_THINKING
 };

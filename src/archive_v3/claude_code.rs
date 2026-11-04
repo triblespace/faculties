@@ -70,8 +70,8 @@ use triblespace::prelude::*;
 use self::json::Json;
 use crate::archive_v3::fields::claude_code::{SUMMARIZED_THINKING, TABLE};
 use crate::archive_v3::{
-    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
-    NodeAnnotations, WitnessAnnotations,
+    annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
+    MediaType, NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -262,6 +262,12 @@ struct Item {
     head: bool,
     /// A tool call.
     call: bool,
+    /// A text fact.
+    text: bool,
+    /// A text item of a prompt he typed: a `user` record that is neither
+    /// harness text (`isMeta`) nor a compaction summary, outside any tool
+    /// result (R1'').
+    prompt: bool,
     /// The head whose part this is.
     part_of: Option<usize>,
     record: Option<usize>,
@@ -425,6 +431,8 @@ struct Builder {
     claims: HashMap<usize, WitnessAnnotations>,
     /// The file positions of attachment records.
     attachments: HashSet<usize>,
+    /// attachment uuid -> (its parent's uuid, whether it is beside-marked)
+    attachment_parents: HashMap<String, (Option<String>, bool)>,
 }
 
 fn core(modality: Id, direction: Id) -> FactCore {
@@ -542,6 +550,7 @@ impl Builder {
             continues: Vec::new(),
             claims: HashMap::new(),
             attachments: HashSet::new(),
+            attachment_parents: HashMap::new(),
         };
         use v3::fact::{absent, direction::IN, modality::*};
         let gap = |modality, kind| FactCore {
@@ -587,6 +596,7 @@ impl Builder {
         let thinking = core.modality == Some(v3::fact::modality::THINKING);
         let head = core.modality == Some(v3::fact::modality::TOOL_RESULT);
         let call = core.modality == Some(v3::fact::modality::TOOL_CALL);
+        let text = core.modality == Some(v3::fact::modality::TEXT);
         let fact = self.put_fact(core, path)?;
         self.items.push(Item {
             fact,
@@ -594,6 +604,8 @@ impl Builder {
             thinking,
             head,
             call,
+            text,
+            prompt: false,
             part_of: None,
             record,
             original: None,
@@ -980,6 +992,13 @@ impl Builder {
                 ))
             }
         }
+        // His typed prompt: the record's own text, unless it is harness text
+        // or a compaction summary (R1'').
+        let typed = !record.is_true("isMeta") && !record.is_true("isCompactSummary");
+        for &item in &items {
+            let item = &mut self.items[item];
+            item.prompt = typed && item.text && !item.head && item.part_of.is_none();
+        }
         // Correlators: the record that holds the call this result answers,
         // and the call a harness message follows.
         if let Some(source) = record.str_at("sourceToolAssistantUUID") {
@@ -1283,10 +1302,19 @@ impl Builder {
                     } else {
                         ("data", sealed::ANTHROPIC_REDACTED_THINKING)
                     };
-                    let sealed = FactCore {
-                        blob: Some(bytes(block.get(field), &path)?),
-                        media_type: Some(sealed_type(spelling)),
-                        ..core(THINKING, OUT)
+                    // An empty token holds nothing (C8): her thinking
+                    // happened and its body is unknown, a body gap as
+                    // Codex's empty token is (X12), never a 0-byte blob.
+                    let sealed = match block.get(field) {
+                        Some(Json::Str(token)) if token.is_empty() => FactCore {
+                            absent: Some(v3::fact::absent::BODY),
+                            ..core(THINKING, OUT)
+                        },
+                        token => FactCore {
+                            blob: Some(bytes(token, &path)?),
+                            media_type: Some(sealed_type(spelling)),
+                            ..core(THINKING, OUT)
+                        },
                     };
                     let item = self.item(sealed, Role::Assistant, Some(at), &path)?;
                     if let Some(readable) = block.str_at("thinking").filter(|t| !t.is_empty()) {
@@ -1413,6 +1441,25 @@ impl Builder {
             }
         }
 
+        // A beside-mark in the middle of one message: the message began
+        // before the mark and this record continues it after (R1'').
+        if self.messages.contains_key(&message_id) {
+            let mut cursor = parent.as_deref();
+            // At most one step per attachment, whatever their parents say.
+            for _ in 0..self.attachment_parents.len() {
+                let Some((up, beside)) = cursor.and_then(|at| self.attachment_parents.get(at))
+                else {
+                    break;
+                };
+                if *beside {
+                    return Err(Failure::new(
+                        "{attachment}.renderedBesideToolResult",
+                        "rendered in the middle of one message: no real mark stands there; not built",
+                    ));
+                }
+                cursor = up.as_deref();
+            }
+        }
         // One API message spans the records that share its id; its window
         // is decided once, from the unedited history at the records'
         // common base.
@@ -1505,6 +1552,14 @@ impl Builder {
         use v3::fact::{direction::IN, modality::*};
         self.claims_of(at, record)?;
         self.attachments.insert(at);
+        if let Some(uuid) = &uuid {
+            let beside = matches!(
+                record.get("renderedBesideToolResult"),
+                Some(Json::Bool(true))
+            );
+            self.attachment_parents
+                .insert(uuid.clone(), (parent.clone(), beside));
+        }
         if record.get("rendered").is_none() && record.get("renderedInHumanTurn").is_none() {
             let items = self.unrecorded(at, members)?;
             return self.place(at, uuid, parent, items);
@@ -1528,6 +1583,8 @@ impl Builder {
         // framed part there held the text plus a newline too, so that case
         // stays open; so does a line whose place before it is unknown. The
         // mark is the JSON boolean `true`; any other spelling fails (R1').
+        // It is built only directly after his typed prompt (R1''), where
+        // 720 of the 727 real marks stand.
         let beside = match record.get("renderedBesideToolResult") {
             None => false,
             Some(Json::Bool(true)) => true,
@@ -1541,7 +1598,7 @@ impl Builder {
         if beside {
             let version = self.version_at[at];
             let line = self.parent_line(parent.as_deref(), version)?;
-            self.beside_no_result(line.edited.node)?;
+            self.beside_his_prompt(line.edited.node)?;
         }
         let mut items = Vec::new();
         for shown in rendered {
@@ -1580,11 +1637,14 @@ impl Builder {
     }
 
     /// R1: the place before a `renderedBesideToolResult` rendering, past
-    /// the renderings of the attachments before it, holds no tool result
-    /// and is known. Beside a result, between a call and its result (R1':
-    /// 0 of 716 real marks follow anything but a typed prompt), or after a
-    /// span of unknown items, the rendering is not built.
-    fn beside_no_result(&self, tail: Option<usize>) -> Result<(), Failure> {
+    /// the renderings of the attachments before it, holds his typed prompt
+    /// (R1''). Beside a result, between a call and its result (R1'), after
+    /// a span of unknown items, or after anything else (her text, harness
+    /// text, a compaction summary, the start of her message), the
+    /// rendering is not built. Of the 727 marks in the live transcripts
+    /// under 60 MB (round 6, counts only), 720 follow his prompt, 4 harness
+    /// text and 3 a compaction summary; none follows anything else.
+    fn beside_his_prompt(&self, tail: Option<usize>) -> Result<(), Failure> {
         let path = "{attachment}.renderedBesideToolResult";
         let mut cursor = tail;
         while let Some(at) = cursor {
@@ -1614,9 +1674,30 @@ impl Builder {
                     "rendered after a span of unknown items: whether a tool result is beside it is unknown",
                 ));
             }
+            if item.prompt {
+                return Ok(());
+            }
+            // Real marks do follow harness text and compaction summaries,
+            // but what her window held there is unverified.
+            let claims = item.record.and_then(|record| self.claims.get(&record));
+            if claims.is_some_and(|claims| claims.harness_written) {
+                return Err(Failure::new(
+                    path,
+                    "rendered after harness text: what her window held there is unverified; not built",
+                ));
+            }
+            if claims.is_some_and(|claims| claims.compaction_summary) {
+                return Err(Failure::new(
+                    path,
+                    "rendered after a compaction summary: what her window held there is unverified; not built",
+                ));
+            }
             break;
         }
-        Ok(())
+        Err(Failure::new(
+            path,
+            "rendered after something other than his typed prompt: no real mark stands there; not built",
+        ))
     }
 
     /// An attachment recorded before its rendering was (S3): the members
@@ -2115,36 +2196,35 @@ impl Builder {
         // Why a sampling stopped annotates its occurrence and is no part of
         // its id (M2). Two records whose own claims are the same converge on
         // one occurrence; if they ended differently, which stopped which way
-        // would be lost, so the unit fails instead.
-        let mut ended: HashMap<Id, Vec<Id>> = HashMap::new();
+        // would be lost, so the unit fails instead. Their claim values are
+        // compared where they are made (P1), shared with Codex.
+        let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
         for (record, nodes) in held {
             let claims = self.claims.get(&record).cloned().unwrap_or_default();
-            for (node, mut ends) in nodes {
-                ends.sort();
-                let built = witness(SOURCE_CLAUDE_CODE, node)
-                    .map_err(|_| Failure::new("<witness>", "a witness does not build"))?;
-                let id = built.root().expect("a witness is rooted");
-                out += unexported(built);
-                let claims = WitnessAnnotations {
-                    ends: ends.clone(),
-                    ..claims.clone()
-                };
-                let built = occurrence(id, claims).map_err(|_| {
-                    Failure::new("<witness>", "a witness occurrence does not build")
-                })?;
-                // The id only tells whether the store would merge the two
-                // (idempotence); nothing is looked up by it.
-                let at = built.root().expect("an occurrence is rooted");
-                if let Some(earlier) = ended.insert(at, ends.clone()) {
-                    if earlier != ends {
-                        return Err(Failure::new(
-                            "{assistant}.message{message}.stop_reason",
-                            "two records with the same claims end differently",
-                        ));
-                    }
-                }
-                out += unexported(built);
+            for (node, ends) in nodes {
+                occurrences.push((
+                    node,
+                    WitnessAnnotations {
+                        ends,
+                        ..claims.clone()
+                    },
+                ));
             }
+        }
+        if ends_disagree(&occurrences) {
+            return Err(Failure::new(
+                "{assistant}.message{message}.stop_reason",
+                "two records with the same claims end differently",
+            ));
+        }
+        for (node, claims) in occurrences {
+            let built = witness(SOURCE_CLAUDE_CODE, node)
+                .map_err(|_| Failure::new("<witness>", "a witness does not build"))?;
+            let id = built.root().expect("a witness is rooted");
+            out += unexported(built);
+            let built = occurrence(id, claims)
+                .map_err(|_| Failure::new("<witness>", "a witness occurrence does not build"))?;
+            out += unexported(built);
         }
         // Titles: the nearest node on the parent chain of the record before
         // the title in the file (I5). A title before every record is a

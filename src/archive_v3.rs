@@ -335,6 +335,84 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
     Ok(Fragment::rooted_from_parts(root, facts, metafacts, blobs))
 }
 
+/// M2, P1: whether two of `occurrences`, each `(node, claims)`, are one
+/// occurrence in the store but ended differently. Why a sampling or turn
+/// ended annotates its occurrence and is no part of its id, so two records
+/// whose own claims are the same converge on one occurrence; if they ended
+/// differently, which stopped which way would be lost, and the importer
+/// fails the unit instead.
+///
+/// The records' claim values are compared directly, as the store would
+/// merge them: the same node, and the same values of every claim of their
+/// own records, repeated claims as sets. No id is derived to compare, and
+/// nothing is looked up by one. Both importers share it.
+pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
+    fn set<T: Ord>(values: impl IntoIterator<Item = T>) -> Vec<T> {
+        let mut values: Vec<T> = values.into_iter().collect();
+        values.sort();
+        values.dedup();
+        values
+    }
+    // Every claim of the record's own, by name, so that a claim added to
+    // [`WitnessAnnotations`] cannot be left out of the comparison.
+    fn same_claims(a: &WitnessAnnotations, b: &WitnessAnnotations) -> bool {
+        let WitnessAnnotations {
+            generated_by,
+            raw_model,
+            raw_role,
+            raw_author,
+            author,
+            experiencer,
+            source_locator,
+            timestamp,
+            pointer,
+            claimed_size,
+            claimed_media_type,
+            claimed_title,
+            compaction_summary,
+            harness_written,
+            turn_ends: _,
+            ends: _,
+        } = a;
+        set(generated_by) == set(&b.generated_by)
+            && *raw_model == b.raw_model
+            && *raw_role == b.raw_role
+            && set(raw_author) == set(&b.raw_author)
+            && *author == b.author
+            && *experiencer == b.experiencer
+            && *source_locator == b.source_locator
+            && set(timestamp.iter().map(|time| time.raw))
+                == set(b.timestamp.iter().map(|time| time.raw))
+            && set(pointer) == set(&b.pointer)
+            && *claimed_size == b.claimed_size
+            && claimed_media_type.as_ref().map(MediaType::canonical)
+                == b.claimed_media_type.as_ref().map(MediaType::canonical)
+            && *claimed_title == b.claimed_title
+            && *compaction_summary == b.compaction_summary
+            && *harness_written == b.harness_written
+    }
+    fn same_ends(a: &WitnessAnnotations, b: &WitnessAnnotations) -> bool {
+        set(&a.ends) == set(&b.ends) && set(&a.turn_ends) == set(&b.turn_ends)
+    }
+    // Records with the same claims assert the same times, so only records
+    // whose times are equal are compared pairwise: ordered by that source
+    // value, never by an id.
+    let times: Vec<Vec<[u8; 32]>> = occurrences
+        .iter()
+        .map(|(_, claims)| set(claims.timestamp.iter().map(|time| time.raw)))
+        .collect();
+    let mut order: Vec<usize> = (0..occurrences.len()).collect();
+    order.sort_by(|&a, &b| times[a].cmp(&times[b]));
+    order.chunk_by(|&a, &b| times[a] == times[b]).any(|run| {
+        run.iter().enumerate().any(|(at, &a)| {
+            run[at + 1..].iter().any(|&b| {
+                let ((node_a, a), (node_b, b)) = (&occurrences[a], &occurrences[b]);
+                node_a == node_b && same_claims(a, b) && !same_ends(a, b)
+            })
+        })
+    })
+}
+
 /// One gloss: side-model `text` of `category` about `describes`.
 pub fn gloss(describes: Id, category: Id, text: &str) -> Result<Fragment> {
     if text.is_empty() {
