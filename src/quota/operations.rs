@@ -24,7 +24,7 @@ use triblespace::prelude::*;
 use crate::quota::status::{self, PageItem, ProviderStatus};
 use crate::quota::{self, Observation, TextHandle};
 use crate::schemas::quota::{provider_status, quota as attributes, DEFAULT_SCOPE_ID};
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
+use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultySnapshot, FacultyStore};
 
 /// Configured Quota operations. Inputs are literal; nothing ambient is read
 /// here except the clock.
@@ -214,7 +214,7 @@ impl Quota {
 /// async runtime: the read acquires through `runtime`.
 pub fn observe_at(
     storage: &crate::storage::Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
     now: i128,
@@ -426,27 +426,46 @@ where
 /// Advance this key's own commits into the Rank9 view and freeze it.
 fn maintain_and_observe(
     storage: &crate::storage::Storage,
-    pile: &mut FacultyStore,
+    pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<(FactArchive, AcquiringReader<FacultySnapshot>)> {
-    let source =
-        storage.open_collection_read(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
+    let control = pile.read_control();
+    let source = if let (Some(control), Some(handle)) =
+        (control.clone(), storage.collection_handle(DEFAULT_SCOPE_ID)?)
+    {
+        // The borrowed Orient caller must keep its one acquisition deadline
+        // and cancellation through exact descriptor/proof reads too. The
+        // frozen reader runs outside the shared store's short local borrow.
+        let reader = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime))
+            .with_control(control);
+        if storage.collection_routes().is_some() {
+            crate::collection_names::open_workspace_read_in(&reader, signer.verifying_key(), handle)?
+        } else {
+            crate::collection_names::open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)?
+        }
+    } else {
+        storage.open_collection_read(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?
+    };
     let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
     let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-    {
-        // Release the backend guard before any reader acquires through it.
-        let mut local = pile.store();
+    // Same resident-only upkeep for ordinary and borrowed callers. Release
+    // the backend guard before the frozen reader acquires any missing bytes.
+    pile.with_local(|local| {
         pollster::block_on(async {
             crate::storage::tolerate_own_lag(local.maintain_attached(succinct, signer).await)?;
             crate::storage::tolerate_own_lag(local.maintain_attached(rank9, signer).await)
         })
-        .context("maintain Quota fact collection")?;
-    }
+        .context("maintain Quota fact collection")
+    })?;
     let snapshot = pile
         .snapshot()
         .context("freeze maintained Quota snapshot")?;
     let snapshot = AcquiringReader::new(snapshot, Arc::clone(runtime));
+    let snapshot = match control {
+        Some(control) => snapshot.with_control(control),
+        None => snapshot,
+    };
     let facts =
         crate::storage::acquire_facts(&snapshot, rank9).context("read Quota Rank9 collection")?;
     Ok((facts, snapshot))

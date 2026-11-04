@@ -2045,7 +2045,7 @@ mod tests {
         fn observe_at(&mut self, at: Epoch) -> HealthObservation {
             assert!(self
                 .sources
-                .maintain(&self.store, &self.signer)
+                .maintain(&mut self.store, &self.signer)
                 .unwrap()
                 .is_none());
             let observation = self.sources.at(self.store.snapshot().unwrap(), at).unwrap();
@@ -4093,7 +4093,7 @@ mod tests {
         let report_id = report.root().unwrap();
         f.publish(report);
         // Complete local production before the counted polling observation.
-        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
+        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
         let watermark = f.store.snapshot().unwrap();
         for (instant, stale, next) in [
             (59.0, false, Some(60.0)),
@@ -4122,7 +4122,7 @@ mod tests {
                 .record(at(0.0), [condition(State::Current, false)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
+        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
         let before = f.store.snapshot().unwrap();
         f.sources
             .refresh_poll_view(before.clone(), at(1.0))
@@ -4171,7 +4171,7 @@ mod tests {
                 .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
+        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();
@@ -4239,7 +4239,7 @@ mod tests {
                 .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&f.store, &f.signer).unwrap().is_none());
+        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();

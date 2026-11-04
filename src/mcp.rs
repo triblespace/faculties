@@ -536,7 +536,7 @@ pub fn invoke_native(
     let content_budget = budget.saturating_sub(ERROR_RESERVE + 64);
     let mut rejected = false;
     let result = {
-        let mut emit = |part| {
+        let mut emit = |part: Part| {
             if rejected {
                 bail!("MCP output emission previously failed");
             }
