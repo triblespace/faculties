@@ -686,7 +686,7 @@ fn unknown_fields_and_kinds_fail() {
     );
     assert!(walk_rows(&source)
         .iter()
-        .any(|(path, kind)| path.starts_with("{novel_record}") && *kind == Kind::Unknown));
+        .any(|(path, kind)| path.starts_with("{<value>}") && *kind == Kind::Unknown));
     let source = g4().replace("\"effort\":\"medium\"", "\"effort\":\"enormous\"");
     assert_eq!(refused(&source).path, "{turn_context}.payload.effort");
     // An open field fails.
@@ -735,6 +735,7 @@ fn real_sample() {
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let mut walk_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut gate_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut failing_files: Vec<String> = Vec::new();
     let mut by_month: BTreeMap<String, [usize; 3]> = BTreeMap::new();
     for file in &files {
         let Ok(bytes) = std::fs::read(file) else {
@@ -762,7 +763,7 @@ fn real_sample() {
                 import_failed += 1;
                 counts[1] += 1;
                 *first_failures
-                    .entry((gate::normalize(&failure.path), failure.reason))
+                    .entry((gate::vocabulary(&TABLE, &failure.path), failure.reason))
                     .or_default() += 1;
             }
             Ok(mut fragment) => {
@@ -774,6 +775,13 @@ fn real_sample() {
                 } else {
                     gate_failed += 1;
                     counts[2] += 1;
+                    let paths: std::collections::BTreeSet<String> = report
+                        .rows
+                        .iter()
+                        .map(|row| format!("{} {}", row.path, row.kind))
+                        .collect();
+                    let paths: Vec<String> = paths.into_iter().collect();
+                    failing_files.push(format!("{}\t{}", gate::file_path(file), paths.join("; ")));
                     let mut seen = std::collections::BTreeSet::new();
                     for row in report.rows {
                         seen.insert((row.path, row.kind.to_string()));
@@ -808,5 +816,9 @@ fn real_sample() {
     println!("-- gate rows of imported files: files, path, kind");
     for ((path, kind), count) in &gate_failures {
         println!("{count}\t{path}\t{kind}");
+    }
+    println!("-- files that import and fail the gate");
+    for file in &failing_files {
+        println!("{file}");
     }
 }

@@ -31,8 +31,8 @@
 //! unit and each says why.
 
 use super::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Mirror, Order, Structure,
-    Windows,
+    Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, GapRule, Gaps,
+    Link, Mirror, Order, Place, Structure, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -1568,8 +1568,156 @@ pub const TABLE: FieldTable = FieldTable {
         rollback_count: "payload.num_turns",
     }),
     windows: Windows::NONE,
+    gaps: Gaps {
+        // A request that records no settings header still had one.
+        header: Some(SYSTEM_GAP),
+        // Before a system prompt is recorded, it is unknown.
+        prefix: &[SYSTEM_GAP],
+        // Tool definitions are never recorded.
+        after_prefix: &[Gap {
+            modality: "tool-definition",
+            direction: "in",
+            kind: "span",
+        }],
+        orphan: None,
+        cleared: None,
+        beside: &BESIDE,
+    },
+    links: &LINKS,
+    places: &[
+        // Why a turn ended: on her last node of the turn (X5, X6).
+        (
+            "{event_msg}.payload{turn_aborted}.reason",
+            "ends",
+            Place::LastOut,
+        ),
+        (
+            "{event_msg}.payload{task_complete}.type",
+            "ends",
+            Place::LastOut,
+        ),
+    ],
     entries: &ENTRIES,
 };
+
+/// A system body gap: the settings header or the system prompt, unknown.
+const SYSTEM_GAP: Gap = Gap {
+    modality: "system",
+    direction: "in",
+    kind: "body",
+};
+
+/// A result's head: a fact that holds no value.
+const HEAD: Gap = Gap {
+    modality: "tool-result",
+    direction: "in",
+    kind: "",
+};
+
+/// What a server-side search read into her window, unrecorded.
+const SPAN: Gap = Gap {
+    modality: "",
+    direction: "",
+    kind: "span",
+};
+
+const fn head(path: &'static str) -> GapRule {
+    GapRule {
+        path,
+        when: &[],
+        at: Beside::Before,
+        gap: HEAD,
+        held: true,
+    }
+}
+
+const fn searched(path: &'static str) -> GapRule {
+    GapRule {
+        path,
+        when: &[],
+        at: Beside::After,
+        gap: SPAN,
+        held: false,
+    }
+}
+
+/// Her reasoning happened; its token is not recorded.
+const fn unsealed(path: &'static str) -> GapRule {
+    GapRule {
+        path,
+        when: &[Cond::SiblingAbsent("encrypted_content")],
+        at: Beside::Same,
+        gap: Gap {
+            modality: "thinking",
+            direction: "out",
+            kind: "body",
+        },
+        held: true,
+    }
+}
+
+const BESIDE: [GapRule; 12] = [
+    head("{function_call_output}.call_id"),
+    head("{custom_tool_call_output}.call_id"),
+    head("{response_item}.payload{function_call_output}.call_id"),
+    head("{response_item}.payload{custom_tool_call_output}.call_id"),
+    searched("{web_search_call}.action"),
+    searched("{response_item}.payload{web_search_call}.action"),
+    searched("{compacted}.payload.replacement_history[]{web_search_call}.action"),
+    unsealed("{reasoning}.type"),
+    unsealed("{response_item}.payload{reasoning}.type"),
+    unsealed("{compacted}.payload.replacement_history[]{reasoning}.type"),
+    // Before replacement histories: what the client kept is unrecorded,
+    // then the summary.
+    GapRule {
+        path: "{compacted}.payload.message",
+        when: &[Cond::IsNot("payload.message", "")],
+        at: Beside::Before,
+        gap: SPAN,
+        held: false,
+    },
+    // The effort is rendered in an unpublished text and place.
+    GapRule {
+        path: "{turn_context}.payload.effort",
+        when: &[
+            Cond::IsNot("payload.effort", "null"),
+            Cond::IsNot("payload.effort", ""),
+        ],
+        at: Beside::Same,
+        gap: SYSTEM_GAP,
+        held: true,
+    },
+];
+
+/// Every call she can make that a result answers.
+const CALLS: &[&str] = &[
+    "{function_call}.call_id",
+    "{custom_tool_call}.call_id",
+    "{local_shell_call}.call_id",
+    "{response_item}.payload{function_call}.call_id",
+    "{response_item}.payload{custom_tool_call}.call_id",
+    "{response_item}.payload{local_shell_call}.call_id",
+    "{compacted}.payload.replacement_history[]{function_call}.call_id",
+    "{compacted}.payload.replacement_history[]{custom_tool_call}.call_id",
+    "{compacted}.payload.replacement_history[]{local_shell_call}.call_id",
+];
+
+const fn answers(from: &'static str) -> Link {
+    Link {
+        attribute: "responds_to",
+        from,
+        from_modality: "tool-result",
+        to: CALLS,
+        to_modality: "tool-call",
+    }
+}
+
+const LINKS: [Link; 4] = [
+    answers("{function_call_output}.call_id"),
+    answers("{custom_tool_call_output}.call_id"),
+    answers("{response_item}.payload{function_call_output}.call_id"),
+    answers("{response_item}.payload{custom_tool_call_output}.call_id"),
+];
 
 /// The side model that writes reasoning summaries; the source does not
 /// name it.

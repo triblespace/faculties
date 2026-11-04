@@ -76,6 +76,9 @@ const TEST: FieldTable = FieldTable {
         parent: "parent",
     },
     windows: crate::archive_v3::fields::Windows::NONE,
+    gaps: crate::archive_v3::fields::Gaps::NONE,
+    links: &[],
+    places: &[],
     entries: TEST_ENTRIES,
 };
 
@@ -141,15 +144,16 @@ fn walker_fails_what_the_table_does_not_name() {
     let rows = |line: &[u8]| kinds(&walk(&TEST, line));
     assert_eq!(
         rows(br#"{"type":"say","id":"1","novel":1}"#),
-        vec![("{say}.novel".to_owned(), Kind::Unknown)]
+        vec![("{say}.<key>".to_owned(), Kind::Unknown)],
+        "a key the table does not name prints as <key> (G8)"
     );
     assert_eq!(
         rows(br#"{"type":"shout","id":"1"}"#),
         vec![
-            ("{shout}.id".to_owned(), Kind::Unknown),
-            ("{shout}.type".to_owned(), Kind::Unknown)
+            ("{<value>}.<key>".to_owned(), Kind::Unknown),
+            ("{<value>}.<key>".to_owned(), Kind::Unknown)
         ],
-        "an unknown discriminator is an unknown path"
+        "an unknown discriminator is an unknown path, printed as <value> (G8)"
     );
     assert_eq!(
         rows(br#"{"type":"say","mood":"stormy"}"#),
@@ -415,6 +419,8 @@ struct Step {
     fact: FactCore,
     ends: Vec<Id>,
     witness: WitnessAnnotations,
+    /// The call node this result answers.
+    responds_to: Option<Id>,
 }
 
 impl Chain {
@@ -435,6 +441,7 @@ impl Chain {
             id,
             &NodeAnnotations {
                 ends: step.ends,
+                responds_to: step.responds_to.into_iter().collect(),
                 ..NodeAnnotations::default()
             },
         );
@@ -444,6 +451,33 @@ impl Chain {
         self.fragment += unexported(occurrence(witness_id, step.witness).unwrap());
         self.nodes.push(id);
         id
+    }
+
+    /// A gap node no record holds: `absent` of `kind`, under `modality`
+    /// (and direction `in`) or none.
+    fn gap(&mut self, modality: Option<Id>, kind: Id) -> Id {
+        let held = fact(FactCore {
+            modality,
+            direction: modality.map(|_| v3::fact::direction::IN),
+            absent: Some(kind),
+            ..FactCore::default()
+        })
+        .unwrap();
+        let built = node(self.nodes.last().copied(), held).unwrap();
+        let id = built.root().unwrap();
+        self.fragment += unexported(built);
+        self.nodes.push(id);
+        id
+    }
+
+    /// The window of a Claude Code request before a system section is
+    /// recorded and with no effort: the settings header gap, the system
+    /// prompt gap and the tool definitions span (G9).
+    fn unrecorded_section(&mut self) {
+        use v3::fact::{absent, modality::*};
+        self.gap(Some(SYSTEM), absent::BODY);
+        self.gap(Some(SYSTEM), absent::BODY);
+        self.gap(Some(TOOL_DEFINITION), absent::SPAN);
     }
 
     fn check(mut self, table: &FieldTable, source: &str) -> Report {
@@ -485,6 +519,8 @@ fn said(modality: Id, direction: Id, text: &str) -> FactCore {
     }
 }
 
+/// The claims of one Claude Code record: its role, model, time and
+/// session.
 fn by(role: &str, time: Inline<NsTAIInterval>) -> WitnessAnnotations {
     let model = (role == "assistant").then(|| "synthetic-model".to_owned());
     WitnessAnnotations {
@@ -492,6 +528,7 @@ fn by(role: &str, time: Inline<NsTAIInterval>) -> WitnessAnnotations {
         raw_model: model,
         raw_role: Some(role.to_owned()),
         timestamp: vec![time],
+        source_locator: Some("s-1".to_owned()),
         ..WitnessAnnotations::default()
     }
 }
@@ -512,12 +549,13 @@ enum Fault {
 fn claude_code_v3(witnessed_items: bool, fault: Fault) -> Chain {
     use v3::fact::{direction::*, modality::*};
     let mut chain = Chain::new(SOURCE_CLAUDE_CODE);
+    chain.unrecorded_section();
     chain.push(Step {
         fact: said(TEXT, IN, "Which tools can search?"),
         witness: by("user", iso("2026-03-01T10:00:00.000Z")),
         ..Step::default()
     });
-    chain.push(Step {
+    let call = chain.push(Step {
         fact: FactCore {
             modality: Some(TOOL_CALL),
             direction: Some(OUT),
@@ -527,6 +565,7 @@ fn claude_code_v3(witnessed_items: bool, fault: Fault) -> Chain {
         },
         ends: vec![v3::node::ends::TOOL_USE],
         witness: by("assistant", iso("2026-03-01T10:00:01.000Z")),
+        ..Step::default()
     });
     let in_result = || by("user", iso("2026-03-01T10:00:02.000Z"));
     chain.push(Step {
@@ -537,6 +576,7 @@ fn claude_code_v3(witnessed_items: bool, fault: Fault) -> Chain {
             ..FactCore::default()
         },
         witness: in_result(),
+        responds_to: Some(call),
         ..Step::default()
     });
     let text = Step {
@@ -578,6 +618,7 @@ fn claude_code_v3(witnessed_items: bool, fault: Fault) -> Chain {
                 modality: Some(TOOL_DEFINITION),
                 direction: Some(IN),
                 tool_name: Some("WebSearch".to_owned()),
+                absent: Some(v3::fact::absent::BODY),
                 ..FactCore::default()
             },
             witness: in_result(),
@@ -608,6 +649,7 @@ fn claude_code_v3(witnessed_items: bool, fault: Fault) -> Chain {
         fact: said(TEXT, OUT, answer),
         ends: vec![v3::node::ends::END_TURN],
         witness: by("assistant", iso("2026-03-01T10:00:03.000Z")),
+        ..Step::default()
     });
     if fault == Fault::Extra {
         chain.push(Step {
@@ -955,6 +997,7 @@ fn twice_source() -> String {
 fn twice_v3(drop_second: bool) -> Chain {
     use v3::fact::{direction::*, modality::*};
     let mut chain = Chain::new(SOURCE_CLAUDE_CODE);
+    chain.unrecorded_section();
     let at = |second: u32| iso(&format!("2026-03-01T10:00:0{second}.000Z"));
     chain.push(Step {
         fact: said(TEXT, IN, "List it twice."),
@@ -971,8 +1014,10 @@ fn twice_v3(drop_second: bool) -> Chain {
         },
         ends: vec![v3::node::ends::TOOL_USE],
         witness: by("assistant", at(second)),
+        ..Step::default()
     };
     let result = |chain: &mut Chain, second: u32| {
+        let call = *chain.nodes.last().unwrap();
         chain.push(Step {
             fact: FactCore {
                 modality: Some(TOOL_RESULT),
@@ -981,6 +1026,7 @@ fn twice_v3(drop_second: bool) -> Chain {
                 ..FactCore::default()
             },
             witness: by("user", at(second)),
+            responds_to: Some(call),
             ..Step::default()
         });
         chain.push(Step {
@@ -1001,6 +1047,7 @@ fn twice_v3(drop_second: bool) -> Chain {
         fact: said(TEXT, OUT, "Same both times."),
         ends: vec![v3::node::ends::END_TURN],
         witness: leaf,
+        ..Step::default()
     });
     chain
 }
@@ -1029,7 +1076,7 @@ fn g3_an_unknown_member_inside_a_correlator_subtree_fails() {
     eprintln!("g3: {rows:?}");
     assert!(
         rows.contains(&(
-            "{system}.compactMetadata.preservedSegment.novel".to_owned(),
+            "{system}.compactMetadata.preservedSegment.<key>".to_owned(),
             Kind::Unknown
         )),
         "{rows:?}"
@@ -1134,7 +1181,8 @@ fn unread_correlators(table: &'static FieldTable, importer: &str) {
             | Cond::Absent(field)
             | Cond::Scalar(field)
             | Cond::Sibling(field, _)
-            | Cond::SiblingNot(field, _) => Some(*field),
+            | Cond::SiblingNot(field, _)
+            | Cond::SiblingAbsent(field) => Some(*field),
         })
         .collect();
     let mut unread = Vec::new();

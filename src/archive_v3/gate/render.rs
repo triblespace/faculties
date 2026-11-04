@@ -5,16 +5,20 @@
 //! `previous` (each node once: the windows form a graph) and renders each
 //! node as tokens:
 //!
-//! - every attribute of every fact the node holds, under the fact's modality
-//!   and direction (a `structure` as its `json_tree` leaves);
-//! - the node's own annotations (`ends`, `rendering`, a time) and those of
-//!   its glosses, and the claims of each occurrence of its witnesses, as
-//!   annotation tokens.
+//! - its facts: every attribute of every fact the node holds, under the
+//!   fact's modality and direction (a `structure` as its `json_tree`
+//!   leaves), the fact's shape (so a fact that holds no value still makes
+//!   the node an item) and a gap's `absent` term;
+//! - its marks: the node's own annotations (`ends`, `rendering`, a time),
+//!   those of its glosses and citations;
+//! - the claims of each occurrence of its witness, one tuple per occurrence;
+//! - its links (`responds_to`, `recalls`, `continues`, `spawned_by`), each
+//!   to the node it names, which the gate names by its place.
 //!
-//! Attributes that are structure (`previous`, `holds`, links between nodes,
-//! kind tags, a gap's `absent`, derived actor ids) render nothing. Every
-//! other attribute renders, and one A does not know renders under its id,
-//! so it can only ever be reported, never pass unseen.
+//! Attributes that are structure (`previous`, `holds`, kind tags, derived
+//! actor ids) render nothing. Every other attribute renders, and one A does
+//! not know renders under its id, so it can only ever be reported, never
+//! pass unseen.
 //!
 //! Then it lists every entity in the `TribleSet` and reports each one no
 //! window reached: a fact no node on a window holds, a node on no window, a
@@ -51,10 +55,31 @@ pub struct GraphNode {
     /// Its one predecessor (an index into the graph); `None` at a root, and
     /// where the predecessor is ambiguous (reported).
     pub previous: Option<usize>,
-    /// Every token: its fact's, and its annotations'.
+    /// Its item: the tokens of the fact(s) it holds, shape and gap terms
+    /// included.
+    pub facts: BTreeSet<Token>,
+    /// Its annotations, its glosses' and its citations'.
+    pub marks: BTreeSet<Token>,
+    /// The claims of each occurrence of its witness, one tuple each (an
+    /// occurrence that claims nothing is none).
+    pub occurrences: BTreeSet<BTreeSet<Token>>,
+    /// Its links: the attribute, and the node it names (`None` when no
+    /// window holds it).
+    pub links: Vec<(String, Option<usize>)>,
+    /// Every value token of its facts, marks and claims, as the gate
+    /// compares them over the unit.
     pub tokens: BTreeSet<Token>,
     /// Whether a witness projects to it.
     pub witnessed: bool,
+}
+
+/// What A renders of one node, before its links are placed.
+#[derive(Clone, Debug, Default)]
+struct Rendering {
+    facts: BTreeSet<Token>,
+    marks: BTreeSet<Token>,
+    occurrences: BTreeSet<BTreeSet<Token>>,
+    links: Vec<(String, Id)>,
 }
 
 type Raw = Inline<UnknownInline>;
@@ -75,6 +100,7 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
     .collect();
     let mut index: HashMap<Id, usize> = HashMap::new();
     let mut graph: Vec<GraphNode> = Vec::new();
+    let mut linked: Vec<Vec<(String, Id)>> = Vec::new();
     for &start in &witnessed {
         // Climb to a node already placed, or to a root.
         let mut climbed: Vec<(Id, Option<Id>)> = Vec::new();
@@ -110,14 +136,35 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
             cursor = up;
         }
         for (node, up) in climbed.into_iter().rev() {
-            let tokens = renderer.node(node);
+            let rendering = renderer.node(node);
             index.insert(node, graph.len());
+            let mut tokens: BTreeSet<Token> = rendering
+                .facts
+                .iter()
+                .filter(|token| !super::walk::positional(token))
+                .cloned()
+                .collect();
+            tokens.extend(rendering.marks.iter().cloned());
+            for claims in &rendering.occurrences {
+                tokens.extend(claims.iter().cloned());
+            }
             graph.push(GraphNode {
                 previous: up.and_then(|up| index.get(&up).copied()),
+                facts: rendering.facts,
+                marks: rendering.marks,
+                occurrences: rendering.occurrences,
+                links: Vec::new(),
                 tokens,
                 witnessed: witnessed.contains(&node),
             });
+            linked.push(rendering.links);
         }
+    }
+    for (at, links) in linked.into_iter().enumerate() {
+        graph[at].links = links
+            .into_iter()
+            .map(|(attribute, target)| (attribute, index.get(&target).copied()))
+            .collect();
     }
     renderer.unreached();
     Rendered {
@@ -129,7 +176,7 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
 struct Renderer<'a, B> {
     facts: &'a TribleSet,
     blobs: &'a B,
-    nodes: BTreeMap<Id, BTreeSet<Token>>,
+    nodes: BTreeMap<Id, Rendering>,
     rows: Vec<(String, Kind, String)>,
     /// Every entity a window reached.
     reached: BTreeSet<Id>,
@@ -215,22 +262,32 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         .collect()
     }
 
-    fn node(&mut self, node: Id) -> BTreeSet<Token> {
-        if let Some(tokens) = self.nodes.get(&node) {
-            return tokens.clone();
+    fn node(&mut self, node: Id) -> Rendering {
+        if let Some(rendering) = self.nodes.get(&node) {
+            return rendering.clone();
         }
         self.reached.insert(node);
+        let mut rendering = Rendering::default();
         let mut tokens = BTreeSet::new();
+        let links = [
+            ("responds_to", main::block::responds_to.id()),
+            ("continues", v3::node::continues.id()),
+            ("spawned_by", v3::node::spawned_by.id()),
+            ("recalls", v3::node::recalls.id()),
+        ];
         for (attribute, raw) in self.attributes(node) {
             if attribute == main::block::holds.id() {
                 if let Some(fact) = Self::id(raw) {
-                    self.fact(fact, &mut tokens);
+                    self.fact(fact, &mut rendering.facts);
+                }
+            } else if let Some((name, _)) = links.iter().find(|(_, id)| *id == attribute) {
+                match Self::id(raw) {
+                    Some(target) => rendering.links.push(((*name).to_owned(), target)),
+                    None => {
+                        tokens.insert(unknown(attribute, raw));
+                    }
                 }
             } else if attribute == main::block::previous.id()
-                || attribute == main::block::responds_to.id()
-                || attribute == v3::node::continues.id()
-                || attribute == v3::node::spawned_by.id()
-                || attribute == v3::node::recalls.id()
                 || (attribute == metadata::tag.id() && Self::id(raw) == Some(main::block::KIND))
             {
             } else if attribute == v3::node::ends.id() {
@@ -268,7 +325,11 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             .collect();
             for occurrence in occurrences {
                 self.reached.insert(occurrence);
-                self.claims(occurrence, &mut tokens);
+                let mut claims = BTreeSet::new();
+                self.claims(occurrence, &mut claims);
+                if !claims.is_empty() {
+                    rendering.occurrences.insert(claims);
+                }
             }
         }
         let glossed: Vec<Id> = find!(
@@ -357,8 +418,9 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 )),
             ));
         }
-        self.nodes.insert(node, tokens.clone());
-        tokens
+        rendering.marks = tokens;
+        self.nodes.insert(node, rendering.clone());
+        rendering
     }
 
     fn fact(&mut self, fact: Id, tokens: &mut BTreeSet<Token>) {
@@ -396,9 +458,15 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             let at = shape(&modalities[0], &directions[0]);
             if attribute == v3::fact::modality.id()
                 || attribute == v3::fact::direction.id()
-                || attribute == v3::fact::absent.id()
                 || (attribute == metadata::tag.id() && Self::id(raw) == Some(v3::fact::KIND))
             {
+                continue;
+            }
+            if attribute == v3::fact::absent.id() {
+                let value = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| {
+                    term(v3::fact::absent::SPECS, id)
+                });
+                values.push(("absent".to_owned(), value));
                 continue;
             }
             let text_attributes = [
@@ -492,6 +560,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         }
         for modality in &modalities {
             for direction in &directions {
+                tokens.insert(super::walk::shape(modality, direction));
                 for (attribute, value) in &values {
                     tokens.insert(Token {
                         modality: modality.clone(),

@@ -225,6 +225,7 @@ impl<'a, 'u> Checker<'a, 'u> {
             Cond::Scalar(field) => self.record.scalars.contains_key(field),
             Cond::Sibling(name, value) => sibling(name).is_some_and(|v| v == value),
             Cond::SiblingNot(name, value) => sibling(name).is_none_or(|v| v != value),
+            Cond::SiblingAbsent(name) => sibling(name).is_none_or(|v| v == "null"),
         })
     }
 

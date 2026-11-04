@@ -71,7 +71,145 @@ pub struct FieldTable {
     /// chain. The gate's walker builds the window behind every record from
     /// this and the order rule alone.
     pub windows: Windows,
+    /// The gaps the rendering rule puts in her window, which the source
+    /// holds no value for: each is an item of its window.
+    pub gaps: Gaps,
+    /// The links between items that the source's correlators establish.
+    pub links: &'static [Link],
+    /// Where an annotation sits when its attribute's default place
+    /// ([`Place::of`]) does not hold: `(entry path, attribute, place)`.
+    pub places: &'static [(&'static str, &'static str, Place)],
     pub entries: &'static [Entry],
+}
+
+/// One gap fact: a modality and direction (both empty for a span of
+/// unknown kind) and its `absent` term (`body` or `span`). A [`GapRule`]
+/// may name the empty term: a fact the source shows only by its place and
+/// that holds no value at all, such as a result's head with no status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Gap {
+    pub modality: &'static str,
+    pub direction: &'static str,
+    pub kind: &'static str,
+}
+
+/// The gaps a window holds where the source holds no value.
+///
+/// A window is `header ++ prefix ++ after_prefix ++ line`; each rule here
+/// fills one of those places, or stands beside a value.
+#[derive(Clone, Copy, Debug)]
+pub struct Gaps {
+    /// The settings header of a window whose request (or header record)
+    /// records none.
+    pub header: Option<Gap>,
+    /// The system section of a window that no prefix record (or a prefix
+    /// record holding nothing) opens.
+    pub prefix: &'static [Gap],
+    /// Items after the system section of every window.
+    pub after_prefix: &'static [Gap],
+    /// After the system section of a line whose first record names a
+    /// parent the unit does not hold: what that parent's line held.
+    pub orphan: Option<Gap>,
+    /// Right after the head of each result a request clears, in place of
+    /// its parts.
+    pub cleared: Option<Gap>,
+    /// Gaps beside a value.
+    pub beside: &'static [GapRule],
+}
+
+impl Gaps {
+    pub const NONE: Gaps = Gaps {
+        header: None,
+        prefix: &[],
+        after_prefix: &[],
+        orphan: None,
+        cleared: None,
+        beside: &[],
+    };
+}
+
+/// A gap the rendering rule puts beside the value at `path` whenever the
+/// walk reaches it and `when` holds (record conditions, or conditions on
+/// the object that holds the value).
+#[derive(Clone, Copy, Debug)]
+pub struct GapRule {
+    pub path: &'static str,
+    pub when: &'static [Cond],
+    pub at: Beside,
+    pub gap: Gap,
+    /// Whether the value's record holds the item ([`Beside::Before`] and
+    /// [`Beside::After`]): a result's head that holds no value is held, a
+    /// span the server read is not.
+    pub held: bool,
+}
+
+/// Where a [`GapRule`]'s gap stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Beside {
+    /// On the value's own fact (the item of the gap's modality at the
+    /// value's place): a fact whose body the source does not hold.
+    Same,
+    /// An item of its own right before the value's item. No record holds
+    /// it, so it is no occurrence of its own.
+    Before,
+    /// An item of its own right after the value's item, held by no record.
+    After,
+}
+
+/// A link an importer makes from one item to another, which the source
+/// establishes by a correlator: the item at the place of the `from`
+/// correlator (of modality `from_modality`) links to the latest item
+/// before it in its window whose `to` correlator has the same value (of
+/// modality `to_modality`).
+#[derive(Clone, Copy, Debug)]
+pub struct Link {
+    /// `responds_to` or `spawned_by`.
+    pub attribute: &'static str,
+    pub from: &'static str,
+    pub from_modality: &'static str,
+    pub to: &'static [&'static str],
+    pub to_modality: &'static str,
+}
+
+/// Where the gate places an annotation value of the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// A claim of its record: one occurrence (the record's claims as one
+    /// tuple) of the witness of each node the record holds. Under
+    /// [`Order::File`] a record that holds no node gives its claims to the
+    /// next node the file places.
+    Claim,
+    /// The record's last item.
+    Last,
+    /// Every item of the record, and every copy of it.
+    Every,
+    /// The item at the value's own place (its array element) whose
+    /// modality is the place's only one.
+    Here,
+    /// The last item of the request whose [`Requests::id`] the value names.
+    Request,
+    /// The end of the line of the latest record before this one in the
+    /// file that names itself ([`Order::Parents`]'s id).
+    FileTail,
+    /// The end of the line of the record's parent.
+    ParentTail,
+    /// The last `out` item of the line since the latest turn started
+    /// ([`Order::File`]); nothing when the turn holds none.
+    LastOut,
+}
+
+impl Place {
+    /// The default place of an annotation attribute: claims of the record,
+    /// `ends` on its last item, `rendering` on every item, a gloss on the
+    /// item at its place.
+    pub fn of(attribute: &str) -> Place {
+        match attribute {
+            "ends" => Place::Last,
+            "rendering" => Place::Every,
+            attribute if attribute.starts_with("gloss:") => Place::Here,
+            _ => Place::Claim,
+        }
+    }
 }
 
 /// The window rules a source marks. Each names record-relative fields;
@@ -107,6 +245,10 @@ impl Windows {
 #[derive(Clone, Copy, Debug)]
 pub struct Compaction {
     pub shape: &'static str,
+    /// The record-relative field naming the last record of the context the
+    /// compaction replaces. A compaction record that names one the unit
+    /// does not hold opens its line on [`Gaps::orphan`].
+    pub parent: &'static str,
     pub head: &'static str,
     pub tail: &'static str,
     pub anchor: &'static str,
@@ -216,6 +358,8 @@ pub enum Cond {
     /// A member of the object that holds the value is absent or has another
     /// value.
     SiblingNot(&'static str, &'static str),
+    /// A member of the object that holds the value is absent or `null`.
+    SiblingAbsent(&'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -408,6 +552,14 @@ impl Entry {
 }
 
 impl FieldTable {
+    /// Where the annotation `attribute` of the entry at `path` sits.
+    pub fn place(&self, path: &str, attribute: &str) -> Place {
+        self.places
+            .iter()
+            .find(|(at, name, _)| *at == path && *name == attribute)
+            .map_or_else(|| Place::of(attribute), |(_, _, place)| *place)
+    }
+
     /// The entries for exactly `path`, in table order.
     pub fn at<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
         self.entries.iter().filter(move |entry| entry.path == path)

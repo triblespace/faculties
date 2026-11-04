@@ -8,7 +8,8 @@
 //! ChatGPT importer.
 
 use super::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure, Windows,
+    Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, Gap, GapRule, Gaps, Mirror, Order,
+    Structure, Windows,
 };
 
 const ROLE: &str = "message.author.role";
@@ -183,5 +184,24 @@ pub const TABLE: FieldTable = FieldTable {
         parent: "parent",
     },
     windows: Windows::NONE,
+    gaps: Gaps {
+        beside: &[
+            // A tool message is a result: its head holds no value.
+            GapRule {
+                path: node!(".message.author.role"),
+                when: &[Cond::Is(ROLE, "tool")],
+                at: Beside::Before,
+                gap: Gap {
+                    modality: "tool-result",
+                    direction: "in",
+                    kind: "",
+                },
+                held: true,
+            },
+        ],
+        ..Gaps::NONE
+    },
+    links: &[],
+    places: &[],
     entries: ENTRIES,
 };

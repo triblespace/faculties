@@ -18,10 +18,18 @@
 //! ([`Windows`]). The gate compares every witnessed window against these,
 //! occurrence by occurrence.
 //!
+//! The gaps the rendering rule puts in a window ([`Gaps`]) are items too:
+//! the header and system section a source does not record, a span a parent
+//! outside the unit held, a cleared result's parts, a gap beside a value.
+//! Each annotation is placed on its item, on every copy of it, at the end of
+//! a line, or in its record's claims ([`Place`]); each correlator a link
+//! names is paired with the items whose correlator it matches.
+//!
 //! A path segment that looks like an id (a uuid, a hex or numeric key, a
 //! prefixed provider id) prints as `<id>`, so a report row never holds one.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 
 use base64::Engine;
@@ -29,8 +37,8 @@ use hifitime::{Duration, Epoch};
 
 use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
 use crate::archive_v3::fields::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Mirror, Order, Structure,
-    Windows,
+    Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps, Mirror,
+    Order, Place, Structure, Windows,
 };
 
 /// What B found in one unit.
@@ -45,6 +53,7 @@ pub struct Walked {
     records: Vec<RecordLinks>,
     ids: HashMap<String, Vec<usize>>,
     windows: Option<Windows>,
+    table_gaps: Option<Gaps>,
     order: Option<Order>,
     /// Anchor id -> the first compaction record that names it.
     anchors: HashMap<String, usize>,
@@ -63,6 +72,31 @@ pub struct Walked {
     /// Unit mirrors to check once the whole unit is read: (path, mirror,
     /// the value's hash, the string when it is one, occurrence label).
     pending: Vec<(String, Mirror, [u8; 32], Option<String>, String)>,
+    /// The item of each gap the rendering rule makes and no record holds.
+    gap_items: BTreeMap<Gap, usize>,
+    /// Annotations placed at the end of a record's line (the record, the
+    /// token).
+    pub line_marks: Vec<(usize, Token)>,
+    /// Annotations of the unit itself, outside every record (a
+    /// conversation's title and id): they sit at the end of each of its
+    /// lines, the claims among them in each occurrence there.
+    pub unit_marks: BTreeSet<Token>,
+    pub unit_claims: BTreeSet<Token>,
+    /// Correlator values that establish links: (record, levels, link,
+    /// value) at a link's `from`, and the places of each value at its
+    /// `to`.
+    link_from: Vec<(usize, Vec<(String, usize)>, usize, String, String)>,
+    link_to: HashMap<(usize, String), Vec<(usize, Vec<(String, usize)>)>>,
+}
+
+/// A link of an item: its attribute, the items its correlator names (the
+/// latest of them in its window is the one it links to), and the path of
+/// the correlator.
+#[derive(Clone, Debug)]
+pub struct Pair {
+    pub attribute: String,
+    pub candidates: Vec<usize>,
+    pub path: String,
 }
 
 /// What precedes one record's items under [`Order::File`].
@@ -94,25 +128,76 @@ enum FileKind {
 #[derive(Clone, Copy, Debug)]
 pub struct Lines {
     pub before: Option<[u8; 32]>,
-    line: Option<[u8; 32]>,
+    pub line: Option<[u8; 32]>,
     unedited: [u8; 32],
     prefix: Option<usize>,
     /// The settings header item the line opens with.
     header: Option<usize>,
+    /// [`Order::File`], a `replace` record: the line it replaces, by the
+    /// hash of its tip, and its last item a record holds (with the hash
+    /// after it).
+    pub replaced: Option<([u8; 32], Option<([u8; 32], usize)>)>,
 }
 
 /// The fact tokens of one source occurrence (one modality at one place),
 /// and where it sits.
 #[derive(Debug)]
 pub struct Item {
+    /// Its record; [`GAP`] for a gap no record holds.
     pub record: usize,
     /// `(array path, position)` from the outermost array in, empty for a
     /// value outside every array.
     pub levels: Vec<(String, usize)>,
     pub modality: String,
+    /// Its fact tokens, the fact's shape ([`shape`]) and any `absent` term
+    /// included.
     pub tokens: BTreeSet<Token>,
-    /// The normalized path of its first token.
+    /// The normalized path of its first valued token.
     pub path: String,
+    /// Whether its record holds it: a witnessed node holds it in its own
+    /// window. A settings header and a gap are held by no record.
+    pub held: bool,
+    /// Its place among the items at the same levels: before (-1), at (0),
+    /// after (1).
+    pub order: i8,
+    /// Annotations of the node that holds it in its own window.
+    pub marks: BTreeSet<Token>,
+    /// Annotations of every node that holds it, re-presented copies too.
+    pub carried: BTreeSet<Token>,
+    /// Its links ([`crate::archive_v3::fields::Link`]).
+    pub pairs: Vec<Pair>,
+    /// Claims of records that hold no node, which the file gives to it.
+    pub claims: Vec<BTreeSet<Token>>,
+}
+
+/// The record of a gap item.
+pub const GAP: usize = usize::MAX;
+
+/// The token that renders a fact's shape: its modality and direction under
+/// the empty attribute. Every fact renders one, so a node is an item even
+/// when its fact holds no value.
+pub fn shape(modality: &str, direction: &str) -> Token {
+    Token {
+        modality: modality.to_owned(),
+        direction: direction.to_owned(),
+        attribute: String::new(),
+        value: Value::Term(String::new()),
+    }
+}
+
+/// Whether a token says only where a fact sits or that its body is
+/// unknown: compared in windows, never as a value.
+pub fn positional(token: &Token) -> bool {
+    token.attribute.is_empty() || token.attribute == "absent"
+}
+
+fn gap_token(gap: &Gap) -> Token {
+    Token {
+        modality: gap.modality.to_owned(),
+        direction: gap.direction.to_owned(),
+        attribute: "absent".to_owned(),
+        value: Value::Term(gap.kind.to_owned()),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -140,6 +225,21 @@ struct RecordLinks {
     header: Option<usize>,
     /// Its kind under [`Order::File`].
     file: FileKind,
+    /// The context a compaction record replaces ([`crate::archive_v3::fields::Compaction::parent`]).
+    logical: Option<String>,
+    /// Its claims: the annotation tokens [`Place::Claim`] places, as one
+    /// tuple.
+    pub claims: BTreeSet<Token>,
+    /// Annotations placed once the unit is read: (token, place, levels,
+    /// the value's spelling, path, occurrence label).
+    deferred: Vec<(
+        Token,
+        Place,
+        Vec<(String, usize)>,
+        Option<String>,
+        String,
+        String,
+    )>,
 }
 
 /// Who an item in a window speaks for, as the window's messages count.
@@ -186,6 +286,49 @@ impl Walked {
         &self.records[record].items
     }
 
+    /// The record's claims, as one tuple.
+    pub fn records_claims(&self, record: usize) -> &BTreeSet<Token> {
+        &self.records[record].claims
+    }
+
+    /// Every record that opens a context replacing another: the record,
+    /// the replaced line's tip, and (under [`Order::File`]) the last item a
+    /// record holds on it with the hash after it.
+    pub fn continuations(
+        &self,
+        lines: &[Option<Lines>],
+    ) -> Vec<(usize, [u8; 32], Option<([u8; 32], usize)>)> {
+        let mut out = Vec::new();
+        if let Some(Order::File(_)) = self.order {
+            for (record, lines) in lines.iter().enumerate() {
+                if let Some((tip, held)) = lines.and_then(|lines| lines.replaced) {
+                    out.push((record, tip, held));
+                }
+            }
+            return out;
+        }
+        for (boundary, links) in self.records.iter().enumerate() {
+            if self.is_repeat(boundary) {
+                continue;
+            }
+            let Some(old) = links.logical.as_deref().and_then(|id| self.first(id)) else {
+                continue;
+            };
+            let Some(tip) = lines[old].and_then(|lines| lines.line) else {
+                continue;
+            };
+            for record in 0..self.records.len() {
+                if self.parent(record) == Some(boundary)
+                    && !self.is_repeat(record)
+                    && !self.records[record].items.is_empty()
+                {
+                    out.push((record, tip, None));
+                }
+            }
+        }
+        out
+    }
+
     /// The record's parent by the order rule, when the unit holds it.
     pub fn parent(&self, record: usize) -> Option<usize> {
         if let Some(Order::File(_)) = self.order {
@@ -221,14 +364,19 @@ impl Walked {
     /// parts.
     fn slots(&self, record: usize) -> Vec<(Vec<(String, usize)>, Slot)> {
         let links = &self.records[record];
-        let mut slots: Vec<(Vec<(String, usize)>, bool, Slot)> = links
+        let mut slots: Vec<(Vec<(String, usize)>, bool, i8, Slot)> = links
             .items
             .iter()
             .map(|&item| {
                 let part = self
                     .result_of(record, Slot::Item(item))
                     .is_some_and(|(_, part)| part);
-                (self.items[item].levels.clone(), part, Slot::Item(item))
+                (
+                    self.items[item].levels.clone(),
+                    part,
+                    self.items[item].order,
+                    Slot::Item(item),
+                )
             })
             .collect();
         for (group, levels) in links.results.iter().enumerate() {
@@ -237,13 +385,13 @@ impl Walked {
                 .iter()
                 .any(|&item| self.result_of(record, Slot::Item(item)) == Some((group, false)));
             if !headed {
-                slots.push((levels.clone(), false, Slot::Head(record, group)));
+                slots.push((levels.clone(), false, 0, Slot::Head(record, group)));
             }
         }
         slots.sort();
         slots
             .into_iter()
-            .map(|(levels, _, slot)| (levels, slot))
+            .map(|(levels, _, _, slot)| (levels, slot))
             .collect()
     }
 
@@ -327,6 +475,63 @@ impl Walked {
         self.records[chain[start]].header
     }
 
+    /// The gap item of `gap`.
+    fn gap(&self, gap: &Gap) -> usize {
+        self.gap_items[gap]
+    }
+
+    /// The header slot: the request's header, else the header gap.
+    fn header_items(&self, header: Option<usize>) -> Vec<usize> {
+        match header {
+            Some(item) => vec![item],
+            None => self.gaps().header.iter().map(|gap| self.gap(gap)).collect(),
+        }
+    }
+
+    /// The system section: the prefix record's items, else the prefix gaps;
+    /// then what follows every system section.
+    fn prefix_items(&self, prefix: Vec<usize>) -> Vec<usize> {
+        let gaps = self.gaps();
+        let mut items = if prefix.is_empty() {
+            gaps.prefix.iter().map(|gap| self.gap(gap)).collect()
+        } else {
+            prefix
+        };
+        items.extend(gaps.after_prefix.iter().map(|gap| self.gap(gap)));
+        items
+    }
+
+    /// Whether a chain's first record names a parent (or a replaced
+    /// context) the unit does not hold: its line opens on the orphan gap.
+    fn orphaned(&self, root: usize) -> bool {
+        let links = &self.records[root];
+        let named = |id: &Option<String>| id.as_deref().is_some_and(|id| self.first(id).is_none());
+        named(&links.parent) || named(&links.logical)
+    }
+
+    fn gaps(&self) -> Gaps {
+        self.table_gaps.unwrap_or(Gaps::NONE)
+    }
+
+    /// What opens the window of `chain` (root first): the header slot, the
+    /// system section, and the orphan gap where it applies.
+    fn opening(&self, chain: &[usize], record: usize) -> Vec<usize> {
+        let mut items = self.header_items(self.header(chain));
+        items.extend(
+            self.prefix_items(
+                self.prefixes[record]
+                    .map(|p| self.ordered(p))
+                    .unwrap_or_default(),
+            ),
+        );
+        if let (Some(&root), Some(gap)) = (chain.first(), self.gaps().orphan) {
+            if self.orphaned(root) {
+                items.push(self.gap(&gap));
+            }
+        }
+        items
+    }
+
     /// The window behind `record`: the items before its own, and its own,
     /// as item indices. `None` when the edits the source marks cannot be
     /// applied to it (a row says where).
@@ -349,7 +554,7 @@ impl Walked {
         let is_prefix =
             |at: usize| shape_of(at).is_some_and(|shape| windows.prefix.contains(&shape));
         if is_prefix(record) {
-            return Some((Vec::new(), own));
+            return Some((self.header_items(None), own));
         }
         // The chain, root first.
         let mut chain = vec![record];
@@ -363,7 +568,6 @@ impl Walked {
             cursor = up;
         }
         chain.reverse();
-        let prefix: Vec<usize> = self.prefixes[record].map(ordered).unwrap_or_default();
         // The latest request on the chain, and its own edits so far.
         let request = |at: usize| self.records[at].request.as_deref();
         let (start, dropped, cleared) = match chain.iter().rposition(|&at| request(at).is_some()) {
@@ -385,7 +589,7 @@ impl Walked {
                 (start, dropped, cleared)
             }
         };
-        let mut base = self.walk_records(&chain[..start])?;
+        let base = self.walk_records(&chain[..start])?;
         let tail = self.walk_records(&chain[start..chain.len() - 1])?;
         // Dropped blocks, by message and block in the base window.
         let mut drop = BTreeSet::new();
@@ -447,24 +651,31 @@ impl Walked {
             return None;
         }
         let cleared: BTreeSet<(usize, usize)> = groups.into_iter().take(count).collect();
-        let mut at = 0;
-        base.retain(|(record, _, slot)| {
-            let keep = !drop.contains(&at)
-                && !self
-                    .result_of(*record, *slot)
-                    .is_some_and(|(group, part)| part && cleared.contains(&(*record, group)));
-            at += 1;
-            keep
-        });
+        // A cleared result keeps its head; a gap stands for its parts.
+        let cleared_gap = self.gaps().cleared.map(|gap| self.gap(&gap));
+        let mut kept = Vec::with_capacity(base.len());
+        for (at, (record, levels, slot)) in base.into_iter().enumerate() {
+            let result = self.result_of(record, slot);
+            let head =
+                result.is_some_and(|(group, part)| !part && cleared.contains(&(record, group)));
+            let part =
+                result.is_some_and(|(group, part)| part && cleared.contains(&(record, group)));
+            if drop.contains(&at) || part {
+                continue;
+            }
+            kept.push((record, levels, slot));
+            if let (true, Some(gap)) = (head, cleared_gap) {
+                kept.push((GAP, Vec::new(), Slot::Item(gap)));
+            }
+        }
         let items = |slots: Vec<(usize, Vec<(String, usize)>, Slot)>| {
             slots.into_iter().filter_map(|(_, _, slot)| match slot {
                 Slot::Item(item) => Some(item),
                 Slot::Head(..) => None,
             })
         };
-        let mut before: Vec<usize> = self.header(&chain).into_iter().collect();
-        before.extend(prefix);
-        before.extend(items(base));
+        let mut before = self.opening(&chain, record);
+        before.extend(items(kept));
         before.extend(items(tail));
         Some((before, own))
     }
@@ -496,16 +707,25 @@ impl Walked {
     /// from its parent's unedited history, without walking the chain again;
     /// only a record whose prefix differs from its parent's, or a request
     /// whose own edits change the window, is built from [`Self::window`].
+    ///
+    /// Every step taken, `(hash before, item, hash after)`, goes to `sink`.
     pub fn lines(
         &self,
         id: &dyn Fn(usize) -> u32,
         step: &dyn Fn(&[u8; 32], u32) -> [u8; 32],
+        sink: &mut dyn FnMut([u8; 32], usize, [u8; 32]),
     ) -> Vec<Option<Lines>> {
+        let sink = RefCell::new(sink);
+        let step = |hash: &[u8; 32], item: usize| {
+            let after = step(hash, id(item));
+            (*sink.borrow_mut())(*hash, item, after);
+            after
+        };
         if let Some(Order::File(_)) = self.order {
-            return self.file_lines(id, step);
+            return self.file_lines(&step);
         }
         let fold = |hash: [u8; 32], items: &[usize]| {
-            items.iter().fold(hash, |hash, &item| step(&hash, id(item)))
+            items.iter().fold(hash, |hash, &item| step(&hash, item))
         };
         let mut lines: Vec<Option<Lines>> = vec![None; self.records.len()];
         let mut busy = vec![false; self.records.len()];
@@ -554,13 +774,9 @@ impl Walked {
 
     /// [`Order::File`]: the hash of the window behind every record, in one
     /// pass.
-    fn file_lines(
-        &self,
-        id: &dyn Fn(usize) -> u32,
-        step: &dyn Fn(&[u8; 32], u32) -> [u8; 32],
-    ) -> Vec<Option<Lines>> {
+    fn file_lines(&self, step: &dyn Fn(&[u8; 32], usize) -> [u8; 32]) -> Vec<Option<Lines>> {
         let fold = |hash: [u8; 32], items: &[usize]| {
-            items.iter().fold(hash, |hash, &item| step(&hash, id(item)))
+            items.iter().fold(hash, |hash, &item| step(&hash, item))
         };
         let lines_of = |before: Option<[u8; 32]>| Lines {
             before,
@@ -568,24 +784,39 @@ impl Walked {
             unedited: [0; 32],
             prefix: None,
             header: None,
+            replaced: None,
         };
+        let gaps = self.gaps();
         let mut out = Vec::with_capacity(self.records.len());
         let mut header: Vec<usize> = Vec::new();
         let mut prefix: Vec<usize> = Vec::new();
         let mut line: Vec<usize> = Vec::new();
         // The hash after each item of the line.
         let mut hashes: Vec<[u8; 32]> = Vec::new();
-        let mut base = [0u8; 32];
         let mut turns: Vec<usize> = Vec::new();
         let mut broken = false;
         let rehash = |base: [u8; 32], line: &[usize], hashes: &mut Vec<[u8; 32]>| {
             hashes.clear();
             let mut hash = base;
             for &item in line {
-                hash = step(&hash, id(item));
+                hash = step(&hash, item);
                 hashes.push(hash);
             }
         };
+        // The opening: the header slot, then the system section.
+        let slot = |header: &[usize]| -> Vec<usize> {
+            if header.is_empty() {
+                gaps.header.iter().map(|gap| self.gap(gap)).collect()
+            } else {
+                header.to_vec()
+            }
+        };
+        let opening = |header: &[usize], prefix: &[usize]| -> Vec<usize> {
+            let mut items = slot(header);
+            items.extend(self.prefix_items(prefix.to_vec()));
+            items
+        };
+        let mut base = fold([0u8; 32], &opening(&[], &[]));
         for at in 0..self.records.len() {
             let own = self.ordered(at);
             let tip = hashes.last().copied().unwrap_or(base);
@@ -595,11 +826,21 @@ impl Walked {
                     header = own;
                 }
                 FileKind::Prefix => {
-                    out.push(Some(lines_of(Some(fold([0; 32], &header)))));
+                    out.push(Some(lines_of(Some(fold([0; 32], &slot(&header))))));
                     prefix = own;
                 }
                 FileKind::Replace => {
-                    out.push(Some(lines_of(Some(base))));
+                    // The line it replaces: its tip, and its last item a
+                    // record holds.
+                    let held = line
+                        .iter()
+                        .zip(&hashes)
+                        .rev()
+                        .find(|(item, _)| self.items[**item].held)
+                        .map(|(item, hash)| (*hash, *item));
+                    let mut lines = lines_of(Some(base));
+                    lines.replaced = Some((tip, held));
+                    out.push(Some(lines));
                     line = own;
                     turns.clear();
                     broken = false;
@@ -626,14 +867,14 @@ impl Walked {
                     out.push(Some(lines_of((!broken).then_some(tip))));
                     let mut hash = tip;
                     for item in own {
-                        hash = step(&hash, id(item));
+                        hash = step(&hash, item);
                         line.push(item);
                         hashes.push(hash);
                     }
                 }
             }
             if matches!(self.records[at].file, FileKind::Header | FileKind::Prefix) {
-                let opened = fold(fold([0; 32], &header), &prefix);
+                let opened = fold([0; 32], &opening(&header, &prefix));
                 if opened != base {
                     base = opened;
                     rehash(base, &line, &mut hashes);
@@ -690,7 +931,7 @@ impl Walked {
                     .window(record)
                     .map(|(before, _)| fold([0; 32], &before));
                 let unedited = if is_prefix {
-                    fold([0; 32], &own)
+                    fold(fold([0; 32], &self.header_items(None)), &own)
                 } else {
                     let mut chain = vec![record];
                     let mut seen = BTreeSet::from([record]);
@@ -703,8 +944,7 @@ impl Walked {
                         cursor = up;
                     }
                     chain.reverse();
-                    let mut items: Vec<usize> = self.header(&chain).into_iter().collect();
-                    items.extend(prefix.map(|p| self.ordered(p)).unwrap_or_default());
+                    let mut items = self.opening(&chain, record);
                     for (at, &link) in chain.iter().enumerate() {
                         items.extend(self.ordered(link));
                         if at + 1 < chain.len() {
@@ -725,6 +965,7 @@ impl Walked {
             unedited,
             prefix,
             header,
+            replaced: None,
         }
     }
 }
@@ -735,14 +976,48 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         table,
         out: Walked {
             windows: Some(table.windows),
+            table_gaps: Some(table.gaps),
             order: Some(table.order),
             ..Walked::default()
         },
         index: HashMap::new(),
         by_path: HashMap::new(),
+        known: known_paths(table),
     };
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
+    }
+    let gaps = table.gaps;
+    for gap in gaps
+        .header
+        .iter()
+        .chain(gaps.prefix)
+        .chain(gaps.after_prefix)
+        .chain(gaps.orphan.iter())
+        .chain(gaps.cleared.iter())
+    {
+        if walker.out.gap_items.contains_key(gap) {
+            continue;
+        }
+        let mut tokens = BTreeSet::from([shape(gap.modality, gap.direction)]);
+        if !gap.kind.is_empty() {
+            tokens.insert(gap_token(gap));
+        }
+        walker.out.items.push(Item {
+            record: GAP,
+            levels: Vec::new(),
+            modality: gap.modality.to_owned(),
+            tokens,
+            path: format!("<gap:{}>", gap.kind),
+            held: false,
+            order: 0,
+            marks: BTreeSet::new(),
+            carried: BTreeSet::new(),
+            pairs: Vec::new(),
+            claims: Vec::new(),
+        });
+        let item = walker.out.items.len() - 1;
+        walker.out.gap_items.insert(*gap, item);
     }
     walker.watch();
     if table.jsonl {
@@ -1016,6 +1291,25 @@ struct Walker<'t> {
     index: HashMap<(Vec<(String, usize)>, String), usize>,
     /// The table's entries by path, in table order.
     by_path: HashMap<&'static str, Vec<&'static Entry>>,
+    /// Every path and path prefix the table names: a report prints a key or
+    /// a discriminator value only when it is one of them.
+    known: HashSet<String>,
+}
+
+/// Every path the table names, and every prefix of one that ends before a
+/// member, an array or a shape.
+pub(super) fn known_paths(table: &FieldTable) -> HashSet<String> {
+    let mut known = HashSet::new();
+    for entry in table.entries {
+        let path = entry.path;
+        for (at, c) in path.char_indices() {
+            if matches!(c, '.' | '[' | '{') {
+                known.insert(path[..at].to_owned());
+            }
+        }
+        known.insert(path.to_owned());
+    }
+    known
 }
 
 /// Where the walk is: the record, its scalar fields, array indices within
@@ -1105,6 +1399,7 @@ fn holds(
     when.iter().all(|cond| match cond {
         Cond::Sibling(name, value) => sibling(name).is_some_and(|v| v == *value),
         Cond::SiblingNot(name, value) => sibling(name).is_none_or(|v| v != *value),
+        Cond::SiblingAbsent(name) => sibling(name).is_none_or(|v| v == "null"),
         Cond::Is(field, value) => scalars.get(*field).is_some_and(|v| v == value),
         Cond::IsNot(field, value) => scalars.get(*field).is_none_or(|v| v != value),
         Cond::Prefix(field, prefix) => scalars.get(*field).is_some_and(|v| v.starts_with(prefix)),
@@ -1153,16 +1448,6 @@ fn is_empty_drop(entry: &Entry) -> bool {
     matches!(entry.class, Class::Drop(DropReason::Empty))
 }
 
-/// A name safe to print in a path: field names and vocabulary, never
-/// content. Anything else prints as a placeholder.
-fn printable(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-.:$@".contains(&b))
-}
-
 enum Failure {
     Decode,
     UnknownValue,
@@ -1194,20 +1479,28 @@ impl<'t> Walker<'t> {
     }
 
     /// The object's shape: the value of each discriminator member it
-    /// carries, in table order, joined by `}{`.
-    fn discriminator(&self, value: &J) -> Option<String> {
+    /// carries, in table order, joined by `}{`. A value the table does not
+    /// name at this path prints as `<value>` (an id as `<id>`): a shape is
+    /// vocabulary, never content.
+    fn discriminator(&self, value: &J, path: &str) -> Option<String> {
         let J::Obj(members) = value else { return None };
-        let shapes: Vec<String> = self
-            .table
-            .discriminators
-            .iter()
-            .filter_map(|key| match members.get(*key) {
-                Some(J::Str(shape)) if id_like(shape) => Some("<id>".to_owned()),
-                Some(J::Str(shape)) if printable(shape) => Some(shape.clone()),
-                Some(J::Str(_)) => Some("?".to_owned()),
-                _ => None,
-            })
-            .collect();
+        let mut at = path.to_owned();
+        let mut shapes: Vec<String> = Vec::new();
+        for key in self.table.discriminators {
+            let Some(J::Str(shape)) = members.get(*key) else {
+                continue;
+            };
+            let named = format!("{at}{{{shape}}}");
+            let shape = if id_like(shape) {
+                "<id>".to_owned()
+            } else if self.known.contains(&named) {
+                shape.clone()
+            } else {
+                "<value>".to_owned()
+            };
+            at = format!("{at}{{{shape}}}");
+            shapes.push(shape);
+        }
         (!shapes.is_empty()).then(|| shapes.join("}{"))
     }
 
@@ -1234,7 +1527,7 @@ impl<'t> Walker<'t> {
                 strings.push(text.clone());
             }
         }
-        let shape = self.discriminator(value);
+        let shape = self.discriminator(value, path);
         let shaped = shape.as_ref().map(|shape| format!("{path}{{{shape}}}"));
         if let (Some(record), Some(windows)) = (ctx.record, self.table.windows.requests) {
             if shaped.as_deref() == Some(windows.result.0) || path == windows.result.0 {
@@ -1283,7 +1576,31 @@ impl<'t> Walker<'t> {
                 let entry = *entry;
                 // Rows and origins name the path the entry matched, shape
                 // included.
+                self.beside(entry.path, parent, &ctx, false);
                 self.apply(entry, value, entry.path, parent, &ctx);
+                self.beside(entry.path, parent, &ctx, true);
+                if let (Class::Correlator, J::Str(id), Some(record)) =
+                    (entry.class, value, ctx.record)
+                {
+                    for (at, link) in self.table.links.iter().enumerate() {
+                        if link.from == entry.path {
+                            self.out.link_from.push((
+                                record,
+                                ctx.levels.clone(),
+                                at,
+                                id.clone(),
+                                entry.path.to_owned(),
+                            ));
+                        }
+                        if link.to.contains(&entry.path) {
+                            self.out
+                                .link_to
+                                .entry((at, id.clone()))
+                                .or_default()
+                                .push((record, ctx.levels.clone()));
+                        }
+                    }
+                }
                 return;
             }
             [] => {}
@@ -1301,10 +1618,11 @@ impl<'t> Walker<'t> {
             J::Obj(members) => {
                 let id_keyed = self.table.id_keyed.contains(&path);
                 for (name, member) in members {
+                    let named = format!("{inner}.{name}");
                     let child = if id_keyed || id_like(name) {
                         format!("{inner}.<id>")
-                    } else if printable(name) {
-                        format!("{inner}.{name}")
+                    } else if self.known.contains(&named) {
+                        named
                     } else {
                         format!("{inner}.<key>")
                     };
@@ -1330,7 +1648,7 @@ impl<'t> Walker<'t> {
         let mut present = BTreeSet::new();
         scalars(value, "", &mut fields, &mut present);
         let field = |name: &str| fields.get(name).filter(|v| *v != "null").cloned();
-        let shape = self.discriminator(value);
+        let shape = self.discriminator(value, "");
         let windows = self.table.windows;
         let mut links = RecordLinks {
             shape: shape.clone(),
@@ -1347,6 +1665,7 @@ impl<'t> Walker<'t> {
         }
         if let Some(compaction) = windows.compaction {
             if shape.as_deref() == Some(compaction.shape) {
+                links.logical = field(compaction.parent);
                 if let (Some(head), Some(tail), Some(anchor)) = (
                     field(compaction.head),
                     field(compaction.tail),
@@ -1397,10 +1716,22 @@ impl<'t> Walker<'t> {
         ctx
     }
 
+    /// A fact token: into the item of its modality at its place (or the
+    /// request's settings header), with the fact's shape.
     fn emit(&mut self, token: Token, path: &str, ctx: &Ctx) {
+        let Some(record) = ctx.record else {
+            if !positional(&token) {
+                self.out.tokens.entry(token).or_default().push(Origin {
+                    path: path.to_owned(),
+                    record: None,
+                    index: ctx.index.clone(),
+                });
+            }
+            return;
+        };
         let header = self.table.windows.header == Some(path);
-        if let (Some(record), false, true) = (ctx.record, token.modality.is_empty(), header) {
-            let item = match self.out.records[record].header {
+        let item = if header {
+            match self.out.records[record].header {
                 Some(item) => item,
                 None => {
                     self.out.items.push(Item {
@@ -1409,17 +1740,20 @@ impl<'t> Walker<'t> {
                         modality: token.modality.clone(),
                         tokens: BTreeSet::new(),
                         path: path.to_owned(),
+                        held: false,
+                        order: 0,
+                        marks: BTreeSet::new(),
+                        carried: BTreeSet::new(),
+                        pairs: Vec::new(),
+                        claims: Vec::new(),
                     });
                     self.out.records[record].header = Some(self.out.items.len() - 1);
                     self.out.items.len() - 1
                 }
-            };
-            self.out.items[item].tokens.insert(token.clone());
-        } else if let (Some(record), false) = (ctx.record, token.modality.is_empty()) {
-            let links = &mut self.out.records[record];
+            }
+        } else {
             let key = (ctx.levels.clone(), token.modality.clone());
-            let found = self.index.get(&key).copied();
-            let item = match found {
+            match self.index.get(&key).copied() {
                 Some(item) => item,
                 None => {
                     self.out.items.push(Item {
@@ -1428,23 +1762,114 @@ impl<'t> Walker<'t> {
                         modality: token.modality.clone(),
                         tokens: BTreeSet::new(),
                         path: path.to_owned(),
+                        held: true,
+                        order: 0,
+                        marks: BTreeSet::new(),
+                        carried: BTreeSet::new(),
+                        pairs: Vec::new(),
+                        claims: Vec::new(),
                     });
-                    links.items.push(self.out.items.len() - 1);
-                    self.index.insert(key, self.out.items.len() - 1);
-                    self.out.items.len() - 1
+                    let item = self.out.items.len() - 1;
+                    self.out.records[record].items.push(item);
+                    self.index.insert(key, item);
+                    item
                 }
-            };
-            let tokens = &mut self.out.items[item].tokens;
-            if tokens.first().is_none_or(|first| token < *first) {
+            }
+        };
+        let tokens = &mut self.out.items[item].tokens;
+        tokens.insert(shape(&token.modality, &token.direction));
+        if !positional(&token) {
+            if tokens
+                .iter()
+                .find(|t| !positional(t))
+                .is_none_or(|first| token < *first)
+            {
                 self.out.items[item].path = path.to_owned();
             }
-            self.out.items[item].tokens.insert(token.clone());
+            self.out
+                .tokens
+                .entry(token.clone())
+                .or_default()
+                .push(Origin {
+                    path: path.to_owned(),
+                    record: ctx.record,
+                    index: ctx.index.clone(),
+                });
+        }
+        self.out.items[item].tokens.insert(token);
+    }
+
+    /// An annotation token: a claim of its record now, anything else once
+    /// the unit is read and its place is known ([`Place`]).
+    fn annotate(&mut self, token: Token, path: &str, ctx: &Ctx, spelling: Option<String>) {
+        let place = self.table.place(path, &token.attribute);
+        match ctx.record {
+            Some(record) if place == Place::Claim => {
+                self.out.records[record].claims.insert(token.clone());
+            }
+            Some(record) => {
+                let label = format!("{}:{:?}", ctx.line, ctx.index);
+                self.out.records[record].deferred.push((
+                    token,
+                    place,
+                    ctx.levels.clone(),
+                    spelling,
+                    path.to_owned(),
+                    label,
+                ));
+                return;
+            }
+            None if place == Place::Claim => {
+                self.out.unit_claims.insert(token.clone());
+            }
+            None => {
+                self.out.unit_marks.insert(token.clone());
+            }
         }
         self.out.tokens.entry(token).or_default().push(Origin {
             path: path.to_owned(),
             record: ctx.record,
             index: ctx.index.clone(),
         });
+    }
+
+    /// The gaps the rendering rule puts beside the value at `path`: before
+    /// it (`after` false), or on it and after it (`after` true).
+    fn beside(&mut self, path: &str, parent: Option<&J>, ctx: &Ctx, after: bool) {
+        let Some(record) = ctx.record else { return };
+        for rule in self.table.gaps.beside {
+            if rule.path != path || !holds(rule.when, &ctx.scalars, &ctx.present, parent) {
+                continue;
+            }
+            match (rule.at, after) {
+                (Beside::Same, true) => {
+                    let token = gap_token(&rule.gap);
+                    self.emit(token, path, ctx);
+                }
+                (Beside::Before, false) | (Beside::After, true) => {
+                    let mut tokens = BTreeSet::from([shape(rule.gap.modality, rule.gap.direction)]);
+                    if !rule.gap.kind.is_empty() {
+                        tokens.insert(gap_token(&rule.gap));
+                    }
+                    self.out.items.push(Item {
+                        record,
+                        levels: ctx.levels.clone(),
+                        modality: rule.gap.modality.to_owned(),
+                        tokens,
+                        path: path.to_owned(),
+                        held: rule.held,
+                        order: if rule.at == Beside::Before { -1 } else { 1 },
+                        marks: BTreeSet::new(),
+                        carried: BTreeSet::new(),
+                        pairs: Vec::new(),
+                        claims: Vec::new(),
+                    });
+                    let item = self.out.items.len() - 1;
+                    self.out.records[record].items.push(item);
+                }
+                _ => {}
+            }
+        }
     }
 
     fn apply(&mut self, entry: &Entry, value: &J, path: &str, parent: Option<&J>, ctx: &Ctx) {
@@ -1492,14 +1917,14 @@ impl<'t> Walker<'t> {
                 for (attribute, decode) in list {
                     match decode_values(*decode, value) {
                         Ok(values) => {
-                            for value in values {
+                            for decoded in values {
                                 let token = Token {
                                     modality: String::new(),
                                     direction: String::new(),
                                     attribute: (*attribute).to_owned(),
-                                    value,
+                                    value: decoded,
                                 };
-                                self.emit(token, path, ctx);
+                                self.annotate(token, path, ctx, spelling(value));
                             }
                         }
                         Err(failure) => self.fail(failure, path, ctx),
@@ -1632,7 +2057,10 @@ impl<'t> Walker<'t> {
         let mut rows = Vec::new();
         for record in 0..self.out.records.len() {
             let mut items = std::mem::take(&mut self.out.records[record].items);
-            items.sort_by(|a, b| self.out.items[*a].levels.cmp(&self.out.items[*b].levels));
+            items.sort_by(|a, b| {
+                let (a, b) = (&self.out.items[*a], &self.out.items[*b]);
+                (&a.levels, a.order).cmp(&(&b.levels, b.order))
+            });
             self.out.records[record].items = items;
         }
         let windows = self.table.windows;
@@ -1747,6 +2175,152 @@ impl<'t> Walker<'t> {
             }
         }
         self.out.rows.extend(rows);
+        self.links();
+        self.places();
+    }
+
+    /// Resolve every link the correlators establish to its items.
+    fn links(&mut self) {
+        let out = &mut self.out;
+        let item_at = |out: &Walked, record: usize, levels: &[(String, usize)], modality: &str| {
+            out.records[record].items.iter().copied().find(|&item| {
+                let item = &out.items[item];
+                item.held && item.levels == levels && item.modality == modality
+            })
+        };
+        for (record, levels, at, id, path) in std::mem::take(&mut out.link_from) {
+            let link = self.table.links[at];
+            let label = format!("record {record}");
+            let Some(from) = item_at(out, record, &levels, link.from_modality) else {
+                out.rows.push((path, Kind::Link, label));
+                continue;
+            };
+            let candidates: Vec<usize> = out
+                .link_to
+                .get(&(at, id))
+                .into_iter()
+                .flatten()
+                .filter_map(|(record, levels)| item_at(out, *record, levels, link.to_modality))
+                .collect();
+            if candidates.is_empty() {
+                out.rows.push((path, Kind::Link, label));
+                continue;
+            }
+            out.items[from].pairs.push(Pair {
+                attribute: link.attribute.to_owned(),
+                candidates,
+                path,
+            });
+        }
+    }
+
+    /// Place every deferred annotation on its item, or at the end of a
+    /// line; under [`Order::File`], give the claims of each record that
+    /// holds no node to the next node the file places.
+    fn places(&mut self) {
+        let out = &mut self.out;
+        let mut placed: Vec<(Token, String, usize)> = Vec::new();
+        for record in 0..out.records.len() {
+            let held: Vec<usize> = out
+                .ordered(record)
+                .into_iter()
+                .filter(|&item| out.items[item].held)
+                .collect();
+            for (token, place, levels, spelling, path, label) in
+                std::mem::take(&mut out.records[record].deferred)
+            {
+                let mut at_line = None;
+                let items: Vec<usize> = match place {
+                    Place::Claim | Place::LastOut => Vec::new(),
+                    Place::Last => held.last().copied().into_iter().collect(),
+                    Place::Every => held.clone(),
+                    Place::Here => {
+                        let mut found = Vec::new();
+                        for depth in (0..=levels.len()).rev() {
+                            found = held
+                                .iter()
+                                .copied()
+                                .filter(|&item| out.items[item].levels == levels[..depth])
+                                .collect();
+                            if !found.is_empty() {
+                                break;
+                            }
+                        }
+                        if found.len() > 1 {
+                            found.clear();
+                        }
+                        found
+                    }
+                    Place::Request => {
+                        let named = out
+                            .records
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find_map(|(at, links)| {
+                                let last = out
+                                    .ordered(at)
+                                    .into_iter()
+                                    .filter(|&item| out.items[item].held)
+                                    .last();
+                                (links.request.is_some() && links.request == spelling)
+                                    .then_some(last)
+                                    .flatten()
+                            });
+                        named.into_iter().collect()
+                    }
+                    Place::FileTail => {
+                        at_line = out.records[..record]
+                            .iter()
+                            .rposition(|links| links.id.is_some())
+                            .and_then(|at| out.records[at].id.as_deref())
+                            .and_then(|id| out.first(id));
+                        Vec::new()
+                    }
+                    Place::ParentTail => {
+                        at_line = out.parent(record);
+                        Vec::new()
+                    }
+                };
+                let every = place == Place::Every;
+                if let Some(line) = at_line {
+                    out.line_marks.push((line, token.clone()));
+                } else if items.is_empty() {
+                    out.rows.push((path.clone(), Kind::Placed, label));
+                }
+                for item in items {
+                    if every {
+                        out.items[item].carried.insert(token.clone());
+                    } else {
+                        out.items[item].marks.insert(token.clone());
+                    }
+                }
+                placed.push((token, path, record));
+            }
+        }
+        for (token, path, record) in placed {
+            out.tokens.entry(token).or_default().push(Origin {
+                path,
+                record: Some(record),
+                index: Vec::new(),
+            });
+        }
+        if let Order::File(_) = self.table.order {
+            let mut pending: Vec<BTreeSet<Token>> = Vec::new();
+            for record in 0..out.records.len() {
+                let first = out
+                    .ordered(record)
+                    .into_iter()
+                    .find(|&item| out.items[item].held);
+                match first {
+                    Some(item) => out.items[item].claims.append(&mut pending),
+                    None if !out.records[record].claims.is_empty() => {
+                        pending.push(out.records[record].claims.clone());
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 }
 
@@ -1763,27 +2337,63 @@ impl Walker<'_> {
         let mut broken = false;
         for at in 0..out.records.len() {
             let own = out.ordered(at);
-            let opening = |header: &[usize], prefix: &[usize]| -> Vec<usize> {
-                header.iter().chain(prefix).copied().collect()
+            let slot = |out: &Walked, header: &[usize]| -> Vec<usize> {
+                if header.is_empty() {
+                    out.header_items(None)
+                } else {
+                    header.to_vec()
+                }
+            };
+            let opening = |out: &Walked, header: &[usize], prefix: &[usize]| -> Vec<usize> {
+                let mut items = slot(out, header);
+                items.extend(out.prefix_items(prefix.to_vec()));
+                items
             };
             let kind = out.records[at].file;
             let trail = match kind {
                 FileKind::Header => FileTrail::default(),
                 FileKind::Prefix => FileTrail {
-                    opening: header.clone(),
+                    opening: slot(out, &header),
                     ..FileTrail::default()
                 },
                 FileKind::Replace => FileTrail {
-                    opening: opening(&header, &prefix),
+                    opening: opening(out, &header, &prefix),
                     ..FileTrail::default()
                 },
                 _ => FileTrail {
-                    opening: opening(&header, &prefix),
+                    opening: opening(out, &header, &prefix),
                     tail: line.last().copied(),
                     broken,
                 },
             };
             out.file_trails.push(trail);
+            // Why the turn ended: on her last item of the turn so far, if
+            // she made one.
+            let since = turns.last().copied().unwrap_or(0);
+            let deferred = std::mem::take(&mut out.records[at].deferred);
+            for entry in deferred {
+                if entry.1 != Place::LastOut {
+                    out.records[at].deferred.push(entry);
+                    continue;
+                }
+                let (token, _, _, _, path, _) = entry;
+                let last_out = line[since.min(line.len())..]
+                    .iter()
+                    .rev()
+                    .map(|&place| out.file_arena[place].0)
+                    .find(|&item| {
+                        out.items[item].held
+                            && out.items[item].tokens.iter().any(|t| t.direction == "out")
+                    });
+                if let Some(item) = last_out {
+                    out.items[item].marks.insert(token.clone());
+                    out.tokens.entry(token).or_default().push(Origin {
+                        path,
+                        record: Some(at),
+                        index: Vec::new(),
+                    });
+                }
+            }
             let mut push = |line: &mut Vec<usize>, item: usize| {
                 let previous = line.last().copied();
                 out.file_arena.push((item, previous));

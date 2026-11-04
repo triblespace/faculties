@@ -35,8 +35,8 @@
 //! an `out` fact was sampled from, and hold no value of their own.
 
 use super::{
-    Class, Compaction, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Requests,
-    Structure, Windows,
+    Beside, Class, Compaction, Cond, Decode, DropReason, Entry, FieldTable, Gap, GapRule, Gaps,
+    Link, Mirror, Order, Place, Requests, Structure, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -1530,6 +1530,7 @@ pub const TABLE: FieldTable = FieldTable {
         header: Some("{assistant}.effort"),
         compaction: Some(Compaction {
             shape: "system",
+            parent: "logicalParentUuid",
             head: "compactMetadata.preservedSegment.headUuid",
             tail: "compactMetadata.preservedSegment.tailUuid",
             anchor: "compactMetadata.preservedSegment.anchorUuid",
@@ -1548,5 +1549,76 @@ pub const TABLE: FieldTable = FieldTable {
             thinking: "thinking",
         }),
     },
+    gaps: Gaps {
+        // The settings header of a request that records no effort.
+        header: Some(SYSTEM_GAP),
+        // Before a system section is recorded: its prompt and its tools.
+        prefix: &[
+            SYSTEM_GAP,
+            Gap {
+                modality: "tool-definition",
+                direction: "in",
+                kind: "span",
+            },
+        ],
+        after_prefix: &[],
+        // What a parent outside the unit, or a replaced context outside it,
+        // held.
+        orphan: Some(Gap {
+            modality: "",
+            direction: "",
+            kind: "span",
+        }),
+        // The server's placeholder for a cleared result is unpublished.
+        cleared: Some(Gap {
+            modality: "text",
+            direction: "in",
+            kind: "body",
+        }),
+        beside: &[
+            // The effort is rendered in an unpublished text and place.
+            GapRule {
+                path: "{assistant}.effort",
+                when: &[],
+                at: Beside::Same,
+                gap: SYSTEM_GAP,
+                held: false,
+            },
+            // A tool reference loads a definition the source does not hold.
+            GapRule {
+                path: "{user}.message.content[]{tool_result}.content[]{tool_reference}.tool_name",
+                when: &[],
+                at: Beside::Same,
+                gap: Gap {
+                    modality: "tool-definition",
+                    direction: "in",
+                    kind: "body",
+                },
+                held: true,
+            },
+        ],
+    },
+    links: &[Link {
+        attribute: "responds_to",
+        from: "{user}.message.content[]{tool_result}.tool_use_id",
+        from_modality: "tool-result",
+        to: &["{assistant}.message{message}.content[]{tool_use}.id"],
+        to_modality: "tool-call",
+    }],
+    places: &[
+        // The message a prompt interrupted ends there.
+        ("{user}.interruptedMessageId", "ends", Place::Request),
+        // A title describes the line of the record before it in the file (I5).
+        ("{ai-title}.aiTitle", "gloss:title", Place::FileTail),
+        // A recap describes its own record's parent line (I5).
+        ("{system}.content", "gloss:recap", Place::ParentTail),
+    ],
     entries: &ENTRIES,
+};
+
+/// A system body gap: the settings header or the system prompt, unknown.
+const SYSTEM_GAP: Gap = Gap {
+    modality: "system",
+    direction: "in",
+    kind: "body",
 };

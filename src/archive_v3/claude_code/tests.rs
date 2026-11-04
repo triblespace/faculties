@@ -480,8 +480,9 @@ fn rendered_attachments_are_what_she_saw() {
     });
     let source = jsonl(&[user("u1", None, 0, json!("Hi.")), stray.clone()]);
     assert_eq!(refused(&source).path, "{attachment}.attachment{date}.zone");
+    // The walker prints vocabulary only: the unnamed key is `<key>` (G8).
     assert!(walk_rows(&source).contains(&(
-        "{attachment}.attachment{date}.zone".to_owned(),
+        "{attachment}.attachment{date}.<key>".to_owned(),
         Kind::Unknown
     )));
     // And so does a kind it does not name.
@@ -802,7 +803,7 @@ fn unknown_and_open_fields_fail_the_unit() {
     record["somethingNew"] = json!(1);
     let source = jsonl(&[record]);
     assert_eq!(refused(&source).path, "{user}.somethingNew");
-    assert!(walk_rows(&source).contains(&("{user}.somethingNew".to_owned(), Kind::Unknown)));
+    assert!(walk_rows(&source).contains(&("{user}.<key>".to_owned(), Kind::Unknown)));
 
     // An effort the vocabulary does not name.
     let mut effort = assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn"));
@@ -1225,6 +1226,7 @@ fn real_sample() {
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let mut walk_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut gate_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut failing_files: Vec<String> = Vec::new();
     for file in &files {
         let Ok(bytes) = std::fs::read(file) else {
             continue;
@@ -1241,8 +1243,10 @@ fn real_sample() {
         match import(&bytes) {
             Err(failure) => {
                 import_failed += 1;
+                // Vocabulary only: a key or kind the table does not name
+                // prints as a placeholder (G8).
                 *first_failures
-                    .entry((failure.path, failure.reason))
+                    .entry((gate::vocabulary(&TABLE, &failure.path), failure.reason))
                     .or_default() += 1;
             }
             Ok(mut fragment) => {
@@ -1252,10 +1256,19 @@ fn real_sample() {
                     passed += 1;
                 } else {
                     gate_failed += 1;
+                    let paths: std::collections::BTreeSet<String> = report
+                        .rows
+                        .iter()
+                        .map(|row| format!("{} {}", row.path, row.kind))
+                        .collect();
+                    let paths: Vec<String> = paths.into_iter().collect();
+                    failing_files.push(format!("{}\t{}", gate::file_path(file), paths.join("; ")));
+                    let mut seen = std::collections::BTreeSet::new();
                     for row in report.rows {
-                        *gate_failures
-                            .entry((row.path, row.kind.to_string()))
-                            .or_default() += 1;
+                        seen.insert((row.path, row.kind.to_string()));
+                    }
+                    for row in seen {
+                        *gate_failures.entry(row).or_default() += 1;
                     }
                 }
             }
@@ -1279,5 +1292,9 @@ fn real_sample() {
     println!("-- gate rows of imported files: files, path, kind");
     for ((path, kind), count) in &gate_failures {
         println!("{count}\t{path}\t{kind}");
+    }
+    println!("-- files that import and fail the gate");
+    for file in &failing_files {
+        println!("{file}");
     }
 }
