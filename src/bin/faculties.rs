@@ -18,6 +18,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Provider-owned, finite Memory create/show capability over a Unix socket.
+    #[cfg(target_os = "linux")]
+    MemoryMcp {
+        /// Private launcher configuration; never a guest tool argument.
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Serve native faculty tools over stdio, or opt into authenticated HTTP.
     Mcp {
         /// Pile configured by the local launcher, never an MCP tool argument.
@@ -69,6 +76,8 @@ enum Command {
 fn main() -> Result<()> {
     let Cli { command } = Cli::parse();
     match command {
+        #[cfg(target_os = "linux")]
+        Command::MemoryMcp { config } => faculties::memory::resident::run(&config),
         Command::Mcp {
             pile,
             key,

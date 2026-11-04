@@ -90,13 +90,28 @@ impl Memory {
     /// preview may show a failure, a dependent calculation must refuse, and
     /// neither may claim completeness it does not have).
     pub fn show_many(&self, selectors: &[String], out: &mut Out<'_>) -> Result<()> {
+        self.show_many_with_diagnostics(selectors, out, &mut |message| {
+            eprintln!("{message}");
+            Ok(())
+        })
+    }
+
+    /// The same lookup and frozen view with an explicit frontend diagnostic
+    /// sink. A remote frontend must not lose the partial-foundation warning or
+    /// mix it into the summary's stdout bytes.
+    pub fn show_many_with_diagnostics(
+        &self,
+        selectors: &[String],
+        out: &mut Out<'_>,
+        diagnostic: &mut dyn FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
         self.with_operation(|storage| {
             let (loaded, unread) = storage.load_read()?;
             if unread != 0 {
-                eprintln!(
+                diagnostic(&format!(
                     "note: {unread} foundation(s) of Memory could not be read, \
                      so this view omits whatever they hold"
-                );
+                ))?;
             }
             for (index, raw) in selectors.iter().enumerate() {
                 let id = if raw.contains("..") {

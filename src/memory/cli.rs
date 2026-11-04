@@ -43,11 +43,19 @@ use std::path::{Path, PathBuf};
 )]
 pub struct Cli {
     /// Path to the pile file to use.
-    #[arg(long, env = "PILE")]
-    pub pile: PathBuf,
+    #[arg(
+        long,
+        env = "PILE",
+        required_unless_present = "mcp_socket",
+        conflicts_with = "mcp_socket"
+    )]
+    pub pile: Option<PathBuf>,
     /// Existing durable signing-key file. Reads and writes never create it.
-    #[arg(long, env = "TRIBLESPACE_KEY")]
+    #[arg(long, env = "TRIBLESPACE_KEY", conflicts_with = "mcp_socket")]
     pub key: Option<PathBuf>,
+    /// Provisioned Linux native Memory socket; only create and one-id/range show.
+    #[arg(long, env = "FACULTIES_MEMORY_SOCKET")]
+    pub mcp_socket: Option<PathBuf>,
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID", trailing_var_arg = true, allow_hyphen_values = true)]
     pub ids: Vec<String>,
@@ -66,14 +74,85 @@ pub fn run() -> Result<()> {
 /// Output routing is finalized before run() applies that process exit code.
 /// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
-    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    if cli.mcp_socket.is_some() {
+        return execute_remote(cli, out);
+    }
+    let storage = crate::storage::Storage::new(
+        cli.pile.clone().context("memory requires a pile")?,
+        cli.key.clone(),
+    );
     execute_in(&storage, cli, out)
 }
 
 /// The process's whole body: one store, closed for process exit.
 fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
-    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
-        .scope_to_exit(|storage| execute_in(storage, cli, out))
+    if cli.mcp_socket.is_some() {
+        return execute_remote(cli, out);
+    }
+    crate::storage::Storage::new(
+        cli.pile.clone().context("memory requires a pile")?,
+        cli.key.clone(),
+    )
+    .scope_to_exit(|storage| execute_in(storage, cli, out))
+}
+
+#[cfg(target_os = "linux")]
+fn execute_remote(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
+    anyhow::ensure!(
+        cli.pile.is_none() && cli.key.is_none(),
+        "remote Memory does not accept pile/key paths"
+    );
+    let path = cli
+        .mcp_socket
+        .as_deref()
+        .context("native Memory socket required")?;
+    if cli.ids.is_empty() {
+        out.line(
+            "Remote Memory: memory create [--tag TAG]... [RANGE] SUMMARY; memory ID_OR_RANGE",
+        )?;
+        return Ok(0);
+    }
+    let invoke = |name, arguments, out: &mut Out<'_>| {
+        let mut client =
+            crate::mcp::local::Client::connect(path, std::time::Duration::from_secs(60))?;
+        client.call(name, arguments, out, &mut |message| {
+            use std::io::Write;
+            writeln!(std::io::stderr().lock(), "{message}")?;
+            Ok(())
+        })
+    };
+    match cli.ids[0].as_str() {
+        "create" => prepare_create(
+            &cli.ids[1..],
+            out,
+            |summary, _, tags, written_range, out| {
+                let mut arguments = serde_json::json!({"summary":summary, "tags":tags});
+                if let Some(range) = written_range {
+                    arguments["range"] = range.into();
+                }
+                invoke("memory_create", arguments, out)
+            },
+        )?,
+        // A show selector is a range or an id/alias prefix, never a path or a
+        // local subcommand. More than one selector would lose show_many's one
+        // frozen-view semantics if sent as separate calls, so refuse explicitly.
+        selector
+            if cli.ids.len() == 1
+                && (selector.contains("..") || selector.bytes().all(|b| b.is_ascii_hexdigit()))
+                && !selector.is_empty() =>
+        {
+            invoke("memory_show", serde_json::json!({"selector":selector}), out)?;
+        }
+        _ => bail!(
+            "remote Memory supports create and one id/range show only; this command is unsupported"
+        ),
+    }
+    Ok(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn execute_remote(_: Cli, _: &mut Out<'_>) -> Result<i32> {
+    bail!("native Memory Unix mode currently requires Linux")
 }
 
 fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<i32> {
@@ -145,6 +224,22 @@ fn literal_or_input(args: &[String], label: &str) -> Result<String> {
 }
 
 fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()> {
+    prepare_create(args, out, |summary, range, tags, _, out| {
+        memory.create(summary, range, tags)?.emit(out)
+    })
+}
+
+fn prepare_create(
+    args: &[String],
+    out: &mut Out<'_>,
+    publish: impl FnOnce(
+        &str,
+        Option<(Epoch, Epoch)>,
+        &[String],
+        Option<&str>,
+        &mut Out<'_>,
+    ) -> Result<()>,
+) -> Result<()> {
     // A help flag must never be minted as memory content — print usage and stop
     // before any parsing, so `memory create --help` explains itself instead of
     // storing the literal "--help" as a chunk.
@@ -235,9 +330,13 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
         bail!("summary text is required: memory create [<from>..<to>] <summary...>");
     }
 
-    memory
-        .create(&summary_text, explicit_range, &tags)?
-        .emit(out)
+    publish(
+        &summary_text,
+        explicit_range,
+        &tags,
+        (summary_start_idx == 1).then(|| args[0].as_str()),
+        out,
+    )
 }
 
 fn cmd_respan(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()> {
@@ -523,4 +622,78 @@ fn comb_persona() -> Result<String> {
              enduring memory stream and are never persona-scoped."
         )
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_remote_commands_and_help_do_not_connect_or_open_storage() {
+        for ids in [
+            vec!["meta", "abc"],
+            vec!["context"],
+            vec!["abc", "def"],
+            vec!["image", "x", "y"],
+        ] {
+            let cli = Cli {
+                pile: None,
+                key: None,
+                mcp_socket: Some("/missing/native.sock".into()),
+                ids: ids.into_iter().map(str::to_owned).collect(),
+            };
+            let error = execute(
+                cli,
+                &mut Out::new(&mut |_| panic!("unsupported command emitted stdout")),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("unsupported"));
+        }
+        let cli = Cli {
+            pile: None,
+            key: None,
+            mcp_socket: Some("/missing/native.sock".into()),
+            ids: vec!["create".into(), "--help".into()],
+        };
+        let mut text = String::new();
+        assert_eq!(
+            execute(
+                cli,
+                &mut Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text: part } = part {
+                        text.push_str(&part);
+                    }
+                    Ok(())
+                })
+            )
+            .unwrap(),
+            0
+        );
+        assert!(text.contains("usage: memory create"));
+    }
+
+    #[test]
+    fn shared_create_parser_resolves_guest_input_once_and_preserves_written_range() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("summary");
+        std::fs::write(&path, "literal @/host/path\nline two")?;
+        let range = "2026-09-01T00:00:00Z..2026-09-02T00:00:00Z";
+        let args = vec![
+            "--tag".into(),
+            "native".into(),
+            range.into(),
+            format!("@{}", path.display()),
+        ];
+        prepare_create(
+            &args,
+            &mut Out::new(&mut |_| panic!("parser wrote a receipt")),
+            |summary, parsed, tags, written, _| {
+                assert_eq!(summary, "literal @/host/path\nline two");
+                assert_eq!(parsed, Some(parse_time_range(range)?));
+                assert_eq!(written, Some(range));
+                assert_eq!(tags, ["native"]);
+                Ok(())
+            },
+        )
+    }
 }

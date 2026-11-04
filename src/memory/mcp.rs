@@ -6,13 +6,30 @@ use super::{ChurnOptions, CoverOpts, CoverReport};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+pub(crate) type Diagnostic = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+pub(crate) type WriteAdmission = Arc<dyn Fn() -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+#[path = "native_tests.rs"]
+mod native_tests;
+
+struct Resident {
+    storage: crate::storage::Storage,
+    diagnostic: Diagnostic,
+    before_create: WriteAdmission,
+    failed_flush: Arc<AtomicBool>,
+}
 
 pub struct Memory {
     operations: super::Memory,
+    resident: Option<Resident>,
 }
 impl Memory {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -21,11 +38,38 @@ impl Memory {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
             operations: super::Memory::with_storage(storage),
+            resident: None,
         }
+    }
+
+    /// Fixed create/show capability. The launcher supplies an exact Memory
+    /// route; neither a tool argument nor another transport can broaden it.
+    pub(crate) fn resident(
+        storage: crate::storage::Storage,
+        diagnostic: Diagnostic,
+        before_create: WriteAdmission,
+        failed_flush: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        let routes = storage
+            .collection_routes()
+            .context("resident Memory requires explicit routes")?;
+        anyhow::ensure!(
+            routes.len() == 1 && routes.contains_key(&crate::schemas::memory::DEFAULT_SCOPE_ID),
+            "resident capability requires exactly the Memory route"
+        );
+        Ok(Self {
+            operations: super::Memory::with_storage(storage.clone()),
+            resident: Some(Resident {
+                storage,
+                diagnostic,
+                before_create,
+                failed_flush,
+            }),
+        })
     }
 }
 
-static TOOLS: &[Tool] = &[
+const TOOLS: &[Tool] = &[
     Tool {
         name: "memory_show",
         description: "Show one immutable episode by id/alias prefix or range. Images are native bounded derived image content, never host paths.",
@@ -189,14 +233,29 @@ arguments!(Replay { persona: String, count: Option<usize> });
 
 impl Faculty for Memory {
     fn tools(&self) -> &[Tool] {
-        TOOLS
+        const RESIDENT_TOOLS: &[Tool] = &[TOOLS[0], TOOLS[4]];
+        if self.resident.is_some() {
+            RESIDENT_TOOLS
+        } else {
+            TOOLS
+        }
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
+        if self.resident.is_some() && !matches!(name, "memory_create" | "memory_show") {
+            bail!("tool is outside the provisioned Memory capability");
+        }
         let memory = &self.operations;
         match name {
             "memory_show" => {
                 let args: Selector = decode_arguments(arguments)?;
-                memory.show(&args.selector, out)
+                match &self.resident {
+                    Some(resident) => {
+                        memory.show_many_with_diagnostics(&[args.selector], out, &mut |message| {
+                            (resident.diagnostic)(message)
+                        })
+                    }
+                    None => memory.show(&args.selector, out),
+                }
             }
             "memory_turn" => {
                 let args: Id = decode_arguments(arguments)?;
@@ -218,9 +277,46 @@ impl Faculty for Memory {
                     .map(parse_time_range)
                     .transpose()
                     .map_err(invalid_arguments)?;
-                memory
-                    .create(&args.summary, range, &args.tags.unwrap_or_default())?
-                    .emit(out)
+                if let Some(resident) = &self.resident {
+                    (resident.before_create)()?;
+                }
+                let tags = args.tags.unwrap_or_default();
+                let created = if let Some(resident) = &self.resident {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        memory.create(&args.summary, range, &tags)
+                    })) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            resident.failed_flush.store(true, Ordering::Release);
+                            Err(anyhow::anyhow!(
+                                "native Memory write panicked; outcome unknown"
+                            ))
+                        }
+                    }
+                } else {
+                    memory.create(&args.summary, range, &tags)
+                };
+                // A long-lived native store otherwise defers sync_all until
+                // shutdown. Report successful authoring only after the same
+                // persistence boundary as the ordinary one-shot CLI.
+                let created = if let Some(resident) = &self.resident {
+                    let flushed = resident.storage.with_pile(|pile, _| {
+                        pile.flush().context("persist native Memory publication")
+                    });
+                    if flushed.is_err() {
+                        resident.failed_flush.store(true, Ordering::Release);
+                    }
+                    match (created, flushed) {
+                        (Ok(value), Ok(())) => Ok(value),
+                        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                        (Err(error), Err(flush)) => {
+                            Err(error.context(format!("Memory flush also failed: {flush:#}")))
+                        }
+                    }
+                } else {
+                    created
+                };
+                created?.emit(out)
             }
             "memory_image" => {
                 let args: Image = decode_arguments(arguments)?;

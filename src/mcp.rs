@@ -20,6 +20,8 @@
 
 pub mod catalog;
 pub mod http;
+#[cfg(target_os = "linux")]
+pub mod local;
 pub mod object;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -43,6 +45,7 @@ const ERROR_RESERVE: usize = 2048;
 /// An explicit MCP tool, independent of any CLI declaration. The input schema
 /// is a JSON object with `type: "object"`; it is checked and compacted once when
 /// a server registers this tool. Argument validation belongs to the adapter.
+#[derive(Clone, Copy)]
 pub struct Tool {
     pub name: &'static str,
     pub description: &'static str,
@@ -265,6 +268,43 @@ pub struct Server<'a> {
     tools: Vec<RegisteredTool<'a>>,
     limits: Limits,
     state: State,
+    logging: Option<Arc<local_logging::Level>>,
+}
+
+/// Shared only by a transport's server and its diagnostic emitter. Ordinary
+/// stdio/HTTP registrations do not advertise logging unless explicitly enabled.
+pub mod local_logging {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    pub struct Level(AtomicU8);
+    impl Default for Level {
+        fn default() -> Self {
+            Self(AtomicU8::new(2))
+        }
+    }
+    impl Level {
+        pub fn warning_enabled(&self) -> bool {
+            self.0.load(Ordering::Relaxed) <= 4
+        }
+        pub(super) fn set(&self, name: &str) -> bool {
+            let Some(level) = [
+                "debug",
+                "info",
+                "notice",
+                "warning",
+                "error",
+                "critical",
+                "alert",
+                "emergency",
+            ]
+            .iter()
+            .position(|candidate| *candidate == name) else {
+                return false;
+            };
+            self.0.store(level as u8 + 1, Ordering::Relaxed);
+            true
+        }
+    }
 }
 
 impl<'a> Server<'a> {
@@ -299,7 +339,13 @@ impl<'a> Server<'a> {
             tools,
             limits,
             state: State::New,
+            logging: None,
         })
+    }
+
+    pub fn with_logging(mut self, level: Arc<local_logging::Level>) -> Self {
+        self.logging = Some(level);
+        self
     }
 
     /// Dispatch one complete JSON-RPC message. HTTP may include JSON whitespace;
@@ -395,6 +441,13 @@ impl<'a> Server<'a> {
                 Err(RpcError::new(-32000, "MCP initialization is not complete"))
             }
             "tools/list" => self.list(request.params, self.result_budget(&id)),
+            "logging/setLevel" if self.logging.is_some() => {
+                if self.state != State::Ready {
+                    Err(RpcError::new(-32000, "MCP initialization is not complete"))
+                } else {
+                    self.set_log_level(request.params)
+                }
+            }
             "tools/call" => match self.prepare(request.params) {
                 Ok((tool, name, arguments)) => {
                     return Ok(Routed::Call(Call {
@@ -438,9 +491,20 @@ impl<'a> Server<'a> {
         // supported version; the client decides whether it can continue.
         self.state = State::AwaitingInitialized;
         Ok(format!(
-            "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"faculties\",\"version\":{}}}}}",
-            quote(PROTOCOL_VERSION), quote(crate::GIT_VERSION)
+            "{{\"protocolVersion\":{},\"capabilities\":{{\"tools\":{{}}{}}},\"serverInfo\":{{\"name\":\"faculties\",\"version\":{}}}}}",
+            quote(PROTOCOL_VERSION),
+            if self.logging.is_some() { ",\"logging\":{}" } else { "" },
+            quote(crate::GIT_VERSION)
         ))
+    }
+
+    fn set_log_level(&self, params: Option<Bytes>) -> std::result::Result<String, RpcError> {
+        let fields = fields::<1>(required_params(params)?, ["level"])?;
+        let level = required_string(fields[0].clone(), "level")?;
+        if !self.logging.as_ref().expect("logging enabled").set(&level) {
+            return Err(RpcError::params("unknown logging level"));
+        }
+        Ok("{}".to_owned())
     }
 
     fn list(&self, params: Option<Bytes>, budget: usize) -> std::result::Result<String, RpcError> {
@@ -594,7 +658,7 @@ fn error_response(limits: Limits, id: &str, code: i32, message: &str) -> Result<
     Ok(response)
 }
 
-fn read_frame(input: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_frame(input: &mut impl BufRead, limit: usize) -> Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
     loop {
         let available = input.fill_buf()?;

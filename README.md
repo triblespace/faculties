@@ -113,6 +113,36 @@ faculties mcp --pile ./self.pile
 
 #### MCP server and launcher configuration
 
+On Linux, a provisioning owner can grant the narrower `faculties memory-mcp
+--config /private/config.json` endpoint. It registers only native `memory_create`
+and `memory_show`, with one explicit Memory descriptor and expected signer in
+`Storage::shared_local`; it does not instantiate the aggregate Catalog. The
+private configuration names `socket`, `pile`, `key`, `expected_signer`,
+`memory_collection`, `min_free_bytes`, and `request_timeout_ms`. READ and WRITE
+admission are checked before readiness, and native Memory operations check their
+ordinary action boundaries. No default role, signer generation or network
+acquisition fills a missing grant.
+
+The actual `memory` CLI accepts `FACULTIES_MEMORY_SOCKET` (or `--mcp-socket`)
+instead of a pile/key. Remote mode supports `memory create ...` and
+`memory ID_OR_RANGE`; meta, context, image authoring and multi-selector show
+return an explicit unsupported-command error. Guest-side argument parsing and
+`@` expansion are shared with local create. The wire carries literal content,
+and successful create keeps the canonical two-line receipt after a pile flush.
+Show uses the ordinary renderer; partial-foundation diagnostics are bounded MCP
+logging notifications rendered on CLI stderr, separate from summary stdout.
+
+This endpoint has one active native operation, a backlog of four, 1 MiB frames,
+16 KiB diagnostics, 64 frames per connection and two-second frame/output
+deadlines. The launcher chooses an operation deadline of 100–60000 ms; the CLI
+has a 60-second total deadline. These are proposed finite policies, not measured
+capacity. Stdin EOF stops admission and drains/flushes the active operation.
+The provider owns process/cgroup limits and treats unexpected exit, forced
+termination or failed flush as loss of control. Disconnect and guest job
+cancellation cannot undo an admitted write: no retry occurs, and a missing
+receipt means the outcome may be unknown. Host disk pressure refuses new
+create calls; this check is not a hard aggregate append quota.
+
 `faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
 Streamable HTTP with `--http-listen`. Both transports use the same 34 adapters,
 230 tools, argument decoding, and native image/audio/resource output. The
