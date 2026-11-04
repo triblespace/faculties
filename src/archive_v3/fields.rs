@@ -8,8 +8,8 @@
 //! - [`Class::Structure`]: the value shapes the graph (order, discriminated
 //!   shape, a vocabulary choice) and is held by no attribute of its own;
 //! - [`Class::Annotation`]: the value annotates a witness or a node;
-//! - [`Class::Correlator`]: a provider id read only to pair things (a call
-//!   with its result) while parsing;
+//! - [`Class::Correlator`]: a provider id the importer reads only to pair
+//!   things (a call with its result) while parsing; always one leaf;
 //! - [`Class::Drop`]: the value is left out, with the reason.
 //!
 //! [`Class::Open`] marks a field whose meaning is not yet verified. It fails
@@ -65,7 +65,69 @@ pub struct FieldTable {
     pub record: &'static str,
     /// The source's order rule over records.
     pub order: Order,
+    /// How the source's own markers shape a window beyond its record
+    /// chain. The gate's walker builds the window behind every record from
+    /// this and the order rule alone.
+    pub windows: Windows,
     pub entries: &'static [Entry],
+}
+
+/// The window rules a source marks. Each names record-relative fields;
+/// a record's shape is its discriminator value.
+#[derive(Clone, Copy, Debug)]
+pub struct Windows {
+    /// Records of these shapes open every window that follows them in the
+    /// file: the latest such record before a record is its window's prefix.
+    pub prefix: &'static [&'static str],
+    pub compaction: Option<Compaction>,
+    pub requests: Option<Requests>,
+}
+
+impl Windows {
+    /// A source whose windows are exactly its record chains.
+    pub const NONE: Windows = Windows {
+        prefix: &[],
+        compaction: None,
+        requests: None,
+    };
+}
+
+/// A record that replaces the context: its children start a new chain, and
+/// the segment `head..=tail` of the old chain (by the order rule) is
+/// re-presented right after the record `anchor` names.
+#[derive(Clone, Copy, Debug)]
+pub struct Compaction {
+    pub shape: &'static str,
+    pub head: &'static str,
+    pub tail: &'static str,
+    pub anchor: &'static str,
+}
+
+/// Sampled requests and the window edits they mark.
+///
+/// A request is a run of consecutive chain records of `shape` that share
+/// the value of `id`. The window a request was sampled from is the whole
+/// history before its first record, with only that request's own edits
+/// applied (never an earlier request's).
+#[derive(Clone, Copy, Debug)]
+pub struct Requests {
+    pub shape: &'static str,
+    pub id: &'static str,
+    /// Elements of the record-relative array `.0` whose member `type` is
+    /// `.1` each drop one block, named by member `.2` as
+    /// `messages.<i>.content.<j>`: block `j` of message `i`, where messages
+    /// are the runs of one role in the window after its prefix.
+    pub dropped: (&'static str, &'static str, &'static str),
+    /// Elements of the record-relative array `.0` whose member `type` is
+    /// `.1` clear the parts of the oldest results, as many as member `.2`
+    /// counts.
+    pub cleared: (&'static str, &'static str, &'static str),
+    /// A result is a value at the normalized path `.0`. Its head is the
+    /// item of modality `.1` it holds directly (it comes first, and counts
+    /// even when it holds no value); its parts are every other item inside.
+    pub result: (&'static str, &'static str),
+    /// The modality of the blocks a drop may name.
+    pub thinking: &'static str,
 }
 
 /// How a source orders its records.
@@ -139,7 +201,9 @@ pub enum Class {
     /// or `gloss:<category>`.
     Annotation(&'static [(&'static str, Decode)]),
     /// A provider id read only while parsing (pairing a call and its result,
-    /// grouping a message). It never reaches the pile.
+    /// grouping a message). It never reaches the pile. It names one leaf: an
+    /// object or array at its path is walked member by member, and an entry
+    /// the importer never reads is no correlator.
     Correlator,
     Drop(DropReason),
     /// Meaning not yet verified; fails until answered.

@@ -10,6 +10,16 @@
 //!
 //! Object members are visited in name order, never in the order the source
 //! spelled them: member order carries no information.
+//!
+//! It also groups the fact tokens into *items* (the tokens of one source
+//! occurrence: one array element, or the record itself) and builds, for each
+//! record, the window behind it: the record chain by the order rule, opened
+//! by the prefix in force and shaped by the window edits the source marks
+//! ([`Windows`]). The gate compares every witnessed window against these,
+//! occurrence by occurrence.
+//!
+//! A path segment that looks like an id (a uuid, a hex or numeric key, a
+//! prefixed provider id) prints as `<id>`, so a report row never holds one.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
@@ -17,9 +27,9 @@ use std::str::FromStr;
 use base64::Engine;
 use hifitime::{Duration, Epoch};
 
-use super::{JsonLeaf, Kind, Origin, Token, Value};
+use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
 use crate::archive_v3::fields::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure,
+    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure, Windows,
 };
 
 /// What B found in one unit.
@@ -29,8 +39,41 @@ pub struct Walked {
     pub tokens: BTreeMap<Token, Vec<Origin>>,
     /// Findings: (path, kind, occurrence label). Labels only count rows.
     pub rows: Vec<(String, Kind, String)>,
+    /// Every item: the fact tokens of one source occurrence.
+    pub items: Vec<Item>,
     records: Vec<RecordLinks>,
     ids: HashMap<String, Vec<usize>>,
+    windows: Option<Windows>,
+    /// Anchor id -> the first compaction record that names it.
+    anchors: HashMap<String, usize>,
+    /// Each record's prefix record: the latest one before it in the file.
+    prefixes: Vec<Option<usize>>,
+}
+
+/// The windows behind one record, as hashes: what precedes its own items
+/// (`None` when the edits the source marks cannot be applied), the window a
+/// child continues (`before`, its own items, a segment re-presented after
+/// it), and the same history unedited, which a new request starts from.
+#[derive(Clone, Copy, Debug)]
+pub struct Lines {
+    pub before: Option<[u8; 32]>,
+    line: Option<[u8; 32]>,
+    unedited: [u8; 32],
+    prefix: Option<usize>,
+}
+
+/// The fact tokens of one source occurrence (one modality at one place),
+/// and where it sits.
+#[derive(Debug)]
+pub struct Item {
+    pub record: usize,
+    /// `(array path, position)` from the outermost array in, empty for a
+    /// value outside every array.
+    pub levels: Vec<(String, usize)>,
+    pub modality: String,
+    pub tokens: BTreeSet<Token>,
+    /// The normalized path of its first token.
+    pub path: String,
 }
 
 #[derive(Debug, Default)]
@@ -39,44 +82,465 @@ struct RecordLinks {
     parent: Option<String>,
     /// A `Mirror::Children` drop: its path and the ids it lists.
     children: Option<(String, Vec<String>)>,
+    /// The record's discriminator value.
+    shape: Option<String>,
+    /// The id of the request this record belongs to.
+    request: Option<String>,
+    /// `(head, tail, anchor)` of a compaction.
+    compaction: Option<(String, String, String)>,
+    /// Each dropped block's `messages.<i>.content.<j>` path, as written.
+    dropped: Vec<String>,
+    /// Each cleared count; `None` when it is no count.
+    cleared: Vec<Option<usize>>,
+    /// The levels of each result in the record, in walk order.
+    results: Vec<Vec<(String, usize)>>,
+    /// Its items, in record order.
+    items: Vec<usize>,
+}
+
+/// Who an item in a window speaks for, as the window's messages count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    User,
+    Assistant,
+    System,
+    Voiced,
+}
+
+/// One place in a window: an item, or the head of a result that holds no
+/// value of its own (it still counts as a result and as a block).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Item(usize),
+    Head(usize, usize),
 }
 
 impl Walked {
-    /// Whether the source places `a` strictly before `b`: in the same
-    /// record at an earlier array position, or in an ancestor record.
-    pub fn precedes(&self, a: &Origin, b: &Origin) -> bool {
-        let (Some(ra), Some(rb)) = (a.record, b.record) else {
-            return false;
-        };
-        if ra == rb {
-            return a
-                .index
-                .iter()
-                .zip(&b.index)
-                .find(|(x, y)| x != y)
-                .is_some_and(|(x, y)| x < y);
-        }
-        self.is_ancestor(ra, rb)
+    /// The first record with this id.
+    fn first(&self, id: &str) -> Option<usize> {
+        self.ids
+            .get(id)
+            .and_then(|records| records.first().copied())
     }
 
-    fn is_ancestor(&self, ancestor: usize, of: usize) -> bool {
-        let mut seen = BTreeSet::new();
-        let mut frontier = vec![of];
-        while let Some(record) = frontier.pop() {
-            if !seen.insert(record) {
-                continue;
-            }
-            let Some(parent) = &self.records[record].parent else {
-                continue;
-            };
-            for &up in self.ids.get(parent).into_iter().flatten() {
-                if up == ancestor {
-                    return true;
-                }
-                frontier.push(up);
+    /// Whether a record repeats an earlier record's id.
+    pub fn is_repeat(&self, record: usize) -> bool {
+        self.records[record]
+            .id
+            .as_deref()
+            .and_then(|id| self.first(id))
+            .is_some_and(|first| first != record)
+    }
+
+    /// The number of records.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
+    /// The record's items, in record order.
+    pub fn record_items(&self, record: usize) -> &[usize] {
+        &self.records[record].items
+    }
+
+    /// The record's parent by the order rule, when the unit holds it.
+    pub fn parent(&self, record: usize) -> Option<usize> {
+        self.records[record]
+            .parent
+            .as_deref()
+            .and_then(|parent| self.first(parent))
+    }
+
+    fn role(&self, slot: Slot) -> Role {
+        let Slot::Item(item) = slot else {
+            return Role::User;
+        };
+        let tokens = &self.items[item].tokens;
+        if tokens
+            .iter()
+            .any(|t| t.attribute == "form" && t.value == Value::Term("voiced".to_owned()))
+        {
+            Role::Voiced
+        } else if tokens.iter().any(|t| t.modality == "system") {
+            Role::System
+        } else if tokens.iter().any(|t| t.direction == "out") {
+            Role::Assistant
+        } else {
+            Role::User
+        }
+    }
+
+    /// The record's slots in record order: its items, and a head for each
+    /// result whose head holds no value. A result's head comes before its
+    /// parts.
+    fn slots(&self, record: usize) -> Vec<(Vec<(String, usize)>, Slot)> {
+        let links = &self.records[record];
+        let mut slots: Vec<(Vec<(String, usize)>, bool, Slot)> = links
+            .items
+            .iter()
+            .map(|&item| {
+                let part = self
+                    .result_of(record, Slot::Item(item))
+                    .is_some_and(|(_, part)| part);
+                (self.items[item].levels.clone(), part, Slot::Item(item))
+            })
+            .collect();
+        for (group, levels) in links.results.iter().enumerate() {
+            let headed = links
+                .items
+                .iter()
+                .any(|&item| self.result_of(record, Slot::Item(item)) == Some((group, false)));
+            if !headed {
+                slots.push((levels.clone(), false, Slot::Head(record, group)));
             }
         }
-        false
+        slots.sort();
+        slots
+            .into_iter()
+            .map(|(levels, _, slot)| (levels, slot))
+            .collect()
+    }
+
+    /// The result a slot belongs to, and whether it is one of its parts.
+    fn result_of(&self, record: usize, slot: Slot) -> Option<(usize, bool)> {
+        let item = match slot {
+            Slot::Item(item) => item,
+            Slot::Head(_, group) => return Some((group, false)),
+        };
+        let head = self.windows?.requests?.result.1;
+        let levels = &self.items[item].levels;
+        let results = &self.records[record].results;
+        results
+            .iter()
+            .position(|group| levels.starts_with(group))
+            .map(|group| {
+                let part = levels.len() > results[group].len() || self.items[item].modality != head;
+                (group, part)
+            })
+    }
+
+    /// The slots of `records` in window order, each followed by the
+    /// segment a compaction re-presents after it. `None` when a segment
+    /// does not reach its head.
+    fn walk_records(&self, records: &[usize]) -> Option<Vec<(usize, Vec<(String, usize)>, Slot)>> {
+        let mut out = Vec::new();
+        for &record in records {
+            out.extend(
+                self.slots(record)
+                    .into_iter()
+                    .map(|(levels, slot)| (record, levels, slot)),
+            );
+            if let Some(segment) = self.segment_after(record) {
+                for at in segment? {
+                    out.extend(
+                        self.slots(at)
+                            .into_iter()
+                            .map(|(levels, slot)| (at, levels, slot)),
+                    );
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// The segment a compaction re-presents after `record`, root first:
+    /// `Some(None)` when it does not reach its head.
+    fn segment_after(&self, record: usize) -> Option<Option<Vec<usize>>> {
+        let id = self.records[record].id.as_deref()?;
+        let boundary = *self.anchors.get(id)?;
+        let (head, tail, _) = self.records[boundary].compaction.clone()?;
+        let mut chain = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cursor = self.first(&tail);
+        loop {
+            let Some(at) = cursor else {
+                return Some(None);
+            };
+            if !seen.insert(at) {
+                return Some(None);
+            }
+            chain.push(at);
+            if self.records[at].id.as_deref() == Some(head.as_str()) {
+                break;
+            }
+            cursor = self.parent(at);
+        }
+        chain.reverse();
+        Some(Some(chain))
+    }
+
+    /// The window behind `record`: the items before its own, and its own,
+    /// as item indices. `None` when the edits the source marks cannot be
+    /// applied to it (a row says where).
+    pub fn window(&self, record: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        let ordered = |at: usize| -> Vec<usize> {
+            self.slots(at)
+                .into_iter()
+                .filter_map(|(_, slot)| match slot {
+                    Slot::Item(item) => Some(item),
+                    Slot::Head(..) => None,
+                })
+                .collect()
+        };
+        let own = ordered(record);
+        let windows = self.windows.unwrap_or(Windows::NONE);
+        let shape_of = |at: usize| self.records[at].shape.as_deref();
+        let is_prefix =
+            |at: usize| shape_of(at).is_some_and(|shape| windows.prefix.contains(&shape));
+        if is_prefix(record) {
+            return Some((Vec::new(), own));
+        }
+        // The chain, root first.
+        let mut chain = vec![record];
+        let mut seen = BTreeSet::from([record]);
+        let mut cursor = record;
+        while let Some(up) = self.parent(cursor) {
+            if !seen.insert(up) {
+                break;
+            }
+            chain.push(up);
+            cursor = up;
+        }
+        chain.reverse();
+        let prefix: Vec<usize> = self.prefixes[record].map(ordered).unwrap_or_default();
+        // The latest request on the chain, and its own edits so far.
+        let request = |at: usize| self.records[at].request.as_deref();
+        let (start, dropped, cleared) = match chain.iter().rposition(|&at| request(at).is_some()) {
+            None => (chain.len() - 1, Vec::new(), Vec::new()),
+            Some(end) => {
+                let mut start = end;
+                while start > 0 && request(chain[start - 1]) == request(chain[end]) {
+                    start -= 1;
+                }
+                let run = &chain[start..=end];
+                let dropped: Vec<String> = run
+                    .iter()
+                    .flat_map(|&at| self.records[at].dropped.iter().cloned())
+                    .collect();
+                let cleared: Vec<Option<usize>> = run
+                    .iter()
+                    .flat_map(|&at| self.records[at].cleared.iter().copied())
+                    .collect();
+                (start, dropped, cleared)
+            }
+        };
+        let mut base = self.walk_records(&chain[..start])?;
+        let tail = self.walk_records(&chain[start..chain.len() - 1])?;
+        // Dropped blocks, by message and block in the base window.
+        let mut drop = BTreeSet::new();
+        if !dropped.is_empty() {
+            let thinking = windows.requests.map(|r| r.thinking).unwrap_or_default();
+            let mut runs: Vec<(Role, Vec<usize>)> = Vec::new();
+            for (at, (_, _, slot)) in base.iter().enumerate() {
+                let role = self.role(*slot);
+                match runs.last_mut() {
+                    Some((last, members)) if *last == role => members.push(at),
+                    _ => runs.push((role, vec![at])),
+                }
+            }
+            for place in &dropped {
+                let steps: Vec<&str> = place.split('.').collect();
+                let (message, block) = match steps.as_slice() {
+                    ["messages", message, "content", block] => {
+                        (message.parse::<usize>().ok()?, block.parse::<usize>().ok()?)
+                    }
+                    _ => return None,
+                };
+                if runs[..message.min(runs.len())]
+                    .iter()
+                    .any(|(role, _)| matches!(role, Role::System | Role::Voiced))
+                {
+                    return None;
+                }
+                let at = match runs.get(message) {
+                    Some((Role::Assistant, members)) => *members.get(block)?,
+                    _ => return None,
+                };
+                match base[at].2 {
+                    Slot::Item(item)
+                        if self.items[item]
+                            .tokens
+                            .iter()
+                            .any(|t| t.modality == thinking) =>
+                    {
+                        drop.insert(at);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // Cleared results: the oldest ones lose their parts.
+        let mut count = 0;
+        for cleared in &cleared {
+            count += (*cleared)?;
+        }
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        for (record, _, slot) in &base {
+            if let Some((group, _)) = self.result_of(*record, *slot) {
+                if !groups.contains(&(*record, group)) {
+                    groups.push((*record, group));
+                }
+            }
+        }
+        if count > groups.len() {
+            return None;
+        }
+        let cleared: BTreeSet<(usize, usize)> = groups.into_iter().take(count).collect();
+        let mut at = 0;
+        base.retain(|(record, _, slot)| {
+            let keep = !drop.contains(&at)
+                && !self
+                    .result_of(*record, *slot)
+                    .is_some_and(|(group, part)| part && cleared.contains(&(*record, group)));
+            at += 1;
+            keep
+        });
+        let items = |slots: Vec<(usize, Vec<(String, usize)>, Slot)>| {
+            slots.into_iter().filter_map(|(_, _, slot)| match slot {
+                Slot::Item(item) => Some(item),
+                Slot::Head(..) => None,
+            })
+        };
+        let mut before = prefix;
+        before.extend(items(base));
+        before.extend(items(tail));
+        Some((before, own))
+    }
+
+    /// The items a compaction re-presents after `record`, in order.
+    fn segment_items(&self, record: usize) -> Option<Vec<usize>> {
+        let mut out = Vec::new();
+        if let Some(segment) = self.segment_after(record) {
+            for at in segment? {
+                out.extend(self.ordered(at));
+            }
+        }
+        Some(out)
+    }
+
+    /// The record's items in window order.
+    pub fn ordered(&self, record: usize) -> Vec<usize> {
+        self.slots(record)
+            .into_iter()
+            .filter_map(|(_, slot)| match slot {
+                Slot::Item(item) => Some(item),
+                Slot::Head(..) => None,
+            })
+            .collect()
+    }
+
+    /// The windows behind every record, as hashes that `step` extends by one
+    /// item id. A record continues its parent's line, or starts a request
+    /// from its parent's unedited history, without walking the chain again;
+    /// only a record whose prefix differs from its parent's, or a request
+    /// whose own edits change the window, is built from [`Self::window`].
+    pub fn lines(
+        &self,
+        id: &dyn Fn(usize) -> u32,
+        step: &dyn Fn(&[u8; 32], u32) -> [u8; 32],
+    ) -> Vec<Option<Lines>> {
+        let fold = |hash: [u8; 32], items: &[usize]| {
+            items.iter().fold(hash, |hash, &item| step(&hash, id(item)))
+        };
+        let mut lines: Vec<Option<Lines>> = vec![None; self.records.len()];
+        let mut busy = vec![false; self.records.len()];
+        for start in 0..self.records.len() {
+            // Parents first: climb to a record already done, then come down.
+            let mut stack = vec![start];
+            while let Some(&record) = stack.last() {
+                if lines[record].is_some() {
+                    stack.pop();
+                    continue;
+                }
+                let parent = self.parent(record).filter(|&p| p != record);
+                if let Some(parent) = parent {
+                    if lines[parent].is_none() && !busy[parent] {
+                        busy[record] = true;
+                        stack.push(parent);
+                        continue;
+                    }
+                }
+                stack.pop();
+                busy[record] = false;
+                lines[record] = Some(self.line_of(record, parent.and_then(|p| lines[p]), &fold));
+            }
+        }
+        lines
+    }
+
+    fn line_of(
+        &self,
+        record: usize,
+        parent: Option<Lines>,
+        fold: &dyn Fn([u8; 32], &[usize]) -> [u8; 32],
+    ) -> Lines {
+        let links = &self.records[record];
+        let own = self.ordered(record);
+        let segment = self.segment_items(record);
+        let prefix = self.prefixes[record];
+        let marks = !links.dropped.is_empty() || !links.cleared.is_empty();
+        let parent_links = self.parent(record).map(|p| &self.records[p]);
+        let continues_request =
+            links.request.is_some() && parent_links.is_some_and(|p| p.request == links.request);
+        let new_request = links.request.is_some() && !continues_request;
+        let quick = match parent {
+            Some(parent) if parent.prefix == prefix && !marks => {
+                if new_request {
+                    Some(parent.unedited)
+                } else {
+                    parent.line
+                }
+            }
+            _ => None,
+        };
+        let windows = self.windows.unwrap_or(Windows::NONE);
+        let is_prefix = links
+            .shape
+            .as_deref()
+            .is_some_and(|shape| windows.prefix.contains(&shape));
+        let (before, unedited) = match (quick, parent) {
+            (Some(before), Some(parent)) if !is_prefix => {
+                (Some(before), fold(parent.unedited, &own))
+            }
+            _ if self.is_repeat(record) => (None, [0; 32]),
+            _ => {
+                let before = self
+                    .window(record)
+                    .map(|(before, _)| fold([0; 32], &before));
+                let unedited = if is_prefix {
+                    fold([0; 32], &own)
+                } else {
+                    let mut chain = vec![record];
+                    let mut seen = BTreeSet::from([record]);
+                    let mut cursor = record;
+                    while let Some(up) = self.parent(cursor) {
+                        if !seen.insert(up) {
+                            break;
+                        }
+                        chain.push(up);
+                        cursor = up;
+                    }
+                    chain.reverse();
+                    let mut items = prefix.map(|p| self.ordered(p)).unwrap_or_default();
+                    for (at, &link) in chain.iter().enumerate() {
+                        items.extend(self.ordered(link));
+                        if at + 1 < chain.len() {
+                            items.extend(self.segment_items(link).unwrap_or_default());
+                        }
+                    }
+                    fold([0; 32], &items)
+                };
+                (before, unedited)
+            }
+        };
+        let segment_hash = |hash: [u8; 32]| segment.as_ref().map(|items| fold(hash, items));
+        let line = before.and_then(|before| segment_hash(fold(before, &own)));
+        let unedited = segment_hash(unedited).unwrap_or(unedited);
+        Lines {
+            before,
+            line,
+            unedited,
+            prefix,
+        }
     }
 }
 
@@ -84,7 +548,10 @@ impl Walked {
 pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
     let mut walker = Walker {
         table,
-        out: Walked::default(),
+        out: Walked {
+            windows: Some(table.windows),
+            ..Walked::default()
+        },
     };
     if table.jsonl {
         for (line, bytes) in source.split(|byte| *byte == b'\n').enumerate() {
@@ -366,6 +833,8 @@ struct Ctx {
     /// The record itself, for mirrors that look across it.
     root: std::rc::Rc<J>,
     index: Vec<usize>,
+    /// `(array path, position)` of each array the walk is inside.
+    levels: Vec<(String, usize)>,
     line: usize,
 }
 
@@ -458,9 +927,11 @@ fn applies(entry: &Entry, value: &J) -> bool {
         Class::Annotation(list) => list
             .iter()
             .all(|(_, decode)| decode_applies(*decode, value)),
-        Class::Structure(_) => is_leaf(value),
+        // A correlator names one id; an object or array under its path is
+        // walked like any other value, so nothing hides inside it.
+        Class::Structure(_) | Class::Correlator => is_leaf(value),
         Class::Drop(DropReason::Empty) => is_leaf(value),
-        Class::Correlator | Class::Drop(_) | Class::Open(_) => true,
+        Class::Drop(_) | Class::Open(_) => true,
     }
 }
 
@@ -511,6 +982,7 @@ impl<'t> Walker<'t> {
             present: Default::default(),
             root: std::rc::Rc::new(J::Null),
             index: Vec::new(),
+            levels: Vec::new(),
             line,
         };
         match Parser::document(bytes) {
@@ -525,6 +997,7 @@ impl<'t> Walker<'t> {
             .discriminators
             .iter()
             .find_map(|key| match members.get(*key) {
+                Some(J::Str(shape)) if id_like(shape) => Some("<id>".to_owned()),
                 Some(J::Str(shape)) if printable(shape) => Some(shape.clone()),
                 Some(J::Str(_)) => Some("?".to_owned()),
                 _ => None,
@@ -537,6 +1010,11 @@ impl<'t> Walker<'t> {
         }
         let shape = self.discriminator(value);
         let shaped = shape.as_ref().map(|shape| format!("{path}{{{shape}}}"));
+        if let (Some(record), Some(windows)) = (ctx.record, self.table.windows.requests) {
+            if shaped.as_deref() == Some(windows.result.0) || path == windows.result.0 {
+                self.out.records[record].results.push(ctx.levels.clone());
+            }
+        }
 
         let table: &'t FieldTable = self.table;
         let candidates = |at: &str| -> Vec<&'t Entry> {
@@ -595,7 +1073,7 @@ impl<'t> Walker<'t> {
             J::Obj(members) => {
                 let id_keyed = self.table.id_keyed.contains(&path);
                 for (name, member) in members {
-                    let child = if id_keyed {
+                    let child = if id_keyed || id_like(name) {
                         format!("{inner}.<id>")
                     } else if printable(name) {
                         format!("{inner}.{name}")
@@ -610,6 +1088,8 @@ impl<'t> Walker<'t> {
                 for (at, element) in elements.iter().enumerate() {
                     let mut ctx = ctx.clone();
                     ctx.index.push(at);
+                    // Member order, not spelling: the array's own path.
+                    ctx.levels.push((inner.clone(), at));
                     self.value(element, &child, Some(value), ctx);
                 }
             }
@@ -623,11 +1103,51 @@ impl<'t> Walker<'t> {
         scalars(value, "", &mut fields, &mut present);
         let Order::Parents { id, parent } = self.table.order;
         let field = |name: &str| fields.get(name).filter(|v| *v != "null").cloned();
-        let links = RecordLinks {
+        let shape = self.discriminator(value);
+        let windows = self.table.windows;
+        let mut links = RecordLinks {
             id: field(id),
             parent: field(parent),
-            children: None,
+            shape: shape.clone(),
+            ..RecordLinks::default()
         };
+        if let Some(compaction) = windows.compaction {
+            if shape.as_deref() == Some(compaction.shape) {
+                if let (Some(head), Some(tail), Some(anchor)) = (
+                    field(compaction.head),
+                    field(compaction.tail),
+                    field(compaction.anchor),
+                ) {
+                    links.compaction = Some((head, tail, anchor));
+                }
+            }
+        }
+        if let Some(requests) = windows.requests {
+            if shape.as_deref() == Some(requests.shape) {
+                links.request = field(requests.id);
+                let (array, kind, place) = requests.dropped;
+                for element in elements(value, array) {
+                    if member(element, "type") == Some(kind) {
+                        links
+                            .dropped
+                            .push(member(element, place).unwrap_or_default().to_owned());
+                    }
+                }
+                let (array, kind, count) = requests.cleared;
+                for element in elements(value, array) {
+                    if member(element, "type") == Some(kind) {
+                        let cleared = match element {
+                            J::Obj(members) => match members.get(count) {
+                                Some(J::Num(token)) => token.parse::<usize>().ok(),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        links.cleared.push(cleared);
+                    }
+                }
+            }
+        }
         let record = self.out.records.len();
         if let Some(id) = &links.id {
             self.out.ids.entry(id.clone()).or_default().push(record);
@@ -638,10 +1158,37 @@ impl<'t> Walker<'t> {
         ctx.present = std::rc::Rc::new(present);
         ctx.root = std::rc::Rc::new(value.clone());
         ctx.index = Vec::new();
+        ctx.levels = Vec::new();
         ctx
     }
 
     fn emit(&mut self, token: Token, path: &str, ctx: &Ctx) {
+        if let (Some(record), false) = (ctx.record, token.modality.is_empty()) {
+            let links = &mut self.out.records[record];
+            let found = links.items.iter().copied().find(|&item| {
+                self.out.items[item].levels == ctx.levels
+                    && self.out.items[item].modality == token.modality
+            });
+            let item = match found {
+                Some(item) => item,
+                None => {
+                    self.out.items.push(Item {
+                        record,
+                        levels: ctx.levels.clone(),
+                        modality: token.modality.clone(),
+                        tokens: BTreeSet::new(),
+                        path: path.to_owned(),
+                    });
+                    links.items.push(self.out.items.len() - 1);
+                    self.out.items.len() - 1
+                }
+            };
+            let tokens = &mut self.out.items[item].tokens;
+            if tokens.first().is_none_or(|first| token < *first) {
+                self.out.items[item].path = path.to_owned();
+            }
+            self.out.items[item].tokens.insert(token.clone());
+        }
         self.out.tokens.entry(token).or_default().push(Origin {
             path: path.to_owned(),
             record: ctx.record,
@@ -804,9 +1351,58 @@ impl<'t> Walker<'t> {
         self.row(path, kind, ctx);
     }
 
-    /// Check the children mirrors against the parent links.
+    /// Check the children mirrors against the parent links, put each
+    /// record's items in record order, and check that a repeated record
+    /// holds what the first one does.
     fn finish(&mut self) {
         let mut rows = Vec::new();
+        for record in 0..self.out.records.len() {
+            let mut items = std::mem::take(&mut self.out.records[record].items);
+            items.sort_by(|a, b| self.out.items[*a].levels.cmp(&self.out.items[*b].levels));
+            self.out.records[record].items = items;
+        }
+        let windows = self.table.windows;
+        let mut latest = None;
+        for record in 0..self.out.records.len() {
+            self.out.prefixes.push(latest);
+            let links = &self.out.records[record];
+            let prefix = links
+                .shape
+                .as_deref()
+                .is_some_and(|shape| windows.prefix.contains(&shape));
+            if prefix && !self.out.is_repeat(record) {
+                latest = Some(record);
+            }
+            if let (Some((_, _, anchor)), false) = (&links.compaction, self.out.is_repeat(record)) {
+                self.out.anchors.entry(anchor.clone()).or_insert(record);
+            }
+        }
+        for record in 0..self.out.records.len() {
+            if !self.out.is_repeat(record) {
+                continue;
+            }
+            let first = self.out.records[record]
+                .id
+                .as_deref()
+                .and_then(|id| self.out.first(id))
+                .expect("a repeat has a first");
+            let held = |at: usize| -> Vec<&BTreeSet<Token>> {
+                self.out.records[at]
+                    .items
+                    .iter()
+                    .map(|&item| &self.out.items[item].tokens)
+                    .collect()
+            };
+            if held(first) != held(record) {
+                let Order::Parents { id, .. } = self.table.order;
+                let shape = self.out.records[record].shape.as_deref().unwrap_or("?");
+                rows.push((
+                    format!("{{{shape}}}.{id}"),
+                    Kind::Count,
+                    format!("record {record}"),
+                ));
+            }
+        }
         for (at, record) in self.out.records.iter().enumerate() {
             let Some((path, listed)) = &record.children else {
                 continue;
@@ -824,6 +1420,33 @@ impl<'t> Walker<'t> {
             }
         }
         self.out.rows.extend(rows);
+    }
+}
+
+/// The elements of the array at a record-relative path (none when there is
+/// no array there).
+fn elements<'j>(root: &'j J, path: &str) -> &'j [J] {
+    let mut at = Some(root);
+    for step in path.split('.') {
+        at = match at {
+            Some(J::Obj(members)) => members.get(step),
+            _ => None,
+        };
+    }
+    match at {
+        Some(J::Arr(elements)) => elements,
+        _ => &[],
+    }
+}
+
+/// A string member of an object.
+fn member<'j>(value: &'j J, name: &str) -> Option<&'j str> {
+    match value {
+        J::Obj(members) => match members.get(name) {
+            Some(J::Str(text)) => Some(text),
+            _ => None,
+        },
+        _ => None,
     }
 }
 

@@ -384,7 +384,6 @@ fn transcript_only_records_and_tool_originals_are_dropped() {
         result("t1", json!([said("one result")])),
     );
     answer["toolUseResult"] = json!({"stdout": "the full original", "originalFile": "x"});
-    answer["sourceToolAssistantUUID"] = json!("a1");
     let source = jsonl(&[
         user("u1", None, 0, json!("Start.")),
         hidden,
@@ -451,7 +450,7 @@ fn shape(second: u32, system: &str, tools: &[(&str, &str)]) -> Value {
         .collect();
     json!({
         "type": "api-request-shape", "sessionId": "s-1", "timestamp": stamp(second),
-        "version": "0.0.0", "shapeHash": "h",
+        "version": "0.0.0",
         "shape": {"system": [{"type": "text", "text": system}], "tools": tools}
     })
 }
@@ -502,7 +501,7 @@ fn compaction_starts_a_root_that_continues_and_recalls() {
         "content": "Conversation compacted", "level": "info", "isMeta": false,
         "compactMetadata": {"trigger": "auto", "preTokens": 100,
             "preservedSegment": {"headUuid": "a2", "tailUuid": "a2", "anchorUuid": "c1"},
-            "preservedMessages": {"uuids": ["a2"], "allUuids": ["a2"], "anchorUuid": "c1"}}
+            "preservedMessages": {"uuids": ["a2"]}}
     });
     let mut summary = user("c1", Some("b1"), 5, json!("Summary of what came before."));
     summary["isCompactSummary"] = json!(true);

@@ -75,6 +75,7 @@ const TEST: FieldTable = FieldTable {
         id: "id",
         parent: "parent",
     },
+    windows: crate::archive_v3::fields::Windows::NONE,
     entries: TEST_ENTRIES,
 };
 
@@ -357,7 +358,7 @@ pub(crate) fn claude_code_source(items: &[&str]) -> String {
     [
         r#"{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","cwd":"/synthetic","version":"0.0.0","message":{"role":"user","content":"Which tools can search?"}}"#.to_owned(),
         r#"{"type":"assistant","sessionId":"s-1","uuid":"a1","parentUuid":"u1","timestamp":"2026-03-01T10:00:01.000Z","requestId":"req_1","message":{"id":"msg_1","type":"message","role":"assistant","model":"synthetic-model","content":[{"type":"tool_use","id":"toolu_1","name":"ToolSearch","input":{"query":"select:WebSearch","max_results":1}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{"input_tokens":1}}}"#.to_owned(),
-        format!(r#"{{"type":"user","sessionId":"s-1","uuid":"u2","parentUuid":"a1","timestamp":"2026-03-01T10:00:02.000Z","sourceToolAssistantUUID":"a1","toolUseResult":{{"type":"text","preview":"synthetic"}},"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":[{items}]}}]}}}}"#),
+        format!(r#"{{"type":"user","sessionId":"s-1","uuid":"u2","parentUuid":"a1","timestamp":"2026-03-01T10:00:02.000Z","toolUseResult":{{"type":"text","preview":"synthetic"}},"message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":[{items}]}}]}}}}"#),
         r#"{"type":"assistant","sessionId":"s-1","uuid":"a2","parentUuid":"u2","timestamp":"2026-03-01T10:00:03.000Z","requestId":"req_2","message":{"id":"msg_2","type":"message","role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"WebSearch can."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":2}}}"#.to_owned(),
         r#"{"type":"user","sessionId":"s-1","uuid":"u3","parentUuid":"a2","timestamp":"2026-03-01T10:00:04.000Z","message":{"role":"user","content":"Thanks."}}"#.to_owned(),
     ]
@@ -632,6 +633,11 @@ fn the_gate_passes_a_right_rendering_and_names_each_fault() {
     let report = claude_code_v3(false, Fault::None).check(&claude_code::TABLE, &control);
     assert!(report.passed(), "{report}");
 
+    // Each fault is a wrong token where the set comparison sees one, and a
+    // window that holds no source window (count) where the comparison per
+    // witness does, with the source window that no witness holds (unheld).
+    let answer = "{assistant}.message{message}.content[]{text}.text";
+    let thanks = "{user}.message.content";
     let report = claude_code_v3(false, Fault::DropImage).check(&claude_code::TABLE, &control);
     assert_eq!(
         report.count(&at("{image}.source{base64}.data"), Kind::Missing),
@@ -641,25 +647,41 @@ fn the_gate_passes_a_right_rendering_and_names_each_fault() {
         report.count(&at("{image}.source{base64}.media_type"), Kind::Missing),
         1
     );
-    assert_eq!(report.rows.len(), 2, "{report}");
+    assert_eq!(report.count(answer, Kind::Count), 1, "{report}");
+    assert_eq!(
+        report.count(&at("{image}.source{base64}.data"), Kind::Unheld),
+        1
+    );
+    assert_eq!(report.rows.len(), 4, "{report}");
 
     let report = claude_code_v3(false, Fault::Retext).check(&claude_code::TABLE, &control);
-    let answer = "{assistant}.message{message}.content[]{text}.text";
     assert_eq!(report.count(answer, Kind::Missing), 1);
     assert_eq!(report.count("window:text/out/payload", Kind::Invented), 1);
-    assert_eq!(report.rows.len(), 2, "{report}");
+    assert_eq!(report.count("window:text/out/payload", Kind::Count), 1);
+    assert_eq!(report.count(answer, Kind::Unheld), 1);
+    assert_eq!(report.rows.len(), 4, "{report}");
 
+    // A swap: the first window that departs holds the image where the
+    // source holds the text; the source window up to the text is unheld.
     let report = claude_code_v3(false, Fault::Swap).check(&claude_code::TABLE, &control);
-    assert_eq!(report.count(&at("{text}.text"), Kind::Order), 1, "{report}");
-    assert_eq!(report.rows.len(), 1, "{report}");
-
-    let report = claude_code_v3(false, Fault::WrongDirection).check(&claude_code::TABLE, &control);
     assert_eq!(
-        report.count("{user}.message.content", Kind::Changed),
+        report.count(&at("{image}.source{base64}.data"), Kind::Count),
         1,
         "{report}"
     );
-    assert_eq!(report.rows.len(), 1, "{report}");
+    assert_eq!(
+        report.count(&at("{text}.text"), Kind::Unheld),
+        1,
+        "{report}"
+    );
+    assert_eq!(report.rows.len(), 2, "{report}");
+
+    let report = claude_code_v3(false, Fault::WrongDirection).check(&claude_code::TABLE, &control);
+    assert_eq!(report.count(thanks, Kind::Changed), 1, "{report}");
+    assert_eq!(report.count("window:text/out/payload", Kind::Invented), 1);
+    assert_eq!(report.count("window:text/out/payload", Kind::Count), 1);
+    assert_eq!(report.count(thanks, Kind::Unheld), 1);
+    assert_eq!(report.rows.len(), 4, "{report}");
 
     let report = claude_code_v3(false, Fault::Extra).check(&claude_code::TABLE, &control);
     assert_eq!(
@@ -667,7 +689,9 @@ fn the_gate_passes_a_right_rendering_and_names_each_fault() {
         1,
         "{report}"
     );
-    assert_eq!(report.rows.len(), 1, "{report}");
+    assert_eq!(report.count("window:text/in/payload", Kind::Count), 1);
+    assert_eq!(report.count(thanks, Kind::Unheld), 1);
+    assert_eq!(report.rows.len(), 3, "{report}");
 }
 
 #[test]
@@ -686,7 +710,7 @@ fn the_gate_reports_attributes_it_does_not_know() {
     chain.fragment += fragment;
     let report = chain.check(&claude_code::TABLE, &control);
     assert_eq!(
-        report.count(&format!("window:annotation/attr:{stray:X}"), Kind::Invented),
+        report.count("window:annotation/attr:<id>", Kind::Invented),
         1,
         "{report}"
     );
@@ -856,8 +880,9 @@ fn witness_chatgpt_loses_the_recipient() {
     eprintln!("main, chatgpt:\n{report}");
     assert_eq!(report.count(RECIPIENT, Kind::Missing), 1, "{report}");
     // Her call's input itself is kept, and so is every message's text.
-    assert!(
-        !report.names("[].mapping.<id>.message.content{code}.text"),
+    assert_eq!(
+        report.count("[].mapping.<id>.message.content{code}.text", Kind::Missing),
+        0,
         "{report}"
     );
     assert_eq!(
@@ -868,4 +893,308 @@ fn witness_chatgpt_loses_the_recipient() {
         0,
         "{report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round-2 holes: each fixture is an importer output that is wrong in exactly
+// one way the round-1 gate did not see.
+
+/// G1: an extra `out` copy of an `in` prompt. Every value it holds is in the
+/// source, under another direction; that makes it invented, not changed.
+#[test]
+fn g1_an_out_copy_of_an_in_prompt_is_invented() {
+    use v3::fact::{direction::*, modality::*};
+    let control = claude_code_source(&[RESULT_TEXT, RESULT_IMAGE]);
+    let mut chain = claude_code_v3(false, Fault::None);
+    chain.push(Step {
+        fact: said(TEXT, OUT, "Thanks."),
+        witness: by("assistant", iso("2026-03-01T10:00:04.000Z")),
+        ..Step::default()
+    });
+    let report = chain.check(&claude_code::TABLE, &control);
+    eprintln!("g1:\n{report}");
+    assert!(!report.passed(), "an out copy of an in prompt passed");
+    assert_eq!(
+        report.count("window:text/out/payload", Kind::Invented),
+        1,
+        "{report}"
+    );
+}
+
+/// A synthetic transcript in which she runs one identical call twice.
+fn twice_source() -> String {
+    let call = |uuid: &str, parent: &str, second: u32, id: &str, msg: &str| {
+        format!(
+            r#"{{"type":"assistant","sessionId":"s-1","uuid":"{uuid}","parentUuid":"{parent}","timestamp":"2026-03-01T10:00:0{second}.000Z","requestId":"req_{msg}","message":{{"id":"{msg}","type":"message","role":"assistant","model":"synthetic-model","content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"ls"}}}}],"stop_reason":"tool_use","stop_sequence":null,"usage":{{"input_tokens":1}}}}}}"#
+        )
+    };
+    let result = |uuid: &str, parent: &str, second: u32, id: &str| {
+        format!(
+            r#"{{"type":"user","sessionId":"s-1","uuid":"{uuid}","parentUuid":"{parent}","timestamp":"2026-03-01T10:00:0{second}.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{id}","is_error":false,"content":[{{"type":"text","text":"a b"}}]}}]}}}}"#
+        )
+    };
+    [
+        r#"{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","message":{"role":"user","content":"List it twice."}}"#.to_owned(),
+        call("a1", "u1", 1, "toolu_1", "msg_1"),
+        result("u2", "a1", 2, "toolu_1"),
+        // The second call at the first one's time: its loss drops no token.
+        call("a2", "u2", 1, "toolu_2", "msg_2"),
+        result("u3", "a2", 4, "toolu_2"),
+        r#"{"type":"assistant","sessionId":"s-1","uuid":"a3","parentUuid":"u3","timestamp":"2026-03-01T10:00:05.000Z","requestId":"req_3","message":{"id":"msg_3","type":"message","role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"Same both times."}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1}}}"#.to_owned(),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// What a v3 importer must make of [`twice_source`]; with `drop_second`,
+/// the second call is lost and its result hangs on the first.
+fn twice_v3(drop_second: bool) -> Chain {
+    use v3::fact::{direction::*, modality::*};
+    let mut chain = Chain::new(SOURCE_CLAUDE_CODE);
+    let at = |second: u32| iso(&format!("2026-03-01T10:00:0{second}.000Z"));
+    chain.push(Step {
+        fact: said(TEXT, IN, "List it twice."),
+        witness: by("user", at(0)),
+        ..Step::default()
+    });
+    let call = |second: u32| Step {
+        fact: FactCore {
+            modality: Some(TOOL_CALL),
+            direction: Some(OUT),
+            tool_name: Some("Bash".to_owned()),
+            structure: Some(tree(r#"{"command":"ls"}"#)),
+            ..FactCore::default()
+        },
+        ends: vec![v3::node::ends::TOOL_USE],
+        witness: by("assistant", at(second)),
+    };
+    let result = |chain: &mut Chain, second: u32| {
+        chain.push(Step {
+            fact: FactCore {
+                modality: Some(TOOL_RESULT),
+                direction: Some(IN),
+                status: Some(v3::fact::status::OK),
+                ..FactCore::default()
+            },
+            witness: by("user", at(second)),
+            ..Step::default()
+        });
+        chain.push(Step {
+            fact: said(TEXT, IN, "a b"),
+            witness: by("user", at(second)),
+            ..Step::default()
+        });
+    };
+    chain.push(call(1));
+    result(&mut chain, 2);
+    if !drop_second {
+        chain.push(call(1));
+    }
+    result(&mut chain, 4);
+    let mut leaf = by("assistant", at(5));
+    leaf.source_locator = Some("s-1".to_owned());
+    chain.push(Step {
+        fact: said(TEXT, OUT, "Same both times."),
+        ends: vec![v3::node::ends::END_TURN],
+        witness: leaf,
+    });
+    chain
+}
+
+/// G2: copies converge on one fact, so a set comparison over the unit cannot
+/// see an identical occurrence go missing; a window compared with the source
+/// chain behind its record, occurrence by occurrence, can.
+#[test]
+fn g2_a_dropped_repeated_identical_call_fails() {
+    let source = twice_source();
+    let report = twice_v3(false).check(&claude_code::TABLE, &source);
+    assert!(report.passed(), "{report}");
+    let report = twice_v3(true).check(&claude_code::TABLE, &source);
+    eprintln!("g2:\n{report}");
+    assert!(!report.passed(), "a dropped repeated call passed");
+    let call = "{assistant}.message{message}.content[]{tool_use}.input";
+    assert_eq!(report.count(call, Kind::Unheld), 1, "{report}");
+}
+
+/// G3: a correlator names one leaf; an object under a correlator path is
+/// walked like any other, so nothing can hide inside it.
+#[test]
+fn g3_an_unknown_member_inside_a_correlator_subtree_fails() {
+    let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"b1","parentUuid":null,"logicalParentUuid":"a0","sessionId":"s-1","timestamp":"2026-03-01T10:00:04.000Z","content":"Conversation compacted","level":"info","isMeta":false,"compactMetadata":{"trigger":"auto","preTokens":100,"preservedSegment":{"headUuid":"a0","tailUuid":"a0","anchorUuid":"c1","novel":"hidden"}}}"#;
+    let rows = kinds(&walk(&claude_code::TABLE, boundary.as_bytes()));
+    eprintln!("g3: {rows:?}");
+    assert!(
+        rows.contains(&(
+            "{system}.compactMetadata.preservedSegment.novel".to_owned(),
+            Kind::Unknown
+        )),
+        "{rows:?}"
+    );
+}
+
+/// G4: a fact, a gloss or an annotation that no window reaches is reported.
+#[test]
+fn g4_what_no_window_reaches_is_reported() {
+    use v3::fact::{direction::*, modality::*};
+    let control = claude_code_source(&[RESULT_TEXT, RESULT_IMAGE]);
+    let stray_fact = || unexported(fact(said(TEXT, IN, "Nobody was shown this.")).unwrap());
+    let elsewhere = trible_genid_for_tests();
+    let strays: [(&str, Fragment); 3] = [
+        ("fact", stray_fact()),
+        (
+            "gloss",
+            gloss(elsewhere, v3::gloss::category::TITLE, "A title of nothing").unwrap(),
+        ),
+        (
+            "annotation",
+            annotate_node(
+                elsewhere,
+                &NodeAnnotations {
+                    ends: vec![v3::node::ends::END_TURN],
+                    ..NodeAnnotations::default()
+                },
+            ),
+        ),
+    ];
+    for (what, stray) in strays {
+        let mut chain = claude_code_v3(false, Fault::None);
+        chain.fragment += stray;
+        let report = chain.check(&claude_code::TABLE, &control);
+        eprintln!("g4 {what}:\n{report}");
+        assert!(!report.passed(), "a stray {what} passed");
+    }
+}
+
+/// G5: a report row never prints an id-like path segment.
+#[test]
+fn g5_report_paths_hold_no_ids() {
+    let uuid = "3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f";
+    let hex = "a7968a0b1c2d3e4f";
+    let line = format!(
+        r#"{{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","message":{{"role":"user","content":"Hi."}},"{uuid}":1,"{hex}":2,"12345":3}}"#
+    );
+    let mut chain = Chain::new(SOURCE_CLAUDE_CODE);
+    let mut leaf = by("user", iso("2026-03-01T10:00:00.000Z"));
+    leaf.source_locator = Some("s-1".to_owned());
+    chain.push(Step {
+        fact: said(v3::fact::modality::TEXT, v3::fact::direction::IN, "Hi."),
+        witness: leaf,
+        ..Step::default()
+    });
+    let report = chain.check(&claude_code::TABLE, &line);
+    eprintln!("g5:\n{report}");
+    assert!(!report.passed());
+    for row in &report.rows {
+        for id in [uuid, hex, "12345"] {
+            assert!(!row.path.contains(id), "{}", row.path);
+        }
+    }
+    assert_eq!(report.count("{user}.<id>", Kind::Unknown), 1, "{report}");
+}
+
+/// G3: an entry the importer never reads is no correlator. Each of these
+/// fails until the importer reads it or its meaning is verified.
+#[test]
+fn g3_correlators_the_importer_never_reads_are_open() {
+    let user = r#"{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","message":{"role":"user","content":"Hi."},"refusedMessageId":"m","sourceToolAssistantUUID":"a","sourceToolUseID":"t"}"#;
+    let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"b1","parentUuid":null,"logicalParentUuid":"a0","sessionId":"s-1","timestamp":"2026-03-01T10:00:04.000Z","content":"Conversation compacted","level":"info","isMeta":false,"compactMetadata":{"trigger":"auto","preTokens":100,"preservedSegment":{"headUuid":"a0","tailUuid":"a0","anchorUuid":"c1"},"preservedMessages":{"uuids":["a0"],"allUuids":["a0"],"anchorUuid":"c1"}}}"#;
+    let source = format!("{user}\n{boundary}\n");
+    let rows = kinds(&walk(&claude_code::TABLE, source.as_bytes()));
+    for open in [
+        "{user}.refusedMessageId",
+        "{user}.sourceToolAssistantUUID",
+        "{user}.sourceToolUseID",
+        "{system}.compactMetadata.preservedMessages.allUuids[]",
+        "{system}.compactMetadata.preservedMessages.anchorUuid",
+    ] {
+        assert!(
+            rows.contains(&(open.to_owned(), Kind::Open)),
+            "{open}: {rows:?}"
+        );
+    }
+    // The leaves the importer reads are correlators, and nothing else
+    // fails.
+    assert_eq!(rows.len(), 5, "{rows:?}");
+}
+
+/// G3, statically: every correlator and order field of the Claude Code
+/// table is named in the importer's source, or by a condition of the table.
+#[test]
+fn g3_the_importer_reads_every_correlator_it_declares() {
+    let importer = include_str!("../claude_code.rs");
+    let conditioned: Vec<&str> = claude_code::TABLE
+        .entries
+        .iter()
+        .flat_map(|entry| entry.when.iter())
+        .filter_map(|cond| match cond {
+            Cond::Is(field, _)
+            | Cond::IsNot(field, _)
+            | Cond::Prefix(field, _)
+            | Cond::Present(field)
+            | Cond::Absent(field)
+            | Cond::Sibling(field, _)
+            | Cond::SiblingNot(field, _) => Some(*field),
+        })
+        .collect();
+    let mut unread = Vec::new();
+    for entry in claude_code::TABLE.entries {
+        // A vocabulary reads its own value: the walk fails any value it
+        // does not name.
+        let declared = matches!(
+            entry.class,
+            Class::Correlator
+                | Class::Structure(Structure::Order)
+                | Class::Structure(Structure::Shape(_))
+        );
+        if !declared {
+            continue;
+        }
+        let name = entry
+            .path
+            .rsplit(['.', '{', '}', '[', ']'])
+            .find(|segment| !segment.is_empty())
+            .unwrap_or_default();
+        let named = [
+            format!("\"{name}\""),
+            format!(".{name}\""),
+            format!("\"{name}."),
+        ]
+        .iter()
+        .any(|spelled| importer.contains(spelled.as_str()))
+            || conditioned
+                .iter()
+                .any(|field| *field == name || field.ends_with(&format!(".{name}")));
+        if !named {
+            unread.push(entry.path);
+        }
+    }
+    assert!(unread.is_empty(), "{unread:?}");
+}
+
+/// G5: the normalizer never touches a path the tables name.
+#[test]
+fn g5_no_table_path_looks_like_an_id() {
+    for table in [&claude_code::TABLE, &chatgpt::TABLE, &TEST] {
+        for entry in table.entries {
+            assert_eq!(normalize(entry.path), entry.path);
+        }
+    }
+    for id in [
+        "3f2a9c1e-7b4d-4e8a-9c0f-1a2b3c4d5e6f",
+        "a7968a0b",
+        "12345",
+        "toolu_01AbCdEfGhIjKlMn",
+    ] {
+        assert!(id_like(id), "{id}");
+    }
+    for name in [
+        "tool_use_id",
+        "clear_tool_uses_20250919",
+        "base64",
+        "deadbeef",
+        "input_transformations",
+        "preCompactArtifactReadVersions",
+    ] {
+        assert!(!id_like(name), "{name}");
+    }
 }

@@ -1,9 +1,9 @@
 //! A: the gate's rendering of what an importer produced.
 //!
 //! It reads one unit's `TribleSet` (and its blobs) and nothing else. For
-//! every witnessed leaf, and for the predecessor of every node that holds an
-//! `out` fact, it walks the window back to its root along `previous` and
-//! renders each node as tokens:
+//! every witnessed node it walks the window back to its root along
+//! `previous` (each node once: the windows form a graph) and renders each
+//! node as tokens:
 //!
 //! - every attribute of every fact the node holds, under the fact's modality
 //!   and direction (a `structure` as its `json_tree` leaves);
@@ -14,8 +14,13 @@
 //! kind tags, a gap's `absent`, derived actor ids) render nothing. Every
 //! other attribute renders, and one A does not know renders under its id,
 //! so it can only ever be reported, never pass unseen.
+//!
+//! Then it lists every entity in the `TribleSet` and reports each one no
+//! window reached: a fact no node on a window holds, a node on no window, a
+//! witness, gloss or citation of no window's node, an annotation of an id no
+//! window holds.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anybytes::{Bytes, View};
 use triblespace::core::import::json_tree;
@@ -30,12 +35,25 @@ use super::{JsonLeaf, Kind, Token, Value};
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag as main;
 
-/// What A rendered: each window as its nodes' token sets, root first.
+/// What A rendered: every node on a witnessed window, with its tokens and
+/// its place.
 #[derive(Debug, Default)]
 pub struct Rendered {
-    pub windows: Vec<Vec<BTreeSet<Token>>>,
+    pub graph: Vec<GraphNode>,
     /// Findings: (path, kind, occurrence label).
     pub rows: Vec<(String, Kind, String)>,
+}
+
+/// One node of the window graph.
+#[derive(Debug)]
+pub struct GraphNode {
+    /// Its one predecessor (an index into the graph); `None` at a root, and
+    /// where the predecessor is ambiguous (reported).
+    pub previous: Option<usize>,
+    /// Every token: its fact's, and its annotations'.
+    pub tokens: BTreeSet<Token>,
+    /// Whether a witness projects to it.
+    pub witnessed: bool,
 }
 
 type Raw = Inline<UnknownInline>;
@@ -47,37 +65,62 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
         blobs,
         nodes: BTreeMap::new(),
         rows: Vec::new(),
+        reached: BTreeSet::new(),
     };
     let witnessed: BTreeSet<Id> = find!(
         node: Id,
         pattern!(facts, [{ _?witness @ main::source_projection::projects_to: ?node }])
     )
     .collect();
-    let mut ends = BTreeSet::new();
-    for &node in &witnessed {
-        let followed = exists!(pattern!(facts, [{ _?next @ main::block::previous: node }]));
-        if !followed {
-            ends.insert(node);
+    let mut index: HashMap<Id, usize> = HashMap::new();
+    let mut graph: Vec<GraphNode> = Vec::new();
+    for &start in &witnessed {
+        // Climb to a node already placed, or to a root.
+        let mut climbed: Vec<(Id, Option<Id>)> = Vec::new();
+        let mut on_path = BTreeSet::new();
+        let mut cursor = Some(start);
+        while let Some(node) = cursor {
+            if index.contains_key(&node) {
+                break;
+            }
+            on_path.insert(node);
+            let previous = renderer.predecessors(node);
+            let up = match previous.as_slice() {
+                [] => None,
+                [one] if on_path.contains(one) => {
+                    renderer.rows.push((
+                        "window:cycle".to_owned(),
+                        Kind::Ambiguous,
+                        format!("{node:X}"),
+                    ));
+                    None
+                }
+                [one] => Some(*one),
+                _ => {
+                    renderer.rows.push((
+                        "window:previous".to_owned(),
+                        Kind::Ambiguous,
+                        format!("{node:X}"),
+                    ));
+                    None
+                }
+            };
+            climbed.push((node, up));
+            cursor = up;
         }
-        let produced = exists!(pattern!(facts, [
-                { node @ main::block::holds: _?fact },
-            { _?fact @ main::content_fact::direction: main::content_fact::direction::OUT },
-        ]));
-        if produced {
-            ends.extend(renderer.predecessors(node));
+        for (node, up) in climbed.into_iter().rev() {
+            let tokens = renderer.node(node);
+            index.insert(node, graph.len());
+            graph.push(GraphNode {
+                previous: up.and_then(|up| index.get(&up).copied()),
+                tokens,
+                witnessed: witnessed.contains(&node),
+            });
         }
     }
-    let mut windows = Vec::new();
-    for end in ends {
-        let window: Vec<BTreeSet<Token>> = renderer
-            .window(end)
-            .into_iter()
-            .map(|node| renderer.node(node))
-            .collect();
-        windows.push(window);
-    }
+    renderer.unreached();
     Rendered {
-        windows,
+        graph,
         rows: renderer.rows,
     }
 }
@@ -87,6 +130,8 @@ struct Renderer<'a, B> {
     blobs: &'a B,
     nodes: BTreeMap<Id, BTreeSet<Token>>,
     rows: Vec<(String, Kind, String)>,
+    /// Every entity a window reached.
+    reached: BTreeSet<Id>,
 }
 
 fn hex(raw: &[u8]) -> String {
@@ -116,42 +161,6 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             pattern!(self.facts, [{ node @ main::block::previous: ?previous }])
         )
         .collect()
-    }
-
-    /// Root first. A node with several predecessors ends the walk there and
-    /// is reported: a window she was sampled from has one past.
-    fn window(&mut self, end: Id) -> Vec<Id> {
-        let mut window = vec![end];
-        let mut seen = BTreeSet::from([end]);
-        let mut cursor = end;
-        loop {
-            let previous = self.predecessors(cursor);
-            match previous.as_slice() {
-                [] => break,
-                [one] if seen.insert(*one) => {
-                    window.push(*one);
-                    cursor = *one;
-                }
-                [_] => {
-                    self.rows.push((
-                        "window:cycle".to_owned(),
-                        Kind::Ambiguous,
-                        format!("{cursor:X}"),
-                    ));
-                    break;
-                }
-                _ => {
-                    self.rows.push((
-                        "window:previous".to_owned(),
-                        Kind::Ambiguous,
-                        format!("{cursor:X}"),
-                    ));
-                    break;
-                }
-            }
-        }
-        window.reverse();
-        window
     }
 
     fn text(&mut self, raw: Raw, at: &str) -> Value {
@@ -185,6 +194,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
     /// The `metadata::name`s of an entity (a media type, a sense, a vendor
     /// model), each as a text value.
     fn names(&mut self, entity: Id, at: &str) -> Vec<Value> {
+        self.reached.insert(entity);
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
             name: Inline<Handle<UTF8String>>,
             pattern!(self.facts, [{ entity @ metadata::name: ?name }])
@@ -208,6 +218,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         if let Some(tokens) = self.nodes.get(&node) {
             return tokens.clone();
         }
+        self.reached.insert(node);
         let mut tokens = BTreeSet::new();
         for (attribute, raw) in self.attributes(node) {
             if attribute == main::block::holds.id() {
@@ -242,7 +253,29 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         )
         .collect();
         for witness in witnesses {
+            self.reached.insert(witness);
             self.witness(witness, &mut tokens);
+        }
+        let glossed: Vec<Id> = find!(
+            gloss: Id,
+            pattern!(self.facts, [{ ?gloss @ v3::gloss::describes: node }])
+        )
+        .collect();
+        for gloss in glossed {
+            self.reached.insert(gloss);
+            for (attribute, raw) in self.attributes(gloss) {
+                if attribute == v3::gloss::generated_by.id() {
+                    if let Some(model) = Self::id(raw) {
+                        self.reached.insert(model);
+                    }
+                } else if attribute != v3::gloss::describes.id()
+                    && attribute != v3::gloss::category.id()
+                    && attribute != v3::gloss::text.id()
+                    && !(attribute == metadata::tag.id() && Self::id(raw) == Some(v3::gloss::KIND))
+                {
+                    tokens.insert(unknown(attribute, raw));
+                }
+            }
         }
         let glosses: Vec<(Id, Inline<Handle<UTF8String>>)> = find!(
             (category: Id, text: Inline<Handle<UTF8String>>),
@@ -260,6 +293,25 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             };
             let value = self.text(text.transmute(), "annotation/gloss");
             tokens.insert(annotation(&format!("gloss:{name}"), value));
+        }
+        let cited: Vec<Id> = find!(
+            citation: Id,
+            pattern!(self.facts, [{ ?citation @ v3::citation::cites: node }])
+        )
+        .collect();
+        for citation in cited {
+            self.reached.insert(citation);
+            for (attribute, raw) in self.attributes(citation) {
+                if attribute != v3::citation::cites.id()
+                    && attribute != v3::citation::start.id()
+                    && attribute != v3::citation::end.id()
+                    && attribute != v3::citation::uri.id()
+                    && !(attribute == metadata::tag.id()
+                        && Self::id(raw) == Some(v3::citation::KIND))
+                {
+                    tokens.insert(unknown(attribute, raw));
+                }
+            }
         }
         let citations: Vec<(Inline<U256BE>, Inline<U256BE>, Inline<Handle<UTF8String>>)> = find!(
             (start: Inline<U256BE>, end: Inline<U256BE>, uri: Inline<Handle<UTF8String>>),
@@ -295,6 +347,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
     }
 
     fn fact(&mut self, fact: Id, tokens: &mut BTreeSet<Token>) {
+        self.reached.insert(fact);
         let attributes = self.attributes(fact);
         let of = |attribute: Id| -> Vec<Id> {
             attributes
@@ -444,6 +497,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             ));
             return;
         }
+        self.reached.insert(node);
         let kinds: Vec<Id> = find!(
             kind: Id,
             pattern!(self.facts, [{ node @ json_tree::kind: ?kind }])
@@ -452,15 +506,16 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         for kind in kinds {
             if kind == json_tree::kind_object {
                 let mut fields: Vec<(String, Id)> = Vec::new();
-                let entries: Vec<(Inline<Handle<UTF8String>>, Id)> = find!(
-                    (name: Inline<Handle<UTF8String>>, value: Id),
+                let entries: Vec<(Id, Inline<Handle<UTF8String>>, Id)> = find!(
+                    (entry: Id, name: Inline<Handle<UTF8String>>, value: Id),
                     pattern!(self.facts, [
-                        { node @ json_tree::object_field: _?entry },
-                        { _?entry @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+                        { node @ json_tree::object_field: ?entry },
+                        { ?entry @ json_tree::field_name: ?name, json_tree::field_value: ?value },
                     ])
                 )
                 .collect();
-                for (name, value) in entries {
+                for (entry, name, value) in entries {
+                    self.reached.insert(entry);
                     match self.text(name.transmute(), "structure") {
                         Value::Text(name) => fields.push((name, value)),
                         _ => continue,
@@ -477,9 +532,9 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     pointer.truncate(len);
                 }
             } else if kind == json_tree::kind_array {
-                let entries: Vec<(Inline<U256BE>, Id)> = find!(
-                    (index: Inline<U256BE>, value: Id),
-                    pattern!(self.facts, [{ _?entry @
+                let entries: Vec<(Id, Inline<U256BE>, Id)> = find!(
+                    (entry: Id, index: Inline<U256BE>, value: Id),
+                    pattern!(self.facts, [{ ?entry @
                         json_tree::array_parent: node,
                         json_tree::array_index: ?index,
                         json_tree::array_value: ?value,
@@ -489,7 +544,8 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 if entries.is_empty() {
                     out.push(Value::Json(pointer.clone(), JsonLeaf::EmptyArray));
                 }
-                for (index, value) in entries {
+                for (entry, index, value) in entries {
+                    self.reached.insert(entry);
                     let index = match index.try_from_inline::<u128>() {
                         Ok(index) => index.to_string(),
                         Err(_) => hex(&index.raw),
@@ -547,6 +603,47 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         }
     }
 
+    /// A media type's essence entity rides along with it.
+    fn essence(&mut self, entity: Id) {
+        let essences: Vec<Id> = find!(
+            essence: Id,
+            pattern!(self.facts, [{ entity @ v3::media_type::essence: ?essence }])
+        )
+        .collect();
+        self.reached.extend(essences);
+    }
+
+    /// Report every entity of the set that no window reached, by kind.
+    fn unreached(&mut self) {
+        let subjects: BTreeSet<Id> = self.facts.iter().map(|trible| *trible.e()).collect();
+        let kinds = [
+            (v3::fact::KIND, "fact"),
+            (main::block::KIND, "node"),
+            (main::source_projection::KIND, "witness"),
+            (v3::gloss::KIND, "gloss"),
+            (v3::citation::KIND, "citation"),
+        ];
+        for entity in subjects {
+            if self.reached.contains(&entity) {
+                continue;
+            }
+            let tags: Vec<Id> = find!(
+                tag: Id,
+                pattern!(self.facts, [{ entity @ metadata::tag: ?tag }])
+            )
+            .collect();
+            let kind = kinds
+                .iter()
+                .find(|(kind, _)| tags.contains(kind))
+                .map_or("entity", |(_, name)| *name);
+            self.rows.push((
+                format!("window:unreached/{kind}"),
+                Kind::Unreached,
+                format!("{entity:X}"),
+            ));
+        }
+    }
+
     fn witness(&mut self, witness: Id, tokens: &mut BTreeSet<Token>) {
         for (attribute, raw) in self.attributes(witness) {
             let w = &main::source_projection::KIND;
@@ -595,6 +692,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                         for value in self.names(entity, &format!("annotation/{name}")) {
                             tokens.insert(annotation(name, value));
                         }
+                        self.essence(entity);
                     }
                     None => {
                         tokens.insert(annotation(name, Value::Raw(hex(&raw.raw))));

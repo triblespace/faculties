@@ -7,7 +7,9 @@
 //! metadata keys, attachments, multimodal parts) is added with the v3
 //! ChatGPT importer.
 
-use super::{Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure};
+use super::{
+    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure, Windows,
+};
 
 const ROLE: &str = "message.author.role";
 const RECIPIENT: &str = "message.recipient";
@@ -180,5 +182,6 @@ pub const TABLE: FieldTable = FieldTable {
         id: "id",
         parent: "parent",
     },
+    windows: Windows::NONE,
     entries: ENTRIES,
 };

@@ -29,7 +29,10 @@
 //! `context_management.applied_edits`) are structure: they shape the window
 //! an `out` fact was sampled from, and hold no value of their own.
 
-use super::{Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure};
+use super::{
+    Class, Compaction, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Requests,
+    Structure, Windows,
+};
 use crate::schemas::blockdag::content_fact::sealed;
 
 const ENVELOPE: DropReason = DropReason::Machinery(
@@ -309,9 +312,9 @@ const USER_FIELDS: &[Entry] = &[
         "{user}.interruptedMessageId",
         Class::Annotation(&[("ends", Decode::ConstTerm("interrupted"))]),
     ),
-    Entry::new("{user}.refusedMessageId", Class::Correlator),
-    Entry::new("{user}.sourceToolAssistantUUID", Class::Correlator),
-    Entry::new("{user}.sourceToolUseID", Class::Correlator),
+    Entry::new("{user}.refusedMessageId", Class::Open(NEVER_READ)),
+    Entry::new("{user}.sourceToolAssistantUUID", Class::Open(NEVER_READ)),
+    Entry::new("{user}.sourceToolUseID", Class::Open(NEVER_READ)),
     Entry::new("{user}.promptId", Class::Drop(DropReason::ProviderId)),
     Entry::new("{user}.imagePasteIds", Class::Drop(DropReason::ProviderId)),
     Entry::new(
@@ -382,7 +385,7 @@ const USER_FIELDS: &[Entry] = &[
 
 const ASSISTANT_FIELDS: &[Entry] = &[
     Entry::new("{assistant}.requestId", Class::Drop(DropReason::ProviderId)),
-    Entry::new("{assistant}.requestRef", Class::Correlator),
+    Entry::new("{assistant}.requestRef", Class::Open(NEVER_READ)),
     Entry::new(
         "{assistant}.message{message}.type",
         Class::Structure(Structure::Discriminator),
@@ -701,7 +704,9 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
     ),
     Entry::new(
         "{attachment}.renderedBesideToolResult",
-        Class::Structure(Structure::Vocabulary(&["true", "false"])),
+        Class::Open(
+            "where the attachment renders beside a tool result: the importer never reads it (G3)",
+        ),
     ),
 ];
 
@@ -801,12 +806,28 @@ const SYSTEM_FIELDS: &[Entry] = &[
     .when(&[Cond::Is("subtype", "compact_boundary")]),
     Entry::new("{system}.logicalParentUuid", Class::Correlator),
     Entry::new(
-        "{system}.compactMetadata.preservedSegment",
+        "{system}.compactMetadata.preservedSegment.headUuid",
         Class::Correlator,
     ),
     Entry::new(
-        "{system}.compactMetadata.preservedMessages",
+        "{system}.compactMetadata.preservedSegment.tailUuid",
         Class::Correlator,
+    ),
+    Entry::new(
+        "{system}.compactMetadata.preservedSegment.anchorUuid",
+        Class::Correlator,
+    ),
+    Entry::new(
+        "{system}.compactMetadata.preservedMessages.uuids[]",
+        Class::Correlator,
+    ),
+    Entry::new(
+        "{system}.compactMetadata.preservedMessages.allUuids[]",
+        Class::Open(NEVER_READ),
+    ),
+    Entry::new(
+        "{system}.compactMetadata.preservedMessages.anchorUuid",
+        Class::Open(NEVER_READ),
     ),
     Entry::new(
         "{system}.compactMetadata.preCompactDiscoveredTools",
@@ -857,7 +878,7 @@ const OTHER_RECORDS: &[Entry] = &[
         "{api-request-shape}.type",
         Class::Structure(Structure::Discriminator),
     ),
-    Entry::new("{api-request-shape}.shapeHash", Class::Correlator),
+    Entry::new("{api-request-shape}.shapeHash", Class::Open(NEVER_READ)),
     Entry::new(
         "{api-request-shape}.sessionId",
         Class::Drop(DropReason::ProviderId),
@@ -989,6 +1010,10 @@ const OTHER_RECORDS: &[Entry] = &[
     ),
 ];
 
+/// A provider id the table once called a correlator although the importer
+/// never pairs anything with it. Its meaning in her window is unverified.
+const NEVER_READ: &str = "a correlator the importer never reads (G3): its meaning is unverified";
+
 const DEFERRED: &str =
     "a deferred tool: its definition renders where a tool_reference loads it; not built";
 
@@ -1044,6 +1069,29 @@ pub const TABLE: FieldTable = FieldTable {
     order: Order::Parents {
         id: "uuid",
         parent: "parentUuid",
+    },
+    windows: Windows {
+        // The system prompt and tools she was given open every later window.
+        prefix: &["api-request-shape"],
+        compaction: Some(Compaction {
+            shape: "system",
+            head: "compactMetadata.preservedSegment.headUuid",
+            tail: "compactMetadata.preservedSegment.tailUuid",
+            anchor: "compactMetadata.preservedSegment.anchorUuid",
+        }),
+        // One API message spans the records sharing its id (facts.md 7).
+        requests: Some(Requests {
+            shape: "assistant",
+            id: "message.id",
+            dropped: ("message.input_transformations", "thinking_dropped", "path"),
+            cleared: (
+                "message.context_management.applied_edits",
+                "clear_tool_uses_20250919",
+                "cleared_tool_uses",
+            ),
+            result: ("{user}.message.content[]{tool_result}", "tool-result"),
+            thinking: "thinking",
+        }),
     },
     entries: &ENTRIES,
 };

@@ -20,23 +20,33 @@
 //!
 //! [`check`] passes a unit when:
 //!
-//! 1. B's token set equals A's: every token B found is in a window (else
-//!    *missing*, or *changed* when the same attribute and value sit in a
-//!    window under another modality or direction);
-//! 2. every token A rendered traces back to B (else *invented*);
-//! 3. along every window, the facts follow the source's order rule (else
-//!    *order*);
-//! 4. B found nothing the table does not name, and every drop held.
+//! 1. every token B found is in a window (else *missing*, or *changed* when
+//!    the same attribute and value sit in a window under another modality or
+//!    direction);
+//! 2. every token A rendered is, exactly, a token B found (else *invented*:
+//!    the same value under another modality or direction is invented too);
+//! 3. every witnessed window holds exactly the occurrences of the source
+//!    window behind its record, each as often as the source holds it and in
+//!    its order (else *count* or *order*), and every source window is held
+//!    by a witnessed window (else *unheld*);
+//! 4. every entity A was given is on a window, or annotates one (else
+//!    *unreached*);
+//! 5. B found nothing the table does not name, and every drop held.
 //!
-//! Sets, not multisets: copies of one item converge on one fact, so the same
-//! token may stand for several source occurrences. `json_tree` objects
-//! compare order-free, because a structure token names its leaf by key
-//! path. A gap fact (`absent`) is structure: it holds no value to compare.
+//! Points 1 and 2 compare sets over the unit: copies of one item converge on
+//! one fact. Point 3 is what counts them: it compares per witness, never by
+//! collapsing the unit, so a repeated identical occurrence the importer lost
+//! is a missing occurrence there. A window is compared as the sequence of
+//! its items (the fact tokens of one node, the fact tokens of one source
+//! occurrence); `json_tree` objects compare order-free, because a structure
+//! token names its leaf by key path. A gap fact (`absent`) is structure: it
+//! holds no value, and a node that holds no value is no item.
 //!
 //! The [`Report`] never holds a value: only format, path, kind and count, so
-//! the gate can run over real transcripts and print its result.
+//! the gate can run over real transcripts and print its result. Path
+//! segments that look like ids print as `<id>` ([`id_like`]).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use triblespace::core::repo::BlobStoreGet;
@@ -102,8 +112,16 @@ pub enum Kind {
     Invented,
     /// A source value is in a window under another modality or direction.
     Changed,
-    /// A window's facts break the source's order.
+    /// A witnessed window holds the occurrences of the source window behind
+    /// its record, in another order.
     Order,
+    /// A witnessed window holds an occurrence more or fewer times than the
+    /// source window behind its record, or a node that is no source item.
+    Count,
+    /// A source window that no witnessed window holds.
+    Unheld,
+    /// An entity A was given that no window reaches.
+    Unreached,
     /// The table names no class for a path (or for its discriminator).
     Unknown,
     /// A vocabulary value the table does not name.
@@ -129,6 +147,9 @@ impl fmt::Display for Kind {
             Kind::Invented => "invented",
             Kind::Changed => "changed",
             Kind::Order => "order",
+            Kind::Count => "count",
+            Kind::Unheld => "unheld",
+            Kind::Unreached => "unreached",
             Kind::Unknown => "unknown",
             Kind::UnknownValue => "unknown-value",
             Kind::Mirror => "mirror",
@@ -221,11 +242,70 @@ pub fn check<B: BlobStoreGet>(
     compare(table, &walked, &rendered)
 }
 
+/// Whether a path segment looks like an id rather than a field name: a
+/// number, a uuid or other hex key of eight digits or more, a prefixed
+/// provider id (`toolu_01…`), or a long mixed run of letters and digits.
+pub fn id_like(segment: &str) -> bool {
+    let digit = |s: &str| s.bytes().any(|b| b.is_ascii_digit());
+    let letter = |s: &str| s.bytes().any(|b| b.is_ascii_alphabetic());
+    let alnum = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    if !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    let hex: String = segment.chars().filter(|c| *c != '-').collect();
+    if hex.len() >= 8 && hex.bytes().all(|b| b.is_ascii_hexdigit()) && digit(&hex) {
+        return true;
+    }
+    if let Some((_, rest)) = segment.split_once(['_', '-']) {
+        if rest.len() >= 12 && alnum(rest) && digit(rest) && letter(rest) {
+            return true;
+        }
+    }
+    segment.len() >= 20 && alnum(segment) && digit(segment)
+}
+
+/// A path with every id-like segment as `<id>`. Segments are what lies
+/// between `.`, `/`, `:`, `{`, `}`, `[`, `]`, `<` and `>`.
+pub fn normalize(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut segment = String::new();
+    let flush = |segment: &mut String, out: &mut String| {
+        if id_like(segment) {
+            out.push_str("<id>");
+        } else {
+            out.push_str(segment);
+        }
+        segment.clear();
+    };
+    for c in path.chars() {
+        if ".:/{}[]<>".contains(c) {
+            flush(&mut segment, &mut out);
+            out.push(c);
+        } else {
+            segment.push(c);
+        }
+    }
+    flush(&mut segment, &mut out);
+    out
+}
+
+type Hash = [u8; 32];
+
+/// The window hash of `before` extended by one item.
+fn step(before: &Hash, item: u32) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(before);
+    hasher.update(&item.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
 /// Compare B's walk with A's rendering.
 pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Rendered) -> Report {
     let mut rows: BTreeMap<(String, Kind), BTreeSet<String>> = BTreeMap::new();
     let mut note = |path: String, kind: Kind, what: String| {
-        rows.entry((path, kind)).or_default().insert(what);
+        rows.entry((normalize(&path), kind))
+            .or_default()
+            .insert(what);
     };
 
     for (path, kind, at) in &walked.rows {
@@ -235,7 +315,11 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
         note(path.clone(), *kind, at.clone());
     }
 
-    let rendered_tokens: BTreeSet<&Token> = rendered.windows.iter().flatten().flatten().collect();
+    let rendered_tokens: BTreeSet<&Token> = rendered
+        .graph
+        .iter()
+        .flat_map(|node| node.tokens.iter())
+        .collect();
     let shapes = |tokens: &mut dyn Iterator<Item = &Token>| {
         let mut shapes: BTreeMap<(String, Value), BTreeSet<(String, String)>> = BTreeMap::new();
         for token in tokens {
@@ -247,7 +331,6 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
         shapes
     };
     let rendered_shapes = shapes(&mut rendered_tokens.iter().copied());
-    let walked_shapes = shapes(&mut walked.tokens.keys());
 
     // A token's identity in a row is its position in the ordered set; the
     // row only counts them.
@@ -265,37 +348,18 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
             note(origin.path.clone(), kind, ordinal.to_string());
         }
     }
+    // Invented: exactly this token is in no source. The same attribute and
+    // value under another modality or direction only labels B's missing
+    // token as changed; it never excuses A's.
     for (ordinal, token) in rendered_tokens.iter().enumerate() {
-        if walked.tokens.contains_key(*token)
-            || walked_shapes.contains_key(&(token.attribute.clone(), token.value.clone()))
-        {
+        if walked.tokens.contains_key(*token) {
             continue;
         }
         note(window_path(token), Kind::Invented, ordinal.to_string());
     }
 
-    // Order: place each window node at the origin of its first fact token
-    // that occurs exactly once in the source, and require consecutive placed
-    // nodes never to run against the source's order.
-    for window in &rendered.windows {
-        let mut last: Option<&Origin> = None;
-        for node in window {
-            let placed = node
-                .iter()
-                .filter(|token| !token.modality.is_empty())
-                .filter_map(|token| match walked.tokens.get(token) {
-                    Some(origins) if origins.len() == 1 => origins.first(),
-                    _ => None,
-                })
-                .next();
-            let Some(origin) = placed else { continue };
-            if let Some(before) = last {
-                if walked.precedes(origin, before) {
-                    note(origin.path.clone(), Kind::Order, format!("{origin:?}"));
-                }
-            }
-            last = Some(origin);
-        }
+    for (path, kind, what) in occurrences(walked, rendered) {
+        note(path, kind, what);
     }
 
     Report {
@@ -309,6 +373,223 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
             })
             .collect(),
     }
+}
+
+/// Per witness: every witnessed window against the source window behind
+/// its record, and every source window against the witnessed windows.
+fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(String, Kind, String)> {
+    let mut rows = Vec::new();
+    let facts: Vec<BTreeSet<Token>> = rendered
+        .graph
+        .iter()
+        .map(|node| {
+            node.tokens
+                .iter()
+                .filter(|token| !token.modality.is_empty())
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let mut ids: BTreeMap<&BTreeSet<Token>, u32> = BTreeMap::new();
+    let mut intern = |tokens| {
+        let next = ids.len() as u32;
+        *ids.entry(tokens).or_insert(next)
+    };
+    let item_ids: Vec<u32> = walked
+        .items
+        .iter()
+        .map(|item| intern(&item.tokens))
+        .collect();
+    let node_ids: Vec<Option<u32>> = facts
+        .iter()
+        .map(|tokens| (!tokens.is_empty()).then(|| intern(tokens)))
+        .collect();
+
+    // A's window hashes, root first; a node is placed after its previous.
+    let mut node_hash: Vec<Option<Hash>> = vec![None; rendered.graph.len()];
+    let mut climbing = vec![false; rendered.graph.len()];
+    for start in 0..rendered.graph.len() {
+        let mut stack = Vec::new();
+        let mut cursor = Some(start);
+        while let Some(at) = cursor {
+            if node_hash[at].is_some() || climbing[at] {
+                break;
+            }
+            climbing[at] = true;
+            stack.push(at);
+            cursor = rendered.graph[at].previous;
+        }
+        for at in stack.into_iter().rev() {
+            let before = rendered.graph[at]
+                .previous
+                .and_then(|previous| node_hash[previous])
+                .unwrap_or([0; 32]);
+            node_hash[at] = Some(match node_ids[at] {
+                Some(id) => step(&before, id),
+                None => before,
+            });
+        }
+    }
+    let held: HashSet<Hash> = rendered
+        .graph
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.witnessed)
+        .filter_map(|(at, _)| node_hash[at])
+        .collect();
+
+    // B's source windows: one per occurrence (record, position).
+    struct Occurrence {
+        record: usize,
+        position: usize,
+        item: usize,
+        hash: Hash,
+    }
+    let mut occurrences: Vec<Occurrence> = Vec::new();
+    let id = |item: usize| item_ids[item];
+    let lines = walked.lines(&id, &step);
+    for record in 0..walked.record_count() {
+        if walked.is_repeat(record) || walked.record_items(record).is_empty() {
+            continue;
+        }
+        let own = walked.ordered(record);
+        let Some(mut hash) = lines[record].and_then(|lines| lines.before) else {
+            rows.push((
+                walked.items[own[0]].path.clone(),
+                Kind::Count,
+                format!("window {record}"),
+            ));
+            continue;
+        };
+        for (position, &item) in own.iter().enumerate() {
+            hash = step(&hash, item_ids[item]);
+            occurrences.push(Occurrence {
+                record,
+                position,
+                item,
+                hash,
+            });
+        }
+    }
+    let sources: HashSet<Hash> = occurrences.iter().map(|o| o.hash).collect();
+
+    // Each witnessed window. A window whose nearest witnessed predecessor
+    // already failed is not reported again.
+    let mut passed: Vec<Option<bool>> = vec![None; rendered.graph.len()];
+    for (at, node) in rendered.graph.iter().enumerate() {
+        if node.witnessed {
+            passed[at] = Some(node_hash[at].is_some_and(|hash| sources.contains(&hash)));
+        }
+    }
+    let multiset = |mut ids: Vec<u32>| {
+        ids.sort_unstable();
+        ids
+    };
+    for (at, node) in rendered.graph.iter().enumerate() {
+        if passed[at] != Some(false) {
+            continue;
+        }
+        let mut cursor = node.previous;
+        let mut inherited = false;
+        while let Some(up) = cursor {
+            if let Some(ok) = passed[up] {
+                inherited = !ok;
+                break;
+            }
+            cursor = rendered.graph[up].previous;
+        }
+        if inherited {
+            continue;
+        }
+        let mut window = Vec::new();
+        let mut cursor = Some(at);
+        while let Some(up) = cursor {
+            window.extend(node_ids[up]);
+            cursor = rendered.graph[up].previous;
+        }
+        // An order fault: the window holds what the source holds before a
+        // record, and as many of that record's own items as it should, in
+        // another order.
+        let window = multiset(window);
+        let reordered = node_ids[at].is_some_and(|id| {
+            occurrences
+                .iter()
+                .filter(|o| item_ids[o.item] == id)
+                .take(64)
+                .any(|o| {
+                    let Some((before, own)) = walked.window(o.record) else {
+                        return false;
+                    };
+                    let mut rest = window.clone();
+                    for &item in &before {
+                        match rest.binary_search(&item_ids[item]) {
+                            Ok(found) => {
+                                rest.remove(found);
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                    let mut own = multiset(own.iter().map(|&item| item_ids[item]).collect());
+                    rest.len() == o.position + 1
+                        && rest.iter().all(|id| match own.binary_search(id) {
+                            Ok(found) => {
+                                own.remove(found);
+                                true
+                            }
+                            Err(_) => false,
+                        })
+                })
+        });
+        let path = match facts[at].first() {
+            Some(token) => walked
+                .tokens
+                .get(token)
+                .and_then(|origins| origins.first())
+                .map(|origin| origin.path.clone())
+                .unwrap_or_else(|| window_path(token)),
+            None => "window:empty".to_owned(),
+        };
+        let kind = if reordered { Kind::Order } else { Kind::Count };
+        rows.push((path, kind, format!("node {at}")));
+    }
+
+    // Each source window. One whose previous occurrence is unheld too is
+    // not reported again.
+    let mut last_of: HashMap<usize, bool> = HashMap::new();
+    let mut previous_held: Option<bool> = None;
+    let mut previous_record = None;
+    for occurrence in &occurrences {
+        let is_held = held.contains(&occurrence.hash);
+        let before = if occurrence.position > 0 && previous_record == Some(occurrence.record) {
+            previous_held
+        } else {
+            let mut cursor = walked.parent(occurrence.record);
+            let mut found = None;
+            let mut seen = BTreeSet::new();
+            while let Some(up) = cursor {
+                if !seen.insert(up) {
+                    break;
+                }
+                if let Some(&ok) = last_of.get(&up) {
+                    found = Some(ok);
+                    break;
+                }
+                cursor = walked.parent(up);
+            }
+            found
+        };
+        if !is_held && before != Some(false) {
+            rows.push((
+                walked.items[occurrence.item].path.clone(),
+                Kind::Unheld,
+                format!("occurrence {} {}", occurrence.record, occurrence.position),
+            ));
+        }
+        previous_held = Some(is_held);
+        previous_record = Some(occurrence.record);
+        last_of.insert(occurrence.record, is_held);
+    }
+    rows
 }
 
 fn window_path(token: &Token) -> String {
