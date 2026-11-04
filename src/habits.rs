@@ -6,6 +6,12 @@
 //! collection. Pause/resume assertions form a predecessor DAG, so set union
 //! keeps concurrent state visible instead of letting time or append order pick
 //! a winner.
+//!
+//! Every reader here is an open-world typed query at its point of use. A fact
+//! a reader does not model is ignored, a record it cannot decode is skipped,
+//! and several values for one attribute are each read: the schema language has
+//! no cardinality, and a union of piles can always supply a second value. No
+//! reader refuses a view, and none first loads the collection into a catalog.
 
 pub mod cli;
 pub mod mcp;
@@ -13,8 +19,8 @@ pub mod operations;
 mod render;
 
 pub use operations::{
-    AddedHabit, EvaluatedHabit, HabitList, HabitObservation, HabitOccurrence, HabitStateChange,
-    Habits,
+    AddedHabit, EvaluatedHabit, HabitCheck, HabitList, HabitObservation, HabitOccurrence,
+    HabitStateChange, Habits,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -25,8 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 use triblespace_paths::{PathExpr, PathIndex, Step};
@@ -42,16 +47,6 @@ use crate::storage::Storage;
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type ScriptHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
-/// Attachment handles of one live definition, selected structurally before
-/// any payload is read.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LiveHabitPayloads {
-    pub habit: Id,
-    pub condition: TextHandle,
-    pub nudge: TextHandle,
-    pub script: Option<ScriptHandle>,
-}
 
 /// Content identity of the Habit collection this pile roots.
 pub fn collection_handle(
@@ -203,143 +198,6 @@ impl Activation {
     }
 }
 
-/// A stopped-world decoding of the complete Habit relation.
-///
-/// This exists for explicit migration and integrity checks. Ordinary Habit
-/// reads query their typed projection directly through [`definitions`],
-/// [`live_definitions`], [`activation`], and [`rows`]; they do not first build
-/// this second in-memory database.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Catalog {
-    habits: BTreeMap<Id, Habit>,
-    completions: BTreeMap<Id, Completion>,
-    assertions: BTreeMap<Id, StateAssertion>,
-}
-
-impl Catalog {
-    pub fn habits(&self) -> impl Iterator<Item = &Habit> {
-        self.habits.values()
-    }
-
-    pub fn habit(&self, id: Id) -> Option<&Habit> {
-        self.habits.get(&id)
-    }
-
-    pub fn completions(&self) -> impl Iterator<Item = &Completion> {
-        self.completions.values()
-    }
-
-    pub fn assertions(&self) -> impl Iterator<Item = &StateAssertion> {
-        self.assertions.values()
-    }
-
-    /// Every definition displaying this name, case-insensitively.
-    ///
-    /// Several results are ordinary, not a conflict: the label is a display
-    /// attribute and nothing owns it. Callers that need one definition must
-    /// disambiguate by id rather than choose.
-    pub fn labelled(&self, label: &str) -> Vec<&Habit> {
-        let label = label.trim().to_ascii_lowercase();
-        self.habits
-            .values()
-            .filter(|habit| habit.label.to_ascii_lowercase() == label)
-            .collect()
-    }
-
-    /// Definitions no other definition supersedes — the current revisions.
-    ///
-    /// Liveness is a property of the supersession DAG and therefore of ids
-    /// alone. It is never derived from the label: a name-based rule is not
-    /// monotonic, because which definition "owns" a name depends on which
-    /// facts a window happens to have observed, so two windows could disagree
-    /// indefinitely while each is locally correct. An explicit edge only ever
-    /// retires, never resurrects, so every window that has seen it agrees and
-    /// order does not matter.
-    pub fn live(&self) -> Vec<&Habit> {
-        let superseded: BTreeSet<Id> = self
-            .habits
-            .values()
-            .flat_map(|habit| habit.supersedes.iter().copied())
-            .collect();
-        self.habits
-            .values()
-            .filter(|habit| !superseded.contains(&habit.id))
-            .collect()
-    }
-
-    /// Whether any other definition supersedes this one.
-    pub fn is_superseded(&self, id: Id) -> bool {
-        self.habits
-            .values()
-            .any(|habit| habit.supersedes.contains(&id))
-    }
-
-    pub fn activation(&self, habit: Id) -> Result<Activation> {
-        if !self.habits.contains_key(&habit) {
-            bail!("unknown Habit {habit:x}");
-        }
-        let graph: BTreeMap<Id, Vec<Id>> = self
-            .assertions
-            .values()
-            .filter(|assertion| assertion.habit == habit)
-            .map(|assertion| (assertion.id, assertion.predecessors.clone()))
-            .collect();
-        let heads = dag_heads(&graph, &format!("state track for Habit {habit:x}"))?;
-        if heads.is_empty() {
-            return Ok(Activation::Active(Vec::new()));
-        }
-        let heads: Vec<_> = heads
-            .into_iter()
-            .map(|id| self.assertions[&id].clone())
-            .collect();
-        let first = heads[0].state;
-        if heads.iter().all(|head| head.state == first) {
-            return Ok(match first {
-                DeclaredState::Active => Activation::Active(heads),
-                DeclaredState::Paused => Activation::Paused(heads),
-            });
-        }
-        Ok(Activation::Forked(heads))
-    }
-
-    /// One row per **live** definition. A superseded revision keeps its facts
-    /// as durable history but is no longer a standing intention, so it is not
-    /// evaluated and cannot come due.
-    ///
-    /// A revision is the same intention, so its completion history includes
-    /// that of every definition it transitively supersedes; see
-    /// [`standing_completions`].
-    pub fn rows(&self) -> Result<Vec<HabitRow>> {
-        let revisions: BTreeMap<Id, Vec<Id>> = self
-            .habits
-            .values()
-            .map(|habit| (habit.id, habit.supersedes.clone()))
-            .collect();
-        let mut rows = Vec::with_capacity(self.habits.len());
-        for habit in self.live() {
-            let mut completed_at = self
-                .completions
-                .values()
-                .filter(|completion| reaches(habit.id, completion.habit, &revisions))
-                .map(|completion| interval_seconds(completion.completed_at, "completion time"))
-                .collect::<Result<Vec<_>>>()?;
-            completed_at.sort_unstable();
-            completed_at.dedup();
-            rows.push(HabitRow {
-                id: habit.id,
-                label: habit.label.clone(),
-                condition: habit.condition.clone(),
-                nudge: habit.nudge.clone(),
-                script: habit.script.clone(),
-                activation: self.activation(habit.id)?,
-                completed_at,
-            });
-        }
-        rows.sort_by(|left, right| (&left.label, left.id).cmp(&(&right.label, right.id)));
-        Ok(rows)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HabitRow {
     pub id: Id,
@@ -429,13 +287,16 @@ fn point_interval(value: IntervalValue, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn interval_seconds(value: IntervalValue, field: &str) -> Result<i64> {
-    point_interval(value, field)?;
-    let (nanoseconds, _): (i128, i128) = value
-        .try_from_inline()
-        .map_err(|error| anyhow!("decode {field}: {error:?}"))?;
-    i64::try_from(nanoseconds / 1_000_000_000)
-        .map_err(|_| anyhow!("{field} lies outside the supported second range"))
+/// The integral TAI second at which an interval starts, if the value decodes.
+///
+/// Queries are types: a value that does not decode as an interval (an
+/// inverted pair) is not a time this reader can use, so callers skip it
+/// rather than fail. A wider interval is read at its lower bound, the earliest
+/// moment it admits. Habits and Orient read completion times through this one
+/// function, so the two cannot disagree about what a completion says.
+pub fn interval_second(value: IntervalValue) -> Option<i64> {
+    let (lower, _): (i128, i128) = value.try_from_inline().ok()?;
+    i64::try_from(lower / 1_000_000_000).ok()
 }
 
 fn habit_record(
@@ -579,49 +440,11 @@ pub fn state_fragment(
     Ok((fragment, id))
 }
 
-fn exactly_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "Habit entity {entity:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(values.into_iter().next().unwrap())
-}
-
-fn at_most_one<T>(values: Vec<T>, entity: Id, field: &str) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "Habit entity {entity:x} has {} values for {field}; expected at most one",
-            values.len()
-        );
-    }
-    Ok(values.into_iter().next())
-}
-
-fn ids_of_kind(facts: &TribleSet, kind: Id) -> BTreeSet<Id> {
+fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
-}
-
-fn ensure_intrinsic(id: Id, record: Fragment, label: &str) -> Result<TribleSet> {
-    let expected = record
-        .root()
-        .ok_or_else(|| anyhow!("{label} record has no unique intrinsic root"))?;
-    if id != expected {
-        bail!("{label} {id:x} does not match intrinsic root {expected:x}");
-    }
-    Ok(record.into_facts())
-}
-
-fn ensure_exact_entity(facts: &TribleSet, id: Id, expected: &TribleSet, label: &str) -> Result<()> {
-    let actual = facts.iter().filter(|fact| fact.e() == &id).count();
-    if actual != expected.len() || !expected.difference(facts).is_empty() {
-        bail!(
-            "{label} {id:x} has {actual} facts; expected exactly {}",
-            expected.len()
-        );
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -633,313 +456,6 @@ struct RawHabit {
     script: Option<ScriptHandle>,
     supersedes: Vec<Id>,
     personas: Vec<Id>,
-}
-
-#[derive(Clone)]
-struct RawCatalog {
-    habits: BTreeMap<Id, RawHabit>,
-    completions: BTreeMap<Id, Completion>,
-    assertions: BTreeMap<Id, StateAssertion>,
-}
-
-impl RawCatalog {
-    fn live_ids(&self) -> BTreeSet<Id> {
-        let superseded: BTreeSet<Id> = self
-            .habits
-            .values()
-            .flat_map(|habit| habit.supersedes.iter().copied())
-            .collect();
-        self.habits
-            .keys()
-            .filter(|habit| !superseded.contains(*habit))
-            .copied()
-            .collect()
-    }
-
-    fn retain_live(&mut self) {
-        let live = self.live_ids();
-        self.habits.retain(|habit, _| live.contains(habit));
-        self.completions
-            .retain(|_, completion| live.contains(&completion.habit));
-        self.assertions
-            .retain(|_, assertion| live.contains(&assertion.habit));
-    }
-}
-
-fn parse_habit(facts: &TribleSet, id: Id) -> Result<RawHabit> {
-    Ok(RawHabit {
-        id,
-        label: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ attrs::label: ?value }])).collect(),
-            id,
-            "habit::label",
-        )?,
-        condition: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ attrs::condition: ?value }]))
-                .collect(),
-            id,
-            "habit::condition",
-        )?,
-        nudge: exactly_one(
-            find!(value: TextHandle, pattern!(facts, [{ id @ attrs::nudge: ?value }])).collect(),
-            id,
-            "habit::nudge",
-        )?,
-        script: at_most_one(
-            find!(value: ScriptHandle, pattern!(facts, [{ id @ attrs::script: ?value }])).collect(),
-            id,
-            "habit::script",
-        )?,
-        supersedes: sorted_ids(find!(
-            value: Id,
-            pattern!(facts, [{ id @ metadata::supersedes: ?value }])
-        )),
-        personas: sorted_ids(find!(
-            value: Id,
-            pattern!(facts, [{ id @ attrs::persona: ?value }])
-        )),
-    })
-}
-
-fn parse_completion(facts: &TribleSet, id: Id) -> Result<Completion> {
-    Ok(Completion {
-        id,
-        habit: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ attrs::of: ?value }])).collect(),
-            id,
-            "habit::of",
-        )?,
-        completed_at: exactly_one(
-            find!(value: IntervalValue, pattern!(facts, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-            id,
-            "metadata::created_at",
-        )?,
-    })
-}
-
-fn parse_assertion(facts: &TribleSet, id: Id) -> Result<StateAssertion> {
-    let state = exactly_one(
-        find!(value: TextHandle, pattern!(facts, [{ id @ attrs::state: ?value }])).collect(),
-        id,
-        "habit::state",
-    )?;
-    Ok(StateAssertion {
-        id,
-        habit: exactly_one(
-            find!(value: Id, pattern!(facts, [{ id @ attrs::of: ?value }])).collect(),
-            id,
-            "habit::of",
-        )?,
-        state: DeclaredState::from_handle(state)
-            .ok_or_else(|| anyhow!("Habit state assertion {id:x} has an unknown state"))?,
-        predecessors: sorted_ids(find!(
-            value: Id,
-            pattern!(facts, [{ id @ metadata::supersedes: ?value }])
-        )),
-        asserted_at: exactly_one(
-            find!(value: IntervalValue, pattern!(facts, [{ id @ metadata::created_at: ?value }]))
-                .collect(),
-            id,
-            "metadata::created_at",
-        )?,
-    })
-}
-
-fn validate_structure(facts: &TribleSet) -> Result<RawCatalog> {
-    let habit_ids = ids_of_kind(facts, KIND_HABIT_ID);
-    let completion_ids = ids_of_kind(facts, KIND_DONE_ID);
-    let assertion_ids = ids_of_kind(facts, KIND_STATE_ID);
-
-    let mut all_ids = BTreeSet::new();
-    for (label, ids) in [
-        ("Habit definition", &habit_ids),
-        ("Habit completion", &completion_ids),
-        ("Habit state assertion", &assertion_ids),
-    ] {
-        for id in ids {
-            if !all_ids.insert(*id) {
-                bail!("entity {id:x} belongs to more than one Habit record kind ({label})");
-            }
-        }
-    }
-
-    let mut habits = BTreeMap::new();
-    for &id in &habit_ids {
-        // A definition with no text label was written under the retired
-        // 32-byte label attribute. This reader cannot read it, so it is not
-        // part of the view (and nor is what names it, below).
-        if !exists!(pattern!(facts, [{ id @ attrs::label: _?label }])) {
-            continue;
-        }
-        let raw = parse_habit(facts, id)?;
-        let expected = habit_record(
-            raw.label,
-            raw.condition,
-            raw.nudge,
-            raw.script,
-            &raw.supersedes,
-            &raw.personas,
-        );
-        if expected.root() != Some(id) {
-            // Additive cutovers retain the exact random-id legacy record next
-            // to its intrinsic native shadow. It remains durable evidence but
-            // is not part of the live Habit view.
-            continue;
-        }
-        ensure_exact_entity(facts, id, expected.facts(), "Habit definition")?;
-        habits.insert(id, raw);
-    }
-
-    // The revision track is deliberately *not* gated here, unlike the state
-    // track. Every rule one could impose on it — predecessors must be present,
-    // must form an antichain, must not cycle — is a rule a partial view can
-    // violate, and violating it would make the whole catalog unreadable to a
-    // window that happened to receive the successor before what it retires.
-    // Liveness is instead computed structurally in `Catalog::live`, where an
-    // edge naming an unseen definition simply retires nothing yet, and retires
-    // it the moment it arrives. Ids are intrinsic, so an id names one
-    // definition forever and retiring it early is correct rather than
-    // accidental. Adding facts can only ever retire more, never resurrect.
-
-    let mut completions = BTreeMap::new();
-    for id in completion_ids {
-        let completion = parse_completion(facts, id)?;
-        let expected = completion_record(completion.habit, completion.completed_at);
-        if expected.root() != Some(id) {
-            continue;
-        }
-        if habit_ids.contains(&completion.habit) && !habits.contains_key(&completion.habit) {
-            // Names a definition this reader does not take into the view.
-            continue;
-        }
-        if !habits.contains_key(&completion.habit) {
-            bail!(
-                "Habit completion {id:x} names missing definition {:x}",
-                completion.habit
-            );
-        }
-        point_interval(completion.completed_at, "Habit completion time")?;
-        ensure_exact_entity(facts, id, expected.facts(), "Habit completion")?;
-        completions.insert(id, completion);
-    }
-
-    let mut assertions = BTreeMap::new();
-    for id in assertion_ids {
-        // As for definitions: an assertion with no text state predates it.
-        if !exists!(pattern!(facts, [{ id @ attrs::state: _?state }])) {
-            continue;
-        }
-        let assertion = parse_assertion(facts, id)?;
-        let expected = state_record(
-            assertion.habit,
-            assertion.state,
-            &assertion.predecessors,
-            assertion.asserted_at,
-        );
-        if expected.root() != Some(id) {
-            continue;
-        }
-        if habit_ids.contains(&assertion.habit) && !habits.contains_key(&assertion.habit) {
-            continue;
-        }
-        if !habits.contains_key(&assertion.habit) {
-            bail!(
-                "Habit state assertion {id:x} names missing definition {:x}",
-                assertion.habit
-            );
-        }
-        point_interval(assertion.asserted_at, "Habit state assertion time")?;
-        ensure_exact_entity(facts, id, expected.facts(), "Habit state assertion")?;
-        assertions.insert(id, assertion);
-    }
-
-    let mut graphs = BTreeMap::<Id, BTreeMap<Id, Vec<Id>>>::new();
-    for assertion in assertions.values() {
-        graphs
-            .entry(assertion.habit)
-            .or_default()
-            .insert(assertion.id, assertion.predecessors.clone());
-    }
-    for (habit, graph) in &graphs {
-        let _ = dag_heads(graph, &format!("state track for Habit {habit:x}"))?;
-    }
-
-    Ok(RawCatalog {
-        habits,
-        completions,
-        assertions,
-    })
-}
-
-fn reaches(start: Id, target: Id, graph: &BTreeMap<Id, Vec<Id>>) -> bool {
-    let mut pending = vec![start];
-    let mut seen = BTreeSet::new();
-    while let Some(node) = pending.pop() {
-        if node == target {
-            return true;
-        }
-        if seen.insert(node) {
-            pending.extend(graph.get(&node).into_iter().flatten().copied());
-        }
-    }
-    false
-}
-
-fn dag_heads(graph: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
-    for (&node, predecessors) in graph {
-        for predecessor in predecessors {
-            if !graph.contains_key(predecessor) {
-                bail!("{label} node {node:x} cites missing predecessor {predecessor:x}");
-            }
-        }
-        for (index, left) in predecessors.iter().enumerate() {
-            for right in &predecessors[index + 1..] {
-                if reaches(*left, *right, graph) || reaches(*right, *left, graph) {
-                    bail!(
-                        "{label} node {node:x} has non-antichain predecessors {left:x} and {right:x}"
-                    );
-                }
-            }
-        }
-    }
-
-    fn visit(
-        node: Id,
-        graph: &BTreeMap<Id, Vec<Id>>,
-        visiting: &mut BTreeSet<Id>,
-        visited: &mut BTreeSet<Id>,
-        label: &str,
-    ) -> Result<()> {
-        if visited.contains(&node) {
-            return Ok(());
-        }
-        if !visiting.insert(node) {
-            bail!("{label} contains a predecessor cycle at {node:x}");
-        }
-        for predecessor in &graph[&node] {
-            visit(*predecessor, graph, visiting, visited, label)?;
-        }
-        visiting.remove(&node);
-        visited.insert(node);
-        Ok(())
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for node in graph.keys().copied() {
-        visit(node, graph, &mut visiting, &mut visited, label)?;
-    }
-
-    let superseded: BTreeSet<_> = graph
-        .values()
-        .flat_map(|predecessors| predecessors.iter().copied())
-        .collect();
-    Ok(graph
-        .keys()
-        .filter(|id| !superseded.contains(*id))
-        .copied()
-        .collect())
 }
 
 fn load_text<Reader>(reader: &Reader, handle: TextHandle, field: &str) -> Result<String>
@@ -1237,14 +753,16 @@ where
 }
 
 /// Resolve the maximal, fork-visible activation assertions for one Habit.
-pub fn activation<P>(facts: &P, habit: Id) -> Result<Activation>
+///
+/// A track with no maximal assertion (a predecessor cycle, which opaque ids
+/// can form and intrinsic ones cannot) declares nothing, exactly like an
+/// empty track: the intention is active with no heads until an assertion
+/// citing the cycle reconciles it. Orient reads such a track the same way.
+pub fn activation<P>(facts: &P, habit: Id) -> Activation
 where
     P: TriblePattern + ?Sized,
 {
     let assertions = state_assertions(facts, habit);
-    if assertions.is_empty() {
-        return Ok(Activation::Active(Vec::new()));
-    }
     let superseded: BTreeSet<Id> = assertions
         .iter()
         .flat_map(|assertion| assertion.predecessors.iter().copied())
@@ -1253,17 +771,16 @@ where
         .into_iter()
         .filter(|assertion| !superseded.contains(&assertion.id))
         .collect();
-    if heads.is_empty() {
-        bail!("state track for Habit {habit:x} has assertions but no maximal element");
-    }
-    let first = heads[0].state;
+    let Some(first) = heads.first().map(|head| head.state) else {
+        return Activation::Active(Vec::new());
+    };
     if heads.iter().all(|head| head.state == first) {
-        return Ok(match first {
+        return match first {
             DeclaredState::Active => Activation::Active(heads),
             DeclaredState::Paused => Activation::Paused(heads),
-        });
+        };
     }
-    Ok(Activation::Forked(heads))
+    Activation::Forked(heads)
 }
 
 /// Project every understood completion occurrence for one Habit.
@@ -1362,6 +879,12 @@ where
 /// Build the command-facing rows for every live definition without first
 /// materializing the full relation into a catalog shadow model. Completion
 /// history is read across each definition's revision ancestry.
+///
+/// A definition with several values for one modeled attribute (two
+/// conditions, say) yields one row per complete combination, all under the
+/// one id. Each row is a reading of the same intention and is evaluated on its
+/// own; the intention is due when any of its readings is. That needs no rule
+/// for choosing between values, so no window can disagree about which won.
 pub fn rows<Reader, P>(reader: &Reader, facts: &P) -> Result<Vec<HabitRow>>
 where
     Reader: BlobStoreGet + ?Sized,
@@ -1370,10 +893,10 @@ where
     let ancestry = revision_ancestry(facts)?;
     let mut rows = Vec::new();
     for habit in live_definitions(reader, facts)? {
-        let mut completed_at = standing_completions(facts, &ancestry, habit.id)
+        let mut completed_at: Vec<i64> = standing_completions(facts, &ancestry, habit.id)
             .into_iter()
-            .map(|completion| interval_seconds(completion.completed_at, "completion time"))
-            .collect::<Result<Vec<_>>>()?;
+            .filter_map(|completion| interval_second(completion.completed_at))
+            .collect();
         completed_at.sort_unstable();
         completed_at.dedup();
         rows.push(HabitRow {
@@ -1382,7 +905,7 @@ where
             condition: habit.condition,
             nudge: habit.nudge,
             script: habit.script,
-            activation: activation(facts, habit.id)?,
+            activation: activation(facts, habit.id),
             completed_at,
         });
     }
@@ -1390,336 +913,237 @@ where
     Ok(rows)
 }
 
-fn load_text_overlay<Reader, Overlay>(
-    reader: &Reader,
-    overlay: Option<&Overlay>,
-    handle: TextHandle,
-    field: &str,
-) -> Result<String>
-where
-    Reader: BlobStoreGet,
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    if let Some(overlay) = overlay {
-        if overlay
-            .metadata(handle)
-            .expect("in-memory Habit attachment lookup is infallible")
-            .is_some()
-        {
-            let value: View<str> = overlay.get(handle).with_context(|| {
-                format!(
-                    "read staged Habit {field} payload {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(value.to_string());
-        }
-    }
-    load_text(reader, handle, field)
+/// What `habit check` observed in one view of the collection.
+///
+/// Counts, plus observations about facts this view holds. An observation is
+/// never a verdict: every fact it names is ordinary in an open-world union,
+/// and each one says how the ordinary readers treat it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Audit {
+    /// Distinct entities with a complete definition projection.
+    pub definitions: usize,
+    /// Of those, the ones no complete successor supersedes.
+    pub live: usize,
+    /// Definitions carrying at least one script attachment.
+    pub scripted: usize,
+    /// Distinct completion occurrences.
+    pub completions: usize,
+    /// Distinct state assertions.
+    pub assertions: usize,
+    pub notes: Vec<String>,
 }
 
-/// Resolve a carried script, from the staged fragment first and the pile
-/// second.
+/// Read the whole Habit relation in `facts` and report what it holds.
 ///
-/// An unresolvable handle is a hard error naming both the habit and the exact
-/// missing blob. It is deliberately not degraded into "this habit is not due":
-/// a standing intention that quietly stops firing is worse than one that
-/// refuses to be read at all, because nobody notices the first.
-fn load_script_overlay<Reader, Overlay>(
-    reader: &Reader,
-    overlay: Option<&Overlay>,
-    handle: ScriptHandle,
-    habit: Id,
-) -> Result<Script>
+/// Every question is a query asked where it is needed; nothing is first
+/// loaded into a catalog, and nothing here refuses a fact. Payloads are read
+/// through `reader`, so an attachment that is not resident is reported, with
+/// the definition and blob it belongs to.
+pub fn audit<Reader, P>(reader: &Reader, facts: &P) -> Audit
 where
-    Reader: BlobStoreGet,
-    Overlay: BlobStoreGet + BlobStoreMeta,
+    Reader: BlobStoreGet + ?Sized,
+    P: TriblePattern + ?Sized,
 {
-    let missing = || {
-        anyhow!(
-            "Habit {habit:x} script blob {} is not in this pile",
-            hex::encode(handle.raw)
+    let mut notes = Vec::new();
+    let known = definition_ids(facts);
+    let superseded = superseded_definition_ids(facts);
+
+    let unread = ids_of_kind(facts, KIND_HABIT_ID).difference(&known).count();
+    if unread > 0 {
+        notes.push(format!(
+            "{unread} Habit-tagged entit(ies) carry no complete text label, condition and \
+             nudge, so no reader takes them for definitions"
+        ));
+    }
+
+    let mut scripted = 0;
+    for &habit in &known {
+        let labels: BTreeSet<[u8; 32]> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ habit @ attrs::label: ?value }])
         )
-    };
-    if let Some(overlay) = overlay {
-        if overlay
-            .metadata(handle)
-            .expect("in-memory Habit attachment lookup is infallible")
-            .is_some()
-        {
-            let bytes: anybytes::Bytes = overlay.get(handle).map_err(|_| missing())?;
-            return Ok(Script {
-                handle,
-                bytes: bytes.to_vec(),
-            });
+        .map(|value| value.raw)
+        .collect();
+        let conditions: BTreeSet<[u8; 32]> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ habit @ attrs::condition: ?value }])
+        )
+        .map(|value| value.raw)
+        .collect();
+        let nudges: BTreeSet<[u8; 32]> = find!(
+            value: TextHandle,
+            pattern!(facts, [{ habit @ attrs::nudge: ?value }])
+        )
+        .map(|value| value.raw)
+        .collect();
+        let scripts: BTreeSet<[u8; 32]> = find!(
+            value: ScriptHandle,
+            pattern!(facts, [{ habit @ attrs::script: ?value }])
+        )
+        .map(|value| value.raw)
+        .collect();
+        if !scripts.is_empty() {
+            scripted += 1;
         }
-    }
-    let bytes: anybytes::Bytes = reader.get(handle).map_err(|_| missing())?;
-    Ok(Script {
-        handle,
-        bytes: bytes.to_vec(),
-    })
-}
-
-fn decode_catalog<Reader, Overlay>(
-    reader: &Reader,
-    overlay: Option<&Overlay>,
-    raw: RawCatalog,
-) -> Result<Catalog>
-where
-    Reader: BlobStoreGet,
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    let mut texts = HashMap::<[u8; 32], String>::new();
-    let mut habits = BTreeMap::new();
-    for raw_habit in raw.habits.values() {
-        let label = if let Some(value) = texts.get(&raw_habit.label.raw) {
-            value.clone()
-        } else {
-            let value = load_text_overlay(reader, overlay, raw_habit.label, "label")?;
-            texts.insert(raw_habit.label.raw, value.clone());
-            value
-        };
-        if canonical_label(label.clone())? != label {
-            bail!("Habit {} label is not canonical", raw_habit.id);
-        }
-        let condition = if let Some(value) = texts.get(&raw_habit.condition.raw) {
-            value.clone()
-        } else {
-            let value = load_text_overlay(reader, overlay, raw_habit.condition, "condition")?;
-            texts.insert(raw_habit.condition.raw, value.clone());
-            value
-        };
-        let canonical_condition = canonical_required(condition.clone(), "Habit condition payload")?;
-        if canonical_condition != condition {
-            bail!("Habit {} condition payload is not canonical", raw_habit.id);
-        }
-        let condition = canonical_condition;
-        let parsed = Condition::parse(&condition)
-            .map_err(|error| anyhow!("Habit {} condition: {error}", raw_habit.id))?;
-
-        let script = match raw_habit.script {
-            Some(handle) => Some(load_script_overlay(reader, overlay, handle, raw_habit.id)?),
-            None => None,
-        };
-        check_script_agreement(
-            &parsed,
-            script.is_some(),
-            &format!("Habit {:x}", raw_habit.id),
-        )?;
-
-        let nudge = if let Some(value) = texts.get(&raw_habit.nudge.raw) {
-            value.clone()
-        } else {
-            let value = load_text_overlay(reader, overlay, raw_habit.nudge, "nudge")?;
-            texts.insert(raw_habit.nudge.raw, value.clone());
-            value
-        };
-        let canonical_nudge = canonical_required(nudge.clone(), "Habit nudge payload")?;
-        if canonical_nudge != nudge {
-            bail!("Habit {} nudge payload is not canonical", raw_habit.id);
-        }
-        let nudge = canonical_nudge;
-        habits.insert(
-            raw_habit.id,
-            Habit {
-                id: raw_habit.id,
-                label,
-                condition,
-                nudge,
-                script,
-                supersedes: raw_habit.supersedes.clone(),
-                personas: raw_habit.personas.clone(),
-            },
-        );
-    }
-    Ok(Catalog {
-        habits,
-        completions: raw.completions,
-        assertions: raw.assertions,
-    })
-}
-
-/// Strictly validate and decode one complete materialized Habit collection.
-pub fn load_catalog<Reader: BlobStoreGet>(reader: &Reader, facts: &TribleSet) -> Result<Catalog> {
-    let raw = validate_structure(facts)?;
-    decode_catalog(reader, None::<&PileSnapshot>, raw)
-}
-
-/// Select the payload obligations of only maximal (live) definitions.
-/// Superseded definitions remain queryable history, but their attachments can
-/// neither affect current evaluation nor hold an observer hostage.
-pub fn live_payloads(facts: &TribleSet) -> Result<Vec<LiveHabitPayloads>> {
-    let raw = validate_structure(facts)?;
-    let live = raw.live_ids();
-    Ok(live
-        .into_iter()
-        .map(|habit| {
-            let definition = &raw.habits[&habit];
-            LiveHabitPayloads {
-                habit,
-                condition: definition.condition,
-                nudge: definition.nudge,
-                script: definition.script,
-            }
-        })
-        .collect())
-}
-
-/// Decode only current standing intentions.
-///
-/// The full structural catalog is still checked so state and completion DAGs
-/// retain their normal semantics. Blob reads are restricted to maximal
-/// definitions; stale history is not an operational dependency of a watcher.
-pub fn load_live_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<Catalog> {
-    let mut raw = validate_structure(facts)?;
-    raw.retain_live();
-    decode_catalog(reader, None::<&PileSnapshot>, raw)
-}
-
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    load_catalog(reader, facts).map(drop)
-}
-
-/// Preflight the exact set union a publication would create, resolving blob
-/// handles from the staged complete fragment before it is appended.
-pub fn validate_catalog_union(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<TribleSet> {
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let raw = validate_structure(&union)?;
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("Habit MemoryBlobStore reader creation is infallible");
-    decode_catalog(reader, Some(&overlay), raw)?;
-    Ok(union)
-}
-
-/// Validate one authored publication unit independently of ambient catalog
-/// facts. Every unit is exactly one intrinsic record; definition payloads must
-/// be carried by the fragment itself.
-pub fn validate_publication_fragment(fragment: &Fragment) -> Result<()> {
-    let id = fragment
-        .root()
-        .ok_or_else(|| anyhow!("Habit publication must export one intrinsic root"))?;
-    if fragment.facts().iter().any(|fact| fact.e() != &id) {
-        bail!("Habit publication {id:x} contains facts owned by another entity");
-    }
-    let facts = fragment.facts();
-    let is_habit = ids_of_kind(facts, KIND_HABIT_ID).contains(&id);
-    let is_completion = ids_of_kind(facts, KIND_DONE_ID).contains(&id);
-    let is_assertion = ids_of_kind(facts, KIND_STATE_ID).contains(&id);
-    if usize::from(is_habit) + usize::from(is_completion) + usize::from(is_assertion) != 1 {
-        bail!("Habit publication {id:x} must carry exactly one recognized kind");
-    }
-
-    let expected = if is_habit {
-        let raw = parse_habit(facts, id)?;
-        if raw.supersedes.contains(&id) {
-            bail!("Habit {id:x} supersedes itself");
-        }
-        let expected = ensure_intrinsic(
-            id,
-            habit_record(
-                raw.label,
-                raw.condition,
-                raw.nudge,
-                raw.script,
-                &raw.supersedes,
-                &raw.personas,
-            ),
-            "Habit definition",
-        )?;
-        let mut local = fragment.clone();
-        let reader = local
-            .blobs_mut()
-            .snapshot()
-            .expect("Habit MemoryBlobStore reader creation is infallible");
-        let condition: View<str> = reader.get(raw.condition).map_err(|_| {
-            anyhow!(
-                "complete Habit definition {id:x} is missing condition payload {}",
-                hex::encode(raw.condition.raw)
-            )
-        })?;
-        let condition_source = condition.to_string();
-        let condition = canonical_required(condition_source.clone(), "Habit condition payload")?;
-        if condition != condition_source {
-            bail!("Habit {id:x} condition payload is not canonical");
-        }
-        let parsed = Condition::parse(&condition).map_err(|error| anyhow!(error))?;
-        if let Some(handle) = raw.script {
-            let script: anybytes::Bytes = reader.get(handle).map_err(|_| {
-                anyhow!(
-                    "complete Habit definition {id:x} is missing script payload {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            if script.is_empty() {
-                bail!("Habit {id:x} script payload is empty");
+        for (count, field) in [
+            (labels.len(), "labels"),
+            (conditions.len(), "conditions"),
+            (nudges.len(), "nudges"),
+            (scripts.len(), "scripts"),
+        ] {
+            if count > 1 {
+                notes.push(format!(
+                    "definition {habit:x} has {count} {field}; each combination is read as \
+                     its own reading, and the intention is due when any reading is"
+                ));
             }
         }
-        check_script_agreement(&parsed, raw.script.is_some(), &format!("Habit {id:x}"))?;
-        let nudge: View<str> = reader.get(raw.nudge).map_err(|_| {
-            anyhow!(
-                "complete Habit definition {id:x} is missing nudge payload {}",
-                hex::encode(raw.nudge.raw)
-            )
-        })?;
-        let nudge_source = nudge.to_string();
-        let nudge = canonical_required(nudge_source.clone(), "Habit nudge payload")?;
-        if nudge != nudge_source {
-            bail!("Habit {id:x} nudge payload is not canonical");
-        }
-        let label: View<str> = reader.get(raw.label).map_err(|_| {
-            anyhow!(
-                "complete Habit definition {id:x} is missing label payload {}",
-                hex::encode(raw.label.raw)
-            )
-        })?;
-        if canonical_label(label.to_string())? != *label {
-            bail!("Habit {id:x} label is not canonical");
-        }
-        expected
-    } else if is_completion {
-        let completion = parse_completion(facts, id)?;
-        point_interval(completion.completed_at, "Habit completion time")?;
-        ensure_intrinsic(
-            id,
-            completion_record(completion.habit, completion.completed_at),
-            "Habit completion",
-        )?
-    } else {
-        let assertion = parse_assertion(facts, id)?;
-        point_interval(assertion.asserted_at, "Habit state assertion time")?;
-        ensure_intrinsic(
-            id,
-            state_record(
-                assertion.habit,
-                assertion.state,
-                &assertion.predecessors,
-                assertion.asserted_at,
-            ),
-            "Habit state assertion",
-        )?
-    };
-    if expected != *facts {
-        bail!("Habit publication {id:x} is not one complete canonical record");
     }
-    Ok(())
+
+    for raw in projected_definitions(facts) {
+        let id = raw.id;
+        let history = if superseded.contains(&id) {
+            " (superseded)"
+        } else {
+            ""
+        };
+        let habit = match decode_definitions(reader, [raw]) {
+            Ok(mut decoded) => decoded.remove(0),
+            Err(error) => {
+                notes.push(format!(
+                    "definition {id:x}{history} cannot be read here: {error:#}"
+                ));
+                continue;
+            }
+        };
+        match Condition::parse(&habit.condition) {
+            Ok(condition) => {
+                if let Err(error) = check_script_agreement(
+                    &condition,
+                    habit.script.is_some(),
+                    &format!("definition {id:x}{history}"),
+                ) {
+                    notes.push(format!("{error:#}; `habit list` reports it as an error"));
+                }
+            }
+            Err(error) => notes.push(format!(
+                "definition {id:x}{history} condition {:?} does not parse ({error}); \
+                 `habit list` shows it BROKEN",
+                habit.condition
+            )),
+        }
+    }
+
+    // A completion or assertion may name a definition this view has not
+    // received yet. One named only by a supersedes edge is already read
+    // through the successor's ancestry, so it is not waiting on anything.
+    let reachable = |habit: &Id| known.contains(habit) || superseded.contains(habit);
+    let mut completions = BTreeSet::new();
+    let mut waiting = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut untimed = BTreeSet::new();
+    for (id, habit, completed_at) in find!(
+        (id: Id, habit: Id, completed_at: IntervalValue),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_DONE_ID,
+            attrs::of: ?habit,
+            metadata::created_at: ?completed_at,
+        }])
+    ) {
+        completions.insert(id);
+        if interval_second(completed_at).is_none() {
+            untimed.insert(id);
+        }
+        if !reachable(&habit) {
+            waiting.entry(habit).or_default().insert(id);
+        }
+    }
+    for (habit, events) in &waiting {
+        notes.push(format!(
+            "{} completion(s) name {habit:x}, no known definition yet; they count once it \
+             arrives",
+            events.len()
+        ));
+    }
+    for id in &untimed {
+        notes.push(format!(
+            "completion {id:x} has a time that does not decode as an interval; readers skip it"
+        ));
+    }
+
+    let mut assertions = BTreeSet::new();
+    let mut tracks = BTreeSet::new();
+    let mut waiting = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut unknown = BTreeSet::new();
+    for (id, habit, state) in find!(
+        (id: Id, habit: Id, state: TextHandle),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_STATE_ID,
+            attrs::of: ?habit,
+            attrs::state: ?state,
+            metadata::created_at: _?asserted_at,
+        }])
+    ) {
+        assertions.insert(id);
+        tracks.insert(habit);
+        if DeclaredState::from_handle(state).is_none() {
+            unknown.insert(id);
+        }
+        if !reachable(&habit) {
+            waiting.entry(habit).or_default().insert(id);
+        }
+    }
+    for (habit, events) in &waiting {
+        notes.push(format!(
+            "{} state assertion(s) name {habit:x}, no known definition yet; they apply once \
+             it arrives",
+            events.len()
+        ));
+    }
+    for id in &unknown {
+        notes.push(format!(
+            "state assertion {id:x} declares a state this reader does not know; readers skip it"
+        ));
+    }
+    for habit in &tracks {
+        let track: BTreeSet<Id> = state_assertions(facts, *habit)
+            .iter()
+            .map(|assertion| assertion.id)
+            .collect();
+        for assertion in state_assertions(facts, *habit) {
+            for predecessor in &assertion.predecessors {
+                if !track.contains(predecessor) {
+                    notes.push(format!(
+                        "state assertion {:x} cites predecessor {predecessor:x}, not in this \
+                         view; it is already superseded if it arrives",
+                        assertion.id
+                    ));
+                }
+            }
+        }
+        if !track.is_empty() && activation(facts, *habit).head_ids().is_empty() {
+            notes.push(format!(
+                "state track for {habit:x} has no maximal assertion (a predecessor cycle); it \
+                 declares nothing until an assertion cites it"
+            ));
+        }
+    }
+
+    Audit {
+        definitions: known.len(),
+        live: known.difference(&superseded).count(),
+        scripted,
+        completions: completions.len(),
+        assertions: assertions.len(),
+        notes,
+    }
 }
 
 /// Publish one caller-constructed Habit fragment to the fixed collection.
 ///
 /// Constructors in this module produce complete records by construction. This
 /// ordinary write path deliberately performs no ambient catalog preflight and
-/// does not re-hash a derived entity id. Untrusted imports can invoke
-/// [`validate_publication_fragment`] and [`validate_catalog_union`] explicitly
-/// before calling it.
+/// does not re-hash a derived entity id: readers are open-world, so a fact
+/// they cannot model is ignored rather than guarded against here.
 pub fn publish(
     pile_path: &Path,
     key_path: Option<&Path>,
@@ -1750,45 +1174,6 @@ pub fn publish_with_storage(storage: &Storage, fragment: Fragment) -> Result<Col
             .block_on(crate::storage::ensure_downstream(pile, collection, signer))
             .context("Habit facts were committed, but ensuring their derived views failed")?;
         Ok(commit)
-    })
-}
-
-/// Materialize and validate the entire foundational collection.
-///
-/// This stopped-world path exists for `habit check`, migrations, and tests.
-/// Ordinary reads use the maintained Succinct relation and the direct query
-/// functions above.
-pub fn read_catalog_strict(pile_path: &Path, key_path: Option<&Path>) -> Result<Catalog> {
-    read_catalog_strict_with_storage(&Storage::new(
-        pile_path.to_owned(),
-        key_path.map(Path::to_owned),
-    ))
-}
-
-/// Run the explicit whole-collection audit without reopening a shared store.
-pub fn read_catalog_strict_with_storage(storage: &Storage) -> Result<Catalog> {
-    storage.with_store(|pile, signer, runtime| {
-        let collection = storage.open_collection_read(
-            pile,
-            DEFAULT_SCOPE_ID,
-            signer.verifying_key(),
-            runtime,
-        )?;
-        let store_snapshot = crate::storage::AcquiringReader::new(
-            pile.snapshot().context("freeze Habit audit snapshot")?,
-            runtime.clone(),
-        );
-        // Strict check includes every admitted foundation, not only the
-        // resident realized cover. Bytes may arrive, but the admitted set and
-        // its authorization evidence stay at this one audit observation.
-        let admitted = collection.admitted(&store_snapshot)?;
-        let mut facts = TribleSet::new();
-        for payload in admitted.members() {
-            facts += store_snapshot
-                .get::<TribleSet, _>(payload)
-                .context("read admitted Habit audit foundation")?;
-        }
-        load_catalog(&store_snapshot, &facts).context("strictly validate native Habit catalog")
     })
 }
 
@@ -1986,6 +1371,9 @@ mod tests {
     };
     use triblespace::core::collection::{Collection, CollectionStoreExt};
 
+    use triblespace::core::repo::pile::PileSnapshot;
+    use triblespace::core::repo::SnapshotSource;
+
     use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as, FactArchive};
     use crate::test_support::initialize_open_collection_fixture;
 
@@ -2020,8 +1408,31 @@ mod tests {
             publish(&self.pile, Some(&self.key), fragment).unwrap()
         }
 
-        fn catalog(&self) -> Catalog {
-            read_catalog_strict(&self.pile, Some(&self.key)).unwrap()
+        /// One prepared view of the collection, read the way commands read it.
+        fn view(&self) -> (PileSnapshot, FactArchive) {
+            let (succinct, rank9) = self.targets();
+            let (reader, _, facts) = self.prepared_targets(succinct, rank9);
+            (reader, facts)
+        }
+
+        fn definitions(&self) -> Vec<Habit> {
+            let (reader, facts) = self.view();
+            definitions(&reader, &facts).unwrap()
+        }
+
+        /// Ids no complete successor supersedes, each once.
+        fn live_ids(&self) -> Vec<Id> {
+            let (reader, facts) = self.view();
+            sorted_ids(
+                live_definitions(&reader, &facts)
+                    .unwrap()
+                    .into_iter()
+                    .map(|habit| habit.id),
+            )
+        }
+
+        fn definition_count(&self) -> usize {
+            definition_ids(&self.view().1).len()
         }
 
         // Name the targets before exercising a writer, so the reader below
@@ -2067,10 +1478,6 @@ mod tests {
             pile.close().unwrap();
             (snapshot, succinct_facts, rank9_facts)
         }
-    }
-
-    fn live_ids(catalog: &Catalog) -> Vec<Id> {
-        catalog.live().into_iter().map(|habit| habit.id).collect()
     }
 
     fn row(condition: &str, completed_at: &[i64], activation: Activation) -> HabitRow {
@@ -2186,7 +1593,7 @@ mod tests {
                 .expect("each transition authors a state event");
             let (_, succinct_facts, rank9_facts) = fixture.prepared_targets(succinct, rank9);
             for facts in [&succinct_facts, &rank9_facts] {
-                let current = activation(facts, added.id).unwrap();
+                let current = activation(facts, added.id);
                 assert_eq!(current.declared(), Some(state));
                 assert_eq!(current.head_ids(), [event]);
             }
@@ -2240,9 +1647,12 @@ mod tests {
         let replay = fixture.publish(fragment);
         assert_eq!(replay, first);
         assert_eq!(std::fs::metadata(&fixture.pile).unwrap().len(), after_first);
-        let catalog = fixture.catalog();
         assert_eq!(
-            catalog.habits().map(|habit| habit.id).collect::<Vec<_>>(),
+            fixture
+                .definitions()
+                .iter()
+                .map(|habit| habit.id)
+                .collect::<Vec<_>>(),
             [id]
         );
 
@@ -2264,7 +1674,8 @@ mod tests {
         let b = Id::new([0xB2; 16]).unwrap();
         let (global, global_id) =
             habit_fragment("tick", "every 1h", "notice", None, &[], &[]).unwrap();
-        let raw = parse_habit(global.facts(), global_id).unwrap();
+        let raw = projected_definitions(global.facts()).remove(0);
+        assert_eq!(raw.id, global_id);
         assert!(raw.personas.is_empty());
         // Adding the optional empty field preserves the old unscoped identity.
         let old_record = entity! { _ @
@@ -2282,17 +1693,16 @@ mod tests {
         assert_eq!(scoped.facts(), reordered.facts());
         assert_ne!(global_id, scoped_id);
         assert_eq!(
-            parse_habit(scoped.facts(), scoped_id).unwrap().personas,
+            projected_definitions(scoped.facts()).remove(0).personas,
             vec![a, b]
         );
-        validate_publication_fragment(&scoped).unwrap();
         let fixture = Fixture::new();
         fixture.publish(global);
         fixture.publish(scoped);
-        let catalog = fixture.catalog();
         assert_eq!(
-            catalog
-                .habits()
+            fixture
+                .definitions()
+                .into_iter()
                 .find(|habit| habit.id == scoped_id)
                 .unwrap()
                 .personas,
@@ -2357,7 +1767,7 @@ mod tests {
         let (assertion, assertion_id) =
             state_fragment(habit, DeclaredState::Paused, &[unseen], at(1.0)).unwrap();
         assert!(matches!(
-            activation(assertion.facts(), habit).unwrap(),
+            activation(assertion.facts(), habit),
             Activation::Paused(ref heads)
                 if heads.len() == 1
                     && heads[0].id == assertion_id
@@ -2378,15 +1788,14 @@ mod tests {
         let (active, _) = state_fragment(habit, DeclaredState::Active, &[], at(2.0)).unwrap();
         fixture.publish(paused);
         fixture.publish(active);
-        let catalog = fixture.catalog();
-        let fork = catalog.activation(habit).unwrap();
+        let fork = activation(&fixture.view().1, habit);
         let heads = fork.head_ids();
         assert!(matches!(fork, Activation::Forked(ref values) if values.len() == 2));
 
         let (joined, _) = state_fragment(habit, DeclaredState::Active, &heads, at(3.0)).unwrap();
         fixture.publish(joined);
         assert!(matches!(
-            fixture.catalog().activation(habit).unwrap(),
+            activation(&fixture.view().1, habit),
             Activation::Active(ref values) if values.len() == 1 && values[0].predecessors == heads
         ));
     }
@@ -2408,12 +1817,13 @@ mod tests {
 
     /// The integral TAI second a row reports for the Unix second `at` takes.
     fn tai(seconds: f64) -> i64 {
-        interval_seconds(at(seconds), "fixture time").unwrap()
+        interval_second(at(seconds)).unwrap()
     }
 
     /// A reworded revision is the same standing intention, so a completion
     /// recorded against the old wording minutes ago still satisfies it. This
-    /// goes through the operations every frontend uses and the strict audit.
+    /// goes through the operations every frontend uses, the direct rows over
+    /// one prepared view, and the check.
     #[test]
     fn a_reworded_revision_is_not_due_after_its_predecessor_was_done() {
         let fixture = Fixture::new();
@@ -2441,17 +1851,23 @@ mod tests {
         assert!(entry.row.last_done().is_some(), "done never");
         assert_eq!(entry.state, Some(State::Cooling));
 
-        let catalog = fixture.catalog();
-        let completed = catalog
-            .completions()
+        let (reader, facts) = fixture.view();
+        let completed = completions(&facts, original.id)
+            .into_iter()
             .find(|completion| completion.id == done.event)
             .unwrap();
-        let expected = interval_seconds(completed.completed_at, "completion time").unwrap();
-        let audited = catalog.rows().unwrap();
-        assert_eq!(audited.len(), 1);
-        assert_eq!(audited[0].id, revised.id);
-        assert_eq!(audited[0].completed_at, [expected]);
+        let expected = interval_second(completed.completed_at).unwrap();
+        let direct = rows(&reader, &facts).unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].id, revised.id);
+        assert_eq!(direct[0].completed_at, [expected]);
         assert_eq!(entry.row.completed_at, [expected]);
+        let checked = audit(&reader, &facts);
+        assert_eq!(
+            (checked.definitions, checked.live, checked.completions),
+            (2, 1, 1)
+        );
+        assert!(checked.notes.is_empty(), "{:?}", checked.notes);
     }
 
     #[test]
@@ -2573,7 +1989,7 @@ mod tests {
         )
         .unwrap();
         fixture.publish(original);
-        assert_eq!(live_ids(&fixture.catalog()), vec![original_id]);
+        assert_eq!(fixture.live_ids(), vec![original_id]);
 
         let (successor, successor_id) = habit_fragment(
             "sweep",
@@ -2586,16 +2002,21 @@ mod tests {
         .unwrap();
         fixture.publish(successor);
 
-        let catalog = fixture.catalog();
+        let (reader, facts) = fixture.view();
         // Both definitions remain; only the successor is live, and only it is
         // evaluated.
-        assert_eq!(catalog.habits().count(), 2);
-        assert_eq!(catalog.labelled("sweep").len(), 2);
-        assert_eq!(live_ids(&catalog), vec![successor_id]);
-        assert!(catalog.is_superseded(original_id));
+        let all = definitions(&reader, &facts).unwrap();
+        assert_eq!(all.len(), 2);
         assert_eq!(
-            catalog
-                .rows()
+            all.iter()
+                .filter(|habit| habit.label.eq_ignore_ascii_case("sweep"))
+                .count(),
+            2
+        );
+        assert_eq!(fixture.live_ids(), vec![successor_id]);
+        assert!(is_superseded(&facts, original_id));
+        assert_eq!(
+            rows(&reader, &facts)
                 .unwrap()
                 .iter()
                 .map(|row| row.id)
@@ -2624,11 +2045,7 @@ mod tests {
                 };
                 fixture.publish(fragment);
             }
-            assert_eq!(
-                live_ids(&fixture.catalog()),
-                vec![successor_id],
-                "{order:?}"
-            );
+            assert_eq!(fixture.live_ids(), vec![successor_id], "{order:?}");
         }
     }
 
@@ -2648,8 +2065,8 @@ mod tests {
         assert_eq!(first.1, second.1);
         fixture.publish(first.0);
         fixture.publish(second.0);
-        assert_eq!(fixture.catalog().habits().count(), 2);
-        assert_eq!(live_ids(&fixture.catalog()), vec![first.1]);
+        assert_eq!(fixture.definition_count(), 2);
+        assert_eq!(fixture.live_ids(), vec![first.1]);
     }
 
     /// Concurrent creation without an edge is two live definitions sharing a
@@ -2663,7 +2080,7 @@ mod tests {
             habit_fragment("sweep", "every 2h", "sweep", None, &[], &[]).unwrap();
         fixture.publish(mine);
         fixture.publish(theirs);
-        assert_eq!(live_ids(&fixture.catalog()).len(), 2);
+        assert_eq!(fixture.live_ids().len(), 2);
 
         let (joined, joined_id) = habit_fragment(
             "sweep",
@@ -2675,12 +2092,12 @@ mod tests {
         )
         .unwrap();
         fixture.publish(joined);
-        assert_eq!(live_ids(&fixture.catalog()), vec![joined_id]);
+        assert_eq!(fixture.live_ids(), vec![joined_id]);
     }
 
     /// An edge naming a definition this window has not seen is legal and
     /// retires nothing yet. Rejecting it would mean a window that received the
-    /// successor first could not read the catalog at all — the partial-view
+    /// successor first could not read the collection at all — the partial-view
     /// hazard that makes any such rule non-monotonic.
     #[test]
     fn an_edge_to_an_unseen_definition_retires_it_on_arrival() {
@@ -2691,14 +2108,14 @@ mod tests {
             habit_fragment("sweep", "every 2h", "sweep", None, &[original_id], &[]).unwrap();
 
         fixture.publish(successor);
-        // The predecessor is not here; nothing is retired, and the catalog reads.
-        assert_eq!(live_ids(&fixture.catalog()), vec![successor_id]);
-        assert!(fixture.catalog().is_superseded(original_id));
+        // The predecessor is not here; nothing is retired, and the view reads.
+        assert_eq!(fixture.live_ids(), vec![successor_id]);
+        assert!(is_superseded(&fixture.view().1, original_id));
 
         fixture.publish(original);
         // It arrives already retired, and liveness is unchanged.
-        assert_eq!(fixture.catalog().habits().count(), 2);
-        assert_eq!(live_ids(&fixture.catalog()), vec![successor_id]);
+        assert_eq!(fixture.definition_count(), 2);
+        assert_eq!(fixture.live_ids(), vec![successor_id]);
     }
 
     #[test]
@@ -2710,83 +2127,15 @@ mod tests {
             habit_fragment("hygiene", "every 7d", "inspect branches", None, &[], &[]).unwrap();
         fixture.publish(daily);
         fixture.publish(weekly);
-        let catalog = fixture.catalog();
         assert_eq!(
-            catalog
-                .labelled("HYGIENE")
+            fixture
+                .definitions()
                 .into_iter()
+                .filter(|habit| habit.label.eq_ignore_ascii_case("HYGIENE"))
                 .map(|habit| habit.id)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([daily_id, weekly_id])
         );
-    }
-
-    #[test]
-    fn strict_catalog_rejects_extra_facts_and_dangling_events() {
-        let mut fragment = habit_fragment("journal", "every 1h", "write", None, &[], &[])
-            .unwrap()
-            .0;
-        let id = fragment.root().unwrap();
-        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::created_at: at(1.0) };
-        assert!(validate_publication_fragment(&fragment).is_err());
-
-        let dangling = completion_fragment(Id::new([9; 16]).unwrap(), at(1.0))
-            .unwrap()
-            .0;
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("empty.pile");
-        File::create(&pile_path).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        let error = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap_err();
-        assert!(format!("{error:#}").contains("expected exactly"));
-        let error = validate_catalog_union(&reader, &TribleSet::new(), &dangling).unwrap_err();
-        assert!(format!("{error:#}").contains("missing definition"));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn additive_legacy_records_are_inert_beside_exact_intrinsic_shadows() {
-        let (mut fragment, native) =
-            habit_fragment("journal", "every 1h", "write", None, &[], &[]).unwrap();
-        let raw = parse_habit(fragment.facts(), native).unwrap();
-        let legacy = Id::new([0xA7; 16]).unwrap();
-        assert_ne!(legacy, native);
-        fragment += entity! { ExclusiveId::force_ref(&legacy) @
-            metadata::tag: &KIND_HABIT_ID,
-            attrs::label: raw.label,
-            attrs::condition: raw.condition,
-            attrs::nudge: raw.nudge,
-            metadata::created_at: at(1.0),
-        };
-
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("empty.pile");
-        File::create(&pile_path).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        let union = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        let raw = validate_structure(&union).unwrap();
-        assert_eq!(raw.habits.keys().copied().collect::<Vec<_>>(), [native]);
-        assert!(union.iter().any(|fact| fact.e() == &legacy));
-        pile.close().unwrap();
-    }
-
-    #[test]
-    fn publication_definition_must_carry_its_own_payloads() {
-        let missing_condition = TextHandle::new([3; 32]);
-        let missing_nudge = TextHandle::new([4; 32]);
-        let unstored_label = "journal".to_owned().to_blob().get_handle();
-        let bare = habit_record(
-            unstored_label,
-            missing_condition,
-            missing_nudge,
-            None,
-            &[],
-            &[],
-        );
-        let error = validate_publication_fragment(&bare).unwrap_err();
-        assert!(format!("{error:#}").contains("missing condition payload"));
     }
 
     /// The point of the whole feature: the predicate is the pile's bytes, not
@@ -2915,14 +2264,21 @@ mod tests {
         )
         .unwrap();
         fixture.publish(fragment);
-        let catalog = fixture.catalog();
-        let carried = catalog.habit(id).unwrap().script.as_ref().unwrap();
+        let definitions = fixture.definitions();
+        let carried = definitions
+            .iter()
+            .find(|habit| habit.id == id)
+            .unwrap()
+            .script
+            .as_ref()
+            .unwrap();
         assert_eq!(carried.bytes, source);
         assert_eq!(carried.digest().len(), 64);
     }
 
-    /// A definition and its attachment must agree in both directions, and the
-    /// check has to hold at publication as well as at authoring.
+    /// A definition and its attachment must agree in both directions. Authoring
+    /// refuses a mismatch; one that arrives anyway is read, reported by the
+    /// check, and evaluated as an error rather than a quiet "not due".
     #[test]
     fn condition_and_attachment_must_agree() {
         let dangling =
@@ -2946,12 +2302,28 @@ mod tests {
         let label = fragment.put("sweep".to_owned());
         let record = habit_record(label, condition, nudge, None, &[], &[]);
         fragment += record;
-        let error = validate_publication_fragment(&fragment).unwrap_err();
-        assert!(format!("{error:#}").contains("carries no script"));
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+        let checked = audit(&reader, &facts);
+        assert_eq!(checked.definitions, 1);
+        assert!(
+            checked
+                .notes
+                .iter()
+                .any(|note| note.contains("carries no script")),
+            "{:?}",
+            checked.notes
+        );
+        let read = rows(&reader, &facts).unwrap();
+        assert!(matches!(
+            evaluate(&read[0], 10_000, Path::new(".")),
+            State::Failed(ref error) if error.contains("carries no script")
+        ));
     }
 
-    /// An unresolvable script names the habit and the exact missing blob, and
-    /// refuses; it never degrades into a habit that silently stops firing.
+    /// An unresolvable script names the habit and the exact missing blob; it
+    /// never degrades into a habit that silently stops firing. The live view
+    /// refuses to evaluate it, and the check reports it.
     #[test]
     fn an_unresolvable_script_blob_is_a_loud_error() {
         let mut fragment = Fragment::empty();
@@ -2963,20 +2335,255 @@ mod tests {
         let id = record.root().unwrap();
         fragment += record;
 
-        let error = validate_publication_fragment(&fragment).unwrap_err();
-        assert!(format!("{error:#}").contains("missing script payload"));
-        assert!(format!("{error:#}").contains(&hex::encode(absent.raw)));
-
-        // And the same handle, reached through a pile which does not hold it.
-        let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("empty.pile");
-        File::create(&pile_path).unwrap();
-        let mut pile = open_pile_strict(&pile_path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        let error = validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap_err();
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+        let error = rows(&reader, &facts).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains(&format!("{id:x}")), "{rendered}");
-        assert!(rendered.contains("is not in this pile"), "{rendered}");
-        pile.close().unwrap();
+        assert!(rendered.contains(&hex::encode(absent.raw)), "{rendered}");
+
+        let checked = audit(&reader, &facts);
+        assert!(
+            checked
+                .notes
+                .iter()
+                .any(|note| note.contains(&format!("{id:x}"))
+                    && note.contains(&hex::encode(absent.raw))),
+            "{:?}",
+            checked.notes
+        );
+    }
+
+    // Open-world reading. Each test below failed on the closed-world reader
+    // this replaced: the facts are ordinary under merge-by-concatenation, so
+    // a reader that refuses them makes the whole collection unreadable.
+
+    fn api(fixture: &Fixture) -> Habits {
+        Habits::new(fixture.pile.clone(), Some(fixture.key.clone()))
+    }
+
+    /// The schema cannot express cardinality, so a definition carrying two
+    /// conditions is two readings of one intention, not a broken record. The
+    /// intention is due when any reading is, and is addressed by its id.
+    #[test]
+    fn two_values_for_one_attribute_are_each_read_not_refused() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let id = Id::new([0xC3; 16]).unwrap();
+        let mut fragment = Fragment::empty();
+        let label = fragment.put("twice".to_owned());
+        let hourly = fragment.put("every 1h".to_owned());
+        let daily = fragment.put("every 1d".to_owned());
+        let nudge = fragment.put("do it".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&id) @
+            metadata::tag: &KIND_HABIT_ID,
+            attrs::label: label,
+            attrs::condition: hourly,
+            attrs::nudge: nudge,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&id) @ attrs::condition: daily };
+        fixture.publish(fragment);
+
+        let checked = api.check().unwrap().audit;
+        assert_eq!(checked.definitions, 1);
+        assert!(
+            checked
+                .notes
+                .iter()
+                .any(|note| note.contains("2 conditions")),
+            "{:?}",
+            checked.notes
+        );
+        let before = api.list(true).unwrap();
+        let readings: Vec<_> = before
+            .entries
+            .iter()
+            .filter(|entry| entry.row.id == id)
+            .collect();
+        assert_eq!(readings.len(), 2);
+        assert!(readings.iter().all(|entry| entry.state == Some(State::Due)));
+        let due = render::listed(&before, true).text;
+        assert_eq!(due.matches("twice: do it").count(), 1, "{due}");
+
+        assert_eq!(api.show("twice").unwrap().definition.id, id);
+        assert_eq!(api.done(&format!("{id:x}")).unwrap().habit, id);
+        assert_eq!(api.done("twice").unwrap().habit, id);
+        let after = api.list(true).unwrap();
+        assert_eq!(after.entries.len(), 2);
+        assert!(after
+            .entries
+            .iter()
+            .all(|entry| entry.state == Some(State::Cooling)));
+    }
+
+    /// Facts this reader does not model annotate a record; they never make it
+    /// unreadable, whichever record kind they are attached to.
+    #[test]
+    fn facts_a_reader_does_not_model_never_fail_the_check() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let (definition, habit) =
+            habit_fragment("annotated", "every 1h", "do it", None, &[], &[]).unwrap();
+        let (completion, event) = completion_fragment(habit, at(10.0)).unwrap();
+        let (paused, assertion) =
+            state_fragment(habit, DeclaredState::Paused, &[], at(20.0)).unwrap();
+        let foreign = Id::new([0xEE; 16]).unwrap();
+        let mut union = definition + completion + paused;
+        for annotated in [habit, event, assertion] {
+            union += entity! { ExclusiveId::force_ref(&annotated) @ metadata::tag: &foreign };
+        }
+        union += entity! { ExclusiveId::force_ref(&habit) @ metadata::created_at: at(1.0) };
+        fixture.publish(union);
+
+        let checked = api.check().unwrap().audit;
+        assert_eq!(
+            (checked.definitions, checked.completions, checked.assertions),
+            (1, 1, 1)
+        );
+        assert!(checked.notes.is_empty(), "{:?}", checked.notes);
+        let listed = api.list(false).unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].row.completed_at, [tai(10.0)]);
+        assert!(matches!(
+            listed.entries[0].row.activation,
+            Activation::Paused(_)
+        ));
+    }
+
+    /// Set union has no order, so a completion or state assertion can arrive
+    /// before the definition it names. It waits, and counts on arrival.
+    #[test]
+    fn a_completion_arriving_before_its_definition_does_not_fail_the_check() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let (definition, habit) =
+            habit_fragment("early", "every 1h", "do it", None, &[], &[]).unwrap();
+        let (completion, _) = completion_fragment(habit, at(10.0)).unwrap();
+        let (paused, _) = state_fragment(habit, DeclaredState::Paused, &[], at(20.0)).unwrap();
+        fixture.publish(completion);
+        fixture.publish(paused);
+
+        let waiting = api.check().unwrap().audit;
+        assert_eq!((waiting.definitions, waiting.completions), (0, 1));
+        let name = format!("{habit:x}");
+        for kind in ["completion(s)", "state assertion(s)"] {
+            assert!(
+                waiting.notes.iter().any(|note| note.contains(kind)
+                    && note.contains(&name)
+                    && note.contains("no known definition yet")),
+                "{:?}",
+                waiting.notes
+            );
+        }
+        assert!(api.list(false).unwrap().entries.is_empty());
+
+        fixture.publish(definition);
+        let arrived = api.check().unwrap().audit;
+        assert!(arrived.notes.is_empty(), "{:?}", arrived.notes);
+        let listed = api.list(false).unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].row.id, habit);
+        assert_eq!(listed.entries[0].row.completed_at, [tai(10.0)]);
+        assert!(matches!(
+            listed.entries[0].row.activation,
+            Activation::Paused(_)
+        ));
+    }
+
+    /// The ordinary path already reads a state track whose predecessor this
+    /// view has not received; the check must not refuse what list reads.
+    #[test]
+    fn an_unseen_state_predecessor_does_not_fail_the_check() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let (definition, habit) =
+            habit_fragment("partial", "every 1h", "do it", None, &[], &[]).unwrap();
+        let unseen = Id::new([0xC4; 16]).unwrap();
+        let (paused, _) = state_fragment(habit, DeclaredState::Paused, &[unseen], at(1.0)).unwrap();
+        fixture.publish(definition);
+        fixture.publish(paused);
+
+        let checked = api.check().unwrap().audit;
+        assert!(
+            checked
+                .notes
+                .iter()
+                .any(|note| note.contains(&format!("{unseen:x}"))
+                    && note.contains("not in this view")),
+            "{:?}",
+            checked.notes
+        );
+        assert!(matches!(
+            api.list(false).unwrap().entries[0].row.activation,
+            Activation::Paused(_)
+        ));
+    }
+
+    /// Intrinsic ids cannot cycle, opaque ones can. A state track with no
+    /// maximal assertion declares nothing, and the rest of the collection
+    /// stays readable.
+    #[test]
+    fn a_state_cycle_does_not_make_the_collection_unreadable() {
+        let (definition, habit) =
+            habit_fragment("cyclic", "every 1h", "do it", None, &[], &[]).unwrap();
+        let (other, other_id) =
+            habit_fragment("bystander", "every 1h", "do it", None, &[], &[]).unwrap();
+        let x = Id::new([0xC5; 16]).unwrap();
+        let y = Id::new([0xC6; 16]).unwrap();
+        let mut cycle = Fragment::empty();
+        for (this, predecessor) in [(x, y), (y, x)] {
+            cycle += entity! { ExclusiveId::force_ref(&this) @
+                metadata::tag: &KIND_STATE_ID,
+                attrs::of: &habit,
+                attrs::state: STATE_PAUSED,
+                metadata::supersedes: &predecessor,
+                metadata::created_at: at(1.0),
+            };
+        }
+        let mut union = definition.clone() + other.clone() + cycle.clone();
+        let facts = union.facts().clone();
+        let reader = union.blobs_mut().snapshot().unwrap();
+        assert!(audit(&reader, &facts)
+            .notes
+            .iter()
+            .any(|note| note.contains("no maximal assertion")));
+        let rows = rows_of([definition, other, cycle]);
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(
+                row.activation,
+                Activation::Active(Vec::new()),
+                "{:x}",
+                row.id
+            );
+        }
+        assert!(rows.iter().any(|row| row.id == other_id));
+    }
+
+    /// Queries are types: a completion time that does not decode as an
+    /// interval is skipped, and an interval wider than a point is read at its
+    /// lower bound, as Orient reads it.
+    #[test]
+    fn a_completion_time_a_reader_cannot_decode_is_skipped() {
+        let (definition, habit) =
+            habit_fragment("timed", "every 1h", "do it", None, &[], &[]).unwrap();
+        let mut inverted = at(2_000.0).raw;
+        inverted[16..].copy_from_slice(&at(1_000.0).raw[16..]);
+        let mut span = at(1_000.0).raw;
+        span[16..].copy_from_slice(&at(1_500.0).raw[16..]);
+        let mut odd = Fragment::empty();
+        for (event, raw) in [
+            (Id::new([0xC7; 16]).unwrap(), inverted),
+            (Id::new([0xC8; 16]).unwrap(), span),
+        ] {
+            odd += entity! { ExclusiveId::force_ref(&event) @
+                metadata::tag: &KIND_DONE_ID,
+                attrs::of: &habit,
+                metadata::created_at: IntervalValue::new(raw),
+            };
+        }
+        let rows = rows_of([definition, odd]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].completed_at, [tai(1_000.0)]);
     }
 }

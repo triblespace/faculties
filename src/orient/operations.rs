@@ -591,9 +591,21 @@ impl RefreshProbe {
     }
 }
 
-fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
-    lower
+/// The lower bound of an interval in TAI nanoseconds, if the value decodes.
+///
+/// Queries are types: a stored value that does not decode as an interval (an
+/// inverted pair) is not a time this reader can order by, so every caller
+/// skips the row that carries it. It must never panic a watcher.
+fn interval_key(interval: IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
+    Some(lower)
+}
+
+/// The current instant as an interval key; a freshly minted point always
+/// decodes.
+fn now_key() -> Result<i128> {
+    interval_key(clock::point_now()?)
+        .ok_or_else(|| anyhow!("the clock minted an inverted interval"))
 }
 
 fn epoch_seconds(epoch: Epoch) -> i64 {
@@ -1636,7 +1648,9 @@ struct NativeMessage {
     from: Id,
     to: Id,
     body: message::TextHandle,
-    created_at: IntervalValue,
+    /// Lower bound in TAI nanoseconds; a row whose time does not decode is
+    /// not a message this reader can order, and is not projected.
+    created_at: i128,
 }
 
 fn native_message_rows(query: &OrientQuery<'_>) -> Vec<NativeMessage> {
@@ -1650,12 +1664,14 @@ fn native_message_rows(query: &OrientQuery<'_>) -> Vec<NativeMessage> {
             metadata::created_at: ?created_at,
         }])
     )
-    .map(|(id, from, to, body, created_at)| NativeMessage {
-        id,
-        from,
-        to,
-        body,
-        created_at,
+    .filter_map(|(id, from, to, body, created_at)| {
+        Some(NativeMessage {
+            id,
+            from,
+            to,
+            body,
+            created_at: interval_key(created_at)?,
+        })
     })
     .collect()
 }
@@ -1728,7 +1744,7 @@ fn unread_messages(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<NativeMes
             rows.push(row);
         }
     }
-    rows.sort_by_key(|row| (std::cmp::Reverse(interval_key(row.created_at)), row.id));
+    rows.sort_by_key(|row| (std::cmp::Reverse(row.created_at), row.id));
     rows.dedup_by_key(|row| row.id);
     Ok(rows)
 }
@@ -1774,7 +1790,7 @@ fn render_native_messages(
         writeln!(out, "- None").unwrap();
         return Ok((out, BTreeSet::new()));
     }
-    let now = interval_key(clock::point_now()?);
+    let now = now_key()?;
     let mut shown = BTreeSet::new();
     for row in unread.into_iter().take(limit) {
         shown.insert(row.id);
@@ -1782,7 +1798,7 @@ fn render_native_messages(
             out,
             "- [{}] {} {} -> {} (unread)",
             fmt_id(row.id),
-            format_age(now, interval_key(row.created_at)),
+            format_age(now, row.created_at),
             read_native_person_label(query, row.from)?,
             read_native_person_label(query, row.to)?,
         )
@@ -1879,7 +1895,7 @@ fn native_unread_mail(query: &OrientQuery<'_>, persona: Id) -> Result<BTreeMap<I
                     value: IntervalValue,
                     pattern!(query.mail, [{ projection @ mail_projection::claimed_date: ?value }])
                 )
-                .map(interval_key)
+                .filter_map(interval_key)
                 .min();
                 by_wire.entry(wire).or_insert(MailSummary {
                     claimed_at,
@@ -2020,7 +2036,7 @@ fn teams_message_detail_handles(
             teams::message_state: &present_state,
         }])
     )
-    .map(|(modified, observation)| (interval_key(modified), observation))
+    .filter_map(|(modified, observation)| Some((interval_key(modified)?, observation)))
     .max();
     let Some((_, observation)) = newest else {
         return Ok(TeamsMessageDetailHandles {
@@ -2150,7 +2166,10 @@ fn native_discord_messages(query: &OrientQuery<'_>, addressees: &HashSet<Id>) ->
         ])
     )
     .filter(|(anchor, channel, author, created, heard)| {
-        interval_key(*created) >= interval_key(*heard)
+        matches!(
+            (interval_key(*created), interval_key(*heard)),
+            (Some(created), Some(heard)) if created >= heard
+        )
             && !own.contains(author)
             && !notices.contains(anchor)
             && for_reader(*channel)
@@ -2177,7 +2196,10 @@ fn native_discord_messages(query: &OrientQuery<'_>, addressees: &HashSet<Id>) ->
             ])
         )
         .filter(|&(_, utterance, channel, author, created, heard)| {
-            interval_key(created) >= interval_key(heard)
+            matches!(
+                (interval_key(created), interval_key(heard)),
+                (Some(created), Some(heard)) if created >= heard
+            )
                 && !own.contains(&author)
                 && for_reader(channel)
                 && !exists!(pattern!(query.discord, [{
@@ -2259,7 +2281,7 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
             created: IntervalValue,
             pattern!(query.discord, [{ anchor @ metadata::created_at: ?created }])
         )
-        .map(|created| (interval_key(created), anchor))
+        .filter_map(|created| Some((interval_key(created)?, anchor)))
         .collect()
     } else {
         find!(
@@ -2271,14 +2293,14 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
                 metadata::created_at: ?created,
             }])
         )
-        .map(|(observation, created)| {
+        .filter_map(|(observation, created)| {
             let edited = find!(
                 edited: IntervalValue,
                 pattern!(query.discord, [{ observation @ archive::edited_at: ?edited }])
             )
-            .map(interval_key)
+            .filter_map(interval_key)
             .max();
-            (edited.unwrap_or(interval_key(created)), observation)
+            Some((edited.or(interval_key(created))?, observation))
         })
         .collect()
     };
@@ -2297,6 +2319,7 @@ fn discord_message_detail(query: &OrientQuery<'_>, anchor: Id) -> Result<Discord
         created: IntervalValue,
         pattern!(query.discord, [{ first @ metadata::created_at: ?created }])
     )
+    .filter(|created| interval_key(*created).is_some())
     .min_by_key(|created| interval_key(*created));
 
     let author = find!(
@@ -2580,7 +2603,7 @@ fn discord_in_order(query: &OrientQuery<'_>, anchors: impl IntoIterator<Item = I
                     metadata::created_at: ?created,
                 }])
             ))
-            .map(interval_key)
+            .filter_map(interval_key)
             .min();
             (created, anchor)
         })
@@ -2628,7 +2651,7 @@ fn render_native_mail(
         writeln!(out, "- None").unwrap();
         return Ok((out, BTreeSet::new()));
     }
-    let now = interval_key(clock::point_now()?);
+    let now = now_key()?;
     let mut shown = BTreeSet::new();
     for (wire, summary) in rows.into_iter().take(limit) {
         shown.insert(wire);
@@ -2677,7 +2700,10 @@ fn latest_goal_status(
 fn goal_priority_edges(query: &OrientQuery<'_>, goals: &BTreeSet<Id>) -> BTreeSet<(Id, Id)> {
     let mut latest = BTreeMap::<(Id, Id), ((i128, Id), bool)>::new();
     let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
-        let order = (interval_key(at), event);
+        let Some(at) = interval_key(at) else {
+            return;
+        };
+        let order = (at, event);
         let entry = latest.entry((higher, lower)).or_insert((order, active));
         if order > entry.0 {
             *entry = (order, active);
@@ -2758,19 +2784,13 @@ fn render_native_compass_goals(
             },
         };
         let (status_event, status, status_at) = status
-            .map(|(event, value, at)| {
-                (
-                    Some(event),
-                    value.to_ascii_lowercase(),
-                    Some(interval_key(at)),
-                )
-            })
+            .map(|(event, value, at)| (Some(event), value.to_ascii_lowercase(), interval_key(at)))
             .unwrap_or_else(|| (None, "todo".to_owned(), None));
         let created = find!(
             at: IntervalValue,
             pattern!(query.compass, [{ task @ metadata::created_at: ?at }])
         )
-        .map(interval_key)
+        .filter_map(interval_key)
         .min()
         .unwrap_or(0);
         let key = status_at.unwrap_or(created);
@@ -2889,7 +2909,10 @@ fn render_window_status(query: &OrientQuery<'_>) -> Result<(String, BTreeSet<Id>
             metadata::created_at: ?at,
         }])
     ) {
-        let key = (interval_key(at), event);
+        let Some(at) = interval_key(at) else {
+            continue;
+        };
+        let key = (at, event);
         let entry = latest.entry(window).or_insert((key, text));
         if key > entry.0 {
             *entry = (key, text);
@@ -2955,14 +2978,9 @@ fn prepare_habits(
         }])
     )
     .collect();
-    let superseded: BTreeSet<Id> = find!(
-        old: Id,
-        pattern!(facts, [{ _?new @
-            metadata::tag: &KIND_HABIT_ID,
-            metadata::supersedes: ?old,
-        }])
-    )
-    .collect();
+    // Liveness has one definition, in habits: only a complete successor
+    // retires what it supersedes, so a tag and an edge alone retire nothing.
+    let superseded = habits::superseded_definition_ids(facts);
 
     // A revision inherits the completion history of what it supersedes.
     let ancestry = habits::revision_ancestry(facts)?;
@@ -3003,7 +3021,7 @@ fn prepare_habits(
 
         let mut completed_at: Vec<i64> = habits::standing_completions(facts, &ancestry, habit)
             .into_iter()
-            .map(|completion| (interval_key(completion.completed_at) / 1_000_000_000) as i64)
+            .filter_map(|completion| habits::interval_second(completion.completed_at))
             .collect();
         completed_at.sort_unstable();
         completed_at.dedup();
@@ -3099,15 +3117,14 @@ fn observe_habits(
                     .next_cooldown_at()
                     .map_err(anyhow::Error::msg)?
                     .unwrap_or(0);
-                observation.due.insert(
-                    row.id,
-                    DueHabit {
-                        label: row.label.clone(),
-                        nudge: row.nudge.clone(),
-                        since,
-                        targeted: observation.targeted.contains(&row.id),
-                    },
-                );
+                // Several readings of one definition: it is due when any is,
+                // and the first due reading speaks for it.
+                observation.due.entry(row.id).or_insert(DueHabit {
+                    label: row.label.clone(),
+                    nudge: row.nudge.clone(),
+                    since,
+                    targeted: observation.targeted.contains(&row.id),
+                });
             }
             habits::State::Cooling => {
                 if let Some(deadline) = row
@@ -3155,7 +3172,7 @@ fn render_passive_habits<R: BlobStoreList + BlobStoreGet>(
     persona: Option<Id>,
 ) -> String {
     use std::fmt::Write as _;
-    let superseded: BTreeSet<Id> = find!(old: Id, pattern!(facts, [{ _?new @ metadata::tag: &KIND_HABIT_ID, metadata::supersedes: ?old }])).collect();
+    let superseded = habits::superseded_definition_ids(facts);
     let mut text = String::from("Habits (passive; conditions not evaluated):\n");
     let mut count = 0;
     for (habit, label) in find!((habit: Id, label: habits::TextHandle), pattern!(facts, [{ ?habit @ metadata::tag: &KIND_HABIT_ID, habit_attrs::label: ?label }]))
@@ -4209,7 +4226,7 @@ fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Optio
             metadata::created_at: ?at,
         }])
     )
-    .map(|(event, status, at)| (interval_key(at), event, status))
+    .filter_map(|(event, status, at)| Some((interval_key(at)?, event, status)))
     .collect();
     events.sort_by_key(|(at, event, _)| (*at, *event));
     let position = events.iter().position(|(_, event, _)| *event == current)?;
@@ -7873,6 +7890,79 @@ mod tests {
         pile.close().unwrap();
     }
 
+    /// Liveness has one definition, in habits: only a complete successor
+    /// retires what it supersedes. A tag and an edge alone are not a
+    /// definition, so Orient and `habit list` must both keep the original.
+    #[test]
+    fn orient_and_habit_list_agree_that_an_incomplete_successor_retires_nothing() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (original, original_id) =
+            habits::habit_fragment("kept", "every 1h", "still due", None, &[], &[]).unwrap();
+        let successor = id(21);
+        let incomplete = entity! { ExclusiveId::force_ref(&successor) @
+            metadata::tag: &KIND_HABIT_ID,
+            metadata::supersedes: &original_id,
+        };
+        let fragment = original + incomplete;
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let listed: Vec<Id> = habits::rows(&snapshot, &facts)
+            .unwrap()
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        let (prepared, _) = prepare_habits(&snapshot, &facts, None).unwrap();
+        let oriented: Vec<Id> = prepared.iter().map(|row| row.id).collect();
+        assert_eq!(listed, [original_id]);
+        assert_eq!(oriented, listed);
+        assert!(render_passive_habits(&snapshot, &facts, None).contains("kept"));
+        pile.close().unwrap();
+    }
+
+    /// Queries are types: a completion time that does not decode is not a
+    /// completion this reader can count, and it must never panic the watcher.
+    #[test]
+    fn an_undecodable_completion_time_is_skipped_not_a_panic() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (definition, habit) =
+            habits::habit_fragment("timed", "every 1h", "due", None, &[], &[]).unwrap();
+        let mut raw = clock::point(Epoch::from_tai_seconds(2_000.0)).unwrap().raw;
+        raw[16..]
+            .copy_from_slice(&clock::point(Epoch::from_tai_seconds(1_000.0)).unwrap().raw[16..]);
+        let event = id(22);
+        let inverted = entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &crate::schemas::habit::KIND_DONE_ID,
+            habit_attrs::of: &habit,
+            metadata::created_at: IntervalValue::new(raw),
+        };
+        assert_eq!(interval_key(IntervalValue::new(raw)), None);
+        let fragment = definition + inverted;
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(prepared.0.len(), 1);
+        assert!(prepared.0[0].completed_at.is_empty());
+        let observed = observe_habits(prepared, &fixture.path, 3_000).unwrap();
+        assert!(observed.due.contains_key(&habit));
+        pile.close().unwrap();
+    }
+
     #[test]
     fn wait_initial_and_timer_paths_do_not_execute_other_personas_predicates() {
         test_block_on(async {
@@ -9986,7 +10076,7 @@ mod tests {
         )
         .collect();
         assert_eq!(stamps.len(), 1);
-        assert!(interval_key(stamps[0]) >= accepted_at.get());
+        assert!(interval_key(stamps[0]).unwrap() >= accepted_at.get());
         drop(facts);
         drop(snapshot);
         pile.close().unwrap();

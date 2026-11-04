@@ -73,7 +73,9 @@ enum Command {
     Pause { label: String },
     /// Assert active state, reconciling every state head currently observed.
     Resume { label: String },
-    /// Validate the complete native Habit catalog and its attachments.
+    /// Read the complete Habit collection and its attachments, and report
+    /// counts plus notes on what readers skip or wait for. Never refuses
+    /// open-world facts and never runs a predicate.
     Check,
 }
 
@@ -157,7 +159,7 @@ pub fn run() -> Result<()> {
             Command::Resume { label } => {
                 render::state_changed(&habits.set_state(&label, DeclaredState::Active)?, out)
             }
-            Command::Check => out.line(habits.check()?),
+            Command::Check => render::checked(&habits.check()?, out),
             Command::List | Command::Due => unreachable!(),
         }),
     }

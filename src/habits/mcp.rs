@@ -19,7 +19,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "habit_done", description: "Publish a completion occurrence for one live intention by label or ID.", input_schema: SELECTOR },
     Tool { name: "habit_pause", description: "Publish paused activation, reconciling all observed state heads without changing the definition.", input_schema: SELECTOR },
     Tool { name: "habit_resume", description: "Publish active activation, reconciling all observed state heads without changing the definition.", input_schema: SELECTOR },
-    Tool { name: "habit_check", description: "Explicitly validate the complete Habit collection and its resident attachments, without executing carried predicates.", input_schema: EMPTY },
+    Tool { name: "habit_check", description: "Explicitly read the complete Habit collection and its resident attachments, without executing carried predicates. Reports counts, plus notes on facts readers skip or wait for (a completion before its definition, two values for one attribute); it never calls the collection invalid.", input_schema: EMPTY },
 ];
 
 #[derive(Deserialize)]
@@ -135,7 +135,7 @@ impl Faculty for Habits {
             }
             "habit_check" => {
                 let _: Empty = decode_arguments(arguments)?;
-                out.line(self.operations.check()?)
+                render::checked(&self.operations.check()?, out)
             }
             _ => bail!("Habit MCP has no tool {name:?}"),
         }

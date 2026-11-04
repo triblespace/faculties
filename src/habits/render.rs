@@ -4,7 +4,8 @@ use anyhow::Result;
 use triblespace::core::id::Id;
 
 use super::{
-    Activation, AddedHabit, HabitList, HabitObservation, HabitOccurrence, HabitStateChange, State,
+    Activation, AddedHabit, Habit, HabitCheck, HabitList, HabitObservation, HabitOccurrence,
+    HabitStateChange, State,
 };
 use crate::out::Out;
 
@@ -65,18 +66,29 @@ pub fn added(receipt: &AddedHabit, out: &mut Out<'_>) -> Result<()> {
     Ok(())
 }
 
+/// One block per reading. A definition with a single reading renders exactly
+/// as it always has; further readings follow, each complete.
 pub fn shown(observation: &HabitObservation, out: &mut Out<'_>) -> Result<()> {
-    let habit = &observation.definition;
+    shown_reading(&observation.definition, observation.superseded, out)?;
+    let total = observation.alternatives.len() + 1;
+    for (index, habit) in observation.alternatives.iter().enumerate() {
+        out.line("")?;
+        out.line(format!(
+            "reading {} of {total} (several values for one attribute; each is read)",
+            index + 2
+        ))?;
+        shown_reading(habit, observation.superseded, out)?;
+    }
+    Ok(())
+}
+
+fn shown_reading(habit: &Habit, superseded: bool, out: &mut Out<'_>) -> Result<()> {
     out.line(format!("label:       {}", habit.label))?;
     out.line(format!("id:          {:x}", habit.id))?;
     out.line(format!("personas:    {}", persona_targets(&habit.personas)))?;
     out.line(format!(
         "definition:  {}",
-        if observation.superseded {
-            "superseded"
-        } else {
-            "live"
-        }
+        if superseded { "superseded" } else { "live" }
     ))?;
     out.line(format!("condition:   {}", habit.condition))?;
     out.line(format!("nudge:\n{}", habit.nudge))?;
@@ -101,6 +113,26 @@ pub fn shown(observation: &HabitObservation, out: &mut Out<'_>) -> Result<()> {
                 .join(", ")
         }
     ))
+}
+
+/// The counts on the answer; every observation beside it, as a note. Nothing
+/// here is a verdict, so the command succeeds whatever it observed.
+pub fn checked(check: &HabitCheck, out: &mut Out<'_>) -> Result<()> {
+    let audit = &check.audit;
+    out.line(format!(
+        "Habit collection {} (scope {:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions read",
+        check.collection,
+        crate::schemas::habit::DEFAULT_SCOPE_ID,
+        audit.definitions,
+        audit.live,
+        audit.scripted,
+        audit.completions,
+        audit.assertions,
+    ))?;
+    for note in &audit.notes {
+        out.note(note.clone())?;
+    }
+    Ok(())
 }
 
 pub fn completed(receipt: &HabitOccurrence, out: &mut Out<'_>) -> Result<()> {
@@ -147,13 +179,17 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
     let mut text = String::new();
     let mut diagnostics = Vec::new();
     let mut shown = 0usize;
+    // An intention is due when any of its readings is, and is announced once.
+    let mut announced = std::collections::BTreeSet::new();
     for observed in &report.entries {
         let row = &observed.row;
         if only_due {
             match &observed.state {
                 Some(state) if state.is_due() => {
-                    shown += 1;
-                    writeln!(text, "{}: {}", row.label, row.nudge).unwrap();
+                    if announced.insert(row.id) {
+                        shown += 1;
+                        writeln!(text, "{}: {}", row.label, row.nudge).unwrap();
+                    }
                 }
                 Some(state) => {
                     if let Some(detail) = state_detail(state) {

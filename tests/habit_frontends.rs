@@ -382,3 +382,57 @@ fn delivery_failure_does_not_repeat_an_authored_definition() {
     assert_eq!(repeated.id, report.entries[0].row.id);
     assert!(repeated.already_present);
 }
+
+/// Set union has no order, so `habit check` must read a completion that
+/// arrived before its definition, and say so beside the answer rather than
+/// call the collection invalid.
+#[test]
+fn check_reads_a_completion_that_arrives_before_its_definition() {
+    let (_directory, pile, key) = fixture();
+    let (definition, habit) =
+        habits::habit_fragment("early", "every 1h", "do it", None, &[], &[]).unwrap();
+    let (completion, _) =
+        habits::completion_fragment(habit, faculties::clock::point_now().unwrap()).unwrap();
+    habits::publish(&pile, Some(&key), completion).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_habit"))
+        .arg("--pile")
+        .arg(&pile)
+        .arg("--key")
+        .arg(&key)
+        .arg("check")
+        .env_remove("DRIVE_ENDPOINT")
+        .env_remove("DRIVE_KEY")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("0 definitions"), "{stdout}");
+    assert!(stdout.contains("1 completions"), "{stdout}");
+    assert!(stderr.contains(&format!("{habit:x}")), "{stderr}");
+    assert!(stderr.contains("no known definition"), "{stderr}");
+
+    let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
+    let mut parts = Vec::new();
+    mcp.call(
+        "habit_check",
+        serde_json::to_vec(&json!({})).unwrap().into(),
+        &mut Out::new(&mut |part| {
+            parts.push(part);
+            Ok(())
+        }),
+    )
+    .unwrap();
+    assert!(parts.iter().any(|part| matches!(
+        part,
+        Part::Note { text } if text.contains("no known definition")
+    )));
+
+    habits::publish(&pile, Some(&key), definition).unwrap();
+    let checked = cli(&pile, &key, &["check"]);
+    assert!(checked.contains("1 definitions (1 live"), "{checked}");
+    let listed = Habits::new(pile, Some(key)).list(false).unwrap();
+    assert_eq!(listed.entries.len(), 1);
+    assert_eq!(listed.entries[0].row.completed_at.len(), 1);
+}

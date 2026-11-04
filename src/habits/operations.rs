@@ -17,7 +17,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::SnapshotSource;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -38,8 +38,19 @@ pub struct AddedHabit {
 }
 #[derive(Clone, Debug)]
 pub struct HabitObservation {
+    /// The first complete reading of the selected definition.
     pub definition: Habit,
+    /// Further readings of the same id, when one of its modeled attributes
+    /// carries several values. Each is read; none is chosen as the winner.
+    pub alternatives: Vec<Habit>,
     pub superseded: bool,
+}
+/// What one explicit `habit check` observed.
+#[derive(Clone, Debug)]
+pub struct HabitCheck {
+    /// Upper-case hex content identity of the Habit collection.
+    pub collection: String,
+    pub audit: habits::Audit,
 }
 #[derive(Clone, Debug)]
 pub struct EvaluatedHabit {
@@ -166,6 +177,8 @@ impl Habits {
                         && !retiring.contains(&habit.id)
                 })
                 .map(|habit| habit.id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect();
             if !already_present {
                 session.commit(fragment)?;
@@ -186,10 +199,13 @@ impl Habits {
     pub fn show(&self, selector: &str) -> Result<HabitObservation> {
         with_habits(&self.storage, false, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
-            let definition = select_habit(&definitions, selector)?.clone();
+            let id = select_habit(&definitions, selector)?.id;
+            let mut readings = definitions.into_iter().filter(|habit| habit.id == id);
+            let definition = readings.next().expect("the selected id has a reading");
             Ok(HabitObservation {
-                superseded: habits::is_superseded(&session.facts, definition.id),
+                superseded: habits::is_superseded(&session.facts, id),
                 definition,
+                alternatives: readings.collect(),
             })
         })
     }
@@ -238,7 +254,7 @@ impl Habits {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
             let superseded = habits::superseded_definition_ids(&session.facts);
             let habit = select_live_habit(&definitions, &superseded, selector)?.clone();
-            let activation = habits::activation(&session.facts, habit.id)?;
+            let activation = habits::activation(&session.facts, habit.id);
             let event = if activation.declared() == Some(state) {
                 None
             } else {
@@ -259,16 +275,37 @@ impl Habits {
             })
         })
     }
-    /// Explicit whole-collection audit; ordinary reads do not build a catalog.
-    pub fn check(&self) -> Result<String> {
-        let catalog = habits::read_catalog_strict_with_storage(&self.storage)?;
-        Ok(format!(
-            "Habit collection {} (scope {DEFAULT_SCOPE_ID:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions validated",
-            hex::encode_upper(habits::collection_handle_with_storage(&self.storage)?.raw),
-            catalog.habits().count(), catalog.live().len(),
-            catalog.habits().filter(|habit| habit.script.is_some()).count(),
-            catalog.completions().count(), catalog.assertions().count()
-        ))
+    /// Explicit whole-collection reading of every admitted foundation.
+    ///
+    /// It reports what the collection holds and observations about it; it
+    /// never calls the store invalid, because every fact it can see is an
+    /// ordinary member of an open-world union. Nothing is executed.
+    pub fn check(&self) -> Result<HabitCheck> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let collection = self.storage.open_collection_read(
+                pile,
+                DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+                runtime,
+            )?;
+            let reader = AcquiringReader::new(
+                pile.snapshot().context("freeze Habit check snapshot")?,
+                runtime.clone(),
+            );
+            // Every admitted foundation, not only the resident realized cover:
+            // bytes may arrive, but the admitted set stays this one observation.
+            let admitted = collection.admitted(&reader)?;
+            let mut facts = TribleSet::new();
+            for payload in admitted.members() {
+                facts += reader
+                    .get::<TribleSet, _>(payload)
+                    .context("read admitted Habit foundation")?;
+            }
+            Ok(HabitCheck {
+                collection: hex::encode_upper(collection.handle().raw),
+                audit: habits::audit(&reader, &facts),
+            })
+        })
     }
 }
 
@@ -370,6 +407,15 @@ fn with_habits<T>(
     })
 }
 
+fn distinct_ids(habits: &[&Habit]) -> Vec<Id> {
+    habits
+        .iter()
+        .map(|habit| habit.id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn id_list(habits: &[&Habit]) -> String {
     habits
         .iter()
@@ -381,15 +427,17 @@ fn id_list(habits: &[&Habit]) -> String {
         .join(", ")
 }
 
-fn unique_projection<'a>(definitions: Vec<&'a Habit>, id: Id) -> Result<&'a Habit> {
-    match definitions.as_slice() {
-        [habit] => Ok(*habit),
-        [] => bail!("no Habit definition {id:x}"),
-        many => bail!(
-            "Habit {id:x} has {} complete projections; its modeled fields are ambiguous",
-            many.len()
-        ),
-    }
+/// The first reading of one definition id.
+///
+/// An id with several readings (two values for one modeled attribute) is one
+/// definition, so a selector naming it is not ambiguous. Mutations need only
+/// the id; the reading supplies a display label, and `definitions` returns
+/// readings in a deterministic order, so every window shows the same one.
+fn first_reading<'a>(definitions: &'a [Habit], id: Id) -> Result<&'a Habit> {
+    definitions
+        .iter()
+        .find(|habit| habit.id == id)
+        .ok_or_else(|| anyhow!("no Habit definition {id:x}"))
 }
 
 /// Resolve a command-line selector to exactly one live definition.
@@ -411,13 +459,14 @@ fn select_live_habit<'a>(
         .filter(|habit| !superseded.contains(&habit.id))
         .filter(|habit| habit.label.eq_ignore_ascii_case(selector))
         .collect();
-    match live.as_slice() {
-        [habit] => return Ok(*habit),
+    // Several readings of one id are one definition, not an ambiguity.
+    match distinct_ids(&live).as_slice() {
+        [_] => return Ok(live[0]),
         [] => {}
         many => bail!(
             "label {selector:?} names {} live Habits; address one by id: {}",
             many.len(),
-            id_list(many)
+            id_list(&live)
         ),
     }
 
@@ -427,10 +476,7 @@ fn select_live_habit<'a>(
     if superseded.contains(&id) {
         bail!("Habit {id:x} is superseded history and cannot be mutated");
     }
-    unique_projection(
-        definitions.iter().filter(|habit| habit.id == id).collect(),
-        id,
-    )
+    first_reading(definitions, id)
 }
 
 /// Resolve any definition, including superseded history, for inspection.
@@ -440,23 +486,20 @@ fn select_habit<'a>(definitions: &'a [Habit], selector: &str) -> Result<&'a Habi
         .iter()
         .filter(|habit| habit.label.eq_ignore_ascii_case(selector))
         .collect();
-    match labelled.as_slice() {
-        [habit] => return Ok(*habit),
+    match distinct_ids(&labelled).as_slice() {
+        [_] => return Ok(labelled[0]),
         [] => {}
         many => bail!(
             "label {selector:?} names {} Habit revisions; address one by id: {}",
             many.len(),
-            id_list(many)
+            id_list(&labelled)
         ),
     }
 
     let ids: BTreeSet<_> = definitions.iter().map(|habit| habit.id).collect();
     let id = crate::resolve_id_prefix(selector, ids)
         .map_err(|error| anyhow!("no Habit labelled {selector:?}, and {error}"))?;
-    unique_projection(
-        definitions.iter().filter(|habit| habit.id == id).collect(),
-        id,
-    )
+    first_reading(definitions, id)
 }
 
 /// Resolve one revision predecessor by intrinsic id or id prefix.
