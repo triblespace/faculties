@@ -35,7 +35,7 @@ use std::str::FromStr;
 use base64::Engine;
 use hifitime::{Duration, Epoch};
 
-use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
+use super::{id_like, JsonLeaf, Kind, Origin, Pointer, Step, Token, Value};
 use crate::archive_v3::fields::{
     Beside, Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps,
     Mirror, Order, Place, Structure, Supply, Windows,
@@ -1226,6 +1226,7 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         walker.document(source, 0);
     }
     walker.finish();
+    documents(&mut walker.out);
     // Every witness names the format's namespace: one token of the unit,
     // where a record holds anything.
     if walker.out.items.iter().any(|item| item.held) {
@@ -1241,6 +1242,122 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
             });
     }
     walker.out
+}
+
+/// G18: the `structure` leaves of one item are one document, its fact's one
+/// root (the model gives a fact at most one `structure`; the members of a
+/// [`Decode::Member`] fact join it), so they fold into one pair, copy 0, in
+/// the item and over the unit. The pair keeps the origins of its leaves in
+/// its record. A leaf no item holds (a value outside every record) folds
+/// with the leaves of its own origin.
+fn documents(out: &mut Walked) {
+    type Group = (String, String, String);
+    let group = |token: &Token| -> Group {
+        (
+            token.modality.clone(),
+            token.direction.clone(),
+            token.attribute.clone(),
+        )
+    };
+    let document = |key: &Group, mut leaves: Vec<(Pointer, JsonLeaf)>| {
+        leaves.sort();
+        leaves.dedup();
+        Token {
+            modality: key.0.clone(),
+            direction: key.1.clone(),
+            attribute: key.2.clone(),
+            value: Value::Structure { copy: 0, leaves },
+        }
+    };
+    let mut leaf_origins: BTreeMap<Token, Vec<Origin>> = BTreeMap::new();
+    out.tokens.retain(|token, origins| {
+        if matches!(token.value, Value::Json(..)) {
+            leaf_origins.insert(token.clone(), std::mem::take(origins));
+            false
+        } else {
+            true
+        }
+    });
+    let mut folded: Vec<(Token, Vec<Origin>)> = Vec::new();
+    let mut held: BTreeSet<Token> = BTreeSet::new();
+    for item in &mut out.items {
+        let mut groups: BTreeMap<Group, Vec<(Pointer, JsonLeaf)>> = BTreeMap::new();
+        let mut sources: BTreeMap<Group, Vec<Origin>> = BTreeMap::new();
+        let record = (item.record != GAP).then_some(item.record);
+        item.tokens.retain(|token| {
+            let Value::Json(pointer, leaf) = &token.value else {
+                return true;
+            };
+            groups
+                .entry(group(token))
+                .or_default()
+                .push((pointer.clone(), leaf.clone()));
+            sources
+                .entry(group(token))
+                .or_default()
+                .extend(leaf_origins.get(token).into_iter().flatten().cloned());
+            held.insert(token.clone());
+            false
+        });
+        for (key, leaves) in groups {
+            // Its leaves' origins in its own record; any of theirs when a
+            // copy came from another record; its item's path at least, so
+            // a missing document is always reported.
+            let all = sources.remove(&key).unwrap_or_default();
+            let mut origins: Vec<Origin> = all
+                .iter()
+                .filter(|origin| origin.record == record)
+                .cloned()
+                .collect();
+            if origins.is_empty() {
+                origins = all;
+            }
+            if origins.is_empty() {
+                origins.push(Origin {
+                    path: item.path.clone(),
+                    record,
+                    index: Vec::new(),
+                });
+            }
+            let token = document(&key, leaves);
+            item.tokens.insert(token.clone());
+            folded.push((token, origins));
+        }
+    }
+    let mut loose: BTreeMap<(Group, String, Option<usize>, Vec<usize>), Vec<(Pointer, JsonLeaf)>> =
+        BTreeMap::new();
+    for (token, origins) in &leaf_origins {
+        if held.contains(token) {
+            continue;
+        }
+        let Value::Json(pointer, leaf) = &token.value else {
+            continue;
+        };
+        for origin in origins {
+            loose
+                .entry((
+                    group(token),
+                    origin.path.clone(),
+                    origin.record,
+                    origin.index.clone(),
+                ))
+                .or_default()
+                .push((pointer.clone(), leaf.clone()));
+        }
+    }
+    for ((key, path, record, index), leaves) in loose {
+        folded.push((
+            document(&key, leaves),
+            vec![Origin {
+                path,
+                record,
+                index,
+            }],
+        ));
+    }
+    for (token, origins) in folded {
+        out.tokens.entry(token).or_default().extend(origins);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3184,19 +3301,19 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
         (Decode::JsonText, J::Str(text)) => {
             let parsed = Parser::document(text.as_bytes()).map_err(|_| Failure::Decode)?;
             let mut leaves = Vec::new();
-            json_leaves(&parsed, &mut String::new(), &mut leaves);
+            json_leaves(&parsed, &mut Vec::new(), &mut leaves);
             Ok(leaves)
         }
         (Decode::Number, J::Num(token)) => one(Value::Number(token.clone())),
         (Decode::Bool, J::Bool(b)) => one(Value::Bool(*b)),
         (Decode::Json, value) => {
             let mut leaves = Vec::new();
-            json_leaves(value, &mut String::new(), &mut leaves);
+            json_leaves(value, &mut Vec::new(), &mut leaves);
             Ok(leaves)
         }
         (Decode::Member(pointer), value) => {
             let mut leaves = Vec::new();
-            json_leaves(value, &mut pointer.to_owned(), &mut leaves);
+            json_leaves(value, &mut member_pointer(pointer), &mut leaves);
             Ok(leaves)
         }
         (Decode::MediaType, J::Str(text)) => one(Value::Text(
@@ -3230,8 +3347,19 @@ fn data_uri(text: &str) -> Option<(&str, &str)> {
     Some((media_type, data))
 }
 
-/// Every leaf of a JSON value under its JSON Pointer.
-fn json_leaves(value: &J, pointer: &mut String, out: &mut Vec<Value>) {
+/// The path a [`Decode::Member`] names, as a JSON Pointer (RFC 6901): every
+/// step an object member, since the members of one object form the fact.
+fn member_pointer(pointer: &str) -> Pointer {
+    pointer
+        .split('/')
+        .skip(1)
+        .map(|name| Step::Key(name.replace("~1", "/").replace("~0", "~")))
+        .collect()
+}
+
+/// Every leaf of a JSON value under its path, each step naming its
+/// container kind (G18).
+fn json_leaves(value: &J, pointer: &mut Pointer, out: &mut Vec<Value>) {
     let leaf = match value {
         J::Null => JsonLeaf::Null,
         J::Bool(b) => JsonLeaf::Bool(*b),
@@ -3241,21 +3369,17 @@ fn json_leaves(value: &J, pointer: &mut String, out: &mut Vec<Value>) {
         J::Obj(members) if members.is_empty() => JsonLeaf::EmptyObject,
         J::Arr(elements) => {
             for (at, element) in elements.iter().enumerate() {
-                let len = pointer.len();
-                pointer.push('/');
-                pointer.push_str(&at.to_string());
+                pointer.push(Step::Index(at as u128));
                 json_leaves(element, pointer, out);
-                pointer.truncate(len);
+                pointer.pop();
             }
             return;
         }
         J::Obj(members) => {
             for (name, member) in members {
-                let len = pointer.len();
-                pointer.push('/');
-                pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
+                pointer.push(Step::Key(name.clone()));
                 json_leaves(member, pointer, out);
-                pointer.truncate(len);
+                pointer.pop();
             }
             return;
         }

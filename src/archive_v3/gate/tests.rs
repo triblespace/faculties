@@ -114,15 +114,27 @@ fn walker_decodes_values_exactly_and_ignores_member_order() {
         values.contains(&&Value::Number("1.0".to_owned())),
         "number tokens stay exact"
     );
-    for leaf in [
-        Value::Json("/a".to_owned(), JsonLeaf::Null),
-        Value::Json("/b/0".to_owned(), JsonLeaf::Number("1".to_owned())),
-        Value::Json("/b/1".to_owned(), JsonLeaf::Number("2.50".to_owned())),
-        Value::Json("/b/2".to_owned(), JsonLeaf::EmptyObject),
-        Value::Json("/c".to_owned(), JsonLeaf::EmptyArray),
-    ] {
-        assert!(values.contains(&&leaf), "{leaf:?}");
-    }
+    // One pair for the whole document (G18), each step naming its kind.
+    use super::Step::{self as JsonStep, Index};
+    let key = |name: &str| JsonStep::Key(name.to_owned());
+    let document = Value::Structure {
+        copy: 0,
+        leaves: vec![
+            (vec![key("a")], JsonLeaf::Null),
+            (vec![key("b"), Index(0)], JsonLeaf::Number("1".to_owned())),
+            (
+                vec![key("b"), Index(1)],
+                JsonLeaf::Number("2.50".to_owned()),
+            ),
+            (vec![key("b"), Index(2)], JsonLeaf::EmptyObject),
+            (vec![key("c")], JsonLeaf::EmptyArray),
+        ],
+    };
+    assert!(values.contains(&&document), "{values:?}");
+    assert!(
+        !values.iter().any(|value| matches!(value, Value::Json(..))),
+        "no leaf stays outside its document"
+    );
 }
 
 #[test]

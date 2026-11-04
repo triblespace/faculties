@@ -50,7 +50,7 @@ use triblespace::prelude::inlineencodings::{
 };
 use triblespace::prelude::*;
 
-use super::{JsonLeaf, Kind, Multiset, Token, Value};
+use super::{JsonLeaf, Kind, Multiset, Pointer, Step, Token, Value};
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag as main;
 
@@ -693,8 +693,8 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
     }
 
     /// A fact's tuple: one token per trible, each under the fact's modality
-    /// and direction (a `structure` as its `json_tree` leaves), with the
-    /// fact's shape for its modality and direction and its kind tag. A fact
+    /// and direction (a `structure` root as its whole document, one pair per
+    /// root: G18), with the fact's shape for its modality and direction and its kind tag. A fact
     /// with no single modality and direction renders a shape for each
     /// combination, which no source fact has.
     fn fact(&mut self, fact: Id) -> Tuple {
@@ -703,6 +703,8 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         let mut directions = Vec::new();
         let mut values: Vec<(String, Value)> = Vec::new();
         let mut plain: Vec<Token> = Vec::new();
+        // Each `structure` root's document (G18).
+        let mut documents: Vec<Vec<(Pointer, JsonLeaf)>> = Vec::new();
         for &(attribute, raw) in &tribles {
             if attribute == v3::fact::modality.id() {
                 match Self::id(raw) {
@@ -817,12 +819,9 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 match Self::id(raw) {
                     Some(root) => {
                         let mut leaves = Vec::new();
-                        self.json(root, &mut String::new(), &mut leaves, 0);
-                        values.extend(
-                            leaves
-                                .into_iter()
-                                .map(|leaf| ("structure".to_owned(), leaf)),
-                        );
+                        self.json(root, &mut Vec::new(), &mut leaves, 0);
+                        leaves.sort();
+                        documents.push(leaves);
                     }
                     None => values.push(("structure".to_owned(), Value::Raw(hex(&raw.raw)))),
                 }
@@ -830,6 +829,26 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             }
             let token = unknown(attribute, raw);
             values.push((token.attribute, token.value));
+        }
+        // Each root its own pair (G18): a document that several roots render
+        // is one pair per root, told apart by its copy.
+        documents.sort();
+        let mut at = 0;
+        while at < documents.len() {
+            let same = documents[at..]
+                .iter()
+                .take_while(|document| **document == documents[at])
+                .count();
+            for copy in 0..same {
+                values.push((
+                    "structure".to_owned(),
+                    Value::Structure {
+                        copy,
+                        leaves: documents[at].clone(),
+                    },
+                ));
+            }
+            at += same;
         }
         let mut tuple: Tuple = plain.into_iter().collect();
         for modality in &modalities {
@@ -848,7 +867,8 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         tuple
     }
 
-    /// One `json_tree` node as its leaves under `pointer`. A node renders
+    /// One `json_tree` node as its leaves under `pointer`, each step of
+    /// which names its container kind (G18). A node renders
     /// as its JSON value only when its tuple is exactly that value's: one
     /// kind and the attributes of that kind, each once (an object's
     /// entries, each exactly a kind, a name and a value, with no name
@@ -856,14 +876,20 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
     /// and a value, with no index twice). Any other node is a malformed
     /// leaf, which no source has; its children still render, so each of
     /// their tribles renders once.
-    fn json(&mut self, node: Id, pointer: &mut String, out: &mut Vec<Value>, depth: usize) {
+    fn json(
+        &mut self,
+        node: Id,
+        pointer: &mut Pointer,
+        out: &mut Vec<(Pointer, JsonLeaf)>,
+        depth: usize,
+    ) {
         if depth > 512 {
             self.rows.push((
                 "window:structure".to_owned(),
                 Kind::Decode,
                 format!("{node:X}"),
             ));
-            out.push(Value::Json(pointer.clone(), JsonLeaf::Malformed));
+            out.push((pointer.clone(), JsonLeaf::Malformed));
             return;
         }
         let mut kinds: Vec<Id> = Vec::new();
@@ -912,7 +938,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         {
             malformed = true;
         }
-        let mut leaves: Vec<Value> = Vec::new();
+        let mut leaves: Vec<(Pointer, JsonLeaf)> = Vec::new();
         match kind {
             Some(kind) if kind == json_tree::kind_object => {
                 let mut members: Vec<(String, Id)> = Vec::new();
@@ -953,14 +979,12 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     malformed = true;
                 }
                 if members.is_empty() {
-                    leaves.push(Value::Json(pointer.clone(), JsonLeaf::EmptyObject));
+                    leaves.push((pointer.clone(), JsonLeaf::EmptyObject));
                 }
                 for (name, value) in members {
-                    let len = pointer.len();
-                    pointer.push('/');
-                    pointer.push_str(&name.replace('~', "~0").replace('/', "~1"));
+                    pointer.push(Step::Key(name));
                     self.json(value, pointer, &mut leaves, depth + 1);
-                    pointer.truncate(len);
+                    pointer.pop();
                 }
             }
             Some(kind) if kind == json_tree::kind_array => {
@@ -1010,14 +1034,12 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     malformed = true;
                 }
                 if elements.is_empty() {
-                    leaves.push(Value::Json(pointer.clone(), JsonLeaf::EmptyArray));
+                    leaves.push((pointer.clone(), JsonLeaf::EmptyArray));
                 }
                 for (index, value) in elements {
-                    let len = pointer.len();
-                    pointer.push('/');
-                    pointer.push_str(&index.to_string());
+                    pointer.push(Step::Index(index));
                     self.json(value, pointer, &mut leaves, depth + 1);
-                    pointer.truncate(len);
+                    pointer.pop();
                 }
             }
             Some(kind) if kind == json_tree::kind_string || kind == json_tree::kind_number => {
@@ -1028,7 +1050,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 };
                 match raws.as_slice() {
                     [raw] => match self.text(*raw, "structure") {
-                        Value::Text(text) => leaves.push(Value::Json(
+                        Value::Text(text) => leaves.push((
                             pointer.clone(),
                             if kind == json_tree::kind_string {
                                 JsonLeaf::String(text)
@@ -1043,18 +1065,18 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             }
             Some(kind) if kind == json_tree::kind_bool => match bools.as_slice() {
                 [raw] => match raw.transmute::<Boolean>().try_from_inline::<bool>() {
-                    Ok(value) => leaves.push(Value::Json(pointer.clone(), JsonLeaf::Bool(value))),
+                    Ok(value) => leaves.push((pointer.clone(), JsonLeaf::Bool(value))),
                     Err(_) => malformed = true,
                 },
                 _ => malformed = true,
             },
             Some(kind) if kind == json_tree::kind_null => {
-                leaves.push(Value::Json(pointer.clone(), JsonLeaf::Null));
+                leaves.push((pointer.clone(), JsonLeaf::Null));
             }
             _ => malformed = true,
         }
         if malformed {
-            out.push(Value::Json(pointer.clone(), JsonLeaf::Malformed));
+            out.push((pointer.clone(), JsonLeaf::Malformed));
         } else {
             out.extend(leaves);
         }

@@ -2,8 +2,9 @@
 //! the round-2 adversarial review's 25 cases, the round-3 review's 45
 //! (Claude Code and Codex, plus the importer refusal of a message whose
 //! content is a string), and the round-3 cases for report vocabulary (G8)
-//! and gap items (G9), and the round-4 review's 50 attacks with its three
-//! controls (G17). Synthetic transcripts only.
+//! and gap items (G9), the round-4 review's 50 attacks with its three
+//! controls (G17), and the round-5 review's 23 attacks with its three
+//! controls (G18). Synthetic transcripts only.
 //!
 //! Each case imports a right transcript, then breaks the fragment (or the
 //! source) in one way an importer could, and asks the gate. A case passes
@@ -3335,6 +3336,948 @@ mod round4 {
             Out::Refused(_) => {}
             Out::Gated(report) => assert!(!report.passed(), "E2 passed the gate"),
             Out::Crashed(why) | Out::Baseline(why) => panic!("E2: {why}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 5: the adversary's 23 attacks and 3 controls (G18). 8 wrong outputs
+// passed the round-5 gate, all in JSON structure: an array rendered like an
+// object keyed "0", "1" (J1, J2, J6, J7), and a fact's input spread over
+// several `structure` roots, or held twice (J3, J4, J5, J8). C1 (the same
+// input under fresh json ids) must pass; C2 and C3 must be caught.
+
+mod round5 {
+    use super::*;
+    use std::collections::HashSet;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use triblespace::core::blob::MemoryBlobStore;
+    use triblespace::core::import::json_tree::{self as jt, JsonTreeImporter};
+
+    // Fresh ids, each minted with `trible genid` for the round-5 attack.
+    const R5_A: Id = triblespace::macros::id_hex!("FD88B10198F8F888A0AF99D3A574A924");
+    const R5_B: Id = triblespace::macros::id_hex!("76021F076404627C60A39AD6D107E2C0");
+    const R5_C: Id = triblespace::macros::id_hex!("27B7DF30E4EE85CE6E1A062EE3CF93C8");
+    const R5_D: Id = triblespace::macros::id_hex!("60D72A0CE258BD3A9B202DDC52EEDE30");
+    const R5_E: Id = triblespace::macros::id_hex!("7EF56A27861A6B6E2C6AB2934DC423E2");
+    const R5_F: Id = triblespace::macros::id_hex!("3A82E93A2FA989FBDF98D4084A679D0D");
+    /// Salt for a JSON tree with fresh node ids (same content, other ids).
+    const R5_SALT: Id = triblespace::macros::id_hex!("66FB2427A83FB425B6D4664AB9830FF5");
+
+    enum Out {
+        Gated(Report),
+        Refused(String),
+        Crashed(String),
+        Baseline(String),
+    }
+
+    fn salt() -> Option<[u8; 32]> {
+        let mut s = [0u8; 32];
+        s[..16].copy_from_slice(R5_SALT.as_ref());
+        Some(s)
+    }
+
+    fn gated(source: &str, table: &FieldTable, f: Fragment) -> Out {
+        match catch_unwind(AssertUnwindSafe(|| run_on(table, source, f))) {
+            Ok(report) => Out::Gated(report),
+            Err(panic) => Out::Crashed(
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    fn fed(import: Importer, table: &FieldTable, source: &str) -> Out {
+        match import(source.as_bytes()) {
+            Err(failure) => Out::Refused(gate::vocabulary(table, &failure.path)),
+            Ok(mut fragment) => {
+                let blobs = fragment.blobs_mut().snapshot().unwrap();
+                Out::Gated(gate::check(
+                    table,
+                    source.as_bytes(),
+                    fragment.facts(),
+                    &blobs,
+                ))
+            }
+        }
+    }
+
+    fn baseline(import: Importer, table: &FieldTable, source: &str) -> Result<Imported, Out> {
+        match import(source.as_bytes()) {
+            Err(failure) => Err(Out::Baseline(format!(
+                "refused at {}",
+                gate::vocabulary(table, &failure.path)
+            ))),
+            Ok(mut fragment) => {
+                let blobs = fragment.blobs_mut().snapshot().unwrap();
+                let report = gate::check(table, source.as_bytes(), fragment.facts(), &blobs);
+                if !report.passed() {
+                    return Err(Out::Baseline(format!("baseline fails: {report}")));
+                }
+                Ok(Imported { fragment, blobs })
+            }
+        }
+    }
+
+    /// Every trible of the `json_tree` entities reachable from `root`.
+    fn json_tribles(set: &TribleSet, root: Id) -> Vec<Trible> {
+        let mut seen = HashSet::new();
+        let mut todo = vec![root];
+        let mut out = Vec::new();
+        while let Some(e) = todo.pop() {
+            if !seen.insert(e) {
+                continue;
+            }
+            for t in entity(set, e) {
+                out.push(t);
+                if *t.a() == jt::object_field.id()
+                    || *t.a() == jt::field_value.id()
+                    || *t.a() == jt::array_value.id()
+                {
+                    if let Ok(id) = t.v::<GenId>().try_from_inline::<Id>() {
+                        todo.push(id);
+                    }
+                }
+            }
+            todo.extend(subjects_with(set, jt::array_parent.id(), e));
+        }
+        out
+    }
+
+    /// A `json_tree` of `text` (as the importers build one), added to `f`.
+    fn tree(f: &mut Fragment, text: &str, salted: bool) -> Id {
+        let mut store = MemoryBlobStore::new();
+        let mut t = JsonTreeImporter::new(&mut store, if salted { salt() } else { None })
+            .import_str(text)
+            .unwrap();
+        t.blobs_mut().union(store);
+        let root = t.root().unwrap();
+        *f += t;
+        root
+    }
+
+    /// The fact's structure becomes the trees of `roots` (each `(json,
+    /// salted)`); the old tree is removed unless `keep` (then it stays
+    /// referenced, so every trible is still consumed).
+    fn restructure(f: &mut Fragment, fact: Id, roots: &[(&str, bool)], keep: bool) {
+        let old = ids(f.facts(), fact, v3::fact::structure.id());
+        if !keep {
+            let mut gone = of(f.facts(), fact, v3::fact::structure.id());
+            for root in &old {
+                gone.extend(json_tribles(f.facts(), *root));
+            }
+            remove(f, &gone);
+        }
+        for (text, salted) in roots {
+            let root = tree(f, text, *salted);
+            add(
+                f,
+                Trible::force(&fact, &v3::fact::structure.id(), &gv(root)),
+            );
+        }
+    }
+
+    /// The fact whose structure has a top-level member `name`.
+    fn fact_with_member(i: &Imported, name: &str) -> Id {
+        let f = &i.fragment;
+        for (fact, root) in subjects_of(f.facts(), v3::fact::structure.id()) {
+            for entry in ids(f.facts(), root, jt::object_field.id()) {
+                for t in of(f.facts(), entry, jt::field_name.id()) {
+                    let h: Inline<Handle<UTF8String>> = *t.v::<Handle<UTF8String>>();
+                    if text_of(i, h) == name {
+                        return fact;
+                    }
+                }
+            }
+        }
+        panic!("no structure with member {name}");
+    }
+
+    fn cc_call(input: Value) -> String {
+        jsonl(&[
+            user("u1", None, 0, json!("Run.")),
+            assistant(
+                "a1",
+                "u1",
+                1,
+                "m1",
+                call("t1", "Bash", input),
+                json!("tool_use"),
+            ),
+            user("u2", Some("a1"), 2, result("t1", json!("out"))),
+            assistant("a2", "u2", 3, "m2", said("Done."), json!("end_turn")),
+        ])
+    }
+
+    /// Codex `g3` with the call's arguments replaced.
+    fn cx_g3_args(arguments: &str) -> String {
+        let mut v: Vec<Value> = cx::g3()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let at = v
+            .iter()
+            .position(|r| r["payload"]["type"] == "function_call")
+            .unwrap();
+        v[at]["payload"]["arguments"] = json!(arguments);
+        jsonl(&v)
+    }
+
+    fn cx_meta() -> Value {
+        cx::line(
+            0,
+            "session_meta",
+            json!({"id": "66666666-6666-4666-8666-666666666666", "timestamp": stamp(0),
+            "cwd": "/synthetic", "originator": "codex_cli_rs", "cli_version": "0.0.0",
+            "instructions": null, "source": "cli", "model_provider": "openai"}),
+        )
+    }
+
+    fn cx_turn(second: u32, turn: &str) -> [Value; 2] {
+        [
+            cx::line(
+                second,
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            cx::line(
+                second,
+                "turn_context",
+                json!({"cwd": "/synthetic", "model": "gpt-5-codex", "effort": "high",
+                "summary": "auto"}),
+            ),
+        ]
+    }
+
+    fn cx_user(second: u32, text: &str) -> [Value; 2] {
+        [
+            cx::line(
+                second,
+                "response_item",
+                json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]}),
+            ),
+            cx::line(
+                second,
+                "event_msg",
+                json!({"type": "user_message", "message": text,
+                "images": [], "local_images": [], "text_elements": []}),
+            ),
+        ]
+    }
+
+    fn cx_said(second: u32, text: &str) -> Value {
+        cx::line(
+            second,
+            "response_item",
+            json!({"type": "message", "role": "assistant", "phase": "final_answer",
+            "content": [{"type": "output_text", "text": text}]}),
+        )
+    }
+
+    fn cx_complete(second: u32, turn: &str, error: bool) -> Value {
+        let mut payload = json!({"type": "task_complete", "turn_id": turn,
+        "last_agent_message": null});
+        if error {
+            payload["error"] = json!({"message": "boom", "codex_error_info": "other"});
+        }
+        cx::line(second, "event_msg", payload)
+    }
+
+    fn cx_abort(second: u32, turn: &str) -> Value {
+        cx::line(
+            second,
+            "event_msg",
+            json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": turn}),
+        )
+    }
+
+    /// A rollout whose turn t2 holds no node and fails.
+    fn cx_nodeless_error() -> Vec<Value> {
+        let mut r = vec![cx_meta()];
+        r.extend(cx_turn(1, "t1"));
+        r.extend(cx_user(2, "P1."));
+        r.push(cx_said(3, "R1."));
+        r.push(cx_complete(4, "t1", false));
+        r.extend(cx_turn(5, "t2"));
+        r.push(cx_complete(6, "t2", true));
+        r.extend(cx_turn(7, "t3"));
+        r.extend(cx_user(8, "P3."));
+        r.push(cx_said(9, "R3."));
+        r
+    }
+
+    fn occurrences_with(f: &Fragment, attribute: Id) -> Vec<Id> {
+        let mut found: Vec<Id> = f
+            .facts()
+            .iter()
+            .filter(|t| *t.a() == attribute)
+            .map(|t| *t.e())
+            .collect();
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// Move every trible of attribute `a` from `from` to `to`.
+    fn move_attr(f: &mut Fragment, from: Id, to: Id, a: Id) {
+        let ts = of(f.facts(), from, a);
+        assert!(!ts.is_empty(), "nothing to move");
+        remove(f, &ts);
+        for t in ts {
+            add(f, Trible::force(&to, t.a(), t.v::<UnknownInline>()));
+        }
+    }
+
+    fn attacks() -> Vec<(&'static str, &'static str, Out)> {
+        use crate::archive_v3::codex::import as cx_import;
+        let mut out: Vec<(&'static str, &'static str, Out)> = Vec::new();
+        macro_rules! base {
+            ($code:expr, $name:expr, $import:expr, $table:expr, $source:expr) => {
+                match baseline($import, $table, $source) {
+                    Ok(i) => i,
+                    Err(o) => {
+                        out.push(($code, $name, o));
+                        break;
+                    }
+                }
+            };
+        }
+
+        // ---- JSON structure, Claude Code call input
+        let two = json!({"command": "ls", "timeout": 5});
+        let s_two = cc_call(two);
+        #[allow(clippy::never_loop)]
+        loop {
+            let i = base!("C1", "control", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls","timeout":5}"#, true)],
+                false,
+            );
+            out.push((
+                "C1",
+                "control (must pass): the same input under fresh json ids",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("C2", "control", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"rm","timeout":5}"#, true)],
+                false,
+            );
+            out.push((
+                "C2",
+                "control: the same procedure with one leaf changed",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("C3", "control", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            add(&mut f, Trible::force(&fact, &UNKNOWN_ATTR, &gv(R5_A)));
+            out.push((
+                "C3",
+                "control: fact gains an unknown attribute",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        let s = cc_call(json!({"command": "ls", "args": ["-l", "-a"]}));
+        loop {
+            let i = base!("J1", "", import, &TABLE, &s);
+            let fact = fact_with_member(&i, "args");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls","args":{"0":"-l","1":"-a"}}"#, false)],
+                false,
+            );
+            out.push((
+                "J1",
+                "an array becomes an object keyed 0,1",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        let s = cc_call(json!({"command": "ls", "m": {"0": "x", "1": "y"}}));
+        loop {
+            let i = base!("J2", "", import, &TABLE, &s);
+            let fact = fact_with_member(&i, "m");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls","m":["x","y"]}"#, false)],
+                false,
+            );
+            out.push((
+                "J2",
+                "an object keyed 0,1 becomes an array",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("J3", "", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls"}"#, false), (r#"{"timeout":5}"#, false)],
+                false,
+            );
+            out.push((
+                "J3",
+                "the input split over two structure roots of one fact",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("J4", "", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            restructure(&mut f, fact, &[(r#"{"command":"ls"}"#, false)], true);
+            out.push((
+                "J4",
+                "a second structure root that is a sub-object of the first",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("J5", "", import, &TABLE, &s_two);
+            let fact = fact_with_member(&i, "timeout");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls","timeout":5}"#, true)],
+                true,
+            );
+            out.push((
+                "J5",
+                "the input held twice: a second root, same content, other ids",
+                gated(&s_two, &TABLE, f),
+            ));
+            break;
+        }
+        let s = cc_call(json!({"command": "ls", "opts": [{}]}));
+        loop {
+            let i = base!("J6", "", import, &TABLE, &s);
+            let fact = fact_with_member(&i, "opts");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"command":"ls","opts":{"0":{}}}"#, false)],
+                false,
+            );
+            out.push((
+                "J6",
+                "an array of an empty object becomes an object keyed 0",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        // ---- JSON structure, Codex function_call arguments
+        let sx = cx_g3_args(r#"{"paths":["a.txt","b.txt"]}"#);
+        loop {
+            let i = base!("J7", "", cx_import, &CX, &sx);
+            let fact = fact_with_member(&i, "paths");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"paths":{"0":"a.txt","1":"b.txt"}}"#, false)],
+                false,
+            );
+            out.push((
+                "J7",
+                "Codex: an argument array becomes an object keyed 0,1",
+                gated(&sx, &CX, f),
+            ));
+            break;
+        }
+        let sx = cx_g3_args(r#"{"path":"a.txt","lines":true}"#);
+        loop {
+            let i = base!("J8", "", cx_import, &CX, &sx);
+            let fact = fact_with_member(&i, "lines");
+            let mut f = i.fragment;
+            restructure(
+                &mut f,
+                fact,
+                &[(r#"{"path":"a.txt"}"#, false), (r#"{"lines":true}"#, false)],
+                false,
+            );
+            out.push((
+                "J8",
+                "Codex: the arguments split over two structure roots",
+                gated(&sx, &CX, f),
+            ));
+            break;
+        }
+
+        // ---- occurrences, witnesses, entities (Claude Code `source()`)
+        let s = source();
+        loop {
+            let i = base!("O1", "", import, &TABLE, &s);
+            let second = second_done(&i);
+            let mut f = i.fragment;
+            let first = prev(&f, second)[0];
+            let o2 = occ_of(&f, witness_of(&f, second)[0])[0];
+            let o1 = occ_of(&f, witness_of(&f, first)[0])[0];
+            let t1 = of(f.facts(), o1, v3::witness::timestamp.id());
+            let t2 = of(f.facts(), o2, v3::witness::timestamp.id());
+            remove(&mut f, &t1);
+            remove(&mut f, &t2);
+            for t in &t1 {
+                add(&mut f, Trible::force(&o2, t.a(), t.v::<UnknownInline>()));
+            }
+            for t in &t2 {
+                add(&mut f, Trible::force(&o1, t.a(), t.v::<UnknownInline>()));
+            }
+            out.push((
+                "O1",
+                "two records of one message swap their timestamps",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("O2", "", import, &TABLE, &s);
+            let second = second_done(&i);
+            let mut f = i.fragment;
+            let first = prev(&f, second)[0];
+            let w2 = witness_of(&f, second)[0];
+            let w1 = witness_of(&f, first)[0];
+            let o2 = occ_of(&f, w2)[0];
+            let o1 = occ_of(&f, w1)[0];
+            set_id(&mut f, o1, v3::occurrence::of.id(), w2);
+            set_id(&mut f, o2, v3::occurrence::of.id(), w1);
+            out.push((
+                "O2",
+                "two records' occurrences swapped between their nodes",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("O4", "", import, &TABLE, &s);
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            let o = occ_of(&f, w)[0];
+            add(
+                &mut f,
+                Trible::force(&R5_A, &v3::occurrence::of.id(), &gv(w)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R5_A, &metadata::tag.id(), &gv(v3::occurrence::KIND)),
+            );
+            move_attr(&mut f, o, R5_A, v3::witness::timestamp.id());
+            out.push((
+                "O4",
+                "one record's claims split over two occurrences",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("O5", "", import, &TABLE, &s);
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            let o = occ_of(&f, w)[0];
+            clone_entity(&mut f, w, R5_B);
+            set_id(&mut f, o, v3::occurrence::of.id(), R5_B);
+            out.push((
+                "O5",
+                "a second, identical witness takes the node's occurrence",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("T1", "", import, &TABLE, &s);
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            let o = occ_of(&f, w)[0];
+            move_attr(&mut f, o, w, v3::witness::timestamp.id());
+            out.push((
+                "T1",
+                "an occurrence's timestamp moved onto its witness",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("T2", "", import, &TABLE, &s);
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            let o = occ_of(&f, w)[0];
+            move_attr(&mut f, w, o, v3::witness::source_namespace.id());
+            out.push((
+                "T2",
+                "a witness's namespace moved onto its occurrence",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("W1", "", import, &TABLE, &s);
+            let hi = one(&i, "Hi.");
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let wh = witness_of(&f, hi)[0];
+            let wa = witness_of(&f, again)[0];
+            set_id(&mut f, wh, v3::witness::projects_to.id(), again);
+            set_id(&mut f, wa, v3::witness::projects_to.id(), hi);
+            out.push((
+                "W1",
+                "two nodes' witnesses (with occurrences) swapped",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("E1", "", import, &TABLE, &s);
+            let mut f = i.fragment;
+            let refs = subjects_of(f.facts(), v3::witness::generated_by.id());
+            let (occ, model) = refs[0];
+            clone_entity(&mut f, model, R5_C);
+            set_id(&mut f, occ, v3::witness::generated_by.id(), R5_C);
+            out.push((
+                "E1",
+                "one occurrence names an identical second vendor-model entity",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("G1", "", import, &TABLE, &s);
+            let mut f = i.fragment;
+            let (g, _) = gloss_on(&f, v3::gloss::category::TITLE);
+            clone_entity(&mut f, g, R5_D);
+            out.push((
+                "G1",
+                "the title gloss twice on one node (identical tuple)",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            // The source holds one title gloss; it moves to the other leaf
+            // (the review ran this case as its own test).
+            let i = base!("G2", "", import, &TABLE, &s);
+            let hello = second_hello(&i);
+            let mut f = i.fragment;
+            let (g, _) = gloss_on(&f, v3::gloss::category::TITLE);
+            set_id(&mut f, g, v3::gloss::describes.id(), hello);
+            out.push((
+                "G2",
+                "the title gloss moved onto the other leaf",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+        loop {
+            let i = base!("F1", "", import, &TABLE, &s);
+            let hi = one(&i, "Hi.");
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let fh = holds(&f, hi)[0];
+            let fa = holds(&f, again)[0];
+            set_id(&mut f, hi, v3::node::holds.id(), fa);
+            set_id(&mut f, again, v3::node::holds.id(), fh);
+            out.push(("F1", "two nodes exchange their facts", gated(&s, &TABLE, f)));
+            break;
+        }
+        loop {
+            let i = base!("P1", "", import, &TABLE, &s);
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let fact = holds(&f, again)[0];
+            for t in entity(f.facts(), fact) {
+                if *t.a() != v3::fact::payload.id() {
+                    add(&mut f, Trible::force(&R5_E, t.a(), t.v::<UnknownInline>()));
+                }
+            }
+            move_attr(&mut f, fact, R5_E, v3::fact::payload.id());
+            // Now R5_E holds the payload and the shape; the original keeps the
+            // shape only. The node holds both.
+            add(
+                &mut f,
+                Trible::force(&again, &v3::node::holds.id(), &gv(R5_E)),
+            );
+            out.push((
+                "P1",
+                "a fact split: a shape-only fact beside the full one",
+                gated(&s, &TABLE, f),
+            ));
+            break;
+        }
+
+        // ---- compaction link
+        let sc = compaction_source();
+        loop {
+            let i = base!("L1", "", import, &TABLE, &sc);
+            let mut f = i.fragment;
+            let links = subjects_of(f.facts(), v3::node::continues.id());
+            if links.is_empty() {
+                out.push(("L1", "", Out::Baseline("no continues".into())));
+                break;
+            }
+            let (from, to) = links[0];
+            let Some(&up) = prev(&f, to).first() else {
+                out.push(("L1", "", Out::Baseline("tail is a root".into())));
+                break;
+            };
+            set_id(&mut f, from, v3::node::continues.id(), up);
+            out.push((
+                "L1",
+                "continues names the old tail's predecessor",
+                gated(&sc, &TABLE, f),
+            ));
+            break;
+        }
+
+        // ---- M2: occurrences and their annotations
+        let sr = regenerated_source();
+        loop {
+            let (i, hello, [early, late]) = regenerated();
+            let report = run(&sr, i.fragment.clone());
+            if !report.passed() {
+                out.push(("O3", "", Out::Baseline(format!("{report}"))));
+                break;
+            }
+            let mut f = i.fragment.clone();
+            for t in entity(f.facts(), late) {
+                if *t.a() != v3::occurrence::of.id() {
+                    add(&mut f, Trible::force(&early, t.a(), t.v::<UnknownInline>()));
+                }
+            }
+            let gone = entity(f.facts(), late);
+            remove(&mut f, &gone);
+            out.push((
+                "O3",
+                "two records' occurrences merged into one entity",
+                gated(&sr, &TABLE, f),
+            ));
+            let mut f = i.fragment;
+            for t in entity(f.facts(), early) {
+                if *t.a() != v3::witness::ends.id() {
+                    add(&mut f, Trible::force(&R5_F, t.a(), t.v::<UnknownInline>()));
+                }
+            }
+            let _ = hello;
+            out.push((
+                "M2a",
+                "an old-model prefix union: the record's occurrence again, without ends",
+                gated(&sr, &TABLE, f),
+            ));
+            break;
+        }
+        let g2 = cx::g2();
+        loop {
+            let i = base!("M2b", "", cx_import, &CX, &g2);
+            let mut f = i.fragment;
+            let own = occurrences_with(&f, v3::witness::ends.id());
+            let claim = occurrences_with(&f, v3::witness::turn_ends.id());
+            let pair = own.iter().find_map(|o| {
+                claim
+                    .iter()
+                    .find(|c| {
+                        *c != o
+                            && ids(f.facts(), **c, v3::occurrence::of.id())
+                                == ids(f.facts(), *o, v3::occurrence::of.id())
+                    })
+                    .map(|c| (*o, *c))
+            });
+            let Some((o, c)) = pair else {
+                out.push((
+                    "M2b",
+                    "",
+                    Out::Baseline(format!("own {} claim {}", own.len(), claim.len())),
+                ));
+                break;
+            };
+            let mut g = f.clone();
+            // Swap which attribute each annotation sits under.
+            let e = of(g.facts(), o, v3::witness::ends.id());
+            let te = of(g.facts(), c, v3::witness::turn_ends.id());
+            remove(&mut g, &e);
+            remove(&mut g, &te);
+            for t in &e {
+                add(
+                    &mut g,
+                    Trible::force(&o, &v3::witness::turn_ends.id(), t.v::<GenId>()),
+                );
+            }
+            for t in &te {
+                add(
+                    &mut g,
+                    Trible::force(&c, &v3::witness::ends.id(), t.v::<GenId>()),
+                );
+            }
+            out.push((
+                "M2b",
+                "Codex: ends and turn_ends swapped between own and claim occurrence",
+                gated(&g2, &CX, g),
+            ));
+            // Merge the claim occurrence into the record's own.
+            move_attr(&mut f, c, o, v3::witness::turn_ends.id());
+            let gone = entity(f.facts(), c);
+            remove(&mut f, &gone);
+            out.push((
+                "M2c",
+                "Codex: the abort's claim occurrence merged into her record's",
+                gated(&g2, &CX, f),
+            ));
+            break;
+        }
+        // Two node-less turns that end differently, then a prompt: both claims
+        // land on one node.
+        {
+            let mut r = vec![cx_meta()];
+            r.extend(cx_turn(1, "t1"));
+            r.extend(cx_user(2, "P1."));
+            r.push(cx_said(3, "R1."));
+            r.push(cx_complete(4, "t1", false));
+            r.extend(cx_turn(5, "t2"));
+            r.push(cx_abort(6, "t2"));
+            r.extend(cx_turn(7, "t3"));
+            r.push(cx_complete(8, "t3", true));
+            r.extend(cx_turn(9, "t4"));
+            r.extend(cx_user(10, "P4."));
+            r.push(cx_said(11, "R4."));
+            let s = jsonl(&r);
+            out.push((
+                "M2e",
+                "Codex source: an abort and an error, both node-less, before one prompt",
+                fed(cx_import, &CX, &s),
+            ));
+        }
+        out
+    }
+
+    /// The controls that must pass: the same input under fresh json ids.
+    const MUST_PASS: &[&str] = &["C1"];
+
+    #[test]
+    fn the_gate_catches_every_round5_attack() {
+        let cases = attacks();
+        assert_eq!(cases.len(), 29);
+        let mut missed = Vec::new();
+        for (code, name, outcome) in &cases {
+            match outcome {
+                Out::Gated(report) => {
+                    let text = format!("{report}");
+                    assert!(leaks(&text).is_empty(), "{code} printed a value:\n{text}");
+                    if report.passed() {
+                        println!("R5\t{code}\tpassed\t{name}");
+                        if !MUST_PASS.contains(code) {
+                            missed.push(*code);
+                        }
+                    } else {
+                        let mut kinds: Vec<String> = report
+                            .rows
+                            .iter()
+                            .map(|r| format!("{}:{}", r.kind, r.path))
+                            .collect();
+                        kinds.sort();
+                        kinds.dedup();
+                        println!("R5\t{code}\tcaught\t{name}\t{}", kinds.join(" | "));
+                        if MUST_PASS.contains(code) {
+                            missed.push(*code);
+                        }
+                    }
+                }
+                Out::Refused(path) => {
+                    println!("R5\t{code}\trefused\t{name}\t{path}");
+                    if MUST_PASS.contains(code) {
+                        missed.push(*code);
+                    }
+                }
+                Out::Crashed(why) => panic!("{code} crashed: {why}"),
+                Out::Baseline(why) => panic!("{code} has no right baseline: {why}"),
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "round 5: these cases did not behave: {missed:?}"
+        );
+    }
+
+    /// Every prefix of a unit that imports adds no trible to the full
+    /// import, and their union passes the gate against the full source.
+    #[test]
+    fn every_round5_prefix_adds_nothing_to_the_full_import() {
+        use crate::archive_v3::codex::import as cx_import;
+        let units: Vec<(&str, Importer, &FieldTable, Vec<Value>)> = vec![
+            ("cx-nodeless-error", cx_import, &CX, cx_nodeless_error()),
+            (
+                "cc-source",
+                import,
+                &TABLE,
+                source()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect(),
+            ),
+            (
+                "cx-g2",
+                cx_import,
+                &CX,
+                cx::g2()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect(),
+            ),
+        ];
+        for (label, imp, table, records) in units {
+            let full = jsonl(&records);
+            let live = match baseline(imp, table, &full) {
+                Ok(i) => i,
+                Err(Out::Baseline(why)) => panic!("{label}: {why}"),
+                Err(_) => unreachable!(),
+            };
+            for k in 1..records.len() {
+                let prefix = jsonl(&records[..k]);
+                let Ok(fragment) = imp(prefix.as_bytes()) else {
+                    continue;
+                };
+                let extra = fragment.facts().difference(live.fragment.facts());
+                assert_eq!(extra.len(), 0, "{label}: prefix {k} adds tribles");
+                let mut union = live.fragment.clone();
+                union += fragment;
+                let ublobs = union.blobs_mut().snapshot().unwrap();
+                let report = gate::check(table, full.as_bytes(), union.facts(), &ublobs);
+                assert!(
+                    report.passed(),
+                    "{label}: prefix {k} union fails:\n{report}"
+                );
+            }
         }
     }
 }

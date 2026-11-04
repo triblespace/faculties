@@ -52,11 +52,16 @@
 //! is a missing occurrence there. A window is compared as the sequence of
 //! its items: an item is the multiset of its facts' tuples (G15), A's each
 //! fact its node holds, B's the one fact of a source occurrence, so a fact
-//! split in two or held twice is another item; `json_tree` objects compare order-free, because a structure
-//! token names its leaf by key path. Every fact renders its shape (modality
-//! and direction), so every node is an item: a gap (`absent`) the rendering
-//! rule puts in her window ([`crate::archive_v3::fields::Gaps`]), and a
-//! result's head that holds no value, count like any other item.
+//! split in two or held twice is another item. A fact's `structure` renders
+//! one pair per root, the root's whole document (G18): each leaf by its
+//! path, every step of which names its container kind (an array index or
+//! an object key), so `json_tree` objects compare order-free, an array never
+//! compares equal to an object keyed "0", "1", and a document split over
+//! several roots, or held twice, is another fact. Every fact renders its
+//! shape (modality and direction), so every node is an item: a gap
+//! (`absent`) the rendering rule puts in her window
+//! ([`crate::archive_v3::fields::Gaps`]), and a result's head that holds no
+//! value, count like any other item.
 //!
 //! Point 4 compares per position (G6, G7): B places each annotation where
 //! its table says ([`crate::archive_v3::fields::Place`]) and A renders each
@@ -127,8 +132,20 @@ pub enum Value {
     Time(i128),
     /// A time interval in TAI nanoseconds, when its ends differ.
     Interval(i128, i128),
-    /// One leaf of a JSON document, by its JSON Pointer (RFC 6901).
-    Json(String, JsonLeaf),
+    /// One leaf of a JSON document, by its path from the root. Only B holds
+    /// one, while it gathers an item's leaves into its document; no
+    /// compared token holds one.
+    Json(Pointer, JsonLeaf),
+    /// One `structure` root of a fact, whole (G18): every leaf of its
+    /// document, sorted. Each root is its own pair, so the roots of one
+    /// fact never merge into one set; `copy` counts identical documents
+    /// (0 for the first root that renders as this document, 1 for a second
+    /// one), so a document held twice is two pairs. B emits exactly the one
+    /// root its document implies, as copy 0.
+    Structure {
+        copy: usize,
+        leaves: Vec<(Pointer, JsonLeaf)>,
+    },
     /// A value of an attribute A does not know, by its raw hex.
     Raw(String),
     /// A place in a window, named by the hash of the window that ends there
@@ -138,6 +155,20 @@ pub enum Value {
     /// sorted, each as often as it has it (G14).
     Tuple(Vec<Token>),
 }
+
+/// One step of a path into a JSON document (G18): it names the kind of
+/// container it steps into, so an array never renders like an object keyed
+/// "0", "1".
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    /// An array element, by its index.
+    Index(u128),
+    /// An object member, by its exact name.
+    Key(String),
+}
+
+/// A path from a document's root to one of its leaves.
+pub type Pointer = Vec<Step>;
 
 /// A JSON leaf; an empty container is a leaf of its own.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
