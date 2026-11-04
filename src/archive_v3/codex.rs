@@ -31,8 +31,10 @@
 //!   replacement history, or a span gap and its summary); the first node of
 //!   the new line that is not on the old line `continues` the old line's
 //!   last node a record holds (X2);
-//! - `task_started` marks a turn, and `thread_rolled_back` cuts the line
-//!   back to the start of its last turns: the next node branches there;
+//! - `task_started` marks a turn (where the unit marks none, his prompt
+//!   after her answer starts one, X17), and `thread_rolled_back` cuts the
+//!   line back to the start of its last turns: the next node branches
+//!   there;
 //! - `turn_aborted` and an erred `task_complete` put `ends` on the
 //!   occurrence of the record that holds her last item of the turn, when
 //!   she produced one, never on the node (X5, X6, M1). An abort, and an
@@ -60,9 +62,14 @@
 //! on one node converge; where they ended differently the unit fails. A
 //! record that holds no node (a header without effort, a
 //! `session_meta` without instructions, an abort) gives its claims to the
-//! next node the file places, or after the last one to that last node.
-//! Reasoning summaries are glosses of the sealed reasoning; the source does
-//! not name the model that wrote them, so they name none. Where her message
+//! next node the file places; where the file ends before that node, the
+//! unit fails, since a snapshot cut there would give them to another node
+//! than the whole file does (X19).
+//! Reasoning summaries are glosses of the sealed reasoning, one per part
+//! with its place (X16); the source does not name the model that wrote
+//! them, so they name none. A tool output is what her live history held:
+//! truncated under the recorded budget, with the full text a claim of its
+//! record (X18). Where her message
 //! holds no phase, its `agent_message` event's phase is its register (X1);
 //! the event names its message by structure, as the first item after it
 //! past her reasoning, never by text alone (X13). An empty sealed token is a
@@ -82,8 +89,8 @@ use crate::archive_v3::claude_code::json::{self, Json};
 use crate::archive_v3::claude_code::Failure;
 use crate::archive_v3::fields::codex::{OPENAI_ENCRYPTED_CONTENT, TABLE};
 use crate::archive_v3::{
-    annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
-    MediaType, NodeAnnotations, WitnessAnnotations,
+    annotate_node, ends_disagree, fact, gloss_part, node, occurrence, unexported, witness,
+    FactCore, MediaType, NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -109,7 +116,11 @@ pub fn import(source: &[u8]) -> Result<Fragment, Failure> {
     }
     unit.verify()?;
     let phases = supplied_phases(&records)?;
-    let mut builder = Builder::new(phases)?;
+    let marked_turns = records.iter().any(|record| {
+        record.str_at("type") == Some("event_msg")
+            && record.str_at("payload.type") == Some("task_started")
+    });
+    let mut builder = Builder::new(phases, marked_turns)?;
     for (at, record) in records.iter().enumerate() {
         builder.record(at, record)?;
     }
@@ -352,35 +363,58 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
     Ok(phases)
 }
 
-/// A tool output's history budget: in tokens, or in bytes.
+/// A tool output's history budget: in tokens, or in bytes (codex-rs
+/// protocol/src/protocol.rs, `TruncationPolicy`).
 #[derive(Clone, Copy)]
 enum Budget {
     Tokens(usize),
     Bytes(usize),
 }
 
+/// Codex's four bytes per token, rounded up (codex-rs
+/// utils/string/src/truncate.rs, `approx_token_count` and
+/// `approx_tokens_from_byte_count`).
+fn approx_tokens(bytes: usize) -> usize {
+    bytes.div_ceil(4)
+}
+
 impl Budget {
-    /// The turn's `truncation_policy` with codex's 20% serialization
-    /// allowance (`with_serialization_allowance`, rounded up).
+    /// A header's `truncation_policy`, which must be exactly `{mode, limit}`
+    /// with `mode` `bytes` or `tokens` and `limit` a count (serde's
+    /// adjacently tagged `TruncationPolicy`), with codex's 20%
+    /// serialization allowance (`with_serialization_allowance`:
+    /// `(limit as f64 * 1.2).ceil()`). Anything else is no budget the
+    /// importer can apply, and fails (X18).
     fn of_policy(policy: &Json) -> Option<Budget> {
+        let Json::Obj(members) = policy else {
+            return None;
+        };
+        if members.len() != 2 {
+            return None;
+        }
         let limit = match policy.get("limit") {
-            Some(Json::Num(token)) => token.parse::<usize>().ok()?,
+            Some(Json::Num(token)) if token.bytes().all(|b| b.is_ascii_digit()) => {
+                token.parse::<usize>().ok()?
+            }
             _ => return None,
         };
         let allowed = (limit as f64 * 1.2).ceil() as usize;
-        match policy.str_at("mode") {
-            Some("tokens") => Some(Budget::Tokens(allowed)),
-            Some("bytes") => Some(Budget::Bytes(allowed)),
+        match policy.get("mode") {
+            Some(Json::Str(mode)) if mode == "tokens" => Some(Budget::Tokens(allowed)),
+            Some(Json::Str(mode)) if mode == "bytes" => Some(Budget::Bytes(allowed)),
             _ => None,
         }
     }
 
-    /// The cost of a text under the budget's unit (codex's four bytes per
-    /// token, rounded up).
-    fn cost(self, text: &str) -> usize {
-        match self {
-            Budget::Tokens(_) => text.len().div_ceil(4),
-            Budget::Bytes(_) => text.len(),
+    /// A per-record override, in tokens, allowance included (codex-rs
+    /// history/src/lib.rs, `history_truncation_token_limit`, serialized as
+    /// `fallback_token_limit_override`).
+    fn of_override(limit: &Json) -> Option<Budget> {
+        match limit {
+            Json::Num(token) if token.bytes().all(|b| b.is_ascii_digit()) => {
+                token.parse::<usize>().ok().map(Budget::Tokens)
+            }
+            _ => None,
         }
     }
 
@@ -390,34 +424,122 @@ impl Budget {
         }
     }
 
-    /// Whether `truncate_function_output_payload` shortens this output:
-    /// a text over the budget, or a list in which a non-empty text part no
-    /// longer fits (codex-rs utils/output-truncation/src/lib.rs,
-    /// `truncate_text` and `truncate_output_iter`). Empty text parts, which
-    /// it drops under any budget, hold no fact here either.
-    fn shortens(self, output: &Json) -> bool {
-        match output {
-            Json::Str(text) => self.cost(text) > self.limit(),
-            Json::Arr(parts) => {
-                let mut remaining = self.limit();
-                for part in parts {
-                    if part.str_at("type") != Some("input_text") {
-                        continue;
-                    }
-                    let Some(text) = part.str_at("text").filter(|text| !text.is_empty()) else {
-                        continue;
-                    };
-                    let cost = self.cost(text);
-                    if remaining == 0 || cost > remaining {
-                        return true;
-                    }
-                    remaining -= cost;
+    /// What codex's history holds of a text output: `truncate_text`
+    /// (codex-rs utils/output-truncation/src/lib.rs), which is
+    /// `truncate_middle_chars` under a byte budget and
+    /// `truncate_middle_with_token_budget` (0.78 to 0.132; its successor
+    /// `plan_token_truncation` renders the same) under a token budget
+    /// (utils/string/src/truncate.rs).
+    fn truncate(self, text: &str) -> String {
+        match self {
+            Budget::Bytes(bytes) => middle(text, bytes, false),
+            Budget::Tokens(tokens) => {
+                if text.is_empty() {
+                    return String::new();
                 }
-                false
+                let bytes = tokens.saturating_mul(4);
+                if tokens > 0 && text.len() <= bytes {
+                    return text.to_owned();
+                }
+                middle(text, bytes, true)
             }
-            _ => false,
         }
     }
+
+    /// Whether codex's history shortens a list output: whether its
+    /// `truncate_function_output_items_with_policy` (codex-rs
+    /// core/src/truncate.rs at rust-v0.78.0 to 0.114.0, then
+    /// utils/output-truncation/src/lib.rs at 0.117.0 to 0.132.0: the same
+    /// rule at each release tag checked of the clients that record a budget)
+    /// changes any part her window holds. A non-empty text part that no longer fits is cut; once
+    /// the budget is spent, every text part, an empty one too, is omitted
+    /// and counted in a notice; images cost nothing.
+    fn shortens(self, parts: &[Json]) -> bool {
+        let mut remaining = self.limit();
+        for part in parts {
+            if part.str_at("type") != Some("input_text") {
+                continue;
+            }
+            let text = part.str_at("text").unwrap_or_default();
+            if remaining == 0 {
+                return true;
+            }
+            let cost = match self {
+                Budget::Tokens(_) => approx_tokens(text.len()),
+                Budget::Bytes(_) => text.len(),
+            };
+            if cost > remaining {
+                return true;
+            }
+            remaining -= cost;
+        }
+        false
+    }
+}
+
+/// `truncate_with_byte_estimate` (codex-rs utils/string/src/truncate.rs at
+/// rust-v0.120.0 and 0.132.0, core/src/truncate.rs at 0.78.0 to 0.114.0,
+/// the same rule), which `truncate_middle_chars` at main (71a4c070)
+/// still renders: at most `max_bytes` of the
+/// text's two ends, split evenly on character boundaries, around a marker
+/// that counts what was cut, in tokens or in characters.
+fn middle(text: &str, max_bytes: usize, tokens: bool) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let marker = |count: usize| {
+        if tokens {
+            format!("\u{2026}{count} tokens truncated\u{2026}")
+        } else {
+            format!("\u{2026}{count} chars truncated\u{2026}")
+        }
+    };
+    if max_bytes == 0 {
+        return marker(if tokens {
+            approx_tokens(text.len())
+        } else {
+            text.chars().count()
+        });
+    }
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let left = max_bytes / 2;
+    let right = max_bytes - left;
+    // `split_string`: the prefix is the characters that end within `left`,
+    // the suffix starts at the first character at or after the tail.
+    let tail = text.len().saturating_sub(right);
+    let (mut prefix_end, mut suffix_start, mut removed, mut started) =
+        (0usize, text.len(), 0usize, false);
+    for (at, c) in text.char_indices() {
+        let end = at + c.len_utf8();
+        if end <= left {
+            prefix_end = end;
+            continue;
+        }
+        if at >= tail {
+            if !started {
+                suffix_start = at;
+                started = true;
+            }
+            continue;
+        }
+        removed += 1;
+    }
+    if suffix_start < prefix_end {
+        suffix_start = prefix_end;
+    }
+    let count = if tokens {
+        approx_tokens(text.len() - max_bytes)
+    } else {
+        removed
+    };
+    format!(
+        "{}{}{}",
+        &text[..prefix_end],
+        marker(count),
+        &text[suffix_start..]
+    )
 }
 
 /// One fact a record places on the line, and whether the record holds it
@@ -425,8 +547,9 @@ impl Budget {
 struct Placed {
     core: FactCore,
     held: bool,
-    /// Glosses of the node, by a side model.
-    glosses: Vec<String>,
+    /// Glosses of the node, by a side model: each part of a summary with
+    /// its place among the parts (X16).
+    glosses: Vec<(u64, String)>,
     /// A call this item answers: its id, and the correlator's path.
     answers: Option<(String, String)>,
     /// A call it opens, by its id.
@@ -492,8 +615,9 @@ struct Builder {
     /// The last node a record held.
     last_node: Option<Id>,
     claims: HashMap<usize, WitnessAnnotations>,
-    /// Claims of records that hold no node, for the next node placed.
-    pending: Vec<WitnessAnnotations>,
+    /// Claims of records that hold no node, for the next node placed, with
+    /// the path a unit that ends before that node fails at (X19).
+    pending: Vec<(WitnessAnnotations, &'static str)>,
     extra: Vec<(Id, WitnessAnnotations)>,
     /// call id -> (line position, call item)
     calls: HashMap<String, (usize, usize)>,
@@ -501,14 +625,27 @@ struct Builder {
     /// (record, node, term): why the sampling of the item that record holds
     /// at that node stopped, a claim of that occurrence (M1).
     ends: Vec<(usize, Id, Id)>,
-    glosses: Vec<(Id, String)>,
+    glosses: Vec<(Id, u64, String)>,
     continues: Vec<(Id, Id)>,
-    /// The history budget of the latest `turn_context` that records one.
+    /// The history budget the latest `turn_context` records: none when it
+    /// records none (X18). `TurnContextItem.truncation_policy` exists from
+    /// codex rust-v0.78.0 to rust-v0.132.0 (codex-rs protocol/src/
+    /// protocol.rs), and those clients write it on every header
+    /// (`truncation_policy: Some(..)`: core/src/codex.rs at 0.78.0 and
+    /// 0.100.0, core/src/session/turn_context.rs at 0.132.0). A header
+    /// without it was written by a client that records none, so a budget is
+    /// never carried into it.
     budget: Option<Budget>,
+    /// The budget of the record being read: its own override, else the
+    /// header's.
+    record_budget: Option<Budget>,
+    /// X17: whether the unit marks its turns with `task_started`. Where it
+    /// marks none, a turn starts at his prompt after an item of hers.
+    marked_turns: bool,
 }
 
 impl Builder {
-    fn new(phases: HashMap<usize, String>) -> Result<Self, Failure> {
+    fn new(phases: HashMap<usize, String>, marked_turns: bool) -> Result<Self, Failure> {
         use v3::fact::{absent, direction::IN, modality::*};
         let gap = |modality, kind| FactCore {
             absent: Some(kind),
@@ -555,6 +692,8 @@ impl Builder {
             glosses: Vec::new(),
             continues: Vec::new(),
             budget: None,
+            record_budget: None,
+            marked_turns,
         };
         builder.root = builder.root_line();
         Ok(builder)
@@ -619,7 +758,7 @@ impl Builder {
         self.items[item].record = Some(record);
         self.held.push((record, node));
         self.last_node = Some(node);
-        for claims in std::mem::take(&mut self.pending) {
+        for (claims, _) in std::mem::take(&mut self.pending) {
             self.extra.push((node, claims));
         }
     }
@@ -658,8 +797,12 @@ impl Builder {
             if placed.held {
                 self.witness(record, item, node);
             }
-            for text in placed.glosses.into_iter().filter(|text| !text.is_empty()) {
-                self.glosses.push((node, text));
+            for (part, text) in placed
+                .glosses
+                .into_iter()
+                .filter(|(_, text)| !text.is_empty())
+            {
+                self.glosses.push((node, part, text));
             }
         }
         Ok(())
@@ -693,7 +836,7 @@ impl Builder {
     /// header). Both lie in the file before or right after the record, so
     /// a snapshot cut after it places the claim where the whole file does
     /// (M2), as long as the turn holds a node.
-    fn end_turn(&mut self, claims: WitnessAnnotations) {
+    fn end_turn(&mut self, claims: WitnessAnnotations, path: &'static str) {
         let since = self.turns.last().copied().unwrap_or(0).min(self.line.len());
         let tail = self.line[since..]
             .iter()
@@ -702,7 +845,7 @@ impl Builder {
             .and_then(|(item, _)| self.items[*item].own);
         match tail {
             Some(node) => self.extra.push((node, claims)),
-            None => self.pending.push(claims),
+            None => self.pending.push((claims, path)),
         }
     }
 
@@ -717,9 +860,20 @@ impl Builder {
                 Some("session_meta") => self.session(at, payload),
                 Some("turn_context") => self.turn_context(at, payload, claims),
                 Some("response_item") => {
-                    self.within_budget(record, payload)?;
+                    self.record_budget = match record.at("metadata.fallback_token_limit_override") {
+                        None => self.budget,
+                        Some(limit) => Some(Budget::of_override(limit).ok_or_else(|| {
+                            Failure::new(
+                                "{response_item}.metadata.fallback_token_limit_override",
+                                "a history budget override that is no count",
+                            )
+                        })?),
+                    };
+                    self.prompt_turn(payload);
                     let items =
-                        self.items(payload, "{response_item}.payload", &mut claims, Some(at))?;
+                        self.items(payload, "{response_item}.payload", &mut claims, Some(at));
+                    self.record_budget = None;
+                    let items = items?;
                     let ghost = payload.str_at("type") == Some("ghost_snapshot");
                     if !ghost {
                         self.claims.insert(at, claims);
@@ -742,15 +896,19 @@ impl Builder {
             None if record.get("record_type").is_some() => Ok(()),
             None => {
                 if let Some(id) = record.str_at("id") {
-                    self.pending.push(WitnessAnnotations {
-                        source_locator: Some(id.to_owned()),
-                        ..WitnessAnnotations::default()
-                    });
+                    self.pending.push((
+                        WitnessAnnotations {
+                            source_locator: Some(id.to_owned()),
+                            ..WitnessAnnotations::default()
+                        },
+                        "<record>",
+                    ));
                 }
                 Ok(())
             }
             // G0/G1: a bare response item.
             Some(_) => {
+                self.prompt_turn(record);
                 let mut claims = WitnessAnnotations::default();
                 let items = self.items(record, "", &mut claims, Some(at))?;
                 self.claims.insert(at, claims);
@@ -759,39 +917,24 @@ impl Builder {
         }
     }
 
-    /// The window she was sampled from holds a tool output as her live
-    /// history recorded it: `ContextManager::record_item_with_metadata`
-    /// (codex-rs core/src/context_manager/history.rs) passes it through
-    /// `truncate_function_output_payload` under the record's
-    /// `fallback_token_limit_override`, else the turn's `truncation_policy`
-    /// with its allowance, "preserving full rollout payloads". Where that
-    /// shortens an output, what she was shown is the truncated form, which
-    /// this importer does not build, so the unit fails rather than import
-    /// the full payload as her window. Where no budget is recorded it is
-    /// unknown, and nothing is claimed.
-    fn within_budget(&self, record: &Json, payload: &Json) -> Result<(), Failure> {
-        let kind = payload.str_at("type").unwrap_or_default();
-        if !matches!(kind, "function_call_output" | "custom_tool_call_output") {
-            return Ok(());
-        }
-        let budget = match record.at("metadata.fallback_token_limit_override") {
-            Some(Json::Num(token)) => token.parse::<usize>().ok().map(Budget::Tokens),
-            _ => self.budget,
-        };
-        let Some(budget) = budget else {
-            return Ok(());
-        };
-        if payload
-            .get("output")
-            .is_some_and(|output| budget.shortens(output))
+    /// X17: where the unit marks no turn with `task_started`, a turn
+    /// starts at his prompt (a user message) when the line since the latest
+    /// turn started holds an item of hers, so an abort after his new prompt
+    /// is no end of her previous answer (X5).
+    fn prompt_turn(&mut self, item: &Json) {
+        if self.marked_turns
+            || item.str_at("type") != Some("message")
+            || item.str_at("role") != Some("user")
         {
-            return Err(Failure::new(
-                &format!("{{response_item}}.payload{{{kind}}}.output"),
-                "an output over its recorded history budget: her window held a truncated form \
-                 the importer does not build",
-            ));
+            return;
         }
-        Ok(())
+        let since = self.turns.last().copied().unwrap_or(0).min(self.line.len());
+        let answered = self.line[since..]
+            .iter()
+            .any(|(item, _)| self.items[*item].held && self.items[*item].out);
+        if answered {
+            self.turns.push(self.line.len());
+        }
     }
 
     fn session(&mut self, at: usize, payload: &Json) -> Result<(), Failure> {
@@ -867,7 +1010,7 @@ impl Builder {
                 self.claims.insert(at, claims);
                 self.witness(at, next, node);
             }
-            None => self.pending.push(claims),
+            None => self.pending.push((claims, "{session_meta}.payload")),
         }
         Ok(())
     }
@@ -879,9 +1022,15 @@ impl Builder {
         mut claims: WitnessAnnotations,
     ) -> Result<(), Failure> {
         claims.raw_model = payload.str_at("model").map(str::to_owned);
-        if let Some(policy) = payload.get("truncation_policy") {
-            self.budget = Budget::of_policy(policy);
-        }
+        self.budget = match payload.get("truncation_policy") {
+            None => None,
+            Some(policy) => Some(Budget::of_policy(policy).ok_or_else(|| {
+                Failure::new(
+                    "{turn_context}.payload.truncation_policy",
+                    "a history budget that does not parse: the importer cannot apply it",
+                )
+            })?),
+        };
         let header = match payload.str_at("effort") {
             Some(term) => {
                 use v3::fact::{absent, direction::IN, modality::SYSTEM};
@@ -919,7 +1068,7 @@ impl Builder {
             }
             None => {
                 claims.timestamp.clear();
-                self.pending.push(claims);
+                self.pending.push((claims, "{turn_context}.payload"));
             }
         }
         Ok(())
@@ -994,11 +1143,13 @@ impl Builder {
                 }
             }
             "reasoning" => {
-                let mut glosses: Vec<String> = Vec::new();
+                // X16: each part keeps its place among the parts, so their
+                // order and count are kept.
+                let mut glosses: Vec<(u64, String)> = Vec::new();
                 match item.get("summary") {
                     None | Some(Json::Null) => {}
                     Some(Json::Arr(parts)) => {
-                        for part in parts {
+                        for (place, part) in (0u64..).zip(parts) {
                             if part.str_at("type") != Some("summary_text") {
                                 return Err(Failure::new(
                                     &at(".summary[]"),
@@ -1006,7 +1157,7 @@ impl Builder {
                                 ));
                             }
                             let text = text_at(part, &at(".summary[]{summary_text}.text"))?;
-                            glosses.push(text.to_owned());
+                            glosses.push((place, text.to_owned()));
                         }
                     }
                     Some(_) => {
@@ -1102,11 +1253,27 @@ impl Builder {
                         .map(|call| (call.to_owned(), at(".call_id"))),
                     ..Placed::held(core(TOOL_RESULT, IN))
                 });
+                // X18: her window holds the output as the client's history
+                // truncated it under the record's budget
+                // (`ContextManager::record_item_with_metadata`, codex-rs
+                // core/src/context_manager/history.rs, through
+                // `truncate_function_output_payload`, utils/output-truncation/
+                // src/lib.rs: "Tool output truncation applies only to live
+                // history, preserving full rollout payloads"). The full text
+                // she never saw is the record's claim beside it.
+                let budget = self.record_budget;
                 match item.get("output") {
                     Some(Json::Str(text)) => {
-                        if !text.is_empty() {
+                        let shown = match budget {
+                            Some(budget) => budget.truncate(text),
+                            None => text.clone(),
+                        };
+                        if shown != *text {
+                            claims.untruncated = Some(text.clone());
+                        }
+                        if !shown.is_empty() {
                             out.push(Placed::held(FactCore {
-                                payload: Some(text.clone()),
+                                payload: Some(shown),
                                 ..core(TEXT, IN)
                             }));
                         }
@@ -1136,6 +1303,13 @@ impl Builder {
                                     ))
                                 }
                             }
+                        }
+                        if budget.is_some_and(|budget| budget.shortens(parts)) {
+                            return Err(Failure::new(
+                                &at(".output"),
+                                "a list output its history budget shortens: how to keep its \
+                                 full parts beside her window is not modeled",
+                            ));
                         }
                     }
                     Some(Json::Null) | None => {}
@@ -1310,10 +1484,13 @@ impl Builder {
                 if let Some((record, node)) = self.last_out() {
                     self.ends.push((record, node, term));
                 }
-                self.end_turn(WitnessAnnotations {
-                    turn_ends: vec![term],
-                    ..WitnessAnnotations::default()
-                });
+                self.end_turn(
+                    WitnessAnnotations {
+                        turn_ends: vec![term],
+                        ..WitnessAnnotations::default()
+                    },
+                    "{event_msg}.payload{turn_aborted}.reason",
+                );
                 Ok(())
             }
             "task_complete" => {
@@ -1353,10 +1530,13 @@ impl Builder {
                         }
                         // X15: a failed turn in which she produced nothing
                         // is never lost: a claim of the record, as an abort.
-                        None => self.end_turn(WitnessAnnotations {
-                            turn_ends: vec![v3::node::ends::ERROR],
-                            ..WitnessAnnotations::default()
-                        }),
+                        None => self.end_turn(
+                            WitnessAnnotations {
+                                turn_ends: vec![v3::node::ends::ERROR],
+                                ..WitnessAnnotations::default()
+                            },
+                            "{event_msg}.payload{task_complete}.error",
+                        ),
                     }
                 }
                 Ok(())
@@ -1411,10 +1591,16 @@ impl Builder {
     }
 
     fn finish(mut self) -> Result<Fragment, Failure> {
-        // Claims after the file's last node go to that node.
-        if let Some(node) = self.last_node {
-            for claims in std::mem::take(&mut self.pending) {
-                self.extra.push((node, claims));
+        // X19: claims that wait for a node the file does not reach. A
+        // backup snapshot cut before that node would give them to another
+        // node than the whole file does (the previous turn's last), so the
+        // unit fails rather than place them where the source does not.
+        if self.last_node.is_some() {
+            if let Some((_, path)) = self.pending.first() {
+                return Err(Failure::new(
+                    path,
+                    "a record's claims wait for a node beyond the end of the file",
+                ));
             }
         }
         // The windows: every node on the line of a node a record holds.
@@ -1540,10 +1726,11 @@ impl Builder {
                 .map_err(|_| Failure::new("<witness>", "a witness occurrence does not build"))?;
             self.out += unexported(built);
         }
-        // Reasoning summaries: the source names no model that wrote them.
-        for (node, text) in std::mem::take(&mut self.glosses) {
+        // Reasoning summaries, part by part: the source names no model that
+        // wrote them.
+        for (node, part, text) in std::mem::take(&mut self.glosses) {
             let node = on_window(node, "<gloss>")?;
-            let built = gloss(node, v3::gloss::category::REASONING_SUMMARY, &text)
+            let built = gloss_part(node, v3::gloss::category::REASONING_SUMMARY, part, &text)
                 .map_err(|_| Failure::new("<gloss>", "a gloss does not build"))?;
             self.out += unexported(built);
         }

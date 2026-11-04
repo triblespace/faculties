@@ -426,6 +426,13 @@ pub mod witness {
         /// carries `ends`.
         /// Minted with `trible genid` 2026-11-04.
         "6A57A45D78882898439B5B5ABF4DDD27" as pub turn_ends: GenId;
+        /// OCCURRENCE CORE. The full text of a tool output the client
+        /// shortened before her window held it: the record keeps the whole
+        /// payload, her window the truncated form (Codex
+        /// `truncate_function_output_payload`, ruling X18). Content she
+        /// never saw, kept beside her window and never in it.
+        /// Minted with `trible genid` 2026-11-04.
+        "85D8BAD321E6E124509C5BD71A80D5B8" as pub untruncated: Handle<UTF8String>;
     }
 }
 
@@ -435,7 +442,8 @@ pub mod witness {
 /// CORE: `of` (the witness) and every claim the record makes, with the
 /// witness attributes above (`timestamp`, `source_locator`, `raw_role`,
 /// `raw_model`, `raw_author`, `generated_by`, `pointer`, the `claimed_*`
-/// attributes, `ends`, `turn_ends` and the tags). Two records that hold the same node
+/// attributes, `untruncated` and the tags). `ends` and `turn_ends`
+/// annotate it (M2). Two records that hold the same node
 /// give two occurrences of its one witness unless they claim the same.
 pub mod occurrence {
     use super::*;
@@ -453,7 +461,8 @@ pub mod occurrence {
 /// a reviewer, a memory extractor) wrote about her context. Searchable, never
 /// trained on, never replayed.
 ///
-/// CORE: `describes`, `category` and `text`. ANNOTATION: `generated_by`.
+/// CORE: `describes`, `category`, `text` and, for a gloss written in parts,
+/// `part`. ANNOTATION: `generated_by`.
 pub mod gloss {
     use super::*;
 
@@ -472,6 +481,12 @@ pub mod gloss {
         "C3A82B05A3D80B69E73F620084C0A38A" as pub category: GenId;
         /// CORE. The exact text.
         "C406426B8E56F7A01D4ADE9C280A5833" as pub text: Handle<UTF8String>;
+        /// CORE, where the source writes a gloss in parts: the part's place
+        /// among them, from 0, in the source's order (a Codex reasoning
+        /// summary, ruling X16). Parts keep their order and count: two
+        /// parts with the same text are two glosses.
+        /// Minted with `trible genid` 2026-11-04.
+        "EA8310B00363BA59A6F1F7AF52FE5AAD" as pub part: U256BE;
     }
 
     pub mod category {

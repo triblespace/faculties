@@ -240,6 +240,9 @@ pub struct WitnessAnnotations {
     pub compaction_summary: bool,
     /// The source flags the held text as the harness's writing.
     pub harness_written: bool,
+    /// The full text of a tool output the client shortened before her
+    /// window held it (X18): the record holds it, she never saw it.
+    pub untruncated: Option<String>,
     /// Why the turn the record closes ended (an `ends` term). An annotation
     /// of the occurrence, never part of its id (M2).
     pub turn_ends: Vec<Id>,
@@ -290,6 +293,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         .collect();
     let source_locator = put(&mut fragment, annotations.source_locator);
     let claimed_title = put(&mut fragment, annotations.claimed_title);
+    let untruncated = put(&mut fragment, annotations.untruncated);
     let pointer: Vec<_> = annotations
         .pointer
         .into_iter()
@@ -322,6 +326,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
+        schema::witness::untruncated?: untruncated,
         metadata::tag*: tags.iter(),
     };
     let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;
@@ -371,6 +376,7 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             claimed_title,
             compaction_summary,
             harness_written,
+            untruncated,
             turn_ends: _,
             ends: _,
         } = a;
@@ -390,6 +396,7 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             && *claimed_title == b.claimed_title
             && *compaction_summary == b.compaction_summary
             && *harness_written == b.harness_written
+            && *untruncated == b.untruncated
     }
     fn same_ends(a: &WitnessAnnotations, b: &WitnessAnnotations) -> bool {
         set(&a.ends) == set(&b.ends) && set(&a.turn_ends) == set(&b.turn_ends)
@@ -423,6 +430,25 @@ pub fn gloss(describes: Id, category: Id, text: &str) -> Result<Fragment> {
     fragment += entity! { _ @
         schema::gloss::describes: &describes,
         schema::gloss::category: &category,
+        schema::gloss::text: text,
+    };
+    attach_kind(fragment, schema::gloss::KIND, "gloss")
+}
+
+/// One part of a gloss the source writes in parts: side-model `text` of
+/// `category` about `describes`, at place `part` among the parts (X16).
+/// Parts keep their order and count, so two parts with the same text are
+/// two glosses.
+pub fn gloss_part(describes: Id, category: Id, part: u64, text: &str) -> Result<Fragment> {
+    if text.is_empty() {
+        bail!("an empty gloss is never stored");
+    }
+    let mut fragment = Fragment::empty();
+    let text = fragment.put::<UTF8String, _>(text.to_owned());
+    fragment += entity! { _ @
+        schema::gloss::describes: &describes,
+        schema::gloss::category: &category,
+        schema::gloss::part: part,
         schema::gloss::text: text,
     };
     attach_kind(fragment, schema::gloss::KIND, "gloss")

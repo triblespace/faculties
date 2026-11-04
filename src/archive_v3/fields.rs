@@ -321,7 +321,9 @@ pub enum Order {
 /// - a `prefix` record's items become the prefix (the system section);
 /// - a `replace` record starts a new line with its own items (a compaction
 ///   installs what it holds);
-/// - a `turn` record marks where a turn starts on the line;
+/// - a `turn` record marks where a turn starts on the line; in a unit that
+///   holds none, a `prompt` record does, when the line since the latest
+///   turn started holds an item of hers;
 /// - a `rollback` record cuts the line back to the start of its last
 ///   `rollback_count` turns;
 /// - any other record's items extend the line.
@@ -338,6 +340,42 @@ pub struct FileWindows {
     pub rollback: &'static [Cond],
     /// The record-relative field of a rollback that counts its turns.
     pub rollback_count: &'static str,
+    /// Records that start a turn in a unit that holds no `turn` record,
+    /// when the line since the latest turn started holds an `out` item a
+    /// record holds: Codex X17, the turn starts at his prompt. Any one of
+    /// the conjunctions applies.
+    pub prompt: &'static [&'static [Cond]],
+    /// How the client shortens tool outputs before her window holds them.
+    pub budget: Option<HistoryBudget>,
+}
+
+/// Codex X18: the client's live history holds each tool output truncated
+/// to a budget, and the rollout keeps the full payload
+/// (`ContextManager::record_item_with_metadata`, codex-rs
+/// core/src/context_manager/history.rs, through
+/// `truncate_function_output_payload`, utils/output-truncation/src/lib.rs).
+/// Her window holds the truncated form, and the full text is a claim of
+/// the record (`untruncated`).
+///
+/// The budget is the latest `header` record's `policy`, exactly
+/// `{mode, limit}` (`bytes` or `tokens`, a count) with codex's 20%
+/// serialization allowance (`with_serialization_allowance`, rounded up),
+/// or, where a record holds one, its `limit` in tokens, allowance
+/// included. A header that records no policy records no budget: none is
+/// carried into its turn, and nothing is truncated. A policy or limit that
+/// does not parse fails. A text output is cut by `truncate_text`; a list
+/// output that the budget would shorten fails, since how to keep its full
+/// parts beside her window is not modeled.
+#[derive(Clone, Copy, Debug)]
+pub struct HistoryBudget {
+    /// The header record's field holding the policy, and the normalized
+    /// path a failure names.
+    pub policy: (&'static str, &'static str),
+    /// A record's field holding its own limit, and the normalized path a
+    /// failure names.
+    pub limit: (&'static str, &'static str),
+    /// The normalized paths of the tool outputs the budget applies to.
+    pub outputs: &'static [&'static str],
 }
 
 /// One field path, under its conditions, and its class.

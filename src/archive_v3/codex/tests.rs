@@ -1640,85 +1640,6 @@ fn x9pp_a_guardian_copy_may_drop_empty_output_text() {
     }
 }
 
-/// X9'': her live history holds a tool output shortened to the recorded
-/// budget, and the rollout the full payload. An output the budget shortens
-/// fails (what she was shown is the truncated form, not built here); one
-/// within it, or under a larger per-record override, imports.
-#[test]
-fn x9pp_an_output_its_budget_shortens_fails() {
-    let build = |policy: Value, output: Value, metadata: Option<Value>| {
-        let mut records = Vec::new();
-        records.push(rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys."));
-        records.push(line(
-            1,
-            "event_msg",
-            json!({"type": "task_started", "turn_id": "t1"}),
-        ));
-        records.push(line(
-            1,
-            "turn_context",
-            json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": "t1",
-                "truncation_policy": policy}),
-        ));
-        records.push(rv_user(2, "Go."));
-        records.push(line(
-            3,
-            "response_item",
-            json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "o1"}),
-        ));
-        let mut out = line(
-            4,
-            "response_item",
-            json!({"type": "function_call_output", "call_id": "o1", "output": output}),
-        );
-        if let Some(metadata) = metadata {
-            out["metadata"] = metadata;
-        }
-        records.push(out);
-        records.push(rv_said(5, "Done.", Some("final_answer")));
-        jsonl(&records)
-    };
-    let path = "{response_item}.payload{function_call_output}.output";
-    // Bytes 10 allow 12; tokens 2 allow 3, that is 12 bytes.
-    let bytes = json!({"mode": "bytes", "limit": 10});
-    let tokens = json!({"mode": "tokens", "limit": 2});
-    for policy in [&bytes, &tokens] {
-        passes(&build(policy.clone(), json!("x".repeat(12)), None));
-        assert_eq!(
-            refused(&build(policy.clone(), json!("x".repeat(13)), None)).path,
-            path
-        );
-        let parts = |a: usize, b: usize| {
-            json!([{"type": "input_text", "text": "x".repeat(a)}, {"type": "input_text", "text": ""},
-                {"type": "input_text", "text": "y".repeat(b)}])
-        };
-        passes(&build(policy.clone(), parts(8, 4), None));
-        assert_eq!(
-            refused(&build(policy.clone(), parts(8, 5), None)).path,
-            path
-        );
-        assert_eq!(
-            refused(&build(policy.clone(), parts(12, 1), None)).path,
-            path
-        );
-        // A per-record override in tokens: 100 tokens hold it.
-        passes(&build(
-            policy.clone(),
-            json!("x".repeat(13)),
-            Some(json!({"fallback_token_limit_override": 100})),
-        ));
-        assert_eq!(
-            refused(&build(
-                policy.clone(),
-                json!("x".repeat(13)),
-                Some(json!({"fallback_token_limit_override": 3})),
-            ))
-            .path,
-            path
-        );
-    }
-}
-
 /// X6, X11 (review r3l_cx_task_error): a failed turn ends with `error` on
 /// her last item's occurrence, with no fact for the error; an error that
 /// names no message fails.
@@ -2383,4 +2304,785 @@ fn real_sample() {
     for file in &failing_files {
         println!("{file}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The round-5 losslessness review's Codex fixtures (`r5l_cx_*`), kept as
+// permanent tests of rulings X16 to X19, and of the items that held.
+
+fn r5_try(source: &str) -> Option<Imported> {
+    let mut fragment = import(source.as_bytes()).ok()?;
+    let blobs = fragment.blobs_mut().snapshot().unwrap();
+    Some(Imported { fragment, blobs })
+}
+
+fn r5_outcome(source: &str) -> String {
+    match import(source.as_bytes()) {
+        Err(f) => format!("refused@{}", f.path),
+        Ok(mut fragment) => {
+            let blobs = fragment.blobs_mut().snapshot().unwrap();
+            let imported = Imported { fragment, blobs };
+            format!("imported gate={}", gate(source, &imported).passed())
+        }
+    }
+}
+
+/// Whether two sources import to different TribleSets (both must import).
+fn r5_differ(a: &str, b: &str) -> bool {
+    match (import(a.as_bytes()), import(b.as_bytes())) {
+        (Ok(fa), Ok(fb)) => fa.facts() != fb.facts(),
+        (Err(f), _) | (_, Err(f)) => panic!("refused@{}", f.path),
+    }
+}
+
+fn r5_label(imported: &Imported, node: Id) -> String {
+    use triblespace::prelude::blobencodings::RawBytes;
+    let facts = imported.fragment.facts();
+    let payload: Vec<Inline<Handle<UTF8String>>> = find!(
+        p: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::payload: ?p }])
+    )
+    .collect();
+    let name: Vec<Inline<Handle<UTF8String>>> = find!(
+        p: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::tool_name: ?p }])
+    )
+    .collect();
+    let blob: Vec<Inline<Handle<RawBytes>>> = find!(
+        p: Inline<Handle<RawBytes>>,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::blob: ?p }])
+    )
+    .collect();
+    let effort = exists!(
+        (),
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::effort: _?e }])
+    );
+    let mut out = String::new();
+    if effort {
+        out += "<header>";
+    }
+    if let Some(n) = name.first() {
+        out += &format!("[{}]", text_of(imported, *n));
+    }
+    if let Some(p) = payload.first() {
+        out += &format!("{:?}", text_of(imported, *p));
+    }
+    if let Some(b) = blob.first() {
+        let bytes = imported.blobs.get::<anybytes::Bytes, RawBytes>(*b).unwrap();
+        out += &format!("<blob {}B>", bytes.len());
+    }
+    if out.is_empty() {
+        out = "<other>".into();
+    }
+    out
+}
+
+fn r5_claims(imported: &Imported) -> String {
+    let facts = imported.fragment.facts();
+    let mut ends: Vec<String> = find!(
+        (node: Id, term: Id),
+        pattern!(facts, [
+            { _?w @ v3::witness::projects_to: ?node },
+            { _?o @ v3::occurrence::of: _?w, v3::witness::ends: ?term },
+        ])
+    )
+    .map(|(n, t)| format!("ends:{}@{}", r5_term(t), r5_label(imported, n)))
+    .collect();
+    let mut turn: Vec<String> = find!(
+        (node: Id, term: Id),
+        pattern!(facts, [
+            { _?w @ v3::witness::projects_to: ?node },
+            { _?o @ v3::occurrence::of: _?w, v3::witness::turn_ends: ?term },
+        ])
+    )
+    .map(|(n, t)| format!("turn_ends:{}@{}", r5_term(t), r5_label(imported, n)))
+    .collect();
+    ends.sort();
+    turn.sort();
+    ends.extend(turn);
+    ends.join(" ")
+}
+
+fn r5_term(t: Id) -> &'static str {
+    use v3::node::ends::*;
+    match t {
+        x if x == INTERRUPTED => "interrupted",
+        x if x == ERROR => "error",
+        _ => "other",
+    }
+}
+
+/// M2, X19: every prefix of `records` (a backup snapshot cut there) either
+/// fails or adds nothing to the full import.
+fn r5_prefixes(records: &[Value]) {
+    let full = jsonl(records);
+    let live = passes(&full);
+    for k in 1..records.len() {
+        let prefix = jsonl(&records[..k]);
+        if let Ok(fragment) = import(prefix.as_bytes()) {
+            let extra = fragment.facts().difference(live.fragment.facts());
+            assert_eq!(
+                extra.len(),
+                0,
+                "the prefix cut after {k} records adds to the full import"
+            );
+        }
+    }
+}
+
+/// X15, M2 and X19 (review `r5l_cx_x15_and_prefixes`): an erred turn with
+/// nothing of hers, with and without a node, and every prefix of it. A
+/// claim waiting for the next node never lands on the previous turn's last
+/// node when a cut falls before that node: a unit whose last records'
+/// claims wait for a node it does not reach fails.
+#[test]
+fn r5l_cx_x15_and_prefixes() {
+    let erred = |s: u32, message: Value| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t", "last_agent_message": null,
+            "error": {"message": message, "codex_error_info": "other"}}),
+        )
+    };
+    let clean = |s: u32| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t", "last_agent_message": null,
+                "error": null}),
+        )
+    };
+    let abort = |s: u32| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": "t"}),
+        )
+    };
+    // With his prompt.
+    let build = |end: Value| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "P1."));
+        r.push(rv_said(3, "R1.", Some("final_answer")));
+        r.push(clean(4));
+        r.extend(rv_turn(5, "t2", "xhigh"));
+        r.push(rv_user(6, "P2."));
+        r.push(end);
+        r.extend(rv_turn(8, "t3", "low"));
+        r.push(rv_user(9, "P3."));
+        r.push(rv_said(10, "R3.", Some("final_answer")));
+        r
+    };
+    let e = jsonl(&build(erred(7, json!("boom"))));
+    let c = jsonl(&build(clean(7)));
+    let ie = passes(&e);
+    assert_eq!(r5_claims(&ie), "turn_ends:error@\"P2.\"");
+    assert!(!gate(&c, &ie).passed());
+    assert!(r5_differ(&e, &c));
+    assert_eq!(
+        r5_outcome(&jsonl(&build(erred(7, json!(""))))),
+        "imported gate=true"
+    );
+    for m in [json!(null), json!(7)] {
+        assert_eq!(
+            r5_outcome(&jsonl(&build(erred(7, m)))),
+            "refused@{event_msg}.payload{task_complete}.error"
+        );
+    }
+    r5_prefixes(&build(erred(7, json!("boom"))));
+    // Headless: the turn holds no node (task_started, then the end).
+    let headless = |end: Value| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "P1."));
+        r.push(rv_said(3, "R1.", Some("final_answer")));
+        r.push(clean(4));
+        r.push(line(
+            5,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t2"}),
+        ));
+        r.push(end);
+        r.extend(rv_turn(8, "t3", "low"));
+        r.push(rv_user(9, "P3."));
+        r.push(rv_said(10, "R3.", Some("final_answer")));
+        r
+    };
+    let he = jsonl(&headless(erred(7, json!("boom"))));
+    let ih = passes(&he);
+    assert_eq!(r5_claims(&ih), "turn_ends:error@<header>");
+    assert!(r5_differ(&he, &jsonl(&headless(clean(7)))));
+    r5_prefixes(&headless(erred(7, json!("boom"))));
+    r5_prefixes(&headless(abort(7)));
+    // A headless end at the end of the file: its claim's node lies beyond
+    // the cut, so the unit fails rather than give it to R1.
+    let cut = &headless(abort(7))[..8];
+    assert_eq!(
+        r5_outcome(&jsonl(cut)),
+        "refused@{event_msg}.payload{turn_aborted}.reason"
+    );
+    // An effortless header holds no node; its claims go to the next node.
+    let mut r = Vec::new();
+    rv_head(&mut r);
+    r.push(rv_user(2, "P1."));
+    r.push(rv_said(3, "R1.", Some("final_answer")));
+    r.push(line(
+        5,
+        "event_msg",
+        json!({"type": "task_started", "turn_id": "t2"}),
+    ));
+    r.push(line(
+        5,
+        "turn_context",
+        json!({"model": "gpt-5.4", "summary": "auto", "turn_id": "t2"}),
+    ));
+    r.push(rv_user(6, "P2."));
+    r.push(rv_said(7, "R2.", Some("final_answer")));
+    r5_prefixes(&r);
+    assert_eq!(
+        r5_outcome(&jsonl(&r[..7])),
+        "refused@{turn_context}.payload"
+    );
+}
+
+/// X17 (review `r5l_cx_unstarted_abort`): in a rollout that marks no turn
+/// with `task_started`, a turn starts at his prompt after her answer. An
+/// abort after that prompt, before she produced anything, carries no
+/// `ends` on her previous answer (X5); its `turn_ends` is the prompt's.
+#[test]
+fn r5l_cx_unstarted_abort() {
+    let prompt = |s: u32, text: &str| {
+        [
+            rv_user(s, text),
+            line(
+                s,
+                "event_msg",
+                json!({"type": "user_message", "message": text, "images": []}),
+            ),
+        ]
+    };
+    let aborted = |s: u32| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "turn_aborted", "reason": "interrupted"}),
+        )
+    };
+    let mut r = vec![
+        rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys."),
+        line(
+            1,
+            "turn_context",
+            json!({"model": "gpt-5", "effort": "high", "summary": "auto"}),
+        ),
+    ];
+    r.extend(prompt(2, "P1."));
+    r.push(rv_said(3, "R1.", None));
+    r.extend(prompt(4, "P2."));
+    r.push(aborted(5));
+    r.extend(prompt(6, "P3."));
+    r.push(rv_said(7, "R3.", None));
+    let i = passes(&jsonl(&r));
+    assert_eq!(r5_claims(&i), "turn_ends:interrupted@\"P2.\"");
+    // Control: the abort right after her answer ends it.
+    let mut r2 = r[..5].to_vec();
+    r2.push(aborted(5));
+    r2.extend(prompt(6, "P3."));
+    r2.push(rv_said(7, "R3.", None));
+    let i = passes(&jsonl(&r2));
+    assert_eq!(
+        r5_claims(&i),
+        "ends:interrupted@\"R1.\" turn_ends:interrupted@\"R1.\""
+    );
+    // Two aborts: after her answer, then after a new prompt.
+    let mut r3 = r2[..6].to_vec();
+    r3.extend(prompt(6, "P2b."));
+    r3.push(aborted(6));
+    r3.extend(prompt(8, "P3."));
+    r3.push(rv_said(9, "R3.", None));
+    let i = passes(&jsonl(&r3));
+    assert_eq!(
+        r5_claims(&i),
+        "ends:interrupted@\"R1.\" turn_ends:interrupted@\"P2b.\" \
+         turn_ends:interrupted@\"R1.\""
+    );
+    // Several prompts in a row are one turn's input: the abort after them
+    // is the last prompt's, and R1 keeps no end.
+    let mut r4 = r[..7].to_vec();
+    r4.extend(prompt(4, "P2c."));
+    r4.push(aborted(5));
+    r4.extend(prompt(6, "P3."));
+    r4.push(rv_said(7, "R3.", None));
+    let i = passes(&jsonl(&r4));
+    assert_eq!(r5_claims(&i), "turn_ends:interrupted@\"P2c.\"");
+}
+
+/// X13' (review `r5l_cx_x13p`): a phase copy whose message a compaction
+/// installs. Held as ruled; kept as a permanent test.
+#[test]
+fn r5l_cx_x13p() {
+    let ev = |s: u32, text: &str| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "agent_message", "message": text, "phase": "commentary"}),
+        )
+    };
+    let compacted = |s: u32, text: &str| {
+        line(
+            s,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
+            {"type": "compaction", "encrypted_content": COMPACTION}]}),
+        )
+    };
+    let head = || {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        r
+    };
+    let copy = "refused@{event_msg}.payload{agent_message}.phase";
+    let mut a = head();
+    a.extend([
+        ev(3, "Kept."),
+        compacted(4, "Kept."),
+        rv_said(5, "After.", None),
+    ]);
+    assert_eq!(r5_outcome(&jsonl(&a)), copy);
+    let mut b = head();
+    b.extend([
+        ev(3, "Kept."),
+        rv_said(3, "Kept.", None),
+        compacted(4, "Kept."),
+        rv_said(5, "After.", None),
+    ]);
+    let i = passes(&jsonl(&b));
+    let set: Vec<bool> = nodes_saying(&i, "Kept.")
+        .into_iter()
+        .filter(|n| witnessed(&i, *n))
+        .map(|n| registers(&i, n) == vec![v3::fact::register::COMMENTARY])
+        .collect();
+    assert_eq!(set.iter().filter(|set| **set).count(), 1);
+    let mut c = head();
+    c.extend([
+        rv_said(3, "Kept.", None),
+        compacted(4, "Kept."),
+        ev(5, "Kept."),
+        rv_said(5, "Kept.", None),
+    ]);
+    assert_eq!(r5_outcome(&jsonl(&c)), "imported gate=true");
+    let mut d = head();
+    d.extend([compacted(4, "Kept."), ev(5, "Kept.")]);
+    assert_eq!(r5_outcome(&jsonl(&d)), copy);
+}
+
+/// The full payloads the record kept beside her window (X18).
+fn untruncated(imported: &Imported) -> Vec<String> {
+    let facts = imported.fragment.facts();
+    let found: Vec<Inline<Handle<UTF8String>>> = find!(
+        text: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ _?occurrence @ v3::witness::untruncated: ?text }])
+    )
+    .collect();
+    let mut texts: Vec<String> = found.into_iter().map(|t| text_of(imported, t)).collect();
+    texts.sort();
+    texts.dedup();
+    texts
+}
+
+/// The window before `Done.`, labelled.
+fn r5_window(imported: &Imported) -> String {
+    let done = witnessed_saying(imported, "Done.");
+    let mut v = vec![];
+    let mut cur = previous(imported, done);
+    while let Some(n) = cur {
+        v.push(r5_label(imported, n));
+        cur = previous(imported, n);
+    }
+    v.reverse();
+    v.join(" , ")
+}
+
+/// X18 (review `r5l_cx_budget`): her window holds a tool output as codex's
+/// history truncated it under the recorded budget, and the full payload is
+/// a claim of the record beside it. A turn whose header records no budget
+/// was written by a client that records none (codex 0.78 to 0.132 write it
+/// on every header), so a budget is never carried into it. An unparsable
+/// budget fails.
+#[test]
+fn r5l_cx_budget() {
+    let build = |second_policy: Option<Value>, output: Value, metadata: Option<Value>| {
+        let mut r = vec![rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys.")];
+        r.push(line(
+            1,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t1"}),
+        ));
+        r.push(line(
+            1,
+            "turn_context",
+            json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": "t1",
+            "truncation_policy": {"mode": "bytes", "limit": 10}}),
+        ));
+        r.push(rv_user(2, "Go."));
+        r.push(rv_said(3, "Ok.", Some("final_answer")));
+        r.push(line(
+            4,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t2"}),
+        ));
+        let mut ctx =
+            json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": "t2"});
+        if let Some(p) = second_policy {
+            ctx["truncation_policy"] = p;
+        }
+        r.push(line(4, "turn_context", ctx));
+        r.push(rv_user(5, "Again."));
+        r.push(line(
+            6,
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "exec", "input": "ls", "call_id": "o1"}),
+        ));
+        let mut out = line(
+            7,
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "o1", "output": output}),
+        );
+        if let Some(metadata) = metadata {
+            out["metadata"] = metadata;
+        }
+        r.push(out);
+        r.push(rv_said(8, "Done.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let x = |n: usize| json!("x".repeat(n));
+    let policy = "refused@{turn_context}.payload.truncation_policy";
+    let output = "refused@{response_item}.payload{custom_tool_call_output}.output";
+    // No budget recorded in the second turn: nothing is carried into it.
+    let none = build(None, x(13), None);
+    let i = passes(&none);
+    assert!(untruncated(&i).is_empty());
+    assert_eq!(nodes_saying(&i, &"x".repeat(13)).len(), 1);
+    assert_eq!(
+        r5_outcome(&build(
+            Some(json!({"mode": "bytes", "limit": 100})),
+            x(13),
+            None
+        )),
+        "imported gate=true"
+    );
+    for bad in [
+        json!(null),
+        json!({"mode": "lines", "limit": 1}),
+        json!({"mode": "bytes", "limit": 1.5}),
+        json!({"mode": "bytes", "limit": "1"}),
+        json!({"mode": "bytes", "limit": null}),
+        json!({"mode": "bytes", "limit": -1}),
+        json!({"mode": "bytes"}),
+        json!({"mode": "bytes", "limit": 1, "extra": 1}),
+    ] {
+        assert_eq!(r5_outcome(&build(Some(bad), x(13000), None)), policy);
+    }
+    // Bytes 10 allow 12 (`with_serialization_allowance`): 13 bytes keep 6
+    // and 6, with a character count.
+    let bytes = |n: usize| Some(json!({"mode": "bytes", "limit": n}));
+    let source = build(bytes(10), x(13), None);
+    let i = passes(&source);
+    let shown = "xxxxxx\u{2026}1 chars truncated\u{2026}xxxxxx";
+    assert_eq!(witnessed(&i, witnessed_saying(&i, shown)), true);
+    assert!(nodes_saying(&i, &"x".repeat(13)).is_empty());
+    assert_eq!(untruncated(&i), vec!["x".repeat(13)]);
+    // The gate tells the truncated window from the full one.
+    let full = import_ok(&build(bytes(100), x(13), None));
+    assert!(!gate(&source, &full).passed());
+    assert!(!gate(&build(bytes(100), x(13), None), &i).passed());
+    // Tokens 2 allow 3, 12 bytes; the cost is in UTF-8 bytes
+    // (`approx_token_count`), and the cut keeps whole characters.
+    let mb = build(
+        Some(json!({"mode": "tokens", "limit": 2})),
+        json!("\u{e9}".repeat(7)),
+        None,
+    );
+    let i = passes(&mb);
+    witnessed_saying(
+        &i,
+        "\u{e9}\u{e9}\u{e9}\u{2026}1 tokens truncated\u{2026}\u{e9}\u{e9}\u{e9}",
+    );
+    assert_eq!(untruncated(&i), vec!["\u{e9}".repeat(7)]);
+    // A budget of zero shows only the marker.
+    let i = passes(&build(bytes(0), x(5), None));
+    witnessed_saying(&i, "\u{2026}5 chars truncated\u{2026}");
+    // A per-record override is in tokens and holds its allowance already.
+    let i = passes(&build(
+        bytes(10),
+        x(13),
+        Some(json!({"fallback_token_limit_override": 3})),
+    ));
+    witnessed_saying(&i, "xxxxxx\u{2026}1 tokens truncated\u{2026}xxxxxx");
+    passes(&build(
+        bytes(1),
+        x(13),
+        Some(json!({"fallback_token_limit_override": 100})),
+    ));
+    assert_eq!(
+        r5_outcome(&build(
+            bytes(10),
+            x(13),
+            Some(json!({"fallback_token_limit_override": "3"}))
+        )),
+        "refused@{response_item}.metadata.fallback_token_limit_override"
+    );
+    // A list the budget shortens: her window would hold a truncated part
+    // or an omission notice, and how to keep its full parts beside it is
+    // not modeled, so it fails (no real list output is shortened).
+    let parts = |a: usize, b: usize| {
+        json!([{"type": "input_text", "text": "x".repeat(a)}, {"type": "input_text", "text": ""},
+            {"type": "input_text", "text": "y".repeat(b)}])
+    };
+    for policy in [bytes(10), Some(json!({"mode": "tokens", "limit": 2}))] {
+        passes(&build(policy.clone(), parts(8, 4), None));
+        assert_eq!(
+            r5_outcome(&build(policy.clone(), parts(8, 5), None)),
+            output
+        );
+        // Budget used up before an empty part: codex 0.78 to 0.132 count it
+        // omitted.
+        assert_eq!(
+            r5_outcome(&build(policy.clone(), parts(12, 0), None)),
+            output
+        );
+    }
+    // An image part costs nothing; text after it is still budgeted.
+    let image_then = |n: usize| json!([{"type": "input_image", "image_url": PNG}, {"type": "input_text", "text": "x".repeat(n)}]);
+    let i = passes(&build(bytes(10), image_then(12), None));
+    assert_eq!(
+        r5_window(&i),
+        "<header> , \"Sys.\" , <other> , \"Go.\" , \"Ok.\" , \"Again.\" , [exec]\"ls\" , \
+         <other> , <blob 8B> , \"xxxxxxxxxxxx\""
+    );
+    assert_eq!(r5_outcome(&build(bytes(10), image_then(13), None)), output);
+}
+
+/// The reasoning summary parts, by their place.
+fn summary_parts(imported: &Imported) -> Vec<(u128, String)> {
+    use triblespace::prelude::inlineencodings::U256BE;
+    let facts = imported.fragment.facts();
+    let found: Vec<(Id, Inline<U256BE>, Inline<Handle<UTF8String>>)> = find!(
+        (gloss: Id, part: Inline<U256BE>, text: Inline<Handle<UTF8String>>),
+        pattern!(facts, [{ ?gloss @
+            v3::gloss::category: v3::gloss::category::REASONING_SUMMARY,
+            v3::gloss::part: ?part,
+            v3::gloss::text: ?text,
+        }])
+    )
+    .collect();
+    let mut out: Vec<(u128, String)> = found
+        .into_iter()
+        .map(|(_, part, text)| {
+            (
+                part.try_from_inline::<u128>().unwrap(),
+                text_of(imported, text),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// X16 (review `r5l_cx_reasoning_summaries`): a reasoning summary's parts
+/// keep their order and count, each a gloss with its place.
+#[test]
+fn r5l_cx_reasoning_summaries() {
+    let build = |summary: Value, token: Value| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        r.push(line(
+            3,
+            "response_item",
+            json!({"type": "reasoning", "summary": summary, "content": null,
+                "encrypted_content": token}),
+        ));
+        r.push(rv_said(4, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let st = |t: &str| json!({"type": "summary_text", "text": t});
+    let r = json!(REASONING);
+    let three = build(
+        json!([st("**One**"), st("**Two**"), st("**Three**")]),
+        r.clone(),
+    );
+    let i = passes(&three);
+    assert_eq!(
+        summary_parts(&i),
+        vec![
+            (0, "**One**".to_owned()),
+            (1, "**Two**".to_owned()),
+            (2, "**Three**".to_owned())
+        ]
+    );
+    assert_eq!(blob_sizes(&i, v3::fact::modality::THINKING), vec![23]);
+    let reordered = build(
+        json!([st("**Two**"), st("**One**"), st("**Three**")]),
+        r.clone(),
+    );
+    assert!(!gate(&reordered, &i).passed());
+    assert!(!gate(&build(json!([st("**One**"), st("**Two**")]), r.clone()), &i).passed());
+    assert!(r5_differ(&three, &reordered));
+    assert!(r5_differ(
+        &three,
+        &build(
+            json!([st("**One**\n\n**Two**"), st("**Three**")]),
+            r.clone()
+        )
+    ));
+    // A repeated part is a second gloss.
+    let one = build(json!([st("**One**")]), r.clone());
+    let twice = build(json!([st("**One**"), st("**One**")]), r.clone());
+    assert!(r5_differ(&one, &twice));
+    let i = passes(&twice);
+    assert_eq!(
+        summary_parts(&i),
+        vec![(0, "**One**".to_owned()), (1, "**One**".to_owned())]
+    );
+    assert!(!gate(&one, &i).passed());
+    assert!(!gate(&twice, &import_ok(&one)).passed());
+    let none = build(json!([]), r.clone());
+    let n = passes(&none);
+    assert!(glosses(&n).is_empty());
+    assert!(r5_differ(&none, &three));
+    assert!(r5_differ(
+        &none,
+        &build(json!([]), json!("b3RoZXIgdG9rZW4="))
+    ));
+    // An empty part holds no gloss, and the parts after it keep their place.
+    let i = passes(&build(json!([st(""), st("**Two**")]), r.clone()));
+    assert_eq!(summary_parts(&i), vec![(1, "**Two**".to_owned())]);
+    assert_eq!(
+        r5_outcome(&build(json!(null), r.clone())),
+        "imported gate=true"
+    );
+}
+
+/// Her call arguments (review `r5l_cx_arguments_text`): accepted by JP's
+/// rule, key order, whitespace and escape spelling are not kept; number
+/// spellings are, and duplicate keys and trailing garbage fail.
+#[test]
+fn r5l_cx_arguments_text() {
+    let build = |args: &str| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        r.push(line(
+            3,
+            "response_item",
+            json!({"type": "function_call", "name": "shell", "arguments": args,
+                "call_id": "c1"}),
+        ));
+        r.push(line(
+            4,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ));
+        r.push(rv_said(5, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let base = build(r#"{"command":["ls"],"timeout":1000}"#);
+    let i = passes(&base);
+    for args in [
+        r#"{"timeout":1000,"command":["ls"]}"#,
+        r#"{"command": ["ls"], "timeout": 1000}"#,
+        "{\n  \"command\": [\"ls\"],\n  \"timeout\": 1000\n}",
+    ] {
+        let other = build(args);
+        assert!(!r5_differ(&base, &other));
+        assert!(gate(&other, &i).passed());
+    }
+    let other = build(r#"{"command":["ls"],"timeout":1e3}"#);
+    assert!(r5_differ(&base, &other));
+    assert!(!gate(&other, &i).passed());
+    let arguments = "refused@{response_item}.payload{function_call}.arguments";
+    assert_eq!(
+        r5_outcome(&build(r#"{"command":["ls"],"command":["rm"]}"#)),
+        arguments
+    );
+    assert_eq!(r5_outcome(&build(r#"{"command":["ls"]} x"#)), arguments);
+}
+
+/// Tool output lists (review `r5l_cx_output_parts`): parts keep their
+/// order, image bytes and detail; empty text parts hold nothing.
+#[test]
+fn r5l_cx_output_parts() {
+    let build = |parts: Value| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        r.push(line(
+            3,
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "view", "input": "a.png",
+                "call_id": "v1"}),
+        ));
+        r.push(line(
+            4,
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "v1", "output": parts}),
+        ));
+        r.push(rv_said(5, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let t = |s: &str| json!({"type": "input_text", "text": s});
+    let img = json!({"type": "input_image", "image_url": PNG});
+    let source = build(json!([t("Before."), t(""), img.clone(), t("After.")]));
+    let i = passes(&source);
+    let a = witnessed_saying(&i, "A.");
+    let mut v = vec![];
+    let mut cur = previous(&i, a);
+    while let Some(n) = cur {
+        v.push(r5_label(&i, n));
+        cur = previous(&i, n);
+    }
+    v.reverse();
+    assert_eq!(
+        v.join(" , "),
+        "<header> , \"Sys.\" , <other> , \"Q.\" , [view]\"a.png\" , <other> , \
+         \"Before.\" , <blob 8B> , \"After.\""
+    );
+    assert!(!r5_differ(
+        &source,
+        &build(json!([t("Before."), img.clone(), t("After.")]))
+    ));
+    for other in [
+        json!([t("After."), t(""), img.clone(), t("Before.")]),
+        json!([img.clone(), t("Before."), t(""), t("After.")]),
+        json!([t("Before."), t(""), {"type": "input_image",
+            "image_url": "data:image/gif;base64,R0lGODlhAQABAAAAACw="}, t("After.")]),
+    ] {
+        assert!(r5_differ(&source, &build(other)));
+    }
+    let detail = |d: &str| json!({"type": "input_image", "image_url": PNG, "detail": d});
+    assert!(r5_differ(
+        &build(json!([t("Before."), img.clone()])),
+        &build(json!([t("Before."), detail("high")]))
+    ));
+    assert!(r5_differ(
+        &build(json!([t("Before."), detail("low")])),
+        &build(json!([t("Before."), detail("high")]))
+    ));
+    assert_eq!(
+        r5_outcome(&build(json!([t("Before."), detail("high")]))),
+        "imported gate=true"
+    );
+    assert_eq!(
+        r5_outcome(&build(
+            json!([{"type": "input_image", "image_url": "https://example.invalid/a.png"}])
+        )),
+        "refused@{response_item}.payload{custom_tool_call_output}.output[]{input_image}.image_url"
+    );
+    assert_eq!(r5_outcome(&build(json!([t("")]))), "imported gate=true");
+    assert_eq!(r5_outcome(&build(json!([]))), "imported gate=true");
 }

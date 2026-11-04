@@ -327,10 +327,12 @@ fn attribute_name(attribute: Id) -> String {
         (v3::witness::claimed_media_type.id(), "claimed_media_type"),
         (v3::witness::claimed_title.id(), "claimed_title"),
         (v3::witness::turn_ends.id(), "turn_ends"),
+        (v3::witness::untruncated.id(), "untruncated"),
         (v3::occurrence::of.id(), "of"),
         (v3::gloss::describes.id(), "describes"),
         (v3::gloss::category.id(), "category"),
         (v3::gloss::text.id(), "text"),
+        (v3::gloss::part.id(), "part"),
         (v3::citation::cites.id(), "cites"),
         (v3::citation::start.id(), "start"),
         (v3::citation::end.id(), "end"),
@@ -592,6 +594,13 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                         pairs.push(annotation("generated_by", value.clone()));
                         models.push(value);
                     }
+                } else if attribute == v3::gloss::part.id() {
+                    // X16: a part of a gloss written in parts, by its place.
+                    let part = match raw.transmute::<U256BE>().try_from_inline::<u128>() {
+                        Ok(part) => Value::Number(part.to_string()),
+                        Err(_) => Value::Raw(hex(&raw.raw)),
+                    };
+                    pairs.push(annotation("part", part));
                 } else if attribute == v3::gloss::describes.id() {
                     if Self::id(raw) != Some(node) {
                         let pair = elsewhere("describes");
@@ -1152,6 +1161,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 ("source_detail", main::source_projection::source_detail.id()),
                 ("pointer", v3::witness::pointer.id()),
                 ("claimed_title", v3::witness::claimed_title.id()),
+                ("untruncated", v3::witness::untruncated.id()),
             ];
             if let Some((name, _)) = text_attributes.iter().find(|(_, id)| *id == attribute) {
                 let value = self.text(raw, &format!("annotation/{name}"));

@@ -32,7 +32,7 @@
 
 use super::{
     Beside, Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, FileWindows, Gap,
-    GapRule, Gaps, Link, Mirror, Order, Place, Structure, Supply, Windows,
+    GapRule, Gaps, HistoryBudget, Link, Mirror, Order, Place, Structure, Supply, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -55,8 +55,8 @@ const SETTING: DropReason = DropReason::Machinery(
 const TIME: DropReason = DropReason::Machinery("the time a record that holds no item was written");
 const STATUS: DropReason = DropReason::Machinery("the client's item status");
 const BUDGET: DropReason = DropReason::Machinery(
-    "the history budget tool outputs are shortened to; the importer refuses an output it \
-     shortens, so every kept output is what her window held",
+    "the history budget tool outputs are shortened to (X18, the table's HistoryBudget): her \
+     window holds the truncated form, the record claims the full text",
 );
 
 const DISCRIMINATOR: Class = Class::Structure(Structure::Discriminator);
@@ -863,8 +863,8 @@ const TURN_CONTEXT: &[Entry] = &[
         "{turn_context}.payload.network_sandbox_policy",
         Class::Drop(SETTING),
     ),
-    // X9'': not rendered into a message. It is the budget her live history
-    // shortens tool outputs to; the importer refuses an output it shortens.
+    // X9'', X18: not rendered into a message. It is the budget her live
+    // history shortens tool outputs to (the table's `HistoryBudget`).
     Entry::new(
         "{turn_context}.payload.truncation_policy",
         Class::Drop(BUDGET),
@@ -1767,6 +1767,30 @@ pub const TABLE: FieldTable = FieldTable {
         turn: TURN_STARTED,
         rollback: ROLLED_BACK,
         rollback_count: "payload.num_turns",
+        // X17: rollouts before `task_started` mark no turn; his prompt
+        // after her answer starts one.
+        prompt: &[
+            &[
+                Cond::Is("type", "response_item"),
+                Cond::Is("payload.type", "message"),
+                Cond::Is("payload.role", "user"),
+            ],
+            &[Cond::Is("type", "message"), Cond::Is("role", "user")],
+        ],
+        budget: Some(HistoryBudget {
+            policy: (
+                "payload.truncation_policy",
+                "{turn_context}.payload.truncation_policy",
+            ),
+            limit: (
+                "metadata.fallback_token_limit_override",
+                "{response_item}.metadata.fallback_token_limit_override",
+            ),
+            outputs: &[
+                "{response_item}.payload{function_call_output}.output",
+                "{response_item}.payload{custom_tool_call_output}.output",
+            ],
+        }),
     }),
     windows: Windows::NONE,
     gaps: Gaps {

@@ -38,7 +38,7 @@ use hifitime::{Duration, Epoch};
 use super::{id_like, JsonLeaf, Kind, Origin, Pointer, Step, Token, Value};
 use crate::archive_v3::fields::{
     Beside, Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps,
-    Mirror, Order, Place, Structure, Supply, Windows,
+    HistoryBudget, Mirror, Order, Place, Structure, Supply, Windows,
 };
 
 /// What B found in one unit.
@@ -279,11 +279,15 @@ pub fn placed_entities(marks: &BTreeSet<Token>) -> BTreeMap<Token, usize> {
             *out.entry(entity_token("witness", vec![tag("witness"), mark.clone()]))
                 .or_default() += 1;
         } else if let Some(category) = mark.attribute.strip_prefix("gloss:") {
-            let pairs = vec![
+            let mut pairs = vec![
                 tag("gloss"),
                 annotation_token("category", Value::Term(category.to_owned())),
-                annotation_token("text", mark.value.clone()),
             ];
+            // X16: a part of a gloss written in parts carries its place.
+            match &mark.value {
+                Value::Tuple(part) => pairs.extend(part.iter().cloned()),
+                value => pairs.push(annotation_token("text", value.clone())),
+            }
             *out.entry(entity_token("gloss", pairs)).or_default() += 1;
         } else {
             node.push(mark.clone());
@@ -385,6 +389,9 @@ struct RecordLinks {
     header: Option<usize>,
     /// Its kind under [`Order::File`].
     file: FileKind,
+    /// [`FileWindows::prompt`]: it starts a turn in a unit that marks none,
+    /// after an item of hers.
+    prompt: bool,
     /// The context a compaction record replaces ([`crate::archive_v3::fields::Compaction::parent`]).
     logical: Option<String>,
     /// Its claims: the annotation tokens [`Place::Claim`] places, as one
@@ -1003,9 +1010,21 @@ impl Walked {
             items
         };
         let mut base = fold([0u8; 32], &opening(&[], &[]));
+        let marked = self
+            .records
+            .iter()
+            .any(|links| links.file == FileKind::Turn);
         for at in 0..self.records.len() {
             let own = self.ordered(at);
             let tip = hashes.last().copied().unwrap_or(base);
+            // X17: his prompt after her answer starts a turn where the unit
+            // marks none.
+            if !marked && self.records[at].prompt {
+                let since = turns.last().copied().unwrap_or(0).min(line.len());
+                if line[since..].iter().any(|&item| self.answered(item)) {
+                    turns.push(line.len());
+                }
+            }
             match self.records[at].file {
                 FileKind::Header => {
                     out.push(Some(lines_of(Some([0; 32]))));
@@ -1068,6 +1087,16 @@ impl Walked {
             }
         }
         out
+    }
+
+    /// An `out` item a record holds: one of hers, which a prompt after it
+    /// starts a new turn behind (X17).
+    fn answered(&self, item: usize) -> bool {
+        self.items[item].held
+            && self.items[item]
+                .tokens
+                .iter()
+                .any(|token| token.direction == "out")
     }
 
     fn line_of(
@@ -1172,6 +1201,8 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         supply_paths: HashMap::new(),
         forks: Vec::new(),
         earlier_paths: HashMap::new(),
+        budget: None,
+        record_budget: None,
     };
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
@@ -1630,6 +1661,11 @@ struct Walker<'t> {
     /// [`Mirror::Earlier`]: the paths its copies compare against, with the
     /// copy forms each declares.
     earlier_paths: HashMap<&'static str, &'static [CopyForm]>,
+    /// [`HistoryBudget`]: the latest header's budget, and the current
+    /// record's (its own limit, else the header's), each `(in tokens,
+    /// limit)`.
+    budget: Option<(bool, usize)>,
+    record_budget: Option<(bool, usize)>,
 }
 
 /// Every path the table names, and every prefix of one that ends before a
@@ -1662,6 +1698,8 @@ struct Ctx {
     /// `(array path, position)` of each array the walk is inside.
     levels: Vec<(String, usize)>,
     line: usize,
+    /// The value is a tool output as the history budget shortened it.
+    shortened: bool,
 }
 
 /// A scalar's spelling, as conditions and vocabularies compare it.
@@ -1810,6 +1848,7 @@ impl<'t> Walker<'t> {
             index: Vec::new(),
             levels: Vec::new(),
             line,
+            shortened: false,
         };
         match Parser::document(bytes) {
             Ok(value) => self.value(&value, "", None, ctx),
@@ -1870,6 +1909,36 @@ impl<'t> Walker<'t> {
     fn value(&mut self, value: &J, path: &str, parent: Option<&J>, mut ctx: Ctx) {
         if path == self.table.record && ctx.record.is_none() {
             ctx = self.start_record(value, ctx);
+        }
+        // X18: her window holds a tool output as the budget shortened it,
+        // and the full text is a claim of its record.
+        if let (
+            Order::File(FileWindows {
+                budget: Some(budget),
+                ..
+            }),
+            Some((tokens, limit)),
+        ) = (self.table.order, self.record_budget)
+        {
+            if !ctx.shortened && ctx.record.is_some() && budget.outputs.contains(&path) {
+                match value {
+                    J::Str(text) => {
+                        let shown = shortened_text(text, tokens, limit);
+                        if shown != *text {
+                            let claim = annotation_token("untruncated", Value::Text(text.clone()));
+                            self.annotate(claim, path, &ctx, None);
+                            let mut ctx = ctx;
+                            ctx.shortened = true;
+                            return self.value(&J::Str(shown), path, parent, ctx);
+                        }
+                    }
+                    J::Arr(parts) if shortens_parts(parts, tokens, limit) => {
+                        self.row(path, Kind::Open, &ctx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
         }
         if let (Some(field), Some(record)) = (self.supply_paths.get(path), ctx.record) {
             let member = ctx.scalars.get(*field).filter(|v| *v != "null").cloned();
@@ -2044,6 +2113,13 @@ impl<'t> Walker<'t> {
             }
             Order::File(rules) => {
                 links.file = file_kind(&rules, &fields, &present);
+                links.prompt = rules
+                    .prompt
+                    .iter()
+                    .any(|when| !when.is_empty() && holds(when, &fields, &present, None));
+                if let Some(budget) = rules.budget {
+                    self.budgets(&budget, value, links.file, &ctx);
+                }
             }
         }
         if let Some(compaction) = windows.compaction {
@@ -2097,6 +2173,40 @@ impl<'t> Walker<'t> {
         ctx.index = Vec::new();
         ctx.levels = Vec::new();
         ctx
+    }
+
+    /// [`HistoryBudget`]: a header record sets the budget (none where it
+    /// records none, a row where it does not parse); every record's own is
+    /// its limit, else the header's.
+    fn budgets(&mut self, budget: &HistoryBudget, record: &J, kind: FileKind, ctx: &Ctx) {
+        if kind == FileKind::Header {
+            self.budget = match field_at(record, budget.policy.0) {
+                None => None,
+                Some(policy) => {
+                    let parsed = policy_budget(policy);
+                    if parsed.is_none() {
+                        self.row(budget.policy.1, Kind::Decode, ctx);
+                    }
+                    parsed
+                }
+            };
+        }
+        self.record_budget = match field_at(record, budget.limit.0) {
+            None => self.budget,
+            Some(J::Num(token)) if token.bytes().all(|b| b.is_ascii_digit()) => {
+                match token.parse::<usize>() {
+                    Ok(limit) => Some((true, limit)),
+                    Err(_) => {
+                        self.row(budget.limit.1, Kind::Decode, ctx);
+                        None
+                    }
+                }
+            }
+            Some(_) => {
+                self.row(budget.limit.1, Kind::Decode, ctx);
+                None
+            }
+        };
     }
 
     /// A fact token: into the item of its modality at its place (or the
@@ -2875,6 +2985,7 @@ impl<'t> Walker<'t> {
             {
                 let mut at_line = None;
                 let mut restated = false;
+                let mut part = None;
                 let items: Vec<usize> = match place {
                     Place::Claim | Place::LastOut | Place::TurnTail | Place::TurnTailWithoutOut => {
                         Vec::new()
@@ -2883,6 +2994,7 @@ impl<'t> Walker<'t> {
                     Place::Every => held.clone(),
                     Place::Here => {
                         let mut found = Vec::new();
+                        let mut at = 0;
                         for depth in (0..=levels.len()).rev() {
                             found = held
                                 .iter()
@@ -2890,11 +3002,17 @@ impl<'t> Walker<'t> {
                                 .filter(|&item| out.items[item].levels == levels[..depth])
                                 .collect();
                             if !found.is_empty() {
+                                at = depth;
                                 break;
                             }
                         }
                         if found.len() > 1 {
                             found.clear();
+                        }
+                        // X16: a gloss in an array below its item is one
+                        // part of it, with its place there.
+                        if token.attribute.starts_with("gloss:") && levels.len() > at {
+                            part = Some(levels[at].1);
                         }
                         found
                     }
@@ -2953,6 +3071,14 @@ impl<'t> Walker<'t> {
                         out.items[item].carried.insert(token.clone());
                     } else if token.attribute == "ends" {
                         out.items[item].ends.insert(token.clone());
+                    } else if let Some(part) = part {
+                        out.items[item].marks.insert(Token {
+                            value: Value::Tuple(vec![
+                                annotation_token("part", Value::Number(part.to_string())),
+                                annotation_token("text", token.value.clone()),
+                            ]),
+                            ..token.clone()
+                        });
                     } else {
                         out.items[item].marks.insert(token.clone());
                     }
@@ -2988,8 +3114,15 @@ impl<'t> Walker<'t> {
                     None => {}
                 }
             }
-            if let Some(item) = last {
-                out.items[item].claims.append(&mut pending);
+            // X19: claims that wait for a node the file does not reach
+            // never go to an earlier node; a snapshot cut before that node
+            // would place them elsewhere than the whole file.
+            if last.is_some() && !pending.is_empty() {
+                out.rows.push((
+                    "<claims>".to_owned(),
+                    Kind::Placed,
+                    "a record's claims wait for a node beyond the end of the file".to_owned(),
+                ));
             }
         }
     }
@@ -3006,8 +3139,20 @@ impl Walker<'_> {
         let mut line: Vec<usize> = Vec::new();
         let mut turns: Vec<usize> = Vec::new();
         let mut broken = false;
+        let marked = out.records.iter().any(|links| links.file == FileKind::Turn);
         for at in 0..out.records.len() {
             let own = out.ordered(at);
+            // X17: his prompt after her answer starts a turn where the unit
+            // marks none.
+            if !marked && out.records[at].prompt {
+                let since = turns.last().copied().unwrap_or(0).min(line.len());
+                if line[since..]
+                    .iter()
+                    .any(|&place| out.answered(out.file_arena[place].0))
+                {
+                    turns.push(line.len());
+                }
+            }
             let slot = |out: &Walked, header: &[usize]| -> Vec<usize> {
                 if header.is_empty() {
                     out.header_items(None)
@@ -3552,4 +3697,110 @@ fn copy_form(form: CopyForm, value: &J) -> Option<J> {
             Some(J::Obj(copy))
         }
     }
+}
+
+/// A history budget's policy (X18), as the client serializes it: exactly
+/// `{mode, limit}`, `mode` `bytes` or `tokens`, `limit` a count. The budget
+/// adds codex's 20% serialization allowance, rounded up
+/// (`with_serialization_allowance`: `(limit as f64 * 1.2).ceil()`).
+fn policy_budget(policy: &J) -> Option<(bool, usize)> {
+    let J::Obj(members) = policy else {
+        return None;
+    };
+    if members.len() != 2 {
+        return None;
+    }
+    let limit = match members.get("limit") {
+        Some(J::Num(token)) if token.bytes().all(|b| b.is_ascii_digit()) => {
+            token.parse::<usize>().ok()?
+        }
+        _ => return None,
+    };
+    let tokens = match members.get("mode") {
+        Some(J::Str(mode)) if mode == "tokens" => true,
+        Some(J::Str(mode)) if mode == "bytes" => false,
+        _ => return None,
+    };
+    Some((tokens, (limit as f64 * 1.2).ceil() as usize))
+}
+
+/// The text a tool output's history holds under a budget (X18): codex-rs
+/// `truncate_text` (utils/output-truncation/src/lib.rs). Under a token
+/// budget a text within four bytes a token is kept; otherwise both ends
+/// are kept, half the byte budget each, on character boundaries, around a
+/// marker counting what was cut: tokens of the bytes over budget, or the
+/// characters cut. A zero budget leaves the marker alone.
+fn shortened_text(text: &str, tokens: bool, limit: usize) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let max = if tokens {
+        limit.saturating_mul(4)
+    } else {
+        limit
+    };
+    if tokens && limit > 0 && text.len() <= max {
+        return text.to_owned();
+    }
+    let unit = if tokens { "tokens" } else { "chars" };
+    if max == 0 {
+        let count = if tokens {
+            text.len().div_ceil(4)
+        } else {
+            text.chars().count()
+        };
+        return format!("\u{2026}{count} {unit} truncated\u{2026}");
+    }
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let head = max / 2;
+    let tail_from = text.len() - (max - head);
+    let mut kept_head = String::new();
+    let mut kept_tail = String::new();
+    let mut cut = 0usize;
+    for (at, c) in text.char_indices() {
+        if at + c.len_utf8() <= head {
+            kept_head.push(c);
+        } else if at >= tail_from {
+            kept_tail.push(c);
+        } else {
+            cut += 1;
+        }
+    }
+    let count = if tokens {
+        (text.len() - max).div_ceil(4)
+    } else {
+        cut
+    };
+    format!("{kept_head}\u{2026}{count} {unit} truncated\u{2026}{kept_tail}")
+}
+
+/// Whether a budget shortens a list output (X18): codex-rs
+/// `truncate_function_output_items_with_policy` as the clients that record
+/// a budget (0.78 to 0.132) run it. Text parts spend the budget in order (in
+/// bytes, or four bytes a token rounded up); one that no longer fits is cut,
+/// and once it is spent every text part, empty ones too, is omitted. Images
+/// cost nothing.
+fn shortens_parts(parts: &[J], tokens: bool, limit: usize) -> bool {
+    let mut left = limit;
+    for part in parts {
+        if member(part, "type") != Some("input_text") {
+            continue;
+        }
+        let text = member(part, "text").unwrap_or_default();
+        if left == 0 {
+            return true;
+        }
+        let cost = if tokens {
+            text.len().div_ceil(4)
+        } else {
+            text.len()
+        };
+        if cost > left {
+            return true;
+        }
+        left -= cost;
+    }
+    false
 }
