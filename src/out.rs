@@ -32,6 +32,16 @@ pub enum Part {
         mime_type: String,
         uri: String,
     },
+    /// One complete advisory message about this output itself, such as what
+    /// it omits; never part of the answer's content. No trailing newline.
+    /// Every frontend delivers it, labelled by [`labelled_note`]: the CLI
+    /// on stderr, so stdout stays the answer; MCP and Drive as text.
+    Note { text: String },
+}
+
+/// A note as text for a medium that has no kind of its own for one.
+pub fn labelled_note(text: &str) -> String {
+    format!("note: {text}")
 }
 
 /// A borrowed synchronous emitter, with no implicit buffering.
@@ -79,6 +89,12 @@ impl<'a> Out<'a> {
             bytes: bytes.into(),
             mime_type: mime_type.into(),
         })
+    }
+
+    /// Say something about this output, such as what it omits, beside the
+    /// answer rather than inside it. A view that is incomplete says so here.
+    pub fn note(&mut self, text: impl Into<String>) -> Result<()> {
+        self.emit(Part::Note { text: text.into() })
     }
 
     /// Export bytes without interpreting them as text or a displayed modality.
@@ -149,6 +165,35 @@ mod tests {
             panic!("expected audio")
         };
         assert_eq!(bytes.as_ptr(), audio.as_ptr(), "audio storage is shared");
+    }
+
+    #[test]
+    fn a_note_keeps_its_place_among_the_parts_of_the_answer() {
+        let mut parts = Vec::new();
+        {
+            let mut collect = |part| {
+                parts.push(part);
+                Ok(())
+            };
+            let mut output = Out::new(&mut collect);
+            output.line("answer").unwrap();
+            output.note("this view omits one source").unwrap();
+            output.text("more answer").unwrap();
+        }
+        assert_eq!(
+            parts,
+            [
+                Part::Text {
+                    text: "answer\n".into()
+                },
+                Part::Note {
+                    text: "this view omits one source".into()
+                },
+                Part::Text {
+                    text: "more answer".into()
+                },
+            ]
+        );
     }
 
     #[test]

@@ -111,6 +111,12 @@ fn write_part<W: Write>(writer: &mut FramedWriter<W>, part: Part) -> Result<()> 
             writer.record_as(&mime_type, bytes.as_ref(), bytes.len() as u64)
         }
         Part::Blob { .. } => anyhow::bail!("binary exports are not sensory input"),
+        // Perceived as text, labelled and on its own line, so it is never
+        // mistaken for part of the answer it accompanies.
+        Part::Note { text } => {
+            let line = format!("{}\n", crate::out::labelled_note(&text));
+            writer.record_as(TEXT_PLAIN, line.as_bytes(), line.len() as u64)
+        }
     }
 }
 
@@ -201,6 +207,13 @@ mod tests {
             },
         )
         .unwrap();
+        write_part(
+            &mut writer,
+            Part::Note {
+                text: "omits one source".into(),
+            },
+        )
+        .unwrap();
         let bytes = writer.finish(EndStatus::Complete).unwrap();
         let mut reader = FramedReader::open(bytes.as_slice()).unwrap();
         let mut types = Vec::new();
@@ -220,9 +233,22 @@ mod tests {
         }
         assert_eq!(
             types,
-            [TEXT_PLAIN, "image/png", "audio/L16;rate=24000;channels=1"]
+            [
+                TEXT_PLAIN,
+                "image/png",
+                "audio/L16;rate=24000;channels=1",
+                TEXT_PLAIN
+            ]
         );
-        assert_eq!(payloads, [b"hello\n".to_vec(), vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(
+            payloads,
+            [
+                b"hello\n".to_vec(),
+                vec![1, 2, 3],
+                vec![4, 5],
+                b"note: omits one source\n".to_vec()
+            ]
+        );
     }
 
     #[test]

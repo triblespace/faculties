@@ -322,7 +322,17 @@ pub fn run() -> Result<()> {
                     crate::out::Part::Text { text } => stdout
                         .write_all(text.as_bytes())
                         .context("write explicit item inspection"),
-                    _ => unreachable!("inspection emits native text only"),
+                    crate::out::Part::Note { text } => writeln!(
+                        std::io::stderr().lock(),
+                        "{}",
+                        crate::out::labelled_note(&text)
+                    )
+                    .context("write item inspection note"),
+                    crate::out::Part::Image { .. }
+                    | crate::out::Part::Audio { .. }
+                    | crate::out::Part::Blob { .. } => {
+                        unreachable!("inspection emits native text only")
+                    }
                 }),
             )?;
             stdout.flush().context("flush explicit item inspection")

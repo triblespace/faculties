@@ -86,6 +86,11 @@ static TOOLS: &[Tool] = &[
         input_schema: EMPTY_SCHEMA,
     },
     Tool {
+        name: "sample_note",
+        description: "An answer with a note about what it omits",
+        input_schema: EMPTY_SCHEMA,
+    },
+    Tool {
         name: "sample_blob",
         description: "Exact binary export",
         input_schema: EMPTY_SCHEMA,
@@ -153,6 +158,10 @@ impl Faculty for Sample {
                 output.text("accepted before limit")?;
                 let _ = output.text("x".repeat(10_000));
                 let _ = output.text("must not leak after rejection");
+            }
+            "sample_note" => {
+                output.line("answer")?;
+                output.note("this view omits one source")?;
             }
             "sample_blob" => output.blob(
                 vec![0_u8, 0xff, b'\n'],
@@ -427,6 +436,19 @@ fn native_parts_preserve_order_text_and_binary_content() {
     let response = dispatch(&mut server, r#"{"jsonrpc":"2.0","id":"quote\"id","method":"tools/call","params":{"name":"sample_mixed","arguments":{"label":"first\nsecond \"quoted\""}}}"#).unwrap();
     assert!(response.contains(r#""id":"quote\"id""#));
     assert!(response.contains(r#""content":[{"type":"text","text":"first\nsecond \"quoted\"\n"},{"type":"image","data":"AP8=","mimeType":"image/png"},{"type":"text","text":"between"},{"type":"audio","data":"AQID","mimeType":"audio/wav"},{"type":"text","text":""}],"isError":false"#), "{response}");
+}
+
+#[test]
+fn a_note_reaches_the_caller_as_labelled_text_in_the_tool_result() {
+    let registrations = registrations();
+    let mut server = Server::new(&registrations).unwrap();
+    initialize(&mut server);
+    let response = dispatch(
+        &mut server,
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"sample_note"}}"#,
+    )
+    .unwrap();
+    assert!(response.contains(r#""content":[{"type":"text","text":"answer\n"},{"type":"text","text":"note: this view omits one source"}],"isError":false"#), "{response}");
 }
 
 #[test]

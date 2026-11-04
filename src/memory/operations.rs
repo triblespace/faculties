@@ -85,7 +85,8 @@ impl Memory {
     /// All selectors resolve against one frozen Memory view; retain input order.
     ///
     /// A lookup names what it holds, so it answers from the foundations this
-    /// observation could read and says how many it could not, rather than
+    /// observation could read and says how many it could not, in a note
+    /// beside the answer that every frontend delivers, rather than
     /// refusing the whole view for one absent member (JP, 2026-11-03: a
     /// preview may show a failure, a dependent calculation must refuse, and
     /// neither may claim completeness it does not have).
@@ -93,10 +94,10 @@ impl Memory {
         self.with_operation(|storage| {
             let (loaded, unread) = storage.load_read()?;
             if unread != 0 {
-                eprintln!(
-                    "note: {unread} foundation(s) of Memory could not be read, \
+                out.note(format!(
+                    "{unread} foundation(s) of Memory could not be read, \
                      so this view omits whatever they hold"
-                );
+                ))?;
             }
             for (index, raw) in selectors.iter().enumerate() {
                 let id = if raw.contains("..") {
@@ -3306,19 +3307,28 @@ mod tests {
         // resident memory is still shown, and the omission is reported beside
         // it rather than refusing the whole view.
         shown.clear();
+        let mut notes = Vec::new();
         memory
             .show(
                 &format!("{warm:x}"),
                 &mut Out::new(&mut |part| {
                     match part {
                         crate::out::Part::Text { text } => shown.push_str(&text),
-                        other => panic!("expected journal text, got {other:?}"),
+                        crate::out::Part::Note { text } => notes.push(text),
+                        other => panic!("expected journal text or a note, got {other:?}"),
                     }
                     Ok(())
                 }),
             )
             .unwrap();
         assert_eq!(shown, "already resident history\n");
+        // The omission travels with the answer as a note, so every frontend
+        // (MCP included) sees that this view is incomplete.
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("1 foundation(s) of Memory could not be read"),
+            "{notes:?}"
+        );
         // A write depends on absence, so it still refuses and names the
         // unread member.
         for summary in [

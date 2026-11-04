@@ -555,7 +555,18 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     }
                     result
                 }
-                _ => bail!("Orient daemon callback requires a complete text report"),
+                crate::out::Part::Note { text } => {
+                    // A note about the output is not a report either.
+                    use std::io::Write;
+                    let note = crate::out::labelled_note(&text);
+                    writeln!(std::io::stderr().lock(), "{note}")?;
+                    Ok(())
+                }
+                crate::out::Part::Image { .. }
+                | crate::out::Part::Audio { .. }
+                | crate::out::Part::Blob { .. } => {
+                    bail!("Orient daemon callback requires a complete text report")
+                }
             };
             orient.daemon_until(
                 persona,

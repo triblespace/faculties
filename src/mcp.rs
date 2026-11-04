@@ -830,6 +830,14 @@ fn encode_part(part: Part, budget: usize) -> Result<String> {
             }
             Ok(format!("{{\"type\":\"text\",\"text\":{}}}", quote(&text)))
         }
+        // MCP content has no kind for a note, so it is labelled text the
+        // caller sees beside the answer.
+        Part::Note { text } => encode_part(
+            Part::Text {
+                text: crate::out::labelled_note(&text),
+            },
+            budget,
+        ),
         Part::Image { bytes, mime_type } => encode_media("image", bytes, mime_type, budget),
         Part::Audio { bytes, mime_type } => encode_media("audio", bytes, mime_type, budget),
         Part::Blob {

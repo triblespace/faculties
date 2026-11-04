@@ -8,6 +8,8 @@
 //! Audio perception accepts mono PCM16 with an explicit rate, or derives it
 //! from PCM16 WAV (downmixing channels, without resampling). MCP and raw exports
 //! retain the original container bytes. Unsupported encodings fail explicitly.
+//! A note about the output goes to stderr on a terminal, so stdout stays
+//! exactly the answer; with Drive it is perceived as labelled text.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -73,7 +75,10 @@ pub fn with_diagnostic_output<T>(
     with_output(label, |out| {
         execute(&mut Out::new(&mut |part| match part {
             part @ Part::Blob { .. } => out.emit(part),
-            part => render_terminal(&mut stderr, part),
+            part @ (Part::Text { .. }
+            | Part::Image { .. }
+            | Part::Audio { .. }
+            | Part::Note { .. }) => render_terminal(&mut stderr, part),
         }))
     })
 }
@@ -84,8 +89,11 @@ struct DriveConfig {
     label: &'static str,
 }
 
-enum Output<W> {
-    Terminal(W),
+enum Output<W, E = io::Stderr> {
+    Terminal {
+        stdout: W,
+        stderr: E,
+    },
     Drive {
         stdout: W,
         config: Option<DriveConfig>,
@@ -96,7 +104,10 @@ enum Output<W> {
 impl Output<io::Stdout> {
     fn from_env(label: &'static str) -> Self {
         let Some(endpoint) = std::env::var_os("DRIVE_ENDPOINT") else {
-            return Self::Terminal(io::stdout());
+            return Self::Terminal {
+                stdout: io::stdout(),
+                stderr: io::stderr(),
+            };
         };
         Self::Drive {
             stdout: io::stdout(),
@@ -110,10 +121,13 @@ impl Output<io::Stdout> {
     }
 }
 
-impl<W: Write> Output<W> {
+impl<W: Write, E: Write> Output<W, E> {
     fn emit(&mut self, part: Part) -> Result<()> {
         match (self, part) {
-            (Self::Terminal(stdout), part)
+            (Self::Terminal { stderr, .. }, part @ Part::Note { .. }) => {
+                render_terminal(stderr, part)
+            }
+            (Self::Terminal { stdout, .. }, part)
             | (Self::Drive { stdout, .. }, part @ Part::Blob { .. }) => {
                 render_terminal(stdout, part)
             }
@@ -140,7 +154,7 @@ impl<W: Write> Output<W> {
 
     fn finish(self, error: Option<&anyhow::Error>) -> Result<()> {
         match self {
-            Self::Terminal(mut stdout) => stdout.flush().context("flush faculty stdout"),
+            Self::Terminal { mut stdout, .. } => stdout.flush().context("flush faculty stdout"),
             Self::Drive {
                 mut stdout, output, ..
             } => {
@@ -170,6 +184,7 @@ fn render_terminal(writer: &mut impl Write, part: Part) -> Result<()> {
             writeln!(writer, "[audio: {mime_type}, {} bytes]", bytes.len())?;
         }
         Part::Blob { bytes, .. } => writer.write_all(bytes.as_ref())?,
+        Part::Note { text } => writeln!(writer, "{}", crate::out::labelled_note(&text))?,
     }
     writer.flush().context("emit faculty terminal output")
 }
@@ -203,6 +218,45 @@ mod tests {
             String::from_utf8(output).unwrap(),
             "hello\n[image: image/png, 2 bytes]\n[audio: audio/wav, 3 bytes]\ntail"
         );
+    }
+
+    #[test]
+    fn a_note_goes_to_stderr_and_stdout_stays_exactly_the_answer() {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut output = Output::Terminal {
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        for part in [
+            Part::Text {
+                text: "answer\n".into(),
+            },
+            Part::Note {
+                text: "this view omits one source".into(),
+            },
+            Part::Text {
+                text: "tail".into(),
+            },
+        ] {
+            output.emit(part).unwrap();
+        }
+        output.finish(None).unwrap();
+        assert_eq!(String::from_utf8(stdout).unwrap(), "answer\ntail");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "note: this view omits one source\n"
+        );
+        // Diagnostic output already writes perception to stderr; a note
+        // there is labelled and ends its line in the same way.
+        let mut diagnostic = Vec::new();
+        render_terminal(
+            &mut diagnostic,
+            Part::Note {
+                text: "omitted".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(diagnostic).unwrap(), "note: omitted\n");
     }
 
     #[test]
@@ -330,7 +384,7 @@ mod tests {
         });
         let mut stdout = Vec::new();
         let clip = crate::voice::synthesis::AudioClip::from_samples(&[0.25, -0.5], 24000).unwrap();
-        let mut output = Output::Drive {
+        let mut output: Output<_> = Output::Drive {
             stdout: &mut stdout,
             config: Some(DriveConfig {
                 endpoint: format!("{}@{direct}", endpoint.id()).into(),
