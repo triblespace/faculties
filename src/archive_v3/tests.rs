@@ -1,0 +1,535 @@
+//! Identity tests for the v3 constructors, on synthetic data only.
+
+use std::collections::BTreeSet;
+
+use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::import::json_tree::JsonTreeImporter;
+use triblespace::core::metadata;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval, U256BE};
+
+use super::*;
+use crate::schemas::archive_v3::{fact::absent, fact::detail, fact::direction, fact::form};
+use crate::schemas::archive_v3::{fact::modality, fact::register, fact::status};
+use crate::schemas::archive_v3::{gloss::category, node::ends};
+use crate::schemas::blockdag::source_projection::{SOURCE_CLAUDE_CODE, SOURCE_CLAUDE_WEB};
+
+fn tree(json: &str) -> Fragment {
+    let mut store = MemoryBlobStore::new();
+    JsonTreeImporter::new(&mut store, None)
+        .import_str(json)
+        .expect("synthetic JSON imports")
+}
+
+fn text(dir: Id, payload: &str) -> FactCore {
+    FactCore {
+        modality: Some(modality::TEXT),
+        direction: Some(dir),
+        payload: Some(payload.to_owned()),
+        ..FactCore::default()
+    }
+}
+
+/// A synthetic window: what her window rendered, one fact per node.
+fn window(call_arguments: &str, schema_json: &str) -> Vec<FactCore> {
+    vec![
+        FactCore {
+            modality: Some(modality::SYSTEM),
+            direction: Some(direction::IN),
+            payload: Some("You are a careful assistant.".to_owned()),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::TOOL_DEFINITION),
+            direction: Some(direction::IN),
+            tool_name: Some("Read".to_owned()),
+            tool_namespace: Some("synthetic-fs".to_owned()),
+            payload: Some("Reads a file.".to_owned()),
+            structure: Some(tree(schema_json)),
+            ..FactCore::default()
+        },
+        text(direction::IN, "Please look at notes.txt"),
+        FactCore {
+            modality: Some(modality::THINKING),
+            direction: Some(direction::OUT),
+            blob: Some(anybytes::Bytes::from(vec![1u8, 2, 3, 4])),
+            media_type: Some(
+                MediaType::parse("application/vnd.anthropic.thinking-signature").unwrap(),
+            ),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::TOOL_CALL),
+            direction: Some(direction::OUT),
+            tool_name: Some("Read".to_owned()),
+            structure: Some(tree(call_arguments)),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::TOOL_RESULT),
+            direction: Some(direction::IN),
+            tool_name: Some("Read".to_owned()),
+            status: Some(status::OK),
+            exit_code: Some(0),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::FILE),
+            direction: Some(direction::IN),
+            payload: Some("synthetic contents\n".to_owned()),
+            title: Some("notes.txt".to_owned()),
+            source_uri: vec!["file:///synthetic/notes.txt".to_owned()],
+            media_type: Some(MediaType::parse("text/plain; charset=utf-8").unwrap()),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::IMAGE),
+            direction: Some(direction::IN),
+            absent: Some(absent::BODY),
+            detail: Some(detail::HIGH),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::AUDIO),
+            direction: Some(direction::IN),
+            blob: Some(anybytes::Bytes::from(vec![0u8; 8])),
+            media_type: Some(MediaType::parse("audio/L16; rate=24000; channels=1").unwrap()),
+            sense: Some("ear".to_owned()),
+            ..FactCore::default()
+        },
+        FactCore {
+            modality: Some(modality::TEXT),
+            direction: Some(direction::OUT),
+            payload: Some("Done: it says hello.".to_owned()),
+            register: Some(register::ANSWER),
+            ..FactCore::default()
+        },
+    ]
+}
+
+struct Built {
+    facts: Vec<Id>,
+    nodes: Vec<Id>,
+    fragment: Fragment,
+}
+
+fn chain(window: Vec<FactCore>) -> Built {
+    let mut built = Built {
+        facts: Vec::new(),
+        nodes: Vec::new(),
+        fragment: Fragment::empty(),
+    };
+    for core in window {
+        let held = fact(core).unwrap();
+        built.facts.push(held.root().unwrap());
+        let node = node(built.nodes.last().copied(), held).unwrap();
+        built.nodes.push(node.root().unwrap());
+        built.fragment += unexported(node);
+    }
+    built
+}
+
+fn ids(facts: &TribleSet) -> BTreeSet<Id> {
+    facts.iter().map(|t| *t.e()).collect()
+}
+
+#[test]
+fn identical_content_converges_across_builds() {
+    let a = chain(window(
+        r#"{"path": "notes.txt", "limit": 10}"#,
+        r#"{"type": "object", "properties": {"path": {"type": "string"}}}"#,
+    ));
+    // The same information spelled differently: member order and whitespace
+    // of the tool-defined JSON, and the media type's case and parameter
+    // order, are spelling, not information.
+    let b = chain(window(
+        r#"{ "limit":10,"path":"notes.txt" }"#,
+        r#"{"properties":{"path":{"type":"string"}},"type":"object"}"#,
+    ));
+    assert_eq!(a.facts, b.facts);
+    assert_eq!(a.nodes, b.nodes);
+    assert_eq!(a.fragment.facts(), b.fragment.facts());
+
+    // Different information is a different id.
+    let c = chain(window(
+        r#"{"path": "notes.txt", "limit": 11}"#,
+        r#"{"type": "object", "properties": {"path": {"type": "string"}}}"#,
+    ));
+    assert_eq!(a.facts[..4], c.facts[..4]);
+    assert_ne!(a.facts[4], c.facts[4]);
+    assert_eq!(a.nodes[..4], c.nodes[..4]);
+    assert_ne!(a.nodes[4..], c.nodes[4..]);
+}
+
+#[test]
+fn annotations_never_change_an_id() {
+    let plain = chain(window(r#"{"path": "notes.txt"}"#, r#"{"type": "object"}"#));
+    let annotated = chain(window(r#"{"path": "notes.txt"}"#, r#"{"type": "object"}"#));
+    let mut annotations = annotated.fragment.clone();
+
+    let call = annotated.nodes[4];
+    let result = annotated.nodes[5];
+    let answer = *annotated.nodes.last().unwrap();
+    annotations += annotate_node(
+        result,
+        &NodeAnnotations {
+            responds_to: vec![call],
+            ..NodeAnnotations::default()
+        },
+    );
+    annotations += annotate_node(
+        answer,
+        &NodeAnnotations {
+            ends: vec![ends::END_TURN],
+            recalls: vec![annotated.nodes[2]],
+            ..NodeAnnotations::default()
+        },
+    );
+    annotations += gloss(answer, category::TITLE, "A synthetic title").unwrap();
+    annotations += citation(answer, 0, 5, "https://example.invalid/cited").unwrap();
+    annotations += MediaType::parse("text/plain; charset=utf-8")
+        .unwrap()
+        .annotations();
+
+    let bare_witness = witness(SOURCE_CLAUDE_CODE, answer).unwrap();
+    let witness_id = bare_witness.root().unwrap();
+    let time: Inline<NsTAIInterval> = (
+        hifitime::Epoch::from_unix_seconds(1.0e9),
+        hifitime::Epoch::from_unix_seconds(1.0e9),
+    )
+        .try_to_inline()
+        .unwrap();
+    annotations += annotate_witness(
+        witness_id,
+        WitnessAnnotations {
+            generated_by: vec!["synthetic-model-1".to_owned()],
+            raw_model: Some("synthetic-model-1".to_owned()),
+            raw_role: Some("assistant".to_owned()),
+            source_locator: Some("synthetic-session".to_owned()),
+            timestamp: vec![time],
+            pointer: vec!["synthetic-pointer".to_owned()],
+            claimed_size: Some(4096),
+            claimed_media_type: Some(MediaType::parse("image/png").unwrap()),
+            claimed_title: Some("unseen.png".to_owned()),
+            compaction_summary: true,
+            ..WitnessAnnotations::default()
+        },
+    )
+    .unwrap();
+
+    // Every annotation landed, and nothing it added is a fact or node of the
+    // chain or carries a new id the chain depends on.
+    let annotated_ids = ids(annotations.facts());
+    let mut union = annotations.facts().clone();
+    union += plain.fragment.facts().clone();
+    assert_eq!(union.len(), annotations.facts().len());
+    assert_eq!(plain.nodes, annotated.nodes);
+    assert_eq!(plain.facts, annotated.facts);
+    assert!(annotated_ids.contains(&witness_id));
+
+    // The witness keeps its id however much a source says about it.
+    assert_eq!(
+        witness(SOURCE_CLAUDE_CODE, answer).unwrap().root(),
+        Some(witness_id)
+    );
+    // And the annotations are queryable.
+    let responds: Vec<Id> = find!(
+        call: Id,
+        pattern!(annotations.facts(), [{ result @ schema::node::responds_to: ?call }])
+    )
+    .collect();
+    assert_eq!(responds, vec![call]);
+    let sizes: Vec<Inline<U256BE>> = find!(
+        size: Inline<U256BE>,
+        pattern!(annotations.facts(), [{ witness_id @ schema::witness::claimed_size: ?size }])
+    )
+    .collect();
+    assert_eq!(sizes.len(), 1);
+    let tags: BTreeSet<Id> = find!(
+        tag: Id,
+        pattern!(annotations.facts(), [{ witness_id @ metadata::tag: ?tag }])
+    )
+    .collect();
+    assert!(tags.contains(&schema::witness::COMPACTION_SUMMARY));
+}
+
+/// Critique F1: the same lived content converges whether or not a source
+/// also claims something about it the window did not render.
+#[test]
+fn source_only_claims_never_split_lived_content() {
+    let lived = || {
+        vec![
+            text(direction::IN, "Here is my photo."),
+            FactCore {
+                modality: Some(modality::IMAGE),
+                direction: Some(direction::IN),
+                absent: Some(absent::BODY),
+                ..FactCore::default()
+            },
+            text(direction::OUT, "What a lovely sky."),
+        ]
+    };
+    // An export that claims the asset's size, media type, name and pointer.
+    let export = chain(lived());
+    let mut export_fragment = export.fragment.clone();
+    for (index, node) in export.nodes.iter().enumerate() {
+        let witness = witness(SOURCE_CLAUDE_WEB, *node).unwrap();
+        let witness_id = witness.root().unwrap();
+        export_fragment += witness;
+        let claims = if index == 1 {
+            WitnessAnnotations {
+                pointer: vec!["synthetic-file-uuid".to_owned()],
+                claimed_size: Some(123_456),
+                claimed_media_type: Some(MediaType::parse("image/jpeg").unwrap()),
+                claimed_title: Some("IMG_0001.jpg".to_owned()),
+                ..WitnessAnnotations::default()
+            }
+        } else {
+            WitnessAnnotations::default()
+        };
+        export_fragment += annotate_witness(witness_id, claims).unwrap();
+    }
+    // A transcript of the same window that records none of it.
+    let transcript = chain(lived());
+
+    assert_eq!(export.facts, transcript.facts);
+    assert_eq!(export.nodes, transcript.nodes);
+    let shared: BTreeSet<Id> = ids(transcript.fragment.facts());
+    assert!(shared.is_subset(&ids(export_fragment.facts())));
+
+    // Control: a title her window DID render is lived content, so it is core
+    // and the rendering table, not the file, made the difference.
+    let shown = fact(FactCore {
+        title: Some("IMG_0001.jpg".to_owned()),
+        ..lived().remove(1)
+    })
+    .unwrap();
+    assert_ne!(shown.root(), Some(export.facts[1]));
+}
+
+/// Critique F2: `continues` and `spawned_by` are annotations, so a root's id
+/// never depends on another unit or on the order units are imported in.
+#[test]
+fn continues_and_spawned_by_leave_root_ids_alone() {
+    let context = || {
+        vec![
+            FactCore {
+                modality: Some(modality::SYSTEM),
+                direction: Some(direction::IN),
+                payload: Some("You are a subagent.".to_owned()),
+                ..FactCore::default()
+            },
+            text(direction::IN, "Count the synthetic files."),
+            text(direction::OUT, "There are three."),
+        ]
+    };
+    // Imported alone: no knowledge of the parent unit.
+    let alone = chain(context());
+
+    // Imported after the parent: the parent's call node and an older tail
+    // are known and annotate the root.
+    let parent = chain(vec![
+        text(direction::IN, "Start a helper."),
+        FactCore {
+            modality: Some(modality::TOOL_CALL),
+            direction: Some(direction::OUT),
+            tool_name: Some("Task".to_owned()),
+            structure: Some(tree(r#"{"prompt": "Count the synthetic files."}"#)),
+            ..FactCore::default()
+        },
+    ]);
+    let call = parent.nodes[1];
+    let old_tail = parent.nodes[0];
+    let together = chain(context());
+    let root = together.nodes[0];
+    let mut fragment = together.fragment.clone();
+    fragment += parent.fragment.clone();
+    fragment += annotate_node(
+        root,
+        &NodeAnnotations {
+            continues: vec![old_tail],
+            spawned_by: vec![call],
+            ..NodeAnnotations::default()
+        },
+    );
+
+    assert_eq!(alone.nodes, together.nodes);
+    assert_eq!(alone.facts, together.facts);
+    let spawned: Vec<Id> = find!(
+        call: Id,
+        pattern!(fragment.facts(), [{ root @ schema::node::spawned_by: ?call }])
+    )
+    .collect();
+    assert_eq!(spawned, vec![call]);
+    let continued: Vec<Id> = find!(
+        tail: Id,
+        pattern!(fragment.facts(), [{ root @ schema::node::continues: ?tail }])
+    )
+    .collect();
+    assert_eq!(continued, vec![old_tail]);
+}
+
+#[test]
+fn media_types_keep_parameters_canonically() {
+    let parse = |s: &str| MediaType::parse(s).unwrap().canonical();
+    assert_eq!(
+        parse("Audio/L16; rate=24000; channels=1"),
+        "audio/l16;channels=1;rate=24000"
+    );
+    assert_eq!(
+        parse("audio/l16;channels=\"1\";rate=24000"),
+        "audio/l16;channels=1;rate=24000"
+    );
+    assert_eq!(parse("text/plain;"), "text/plain");
+    assert_eq!(
+        parse(r#"text/plain; title="a \"b\" c""#),
+        r#"text/plain;title="a \"b\" c""#
+    );
+    // Values are exact: case is information here.
+    assert_ne!(
+        parse("text/plain;charset=UTF-8"),
+        parse("text/plain;charset=utf-8")
+    );
+    assert_eq!(
+        MediaType::parse("TEXT/Plain; Charset=UTF-8")
+            .unwrap()
+            .essence(),
+        "text/plain"
+    );
+    for bad in [
+        "",
+        "  ",
+        "text",
+        "text/",
+        "text/plain; a",
+        "text/plain;a=1;A=2",
+        "text/plain;a=\"x",
+    ] {
+        assert!(MediaType::parse(bad).is_err(), "{bad:?} must be refused");
+    }
+
+    // A parameter-free type is the Files entity Files already builds.
+    assert_eq!(
+        MediaType::parse("Image/PNG").unwrap().core().root(),
+        crate::files::media_type_fragment("image/png")
+            .unwrap()
+            .root()
+    );
+    // Parameters are identity of the media type.
+    assert_ne!(
+        MediaType::parse("audio/l16;rate=24000")
+            .unwrap()
+            .core()
+            .root(),
+        MediaType::parse("audio/l16;rate=16000")
+            .unwrap()
+            .core()
+            .root()
+    );
+    // The essence is linked as an annotation.
+    let media_type = MediaType::parse("audio/l16;rate=24000").unwrap();
+    let root = media_type.core().root().unwrap();
+    let essence = MediaType::parse("audio/l16")
+        .unwrap()
+        .core()
+        .root()
+        .unwrap();
+    let annotations = media_type.annotations();
+    assert_eq!(annotations.exports().count(), 0);
+    let linked: Vec<Id> = find!(
+        e: Id,
+        pattern!(annotations.facts(), [{ root @ schema::media_type::essence: ?e }])
+    )
+    .collect();
+    assert_eq!(linked, vec![essence]);
+}
+
+#[test]
+fn constructors_refuse_what_was_never_rendered() {
+    // Only a span gap may be of unknown kind or direction.
+    assert!(fact(FactCore {
+        absent: Some(absent::SPAN),
+        ..FactCore::default()
+    })
+    .is_ok());
+    assert!(fact(FactCore {
+        modality: Some(modality::TEXT),
+        absent: Some(absent::BODY),
+        ..FactCore::default()
+    })
+    .is_err());
+    assert!(fact(text(direction::IN, "")).is_err());
+    assert!(fact(FactCore {
+        structure: Some(Fragment::empty()),
+        ..text(direction::IN, "x")
+    })
+    .is_err());
+    assert!(node(None, Fragment::empty()).is_err());
+    assert!(gloss(genid().id, category::RECAP, "").is_err());
+    assert!(citation(genid().id, 5, 4, "https://example.invalid").is_err());
+}
+
+#[test]
+fn form_voiced_is_not_her_text() {
+    // Harness text in her slot is `in` with `form: voiced`: a different fact
+    // from the same words spoken by her.
+    let voiced = fact(FactCore {
+        form: Some(form::VOICED),
+        ..text(direction::IN, "API Error: synthetic")
+    })
+    .unwrap();
+    let hers = fact(text(direction::OUT, "API Error: synthetic")).unwrap();
+    assert_ne!(voiced.root(), hers.root());
+}
+
+#[test]
+fn senses_glosses_and_vocabulary_are_intrinsic() {
+    assert_eq!(sense("ear").root(), sense("ear").root());
+    assert_ne!(sense("ear").root(), sense("Ear").root());
+
+    let node = chain(vec![text(direction::OUT, "x")]).nodes[0];
+    let a = gloss(node, category::REASONING_SUMMARY, "summary").unwrap();
+    let mut b = gloss(node, category::REASONING_SUMMARY, "summary").unwrap();
+    let root = b.root().unwrap();
+    b += annotate_gloss(root, "synthetic-summarizer").unwrap();
+    assert_eq!(a.root(), b.root());
+    assert_ne!(
+        gloss(node, category::RECAP, "summary").unwrap().root(),
+        a.root()
+    );
+
+    // Every vocabulary term has its own id and a name.
+    let vocabulary = vocabulary_fragment();
+    let named: BTreeSet<Id> = find!(
+        (term: Id, name: Inline<Handle<UTF8String>>),
+        pattern!(vocabulary.facts(), [{ ?term @ metadata::name: ?name }])
+    )
+    .map(|(term, _)| term)
+    .collect();
+    let mut all: Vec<Id> = Vec::new();
+    for specs in [
+        schema::fact::modality::SPECS,
+        schema::fact::direction::SPECS,
+        schema::fact::status::SPECS,
+        schema::fact::detail::SPECS,
+        schema::fact::register::SPECS,
+        schema::fact::form::SPECS,
+        schema::fact::absent::SPECS,
+        schema::gloss::category::SPECS,
+    ] {
+        all.extend(specs.iter().map(|(id, _)| *id));
+    }
+    all.extend(ends::SPECS.iter().map(|(id, _, _)| *id));
+    let distinct: BTreeSet<Id> = all.iter().copied().collect();
+    assert_eq!(distinct.len(), all.len());
+    assert_eq!(named, distinct);
+    let finals: BTreeSet<Id> = find!(
+        (term: Id, last: bool),
+        pattern!(vocabulary.facts(), [{ ?term @ schema::node::ends::message_final: ?last }])
+    )
+    .filter(|(_, last)| *last)
+    .map(|(term, _)| term)
+    .collect();
+    assert!(finals.contains(&ends::MAX_TOKENS));
+    assert!(!finals.contains(&ends::CUT));
+}

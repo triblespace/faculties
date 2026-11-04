@@ -1,6 +1,7 @@
 //! Faculty schemas: attribute IDs and kind markers per faculty.
 
 pub mod archive;
+pub mod archive_v3;
 pub mod atlas;
 pub mod blockdag;
 pub mod care;

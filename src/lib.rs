@@ -47,6 +47,7 @@ pub mod archive_collection;
 pub mod archive_copilot;
 pub mod archive_gemini;
 pub mod archive_source;
+pub mod archive_v3;
 pub mod atlas;
 pub mod blockdag;
 pub mod body;
