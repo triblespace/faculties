@@ -544,3 +544,39 @@ fn senses_glosses_and_vocabulary_are_intrinsic() {
     assert!(finals.contains(&ends::MAX_TOKENS));
     assert!(!finals.contains(&ends::CUT));
 }
+
+/// M2: an occurrence's id holds only its own record's claims. Why the
+/// sampling or the turn ended annotates it, so learning it from a later
+/// record keeps the id and adds only the annotation.
+#[test]
+fn an_occurrence_keeps_its_id_when_its_end_is_learned() {
+    // Minted with `trible genid`; it names nothing outside this test.
+    let node = triblespace::macros::id_hex!("3C2F6478399354F035CC65B45A17FD7D");
+    let witness_id = witness(SOURCE_CLAUDE_CODE, node).unwrap().root().unwrap();
+    let claims = WitnessAnnotations {
+        raw_role: Some("assistant".to_owned()),
+        source_locator: Some("synthetic-session".to_owned()),
+        ..WitnessAnnotations::default()
+    };
+    let bare = occurrence(witness_id, claims.clone()).unwrap();
+    let ended = occurrence(
+        witness_id,
+        WitnessAnnotations {
+            ends: vec![ends::INTERRUPTED],
+            turn_ends: vec![ends::INTERRUPTED],
+            ..claims
+        },
+    )
+    .unwrap();
+    assert_eq!(bare.root(), ended.root());
+    let added = ended.facts().difference(bare.facts());
+    assert_eq!(added.len(), 2, "only the two end annotations are new");
+    let id = ended.root().unwrap();
+    let facts = ended.facts();
+    let ended_by: Vec<Id> = find!(
+        term: Id,
+        pattern!(facts, [{ id @ schema::witness::ends: ?term }])
+    )
+    .collect();
+    assert_eq!(ended_by, vec![ends::INTERRUPTED]);
+}

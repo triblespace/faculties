@@ -240,16 +240,26 @@ pub struct WitnessAnnotations {
     pub compaction_summary: bool,
     /// The source flags the held text as the harness's writing.
     pub harness_written: bool,
-    /// Why the turn the record closes ended (an `ends` term).
+    /// Why the turn the record closes ended (an `ends` term). An annotation
+    /// of the occurrence, never part of its id (M2).
     pub turn_ends: Vec<Id>,
     /// Why the sampling that produced the held item stopped (`ends` terms,
-    /// ruling M1): the record's own claim, never the node's.
+    /// ruling M1): a claim about the record's occurrence, never the node's.
+    /// An annotation of the occurrence, never part of its id (M2).
     pub ends: Vec<Id>,
 }
 
 /// One occurrence of `witness`: the claims of one source record, rooted at an
-/// id derived from the witness and all of them, so two records' claims never
-/// mix. The vendor-model and media-type entities they point at ride along.
+/// id derived from the witness and the record's own claims, so two records'
+/// claims never mix. The vendor-model and media-type entities they point at
+/// ride along.
+///
+/// Why a sampling or turn ended (`ends`, `turn_ends`) is often known only
+/// from a later record: an interrupt notice, an aborted turn, an erred
+/// completion. So it annotates the occurrence and is no part of its id
+/// (M2): a backup snapshot cut before that record imports the same
+/// occurrence, without the annotation, and its union with the full import
+/// adds no second occurrence of one record.
 pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragment> {
     let mut fragment = Fragment::empty();
     let mut generated_by = Vec::new();
@@ -312,13 +322,15 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
-        schema::witness::turn_ends*: annotations.turn_ends.iter(),
-        schema::witness::ends*: annotations.ends.iter(),
         metadata::tag*: tags.iter(),
     };
     let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;
     let root = rooted(&core, "occurrence")?;
     fragment += unexported(core);
+    fragment += unexported(entity! { ExclusiveId::force_ref(&root) @
+        schema::witness::turn_ends*: annotations.turn_ends.iter(),
+        schema::witness::ends*: annotations.ends.iter(),
+    });
     let (_, facts, metafacts, blobs) = fragment.into_parts();
     Ok(Fragment::rooted_from_parts(root, facts, metafacts, blobs))
 }

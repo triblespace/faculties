@@ -260,6 +260,8 @@ struct Item {
     thinking: bool,
     /// The head of a tool result.
     head: bool,
+    /// A tool call.
+    call: bool,
     /// The head whose part this is.
     part_of: Option<usize>,
     record: Option<usize>,
@@ -584,12 +586,14 @@ impl Builder {
     ) -> Result<usize, Failure> {
         let thinking = core.modality == Some(v3::fact::modality::THINKING);
         let head = core.modality == Some(v3::fact::modality::TOOL_RESULT);
+        let call = core.modality == Some(v3::fact::modality::TOOL_CALL);
         let fact = self.put_fact(core, path)?;
         self.items.push(Item {
             fact,
             role,
             thinking,
             head,
+            call,
             part_of: None,
             record,
             original: None,
@@ -1522,8 +1526,18 @@ impl Builder {
         // newline (403 of 403 framed parts whose own line holds them). Beside
         // a result on its line the ruling names the exact text, but the one
         // framed part there held the text plus a newline too, so that case
-        // stays open; so does a line whose place before it is unknown.
-        let beside = record.get("renderedBesideToolResult").is_some();
+        // stays open; so does a line whose place before it is unknown. The
+        // mark is the JSON boolean `true`; any other spelling fails (R1').
+        let beside = match record.get("renderedBesideToolResult") {
+            None => false,
+            Some(Json::Bool(true)) => true,
+            Some(_) => {
+                return Err(Failure::new(
+                    "{attachment}.renderedBesideToolResult",
+                    "a beside-mark that is not the boolean true",
+                ))
+            }
+        };
         if beside {
             let version = self.version_at[at];
             let line = self.parent_line(parent.as_deref(), version)?;
@@ -1567,8 +1581,9 @@ impl Builder {
 
     /// R1: the place before a `renderedBesideToolResult` rendering, past
     /// the renderings of the attachments before it, holds no tool result
-    /// and is known. Beside a result, or after a span of unknown items, the
-    /// rendering is not built.
+    /// and is known. Beside a result, between a call and its result (R1':
+    /// 0 of 716 real marks follow anything but a typed prompt), or after a
+    /// span of unknown items, the rendering is not built.
     fn beside_no_result(&self, tail: Option<usize>) -> Result<(), Failure> {
         let path = "{attachment}.renderedBesideToolResult";
         let mut cursor = tail;
@@ -1585,6 +1600,12 @@ impl Builder {
                 return Err(Failure::new(
                     path,
                     "rendered beside a tool result: the one framed case held the text with a trailing newline, not the exact text; not built",
+                ));
+            }
+            if item.call {
+                return Err(Failure::new(
+                    path,
+                    "rendered between a call and its result: no real mark follows anything but a typed prompt; not built",
                 ));
             }
             if self.positions[at].item == self.span_gap {
@@ -2091,20 +2112,37 @@ impl Builder {
                 }
             }
         }
+        // Why a sampling stopped annotates its occurrence and is no part of
+        // its id (M2). Two records whose own claims are the same converge on
+        // one occurrence; if they ended differently, which stopped which way
+        // would be lost, so the unit fails instead.
+        let mut ended: HashMap<Id, Vec<Id>> = HashMap::new();
         for (record, nodes) in held {
             let claims = self.claims.get(&record).cloned().unwrap_or_default();
-            for (node, ends) in nodes {
+            for (node, mut ends) in nodes {
+                ends.sort();
                 let built = witness(SOURCE_CLAUDE_CODE, node)
                     .map_err(|_| Failure::new("<witness>", "a witness does not build"))?;
                 let id = built.root().expect("a witness is rooted");
                 out += unexported(built);
                 let claims = WitnessAnnotations {
-                    ends,
+                    ends: ends.clone(),
                     ..claims.clone()
                 };
                 let built = occurrence(id, claims).map_err(|_| {
                     Failure::new("<witness>", "a witness occurrence does not build")
                 })?;
+                // The id only tells whether the store would merge the two
+                // (idempotence); nothing is looked up by it.
+                let at = built.root().expect("an occurrence is rooted");
+                if let Some(earlier) = ended.insert(at, ends.clone()) {
+                    if earlier != ends {
+                        return Err(Failure::new(
+                            "{assistant}.message{message}.stop_reason",
+                            "two records with the same claims end differently",
+                        ));
+                    }
+                }
                 out += unexported(built);
             }
         }

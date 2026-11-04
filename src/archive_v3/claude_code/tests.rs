@@ -1909,3 +1909,174 @@ fn an_early_title_restates_a_later_one() {
     ]);
     assert_eq!(refused(&source).path, "{ai-title}.aiTitle");
 }
+
+/// M2: a backup snapshot is a prefix of the live file. Importing any prefix
+/// and taking the union with the full import adds no occurrence, and no
+/// trible at all: why a sampling ended is often known only from a later
+/// record (here the interrupt notice), so it annotates the occurrence and
+/// is no part of its id. The round-4 losslessness review's
+/// `r4l_cc_backup_overlap`, kept as a permanent test.
+#[test]
+fn m2_every_prefix_adds_no_occurrence_to_the_full_import() {
+    let mut stop = user(
+        "u3",
+        Some("a3"),
+        5,
+        json!([said("[Request interrupted by user]")]),
+    );
+    stop["interruptedMessageId"] = json!("m3");
+    let mut summary = user("c1", Some("b1"), 8, json!("Summary of what came before."));
+    summary["isCompactSummary"] = json!(true);
+    summary["isVisibleInTranscriptOnly"] = json!(true);
+    let mut b = boundary("b1", Some("u4"), Some("c1"));
+    let metadata = b["compactMetadata"].as_object_mut().unwrap();
+    metadata.remove("preservedSegment");
+    metadata.remove("preservedMessages");
+    b["timestamp"] = json!(stamp(7));
+    let mut a1 = assistant("a1", "u1", 1, "m1", thinking("plan"), json!(null));
+    a1["effort"] = json!("high");
+    let mut a2 = assistant(
+        "a2",
+        "a1",
+        1,
+        "m1",
+        call("t1", "Read", json!({"file_path": "/x"})),
+        json!("tool_use"),
+    );
+    a2["effort"] = json!("high");
+    let mut a3 = assistant("a3", "u2", 3, "m3", said("Partial"), json!(null));
+    a3["effort"] = json!("xhigh");
+    let records = vec![
+        user("u1", None, 0, json!("Read it.")),
+        a1,
+        a2,
+        user("u2", Some("a2"), 2, result("t1", json!("x"))),
+        a3,
+        stop,
+        json!({"type": "ai-title", "sessionId": "s-1", "aiTitle": "A synthetic chat"}),
+        user("u4", Some("u3"), 6, json!("Go on.")),
+        b,
+        summary,
+        user("u5", Some("c1"), 9, json!("After.")),
+        assistant("a5", "u5", 10, "m5", said("Done."), json!("end_turn")),
+    ];
+    let full = jsonl(&records);
+    let live = passes(&full);
+    let partial = witnessed_saying(&live, "Partial");
+    assert_eq!(ends_of(&live, partial), vec![v3::node::ends::INTERRUPTED]);
+    // The cut the review found: the interrupted message is held, the
+    // notice that names why it ended is not yet written.
+    assert!(import(jsonl(&records[..5]).as_bytes()).is_ok());
+    let mut cuts = 0;
+    for k in 1..records.len() {
+        let prefix = jsonl(&records[..k]);
+        let Ok(fragment) = import(prefix.as_bytes()) else {
+            continue;
+        };
+        cuts += 1;
+        let extra = fragment.facts().difference(live.fragment.facts());
+        let facts = &extra;
+        let added = find!(
+            occurrence: Id,
+            pattern!(facts, [{ ?occurrence @ v3::occurrence::of: _?witness }])
+        )
+        .count();
+        assert_eq!(added, 0, "the prefix of {k} records adds an occurrence");
+        assert_eq!(extra.len(), 0, "the prefix of {k} records adds tribles");
+        let mut union = live.fragment.clone();
+        union += fragment;
+        let blobs = union.blobs_mut().snapshot().unwrap();
+        let union = Imported {
+            fragment: union,
+            blobs,
+        };
+        let report = gate(&full, &union);
+        assert!(report.passed(), "the union with {k} records: {report}");
+    }
+    assert!(cuts >= 5, "only {cuts} prefixes import");
+}
+
+/// M2: two records whose claims are the same apart from why they ended
+/// would converge on one occurrence holding both ends, losing which record
+/// stopped which way; the importer refuses them rather than forget.
+#[test]
+fn m2_one_claim_set_that_ends_two_ways_fails() {
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Say it.")),
+        assistant("a1", "u1", 1, "m1", said("Same."), json!("end_turn")),
+        assistant("a2", "u1", 1, "m2", said("Same."), json!("max_tokens")),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{assistant}.message{message}.stop_reason"
+    );
+    // Ending the same way, they are one occurrence, as before.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Say it.")),
+        assistant("a1", "u1", 1, "m1", said("Same."), json!("end_turn")),
+        assistant("a2", "u1", 1, "m2", said("Same."), json!("end_turn")),
+    ]);
+    let imported = passes(&source);
+    let node = nodes_saying(&imported, "Same.");
+    assert_eq!(ends_of(&imported, node[0]), vec![v3::node::ends::END_TURN]);
+}
+
+/// R1': a beside-mark between a call and its result fails: no real mark
+/// follows anything but a typed prompt (0 of 716, round-4 review). The
+/// mark must be the JSON boolean `true`; the string `"true"` fails.
+#[test]
+fn r1p_a_beside_mark_after_a_call_or_spelled_as_a_string_fails() {
+    let moved = |uuid: &str, parent: &str, second: u32| {
+        json!({
+            "type": "attachment", "sessionId": "s-1", "uuid": uuid, "parentUuid": parent,
+            "timestamp": stamp(second), "cwd": "/synthetic", "version": "0.0.0",
+            "attachment": {"type": "remote_session_change", "url": "https://example.invalid/r"},
+            "rendered": [{"content": "Moved."}],
+            "renderedRole": "user",
+            "renderedBesideToolResult": true,
+        })
+    };
+    // Between a call and its result, past another marked rendering.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Read it.")),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            call("t1", "Read", json!({"file_path": "/x"})),
+            json!("tool_use"),
+        ),
+        moved("x0", "a1", 2),
+        moved("x1", "x0", 3),
+        user("u2", Some("x1"), 4, result("t1", json!("x"))),
+        assistant("a2", "u2", 5, "m2", said("Read."), json!("end_turn")),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{attachment}.renderedBesideToolResult"
+    );
+    // After her text and after his prompt it still builds.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        moved("x1", "a1", 2),
+        user("u2", Some("x1"), 3, json!("Next.")),
+        moved("x2", "u2", 4),
+        assistant("a2", "x2", 5, "m2", said("Ok."), json!("end_turn")),
+    ]);
+    let imported = passes(&source);
+    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
+    // The mark spelled as a string.
+    let mut spelled = moved("x1", "u1", 1);
+    spelled["renderedBesideToolResult"] = json!("true");
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        spelled,
+        assistant("a1", "x1", 2, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{attachment}.renderedBesideToolResult"
+    );
+}
