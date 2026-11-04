@@ -2143,18 +2143,20 @@ fn r1pp_a_beside_mark_stands_only_after_his_typed_prompt() {
         assistant("a2", "x1", 3, "m1", said("Hello."), json!("end_turn")),
     ]);
     assert_eq!(refused(&source).path, path);
-    // After his prompt, as a string or as text blocks, past another marked
-    // rendering: built.
-    for prompt in [json!("Hi."), json!([said("Hi.")])] {
-        let source = jsonl(&[
+    // After his prompt as a string, past another marked rendering: built.
+    // As text blocks it fails (R1''': every real mark follows a plain
+    // string prompt).
+    let after = |prompt: Value| {
+        jsonl(&[
             user("u1", None, 0, prompt),
             moved("x1", "u1", 1),
             moved("x2", "x1", 2),
             assistant("a1", "x2", 3, "m1", said("Hello."), json!("end_turn")),
-        ]);
-        let imported = passes(&source);
-        assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
-    }
+        ])
+    };
+    let imported = passes(&after(json!("Hi.")));
+    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
+    assert_eq!(refused(&after(json!([said("Hi.")]))).path, path);
 }
 
 /// C8: an empty sealed token holds nothing. The thinking happened and its
@@ -2207,4 +2209,337 @@ fn c8_an_empty_signature_is_a_body_gap() {
     assert!(import(source.as_bytes()).is_err());
     let source = build(json!({"type": "thinking", "thinking": "", "signature": null}));
     assert!(import(source.as_bytes()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// The round-6 losslessness review's fixtures, as permanent tests (round 6b).
+
+/// How the importer and the gate take one source: refused at a path (with
+/// its reason), or imported and gated.
+fn r6_outcome(source: &str) -> String {
+    match import(source.as_bytes()) {
+        Err(f) => format!("refused@{} ({})", f.path, f.reason),
+        Ok(mut fragment) => {
+            let blobs = fragment.blobs_mut().snapshot().unwrap();
+            let imported = Imported { fragment, blobs };
+            format!("imported gate={}", gate(source, &imported).passed())
+        }
+    }
+}
+
+/// Whether two sources, both imported, import to different TribleSets.
+fn r6_differ(a: &str, b: &str) -> bool {
+    import_ok(a).fragment.facts() != import_ok(b).fragment.facts()
+}
+
+/// Whether the gate passes `source` against the import of `other`.
+fn r6_cross(source: &str, other: &str) -> bool {
+    gate(source, &import_ok(other)).passed()
+}
+
+fn r6_moved(uuid: &str, parent: &str, second: u32) -> Value {
+    json!({
+        "type": "attachment", "sessionId": "s-1", "uuid": uuid, "parentUuid": parent,
+        "timestamp": stamp(second), "cwd": "/synthetic", "version": "0.0.0",
+        "attachment": {"type": "remote_session_change", "url": "https://example.invalid/r"},
+        "rendered": [{"content": "Moved."}],
+        "renderedRole": "user",
+        "renderedBesideToolResult": true,
+    })
+}
+
+/// R1''': a beside-mark is built only after his prompt written as a plain
+/// string, the one shape every real mark follows (r6l_cc_r1pp_more). After a
+/// compaction summary, after a prompt of blocks (text and image in either
+/// order, an image alone, a single text block), and after a record that
+/// holds a result and then his text, the import fails.
+#[test]
+fn r6l_cc_r1pp_more() {
+    let refused = |source: &str| {
+        let outcome = r6_outcome(source);
+        assert!(
+            outcome.starts_with("refused@{attachment}.renderedBesideToolResult"),
+            "{outcome}"
+        );
+        outcome
+    };
+    let mut summary = user("c1", Some("b1"), 5, json!("Summary."));
+    summary["isCompactSummary"] = json!(true);
+    refused(&jsonl(&[
+        user("u1", None, 0, json!("First.")),
+        assistant("a2", "u1", 3, "m2", said("Two."), json!("end_turn")),
+        boundary("b1", Some("a2"), None),
+        summary,
+        r6_moved("x1", "c1", 6),
+        assistant("a3", "x1", 7, "m3", said("Ok."), json!("end_turn")),
+    ]));
+    let img = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG}});
+    let after = |prompt: Value| {
+        jsonl(&[
+            user("u1", None, 0, prompt),
+            r6_moved("x1", "u1", 1),
+            assistant("a1", "x1", 2, "m1", said("Hello."), json!("end_turn")),
+        ])
+    };
+    for prompt in [
+        json!([said("Look."), img.clone()]),
+        json!([img.clone(), said("Look.")]),
+        json!([img.clone()]),
+        json!([said("Look.")]),
+    ] {
+        refused(&after(prompt));
+    }
+    // A user record holding a result and then his text (0 real records).
+    let mut mixed = result("t1", json!("x"));
+    mixed.as_array_mut().unwrap().push(said("Also this."));
+    refused(&jsonl(&[
+        user("u1", None, 0, json!("Read it.")),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            call("t1", "Read", json!({"file_path": "/x"})),
+            json!("tool_use"),
+        ),
+        user("u2", Some("a1"), 2, mixed),
+        r6_moved("x1", "u2", 3),
+        assistant("a2", "x1", 4, "m2", said("Read."), json!("end_turn")),
+    ]));
+    // Control: after his plain string prompt the mark is built.
+    let source = after(json!("Look."));
+    let imported = passes(&source);
+    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 1);
+}
+
+/// C8': an empty `thinking` block and an empty `redacted_thinking` block are
+/// two different blocks in her window: each is a body gap that keeps its
+/// block kind (the sealed media type of its kind), and the gate tells them
+/// apart both ways (r6l_cc_c8_more). Two empty blocks are two gaps.
+#[test]
+fn r6l_cc_c8_more() {
+    let empty = json!({"type": "thinking", "thinking": "", "signature": ""});
+    let build = |blocks: &[Value]| {
+        let mut records = vec![user("u1", None, 0, json!("Think."))];
+        let mut parent = "u1".to_owned();
+        for (k, block) in blocks.iter().enumerate() {
+            let uuid = format!("a{k}");
+            records.push(assistant(
+                &uuid,
+                &parent,
+                1 + k as u32,
+                "m1",
+                block.clone(),
+                json!(null),
+            ));
+            parent = uuid;
+        }
+        records.push(assistant(
+            "z",
+            &parent,
+            9,
+            "m1",
+            said("Thought."),
+            json!("end_turn"),
+        ));
+        jsonl(&records)
+    };
+    let one = build(&[empty.clone()]);
+    let two = build(&[empty.clone(), empty.clone()]);
+    let i = passes(&two);
+    let w = window_before(&i, witnessed_saying(&i, "Thought."));
+    let gaps = w
+        .iter()
+        .filter(|x| **x == (v3::fact::modality::THINKING, Some(v3::fact::absent::BODY)))
+        .count();
+    assert_eq!(gaps, 2);
+    assert!(r6_differ(&one, &two));
+    assert!(!r6_cross(&one, &two));
+    let redacted = build(&[json!({"type": "redacted_thinking", "data": ""})]);
+    passes(&one);
+    passes(&redacted);
+    assert!(r6_differ(&one, &redacted), "the block kind is lost");
+    assert!(!r6_cross(&redacted, &one));
+    assert!(!r6_cross(&one, &redacted));
+    // Each gap keeps its kind as the sealed media type of the block.
+    for (source, spelling) in [
+        (&one, sealed::ANTHROPIC_THINKING_SIGNATURE),
+        (&redacted, sealed::ANTHROPIC_REDACTED_THINKING),
+    ] {
+        let imported = import_ok(source);
+        let facts = imported.fragment.facts();
+        let thinking_term = v3::fact::modality::THINKING;
+        let body = v3::fact::absent::BODY;
+        let typed: Vec<Id> = find!(
+            media_type: Id,
+            pattern!(facts, [{ _?fact @
+                v3::fact::modality: thinking_term,
+                v3::fact::absent: body,
+                v3::fact::media_type: ?media_type,
+            }])
+        )
+        .collect();
+        let want = MediaType::parse(spelling).unwrap().core().root().unwrap();
+        assert_eq!(typed, vec![want]);
+    }
+}
+
+/// One API message over several records (38,914 real): the block order
+/// across records is kept, and a swap is another import the gate refuses.
+#[test]
+fn r6l_cc_message_over_records() {
+    let build = |order: [usize; 3]| {
+        let blocks = [
+            thinking("Plan."),
+            said("Doing it."),
+            call("t1", "Read", json!({"file_path": "/x"})),
+        ];
+        let mut r = vec![user("u1", None, 0, json!("Go."))];
+        let mut parent = "u1".to_owned();
+        for (k, &b) in order.iter().enumerate() {
+            let uuid = format!("a{k}");
+            let stop = if k == 2 {
+                json!("tool_use")
+            } else {
+                json!(null)
+            };
+            r.push(assistant(
+                &uuid,
+                &parent,
+                1 + k as u32,
+                "m1",
+                blocks[b].clone(),
+                stop,
+            ));
+            parent = uuid;
+        }
+        r.push(user("u2", Some(&parent), 5, result("t1", json!("x"))));
+        r.push(assistant(
+            "b1",
+            "u2",
+            6,
+            "m2",
+            said("Done."),
+            json!("end_turn"),
+        ));
+        jsonl(&r)
+    };
+    let base = build([0, 1, 2]);
+    let i = passes(&base);
+    let w: Vec<Id> = window_before(&i, witnessed_saying(&i, "Done."))
+        .into_iter()
+        .map(|(m, _)| m)
+        .skip(3)
+        .collect();
+    use v3::fact::modality::{TEXT, THINKING, TOOL_CALL, TOOL_RESULT};
+    assert_eq!(w, vec![TEXT, THINKING, TEXT, TOOL_CALL, TOOL_RESULT, TEXT]);
+    let swapped = build([1, 0, 2]);
+    assert_eq!(r6_outcome(&swapped), "imported gate=true");
+    assert!(r6_differ(&base, &swapped));
+    assert!(!r6_cross(&swapped, &base));
+}
+
+/// Why her sampling stopped: `refusal` and `max_tokens` are kept; a
+/// non-empty `stop_sequence` is refused (every real one is empty).
+#[test]
+fn r6l_cc_stop_reasons() {
+    let build = |stop: Value, seq: Value| {
+        let mut a = assistant("a1", "u1", 1, "m1", said("Part"), stop);
+        a["message"]["stop_sequence"] = seq;
+        jsonl(&[
+            user("u1", None, 0, json!("Go.")),
+            a,
+            user("u2", Some("a1"), 2, json!("Next.")),
+        ])
+    };
+    for (stop, seq) in [("stop_sequence", "</x>"), ("end_turn", "</x>")] {
+        let outcome = r6_outcome(&build(json!(stop), json!(seq)));
+        assert!(
+            outcome.starts_with("refused@{assistant}.message{message}.stop_sequence"),
+            "{outcome}"
+        );
+    }
+    let e = build(json!("end_turn"), json!(null));
+    for stop in ["refusal", "max_tokens"] {
+        let s = build(json!(stop), json!(null));
+        assert_eq!(r6_outcome(&s), "imported gate=true");
+        assert!(r6_differ(&e, &s));
+        assert!(!r6_cross(&e, &s));
+    }
+}
+
+/// A result's `is_error`: absent and false import the same (ruling I2),
+/// true is kept, and the string "true" is refused.
+#[test]
+fn r6l_cc_is_error() {
+    let build = |flag: Option<Value>| {
+        let mut res = json!([{"type": "tool_result", "tool_use_id": "t1", "content": "x"}]);
+        if let Some(flag) = flag {
+            res[0]["is_error"] = flag;
+        }
+        jsonl(&[
+            user("u1", None, 0, json!("Read it.")),
+            assistant(
+                "a1",
+                "u1",
+                1,
+                "m1",
+                call("t1", "Read", json!({"file_path": "/x"})),
+                json!("tool_use"),
+            ),
+            user("u2", Some("a1"), 2, res),
+            assistant("a2", "u2", 3, "m2", said("Read."), json!("end_turn")),
+        ])
+    };
+    let absent = build(None);
+    let f = build(Some(json!(false)));
+    let t = build(Some(json!(true)));
+    for source in [&absent, &f, &t] {
+        assert_eq!(r6_outcome(source), "imported gate=true");
+    }
+    assert!(!r6_differ(&absent, &f));
+    assert!(r6_differ(&absent, &t));
+    assert!(!r6_cross(&t, &absent));
+    assert!(r6_outcome(&build(Some(json!("true"))))
+        .starts_with("refused@{user}.message.content[]{tool_result}.is_error"));
+}
+
+/// Exact text: carriage returns, NFD against NFC, trailing whitespace and
+/// trailing newlines all change the import.
+#[test]
+fn r6l_cc_text_exact() {
+    let build = |content: &str, hers: &str| {
+        jsonl(&[
+            user("u1", None, 0, json!("Read it.")),
+            assistant(
+                "a1",
+                "u1",
+                1,
+                "m1",
+                call("t1", "Read", json!({"file_path": "/x"})),
+                json!("tool_use"),
+            ),
+            user("u2", Some("a1"), 2, result("t1", json!(content))),
+            assistant("a2", "u2", 3, "m2", said(hers), json!("end_turn")),
+        ])
+    };
+    let base = build("a\nb", "Read.");
+    passes(&base);
+    assert!(r6_differ(&base, &build("a\r\nb", "Read.")));
+    assert!(r6_differ(
+        &build("caf\u{e9}", "Read."),
+        &build("cafe\u{301}", "Read.")
+    ));
+    assert!(r6_differ(&base, &build("a\nb  \n", "Read.")));
+    assert!(r6_differ(&base, &build("a\nb", "Read.  ")));
+    assert!(r6_differ(
+        &jsonl(&[
+            user("u1", None, 0, json!("Hi.")),
+            assistant("a1", "u1", 1, "m1", said("Ok."), json!("end_turn"))
+        ]),
+        &jsonl(&[
+            user("u1", None, 0, json!("Hi.\n")),
+            assistant("a1", "u1", 1, "m1", said("Ok."), json!("end_turn"))
+        ]),
+    ));
 }

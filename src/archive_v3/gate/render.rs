@@ -462,6 +462,24 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         names
     }
 
+    /// A model entity as a `generated_by` claim refers to it: its whole
+    /// tuple, so two models that share a name never stand in for each
+    /// other. It renders once, as its own tuple, into
+    /// [`Rendered::entities`] too.
+    fn model(&mut self, raw: Raw, at: &str) -> Value {
+        let Some(entity) = Self::id(raw) else {
+            return Value::Raw(hex(&raw.raw));
+        };
+        self.named(entity, at);
+        match self.named.get(&entity) {
+            Some(Token {
+                value: Value::Tuple(pairs),
+                ..
+            }) => Value::Tuple(pairs.clone()),
+            _ => Value::Raw(format!("{entity:X}")),
+        }
+    }
+
     fn node(&mut self, node: Id) -> Rendering {
         if let Some(rendering) = self.nodes.get(&node) {
             return rendering.clone();
@@ -586,14 +604,9 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     pairs.push(annotation("text", text.clone()));
                     texts.push(text);
                 } else if attribute == v3::gloss::generated_by.id() {
-                    let values = match Self::id(raw) {
-                        Some(model) => self.named(model, "annotation/gloss"),
-                        None => vec![Value::Raw(hex(&raw.raw))],
-                    };
-                    for value in values {
-                        pairs.push(annotation("generated_by", value.clone()));
-                        models.push(value);
-                    }
+                    let value = self.model(raw, "annotation/gloss");
+                    pairs.push(annotation("generated_by", value.clone()));
+                    models.push(value);
                 } else if attribute == v3::gloss::part.id() {
                     // X16: a part of a gloss written in parts, by its place.
                     let part = match raw.transmute::<U256BE>().try_from_inline::<u128>() {
@@ -1168,14 +1181,13 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 tokens.push(annotation(name, value));
                 continue;
             }
-            if attribute == main::source_projection::generated_by.id()
-                || attribute == v3::witness::claimed_media_type.id()
-            {
-                let name = if attribute == main::source_projection::generated_by.id() {
-                    "generated_by"
-                } else {
-                    "claimed_media_type"
-                };
+            if attribute == main::source_projection::generated_by.id() {
+                let value = self.model(raw, "annotation/generated_by");
+                tokens.push(annotation("generated_by", value));
+                continue;
+            }
+            if attribute == v3::witness::claimed_media_type.id() {
+                let name = "claimed_media_type";
                 match Self::id(raw) {
                     Some(entity) => {
                         for value in self.named(entity, &format!("annotation/{name}")) {

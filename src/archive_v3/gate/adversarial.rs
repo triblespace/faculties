@@ -1276,7 +1276,7 @@ fn round3_cases() -> Vec<(&'static str, Outcome)> {
     {
         let mut f = fresh().fragment;
         let (g, _) = gloss_on(&f, v3::gloss::category::TITLE);
-        f += av3::annotate_gloss(g, "claude-opus-4-6").unwrap();
+        f += av3::annotate_gloss(g, &av3::Model::vendor("claude-opus-4-6").unwrap()).unwrap();
         note("CC-1 title gloss generated_by invented", run(&s, f));
     }
     // CC-2 occurrence author/experiencer invented.
@@ -1609,7 +1609,7 @@ fn round3_cases() -> Vec<(&'static str, Outcome)> {
     {
         let mut f = freshx().fragment;
         let (g, _) = gloss_on(&f, v3::gloss::category::REASONING_SUMMARY);
-        f += av3::annotate_gloss(g, "gpt-5-codex").unwrap();
+        f += av3::annotate_gloss(g, &av3::Model::vendor("gpt-5-codex").unwrap()).unwrap();
         note("CX-1 reasoning gloss generated_by invented", runx(f));
     }
     // CX-2 ends:interrupted on his prompt instead of her commentary (X5).

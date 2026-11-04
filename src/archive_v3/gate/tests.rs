@@ -22,7 +22,7 @@ use crate::archive_v3::fields::{
     Structure,
 };
 use crate::archive_v3::{
-    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
+    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType, Model,
     NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
@@ -547,7 +547,10 @@ fn said(modality: Id, direction: Id, text: &str) -> FactCore {
 fn by(role: &str, time: Inline<NsTAIInterval>) -> WitnessAnnotations {
     let model = (role == "assistant").then(|| "synthetic-model".to_owned());
     WitnessAnnotations {
-        generated_by: model.iter().cloned().collect(),
+        generated_by: model
+            .iter()
+            .map(|label| Model::vendor(label).unwrap())
+            .collect(),
         raw_model: model,
         raw_role: Some(role.to_owned()),
         timestamp: vec![time],

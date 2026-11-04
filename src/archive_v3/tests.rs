@@ -202,7 +202,7 @@ fn annotations_never_change_an_id() {
     let claims = occurrence(
         witness_id,
         WitnessAnnotations {
-            generated_by: vec!["synthetic-model-1".to_owned()],
+            generated_by: vec![Model::vendor("synthetic-model-1").unwrap()],
             raw_model: Some("synthetic-model-1".to_owned()),
             raw_role: Some("assistant".to_owned()),
             source_locator: Some("synthetic-session".to_owned()),
@@ -467,7 +467,6 @@ fn constructors_refuse_what_was_never_rendered() {
         ..FactCore::default()
     })
     .is_err());
-    assert!(fact(text(direction::IN, "")).is_err());
     assert!(fact(FactCore {
         structure: Some(Fragment::empty()),
         ..text(direction::IN, "x")
@@ -476,6 +475,139 @@ fn constructors_refuse_what_was_never_rendered() {
     assert!(node(None, Fragment::empty()).is_err());
     assert!(gloss(genid().id, category::RECAP, "").is_err());
     assert!(citation(genid().id, 5, 4, "https://example.invalid").is_err());
+}
+
+/// Constructor delta for the native writer: an empty text that reached her
+/// window is a fact holding the empty blob. It differs from a body gap (its
+/// content unknown) and from a fact with no payload (a part the provider
+/// never rendered).
+#[test]
+fn an_empty_rendered_text_is_a_fact_holding_the_empty_blob() {
+    use triblespace::core::repo::BlobStoreGet;
+    let empty = fact(text(direction::IN, "")).unwrap();
+    let gap = fact(FactCore {
+        modality: Some(modality::TEXT),
+        direction: Some(direction::IN),
+        absent: Some(absent::BODY),
+        ..FactCore::default()
+    })
+    .unwrap();
+    let unrendered = fact(FactCore {
+        modality: Some(modality::TEXT),
+        direction: Some(direction::IN),
+        ..FactCore::default()
+    })
+    .unwrap();
+    assert_ne!(empty.root(), gap.root());
+    assert_ne!(empty.root(), unrendered.root());
+    assert_eq!(empty.root(), fact(text(direction::IN, "")).unwrap().root());
+    let id = empty.root().unwrap();
+    let facts = empty.facts();
+    let payloads: Vec<Inline<Handle<UTF8String>>> = find!(
+        payload: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ id @ schema::fact::payload: ?payload }])
+    )
+    .collect();
+    assert_eq!(payloads.len(), 1);
+    let mut blobs = empty.clone();
+    let reader = blobs.blobs_mut().snapshot().unwrap();
+    let held: anybytes::View<str> = reader.get(payloads[0]).unwrap();
+    assert_eq!(held.as_ref(), "");
+}
+
+/// Constructor delta for the native writer: `generated_by` references a
+/// model entity. The occurrence takes its id and the fragment that builds
+/// it, so an exact model-selection fragment rides along unchanged; an
+/// importer passes the vendor model of the provider's label. A fragment
+/// that does not build the entity it names is refused.
+#[test]
+fn generated_by_references_a_model_entity() {
+    let witness_id = witness(SOURCE_CLAUDE_CODE, genid().id)
+        .unwrap()
+        .root()
+        .unwrap();
+    // A model selection: the vendor model's tag and name, and a setting.
+    let mut selection = Fragment::empty();
+    let name = selection.put::<UTF8String, _>("synthetic-model-1".to_owned());
+    selection += entity! { _ @
+        metadata::tag: &crate::schemas::blockdag::vendor_model::KIND,
+        metadata::name: name,
+        schema::fact::effort: &schema::fact::effort::HIGH,
+    };
+    let selected = Model {
+        id: selection.root().unwrap(),
+        fragment: selection.clone(),
+    };
+    let vendor = Model::vendor("synthetic-model-1").unwrap();
+    assert_eq!(
+        vendor.id,
+        crate::blockdag::vendor_model("synthetic-model-1")
+            .root()
+            .unwrap()
+    );
+    assert_ne!(selected.id, vendor.id);
+    for model in [&selected, &vendor] {
+        let built = occurrence(
+            witness_id,
+            WitnessAnnotations {
+                generated_by: vec![model.clone()],
+                ..WitnessAnnotations::default()
+            },
+        )
+        .unwrap();
+        let root = built.root().unwrap();
+        let facts = built.facts();
+        let named: Vec<Id> = find!(
+            model: Id,
+            pattern!(facts, [{ root @ schema::witness::generated_by: ?model }])
+        )
+        .collect();
+        assert_eq!(named, vec![model.id]);
+        // The model's own tribles ride along, exactly.
+        let mut union = facts.clone();
+        union += model.fragment.facts().clone();
+        assert_eq!(union.len(), facts.len());
+        assert_eq!(built.exports().collect::<Vec<_>>(), vec![root]);
+    }
+    // Two models are two occurrences.
+    let of = |model: &Model| {
+        occurrence(
+            witness_id,
+            WitnessAnnotations {
+                generated_by: vec![model.clone()],
+                ..WitnessAnnotations::default()
+            },
+        )
+        .unwrap()
+        .root()
+    };
+    assert_ne!(of(&selected), of(&vendor));
+    // A fragment that does not build the entity it names.
+    let dangling = Model {
+        id: genid().id,
+        fragment: selection,
+    };
+    assert!(occurrence(
+        witness_id,
+        WitnessAnnotations {
+            generated_by: vec![dangling.clone()],
+            ..WitnessAnnotations::default()
+        },
+    )
+    .is_err());
+    // A gloss names its model by the same path.
+    let node = chain(vec![text(direction::OUT, "x")]).nodes[0];
+    let g = gloss(node, category::RECAP, "summary").unwrap();
+    let gloss_id = g.root().unwrap();
+    let annotated = annotate_gloss(gloss_id, &selected).unwrap();
+    let facts = annotated.facts();
+    let wrote: Vec<Id> = find!(
+        model: Id,
+        pattern!(facts, [{ gloss_id @ schema::gloss::generated_by: ?model }])
+    )
+    .collect();
+    assert_eq!(wrote, vec![selected.id]);
+    assert!(annotate_gloss(gloss_id, &dangling).is_err());
 }
 
 #[test]
@@ -500,7 +632,7 @@ fn senses_glosses_and_vocabulary_are_intrinsic() {
     let a = gloss(node, category::REASONING_SUMMARY, "summary").unwrap();
     let mut b = gloss(node, category::REASONING_SUMMARY, "summary").unwrap();
     let root = b.root().unwrap();
-    b += annotate_gloss(root, "synthetic-summarizer").unwrap();
+    b += annotate_gloss(root, &Model::vendor("synthetic-summarizer").unwrap()).unwrap();
     assert_eq!(a.root(), b.root());
     assert_ne!(
         gloss(node, category::RECAP, "summary").unwrap().root(),

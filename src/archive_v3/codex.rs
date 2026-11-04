@@ -120,7 +120,14 @@ pub fn import(source: &[u8]) -> Result<Fragment, Failure> {
         record.str_at("type") == Some("event_msg")
             && record.str_at("payload.type") == Some("task_started")
     });
-    let mut builder = Builder::new(phases, marked_turns)?;
+    // X18': every client that wrote or resumed the unit, by its version.
+    let unrecorded = Unrecorded::of_clients(
+        records
+            .iter()
+            .filter(|record| record.str_at("type") == Some("session_meta"))
+            .map(|record| record.str_at("payload.cli_version")),
+    );
+    let mut builder = Builder::new(phases, marked_turns, unrecorded)?;
     for (at, record) in records.iter().enumerate() {
         builder.record(at, record)?;
     }
@@ -477,6 +484,108 @@ impl Budget {
     }
 }
 
+/// X18': the budgets a client may have cut a tool output under where its
+/// rollout records none. Clients 0.51 to 0.77 and 0.133 on truncate her
+/// history without recording the budget, so where an output exceeds the
+/// smallest budget its client's generation could have run under, the
+/// window she saw is unknown and the unit fails (Open). Within it, every
+/// such budget leaves the output whole.
+///
+/// - Before 0.51 the history keeps what it is given (codex-rs 0.50.0
+///   core/src/conversation_history.rs, `record_items`): the recorded
+///   output is what she saw.
+/// - 0.51 to 0.58 cut a text at 10 KiB or 256 lines
+///   (`format_output_for_model_body`, `MODEL_FORMAT_MAX_BYTES`,
+///   `MODEL_FORMAT_MAX_LINES`, core/src/conversation_history.rs at 0.51.0
+///   to 0.54.0, then context_manager); a list's text parts each so at 0.51
+///   to 0.53, and together at 10 KiB at 0.54 on
+///   (`globally_truncate_function_output_items`).
+/// - 0.59 to 0.77 and 0.133 on cut under the model's policy times 1.2
+///   (`process_item`, `policy.mul(1.2)`, core/src/context_manager/
+///   history.rs at 0.59.0 to 0.77.0; `record_items`, `policy * 1.2`, at
+///   0.133.0 to 0.160.0). The smallest documented policy is Bytes(10_000)
+///   (core/src/model_family.rs at 0.77.0; models-manager models.json at
+///   0.133.0, 0.140.0 and 0.150.0, where every other model has
+///   Tokens(10_000)), so 12,000 bytes; the token policy is checked too. A
+///   config override (`tool_output_token_limit`) could set any smaller
+///   budget and is not recorded either; it is not modelled.
+/// - 0.78 to 0.132 record the policy on every header; one that records
+///   none is treated as the model's policy.
+/// - A version that does not parse, `0.0.0` (a source build), or no
+///   `session_meta` at all: any generation.
+#[derive(Clone, Copy, Default)]
+struct Unrecorded {
+    /// 0.51 to 0.58: 10 KiB or 256 lines.
+    fixed: bool,
+    /// 0.59 on: the model's policy, at least Bytes(12_000).
+    model: bool,
+}
+
+impl Unrecorded {
+    const FIXED_BYTES: usize = 10 * 1024;
+    const FIXED_LINES: usize = 256;
+    /// The smallest documented model policy, Bytes(10_000), with codex's
+    /// 1.2 allowance; Tokens(10_000) likewise.
+    const MODEL: [Budget; 2] = [Budget::Bytes(12_000), Budget::Tokens(12_000)];
+
+    fn of_clients<'a>(versions: impl Iterator<Item = Option<&'a str>>) -> Self {
+        let mut out = Unrecorded::default();
+        let mut any = false;
+        for version in versions {
+            any = true;
+            let minor = version.and_then(|version| {
+                let mut parts = version.split('.');
+                let major = parts.next()?.parse::<u64>().ok()?;
+                let minor = parts.next()?;
+                let digits: String = minor.chars().take_while(char::is_ascii_digit).collect();
+                let minor = digits.parse::<u64>().ok()?;
+                Some((major, minor))
+            });
+            match minor {
+                Some((0, 0)) | None => {
+                    out.fixed = true;
+                    out.model = true;
+                }
+                Some((0, minor)) if minor < 51 => {}
+                Some((0, minor)) if minor <= 58 => out.fixed = true,
+                Some(_) => out.model = true,
+            }
+        }
+        if !any {
+            out.fixed = true;
+            out.model = true;
+        }
+        out
+    }
+
+    fn fixed_cuts(text: &str) -> bool {
+        text.len() > Self::FIXED_BYTES || text.lines().count() > Self::FIXED_LINES
+    }
+
+    /// Whether some budget the unit's clients could have run under cuts
+    /// this text output.
+    fn cuts_text(self, text: &str) -> bool {
+        (self.fixed && Self::fixed_cuts(text))
+            || (self.model
+                && Self::MODEL
+                    .iter()
+                    .any(|budget| budget.truncate(text) != text))
+    }
+
+    /// Whether some such budget changes this list output.
+    fn cuts_parts(self, parts: &[Json]) -> bool {
+        let texts = || {
+            parts
+                .iter()
+                .filter(|part| part.str_at("type") == Some("input_text"))
+                .map(|part| part.str_at("text").unwrap_or_default())
+        };
+        (self.fixed
+            && (texts().any(Self::fixed_cuts) || Budget::Bytes(Self::FIXED_BYTES).shortens(parts)))
+            || (self.model && Self::MODEL.iter().any(|budget| budget.shortens(parts)))
+    }
+}
+
 /// `truncate_with_byte_estimate` (codex-rs utils/string/src/truncate.rs at
 /// rust-v0.120.0 and 0.132.0, core/src/truncate.rs at 0.78.0 to 0.114.0,
 /// the same rule), which `truncate_middle_chars` at main (71a4c070)
@@ -642,10 +751,17 @@ struct Builder {
     /// X17: whether the unit marks its turns with `task_started`. Where it
     /// marks none, a turn starts at his prompt after an item of hers.
     marked_turns: bool,
+    /// X18': the budgets an output may have been cut under where none is
+    /// recorded.
+    unrecorded: Unrecorded,
 }
 
 impl Builder {
-    fn new(phases: HashMap<usize, String>, marked_turns: bool) -> Result<Self, Failure> {
+    fn new(
+        phases: HashMap<usize, String>,
+        marked_turns: bool,
+        unrecorded: Unrecorded,
+    ) -> Result<Self, Failure> {
         use v3::fact::{absent, direction::IN, modality::*};
         let gap = |modality, kind| FactCore {
             absent: Some(kind),
@@ -694,6 +810,7 @@ impl Builder {
             budget: None,
             record_budget: None,
             marked_turns,
+            unrecorded,
         };
         builder.root = builder.root_line();
         Ok(builder)
@@ -1262,8 +1379,29 @@ impl Builder {
                 // history, preserving full rollout payloads"). The full text
                 // she never saw is the record's claim beside it.
                 let budget = self.record_budget;
+                // X18': only a response item the client recorded as it
+                // entered her history. A `compacted` replacement history is
+                // installed as it stands (`ContextManager::replace`, codex-rs
+                // core/src/context_manager/history.rs at 0.77.0, 0.132.0 and
+                // 0.140.0, truncates nothing), and a bare item predates the
+                // wrapped rollout lines 0.50.0 already writes
+                // (`RolloutItem::ResponseItem`, core/src/codex.rs), so its
+                // client cut nothing when recording (before 0.51).
+                let recorded_here = path == "{response_item}.payload";
+                let unrecorded = |cut: bool| {
+                    if recorded_here && budget.is_none() && cut {
+                        return Err(Failure::new(
+                            &at(".output"),
+                            "an output a budget her client could have run under cuts, and the \
+                             rollout records none: the truncation is unrecorded, so what her \
+                             window held is unknown (X18')",
+                        ));
+                    }
+                    Ok(())
+                };
                 match item.get("output") {
                     Some(Json::Str(text)) => {
+                        unrecorded(self.unrecorded.cuts_text(text))?;
                         let shown = match budget {
                             Some(budget) => budget.truncate(text),
                             None => text.clone(),
@@ -1279,6 +1417,7 @@ impl Builder {
                         }
                     }
                     Some(Json::Arr(parts)) => {
+                        unrecorded(self.unrecorded.cuts_parts(parts))?;
                         for part in parts {
                             match part.str_at("type") {
                                 Some("input_text") => {

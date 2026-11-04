@@ -362,8 +362,10 @@ pub struct FileWindows {
 /// serialization allowance (`with_serialization_allowance`, rounded up),
 /// or, where a record holds one, its `limit` in tokens, allowance
 /// included. A header that records no policy records no budget: none is
-/// carried into its turn, and nothing is truncated. A policy or limit that
-/// does not parse fails. A text output is cut by `truncate_text`; a list
+/// carried into its turn, and nothing is truncated, unless a budget the
+/// unit's clients could have run under unrecorded would cut the output,
+/// which then fails (X18', [`HistoryBudget::client`]). A policy or limit
+/// that does not parse fails. A text output is cut by `truncate_text`; a list
 /// output that the budget would shorten fails, since how to keep its full
 /// parts beside her window is not modeled.
 #[derive(Clone, Copy, Debug)]
@@ -376,6 +378,12 @@ pub struct HistoryBudget {
     pub limit: (&'static str, &'static str),
     /// The normalized paths of the tool outputs the budget applies to.
     pub outputs: &'static [&'static str],
+    /// X18': the records that name the client that wrote the unit (a
+    /// record-relative field and its value), and the record-relative field
+    /// holding its version. Where no budget is recorded, an output that a
+    /// budget some client of the unit's could have run under would cut is
+    /// unknown in her window, and fails.
+    pub client: ((&'static str, &'static str), &'static str),
 }
 
 /// One field path, under its conditions, and its class.
@@ -530,6 +538,11 @@ pub enum Structure {
 pub enum Decode {
     /// A string, exactly as decoded.
     Text,
+    /// A model label, as the vendor-model entity it names
+    /// (`crate::archive_v3::Model::vendor`): a claim references the
+    /// entity `{ tag: vendor-model, name: label }`, and the gate compares
+    /// that whole tuple at the reference.
+    VendorModel,
     /// A string followed by a constant text the rendering rule appends (a
     /// rendering her window held with a trailing newline).
     TextThen(&'static str),

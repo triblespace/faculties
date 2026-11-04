@@ -109,6 +109,17 @@ const LOCAL_SHELL: &[(&str, Decode)] = &[("tool_name", Decode::ConstText("local_
 const WEB_SEARCH: &[(&str, Decode)] = &[("tool_name", Decode::ConstText("web_search"))];
 const SUMMARY: Class = Class::Annotation(&[("gloss:reasoning-summary", Decode::Text)]);
 
+/// C8': an empty `input_text` part of a message. Codex records the parts
+/// it sends and forwards each one to the server (`ResponseItem::Message`
+/// content, as the rollout holds it); it renders nothing itself, and what
+/// the server renders into her window for an empty part is recorded
+/// nowhere. So the part is no machinery that provably renders nothing: the
+/// unit fails until it is known. (Empty text parts of a tool output are
+/// different: codex's own history drops them, see [`GUARDIAN_COPIES`].)
+const EMPTY_MESSAGE_PART: &str =
+    "an empty text part of a message: codex forwards it to the server, and what her window \
+     held for it is unrecorded";
+
 /// The texts a client copy must be found in.
 pub const USER_TEXTS: &[&str] = &[
     "{message}{user}.content[]{input_text}.text",
@@ -157,7 +168,13 @@ macro_rules! shown {
                 "in",
                 "payload",
                 Decode::Text,
-            ),
+            )
+            .when(&[Cond::SiblingNot("text", "")]),
+            Entry::new(
+                concat!($at, ".content[]{input_text}.text"),
+                Class::Open(EMPTY_MESSAGE_PART),
+            )
+            .when(&[Cond::Sibling("text", "")]),
             Entry::new(concat!($at, ".content[]{input_image}.type"), DISCRIMINATOR),
             Entry::fact_with(
                 concat!($at, ".content[]{input_image}.image_url"),
@@ -416,7 +433,13 @@ macro_rules! items {
                 "in",
                 "payload",
                 Decode::Text,
-            ),
+            )
+            .when(&[Cond::SiblingNot("text", "")]),
+            Entry::new(
+                concat!($p, "{agent_message}.content[]{input_text}.text"),
+                Class::Open(EMPTY_MESSAGE_PART),
+            )
+            .when(&[Cond::Sibling("text", "")]),
             Entry::new(
                 concat!($p, "{agent_message}.content[]{encrypted_content}.type"),
                 DISCRIMINATOR,
@@ -1006,6 +1029,9 @@ const SESSION_META: &[Entry] = &[
         .when(&[Cond::Scalar("payload.source")]),
     Entry::new("{session_meta}.payload.cwd", Class::Drop(ENVELOPE)),
     Entry::new("{session_meta}.payload.originator", Class::Drop(ENVELOPE)),
+    // Machinery, which also names the client's generation: where no budget
+    // is recorded, the budgets it may have truncated her history under
+    // (X18', the table's `HistoryBudget::client`).
     Entry::new("{session_meta}.payload.cli_version", Class::Drop(ENVELOPE)),
     Entry::new(
         "{session_meta}.payload.model_provider",
@@ -1790,6 +1816,7 @@ pub const TABLE: FieldTable = FieldTable {
                 "{response_item}.payload{function_call_output}.output",
                 "{response_item}.payload{custom_tool_call_output}.output",
             ],
+            client: (("type", "session_meta"), "payload.cli_version"),
         }),
     }),
     windows: Windows::NONE,

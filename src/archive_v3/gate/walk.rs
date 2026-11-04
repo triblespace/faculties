@@ -245,6 +245,17 @@ fn annotation_token(attribute: &str, value: Value) -> Token {
     }
 }
 
+/// The tuple of the vendor-model entity a model label names, as the
+/// constructor builds it: its kind tag and its name, sorted.
+fn vendor_model(label: &str) -> Vec<Token> {
+    let mut pairs = vec![
+        tag("vendor-model"),
+        annotation_token("name", Value::Text(label.to_owned())),
+    ];
+    pairs.sort();
+    pairs
+}
+
 fn entity_token(reached_as: &str, mut pairs: Vec<Token>) -> Token {
     pairs.sort();
     annotation_token(reached_as, Value::Tuple(pairs))
@@ -317,6 +328,23 @@ pub fn named_entities(walked: &Walked) -> BTreeMap<Token, usize> {
     }
     let mut entities = Entities::new();
     for token in walked.tokens.keys() {
+        // A model claim references its entity by the whole tuple; the
+        // entity itself is the one its name implies.
+        if let Value::Tuple(pairs) = &token.value {
+            let model = token.attribute == "generated_by"
+                || (token.attribute.starts_with("gloss:")
+                    && token.attribute.ends_with(":generated_by"));
+            if model {
+                for pair in pairs {
+                    if let (true, Value::Text(name)) = (pair.attribute == "name", &pair.value) {
+                        if *pairs == vendor_model(name) {
+                            add(&mut entities, "vendor-model", name);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         let Value::Text(name) = &token.value else {
             continue;
         };
@@ -332,13 +360,6 @@ pub fn named_entities(walked: &Walked) -> BTreeMap<Token, usize> {
                 add(&mut entities, "media-type", name)
                     .insert(annotation_token("essence", Value::Text(essence.clone())));
                 add(&mut entities, "media-type", &essence);
-            }
-            attribute
-                if attribute == "generated_by"
-                    || (attribute.starts_with("gloss:")
-                        && attribute.ends_with(":generated_by")) =>
-            {
-                add(&mut entities, "vendor-model", name);
             }
             _ => {}
         }
@@ -1203,7 +1224,15 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         earlier_paths: HashMap::new(),
         budget: None,
         record_budget: None,
+        unrecorded: (false, false),
     };
+    if let Order::File(FileWindows {
+        budget: Some(budget),
+        ..
+    }) = table.order
+    {
+        walker.unrecorded = unrecorded_generations(&budget, table.jsonl, source);
+    }
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
         if let Class::Supply(supply) = entry.class {
@@ -1666,6 +1695,9 @@ struct Walker<'t> {
     /// limit)`.
     budget: Option<(bool, usize)>,
     record_budget: Option<(bool, usize)>,
+    /// X18': the generations of the unit's clients whose unrecorded budgets
+    /// may have cut an output: (0.51 to 0.58, 0.59 on).
+    unrecorded: (bool, bool),
 }
 
 /// Every path the table names, and every prefix of one that ends before a
@@ -1807,6 +1839,7 @@ fn decode_applies(decode: Decode, value: &J) -> bool {
     match decode {
         Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
         Decode::Text
+        | Decode::VendorModel
         | Decode::TextThen(_)
         | Decode::Base64
         | Decode::Base64Url
@@ -1938,6 +1971,24 @@ impl<'t> Walker<'t> {
                     }
                     _ => {}
                 }
+            }
+        }
+        // X18': no budget recorded, and one her client could have run under
+        // cuts the output: what her window held is unknown.
+        if let (
+            Order::File(FileWindows {
+                budget: Some(budget),
+                ..
+            }),
+            None,
+        ) = (self.table.order, self.record_budget)
+        {
+            if ctx.record.is_some()
+                && budget.outputs.contains(&path)
+                && unrecorded_cut(self.unrecorded, value)
+            {
+                self.row(path, Kind::Open, &ctx);
+                return;
             }
         }
         if let (Some(field), Some(record)) = (self.supply_paths.get(path), ctx.record) {
@@ -3403,6 +3454,9 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
         // `""` is never stored: it is no value.
         (Decode::Text, J::Str(text)) if text.is_empty() => Ok(Vec::new()),
         (Decode::Text, J::Str(text)) => one(Value::Text(text.clone())),
+        // A model label: the vendor-model entity it names, as its tuple.
+        (Decode::VendorModel, J::Str(label)) if label.is_empty() => Ok(Vec::new()),
+        (Decode::VendorModel, J::Str(label)) => one(Value::Tuple(vendor_model(label))),
         // What an empty rendering became is unverified: never a value.
         (Decode::TextThen(_), J::Str(text)) if text.is_empty() => Err(Failure::Decode),
         (Decode::TextThen(then), J::Str(text)) => one(Value::Text(format!("{text}{then}"))),
@@ -3696,6 +3750,84 @@ fn copy_form(form: CopyForm, value: &J) -> Option<J> {
             );
             Some(J::Obj(copy))
         }
+    }
+}
+
+/// X18': which client generations of the unit may have cut an output under
+/// a budget no record holds: `(fixed, model)`. Codex 0.51 to 0.58 cut at
+/// 10 KiB or 256 lines (codex-rs core/src/conversation_history.rs at 0.51.0,
+/// `format_output_for_model_body`; lists at 10 KiB together from 0.54.0,
+/// `globally_truncate_function_output_items`); 0.59 on cut under the
+/// model's policy times 1.2, whose smallest documented value is
+/// Bytes(10_000) (core/src/model_family.rs at 0.77.0, models-manager
+/// models.json at 0.133.0 to 0.150.0). Before 0.51 nothing is cut when the
+/// history records it. A version that does not parse, `0.0.0` (a source
+/// build), or a unit that names no client: both.
+fn unrecorded_generations(budget: &HistoryBudget, jsonl: bool, source: &[u8]) -> (bool, bool) {
+    let ((kind_field, kind), version_field) = budget.client;
+    let mut out = (false, false);
+    let mut named = false;
+    let lines: Vec<&[u8]> = if jsonl {
+        source.split(|byte| *byte == b'\n').collect()
+    } else {
+        vec![source]
+    };
+    for bytes in lines {
+        let Ok(record) = Parser::document(bytes) else {
+            continue;
+        };
+        if !matches!(field_at(&record, kind_field), Some(J::Str(k)) if k == kind) {
+            continue;
+        }
+        named = true;
+        let version = match field_at(&record, version_field) {
+            Some(J::Str(version)) => {
+                let mut parts = version.split('.');
+                let major = parts.next().and_then(|p| p.parse::<u64>().ok());
+                let minor = parts.next().and_then(|p| {
+                    let digits: String = p.chars().take_while(char::is_ascii_digit).collect();
+                    digits.parse::<u64>().ok()
+                });
+                major.zip(minor)
+            }
+            _ => None,
+        };
+        match version {
+            Some((0, 0)) | None => out = (true, true),
+            Some((0, minor)) if minor < 51 => {}
+            Some((0, minor)) if minor <= 58 => out.0 = true,
+            Some(_) => out.1 = true,
+        }
+    }
+    if !named {
+        out = (true, true);
+    }
+    out
+}
+
+/// X18': whether a budget of these generations cuts this output: 10 KiB or
+/// 256 lines of a text, or of any text part, or 10 KiB of a list's text
+/// parts together (0.51 to 0.58); Bytes(12_000) or Tokens(12_000) (0.59
+/// on).
+fn unrecorded_cut((fixed, model): (bool, bool), value: &J) -> bool {
+    const FIXED_BYTES: usize = 10 * 1024;
+    let fixed_cut = |text: &str| text.len() > FIXED_BYTES || text.lines().count() > 256;
+    let model_cut = |text: &str| {
+        shortened_text(text, false, 12_000) != text || shortened_text(text, true, 12_000) != text
+    };
+    match value {
+        J::Str(text) => (fixed && fixed_cut(text)) || (model && model_cut(text)),
+        J::Arr(parts) => {
+            let fixed_parts = parts.iter().any(|part| {
+                member(part, "type") == Some("input_text")
+                    && fixed_cut(member(part, "text").unwrap_or_default())
+            });
+            (fixed && (fixed_parts || shortens_parts(parts, false, FIXED_BYTES)))
+                || (model
+                    && (shortens_parts(parts, false, 12_000)
+                        || shortens_parts(parts, true, 12_000)))
+        }
+        _ => false,
     }
 }
 

@@ -71,7 +71,7 @@ use self::json::Json;
 use crate::archive_v3::fields::claude_code::{SUMMARIZED_THINKING, TABLE};
 use crate::archive_v3::{
     annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
-    MediaType, NodeAnnotations, WitnessAnnotations,
+    MediaType, Model, NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -268,6 +268,9 @@ struct Item {
     /// harness text (`isMeta`) nor a compaction summary, outside any tool
     /// result (R1'').
     prompt: bool,
+    /// [`Item::prompt`], and the record's content is the plain string, not
+    /// blocks (R1'''): the one shape every real beside-mark follows.
+    plain_prompt: bool,
     /// The head whose part this is.
     part_of: Option<usize>,
     record: Option<usize>,
@@ -606,6 +609,7 @@ impl Builder {
             call,
             text,
             prompt: false,
+            plain_prompt: false,
             part_of: None,
             record,
             original: None,
@@ -805,9 +809,16 @@ impl Builder {
             "assistant" => {
                 claims.raw_role = record.str_at("message.role").map(str::to_owned);
                 let model = record.str_at("message.model").map(str::to_owned);
+                // The vendor model the provider's label names: an entity
+                // the claim references.
                 if let Some(model) = &model {
                     if model != "<synthetic>" {
-                        claims.generated_by.push(model.clone());
+                        claims.generated_by.push(Model::vendor(model).map_err(|_| {
+                            Failure::new(
+                                "{assistant}.message{message}.model",
+                                "a model entity does not build",
+                            )
+                        })?);
                     }
                 }
                 claims.raw_model = model;
@@ -995,9 +1006,11 @@ impl Builder {
         // His typed prompt: the record's own text, unless it is harness text
         // or a compaction summary (R1'').
         let typed = !record.is_true("isMeta") && !record.is_true("isCompactSummary");
+        let plain = matches!(record.at("message.content"), Some(Json::Str(_)));
         for &item in &items {
             let item = &mut self.items[item];
             item.prompt = typed && item.text && !item.head && item.part_of.is_none();
+            item.plain_prompt = item.prompt && plain;
         }
         // Correlators: the record that holds the call this result answers,
         // and the call a harness message follows.
@@ -1305,9 +1318,13 @@ impl Builder {
                     // An empty token holds nothing (C8): her thinking
                     // happened and its body is unknown, a body gap as
                     // Codex's empty token is (X12), never a 0-byte blob.
+                    // The gap keeps its block kind, the sealed media type
+                    // of a thinking or a redacted thinking block (C8'):
+                    // the two are different blocks in her window.
                     let sealed = match block.get(field) {
                         Some(Json::Str(token)) if token.is_empty() => FactCore {
                             absent: Some(v3::fact::absent::BODY),
+                            media_type: Some(sealed_type(spelling)),
                             ..core(THINKING, OUT)
                         },
                         token => FactCore {
@@ -1638,7 +1655,8 @@ impl Builder {
 
     /// R1: the place before a `renderedBesideToolResult` rendering, past
     /// the renderings of the attachments before it, holds his typed prompt
-    /// (R1''). Beside a result, between a call and its result (R1'), after
+    /// (R1''), written as a plain string (R1''': every real mark in the
+    /// round-6 sample follows one; a prompt of blocks fails). Beside a result, between a call and its result (R1'), after
     /// a span of unknown items, or after anything else (her text, harness
     /// text, a compaction summary, the start of her message), the
     /// rendering is not built. Of the 727 marks in the live transcripts
@@ -1674,8 +1692,17 @@ impl Builder {
                     "rendered after a span of unknown items: whether a tool result is beside it is unknown",
                 ));
             }
-            if item.prompt {
+            if item.plain_prompt {
                 return Ok(());
+            }
+            // R1''': every real mark follows a prompt written as a plain
+            // string; one of blocks (an image beside his text, a result
+            // before it) is unverified.
+            if item.prompt {
+                return Err(Failure::new(
+                    path,
+                    "rendered after a prompt of blocks: every real mark follows a plain string prompt; not built",
+                ));
             }
             // Real marks do follow harness text and compaction summaries,
             // but what her window held there is unverified.

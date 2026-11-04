@@ -61,7 +61,9 @@ pub(crate) fn unexported(fragment: Fragment) -> Fragment {
 pub struct FactCore {
     pub modality: Option<Id>,
     pub direction: Option<Id>,
-    /// The exact decoded text. Never `""`.
+    /// The exact decoded text. `Some("")` is an empty text that reached her
+    /// window: the fact holds the empty blob. That differs from a gap
+    /// (`absent`: its content unknown) and from `None` (no text rendered).
     pub payload: Option<String>,
     /// Resident bytes.
     pub blob: Option<anybytes::Bytes>,
@@ -96,9 +98,6 @@ pub fn fact(core: FactCore) -> Result<Fragment> {
         && core.absent != Some(schema::fact::absent::SPAN)
     {
         bail!("only a span gap may leave its modality or direction unknown");
-    }
-    if core.payload.as_deref() == Some("") {
-        bail!("an empty payload is never stored");
     }
     let structure = match core.structure {
         Some(tree) => {
@@ -214,13 +213,44 @@ pub fn witness(source_namespace: Id, node: Id) -> Result<Fragment> {
     attach_kind(fragment, schema::witness::KIND, "witness")
 }
 
+/// The model a `generated_by` claim names: the id of a model entity and the
+/// fragment that builds it, which rides along with the claim. A caller
+/// passes an exact model-selection fragment, or the vendor model the
+/// provider's label names ([`Model::vendor`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Model {
+    pub id: Id,
+    /// Builds the entity `id`: it exports `id`.
+    pub fragment: Fragment,
+}
+
+impl Model {
+    /// The vendor-model entity `{ tag: vendor_model::KIND, name: label }`
+    /// for a model label exactly as the provider spells it.
+    pub fn vendor(label: &str) -> Result<Model> {
+        let fragment = blockdag::vendor_model(label);
+        let id = rooted(&fragment, "vendor model")?;
+        Ok(Model { id, fragment })
+    }
+
+    /// Its fragment, exporting nothing, after checking that it builds the
+    /// entity the claim names.
+    fn annotation(&self) -> Result<Fragment> {
+        if !self.fragment.exports().any(|exported| exported == self.id) {
+            bail!("a model's fragment must export the model entity it names");
+        }
+        Ok(unexported(self.fragment.clone()))
+    }
+}
+
 /// One source record's claims about a witnessed node: the core of one
 /// [`occurrence`].
 #[derive(Clone, Debug, Default)]
 pub struct WitnessAnnotations {
-    /// Model labels, exactly as the source spells them, of the model that
-    /// sampled the node. Empty for anything she perceived.
-    pub generated_by: Vec<String>,
+    /// The model entities that sampled the node (an importer passes the
+    /// vendor model of the provider's label). Empty for anything she
+    /// perceived.
+    pub generated_by: Vec<Model>,
     pub raw_model: Option<String>,
     pub raw_role: Option<String>,
     /// Who wrote what the node holds, as the source spells it.
@@ -254,8 +284,8 @@ pub struct WitnessAnnotations {
 
 /// One occurrence of `witness`: the claims of one source record, rooted at an
 /// id derived from the witness and the record's own claims, so two records'
-/// claims never mix. The vendor-model and media-type entities they point at
-/// ride along.
+/// claims never mix. The model and media-type entities they point at ride
+/// along.
 ///
 /// Why a sampling or turn ended (`ends`, `turn_ends`) is often known only
 /// from a later record: an interrupt notice, an aborted turn, an erred
@@ -266,10 +296,9 @@ pub struct WitnessAnnotations {
 pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragment> {
     let mut fragment = Fragment::empty();
     let mut generated_by = Vec::new();
-    for label in &annotations.generated_by {
-        let model = blockdag::vendor_model(label);
-        generated_by.push(rooted(&model, "vendor model")?);
-        fragment += unexported(model);
+    for model in &annotations.generated_by {
+        fragment += model.annotation()?;
+        generated_by.push(model.id);
     }
     let claimed_media_type = match &annotations.claimed_media_type {
         Some(media_type) => {
@@ -380,7 +409,8 @@ pub fn ends_disagree(occurrences: &[(Id, WitnessAnnotations)]) -> bool {
             turn_ends: _,
             ends: _,
         } = a;
-        set(generated_by) == set(&b.generated_by)
+        set(generated_by.iter().map(|model| model.id))
+            == set(b.generated_by.iter().map(|model| model.id))
             && *raw_model == b.raw_model
             && *raw_role == b.raw_role
             && set(raw_author) == set(&b.raw_author)
@@ -454,13 +484,12 @@ pub fn gloss_part(describes: Id, category: Id, part: u64, text: &str) -> Result<
     attach_kind(fragment, schema::gloss::KIND, "gloss")
 }
 
-/// The model that wrote `gloss`, as an annotation fragment exporting nothing.
-pub fn annotate_gloss(gloss: Id, generated_by: &str) -> Result<Fragment> {
-    let model = blockdag::vendor_model(generated_by);
-    let model_id = rooted(&model, "vendor model")?;
-    let mut fragment = unexported(model);
+/// The model that wrote `gloss`, as an annotation fragment exporting
+/// nothing: the same model entity path as an occurrence's `generated_by`.
+pub fn annotate_gloss(gloss: Id, generated_by: &Model) -> Result<Fragment> {
+    let mut fragment = generated_by.annotation()?;
     fragment += unexported(entity! { ExclusiveId::force_ref(&gloss) @
-        schema::gloss::generated_by: &model_id,
+        schema::gloss::generated_by: &generated_by.id,
     });
     Ok(fragment)
 }

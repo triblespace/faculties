@@ -852,7 +852,10 @@ const ASSISTANT_FIELDS: &[Entry] = &[
     ),
     Entry::new(
         "{assistant}.message{message}.model",
-        Class::Annotation(&[("raw_model", Decode::Text), ("generated_by", Decode::Text)]),
+        Class::Annotation(&[
+            ("raw_model", Decode::Text),
+            ("generated_by", Decode::VendorModel),
+        ]),
     )
     .when(SAMPLED),
     Entry::new(
@@ -986,9 +989,11 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         "{assistant}.message{message}.content[]{thinking}.type",
         Class::Structure(Structure::Discriminator),
     ),
-    // An empty token holds nothing (C8): its empty drop, and the thinking
-    // is a body gap ([`EMPTY_SEALED_THINKING`]), as Codex's empty token is
-    // (X12). The same holds for redacted thinking's `data`.
+    // An empty token holds nothing (C8): the thinking is a body gap
+    // ([`EMPTY_SEALED_THINKING`]), as Codex's empty token is (X12). The gap
+    // keeps its block kind as the sealed media type of the block (C8'), so
+    // an empty thinking block and an empty redacted one stay two different
+    // blocks. The same holds for redacted thinking's `data`.
     Entry::fact_with(
         "{assistant}.message{message}.content[]{thinking}.signature",
         "thinking",
@@ -998,10 +1003,14 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         SIGNATURE,
     )
     .when(&[Cond::SiblingNot("signature", "")]),
-    Entry::new(
+    Entry::fact(
         "{assistant}.message{message}.content[]{thinking}.signature",
-        Class::Drop(DropReason::Empty),
-    ),
+        "thinking",
+        "out",
+        "media_type",
+        Decode::ConstText(sealed::ANTHROPIC_THINKING_SIGNATURE),
+    )
+    .when(&[Cond::Sibling("signature", "")]),
     Entry::new(
         "{assistant}.message{message}.content[]{redacted_thinking}.type",
         Class::Structure(Structure::Discriminator),
@@ -1015,10 +1024,14 @@ const ASSISTANT_FIELDS: &[Entry] = &[
         REDACTED,
     )
     .when(&[Cond::SiblingNot("data", "")]),
-    Entry::new(
+    Entry::fact(
         "{assistant}.message{message}.content[]{redacted_thinking}.data",
-        Class::Drop(DropReason::Empty),
-    ),
+        "thinking",
+        "out",
+        "media_type",
+        Decode::ConstText(sealed::ANTHROPIC_REDACTED_THINKING),
+    )
+    .when(&[Cond::Sibling("data", "")]),
     Entry::new(
         "{assistant}.message{message}.content[]{tool_use}.type",
         Class::Structure(Structure::Discriminator),

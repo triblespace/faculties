@@ -3086,3 +3086,509 @@ fn r5l_cx_output_parts() {
     assert_eq!(r5_outcome(&build(json!([t("")]))), "imported gate=true");
     assert_eq!(r5_outcome(&build(json!([]))), "imported gate=true");
 }
+
+// ---------------------------------------------------------------------------
+// The round-6 losslessness review's fixtures, as permanent tests (round 6b).
+
+/// Whether the gate passes `source` against the import of `other`.
+fn r6_cross(source: &str, other: &str) -> bool {
+    gate(source, &import_ok(other)).passed()
+}
+
+fn r6_window_before(imported: &Imported, text: &str) -> String {
+    let done = witnessed_saying(imported, text);
+    let mut v = vec![];
+    let mut cur = previous(imported, done);
+    while let Some(n) = cur {
+        v.push(r5_label(imported, n));
+        cur = previous(imported, n);
+    }
+    v.reverse();
+    v.join(" , ")
+}
+
+/// The prefixes of `records` that import and add tribles the full import
+/// does not hold; the full import must pass the gate.
+fn r6_prefixes_adding(records: &[Value]) -> Vec<usize> {
+    let full = jsonl(records);
+    let live = passes(&full);
+    (1..records.len())
+        .filter(|&k| {
+            import(jsonl(&records[..k]).as_bytes())
+                .is_ok_and(|fragment| fragment.facts().difference(live.fragment.facts()).len() > 0)
+        })
+        .collect()
+}
+
+/// One tool output under a header that records no budget, written by a
+/// client of `version` (`None`: a `session_meta` without `cli_version`).
+fn x18p_source(version: Option<&str>, model: &str, output: Value) -> String {
+    let mut meta = json!({"id": "77777777-7777-4777-8777-777777777777", "timestamp": stamp(0),
+        "cwd": "/synthetic", "originator": "codex_cli_rs",
+        "model_provider": "openai", "base_instructions": {"text": "Sys."}});
+    if let Some(version) = version {
+        meta["cli_version"] = json!(version);
+    }
+    jsonl(&[
+        line(0, "session_meta", meta),
+        line(
+            1,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t1"}),
+        ),
+        line(
+            1,
+            "turn_context",
+            json!({"model": model, "effort": "high", "summary": "auto", "turn_id": "t1"}),
+        ),
+        rv_user(2, "Go."),
+        line(
+            3,
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "exec", "input": "ls", "call_id": "o1"}),
+        ),
+        line(
+            4,
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "o1", "output": output}),
+        ),
+        rv_said(5, "Done.", Some("final_answer")),
+    ])
+}
+
+/// X18': where no budget is recorded, the window she saw is unknown for an
+/// output that any budget her client could have run under would cut. Codex
+/// 0.51 to 0.58 cut at 10 KiB or 256 lines (`MODEL_FORMAT_MAX_BYTES`,
+/// `MODEL_FORMAT_MAX_LINES`); 0.59 to 0.77 and 0.133 on cut under the
+/// model's policy times 1.2, whose smallest documented value is
+/// Bytes(10_000), so 12,000 bytes. Such an output fails the unit as Open,
+/// at the importer and in the gate's walk, and never reaches her window
+/// whole (r6l_cx_unrecorded_budget). Outputs within that bound, and clients
+/// before 0.51 (which cut nothing when recording), are unaffected.
+#[test]
+fn r6l_cx_unrecorded_budget() {
+    let path = "{response_item}.payload{custom_tool_call_output}.output";
+    let open = |source: &str| {
+        let failure = refused(source);
+        assert_eq!(failure.path, path, "{}", failure.reason);
+        assert!(failure.reason.contains("unrecorded"), "{}", failure.reason);
+        assert!(
+            walk_rows(source).contains(&(path.to_owned(), Kind::Open)),
+            "the gate's walk lets the output through"
+        );
+    };
+    let whole = |source: &str, n: usize| {
+        let imported = passes(source);
+        assert_eq!(nodes_saying(&imported, &"x".repeat(n)).len(), 1);
+        assert!(untruncated(&imported).is_empty());
+    };
+    let x = |n: usize| json!("x".repeat(n));
+    // The reviewer's four: each over its generation's smallest budget.
+    for (version, model, n) in [
+        ("0.140.0", "gpt-5.2", 13_000usize),
+        ("0.140.0", "gpt-5.5", 50_000),
+        ("0.70.0", "gpt-5", 13_000),
+        ("0.55.0", "gpt-5", 11_000),
+    ] {
+        open(&x18p_source(Some(version), model, x(n)));
+    }
+    // At the bound: unaffected.
+    whole(&x18p_source(Some("0.140.0"), "gpt-5.5", x(12_000)), 12_000);
+    whole(&x18p_source(Some("0.70.0"), "gpt-5", x(12_000)), 12_000);
+    whole(&x18p_source(Some("0.55.0"), "gpt-5", x(10_240)), 10_240);
+    // 0.51 to 0.58 also cut by lines.
+    let lines = "x\n".repeat(257);
+    open(&x18p_source(Some("0.55.0"), "gpt-5", json!(lines)));
+    let lines = "x\n".repeat(256);
+    passes(&x18p_source(Some("0.55.0"), "gpt-5", json!(lines)));
+    passes(&x18p_source(
+        Some("0.140.0"),
+        "gpt-5",
+        json!("x\n".repeat(300)),
+    ));
+    // Before 0.51 the recorded output is what she saw.
+    whole(&x18p_source(Some("0.50.0"), "gpt-5", x(50_000)), 50_000);
+    // An unknown client: any generation's bound.
+    open(&x18p_source(None, "gpt-5", x(11_000)));
+    open(&x18p_source(Some("0.0.0"), "gpt-5", x(11_000)));
+    open(&x18p_source(Some("not a version"), "gpt-5", x(11_000)));
+    // A list output over the bound.
+    let parts = json!([{"type": "input_text", "text": "x".repeat(13_000)}]);
+    open(&x18p_source(Some("0.140.0"), "gpt-5.5", parts));
+    let parts = json!([{"type": "input_text", "text": "x".repeat(100)}]);
+    passes(&x18p_source(Some("0.140.0"), "gpt-5.5", parts));
+    // A bare item predates the wrapped lines 0.50 writes: its client cut
+    // nothing when recording.
+    let long = "x".repeat(50_000);
+    let bare = jsonl(&[
+        json!({"id": "11111111-1111-4111-8111-111111111111", "timestamp": "2025-07-07T20:00:00.000Z"}),
+        json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "List the files."}]}),
+        json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "call_1"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": long}),
+        json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}]}),
+    ]);
+    let imported = passes(&bare);
+    assert_eq!(nodes_saying(&imported, &long).len(), 1);
+}
+
+/// X18: two full outputs with the same truncated window differ only in
+/// the `untruncated` claim beside it, and the gate tells them apart.
+#[test]
+fn r6l_cx_untruncated_distinguishes() {
+    let build = |output: &str| {
+        let mut r = vec![rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys.")];
+        r.push(line(
+            1,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t1"}),
+        ));
+        r.push(line(
+            1,
+            "turn_context",
+            json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": "t1",
+                "truncation_policy": {"mode": "bytes", "limit": 10}}),
+        ));
+        r.push(rv_user(2, "Go."));
+        r.push(line(
+            3,
+            "response_item",
+            json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "o1"}),
+        ));
+        r.push(line(
+            4,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "o1", "output": output}),
+        ));
+        r.push(rv_said(5, "Done.", Some("final_answer")));
+        r
+    };
+    let a = jsonl(&build("xxxxxxAxxxxxx"));
+    let b = jsonl(&build("xxxxxxBxxxxxx"));
+    let ia = passes(&a);
+    assert_eq!(
+        r6_window_before(&ia, "Done."),
+        "<header> , \"Sys.\" , <other> , \"Go.\" , [shell] , <other> , \
+         \"xxxxxx\u{2026}1 chars truncated\u{2026}xxxxxx\""
+    );
+    assert_eq!(untruncated(&ia), vec!["xxxxxxAxxxxxx".to_owned()]);
+    assert!(r5_differ(&a, &b));
+    assert!(!r6_cross(&b, &a));
+    assert!(r6_prefixes_adding(&build("xxxxxxAxxxxxx")).is_empty());
+    let c = jsonl(&build("aaaaa\u{e9}\u{e9}bbbbb"));
+    let ic = passes(&c);
+    assert!(
+        r6_window_before(&ic, "Done.").ends_with("\"aaaaa\u{2026}2 chars truncated\u{2026}bbbbb\"")
+    );
+}
+
+/// X17 beyond the permanent test: in a rollout without `task_started`, an
+/// abort after her reasoning or her call ends that item, and no prefix
+/// adds anything.
+#[test]
+fn r6l_cx_x17_more() {
+    let prompt = |s: u32, text: &str| {
+        [
+            rv_user(s, text),
+            line(
+                s,
+                "event_msg",
+                json!({"type": "user_message", "message": text, "images": []}),
+            ),
+        ]
+    };
+    let aborted = |s: u32| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "turn_aborted", "reason": "interrupted"}),
+        )
+    };
+    let head = || {
+        vec![
+            rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys."),
+            line(
+                1,
+                "turn_context",
+                json!({"model": "gpt-5", "effort": "high", "summary": "auto"}),
+            ),
+        ]
+    };
+    let mut r = head();
+    r.extend(prompt(2, "P1."));
+    r.push(rv_said(3, "R1.", None));
+    r.extend(prompt(4, "P2."));
+    r.push(line(
+        5,
+        "response_item",
+        json!({"type": "reasoning", "summary": [], "content": null, "encrypted_content": REASONING}),
+    ));
+    r.push(aborted(6));
+    r.extend(prompt(7, "P3."));
+    r.push(rv_said(8, "R3.", None));
+    let i = passes(&jsonl(&r));
+    assert_eq!(
+        r5_claims(&i),
+        "ends:interrupted@<blob 23B> turn_ends:interrupted@<blob 23B>"
+    );
+    assert!(r6_prefixes_adding(&r).is_empty());
+    let mut r = head();
+    r.extend(prompt(2, "P1."));
+    r.push(rv_said(3, "R1.", None));
+    r.extend(prompt(4, "P2."));
+    r.push(line(
+        5,
+        "response_item",
+        json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c1"}),
+    ));
+    r.push(aborted(6));
+    r.extend(prompt(7, "P3."));
+    r.push(rv_said(8, "R3.", None));
+    let i = passes(&jsonl(&r));
+    assert_eq!(
+        r5_claims(&i),
+        "ends:interrupted@[shell] turn_ends:interrupted@[shell]"
+    );
+    let mut r = head();
+    r.extend(prompt(2, "P1."));
+    r.push(rv_said(3, "R1.", None));
+    r.extend(prompt(4, "P2."));
+    r.push(aborted(5));
+    r.extend(prompt(6, "P3."));
+    r.push(rv_said(7, "R3.", None));
+    assert!(r6_prefixes_adding(&r).is_empty());
+    // A prompt held only by its event copy fails.
+    let mut r = head();
+    r.extend(prompt(2, "P1."));
+    r.push(rv_said(3, "R1.", None));
+    r.push(line(
+        4,
+        "event_msg",
+        json!({"type": "user_message", "message": "P2.", "images": []}),
+    ));
+    r.push(aborted(5));
+    r.extend(prompt(6, "P3."));
+    r.push(rv_said(7, "R3.", None));
+    assert_eq!(
+        r5_outcome(&jsonl(&r)),
+        "refused@{event_msg}.payload{user_message}.message"
+    );
+}
+
+/// X16 beyond the permanent test: the client's event copies of the parts,
+/// two reasoning items with one summary, and an unnamed part type.
+#[test]
+fn r6l_cx_x16_more() {
+    let st = |t: &str| json!({"type": "summary_text", "text": t});
+    let reasoning = |s: u32, summary: Value| {
+        line(
+            s,
+            "response_item",
+            json!({"type": "reasoning", "summary": summary, "content": null, "encrypted_content": REASONING}),
+        )
+    };
+    let ev = |s: u32, t: &str| {
+        line(
+            s,
+            "event_msg",
+            json!({"type": "agent_reasoning", "text": t}),
+        )
+    };
+    let build = |events: &[&str], summary: Value| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        for e in events {
+            r.push(ev(3, e));
+        }
+        r.push(reasoning(3, summary));
+        r.push(rv_said(4, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let two = json!([st("**One**"), st("**Two**")]);
+    for events in [
+        &["**One**", "**Two**"],
+        &["**Two**", "**One**"],
+        &["**One**", "**One**"],
+    ] {
+        assert_eq!(
+            r5_outcome(&build(events, two.clone())),
+            "imported gate=true"
+        );
+    }
+    assert_eq!(
+        r5_outcome(&build(&["**Three**"], two.clone())),
+        "refused@{event_msg}.payload{agent_reasoning}.text"
+    );
+    assert!(!r5_differ(
+        &build(&[], two.clone()),
+        &build(&["**One**", "**Two**"], two.clone())
+    ));
+    assert_eq!(
+        r5_outcome(&build(
+            &[],
+            json!([st("**One**"), {"type": "summary_image", "text": "x"}])
+        )),
+        "refused@{response_item}.payload{reasoning}.summary[]{summary_image}.text"
+    );
+    assert_eq!(
+        r5_outcome(&build(&[], json!([{"type": "summary_text", "text": 7}]))),
+        "refused@{response_item}.payload{reasoning}.summary[]{summary_text}.text"
+    );
+    let mut r = Vec::new();
+    rv_head(&mut r);
+    r.push(rv_user(2, "Q."));
+    r.push(reasoning(3, json!([st("**Same**")])));
+    r.push(line(
+        3,
+        "response_item",
+        json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "c1"}),
+    ));
+    r.push(line(
+        3,
+        "response_item",
+        json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+    ));
+    r.push(reasoning(3, json!([st("**Same**")])));
+    r.push(rv_said(4, "A.", Some("final_answer")));
+    let s = jsonl(&r);
+    let i = passes(&s);
+    assert_eq!(
+        summary_parts(&i),
+        vec![(0, "**Same**".to_owned()), (0, "**Same**".to_owned())]
+    );
+    let mut r1 = r.clone();
+    let last = r1.len() - 2;
+    r1[last] = reasoning(3, json!([]));
+    assert!(r5_differ(&s, &jsonl(&r1)));
+    assert!(!r6_cross(&jsonl(&r1), &s));
+}
+
+/// His message parts: order and count are kept. An empty `input_text`
+/// part (C8') fails as Open: codex forwards the part to the server, and
+/// what her window held for it is unknown.
+#[test]
+fn r6l_cx_user_parts() {
+    let build = |parts: &[&str]| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        let content: Vec<Value> = parts
+            .iter()
+            .map(|t| json!({"type": "input_text", "text": t}))
+            .collect();
+        r.push(line(
+            2,
+            "response_item",
+            json!({"type": "message", "role": "user", "content": content}),
+        ));
+        r.push(rv_said(3, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let abc = build(&["<env>x</env>", "<inst>y</inst>", "Prompt."]);
+    let i = passes(&abc);
+    assert_eq!(
+        r6_window_before(&i, "A."),
+        "<header> , \"Sys.\" , <other> , \"<env>x</env>\" , \"<inst>y</inst>\" , \"Prompt.\""
+    );
+    let swapped = build(&["<inst>y</inst>", "<env>x</env>", "Prompt."]);
+    assert!(r5_differ(&abc, &swapped));
+    assert!(!r6_cross(&swapped, &abc));
+    let twice = build(&["Prompt.", "Prompt."]);
+    let once = build(&["Prompt."]);
+    assert!(r5_differ(&once, &twice));
+    assert!(!r6_cross(&once, &twice));
+    let joined = build(&["<env>x</env><inst>y</inst>", "Prompt."]);
+    assert!(r5_differ(&abc, &joined));
+    assert!(!r6_cross(&joined, &abc));
+    let path = "{response_item}.payload{message}{user}.content[]{input_text}.text";
+    let empty = build(&["", "Prompt."]);
+    assert_eq!(refused(&empty).path, path);
+    assert!(walk_rows(&empty).contains(&(path.to_owned(), Kind::Open)));
+}
+
+/// Exact text of her freeform call inputs and of outputs, and outputs that
+/// hold a JSON document in a string, kept as written.
+#[test]
+fn r6l_cx_text_exact() {
+    let build = |input: &str, output: &str| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        r.push(line(
+            3,
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "apply_patch", "input": input, "call_id": "p1"}),
+        ));
+        r.push(line(
+            4,
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "p1", "output": output}),
+        ));
+        r.push(rv_said(5, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let base = build("*** Begin Patch\n*** End Patch\n", "ok");
+    passes(&base);
+    assert!(r5_differ(
+        &base,
+        &build("*** Begin Patch\n*** End Patch", "ok")
+    ));
+    assert!(r5_differ(
+        &base,
+        &build("*** Begin Patch\r\n*** End Patch\r\n", "ok")
+    ));
+    assert!(r5_differ(&build("p", "a\r\nb"), &build("p", "a\nb")));
+    assert!(r5_differ(
+        &build("p", "caf\u{e9}"),
+        &build("p", "cafe\u{301}")
+    ));
+    let j1 = build(
+        "p",
+        r#"{"output":"x","metadata":{"exit_code":0,"duration_seconds":0.1}}"#,
+    );
+    let j2 = build(
+        "p",
+        r#"{"metadata":{"exit_code":0,"duration_seconds":0.1},"output":"x"}"#,
+    );
+    let j3 = build(
+        "p",
+        r#"{"output": "x", "metadata": {"exit_code": 0, "duration_seconds": 0.1}}"#,
+    );
+    passes(&j1);
+    for other in [&j2, &j3] {
+        assert!(r5_differ(&j1, other));
+        assert!(!r6_cross(other, &j1));
+    }
+}
+
+/// The `namespace` of her function calls is kept.
+#[test]
+fn r6l_cx_call_namespace() {
+    let build = |ns: Option<&str>| {
+        let mut r = Vec::new();
+        rv_head(&mut r);
+        r.push(rv_user(2, "Q."));
+        let mut call =
+            json!({"type": "function_call", "name": "read", "arguments": "{}", "call_id": "c1"});
+        if let Some(ns) = ns {
+            call["namespace"] = json!(ns);
+        }
+        r.push(line(3, "response_item", call));
+        r.push(line(
+            4,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+        ));
+        r.push(rv_said(5, "A.", Some("final_answer")));
+        jsonl(&r)
+    };
+    let none = build(None);
+    let a = build(Some("mcp__a"));
+    let b = build(Some("mcp__b"));
+    assert_eq!(r5_outcome(&none), "imported gate=true");
+    assert_eq!(r5_outcome(&a), "imported gate=true");
+    assert!(r5_differ(&none, &a));
+    assert!(r5_differ(&a, &b));
+    assert!(!r6_cross(&b, &a));
+}
