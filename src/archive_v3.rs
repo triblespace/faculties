@@ -23,6 +23,8 @@ use triblespace::prelude::*;
 use crate::blockdag;
 use crate::schemas::archive_v3 as schema;
 
+pub mod fields;
+pub mod gate;
 pub mod media_type;
 #[cfg(test)]
 mod tests;
