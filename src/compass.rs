@@ -20,7 +20,7 @@ use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
@@ -36,8 +36,8 @@ use triblespace::prelude::*;
 
 use crate::collection_names::open_configured;
 use crate::schemas::compass::{
-    board, interval_key, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID,
-    KIND_PRIORITIZE_ID, KIND_SPECS, KIND_STATUS_ID,
+    board, DEFAULT_SCOPE_ID, KIND_DEPRIORITIZE_ID, KIND_GOAL_ID, KIND_NOTE_ID, KIND_PRIORITIZE_ID,
+    KIND_SPECS, KIND_STATUS_ID,
 };
 use crate::storage::FactArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -64,7 +64,7 @@ impl<R> CompassSnapshot<R> {
         &self.facts
     }
 
-    /// Store snapshot captured while validating this exact collection view.
+    /// Store snapshot captured with this exact collection view.
     pub fn store_snapshot(&self) -> &R {
         &self.store_snapshot
     }
@@ -187,36 +187,6 @@ fn sorted_strings(values: impl IntoIterator<Item = String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
-}
-
-fn exactly_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<T> {
-    if values.len() != 1 {
-        bail!(
-            "Compass entity {entity:x} has {} values for {field}; expected exactly one",
-            values.len()
-        );
-    }
-    Ok(values.pop().expect("one Compass value"))
-}
-
-fn at_most_one<T>(entity: Id, field: &str, mut values: Vec<T>) -> Result<Option<T>> {
-    if values.len() > 1 {
-        bail!(
-            "Compass entity {entity:x} has {} values for {field}; expected at most one",
-            values.len()
-        );
-    }
-    Ok(values.pop())
-}
-
-fn require_point(entity: Id, field: &str, value: IntervalValue) -> Result<()> {
-    let (lower, upper): (i128, i128) = value
-        .try_from_inline()
-        .map_err(|error| anyhow!("decode Compass {field} on {entity:x}: {error:?}"))?;
-    if lower != upper {
-        bail!("Compass {field} on {entity:x} must be a point interval");
-    }
-    Ok(())
 }
 
 /// Self-contained descriptions of Compass's published event kinds.
@@ -372,9 +342,9 @@ fn note_fragment_impl(
 /// [`note_fragment`], whose intrinsic roots make exact retries idempotent.
 ///
 /// Readers deliberately do not distinguish records produced here from records
-/// produced by the intrinsic constructors. The identifier substitution law is
-/// load-bearing: changing only an entity id may affect idempotence, never
-/// meaning.
+/// produced by the intrinsic constructors, and never recompute or compare an
+/// id. The identifier substitution law is load-bearing: changing only an
+/// entity id may affect idempotence, never meaning.
 pub mod replay {
     use super::*;
 
@@ -454,435 +424,18 @@ pub fn note_ids<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     .collect()
 }
 
-fn ids_of_kind<P: TriblePattern>(facts: &P, kind: Id) -> BTreeSet<Id> {
-    find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &kind }])).collect()
-}
-
-fn is_compass_kind(kind: Id) -> bool {
-    KIND_SPECS.iter().any(|(candidate, _)| *candidate == kind)
-}
-
-fn is_compass_attribute(attribute: Id) -> bool {
-    [
-        board::title.id(),
-        board::tag.id(),
-        board::parent.id(),
-        board::task.id(),
-        board::status_of.id(),
-        board::status.id(),
-        board::by.id(),
-        board::note.id(),
-        board::reference.id(),
-        board::higher.id(),
-        board::lower.id(),
-        metadata::created_at.id(),
-        metadata::supersedes.id(),
-    ]
-    .contains(&attribute)
-}
-
-fn is_compass_signal_attribute(attribute: Id) -> bool {
-    [
-        board::title.id(),
-        board::tag.id(),
-        board::parent.id(),
-        board::task.id(),
-        board::status_of.id(),
-        board::status.id(),
-        board::by.id(),
-        board::note.id(),
-        board::reference.id(),
-        board::higher.id(),
-        board::lower.id(),
-    ]
-    .contains(&attribute)
-}
-
-fn allowed_attribute(kind: Id, attribute: Id) -> bool {
-    if attribute == metadata::created_at.id() {
-        return true;
-    }
-    if kind == KIND_GOAL_ID {
-        [board::title.id(), board::tag.id(), board::parent.id()].contains(&attribute)
-    } else if kind == KIND_NOTE_ID {
-        [
-            board::task.id(),
-            board::note.id(),
-            board::by.id(),
-            board::tag.id(),
-            board::reference.id(),
-            metadata::supersedes.id(),
-        ]
-        .contains(&attribute)
-    } else if kind == KIND_STATUS_ID {
-        // `task` stays allowed but is never written: every status event in
-        // the pile predating `status_of` carries it, and the pile is
-        // append-only.
-        [
-            board::status_of.id(),
-            board::task.id(),
-            board::status.id(),
-            board::by.id(),
-        ]
-        .contains(&attribute)
-    } else if kind == KIND_PRIORITIZE_ID || kind == KIND_DEPRIORITIZE_ID {
-        [board::higher.id(), board::lower.id()].contains(&attribute)
-    } else {
-        false
-    }
-}
-
-fn validate_open_entity(facts: &TribleSet, entity: Id, kind: Id) -> Result<()> {
-    for fact in facts {
-        if fact.a() == &metadata::tag.id() {
-            let observed: Id = (*fact.v::<inlineencodings::GenId>())
-                .try_from_inline()
-                .expect("GenId metadata tag decodes as Id");
-            if is_compass_kind(observed) && observed != kind {
-                bail!(
-                    "Compass entity {entity:x} carries both {kind:x} and {observed:x} kind markers"
-                );
-            }
-        } else if is_compass_attribute(*fact.a()) && !allowed_attribute(kind, *fact.a()) {
-            bail!(
-                "Compass entity {entity:x} carries attribute {:x}, which is not part of its {kind:x} core",
-                fact.a()
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Project the fields Compass owns for one event kind. Unknown attributes and
-/// non-Compass metadata tags are deliberately absent: Trible entities are open
-/// world, and preserved history may carry earlier timestamp encodings or
-/// domain annotations beside the current Compass core.
-fn core_projection(facts: &TribleSet, entity: Id, kind: Id) -> TribleSet {
-    let mut projected = TribleSet::new();
-    for fact in facts {
-        if fact.e() != &entity {
-            continue;
-        }
-        let include = if fact.a() == &metadata::tag.id() {
-            let observed: Id = (*fact.v::<inlineencodings::GenId>())
-                .try_from_inline()
-                .expect("GenId metadata tag decodes as Id");
-            is_compass_kind(observed)
-        } else {
-            allowed_attribute(kind, *fact.a())
-        };
-        if include {
-            projected.insert(fact);
-        }
-    }
-    projected
-}
-
-fn validate_goal(facts: &TribleSet, goal: Id) -> Result<()> {
-    validate_open_entity(facts, goal, KIND_GOAL_ID)?;
-    let _title = exactly_one(
-        goal,
-        "board::title",
-        find!(value: TextHandle, pattern!(facts, [{ goal @ board::title: ?value }])).collect(),
-    )?;
-    let created_at = at_most_one(
-        goal,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ goal @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    if let Some(created_at) = created_at {
-        require_point(goal, "metadata::created_at", created_at)?;
-    }
-    let _parent = at_most_one(
-        goal,
-        "board::parent",
-        find!(value: Id, pattern!(facts, [{ goal @ board::parent: ?value }])).collect(),
-    )?;
-    Ok(())
-}
-
-fn validate_note(facts: &TribleSet, note: Id) -> Result<()> {
-    validate_open_entity(facts, note, KIND_NOTE_ID)?;
-    let _task = exactly_one(
-        note,
-        "board::task",
-        find!(value: Id, pattern!(facts, [{ note @ board::task: ?value }])).collect(),
-    )?;
-    let _body = exactly_one(
-        note,
-        "board::note",
-        find!(value: TextHandle, pattern!(facts, [{ note @ board::note: ?value }])).collect(),
-    )?;
-    let created_at = at_most_one(
-        note,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ note @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    if let Some(created_at) = created_at {
-        require_point(note, "metadata::created_at", created_at)?;
-    }
-    let _by = at_most_one(
-        note,
-        "board::by",
-        find!(value: Id, pattern!(facts, [{ note @ board::by: ?value }])).collect(),
-    )?;
-    Ok(())
-}
-
-fn validate_status(facts: &TribleSet, event: Id) -> Result<()> {
-    validate_open_entity(facts, event, KIND_STATUS_ID)?;
-    // A status event names at most one register and at most one goal. Both
-    // are `at_most_one` rather than `exactly_one` because the two eras
-    // disagree about which attribute carries it, and the pile holds both:
-    // events written before `status_of` have only `task`, and current events
-    // only `status_of`. Candidate validation requires the complete current
-    // shape for newly introduced events without making identity observable.
-    let _register = at_most_one(
-        event,
-        "board::status_of",
-        find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
-    )?;
-    let _task = at_most_one(
-        event,
-        "board::task",
-        find!(value: Id, pattern!(facts, [{ event @ board::task: ?value }])).collect(),
-    )?;
-    // At most one, for the same reason: an event written before status
-    // became text carries its word under the retired 32-byte attribute, which
-    // this reader does not model, until a backfill gives it its text twin.
-    let _status = at_most_one(
-        event,
-        "board::status",
-        find!(value: TextHandle, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
-    )?;
-    let _by = at_most_one(
-        event,
-        "board::by",
-        find!(value: Id, pattern!(facts, [{ event @ board::by: ?value }])).collect(),
-    )?;
-    let created_at = at_most_one(
-        event,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ event @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    if let Some(created_at) = created_at {
-        require_point(event, "metadata::created_at", created_at)?;
-    }
-    Ok(())
-}
-
-fn validate_priority(facts: &TribleSet, event: Id, kind: Id, label: &str) -> Result<()> {
-    validate_open_entity(facts, event, kind)?;
-    let higher = exactly_one(
-        event,
-        "board::higher",
-        find!(value: Id, pattern!(facts, [{ event @ board::higher: ?value }])).collect(),
-    )?;
-    let lower = exactly_one(
-        event,
-        "board::lower",
-        find!(value: Id, pattern!(facts, [{ event @ board::lower: ?value }])).collect(),
-    )?;
-    if higher == lower {
-        bail!("Compass {label} {event:x} relates one goal to itself");
-    }
-    let created_at = at_most_one(
-        event,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ event @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    if let Some(created_at) = created_at {
-        require_point(event, "metadata::created_at", created_at)?;
-    }
-    Ok(())
-}
-
-/// Validate the complete Compass event algebra without imposing intrinsic ids
-/// on preserved legacy events. Random goal and note anchors remain valid;
-/// Compass-owned scalar fields retain their cardinalities while orthogonal
-/// facts on the same open-world entity remain intact.
-pub fn validate_structure(facts: &TribleSet) -> Result<()> {
-    let mut by_entity: BTreeMap<Id, TribleSet> = BTreeMap::new();
-    for fact in facts {
-        by_entity.entry(*fact.e()).or_default().insert(fact);
-    }
-    for goal in ids_of_kind(facts, KIND_GOAL_ID) {
-        validate_goal(&by_entity[&goal], goal)?;
-    }
-    for note in ids_of_kind(facts, KIND_NOTE_ID) {
-        validate_note(&by_entity[&note], note)?;
-    }
-    for event in ids_of_kind(facts, KIND_STATUS_ID) {
-        validate_status(&by_entity[&event], event)?;
-    }
-    for event in ids_of_kind(facts, KIND_PRIORITIZE_ID) {
-        validate_priority(
-            &by_entity[&event],
-            event,
-            KIND_PRIORITIZE_ID,
-            "priority event",
-        )?;
-    }
-    for event in ids_of_kind(facts, KIND_DEPRIORITIZE_ID) {
-        validate_priority(
-            &by_entity[&event],
-            event,
-            KIND_DEPRIORITIZE_ID,
-            "depriority event",
-        )?;
-    }
-    Ok(())
-}
-
-/// Reject newly introduced Compass fields that have no current Compass event
-/// kind. Full-view validation intentionally preserves retired event kinds and
-/// earlier cross-domain uses of shared attributes; exact replay of those facts
-/// therefore remains harmless. New facts must use the current algebra.
-fn validate_candidate_kind_ownership(
-    current: &TribleSet,
-    candidate: &TribleSet,
-    union: &TribleSet,
-) -> Result<()> {
-    let touched: BTreeSet<Id> = candidate
-        .iter()
-        .filter(|fact| is_compass_signal_attribute(*fact.a()))
-        .map(|fact| *fact.e())
-        .collect();
-    for entity in touched {
-        let kinds: BTreeSet<Id> = union
-            .iter()
-            .filter(|fact| fact.e() == &entity && fact.a() == &metadata::tag.id())
-            .filter_map(|fact| {
-                let kind: Id = (*fact.v::<inlineencodings::GenId>())
-                    .try_from_inline()
-                    .expect("GenId metadata tag decodes as Id");
-                is_compass_kind(kind).then_some(kind)
-            })
-            .collect();
-        if kinds.len() == 1 {
-            continue;
-        }
-        let introduces_field = candidate.iter().any(|fact| {
-            fact.e() == &entity && is_compass_signal_attribute(*fact.a()) && !current.contains(fact)
-        });
-        if introduces_field {
-            bail!(
-                "new Compass-owned fields on entity {entity:x} require exactly one Compass kind; found {}",
-                kinds.len()
-            );
-        }
-    }
-    Ok(())
-}
-
-fn require_current_status_shape(facts: &TribleSet, event: Id) -> Result<()> {
-    let _task = exactly_one(
-        event,
-        "board::status_of",
-        find!(value: Id, pattern!(facts, [{ event @ board::status_of: ?value }])).collect(),
-    )?;
-    // The word itself is checked against its staged text in
-    // `validate_candidate`; here only its presence.
-    let _status = exactly_one(
-        event,
-        "board::status",
-        find!(value: TextHandle, pattern!(facts, [{ event @ board::status: ?value }])).collect(),
-    )?;
-    require_complete_occurrence(facts, event, "status event")
-}
-
-fn require_complete_occurrence(facts: &TribleSet, entity: Id, label: &str) -> Result<()> {
-    let created_at = exactly_one(
-        entity,
-        "metadata::created_at",
-        find!(
-            value: IntervalValue,
-            pattern!(facts, [{ entity @ metadata::created_at: ?value }])
-        )
-        .collect(),
-    )?;
-    require_point(entity, "metadata::created_at", created_at)
-        .with_context(|| format!("validate new Compass {label} {entity:x}"))
-}
-
-fn validate_candidate_structure(current: &TribleSet, candidate: &TribleSet) -> Result<TribleSet> {
-    let mut union = current.clone();
-    union += candidate.clone();
-    validate_structure(&union)?;
-    validate_candidate_kind_ownership(current, candidate, &union)?;
-
-    let touched: BTreeSet<Id> = candidate.iter().map(|fact| *fact.e()).collect();
-    for (kind, label) in [
-        (KIND_GOAL_ID, "goal"),
-        (KIND_NOTE_ID, "note"),
-        (KIND_STATUS_ID, "status event"),
-        (KIND_PRIORITIZE_ID, "priority event"),
-        (KIND_DEPRIORITIZE_ID, "depriority event"),
-    ] {
-        let existing = ids_of_kind(current, kind);
-        for entity in existing.intersection(&touched).copied() {
-            let proposed = core_projection(candidate, entity, kind);
-            if proposed.is_empty() {
-                continue;
-            }
-            let prior = core_projection(current, entity, kind);
-            if proposed != prior {
-                bail!("Compass candidate divergently reuses existing {label} anchor {entity:x}");
-            }
-        }
-    }
-
-    for goal in ids_of_kind(candidate, KIND_GOAL_ID)
-        .difference(&ids_of_kind(current, KIND_GOAL_ID))
-        .copied()
-    {
-        require_complete_occurrence(&union, goal, "goal")?;
-    }
-    for note in ids_of_kind(candidate, KIND_NOTE_ID)
-        .difference(&ids_of_kind(current, KIND_NOTE_ID))
-        .copied()
-    {
-        require_complete_occurrence(&union, note, "note")?;
-    }
-
-    for event in ids_of_kind(candidate, KIND_STATUS_ID)
-        .difference(&ids_of_kind(current, KIND_STATUS_ID))
-        .copied()
-    {
-        require_current_status_shape(&union, event)?;
-    }
-    for kind in [KIND_PRIORITIZE_ID, KIND_DEPRIORITIZE_ID] {
-        for event in ids_of_kind(candidate, kind)
-            .difference(&ids_of_kind(current, kind))
-            .copied()
-        {
-            require_complete_occurrence(&union, event, "priority event")?;
-        }
-    }
-    Ok(union)
-}
-
 /// Active explicit priority edges after deterministic last-event reduction.
+///
+/// Every complete reading of an event counts: an event naming two higher
+/// goals speaks for both edges. An event whose time does not decode is not
+/// one this reader can order, so it is skipped.
 pub fn active_priority_edges<P: TriblePattern>(facts: &P) -> BTreeSet<(Id, Id)> {
     let mut latest: BTreeMap<(Id, Id), ((i128, Id), bool)> = BTreeMap::new();
     let mut absorb = |event: Id, higher: Id, lower: Id, at: IntervalValue, active: bool| {
-        let order = (interval_key(at), event);
+        let Ok((lower_bound, _)): Result<(i128, i128), _> = at.try_from_inline() else {
+            return;
+        };
+        let order = (lower_bound, event);
         latest
             .entry((higher, lower))
             .and_modify(|(current, value)| {
@@ -1029,19 +582,22 @@ pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<Strin
     Ok(value.to_string())
 }
 
-/// Strictly load every direct text attachment required by Compass semantics.
-/// Kind names are descriptive catalog sugar and are deliberately excluded:
-/// the legacy CLI emitted some of those handles without retaining their blob,
-/// and a missing label must not make otherwise-complete board data unreadable.
-pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
-    validate_structure(facts)?;
+/// Read every Compass text that `facts` names through `reader`.
+///
+/// This is a writer confirming that what it just published is readable, at
+/// its own write boundary, over its own facts. No reader calls it on a
+/// collection: there a text that has not arrived is read, and reported, at
+/// the point of use, and the rest of the view stays readable.
+pub fn require_text_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
+    let texts = [
+        board::title.id(),
+        board::note.id(),
+        board::reference.id(),
+        board::tag.id(),
+        board::status.id(),
+    ];
     for fact in facts {
-        if fact.a() == &board::title.id()
-            || fact.a() == &board::note.id()
-            || fact.a() == &board::reference.id()
-            || fact.a() == &board::tag.id()
-            || fact.a() == &board::status.id()
-        {
+        if texts.contains(fact.a()) {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
                 format!(
@@ -1054,54 +610,12 @@ pub fn validate_known_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) ->
     Ok(())
 }
 
-/// Validate the exact union and text-attachment closure of an additive Compass
-/// publication assembled outside the typed constructors.
-///
-/// Existing facts must remain readable from the pile snapshot; newly staged
-/// title, note, and reference handles must be owned by the candidate fragment.
-/// Identity policy is intentionally absent here: intrinsic and extrinsic ids
-/// are substitutable to every reader and validator. The normal constructors
-/// provide intrinsic idempotence; replay/import paths may retain old ids.
-pub fn validate_candidate(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<()> {
-    validate_known_payloads(reader, current)?;
-    validate_candidate_structure(current, fragment.facts())?;
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .context("snapshot staged Compass attachments")?;
-    for fact in fragment.facts() {
-        if fact.a() == &board::title.id()
-            || fact.a() == &board::note.id()
-            || fact.a() == &board::reference.id()
-            || fact.a() == &board::tag.id()
-            || fact.a() == &board::status.id()
-        {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let text: View<str> = overlay.get(handle).with_context(|| {
-                format!(
-                    "read staged Compass text payload {}",
-                    hex::encode_upper(handle.raw)
-                )
-            })?;
-            if fact.a() == &board::status.id() && canonical_status(text.to_string())? != *text {
-                bail!(
-                    "new Compass status event {:x} has non-canonical status {:?}",
-                    fact.e(),
-                    &*text
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Materialize the complete WRITE-authorized Compass collection through an
 /// already-open pile.
+///
+/// The view is the collection's facts, as they are: nothing is checked
+/// against a closed shape, and a text that is not resident is only a missing
+/// blob for whichever reader later asks for it.
 pub fn materialize_collection(
     pile: &mut Pile,
     signer: &SigningKey,
@@ -1113,7 +627,6 @@ pub fn materialize_collection(
         .context("attach Compass collection")?
         .view::<TribleSet>()
         .context("read Compass collection")?;
-    validate_known_payloads(&store_snapshot, &facts)?;
     Ok((facts, store_snapshot))
 }
 
@@ -1540,6 +1053,202 @@ mod tests {
         });
     }
 
+    /// Facts an open-world union can hold, each of which a reader of the whole
+    /// collection once refused. Every one is now read: the view comes back and
+    /// holds every fact that was committed.
+    #[test]
+    fn open_world_collection_facts_are_read_never_refused() {
+        fn text(fragment: &mut Fragment, value: &str) -> TextHandle {
+            fragment.put::<blobencodings::UTF8String, _>(value.to_owned())
+        }
+        let wide: IntervalValue = (Epoch::from_unix_seconds(1.0), Epoch::from_unix_seconds(2.0))
+            .try_to_inline()
+            .unwrap();
+        let mut cases: Vec<(&str, Fragment)> = Vec::new();
+
+        let goal = genid().id;
+        let mut two_titles = Fragment::empty();
+        let (alpha, beta) = (
+            text(&mut two_titles, "alpha"),
+            text(&mut two_titles, "beta"),
+        );
+        two_titles += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: alpha,
+            metadata::created_at: at(1),
+        };
+        two_titles += entity! { ExclusiveId::force_ref(&goal) @ board::title: beta };
+        cases.push(("a goal with two titles", two_titles));
+
+        let goal = genid().id;
+        let mut two_times = Fragment::empty();
+        let title = text(&mut two_times, "twice created");
+        two_times += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at(1),
+        };
+        two_times += entity! { ExclusiveId::force_ref(&goal) @ metadata::created_at: at(2) };
+        cases.push(("a goal with two creation times", two_times));
+
+        let goal = genid().id;
+        let mut two_parents = Fragment::empty();
+        let title = text(&mut two_parents, "two parents");
+        two_parents += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at(1),
+            board::parent: &genid().id,
+        };
+        two_parents += entity! { ExclusiveId::force_ref(&goal) @ board::parent: &genid().id };
+        cases.push(("a goal with two parents", two_parents));
+
+        let goal = genid().id;
+        let mut interval = Fragment::empty();
+        let title = text(&mut interval, "wide");
+        interval += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: wide,
+        };
+        cases.push(("a goal created over an interval", interval));
+
+        let goal = genid().id;
+        let mut extra = Fragment::empty();
+        let title = text(&mut extra, "carries a status");
+        let doing = text(&mut extra, "doing");
+        extra += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at(1),
+            board::status: doing,
+        };
+        cases.push((
+            "a goal carrying a Compass attribute outside its core",
+            extra,
+        ));
+
+        let entity = genid().id;
+        let mut two_kinds = Fragment::empty();
+        let title = text(&mut two_kinds, "goal and note");
+        two_kinds += entity! { ExclusiveId::force_ref(&entity) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at(1),
+        };
+        two_kinds += entity! { ExclusiveId::force_ref(&entity) @ metadata::tag: &KIND_NOTE_ID };
+        cases.push(("an entity with two Compass kinds", two_kinds));
+
+        let note = genid().id;
+        let mut two_bodies = Fragment::empty();
+        let (first, second) = (
+            text(&mut two_bodies, "first"),
+            text(&mut two_bodies, "second"),
+        );
+        two_bodies += entity! { ExclusiveId::force_ref(&note) @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &genid().id,
+            board::note: first,
+            metadata::created_at: at(1),
+            board::by: &genid().id,
+        };
+        two_bodies += entity! { ExclusiveId::force_ref(&note) @
+            board::note: second,
+            board::task: &genid().id,
+            board::by: &genid().id,
+        };
+        cases.push(("a note with two bodies, goals and authors", two_bodies));
+
+        let note = genid().id;
+        let mut no_body = Fragment::empty();
+        no_body += entity! { ExclusiveId::force_ref(&note) @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &genid().id,
+            metadata::created_at: at(1),
+        };
+        cases.push(("a note whose body has not arrived", no_body));
+
+        let event = genid().id;
+        let mut two_words = Fragment::empty();
+        let (todo, done) = (text(&mut two_words, "todo"), text(&mut two_words, "done"));
+        two_words += entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &genid().id,
+            board::status: todo,
+            metadata::created_at: at(1),
+        };
+        two_words += entity! { ExclusiveId::force_ref(&event) @
+            board::status: done,
+            board::status_of: &genid().id,
+            metadata::created_at: at(2),
+        };
+        cases.push(("a status event with two words, goals and times", two_words));
+
+        let event = genid().id;
+        let goal = genid().id;
+        let mut reflexive = entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &KIND_PRIORITIZE_ID,
+            board::higher: &goal,
+            board::lower: &goal,
+            metadata::created_at: at(1),
+        };
+        reflexive += entity! { ExclusiveId::force_ref(&event) @ board::higher: &genid().id };
+        cases.push((
+            "a priority event relating a goal to itself, twice higher",
+            reflexive,
+        ));
+
+        let goal = genid().id;
+        let mut absent = Fragment::empty();
+        let title = text(&mut absent, "title not resident");
+        absent += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at(1),
+        };
+        absent.blobs_mut().keep([]);
+        cases.push(("a goal whose title text is not resident", absent));
+
+        let mut refused = Vec::new();
+        for (case, fragment) in cases {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let signer = SigningKey::from_bytes(&[31; 32]);
+            let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+            let expected = fragment.facts().clone();
+            commit_collection(&mut pile, &signer, fragment).unwrap();
+            match materialize_collection(&mut pile, &signer) {
+                Ok((facts, _)) => assert!(
+                    expected.difference(&facts).is_empty(),
+                    "{case}: the view lost committed facts"
+                ),
+                Err(error) => refused.push(format!("{case}: {error:#}")),
+            }
+            pile.close().unwrap();
+        }
+        assert!(refused.is_empty(), "refused:\n{}", refused.join("\n"));
+    }
+
+    /// A priority event whose time does not decode is not an event this
+    /// reader can order, so it is skipped instead of panicking the board.
+    #[test]
+    fn a_priority_event_whose_time_does_not_decode_is_skipped() {
+        let mut raw = at(2_000).raw;
+        raw[16..].copy_from_slice(&at(1_000).raw[16..]);
+        let inverted = IntervalValue::new(raw);
+        let decoded: Result<(i128, i128), _> = inverted.try_from_inline();
+        assert!(decoded.is_err());
+        let (high, low) = (genid().id, genid().id);
+        let mut facts = TribleSet::new();
+        facts += entity! {
+            metadata::tag: &KIND_PRIORITIZE_ID,
+            board::higher: &high,
+            board::lower: &low,
+            metadata::created_at: inverted,
+        };
+        facts += priority_fragment(low, high, true, at(1));
+        assert_eq!(active_priority_edges(&facts), BTreeSet::from([(low, high)]));
+    }
+
     #[test]
     fn equal_time_priority_events_use_entity_id_not_insertion_order() {
         let high = genid().id;
@@ -1664,7 +1373,7 @@ mod tests {
     }
 
     #[test]
-    fn extrinsic_goal_and_note_ids_are_substitutable_in_validation_and_queries() {
+    fn extrinsic_goal_and_note_ids_are_substitutable_in_queries() {
         let goal = genid().id;
         let note = genid().id;
         let mut records =
@@ -1681,8 +1390,6 @@ mod tests {
         )
         .unwrap();
 
-        validate_structure(records.facts()).unwrap();
-        validate_candidate_structure(&TribleSet::new(), records.facts()).unwrap();
         assert_eq!(goal_ids(records.facts()), BTreeSet::from([goal]));
         assert_eq!(note_ids(records.facts()), BTreeSet::from([note]));
         assert_eq!(
@@ -1690,145 +1397,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![goal]
         );
-    }
-
-    #[test]
-    fn additive_union_rejects_a_reused_goal_anchor_with_divergent_shape() {
-        let goal = genid().id;
-        let first = replay::goal_fragment(goal, "first", vec!["one".into()], None, at(4)).unwrap();
-        let second =
-            replay::goal_fragment(goal, "second", vec!["two".into()], None, at(5)).unwrap();
-        let mut union = first.facts().clone();
-        union += second.facts().clone();
-
-        let error = validate_structure(&union).unwrap_err().to_string();
-        assert!(error.contains("values for board::title"));
-    }
-
-    #[test]
-    fn exact_replay_of_an_extrinsic_anchor_remains_valid() {
-        let goal = genid().id;
-        let fragment =
-            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-        let mut union = fragment.facts().clone();
-        union += fragment.facts().clone();
-
-        validate_structure(&union).unwrap();
-    }
-
-    #[test]
-    fn preserved_goal_accepts_orthogonal_annotations_and_legacy_time() {
-        let goal = genid().id;
-        let mut fragment =
-            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-        fragment += entity! { ExclusiveId::force_ref(&goal) @ metadata::updated_at: at(5) };
-
-        validate_structure(fragment.facts()).unwrap();
-
-        let exact = replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-        validate_candidate_structure(fragment.facts(), exact.facts()).unwrap();
-    }
-
-    #[test]
-    fn candidate_rejects_tag_removal_hidden_by_additive_union() {
-        let goal = genid().id;
-        let current =
-            replay::goal_fragment(goal, "same", vec!["one".into(), "two".into()], None, at(4))
-                .unwrap();
-        let candidate =
-            replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-
-        let error = validate_candidate_structure(current.facts(), candidate.facts())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("divergently reuses existing goal anchor"));
-    }
-
-    #[test]
-    fn orthogonal_candidate_fact_does_not_mutate_goal_core() {
-        let goal = genid().id;
-        let current = replay::goal_fragment(goal, "same", vec!["one".into()], None, at(4)).unwrap();
-        let candidate = entity! { ExclusiveId::force_ref(&goal) @ metadata::updated_at: at(5) };
-
-        validate_candidate_structure(current.facts(), candidate.facts()).unwrap();
-    }
-
-    #[test]
-    fn current_status_shape_accepts_an_extrinsic_id() {
-        let goal = genid().id;
-        let canonical = status_fragment(goal, "doing", None, at(7)).unwrap();
-        validate_candidate_structure(&TribleSet::new(), canonical.facts()).unwrap();
-
-        let extrinsic_id = genid().id;
-        let extrinsic = entity! { ExclusiveId::force_ref(&extrinsic_id) @
-            metadata::tag: &KIND_STATUS_ID,
-            board::status_of: &goal,
-            board::status: "doing",
-            metadata::created_at: at(7),
-        };
-        validate_candidate_structure(&TribleSet::new(), extrinsic.facts()).unwrap();
-    }
-
-    #[test]
-    fn current_priority_shape_accepts_an_extrinsic_id() {
-        let higher = genid().id;
-        let lower = genid().id;
-        let canonical = priority_fragment(higher, lower, true, at(7));
-        validate_candidate_structure(&TribleSet::new(), canonical.facts()).unwrap();
-
-        let extrinsic_id = genid().id;
-        let extrinsic = entity! { ExclusiveId::force_ref(&extrinsic_id) @
-            metadata::tag: &KIND_PRIORITIZE_ID,
-            board::higher: &higher,
-            board::lower: &lower,
-            metadata::created_at: at(7),
-        };
-        validate_candidate_structure(&TribleSet::new(), extrinsic.facts()).unwrap();
-    }
-
-    #[test]
-    fn new_extrinsic_goal_requires_complete_occurrence_time() {
-        let goal = genid().id;
-        let mut incomplete = Fragment::empty();
-        let title = incomplete.put::<blobencodings::UTF8String, _>("incomplete".to_owned());
-        incomplete += entity! { ExclusiveId::force_ref(&goal) @
-            metadata::tag: &KIND_GOAL_ID,
-            board::title: title,
-        };
-
-        let error = validate_candidate_structure(&TribleSet::new(), incomplete.facts())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("metadata::created_at"));
-    }
-
-    #[test]
-    fn exact_replay_preserves_a_noncanonical_legacy_status_id() {
-        let goal = genid().id;
-        let legacy_id = genid().id;
-        let legacy = entity! { ExclusiveId::force_ref(&legacy_id) @
-            metadata::tag: &KIND_STATUS_ID,
-            board::task: &goal,
-            board::status: "doing",
-        };
-
-        validate_structure(legacy.facts()).unwrap();
-        validate_candidate_structure(legacy.facts(), legacy.facts()).unwrap();
-    }
-
-    #[test]
-    fn newly_introduced_compass_owned_field_requires_exactly_one_compass_kind() {
-        let entity = genid().id;
-        let mut orphan = Fragment::empty();
-        let title = orphan.put::<blobencodings::UTF8String, _>("orphan".to_owned());
-        orphan += entity! { ExclusiveId::force_ref(&entity) @ board::title: title };
-
-        // A frozen legacy view remains inspectable, but no writer may add this
-        // untyped field to an empty collection.
-        validate_structure(orphan.facts()).unwrap();
-        let error = validate_candidate_structure(&TribleSet::new(), orphan.facts())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("require exactly one Compass kind"));
     }
 }

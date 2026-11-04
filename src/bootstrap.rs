@@ -597,7 +597,9 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
             bail!("Wiki collection omitted portable bootstrap facts after publication");
         }
         let compass_after = read_all(compass_source, &after)?;
-        compass::validate_known_payloads(&after, &compass_after)?;
+        // The seed's own texts must be readable; whatever else the collection
+        // holds is read open-world by its readers, never checked here.
+        compass::require_text_payloads(&after, &expected_compass)?;
         if !expected_compass.difference(&compass_after).is_empty() {
             bail!("Compass collection omitted portable bootstrap facts after publication");
         }
@@ -1065,5 +1067,49 @@ mod tests {
             vec![successor]
         );
         pile.close().unwrap();
+    }
+
+    /// Import adds the seed beside whatever the Compass collection already
+    /// holds. A goal there with two titles, or one whose title text is not
+    /// resident here, is an ordinary open-world fact, not a reason to refuse.
+    #[test]
+    fn import_beside_an_open_world_compass_collection_does_not_refuse() {
+        use crate::schemas::compass::{board, KIND_GOAL_ID};
+        use triblespace::core::metadata;
+        use triblespace::macros::entity;
+        use triblespace::prelude::*;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pile_path = directory.path().join("open-compass.pile");
+        let key = directory.path().join("open-compass.key");
+        File::create(&pile_path).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+        let signer = load_signer(&pile_path, Some(&key)).unwrap();
+        let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        let goal = genid().id;
+        let at = crate::clock::point(hifitime::Epoch::from_unix_seconds(1.0)).unwrap();
+        let mut fragment = Fragment::empty();
+        let alpha = fragment.put::<blobencodings::UTF8String, _>("alpha".to_owned());
+        let beta = fragment.put::<blobencodings::UTF8String, _>("beta".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: alpha,
+            metadata::created_at: at,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&goal) @ board::title: beta };
+        let elsewhere = genid().id;
+        let mut absent = Fragment::empty();
+        let title = absent.put::<blobencodings::UTF8String, _>("held elsewhere".to_owned());
+        absent += entity! { ExclusiveId::force_ref(&elsewhere) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: at,
+        };
+        absent.blobs_mut().keep([]);
+        fragment += absent;
+        compass::commit_collection(&mut pile, &signer, fragment).unwrap();
+        pile.close().unwrap();
+
+        import(&pile_path, Some(&key)).unwrap();
     }
 }

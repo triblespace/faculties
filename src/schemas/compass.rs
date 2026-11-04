@@ -102,7 +102,13 @@ pub fn text_handle(value: &str) -> Inline<inlineencodings::Handle<blobencodings:
 /// `register` is the maintained LWW index for `board::status_of` ordered by
 /// `metadata::created_at`. Positive membership joins only known complete
 /// winners, so facts ahead of the index cannot surface unseen events. Its
-/// `(created_at, event-id)` total order leaves exactly one per register.
+/// `(created_at, event-id)` total order leaves one winning event per register.
+///
+/// The schema cannot express cardinality, so that one event may still carry
+/// several words or times. Its reading is then the row with the latest time
+/// that decodes (a time that does not decode ranks below every one that
+/// does), and among equal times the greatest word handle: the same on every
+/// read, whatever order the index yields rows in.
 pub fn latest_status_event<P: TriblePattern>(
     space: &P,
     register: &LwwQuery,
@@ -124,6 +130,9 @@ pub fn latest_status_event<P: TriblePattern>(
             register.has(event),
         )
     )
-    .next();
+    .max_by_key(|(_, status, at)| {
+        let decoded: Option<(i128, i128)> = at.try_from_inline().ok();
+        (decoded.map(|(lower, _)| lower), status.raw)
+    });
     current
 }

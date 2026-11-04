@@ -192,14 +192,28 @@ impl Compass {
 
 type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
-fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval.try_from_inline().unwrap();
-    lower
+/// The lower bound of an interval in TAI nanoseconds, if the value decodes.
+///
+/// Queries are types: a stored value that does not decode as an interval (an
+/// inverted pair) is not a time this reader can order by, so every caller
+/// skips the row that carries it instead of panicking. A wider interval is
+/// read at its lower bound, the earliest moment it admits.
+fn interval_key(interval: IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
+    Some(lower)
 }
 
-fn format_interval(interval: IntervalValue) -> String {
-    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().unwrap();
-    format!("{}", lower)
+/// The lower bound of an interval as text, if the value decodes.
+fn format_interval(interval: IntervalValue) -> Option<String> {
+    let (lower, _): (Epoch, Epoch) = interval.try_from_inline().ok()?;
+    Some(format!("{}", lower))
+}
+
+fn fmt_ids(ids: &[Id]) -> String {
+    ids.iter()
+        .map(|id| fmt_id(*id))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn validate_label(label: &str, value: &str) -> Result<()> {
@@ -451,16 +465,33 @@ impl CompassStorage<'_> {
     }
 }
 
+/// Every distinct title of a goal, sorted by text.
+///
+/// The schema cannot express cardinality, so a goal may hold several titles
+/// (two writers, a merge). Each is read; none is chosen over another. A goal
+/// whose title has not arrived has none.
+fn task_titles<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    task_id: Id,
+) -> Result<Vec<String>> {
+    let mut titles: Vec<String> =
+        find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
+            .map(|handle| read_text(reader, handle))
+            .collect::<Result<_>>()?;
+    titles.sort();
+    titles.dedup();
+    Ok(titles)
+}
+
+/// A goal's titles as one line: each distinct title, sorted, joined by
+/// " / ". One title reads as itself, and no title as the empty string.
 fn task_title<P: TriblePattern>(
     reader: &impl BlobStoreGet,
     space: &P,
     task_id: Id,
 ) -> Result<String> {
-    find!(h: TextHandle, pattern!(space, [{ task_id @ board::title: ?h }]))
-        .next()
-        .map(|handle| read_text(reader, handle))
-        .transpose()
-        .map(Option::unwrap_or_default)
+    Ok(task_titles(reader, space, task_id)?.join(" / "))
 }
 
 /// The text of a status or tag word. A word whose handle is that of one of
@@ -493,12 +524,21 @@ fn task_tags<P: TriblePattern>(
     Ok(tags)
 }
 
-fn task_parent<P: TriblePattern>(space: &P, task_id: Id) -> Option<Id> {
-    find!(p: Id, pattern!(space, [{ task_id @ board::parent: ?p }])).next()
+/// Every parent a goal names, in id order. A parent need not be present.
+fn task_parents<P: TriblePattern>(space: &P, task_id: Id) -> Vec<Id> {
+    let mut parents: Vec<Id> =
+        find!(p: Id, pattern!(space, [{ task_id @ board::parent: ?p }])).collect();
+    parents.sort();
+    parents.dedup();
+    parents
 }
 
+/// When a goal was created: the earliest of its creation times that decodes.
 fn task_created_at<P: TriblePattern>(space: &P, task_id: Id) -> Option<IntervalValue> {
-    find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }])).next()
+    find!(s: IntervalValue, pattern!(space, [{ task_id @ metadata::created_at: ?s }]))
+        .filter_map(|at| Some((interval_key(at)?, at)))
+        .min_by_key(|(key, at)| (*key, at.raw))
+        .map(|(_, at)| at)
 }
 
 /// Latest status for a task.
@@ -518,23 +558,6 @@ fn all_goal_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
     find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])).collect()
 }
 
-/// All note event IDs.
-fn all_note_ids<P: TriblePattern>(space: &P) -> Vec<Id> {
-    find!(
-        id: Id,
-        pattern!(space, [
-            {
-                ?id @
-                metadata::tag: &KIND_NOTE_ID,
-                board::task: _?goal,
-                board::note: _?body,
-            },
-            { _?goal @ metadata::tag: &KIND_GOAL_ID },
-        ])
-    )
-    .collect()
-}
-
 fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     compass::read_text(reader, handle)
 }
@@ -551,7 +574,8 @@ fn resolve_note_id<P: TriblePattern>(input: &str, space: &P) -> Result<Id> {
     }
     let note_id =
         Id::from_hex(trimmed).ok_or_else(|| anyhow::anyhow!("invalid note id '{trimmed}'"))?;
-    if !all_note_ids(space).contains(&note_id) {
+    // A note is a note whether or not the goal it names is in this view.
+    if !compass::note_ids(space).contains(&note_id) {
         bail!("supersedes target is not an existing note: '{trimmed}'");
     }
     Ok(note_id)
@@ -584,16 +608,23 @@ fn is_ancestor(paths: &PathIndex, from: Id, to: Id) -> bool {
     paths.contains(&from.raw, &to.raw)
 }
 
-/// Count notes for a task.
+/// Count the distinct notes on a task; a note with two bodies is one note.
 fn note_count<P: TriblePattern>(space: &P, task_id: Id) -> usize {
     find!(
-        _n: TextHandle,
-        pattern!(space, [{ _?evt @ metadata::tag: &KIND_NOTE_ID, board::task: &task_id, board::note: ?_n }])
-    ).count()
+        note: Id,
+        pattern!(space, [{ ?note @ metadata::tag: &KIND_NOTE_ID, board::task: &task_id, board::note: _?body }])
+    )
+    .collect::<BTreeSet<_>>()
+    .len()
 }
 
-fn event_actor<P: TriblePattern>(space: &P, event_id: Id) -> Option<Id> {
-    find!(by: Id, pattern!(space, [{ event_id @ board::by: ?by }])).next()
+/// Every persona an event names as its author, in id order.
+fn event_actors<P: TriblePattern>(space: &P, event_id: Id) -> Vec<Id> {
+    let mut actors: Vec<Id> =
+        find!(by: Id, pattern!(space, [{ event_id @ board::by: ?by }])).collect();
+    actors.sort();
+    actors.dedup();
+    actors
 }
 
 fn note_tags<P: TriblePattern>(
@@ -690,11 +721,11 @@ fn render_board<P: TriblePattern>(
         let title = task_title(reader, space, task_id)?;
         let created_at = task_created_at(space, task_id);
         let notes = note_count(space, task_id);
-        let parent = task_parent(space, task_id);
+        let parents = task_parents(space, task_id);
 
         let sort_key = status_at
-            .map(interval_key)
-            .or(created_at.map(interval_key))
+            .and_then(interval_key)
+            .or_else(|| created_at.and_then(interval_key))
             .unwrap_or(0);
         columns.entry(status).or_default().push(TaskRow {
             id: task_id,
@@ -703,7 +734,7 @@ fn render_board<P: TriblePattern>(
             tags,
             sort_key,
             note_count: notes,
-            parent,
+            parents,
         });
     }
 
@@ -756,7 +787,9 @@ struct TaskRow {
     tags: Vec<String>,
     sort_key: i128,
     note_count: usize,
-    parent: Option<Id>,
+    /// Every parent the goal names, in id order; it nests under the first
+    /// one the board also shows.
+    parents: Vec<Id>,
 }
 
 #[derive(Debug)]
@@ -765,7 +798,7 @@ struct NoteRow {
     text: String,
     sort_key: i128,
     at: String,
-    by: Option<Id>,
+    by: Vec<Id>,
     tags: Vec<String>,
     references: Vec<String>,
     supersedes: Vec<Id>,
@@ -808,11 +841,9 @@ fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, 
     let mut roots = Vec::new();
 
     for (id, row) in &by_id {
-        if let Some(parent) = row.parent {
-            if ids.contains(&parent) {
-                children.entry(parent).or_default().push(*id);
-                continue;
-            }
+        if let Some(parent) = row.parents.iter().find(|parent| ids.contains(*parent)) {
+            children.entry(*parent).or_default().push(*id);
+            continue;
         }
         roots.push(*id);
     }
@@ -867,9 +898,14 @@ fn order_rows(rows: Vec<TaskRow>, ranks: &BTreeMap<Id, usize>) -> Vec<(TaskRow, 
         walk(root, 0, &by_id, &children, &mut visited, &mut ordered);
     }
 
-    for id in by_id.keys() {
-        if !visited.contains(id) {
-            walk(*id, 0, &by_id, &children, &mut visited, &mut ordered);
+    // Whatever no root reached sits on a parent cycle, which opaque ids can
+    // form; it is shown from its smallest id, so the order is the same on
+    // every read.
+    let mut rest: Vec<Id> = by_id.keys().copied().collect();
+    rest.sort();
+    for id in rest {
+        if !visited.contains(&id) {
+            walk(id, 0, &by_id, &children, &mut visited, &mut ordered);
         }
     }
 
@@ -1066,19 +1102,20 @@ fn render_goal<P: TriblePattern>(
     task_id: Id,
 ) -> Result<String> {
     let mut output = String::new();
-    let title = task_title(reader, space, task_id)?;
-    if title.is_empty() {
-        bail!("goal missing");
-    }
-
     writeln!(output, "Goal {:x}", task_id)?;
-    writeln!(output, "Title: {}", title)?;
-    if let Some(created) = task_created_at(space, task_id) {
-        writeln!(output, "Created: {}", format_interval(created))?;
+    // One line per title; a goal whose title has not arrived has none.
+    for title in task_titles(reader, space, task_id)? {
+        writeln!(output, "Title: {}", title)?;
+    }
+    if let Some(created) = task_created_at(space, task_id).and_then(format_interval) {
+        writeln!(output, "Created: {}", created)?;
     }
 
     if let Some((status, at)) = task_latest_status(reader, space, status_register, task_id)? {
-        writeln!(output, "Status: {} (since {})", status, format_interval(at))?;
+        match format_interval(at) {
+            Some(at) => writeln!(output, "Status: {} (since {})", status, at)?,
+            None => writeln!(output, "Status: {}", status)?,
+        }
     }
 
     let tags = task_tags(reader, space, task_id, &[])?;
@@ -1086,7 +1123,7 @@ fn render_goal<P: TriblePattern>(
         writeln!(output, "Tags: {}", tags.join(", "))?;
     }
 
-    if let Some(parent_id) = task_parent(space, task_id) {
+    for parent_id in task_parents(space, task_id) {
         let parent_hex = fmt_id(parent_id);
         let parent_title = task_title(reader, space, parent_id)?;
         if parent_title.is_empty() {
@@ -1096,8 +1133,11 @@ fn render_goal<P: TriblePattern>(
         }
     }
 
-    // Status history for this task.
-    let mut history: Vec<(i128, Id, String, String, Option<Id>)> = find!(
+    // Status history for this task: one row per complete reading of each
+    // event, ordered by time, then event id, then word. A row whose time does
+    // not decode is skipped.
+    let mut history: Vec<(i128, Id, String, String, Vec<Id>)> = Vec::new();
+    for (event, status, at) in find!(
         (event: Id, status: TextHandle, at: IntervalValue),
         pattern!(space, [{
             ?event @
@@ -1106,31 +1146,36 @@ fn render_goal<P: TriblePattern>(
             board::status: ?status,
             metadata::created_at: ?at,
         }])
-    )
-    .map(|(event, status, at)| {
-        Ok((
-            interval_key(at),
+    ) {
+        let (Some(key), Some(at)) = (interval_key(at), format_interval(at)) else {
+            continue;
+        };
+        history.push((
+            key,
             event,
-            format_interval(at),
             word(reader, status, &DEFAULT_STATUSES)?,
-            event_actor(space, event),
-        ))
-    })
-    .collect::<Result<_>>()?;
+            at,
+            event_actors(space, event),
+        ));
+    }
     if !history.is_empty() {
-        history.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        history.sort();
         writeln!(output)?;
         writeln!(output, "Status history:")?;
-        for (_, _, at, status, by) in &history {
-            match by {
-                Some(by) => writeln!(output, "- {at} {status} by {by:x}")?,
-                None => writeln!(output, "- {at} {status}")?,
+        for (_, _, status, at, by) in &history {
+            if by.is_empty() {
+                writeln!(output, "- {at} {status}")?;
+            } else {
+                writeln!(output, "- {at} {status} by {}", fmt_ids(by))?;
             }
         }
     }
 
-    // Notes for this task.
-    let mut notes: Vec<NoteRow> = find!(
+    // Notes for this task: one row per complete reading of each note (a note
+    // with two bodies shows both under its one id), ordered by time, then
+    // note id, then text. A row whose time does not decode is skipped.
+    let mut notes: Vec<NoteRow> = Vec::new();
+    for (note_id, handle, at) in find!(
         (note_id: Id, note_handle: TextHandle, at: IntervalValue),
         pattern!(space, [{
             ?note_id @
@@ -1139,28 +1184,36 @@ fn render_goal<P: TriblePattern>(
             board::note: ?note_handle,
             metadata::created_at: ?at,
         }])
-    )
-    .map(|(note_id, handle, at)| {
-        Ok(NoteRow {
+    ) {
+        let (Some(sort_key), Some(at)) = (interval_key(at), format_interval(at)) else {
+            continue;
+        };
+        notes.push(NoteRow {
             id: note_id,
             text: read_text(reader, handle)?,
-            sort_key: interval_key(at),
-            at: format_interval(at),
-            by: event_actor(space, note_id),
+            sort_key,
+            at,
+            by: event_actors(space, note_id),
             tags: note_tags(reader, space, note_id)?,
             references: note_references(reader, space, note_id)?,
             supersedes: note_supersedes(space, note_id),
-        })
-    })
-    .collect::<Result<_>>()?;
+        });
+    }
     if !notes.is_empty() {
-        notes.sort_by(|a, b| (a.sort_key, a.id).cmp(&(b.sort_key, b.id)));
+        notes.sort_by(|a, b| (a.sort_key, a.id, &a.text).cmp(&(b.sort_key, b.id, &b.text)));
         writeln!(output)?;
         writeln!(output, "Notes:")?;
         for note in &notes {
-            match note.by {
-                Some(by) => writeln!(output, "- [{}] {} by {by:x}", fmt_id(note.id), note.at)?,
-                None => writeln!(output, "- [{}] {}", fmt_id(note.id), note.at)?,
+            if note.by.is_empty() {
+                writeln!(output, "- [{}] {}", fmt_id(note.id), note.at)?;
+            } else {
+                writeln!(
+                    output,
+                    "- [{}] {} by {}",
+                    fmt_id(note.id),
+                    note.at,
+                    fmt_ids(&note.by)
+                )?;
             }
             if note.text.is_empty() {
                 writeln!(output, "  (empty)")?;
@@ -1920,5 +1973,273 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// A real pile whose Compass collection holds `fragment` as one raw
+    /// commit, carried by the worker, so reads see exactly those facts.
+    fn raw_pile(fragment: Fragment) -> (tempfile::TempDir, Storage) {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("open-compass.pile");
+        let key = directory.path().join("open-compass.key");
+        std::fs::File::create(&pile).unwrap();
+        initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = Storage::new(pile, Some(key));
+        let handle = CompassStorage { storage: &storage };
+        handle
+            .with_pile(|pile, signer, _runtime| {
+                compass::commit_collection(pile, signer, fragment)?;
+                Ok(())
+            })
+            .unwrap();
+        carry_storage(handle);
+        (directory, storage)
+    }
+
+    fn point(seconds: f64) -> IntervalValue {
+        clock::point(Epoch::from_unix_seconds(seconds)).unwrap()
+    }
+
+    fn text(fragment: &mut Fragment, value: &str) -> TextHandle {
+        fragment.put::<blobencodings::UTF8String, _>(value.to_owned())
+    }
+
+    fn plain_goal(fragment: &mut Fragment, title: &str, seconds: f64) -> Id {
+        let (goal, id) = compass::goal_fragment(title, vec![], None, point(seconds)).unwrap();
+        *fragment += goal;
+        id
+    }
+
+    /// The schema cannot express cardinality, so a goal with two titles and
+    /// two parents is read, not refused: the board shows every title, sorted
+    /// and joined by " / ", and nests the goal under its first shown parent
+    /// by id; `show` prints one line per title and per parent. Both readings
+    /// are the same on every read.
+    #[test]
+    fn a_goal_with_two_titles_and_two_parents_lists_and_shows_both() {
+        let mut fragment = Fragment::empty();
+        let first_parent = plain_goal(&mut fragment, "first parent", 1.0);
+        let second_parent = plain_goal(&mut fragment, "second parent", 2.0);
+        let goal = genid().id;
+        let (beta, alpha) = (text(&mut fragment, "beta"), text(&mut fragment, "alpha"));
+        fragment += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: beta,
+            board::parent: &first_parent,
+            metadata::created_at: point(3.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&goal) @
+            board::title: alpha,
+            board::parent: &second_parent,
+            metadata::created_at: point(4.0),
+        };
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let board = list(handle, vec![], vec![], false).unwrap();
+        assert_eq!(board, list(handle, vec![], vec![], false).unwrap());
+        assert!(
+            board.contains(&format!("  - [{goal:x}] alpha / beta\n")),
+            "{board}"
+        );
+        assert_eq!(board.matches(&format!("[{goal:x}]")).count(), 1, "{board}");
+
+        let shown = show(handle, format!("{goal:x}")).unwrap();
+        assert_eq!(shown, show(handle, format!("{goal:x}")).unwrap());
+        assert!(shown.contains("Title: alpha\nTitle: beta\n"), "{shown}");
+        let (low, high) = if first_parent < second_parent {
+            (first_parent, second_parent)
+        } else {
+            (second_parent, first_parent)
+        };
+        let parent_line = |id: Id| {
+            let title = if id == first_parent {
+                "first parent"
+            } else {
+                "second parent"
+            };
+            format!("Parent: {title} ({id:x})\n")
+        };
+        assert!(
+            shown.contains(&format!("{}{}", parent_line(low), parent_line(high))),
+            "{shown}"
+        );
+        // The earliest creation time is the one shown.
+        let (earliest, _): (Epoch, Epoch) = point(3.0).try_from_inline().unwrap();
+        assert!(shown.contains(&format!("Created: {earliest}\n")), "{shown}");
+    }
+
+    /// A note with two bodies is one note: the board counts it once, and
+    /// `show` prints each body as its own reading under the one id.
+    #[test]
+    fn a_note_with_two_bodies_is_counted_once_and_shows_both() {
+        let mut fragment = Fragment::empty();
+        let goal = plain_goal(&mut fragment, "noted goal", 1.0);
+        let note = genid().id;
+        let (second, first) = (
+            text(&mut fragment, "second body"),
+            text(&mut fragment, "first body"),
+        );
+        fragment += entity! { ExclusiveId::force_ref(&note) @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: second,
+            metadata::created_at: point(2.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&note) @ board::note: first };
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let board = list(handle, vec![], vec![], false).unwrap();
+        assert!(board.contains("noted goal (1 note)\n"), "{board}");
+        let shown = show(handle, format!("{goal:x}")).unwrap();
+        let first_at = shown.find("  first body\n").expect("first body shown");
+        let second_at = shown.find("  second body\n").expect("second body shown");
+        assert!(first_at < second_at, "{shown}");
+        assert_eq!(
+            shown.matches(&format!("- [{note:x}]")).count(),
+            2,
+            "{shown}"
+        );
+    }
+
+    /// A goal whose title has not arrived is still a goal: `show` prints
+    /// what is known instead of calling it missing.
+    #[test]
+    fn a_goal_without_a_title_still_shows() {
+        let goal = genid().id;
+        let fragment = entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            metadata::created_at: point(1.0),
+        };
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+        let shown = show(handle, format!("{goal:x}")).unwrap();
+        assert!(
+            shown.starts_with(&format!("Goal {goal:x}\nCreated: ")),
+            "{shown}"
+        );
+        assert!(list(handle, vec![], vec![], false)
+            .unwrap()
+            .contains(&format!("[{goal:x}]")));
+    }
+
+    /// Queries are types: a time that does not decode (an inverted interval)
+    /// is not one this reader can order by, so the board and `show` skip it
+    /// instead of panicking.
+    #[test]
+    fn times_that_do_not_decode_are_skipped_not_panicked() {
+        let mut raw = point(2_000.0).raw;
+        raw[16..].copy_from_slice(&point(1_000.0).raw[16..]);
+        let inverted = IntervalValue::new(raw);
+        let decoded: Result<(i128, i128), _> = inverted.try_from_inline();
+        assert!(decoded.is_err());
+
+        let mut fragment = Fragment::empty();
+        let other = plain_goal(&mut fragment, "ordinary goal", 1.0);
+        let goal = genid().id;
+        let title = text(&mut fragment, "inverted goal");
+        fragment += entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::title: title,
+            metadata::created_at: inverted,
+        };
+        let body = text(&mut fragment, "inverted note");
+        fragment += entity! {
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: body,
+            metadata::created_at: inverted,
+        };
+        let doing = text(&mut fragment, "doing");
+        fragment += entity! {
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &other,
+            board::status: doing,
+            metadata::created_at: inverted,
+        };
+        fragment += entity! {
+            metadata::tag: &crate::schemas::compass::KIND_PRIORITIZE_ID,
+            board::higher: &goal,
+            board::lower: &other,
+            metadata::created_at: inverted,
+        };
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let board = list(handle, vec![], vec![], false).unwrap();
+        assert!(board.contains("inverted goal (1 note)"), "{board}");
+        assert!(board.contains("ordinary goal"), "{board}");
+        let shown = show(handle, format!("{goal:x}")).unwrap();
+        assert!(!shown.contains("Created:"), "{shown}");
+        assert!(!shown.contains("inverted note"), "{shown}");
+        show(handle, format!("{other:x}")).unwrap();
+    }
+
+    /// A note or status event may name a goal this view does not hold yet;
+    /// it waits, and the board reads the goals it does hold.
+    #[test]
+    fn events_naming_an_absent_goal_do_not_break_the_board() {
+        let mut fragment = Fragment::empty();
+        let goal = plain_goal(&mut fragment, "present goal", 1.0);
+        let absent = genid().id;
+        fragment += compass::note_fragment(
+            absent,
+            "early note",
+            vec![],
+            vec![],
+            vec![],
+            None,
+            point(2.0),
+        )
+        .unwrap()
+        .0;
+        fragment += compass::status_fragment(absent, "doing", None, point(2.0)).unwrap();
+        fragment += compass::priority_fragment(absent, goal, true, point(2.0));
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        assert_eq!(
+            list(handle, vec![], vec![], false).unwrap(),
+            format!("\n== TODO (1) ==\n- [{goal:x}] present goal\n\n")
+        );
+        show(handle, format!("{goal:x}")).unwrap();
+    }
+
+    /// Superseding names a note, and a note is a note whether or not the goal
+    /// it hangs off has arrived here yet.
+    #[test]
+    fn a_note_whose_goal_is_absent_can_still_be_superseded() {
+        let mut fragment = Fragment::empty();
+        let goal = plain_goal(&mut fragment, "present goal", 1.0);
+        let (early, early_id) = compass::note_fragment(
+            genid().id,
+            "note on an absent goal",
+            vec![],
+            vec![],
+            vec![],
+            None,
+            point(2.0),
+        )
+        .unwrap();
+        fragment += early;
+        let (_directory, storage) = raw_pile(fragment);
+        let handle = CompassStorage { storage: &storage };
+
+        let added = add_note(
+            handle,
+            format!("{goal:x}"),
+            "supersedes the early note".to_owned(),
+            vec![],
+            vec![],
+            vec![format!("{early_id:x}")],
+            None,
+        )
+        .unwrap();
+        let shown = show(handle, format!("{goal:x}")).unwrap();
+        assert!(shown.contains(&format!("[{:x}]", added.note)), "{shown}");
+        assert!(
+            shown.contains(&format!("supersedes: {early_id:x}")),
+            "{shown}"
+        );
     }
 }
