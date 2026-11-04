@@ -426,9 +426,10 @@ pub mod witness {
         /// render.
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
         /// OCCURRENCE CORE. A media type exactly as the source spells it,
-        /// where it does not parse as one (`claimed_media_type` holds the
-        /// parsed form of one that does). The record's own claim, kept so a
-        /// malformed spelling never costs the bytes it labels. Also on a part
+        /// valid or not. `claimed_media_type` holds the parsed reading of a
+        /// valid one, so a record may carry both: the lexical claim and its
+        /// meaning. The record's own claim, kept so a malformed spelling
+        /// never costs the bytes it labels. Also on a part
         /// wrapper inside a `rendered_from` original: an intrinsic
         /// `{ rendered_from: part, raw_media_type: spelling }`, a source's
         /// claim about that one part, which keeps each spelling paired with
