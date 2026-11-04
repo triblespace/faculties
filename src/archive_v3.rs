@@ -185,7 +185,8 @@ pub struct NodeAnnotations {
     pub spawned_by: Vec<Id>,
     /// Original(s) this node re-presents.
     pub recalls: Vec<Id>,
-    /// [`schema::node::ends`] terms.
+    /// [`schema::node::ends`] terms. Ruling M1 moves them to the occurrence
+    /// ([`WitnessAnnotations::ends`]); the gate fails a node that carries one.
     pub ends: Vec<Id>,
     /// [`schema::node::rendering`] terms.
     pub rendering: Vec<Id>,
@@ -241,6 +242,9 @@ pub struct WitnessAnnotations {
     pub harness_written: bool,
     /// Why the turn the record closes ended (an `ends` term).
     pub turn_ends: Vec<Id>,
+    /// Why the sampling that produced the held item stopped (`ends` terms,
+    /// ruling M1): the record's own claim, never the node's.
+    pub ends: Vec<Id>,
 }
 
 /// One occurrence of `witness`: the claims of one source record, rooted at an
@@ -309,6 +313,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
         schema::witness::turn_ends*: annotations.turn_ends.iter(),
+        schema::witness::ends*: annotations.ends.iter(),
         metadata::tag*: tags.iter(),
     };
     let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;

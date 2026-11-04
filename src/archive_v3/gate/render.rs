@@ -8,17 +8,23 @@
 //! - its facts: every attribute of every fact the node holds, under the
 //!   fact's modality and direction (a `structure` as its `json_tree`
 //!   leaves), the fact's shape (so a fact that holds no value still makes
-//!   the node an item) and a gap's `absent` term;
-//! - its marks: the node's own annotations (`ends`, `rendering`, a time),
-//!   those of its glosses and citations;
-//! - the claims of each occurrence of its witness, one tuple per occurrence;
+//!   the node an item) and a gap's `absent` term; a node that holds nothing
+//!   is the `empty` shape, an item no source has (G11);
+//! - its marks: the node's own annotations (`rendering`, a time, and an
+//!   `ends`, which ruling M1 places on occurrences instead), each of its
+//!   glosses (kind, text, the model that wrote it), each citation, and each
+//!   witness's claims (its `source_namespace`), counted (G12);
+//! - the claims of each occurrence of its witness, one tuple per occurrence,
+//!   counted: an occurrence entity duplicated is two;
 //! - its links (`responds_to`, `recalls`, `continues`, `spawned_by`), each
 //!   to the node it names, which the gate names by its place.
 //!
-//! Attributes that are structure (`previous`, `holds`, kind tags, derived
-//! actor ids) render nothing. Every other attribute renders, and one A does
-//! not know renders under its id, so it can only ever be reported, never
-//! pass unseen.
+//! Attributes that are structure (`previous`, `holds`, `projects_to`, `of`,
+//! kind tags) render nothing. Every other attribute renders (G10): one A
+//! does not know renders under its id, an `author` or `experiencer` (which
+//! no source table declares) under its own name, and a gloss without a kind
+//! or a text, or an entity A names that has no name, as a value no source
+//! has, so each can only ever be reported, never pass unseen.
 //!
 //! Then it lists every entity in the `TribleSet` and reports each one no
 //! window reached: a fact no node on a window holds, a node on no window, a
@@ -36,7 +42,7 @@ use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{GenId, Handle, NsTAIInterval, I256BE, U256BE};
 use triblespace::prelude::*;
 
-use super::{JsonLeaf, Kind, Token, Value};
+use super::{JsonLeaf, Kind, Multiset, Token, Value};
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag as main;
 
@@ -58,11 +64,12 @@ pub struct GraphNode {
     /// Its item: the tokens of the fact(s) it holds, shape and gap terms
     /// included.
     pub facts: BTreeSet<Token>,
-    /// Its annotations, its glosses' and its citations'.
-    pub marks: BTreeSet<Token>,
-    /// The claims of each occurrence of its witness, one tuple each (an
-    /// occurrence that claims nothing is none).
-    pub occurrences: BTreeSet<BTreeSet<Token>>,
+    /// Its annotations, its glosses', its citations' and its witnesses',
+    /// each as often as an entity carries it.
+    pub marks: Multiset<Token>,
+    /// The claims of each occurrence of its witness, one tuple per
+    /// occurrence entity (an occurrence that claims nothing is none).
+    pub occurrences: Multiset<BTreeSet<Token>>,
     /// Its links: the attribute, and the node it names (`None` when no
     /// window holds it).
     pub links: Vec<(String, Option<usize>)>,
@@ -77,8 +84,8 @@ pub struct GraphNode {
 #[derive(Clone, Debug, Default)]
 struct Rendering {
     facts: BTreeSet<Token>,
-    marks: BTreeSet<Token>,
-    occurrences: BTreeSet<BTreeSet<Token>>,
+    marks: Multiset<Token>,
+    occurrences: Multiset<BTreeSet<Token>>,
     links: Vec<(String, Id)>,
 }
 
@@ -123,6 +130,11 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
                     None
                 }
                 [one] => Some(*one),
+                // A node with several predecessors is reported, never
+                // followed: the gate verifies one window at a time, and a
+                // node on two windows at once is no window a request was
+                // sampled from. A converged node has one predecessor,
+                // because its id derives from it.
                 _ => {
                     renderer.rows.push((
                         "window:previous".to_owned(),
@@ -144,8 +156,8 @@ pub fn render<B: BlobStoreGet>(facts: &TribleSet, blobs: &B) -> Rendered {
                 .filter(|token| !super::walk::positional(token))
                 .cloned()
                 .collect();
-            tokens.extend(rendering.marks.iter().cloned());
-            for claims in &rendering.occurrences {
+            tokens.extend(rendering.marks.keys().cloned());
+            for claims in rendering.occurrences.keys() {
                 tokens.extend(claims.iter().cloned());
             }
             graph.push(GraphNode {
@@ -191,6 +203,21 @@ fn term(specs: &[(Id, &str)], id: Id) -> Value {
         Some((_, name)) => Value::Term((*name).to_owned()),
         None => Value::Term(format!("{id:X}")),
     }
+}
+
+/// The shape of a node that holds no fact: an item of its window that no
+/// source item is (G11).
+pub fn empty() -> Token {
+    Token {
+        modality: String::new(),
+        direction: String::new(),
+        attribute: String::new(),
+        value: Value::Term("empty".to_owned()),
+    }
+}
+
+fn count(marks: &mut Multiset<Token>, token: Token) {
+    *marks.entry(token).or_default() += 1;
 }
 
 fn annotation(attribute: &str, value: Value) -> Token {
@@ -240,7 +267,8 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
     }
 
     /// The `metadata::name`s of an entity (a media type, a sense, a vendor
-    /// model), each as a text value.
+    /// model), each as a text value. An entity with no name renders as its
+    /// id, a value no source has (G10).
     fn names(&mut self, entity: Id, at: &str) -> Vec<Value> {
         self.reached.insert(entity);
         let handles: Vec<Inline<Handle<UTF8String>>> = find!(
@@ -248,6 +276,9 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             pattern!(self.facts, [{ entity @ metadata::name: ?name }])
         )
         .collect();
+        if handles.is_empty() {
+            return vec![Value::Raw(format!("{entity:X}"))];
+        }
         handles
             .into_iter()
             .map(|handle| self.text(handle.transmute(), at))
@@ -268,47 +299,51 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         }
         self.reached.insert(node);
         let mut rendering = Rendering::default();
-        let mut tokens = BTreeSet::new();
+        let mut tokens: Multiset<Token> = Multiset::new();
         let links = [
             ("responds_to", main::block::responds_to.id()),
             ("continues", v3::node::continues.id()),
             ("spawned_by", v3::node::spawned_by.id()),
             ("recalls", v3::node::recalls.id()),
         ];
+        let ends: Vec<(Id, &str)> = v3::node::ends::SPECS
+            .iter()
+            .map(|(id, name, _)| (*id, *name))
+            .collect();
+        let mut held = false;
         for (attribute, raw) in self.attributes(node) {
             if attribute == main::block::holds.id() {
-                if let Some(fact) = Self::id(raw) {
-                    self.fact(fact, &mut rendering.facts);
+                match Self::id(raw) {
+                    Some(fact) => {
+                        held = true;
+                        self.fact(fact, &mut rendering.facts);
+                    }
+                    None => count(&mut tokens, unknown(attribute, raw)),
                 }
             } else if let Some((name, _)) = links.iter().find(|(_, id)| *id == attribute) {
                 match Self::id(raw) {
                     Some(target) => rendering.links.push(((*name).to_owned(), target)),
-                    None => {
-                        tokens.insert(unknown(attribute, raw));
-                    }
+                    None => count(&mut tokens, unknown(attribute, raw)),
                 }
             } else if attribute == main::block::previous.id()
                 || (attribute == metadata::tag.id() && Self::id(raw) == Some(main::block::KIND))
             {
             } else if attribute == v3::node::ends.id() {
-                let name = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| {
-                    let specs: Vec<(Id, &str)> = v3::node::ends::SPECS
-                        .iter()
-                        .map(|(id, name, _)| (*id, *name))
-                        .collect();
-                    term(&specs, id)
-                });
-                tokens.insert(annotation("ends", name));
+                let name = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| term(&ends, id));
+                count(&mut tokens, annotation("ends", name));
             } else if attribute == v3::node::rendering.id() {
                 let name = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| {
                     term(v3::node::rendering::SPECS, id)
                 });
-                tokens.insert(annotation("rendering", name));
+                count(&mut tokens, annotation("rendering", name));
             } else if attribute == main::block::timestamp.id() {
-                tokens.insert(annotation("timestamp", time(raw)));
+                count(&mut tokens, annotation("timestamp", time(raw)));
             } else {
-                tokens.insert(unknown(attribute, raw));
+                count(&mut tokens, unknown(attribute, raw));
             }
+        }
+        if !held {
+            rendering.facts.insert(empty());
         }
         let witnesses: Vec<Id> = find!(
             witness: Id,
@@ -317,7 +352,11 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         .collect();
         for witness in witnesses {
             self.reached.insert(witness);
-            self.claims(witness, &mut tokens);
+            let mut claims = BTreeSet::new();
+            self.claims(witness, true, &mut claims);
+            for token in claims {
+                count(&mut tokens, token);
+            }
             let occurrences: Vec<Id> = find!(
                 occurrence: Id,
                 pattern!(self.facts, [{ ?occurrence @ v3::occurrence::of: witness }])
@@ -326,12 +365,15 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             for occurrence in occurrences {
                 self.reached.insert(occurrence);
                 let mut claims = BTreeSet::new();
-                self.claims(occurrence, &mut claims);
+                self.claims(occurrence, false, &mut claims);
                 if !claims.is_empty() {
-                    rendering.occurrences.insert(claims);
+                    *rendering.occurrences.entry(claims).or_default() += 1;
                 }
             }
         }
+        // Each gloss as one entity: its kind and text, and the model that
+        // wrote it under its kind. One without a kind or a text renders as
+        // `gloss:incomplete`, which no source names.
         let glossed: Vec<Id> = find!(
             gloss: Id,
             pattern!(self.facts, [{ ?gloss @ v3::gloss::describes: node }])
@@ -339,84 +381,96 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         .collect();
         for gloss in glossed {
             self.reached.insert(gloss);
+            let mut kinds = Vec::new();
+            let mut texts = Vec::new();
+            let mut models = Vec::new();
             for (attribute, raw) in self.attributes(gloss) {
-                if attribute == v3::gloss::generated_by.id() {
-                    if let Some(model) = Self::id(raw) {
-                        self.reached.insert(model);
+                if attribute == v3::gloss::category.id() {
+                    kinds.push(Self::id(raw).map_or_else(
+                        || hex(&raw.raw),
+                        |id| name_of(v3::gloss::category::SPECS, id),
+                    ));
+                } else if attribute == v3::gloss::text.id() {
+                    texts.push(self.text(raw, "annotation/gloss"));
+                } else if attribute == v3::gloss::generated_by.id() {
+                    match Self::id(raw) {
+                        Some(model) => models.extend(self.names(model, "annotation/gloss")),
+                        None => models.push(Value::Raw(hex(&raw.raw))),
                     }
                 } else if attribute != v3::gloss::describes.id()
-                    && attribute != v3::gloss::category.id()
-                    && attribute != v3::gloss::text.id()
                     && !(attribute == metadata::tag.id() && Self::id(raw) == Some(v3::gloss::KIND))
                 {
-                    tokens.insert(unknown(attribute, raw));
+                    count(&mut tokens, unknown(attribute, raw));
+                }
+            }
+            if kinds.is_empty() || texts.is_empty() {
+                count(
+                    &mut tokens,
+                    annotation("gloss:incomplete", Value::Raw(format!("{gloss:X}"))),
+                );
+            }
+            for kind in &kinds {
+                for text in &texts {
+                    count(
+                        &mut tokens,
+                        annotation(&format!("gloss:{kind}"), text.clone()),
+                    );
+                }
+                for model in &models {
+                    count(
+                        &mut tokens,
+                        annotation(&format!("gloss:{kind}:generated_by"), model.clone()),
+                    );
                 }
             }
         }
-        let glosses: Vec<(Id, Inline<Handle<UTF8String>>)> = find!(
-            (category: Id, text: Inline<Handle<UTF8String>>),
-            pattern!(self.facts, [{ _?gloss @
-                v3::gloss::describes: node,
-                v3::gloss::category: ?category,
-                v3::gloss::text: ?text,
-            }])
-        )
-        .collect();
-        for (category, text) in glosses {
-            let name = match term(v3::gloss::category::SPECS, category) {
-                Value::Term(name) => name,
-                _ => unreachable!("term renders a term"),
-            };
-            let value = self.text(text.transmute(), "annotation/gloss");
-            tokens.insert(annotation(&format!("gloss:{name}"), value));
-        }
+        // Each citation as one entity; one without its span or uri renders
+        // as `citation:incomplete`, which no source names.
         let cited: Vec<Id> = find!(
             citation: Id,
             pattern!(self.facts, [{ ?citation @ v3::citation::cites: node }])
         )
         .collect();
+        let span = |value: Raw| match value.transmute::<U256BE>().try_from_inline::<u128>() {
+            Ok(n) => n.to_string(),
+            Err(_) => hex(&value.raw),
+        };
         for citation in cited {
             self.reached.insert(citation);
+            let (mut starts, mut stops, mut uris) = (Vec::new(), Vec::new(), Vec::new());
             for (attribute, raw) in self.attributes(citation) {
-                if attribute != v3::citation::cites.id()
-                    && attribute != v3::citation::start.id()
-                    && attribute != v3::citation::end.id()
-                    && attribute != v3::citation::uri.id()
+                if attribute == v3::citation::start.id() {
+                    starts.push(span(raw));
+                } else if attribute == v3::citation::end.id() {
+                    stops.push(span(raw));
+                } else if attribute == v3::citation::uri.id() {
+                    uris.push(match self.text(raw, "annotation/citation") {
+                        Value::Text(uri) => uri,
+                        other => format!("{other:?}"),
+                    });
+                } else if attribute != v3::citation::cites.id()
                     && !(attribute == metadata::tag.id()
                         && Self::id(raw) == Some(v3::citation::KIND))
                 {
-                    tokens.insert(unknown(attribute, raw));
+                    count(&mut tokens, unknown(attribute, raw));
                 }
             }
-        }
-        let citations: Vec<(Inline<U256BE>, Inline<U256BE>, Inline<Handle<UTF8String>>)> = find!(
-            (start: Inline<U256BE>, end: Inline<U256BE>, uri: Inline<Handle<UTF8String>>),
-            pattern!(self.facts, [{ _?citation @
-                v3::citation::cites: node,
-                v3::citation::start: ?start,
-                v3::citation::end: ?end,
-                v3::citation::uri: ?uri,
-            }])
-        )
-        .collect();
-        for (start, end, uri) in citations {
-            let uri = self.text(uri.transmute(), "annotation/citation");
-            let span = |value: Inline<U256BE>| match value.try_from_inline::<u128>() {
-                Ok(n) => n.to_string(),
-                Err(_) => hex(&value.raw),
-            };
-            tokens.insert(annotation(
-                "citation",
-                Value::Text(format!(
-                    "{}..{} {}",
-                    span(start),
-                    span(end),
-                    match uri {
-                        Value::Text(uri) => uri,
-                        other => format!("{other:?}"),
+            if starts.is_empty() || stops.is_empty() || uris.is_empty() {
+                count(
+                    &mut tokens,
+                    annotation("citation:incomplete", Value::Raw(format!("{citation:X}"))),
+                );
+            }
+            for start in &starts {
+                for stop in &stops {
+                    for uri in &uris {
+                        count(
+                            &mut tokens,
+                            annotation("citation", Value::Text(format!("{start}..{stop} {uri}"))),
+                        );
                     }
-                )),
-            ));
+                }
+            }
         }
         rendering.marks = tokens;
         self.nodes.insert(node, rendering.clone());
@@ -544,14 +598,17 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 continue;
             }
             if attribute == v3::fact::structure.id() {
-                if let Some(root) = Self::id(raw) {
-                    let mut leaves = Vec::new();
-                    self.json(root, &mut String::new(), &mut leaves, 0);
-                    values.extend(
-                        leaves
-                            .into_iter()
-                            .map(|leaf| ("structure".to_owned(), leaf)),
-                    );
+                match Self::id(raw) {
+                    Some(root) => {
+                        let mut leaves = Vec::new();
+                        self.json(root, &mut String::new(), &mut leaves, 0);
+                        values.extend(
+                            leaves
+                                .into_iter()
+                                .map(|leaf| ("structure".to_owned(), leaf)),
+                        );
+                    }
+                    None => values.push(("structure".to_owned(), Value::Raw(hex(&raw.raw)))),
                 }
                 continue;
             }
@@ -730,19 +787,46 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         }
     }
 
-    /// The claims on a witness or on one of its occurrences.
-    fn claims(&mut self, witness: Id, tokens: &mut BTreeSet<Token>) {
-        for (attribute, raw) in self.attributes(witness) {
-            let w = &main::source_projection::KIND;
-            if attribute == main::source_projection::source_namespace.id()
-                || attribute == main::source_projection::projects_to.id()
-                || attribute == v3::occurrence::of.id()
-                || (attribute == metadata::tag.id() && Self::id(raw) == Some(v3::occurrence::KIND))
-                || attribute == main::source_projection::semantic_predecessor_support.id()
-                || attribute == main::source_projection::author.id()
-                || attribute == main::source_projection::experiencer.id()
-                || (attribute == metadata::tag.id() && Self::id(raw).as_ref() == Some(w))
+    /// The claims on a witness (`witness`) or on one of its occurrences.
+    /// Only what makes it one of those is structure; every claim renders
+    /// (G10): the witness's `source_namespace`, an occurrence's `ends`
+    /// (ruling M1), and an `author` or `experiencer`, which no source table
+    /// declares, under its own name.
+    fn claims(&mut self, entity: Id, witness: bool, tokens: &mut BTreeSet<Token>) {
+        let (kind, structure) = if witness {
+            (
+                main::source_projection::KIND,
+                main::source_projection::projects_to.id(),
+            )
+        } else {
+            (v3::occurrence::KIND, v3::occurrence::of.id())
+        };
+        let ends: Vec<(Id, &str)> = v3::node::ends::SPECS
+            .iter()
+            .map(|(id, name, _)| (*id, *name))
+            .collect();
+        for (attribute, raw) in self.attributes(entity) {
+            if attribute == structure
+                || (attribute == metadata::tag.id() && Self::id(raw) == Some(kind))
             {
+                continue;
+            }
+            if attribute == main::source_projection::source_namespace.id() {
+                let value = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| {
+                    term(v3::witness::NAMESPACES, id)
+                });
+                tokens.insert(annotation("source_namespace", value));
+                continue;
+            }
+            if attribute == main::source_projection::author.id()
+                || attribute == main::source_projection::experiencer.id()
+            {
+                let name = if attribute == main::source_projection::author.id() {
+                    "author"
+                } else {
+                    "experiencer"
+                };
+                tokens.insert(annotation(name, Value::Raw(hex(&raw.raw))));
                 continue;
             }
             if attribute == metadata::tag.id()
@@ -795,16 +879,17 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 }
                 continue;
             }
-            if attribute == v3::witness::turn_ends.id() {
-                let specs: Vec<(Id, &str)> = v3::node::ends::SPECS
-                    .iter()
-                    .map(|(id, name, _)| (*id, *name))
-                    .collect();
+            if attribute == v3::witness::turn_ends.id() || attribute == v3::witness::ends.id() {
+                let name = if attribute == v3::witness::ends.id() {
+                    "ends"
+                } else {
+                    "turn_ends"
+                };
                 let value = match Self::id(raw) {
-                    Some(id) => term(&specs, id),
+                    Some(id) => term(&ends, id),
                     None => Value::Raw(hex(&raw.raw)),
                 };
-                tokens.insert(annotation("turn_ends", value));
+                tokens.insert(annotation(name, value));
                 continue;
             }
             if attribute == main::source_projection::source_timestamp.id() {

@@ -56,6 +56,9 @@
 pub struct FieldTable {
     /// Format name used in gate reports, e.g. `claude-code`.
     pub format: &'static str,
+    /// The term name of the source namespace every witness of the format
+    /// names ([`crate::schemas::archive_v3::witness::NAMESPACES`]).
+    pub namespace: &'static str,
     /// A unit is JSON Lines (one record value per line) rather than one
     /// JSON document.
     pub jsonl: bool,

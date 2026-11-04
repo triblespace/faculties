@@ -177,6 +177,9 @@ pub struct Item {
     pub pairs: Vec<Pair>,
     /// Claims of records that hold no node, which the file gives to it.
     pub claims: Vec<BTreeSet<Token>>,
+    /// Why the sampling that produced it stopped: claims of its own
+    /// occurrence (ruling M1), never marks of the node that holds it.
+    pub ends: BTreeSet<Token>,
 }
 
 /// The record of a gap item.
@@ -191,6 +194,17 @@ pub fn shape(modality: &str, direction: &str) -> Token {
         direction: direction.to_owned(),
         attribute: String::new(),
         value: Value::Term(String::new()),
+    }
+}
+
+/// The claim every witness of the table's format makes: its source
+/// namespace, by term name.
+pub fn namespace(table: &FieldTable) -> Token {
+    Token {
+        modality: String::new(),
+        direction: String::new(),
+        attribute: "source_namespace".to_owned(),
+        value: Value::Term(table.namespace.to_owned()),
     }
 }
 
@@ -1056,6 +1070,7 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
             carried: BTreeSet::new(),
             pairs: Vec::new(),
             claims: Vec::new(),
+            ends: BTreeSet::new(),
         });
         let item = walker.out.items.len() - 1;
         walker.out.gap_items.insert(*gap, item);
@@ -1072,6 +1087,20 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         walker.document(source, 0);
     }
     walker.finish();
+    // Every witness names the format's namespace: one token of the unit,
+    // where a record holds anything.
+    if walker.out.items.iter().any(|item| item.held) {
+        walker
+            .out
+            .tokens
+            .entry(namespace(table))
+            .or_default()
+            .push(Origin {
+                path: "<witness>".to_owned(),
+                record: None,
+                index: Vec::new(),
+            });
+    }
     walker.out
 }
 
@@ -1797,6 +1826,7 @@ impl<'t> Walker<'t> {
                         carried: BTreeSet::new(),
                         pairs: Vec::new(),
                         claims: Vec::new(),
+                        ends: BTreeSet::new(),
                     });
                     self.out.records[record].header = Some(self.out.items.len() - 1);
                     self.out.items.len() - 1
@@ -1819,6 +1849,7 @@ impl<'t> Walker<'t> {
                         carried: BTreeSet::new(),
                         pairs: Vec::new(),
                         claims: Vec::new(),
+                        ends: BTreeSet::new(),
                     });
                     let item = self.out.items.len() - 1;
                     self.out.records[record].items.push(item);
@@ -1914,6 +1945,7 @@ impl<'t> Walker<'t> {
                         carried: BTreeSet::new(),
                         pairs: Vec::new(),
                         claims: Vec::new(),
+                        ends: BTreeSet::new(),
                     });
                     let item = self.out.items.len() - 1;
                     self.out.records[record].items.push(item);
@@ -2298,6 +2330,7 @@ impl<'t> Walker<'t> {
                     carried: BTreeSet::new(),
                     pairs: Vec::new(),
                     claims: Vec::new(),
+                    ends: BTreeSet::new(),
                 });
                 let sent = self.out.items.len() - 1;
                 self.out.wire.insert(*call, sent);
@@ -2545,6 +2578,8 @@ impl<'t> Walker<'t> {
                 for item in items {
                     if every {
                         out.items[item].carried.insert(token.clone());
+                    } else if token.attribute == "ends" {
+                        out.items[item].ends.insert(token.clone());
                     } else {
                         out.items[item].marks.insert(token.clone());
                     }
@@ -2649,7 +2684,7 @@ impl Walker<'_> {
                             && out.items[item].tokens.iter().any(|t| t.direction == "out")
                     });
                 if let Some(item) = last_out {
-                    out.items[item].marks.insert(token.clone());
+                    out.items[item].ends.insert(token.clone());
                     out.tokens.entry(token).or_default().push(Origin {
                         path,
                         record: Some(at),

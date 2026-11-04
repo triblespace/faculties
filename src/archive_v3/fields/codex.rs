@@ -1626,6 +1626,7 @@ const ROLLED_BACK: &[Cond] = &[
 pub const TABLE: FieldTable = FieldTable {
     jsonl: true,
     format: "codex",
+    namespace: "codex",
     discriminators: &["type", "role"],
     id_keyed: &[],
     record: "",

@@ -1283,6 +1283,8 @@ fn real_sample() {
     let mut passed = 0;
     let mut import_failed = 0;
     let mut gate_failed = 0;
+    let m1 = std::env::var_os("AV3_M1").is_some();
+    let mut unattributable = 0;
     let mut unread = 0;
     let mut skipped = 0;
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
@@ -1324,6 +1326,12 @@ fn real_sample() {
                     .or_default() += 1;
             }
             Ok(mut fragment) => {
+                // AV3_M1: gate the output with each node's `ends` moved to
+                // its one occurrence (ruling M1), to see what else fails.
+                if m1 && gate::tests::occurrence_ends(&mut fragment).is_err() {
+                    unattributable += 1;
+                    continue;
+                }
                 let blobs = fragment.blobs_mut().snapshot().unwrap();
                 let report = gate::check(&TABLE, &bytes, fragment.facts(), &blobs);
                 if report.passed() {
@@ -1349,6 +1357,9 @@ fn real_sample() {
                 }
             }
         }
+    }
+    if m1 {
+        println!("AV3_M1: ends moved to occurrences; unattributable {unattributable}");
     }
     println!(
         "files {} skipped-over-400MB {} unread {} passed {} import-failed {} gate-failed {}",

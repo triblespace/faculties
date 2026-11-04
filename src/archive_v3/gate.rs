@@ -52,7 +52,14 @@
 //! its table says ([`crate::archive_v3::fields::Place`]) and A renders each
 //! node's own, so `ends` on the wrong node, a gloss moved or doubled, or
 //! claims swapped between records fail even when every value is in the
-//! source. A witness's occurrences compare as tuples, one per record. A link
+//! source. A witness's occurrences compare as tuples, one per record, and
+//! carry why that record's sampling stopped (`ends`, ruling M1): a node
+//! carries none, so two records converging on one node keep which stopped
+//! which way. Marks and occurrences compare with counts (G12): A counts the
+//! entities it reads (a gloss, a witness, an occurrence), and the source
+//! places each distinct one once, because the model converges identical
+//! claims (an occurrence's id derives from its claims, a gloss's from its
+//! node, kind and text). A link
 //! is named by place, never by id: `responds_to` by how many items back its
 //! call stands in the window, `recalls` and `continues` by the hash of the
 //! window that ends at their target. B establishes them from the source:
@@ -482,7 +489,7 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
         note(window_path(token), Kind::Invented, ordinal.to_string());
     }
 
-    for (path, kind, what) in occurrences(walked, rendered) {
+    for (path, kind, what) in occurrences(table, walked, rendered) {
         note(path, kind, what);
     }
 
@@ -499,8 +506,12 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
     }
 }
 
+/// A multiset: each element with how often it occurs.
+pub type Multiset<T> = BTreeMap<T, usize>;
+
 /// What the source places at one window position: whether a record holds
 /// it there (its own window), its marks, its links and its occurrences.
+/// Each distinct mark and occurrence is placed once (see the module docs).
 #[derive(Debug, Default)]
 struct Expect {
     witnessed: bool,
@@ -526,7 +537,11 @@ fn place(hash: &Hash) -> Value {
 /// its record, and every source window against the witnessed windows; then
 /// every node's marks, links and occurrences against what the source places
 /// at its window position.
-fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(String, Kind, String)> {
+fn occurrences(
+    table: &FieldTable,
+    walked: &walk::Walked,
+    rendered: &render::Rendered,
+) -> Vec<(String, Kind, String)> {
     let mut rows = Vec::new();
     let facts: Vec<&BTreeSet<Token>> = rendered.graph.iter().map(|node| &node.facts).collect();
     let mut ids: BTreeMap<&BTreeSet<Token>, u32> = BTreeMap::new();
@@ -539,10 +554,9 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
         .iter()
         .map(|item| intern(&item.tokens))
         .collect();
-    let node_ids: Vec<Option<u32>> = facts
-        .iter()
-        .map(|tokens| (!tokens.is_empty()).then(|| intern(tokens)))
-        .collect();
+    // Every node is an item: A renders a node that holds nothing as the
+    // `empty` shape (G11), which no source item has.
+    let node_ids: Vec<u32> = facts.iter().map(|tokens| intern(tokens)).collect();
 
     // A's window hashes, root first; a node is placed after its previous.
     let mut node_hash: Vec<Option<Hash>> = vec![None; rendered.graph.len()];
@@ -563,10 +577,7 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
                 .previous
                 .and_then(|previous| node_hash[previous])
                 .unwrap_or([0; 32]);
-            node_hash[at] = Some(match node_ids[at] {
-                Some(id) => step(&before, id),
-                None => before,
-            });
+            node_hash[at] = Some(step(&before, node_ids[at]));
         }
     }
     let held: HashSet<Hash> = rendered
@@ -656,10 +667,13 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
             })
             .or_else(|| valued().next().map(window_path))
             .or_else(|| {
-                facts[at]
-                    .iter()
-                    .next()
-                    .map(|token| format!("window:{}/{}/absent", token.modality, token.direction))
+                facts[at].iter().next().map(|token| {
+                    if *token == render::empty() {
+                        "window:empty".to_owned()
+                    } else {
+                        format!("window:{}/{}/absent", token.modality, token.direction)
+                    }
+                })
             })
             .unwrap_or_else(|| "window:empty".to_owned())
     };
@@ -682,14 +696,15 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
         let mut window = Vec::new();
         let mut cursor = Some(at);
         while let Some(up) = cursor {
-            window.extend(node_ids[up]);
+            window.push(node_ids[up]);
             cursor = rendered.graph[up].previous;
         }
         // An order fault: the window holds what the source holds before a
         // record, and as many of that record's own items as it should, in
         // another order.
         let window = multiset(window);
-        let reordered = node_ids[at].is_some_and(|id| {
+        let id = node_ids[at];
+        let reordered = {
             occurrences
                 .iter()
                 .filter(|o| item_ids[o.item] == id)
@@ -717,7 +732,7 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
                             Err(_) => false,
                         })
                 })
-        });
+        };
         let kind = if reordered { Kind::Order } else { Kind::Count };
         rows.push((path_of(at), kind, format!("node {at}")));
     }
@@ -765,11 +780,14 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
         let item = &walked.items[occurrence.item];
         let at = expect.entry(occurrence.hash).or_default();
         at.witnessed = true;
+        at.marks.insert(walk::namespace(table));
         at.marks.extend(item.marks.iter().cloned());
         at.marks.extend(item.carried.iter().cloned());
-        let claims = walked.records_claims(occurrence.record);
+        // The record's claims, and why its sampling of this item stopped.
+        let mut claims = walked.records_claims(occurrence.record).clone();
+        claims.extend(item.ends.iter().cloned());
         if !claims.is_empty() {
-            at.occurrences.insert(claims.clone());
+            at.occurrences.insert(claims);
         }
         at.occurrences.extend(item.claims.iter().cloned());
         // A link: the latest candidate before the item in its window, by
@@ -903,7 +921,8 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
         }
         let expected = expect.get(&hash).unwrap_or(&none);
         let label = format!("node {at}");
-        for token in node.marks.symmetric_difference(&expected.marks) {
+        let marks: Multiset<Token> = expected.marks.iter().map(|t| (t.clone(), 1)).collect();
+        for token in differing(&node.marks, &marks) {
             let path = walked
                 .tokens
                 .get(token)
@@ -962,11 +981,27 @@ fn occurrences(walked: &walk::Walked, rendered: &render::Rendered) -> Vec<(Strin
                 label.clone(),
             ));
         }
-        if node.witnessed && expected.witnessed && node.occurrences != expected.occurrences {
+        let tuples: Multiset<BTreeSet<Token>> = expected
+            .occurrences
+            .iter()
+            .map(|t| (t.clone(), 1))
+            .collect();
+        if node.witnessed && expected.witnessed && node.occurrences != tuples {
             rows.push(("window:occurrence".to_owned(), Kind::Placed, label.clone()));
         }
     }
     rows
+}
+
+/// The elements whose counts differ between two multisets.
+fn differing<'a, T: Ord>(a: &'a Multiset<T>, b: &'a Multiset<T>) -> Vec<&'a T> {
+    let mut out: Vec<&T> = a
+        .iter()
+        .filter(|(t, n)| b.get(*t) != Some(*n))
+        .map(|(t, _)| t)
+        .collect();
+    out.extend(b.keys().filter(|t| !a.contains_key(*t)));
+    out
 }
 
 fn window_path(token: &Token) -> String {

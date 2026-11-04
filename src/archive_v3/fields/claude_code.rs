@@ -1541,6 +1541,7 @@ const ENTRIES: [Entry; LEN] = concat_entries(&[
 pub const TABLE: FieldTable = FieldTable {
     jsonl: true,
     format: "claude-code",
+    namespace: "claude-code",
     discriminators: &["type"],
     id_keyed: &[],
     record: "",

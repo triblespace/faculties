@@ -291,9 +291,12 @@ pub mod node {
         "F7A56A509F4A72CB04997EAFE0A7D0CE" as pub spawned_by: GenId;
         /// ANNOTATION. A re-presented copy points to its original.
         "6D68E246D6D0585336DB523253625D53" as pub recalls: GenId;
-        /// ANNOTATION. Why the message (or, for `CUT`, the item) ended here,
-        /// see [`ends`]. Whatever was rendered to her about it is an `in`
-        /// fact of its own.
+        /// Why the message (or, for `CUT`, the item) ended here, see
+        /// [`ends`]. It is a claim of one sampling, so it belongs to the
+        /// occurrence of the record that stopped (ruling M1, as
+        /// [`super::witness::ends`]), never to the node: two records with the
+        /// same text converge on one node and may have stopped differently.
+        /// Whatever was rendered to her about it is an `in` fact of its own.
         "94D56771E2B6852DEBEB5F413EEA27ED" as pub ends: GenId;
         /// ANNOTATION. How the source recorded what the node holds, see
         /// [`rendering`]. A window holding a node marked `unrecorded` is
@@ -377,12 +380,32 @@ pub mod witness {
     /// never a spelling of who wrote it. Minted with `trible genid`
     /// 2026-11-04.
     pub const HARNESS_WRITTEN: Id = id_hex!("1F44A09823DCDC73A2D7C48371BE8724");
+    /// OCCURRENCE CORE. Why the sampling that produced the held item
+    /// stopped (an [`super::node::ends`] term): a claim of this one record
+    /// (ruling M1). The same attribute as the node's, which carries none.
+    pub use super::node::ends;
     /// Nonidentity kind marker attached after construction. Same id as main.
     pub use crate::schemas::blockdag::source_projection::KIND;
+    /// The source namespaces a witness names, by the term name the gate
+    /// renders and a field table declares ([`crate::archive_v3::fields::FieldTable::namespace`]).
+    pub const NAMESPACES: &[(Id, &str)] = &[
+        (SOURCE_CLAUDE_CODE, "claude-code"),
+        (SOURCE_CODEX, "codex"),
+        (SOURCE_CHATGPT, "chatgpt"),
+        (SOURCE_CLAUDE_WEB, "claude-web"),
+        (SOURCE_GEMINI, "gemini"),
+        (SOURCE_COPILOT, "copilot"),
+        (SOURCE_AGY, "antigravity"),
+        (SOURCE_DRIVE, "drive"),
+    ];
     /// OCCURRENCE CORE. Relations entities that produced and observed it.
     pub use crate::schemas::blockdag::source_projection::{author, experiencer};
     /// OCCURRENCE CORE. Exact source spellings.
     pub use crate::schemas::blockdag::source_projection::{raw_author, raw_model, raw_role};
+    use crate::schemas::blockdag::source_projection::{
+        SOURCE_AGY, SOURCE_CHATGPT, SOURCE_CLAUDE_CODE, SOURCE_CLAUDE_WEB, SOURCE_CODEX,
+        SOURCE_COPILOT, SOURCE_DRIVE, SOURCE_GEMINI,
+    };
 
     attributes! {
         /// OCCURRENCE CORE. The provider's reference for content the source does
@@ -399,7 +422,8 @@ pub mod witness {
         /// OCCURRENCE CORE. Why the turn the record closes ended, an
         /// [`super::node::ends`] term, as a claim of a record that holds no
         /// node: Codex's `turn_aborted` (ruling X5). Where she produced
-        /// something in the turn, her last node also carries `ends`.
+        /// something in the turn, the occurrence of her last node also
+        /// carries `ends`.
         /// Minted with `trible genid` 2026-11-04.
         "6A57A45D78882898439B5B5ABF4DDD27" as pub turn_ends: GenId;
     }
@@ -411,7 +435,7 @@ pub mod witness {
 /// CORE: `of` (the witness) and every claim the record makes, with the
 /// witness attributes above (`timestamp`, `source_locator`, `raw_role`,
 /// `raw_model`, `raw_author`, `generated_by`, `pointer`, the `claimed_*`
-/// attributes and the compaction tag). Two records that hold the same node
+/// attributes, `ends`, `turn_ends` and the tags). Two records that hold the same node
 /// give two occurrences of its one witness unless they claim the same.
 pub mod occurrence {
     use super::*;

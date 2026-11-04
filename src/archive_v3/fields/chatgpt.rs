@@ -176,6 +176,7 @@ const ENTRIES: &[Entry] = &[
 pub const TABLE: FieldTable = FieldTable {
     jsonl: false,
     format: "chatgpt",
+    namespace: "chatgpt",
     discriminators: &["content_type"],
     id_keyed: &["[].mapping"],
     record: NODE,
