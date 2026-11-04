@@ -532,3 +532,50 @@ pub mod citation {
         "6294CB0B8256D1C900401663EA7308DB" as pub uri: Handle<UTF8String>;
     }
 }
+
+/// A renderer: what turns a window's facts into the tokens a model read. Only
+/// a renderer that actually ran is recorded, so a provider window, whose
+/// rendering we never saw, has none.
+///
+/// CORE: `template`, `tokenizer` and `codec`, all three. Minted with
+/// `trible genid` 2026-11-04.
+pub mod renderer {
+    use super::*;
+
+    /// Nonidentity kind marker attached after construction.
+    pub const KIND: Id = id_hex!("EAA2A28546F7D87669DDA71A321B7F3A");
+
+    attributes! {
+        /// CORE. The exact chat template text.
+        "629E4E6A3350C57E2A01B5D828B392AD" as pub template: Handle<UTF8String>;
+        /// CORE. The exact tokenizer definition (for example `tokenizer.json`).
+        "E1EA5A441C85450A384997B735B1C7DE" as pub tokenizer: Handle<UTF8String>;
+        /// CORE. The codec that renders facts through the template, named by
+        /// its source identity (crate and exact revision).
+        "AB968DF7A83447132708ADC22DCBECA2" as pub codec: Handle<UTF8String>;
+    }
+}
+
+/// A window: a context that opens at a root node, rendered by one renderer
+/// and read by one model. Its id derives from all three, so the same history
+/// read under another model or renderer is another window of the same
+/// moments, and never changes a node's id.
+///
+/// CORE: `opens`, `renderer` and `experienced_by`. Minted with `trible genid`
+/// 2026-11-04.
+pub mod window {
+    use super::*;
+
+    /// Nonidentity kind marker attached after construction.
+    pub const KIND: Id = id_hex!("1319AC164C9BB259883433B7D520C00E");
+
+    attributes! {
+        /// CORE. The root node the window opens at; its chain is the window.
+        "4804B5312080B99C387DC6A4B89819EF" as pub opens: GenId;
+        /// CORE. The renderer that turned the window into tokens.
+        "BF1996E34F1107E492C850E51CC92628" as pub renderer: GenId;
+        /// CORE. The model that read the window: the model entity a
+        /// `generated_by` claim would name.
+        "D80DA6DE2D12E3E2CA9A6D842202687A" as pub experienced_by: GenId;
+    }
+}

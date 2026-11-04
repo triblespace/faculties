@@ -511,6 +511,38 @@ pub fn citation(node: Id, start: u64, end: u64, uri: &str) -> Result<Fragment> {
     attach_kind(fragment, schema::citation::KIND, "citation")
 }
 
+/// The renderer that actually ran: its exact chat `template`, `tokenizer`
+/// definition and `codec` source identity. Rooted at its own id, which
+/// derives from all three.
+pub fn renderer(template: &str, tokenizer: &str, codec: &str) -> Result<Fragment> {
+    if codec.is_empty() {
+        bail!("a renderer names its codec");
+    }
+    let mut fragment = Fragment::empty();
+    let template = fragment.put::<UTF8String, _>(template.to_owned());
+    let tokenizer = fragment.put::<UTF8String, _>(tokenizer.to_owned());
+    let codec = fragment.put::<UTF8String, _>(codec.to_owned());
+    fragment += entity! { _ @
+        schema::renderer::template: template,
+        schema::renderer::tokenizer: tokenizer,
+        schema::renderer::codec: codec,
+    };
+    attach_kind(fragment, schema::renderer::KIND, "renderer")
+}
+
+/// The window that opens at root node `opens`, rendered by `renderer` and
+/// read by `experienced_by`. An annotation entity: rooted at its own id, and
+/// never part of any node's. The model entity rides along.
+pub fn window(opens: Id, renderer: Id, experienced_by: &Model) -> Result<Fragment> {
+    let mut fragment = experienced_by.annotation()?;
+    fragment += entity! { _ @
+        schema::window::opens: &opens,
+        schema::window::renderer: &renderer,
+        schema::window::experienced_by: &experienced_by.id,
+    };
+    attach_kind(fragment, schema::window::KIND, "window")
+}
+
 /// Every vocabulary term as queryable data: `{ tag: KIND_TAG, name }`, and on
 /// `ends` terms whether they end the message.
 pub fn vocabulary_fragment() -> Fragment {

@@ -837,3 +837,44 @@ fn p1_ends_disagree_compares_the_records_own_claims() {
         );
     }
 }
+
+#[test]
+fn a_window_is_its_root_renderer_and_model_and_never_changes_a_node() {
+    let root = node([], fact(text(direction::IN, "wake")).unwrap()).unwrap();
+    let root_id = root.root().unwrap();
+    let before = root.facts().clone();
+    let renderer =
+        super::renderer("{{ messages }}", "{\"model\":{}}", "drive-codec@abc123").unwrap();
+    let renderer_id = renderer.root().unwrap();
+    let nemotron = Model::vendor("nemotron-test").unwrap();
+    let other = Model::vendor("other-test").unwrap();
+
+    let a = crate::archive_v3::window(root_id, renderer_id, &nemotron).unwrap();
+    let again = crate::archive_v3::window(root_id, renderer_id, &nemotron).unwrap();
+    assert_eq!(a.root(), again.root(), "the same window converges");
+    assert_eq!(a.facts(), again.facts());
+
+    // The same moments read by another model, or rendered another way, are
+    // another window, and the node is untouched.
+    let b = crate::archive_v3::window(root_id, renderer_id, &other).unwrap();
+    assert_ne!(a.root(), b.root());
+    let renderer2 =
+        super::renderer("{{ messages }}\n", "{\"model\":{}}", "drive-codec@abc123").unwrap();
+    let c = crate::archive_v3::window(root_id, renderer2.root().unwrap(), &nemotron).unwrap();
+    assert_ne!(a.root(), c.root());
+    assert_ne!(renderer.root(), renderer2.root());
+    assert_eq!(root.facts(), &before);
+    assert_eq!(
+        node([], fact(text(direction::IN, "wake")).unwrap())
+            .unwrap()
+            .root(),
+        Some(root_id)
+    );
+
+    // The model entity rides along with the window.
+    assert!(a.facts().len() > nemotron.fragment.facts().len());
+    assert!(
+        super::renderer("t", "k", "").is_err(),
+        "a renderer names its codec"
+    );
+}
