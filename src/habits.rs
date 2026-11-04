@@ -29,6 +29,7 @@ use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
+use triblespace_paths::{PathExpr, PathIndex, Step};
 
 #[cfg(test)]
 use crate::collection_names::open_configured;
@@ -304,13 +305,22 @@ impl Catalog {
     /// One row per **live** definition. A superseded revision keeps its facts
     /// as durable history but is no longer a standing intention, so it is not
     /// evaluated and cannot come due.
+    ///
+    /// A revision is the same intention, so its completion history includes
+    /// that of every definition it transitively supersedes; see
+    /// [`standing_completions`].
     pub fn rows(&self) -> Result<Vec<HabitRow>> {
+        let revisions: BTreeMap<Id, Vec<Id>> = self
+            .habits
+            .values()
+            .map(|habit| (habit.id, habit.supersedes.clone()))
+            .collect();
         let mut rows = Vec::with_capacity(self.habits.len());
         for habit in self.live() {
             let mut completed_at = self
                 .completions
                 .values()
-                .filter(|completion| completion.habit == habit.id)
+                .filter(|completion| reaches(habit.id, completion.habit, &revisions))
                 .map(|completion| interval_seconds(completion.completed_at, "completion time"))
                 .collect::<Result<Vec<_>>>()?;
             completed_at.sort_unstable();
@@ -1280,16 +1290,87 @@ where
     completions
 }
 
+/// Revision ancestry of Habit definitions: the `supersedes+` relation between
+/// complete, understood definitions.
+///
+/// A superseding definition is the same standing intention, revised, so its
+/// history is the union of its predecessors' histories. That is derived here
+/// at read time from the edges alone, never copied onto a successor when it is
+/// written, so a predecessor's completion that arrives later (from another
+/// pile, say) counts the moment it arrives. Branches and merges are ordinary
+/// paths, and the fixpoint terminates on cycles, which opaque ids can form.
+pub fn revision_ancestry<P>(facts: &P) -> Result<PathIndex>
+where
+    P: TriblePattern + ?Sized,
+{
+    let edges: TribleSet = find!(
+        (successor: Id, predecessor: Id),
+        pattern!(facts, [{ ?successor @
+            metadata::tag: &KIND_HABIT_ID,
+            attrs::label: _?label,
+            attrs::condition: _?condition,
+            attrs::nudge: _?nudge,
+            metadata::supersedes: ?predecessor,
+        }])
+    )
+    .map(|(successor, predecessor)| {
+        let predecessor: Inline<inlineencodings::GenId> = predecessor.to_inline();
+        Trible::force(&successor, &metadata::supersedes.id(), &predecessor)
+    })
+    .collect();
+    let supersedes_plus = PathExpr::from(Step::Forward(metadata::supersedes.id().into()))
+        .plus()
+        .compile();
+    PathIndex::from_tribles(supersedes_plus, edges.iter())
+        .map_err(|error| anyhow!("materialize Habit revision ancestry: {error}"))
+}
+
+/// Every understood completion of the standing intention `habit`: its own,
+/// and each one recorded against a definition it transitively supersedes in
+/// `ancestry` (from [`revision_ancestry`] over the same facts). Each
+/// occurrence keeps the definition it actually names in [`Completion::habit`].
+pub fn standing_completions<P>(facts: &P, ancestry: &PathIndex, habit: Id) -> Vec<Completion>
+where
+    P: TriblePattern + ?Sized,
+{
+    let start: Inline<inlineencodings::GenId> = habit.to_inline();
+    let mut completions = completions(facts, habit);
+    completions.extend(
+        find!(
+            (id: Id, predecessor: Id, completed_at: IntervalValue),
+            and!(
+                ancestry.constraint(start, predecessor),
+                pattern!(facts, [{ ?id @
+                    metadata::tag: &KIND_DONE_ID,
+                    attrs::of: ?predecessor,
+                    metadata::created_at: ?completed_at,
+                }])
+            )
+        )
+        .map(|(id, habit, completed_at)| Completion {
+            id,
+            habit,
+            completed_at,
+        }),
+    );
+    completions
+        .sort_by_key(|completion| (completion.id, completion.habit, completion.completed_at.raw));
+    completions.dedup();
+    completions
+}
+
 /// Build the command-facing rows for every live definition without first
-/// materializing the full relation into a catalog shadow model.
+/// materializing the full relation into a catalog shadow model. Completion
+/// history is read across each definition's revision ancestry.
 pub fn rows<Reader, P>(reader: &Reader, facts: &P) -> Result<Vec<HabitRow>>
 where
     Reader: BlobStoreGet + ?Sized,
     P: TriblePattern + ?Sized,
 {
+    let ancestry = revision_ancestry(facts)?;
     let mut rows = Vec::new();
     for habit in live_definitions(reader, facts)? {
-        let mut completed_at = completions(facts, habit.id)
+        let mut completed_at = standing_completions(facts, &ancestry, habit.id)
             .into_iter()
             .map(|completion| interval_seconds(completion.completed_at, "completion time"))
             .collect::<Result<Vec<_>>>()?;
@@ -2308,6 +2389,173 @@ mod tests {
             fixture.catalog().activation(habit).unwrap(),
             Activation::Active(ref values) if values.len() == 1 && values[0].predecessors == heads
         ));
+    }
+
+    /// Rows over an in-memory union of complete fragments, payloads included.
+    fn rows_of(fragments: impl IntoIterator<Item = Fragment>) -> Vec<HabitRow> {
+        let mut union = Fragment::empty();
+        for fragment in fragments {
+            union += fragment;
+        }
+        let facts = union.facts().clone();
+        let reader = union.blobs_mut().snapshot().unwrap();
+        rows(&reader, &facts).unwrap()
+    }
+
+    fn done_at(habit: Id, seconds: f64) -> Fragment {
+        completion_fragment(habit, at(seconds)).unwrap().0
+    }
+
+    /// The integral TAI second a row reports for the Unix second `at` takes.
+    fn tai(seconds: f64) -> i64 {
+        interval_seconds(at(seconds), "fixture time").unwrap()
+    }
+
+    /// A reworded revision is the same standing intention, so a completion
+    /// recorded against the old wording minutes ago still satisfies it. This
+    /// goes through the operations every frontend uses and the strict audit.
+    #[test]
+    fn a_reworded_revision_is_not_due_after_its_predecessor_was_done() {
+        let fixture = Fixture::new();
+        let api = Habits::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let original = api
+            .add("comb", "every 1h", "comb upward", None, &[], &[])
+            .unwrap();
+        let done = api.done(&format!("{:x}", original.id)).unwrap();
+        let revised = api
+            .add(
+                "comb",
+                "every 1h",
+                "comb upward, reworded",
+                None,
+                &[format!("{:x}", original.id)],
+                &[],
+            )
+            .unwrap();
+        assert_ne!(revised.id, original.id);
+
+        let listed = api.list(true).unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        let entry = &listed.entries[0];
+        assert_eq!(entry.row.id, revised.id);
+        assert!(entry.row.last_done().is_some(), "done never");
+        assert_eq!(entry.state, Some(State::Cooling));
+
+        let catalog = fixture.catalog();
+        let completed = catalog
+            .completions()
+            .find(|completion| completion.id == done.event)
+            .unwrap();
+        let expected = interval_seconds(completed.completed_at, "completion time").unwrap();
+        let audited = catalog.rows().unwrap();
+        assert_eq!(audited.len(), 1);
+        assert_eq!(audited[0].id, revised.id);
+        assert_eq!(audited[0].completed_at, [expected]);
+        assert_eq!(entry.row.completed_at, [expected]);
+    }
+
+    #[test]
+    fn completions_follow_a_two_step_revision_chain() {
+        let (a, a_id) = habit_fragment("chain", "every 1h", "first", None, &[], &[]).unwrap();
+        let (b, b_id) = habit_fragment("chain", "every 1h", "second", None, &[a_id], &[]).unwrap();
+        let (c, c_id) = habit_fragment("chain", "every 1h", "third", None, &[b_id], &[]).unwrap();
+        let rows = rows_of([a, b, c, done_at(a_id, 1_000.0), done_at(b_id, 2_000.0)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, c_id);
+        assert_eq!(rows[0].completed_at, [tai(1_000.0), tai(2_000.0)]);
+        assert_eq!(rows[0].last_done(), Some(tai(2_000.0)));
+        assert_eq!(rows[0].next_cooldown_at().unwrap(), Some(tai(5_600.0)));
+        assert_eq!(
+            evaluate(&rows[0], tai(3_000.0), Path::new(".")),
+            State::Cooling
+        );
+    }
+
+    /// Merges take the union of every predecessor's history and the latest
+    /// completion wins. Branches each inherit the shared history, but a
+    /// completion of one sibling is not a completion of the other.
+    #[test]
+    fn revision_merges_and_branches_read_the_union_of_their_ancestry() {
+        let (a, a_id) = habit_fragment("merge", "every 1h", "left", None, &[], &[]).unwrap();
+        let (b, b_id) = habit_fragment("merge", "every 1h", "right", None, &[], &[]).unwrap();
+        let (c, c_id) =
+            habit_fragment("merge", "every 1h", "joined", None, &[a_id, b_id], &[]).unwrap();
+        let merged = rows_of([a, b, c, done_at(a_id, 5_000.0), done_at(b_id, 3_000.0)]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, c_id);
+        assert_eq!(merged[0].completed_at, [tai(3_000.0), tai(5_000.0)]);
+        assert_eq!(merged[0].last_done(), Some(tai(5_000.0)));
+
+        let (root, root_id) = habit_fragment("fork", "every 1h", "root", None, &[], &[]).unwrap();
+        let (d, d_id) =
+            habit_fragment("fork", "every 1h", "one way", None, &[root_id], &[]).unwrap();
+        let (e, e_id) =
+            habit_fragment("fork", "every 1h", "other way", None, &[root_id], &[]).unwrap();
+        let forked = rows_of([root, d, e, done_at(root_id, 100.0), done_at(d_id, 900.0)]);
+        let by_id: BTreeMap<Id, Vec<i64>> = forked
+            .into_iter()
+            .map(|row| (row.id, row.completed_at))
+            .collect();
+        assert_eq!(by_id.len(), 2);
+        assert_eq!(by_id[&d_id], [tai(100.0), tai(900.0)]);
+        assert_eq!(by_id[&e_id], [tai(100.0)]);
+    }
+
+    /// Intrinsic ids cannot form a cycle, but opaque ones can and the store
+    /// cannot forbid it. Reading such history must terminate.
+    #[test]
+    fn a_supersession_cycle_terminates() {
+        let x = Id::new([0xB1; 16]).unwrap();
+        let y = Id::new([0xB2; 16]).unwrap();
+        let absent = TextHandle::new([0xB3; 32]);
+        let mut cycle = Fragment::empty();
+        cycle += entity! { ExclusiveId::force_ref(&x) @
+            metadata::tag: &KIND_HABIT_ID,
+            attrs::label: absent,
+            attrs::condition: absent,
+            attrs::nudge: absent,
+            metadata::supersedes: &y,
+        };
+        cycle += entity! { ExclusiveId::force_ref(&y) @
+            metadata::tag: &KIND_HABIT_ID,
+            attrs::label: absent,
+            attrs::condition: absent,
+            attrs::nudge: absent,
+            metadata::supersedes: &x,
+        };
+        // Every member of a closed cycle is superseded, so nothing is live.
+        assert!(rows_of([cycle.clone(), done_at(x, 10.0)]).is_empty());
+
+        let (z, z_id) = habit_fragment("cycle", "every 1h", "escape", None, &[x], &[]).unwrap();
+        let rows = rows_of([cycle, z, done_at(x, 10.0), done_at(y, 20.0)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, z_id);
+        assert_eq!(rows[0].completed_at, [tai(10.0), tai(20.0)]);
+    }
+
+    /// The history is derived at read time from the edges, never copied onto
+    /// the successor, so a predecessor's completion that arrives after the
+    /// revision (from another pile, say) still counts.
+    #[test]
+    fn a_predecessor_completion_arriving_late_still_counts() {
+        let (a, a_id) = habit_fragment("late", "every 1h", "before", None, &[], &[]).unwrap();
+        let (b, b_id) = habit_fragment("late", "every 1h", "after", None, &[a_id], &[]).unwrap();
+        let before = rows_of([a.clone(), b.clone()]);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].id, b_id);
+        assert!(before[0].completed_at.is_empty());
+        assert_eq!(
+            evaluate(&before[0], tai(4_000.0), Path::new(".")),
+            State::Due
+        );
+
+        let after = rows_of([a, b, done_at(a_id, 3_500.0)]);
+        assert_eq!(after[0].id, b_id);
+        assert_eq!(after[0].completed_at, [tai(3_500.0)]);
+        assert_eq!(
+            evaluate(&after[0], tai(4_000.0), Path::new(".")),
+            State::Cooling
+        );
     }
 
     /// Revision is an explicit id edge, so the upgrade path exists without the

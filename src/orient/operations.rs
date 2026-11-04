@@ -324,8 +324,8 @@ use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID};
 use crate::schemas::files::file;
 use crate::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use crate::schemas::habit::{
-    attrs as habit_attrs, KIND_DONE_ID as KIND_HABIT_DONE_ID, KIND_HABIT_ID,
-    KIND_STATE_ID as KIND_HABIT_STATE_ID, STATE_ACTIVE, STATE_PAUSED,
+    attrs as habit_attrs, KIND_HABIT_ID, KIND_STATE_ID as KIND_HABIT_STATE_ID, STATE_ACTIVE,
+    STATE_PAUSED,
 };
 use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::mail::{
@@ -2964,6 +2964,9 @@ fn prepare_habits(
     )
     .collect();
 
+    // A revision inherits the completion history of what it supersedes.
+    let ancestry = habits::revision_ancestry(facts)?;
+
     for (habit, label, condition_handle, nudge_handle) in definitions {
         if superseded.contains(&habit) {
             continue;
@@ -2998,16 +3001,10 @@ fn prepare_habits(
             None => None,
         };
 
-        let mut completed_at: Vec<i64> = find!(
-            at: IntervalValue,
-            pattern!(facts, [{ _?done @
-                metadata::tag: &KIND_HABIT_DONE_ID,
-                habit_attrs::of: &habit,
-                metadata::created_at: ?at,
-            }])
-        )
-        .map(|at| (interval_key(at) / 1_000_000_000) as i64)
-        .collect();
+        let mut completed_at: Vec<i64> = habits::standing_completions(facts, &ancestry, habit)
+            .into_iter()
+            .map(|completion| (interval_key(completion.completed_at) / 1_000_000_000) as i64)
+            .collect();
         completed_at.sort_unstable();
         completed_at.dedup();
 
@@ -7828,6 +7825,51 @@ mod tests {
                 expected
             );
         }
+        pile.close().unwrap();
+    }
+
+    /// The watcher reads a revision's completion history across its
+    /// supersedes chain, so a reworded intention does not nudge the colony
+    /// minutes after it was done under the old wording.
+    #[test]
+    fn a_reworded_habit_is_not_due_after_its_predecessor_was_done() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        )
+        .unwrap();
+        let (original, original_id) =
+            habits::habit_fragment("comb", "every 1h", "comb upward", None, &[], &[]).unwrap();
+        let (done, _) = habits::completion_fragment(
+            original_id,
+            clock::point(Epoch::from_tai_seconds(1_000.0)).unwrap(),
+        )
+        .unwrap();
+        let (revised, revised_id) = habits::habit_fragment(
+            "comb",
+            "every 1h",
+            "comb upward, reworded",
+            None,
+            &[original_id],
+            &[],
+        )
+        .unwrap();
+        let fragment = original + done + revised;
+        let facts = archive(fragment.facts());
+        pile.commit(collection, &fixture.signer, fragment).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        assert_eq!(
+            prepared.0.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [revised_id]
+        );
+        assert_eq!(prepared.0[0].completed_at, [1_000]);
+        let observed = observe_habits(prepared, &fixture.path, 1_600).unwrap();
+        assert!(observed.due.is_empty());
+        assert_eq!(observed.next_cooldown_at, Some(4_600));
         pile.close().unwrap();
     }
 
