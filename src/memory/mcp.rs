@@ -1,8 +1,9 @@
 //! Explicit local MCP tools over resident Memory operations. Content is literal;
 //! no @ expansion, ambient persona, host-cache cover paths, or argv dispatch.
 //! Embedding tools retain the trusted local model configuration/compute boundary.
+use super::cli::emit_context;
 use super::operations::{parse_tai_timestamp, parse_time_range};
-use super::{ChurnOptions, CoverOpts, CoverReport};
+use super::{ChurnOptions, CoverOpts};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
@@ -367,20 +368,10 @@ impl Faculty for Memory {
     }
 }
 
-fn emit_context(report: CoverReport, out: &mut Out<'_>) -> Result<()> {
-    out.text(report.text)?;
-    if !report.diagnostics.is_empty() {
-        out.text(format!(
-            "Memory diagnostics (outside the charged cover text):\n{}",
-            report.diagnostics.join("\n")
-        ))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_cover::CoverReport;
     use crate::out::Part;
 
     #[test]
@@ -400,18 +391,19 @@ mod tests {
             }),
         )
         .unwrap();
-        assert_eq!(parts.len(), 2);
+        // The warning is about the cover, never part of it: a note beside
+        // the exact charged text, which every frontend delivers.
         assert_eq!(
-            parts[0],
-            Part::Text {
-                text: cover.to_owned()
-            }
+            parts,
+            [
+                Part::Text {
+                    text: cover.to_owned()
+                },
+                Part::Note {
+                    text: warning.to_owned()
+                },
+            ]
         );
-        let Part::Text { text } = &parts[1] else {
-            panic!("diagnostic must be text")
-        };
-        assert!(text.contains("outside the charged cover text"));
-        assert!(text.contains(warning));
         assert!(!cover.contains(warning));
     }
 }

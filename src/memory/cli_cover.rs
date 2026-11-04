@@ -249,7 +249,9 @@ pub(super) fn execute(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Re
 
     match verb {
         "start" => {
-            let cover = super::cli::report_text(memory.context(&CoverOpts::plain(budget_chars))?);
+            let report = memory.context(&CoverOpts::plain(budget_chars))?;
+            super::cli::note_diagnostics(report.diagnostics, out)?;
+            let cover = report.text;
             let now = clock::now().context("generate cover state timestamp")?;
             let (chunks, total) = cover_write_state(&dir, &cover, chunk_chars, fmt_epoch(now))?;
             out.line(format!(

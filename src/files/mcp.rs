@@ -261,16 +261,8 @@ impl Faculty for Files {
             }
             "files_resolve" => {
                 let args: Resolve = decode_arguments(arguments)?;
-                for (selector, result) in args.selectors.iter().zip(files.resolve(&args.selectors)?)
-                {
-                    match result {
-                        Ok(reference) => {
-                            out.line(format!("{selector}\tfiles:{}", reference.hex()))?
-                        }
-                        Err(error) => out.line(format!("UNRESOLVED: {selector} — {error}"))?,
-                    }
-                }
-                Ok(())
+                let results = files.resolve(&args.selectors)?;
+                super::cli::emit_resolved(&args.selectors, results, out)
             }
             "files_diff" => {
                 let args: Diff = decode_arguments(arguments)?;

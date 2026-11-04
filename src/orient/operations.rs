@@ -899,8 +899,8 @@ async fn refresh_receipts_before_observation(
     output: &mut Out<'_>,
 ) -> Result<()> {
     if let Err(error) = sources.presentations.maintain(pile, signer).await {
-        output.line(format!(
-            "note: Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
+        output.note(format!(
+            "Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
         ))?;
     }
     Ok(())
@@ -7063,6 +7063,57 @@ mod tests {
         });
     }
 
+    /// The refresh is best effort: when it fails the run goes on, and says
+    /// so in a note beside the report, which every frontend delivers and no
+    /// report sink mistakes for news.
+    #[test]
+    fn a_failed_receipt_refresh_is_a_note_not_a_line_of_the_report() {
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            // Resident and content-valid as a blob, but not a SimpleArchive,
+            // so the projection's upkeep fails rather than skipping it. The
+            // store's own host maintains it: another key would attach
+            // nothing and report nothing.
+            let handle = pile
+                .put::<SimpleArchive, _>(Blob::<SimpleArchive>::new(Bytes::from(vec![0xff])))
+                .unwrap();
+            let commit = CollectionCommit::sign(
+                &fixture.signer,
+                sources.presentations.source.handle(),
+                inlineencodings::Handle::<SimpleArchive>::to_hash(handle),
+                empty_metadata_handle(),
+            );
+            pile.insert(CollectionRecord::Commit(commit)).unwrap();
+
+            let mut parts = Vec::new();
+            let mut emit = |part| {
+                parts.push(part);
+                Ok(())
+            };
+            refresh_receipts_before_observation(
+                &mut pile,
+                &fixture.signer,
+                &sources,
+                &mut Out::new(&mut emit),
+            )
+            .await
+            .unwrap();
+            let [crate::out::Part::Note { text }] = parts.as_slice() else {
+                panic!("expected exactly one note, got {parts:?}")
+            };
+            assert!(
+                text.starts_with("Orient receipt membership not refreshed ("),
+                "{text}"
+            );
+            assert!(text.ends_with("; a recent event may repeat"), "{text}");
+            pile.close().unwrap();
+        });
+    }
+
     #[test]
     fn persona_wake_ignores_unrelated_historical_receipt_projection_lag() {
         runtime().unwrap().block_on(async {
@@ -8070,11 +8121,12 @@ mod tests {
                 (mode == Stop::Deadline).then(|| Instant::now() + Duration::from_secs(3));
             let mut policy = RetryPolicy::new(true, deadline);
             let mut emit = |part| {
-                let crate::out::Part::Text { text } = part else {
-                    bail!("expected text")
-                };
-                if text.starts_with("note: ") {
-                    return Ok(());
+                // A note about the run (such as a receipt refresh that
+                // failed) is not a report the sink delivers.
+                match part {
+                    crate::out::Part::Text { .. } => {}
+                    crate::out::Part::Note { .. } => return Ok(()),
+                    _ => bail!("expected text or a note"),
                 }
                 match mode {
                     Stop::Clean => Ok(()),

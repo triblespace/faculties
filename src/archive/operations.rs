@@ -1683,8 +1683,8 @@ fn run_search(
 ) -> Result<()> {
     let (observed, index, lag) = archive_collection::search_views_with_storage(storage.storage)?;
     if !lag.is_current() {
-        out.line(format!(
-            "note: searching what is present; facts: {}; index: {} source commit(s) not yet \
+        out.note(format!(
+            "searching what is present; facts: {}; index: {} source commit(s) not yet \
              derived (`archive index` derives them)",
             lag.facts, lag.index,
         ))?;
@@ -2768,29 +2768,40 @@ mod tests {
         .unwrap();
         run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
         let search = |text: &str| {
-            let mut printed = String::new();
+            let (mut printed, mut notes) = (String::new(), Vec::new());
             run_search(
                 storage(&fixture),
                 text,
                 10,
                 Reading::default(),
                 &mut Out::new(&mut |part| {
-                    if let crate::out::Part::Text { text } = part {
-                        printed.push_str(&text);
+                    match part {
+                        crate::out::Part::Text { text } => printed.push_str(&text),
+                        crate::out::Part::Note { text } => notes.push(text),
+                        other => panic!("expected search text or a note, got {other:?}"),
                     }
                     Ok(())
                 }),
             )
             .unwrap();
-            printed
+            (printed, notes)
         };
 
-        let before = search("quasar");
-        assert!(before.contains("not yet derived"), "{before}");
+        // The lag is a note beside the hits, never one of them, so every
+        // frontend says the search saw only what is derived.
+        let (before, notes) = search("quasar");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("searching what is present;"),
+            "{notes:?}"
+        );
+        assert!(notes[0].contains("not yet derived"), "{notes:?}");
+        assert!(!before.contains("not yet derived"), "{before}");
         assert!(!before.contains("quasar needle"), "{before}");
         archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        let after = search("quasar");
+        let (after, notes) = search("quasar");
+        assert!(notes.is_empty(), "{notes:?}");
         assert!(!after.contains("not yet derived"), "{after}");
         assert!(after.contains("quasar needle"), "{after}");
     }

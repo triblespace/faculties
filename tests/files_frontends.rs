@@ -346,9 +346,81 @@ fn cli_batch_stdin_remains_usable_but_mcp_selectors_are_literal() {
             }),
         )
         .unwrap();
+    // The literal "@-" names no file, so the answer omits it and says so in
+    // a note, never as a line of the answer.
     assert!(parts
         .iter()
-        .any(|part| matches!(part, Part::Text { text } if text.contains("UNRESOLVED"))));
+        .any(|part| matches!(part, Part::Note { text } if text.starts_with("UNRESOLVED: @-"))));
+    assert!(
+        !parts.iter().any(|part| matches!(part, Part::Text { .. })),
+        "{parts:?}"
+    );
+}
+
+#[test]
+fn an_unresolved_selector_is_a_note_beside_the_resolved_list_on_every_frontend() {
+    let fixture = Fixture::new();
+    // A full id resolves literally; a prefix must name something present.
+    let missing = "0123456789ab";
+    let mut child = fixture
+        .cli()
+        .args(["resolve", "@-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{}\n{missing}", fixture.ids[0]).unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    // Stdout stays exactly the resolved list; the omission is a note.
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        format!("{}\tfiles:{}\n", fixture.ids[0], fixture.ids[0])
+    );
+    assert!(
+        stderr.contains(&format!("note: UNRESOLVED: {missing} — ")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("note: 1 resolved, 1 unresolved\n"),
+        "{stderr}"
+    );
+
+    let mut parts = Vec::new();
+    fixture
+        .mcp()
+        .call(
+            "files_resolve",
+            Bytes::from(
+                format!(r#"{{"selectors":["{}","{missing}"]}}"#, fixture.ids[0]).into_bytes(),
+            ),
+            &mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        parts[0],
+        Part::Text {
+            text: format!("{}\tfiles:{}\n", fixture.ids[0], fixture.ids[0])
+        }
+    );
+    let notes: Vec<_> = parts[1..]
+        .iter()
+        .map(|part| match part {
+            Part::Note { text } => text.as_str(),
+            other => panic!("expected only notes after the answer, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(
+        notes[0].starts_with(&format!("UNRESOLVED: {missing} — ")),
+        "{notes:?}"
+    );
+    assert_eq!(notes[1], "1 resolved, 1 unresolved");
 }
 
 #[test]

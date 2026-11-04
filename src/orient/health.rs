@@ -127,7 +127,7 @@ impl HealthSources {
             let receipt_result = self.presentations.maintain(&mut *local, signer).await;
             Ok(receipt_result.err().map(|error| {
                 format!(
-                    "note: Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
+                    "Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
                 )
             }))
         })
@@ -260,7 +260,7 @@ impl HealthSources {
     ) -> Result<(bool, Option<Epoch>)> {
         self.maintain_if_changed(pile, signer)?;
         if let Some(note) = &self.receipt_maintenance_note {
-            output.line(note)?;
+            output.note(note.clone())?;
         }
         let now = clock::now()?;
         let sampled = pile.snapshot()?;
@@ -666,7 +666,7 @@ impl HealthSources {
             publish(pile, signer, self.health.source, exit)
         };
         if let Err(note) = record() {
-            let _ = output.line(format!("note: news-path exit not recorded ({note:#})"));
+            let _ = output.note(format!("news-path exit not recorded ({note:#})"));
         }
     }
 
@@ -755,7 +755,7 @@ impl HealthSources {
                     }
                 }
             }
-            Err(error) => output.line(format!("note: news-path beat not recorded ({error:#})"))?,
+            Err(error) => output.note(format!("news-path beat not recorded ({error:#})"))?,
         }
         Ok(())
     }
@@ -3673,12 +3673,13 @@ mod tests {
         let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
         assert!(!observed.report().attention.is_empty());
         assert!(observed.presentations.is_empty());
-        let mut text = String::new();
+        let (mut text, mut notes) = (String::new(), Vec::new());
         let mut emit = |part| {
-            let crate::out::Part::Text { text: part } = part else {
-                bail!("expected health text");
-            };
-            text.push_str(&part);
+            match part {
+                crate::out::Part::Text { text: part } => text.push_str(&part),
+                crate::out::Part::Note { text } => notes.push(text),
+                _ => bail!("expected health text or a note"),
+            }
             Ok(())
         };
         let (fired, _) = f
@@ -3692,8 +3693,11 @@ mod tests {
             )
             .unwrap();
         assert!(fired);
-        assert!(text.contains("note: Orient receipt membership not refreshed"));
-        assert!(text.contains("malformed"));
+        // The upkeep failure is a note beside the report, not a line of it.
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("Orient receipt membership not refreshed"));
+        assert!(notes[0].contains("malformed"));
+        assert!(!text.contains("receipt membership"), "{text}");
         assert!(text.contains("News:"));
         let after = f.store.snapshot().unwrap();
         assert_eq!(after.collection(receipts).unwrap().cover(), &raw_receipts);
@@ -3712,12 +3716,13 @@ mod tests {
             .map(Result::unwrap)
             .collect::<Vec<_>>();
         for _ in 0..2 {
-            let mut text = String::new();
+            let (mut text, mut notes) = (String::new(), Vec::new());
             let mut emit = |part| {
-                let crate::out::Part::Text { text: part } = part else {
-                    bail!("expected health text");
-                };
-                text.push_str(&part);
+                match part {
+                    crate::out::Part::Text { text: part } => text.push_str(&part),
+                    crate::out::Part::Note { text } => notes.push(text),
+                    _ => bail!("expected health text or a note"),
+                }
                 Ok(())
             };
             let (fired, _) = f
@@ -3731,8 +3736,10 @@ mod tests {
                 )
                 .unwrap();
             assert!(!fired);
-            assert!(text.contains("note: Orient receipt membership not refreshed"));
-            assert!(text.contains("malformed"));
+            assert!(text.is_empty(), "a quiet poll has no report: {text}");
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(notes[0].starts_with("Orient receipt membership not refreshed"));
+            assert!(notes[0].contains("malformed"));
             assert_eq!(f.sources.maintenance_passes.get(), 1);
         }
         let after = f.store.snapshot().unwrap();

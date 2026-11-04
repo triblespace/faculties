@@ -357,15 +357,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 fetch_limit: fetch_limit.clamp(1, 100),
                 reconcile_limit: reconcile_limit.clamp(1, 100),
             })?;
-            render::pull_header(&report, out)?;
-            for channel in &report.channels {
-                match &channel.result {
-                    Ok(receipt) => render::channel_receipt(receipt, out)?,
-                    Err(error) => {
-                        eprintln!("  ! {} ({}): {error}", channel.channel_id, channel.name)
-                    }
-                }
-            }
+            render::read_pull(&report, out)?;
             if report.all_visible && report.channels.is_empty() {
                 return Ok(());
             }

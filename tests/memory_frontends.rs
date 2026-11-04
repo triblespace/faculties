@@ -81,6 +81,17 @@ fn text(parts: &[Part]) -> String {
         })
         .collect()
 }
+/// The answer of an output whose other parts are notes about it.
+fn answer(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text.as_str()),
+            Part::Note { .. } => None,
+            other => panic!("expected text or a note, got {other:?}"),
+        })
+        .collect()
+}
 fn receipt_id(parts: &[Part]) -> String {
     text(parts)
         .lines()
@@ -266,26 +277,32 @@ fn library_cli_and_mcp_agree_on_resident_reads_and_exact_cover_text() {
     let mut options = CoverOpts::plain(1000);
     options.chunk_overhead = 17;
     let report = memory.context(&options).unwrap();
-    assert_eq!(
-        text(&fixture.cli(&["context", "--chars", "1000", "--chunk-overhead", "17"])),
-        report.text
-    );
+    // The cover is the answer and each diagnostic is a note beside it, the
+    // same on the CLI and on MCP.
+    let cli = fixture.cli(&["context", "--chars", "1000", "--chunk-overhead", "17"]);
     let mcp = fixture.call(
         "memory_context",
         json!({"budget_chars":1000,"chunk_overhead":17}),
     );
+    assert_eq!(cli, mcp);
     assert_eq!(
-        mcp[0],
-        Part::Text {
+        mcp,
+        std::iter::once(Part::Text {
             text: report.text.clone()
-        }
+        })
+        .chain(
+            report
+                .diagnostics
+                .iter()
+                .map(|text| Part::Note { text: text.clone() })
+        )
+        .collect::<Vec<_>>()
     );
     assert!(!report.text.contains("memory context —"));
     assert!(report
         .diagnostics
         .iter()
         .any(|value| value.contains("greedy SPACE order")));
-    assert!(text(&mcp[1..]).contains("outside the charged cover text"));
 }
 
 #[test]
@@ -432,7 +449,7 @@ fn context_tag_filters_agree_across_library_cli_and_mcp() {
         assert_eq!(shown(&report.text), expected, "{argv:?}: {}", report.text);
         let mut cli_argv = vec!["context", "--chars", "10000"];
         cli_argv.extend_from_slice(argv);
-        assert_eq!(text(&fixture.cli(&cli_argv)), report.text, "{argv:?}");
+        assert_eq!(answer(&fixture.cli(&cli_argv)), report.text, "{argv:?}");
         let mcp = fixture.call("memory_context", arguments);
         assert_eq!(
             mcp[0],
@@ -444,8 +461,8 @@ fn context_tag_filters_agree_across_library_cli_and_mcp() {
     }
     // A multi-word `--about` query stops at `--tag`, which takes one argument.
     assert_eq!(
-        text(&fixture.cli(&["context", "--about", "design", "work", "--tag", "bullet", "10000"])),
-        text(&fixture.cli(&["context", "10000", "--tag", "bullet"]))
+        answer(&fixture.cli(&["context", "--about", "design", "work", "--tag", "bullet", "10000"])),
+        answer(&fixture.cli(&["context", "10000", "--tag", "bullet"]))
     );
 }
 

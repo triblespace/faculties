@@ -114,7 +114,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         "search" => memory.search(&literal_or_input(args, "query")?, out),
         "similar" => memory.similar(&literal_or_input(args, "query")?, out),
         "index" => memory.index(out),
-        "context" => out.text(report_text(memory.context(&context_options(args)?)?)),
+        "context" => emit_context(memory.context(&context_options(args)?)?, out),
         "cover" => return super::cli_cover::execute(&memory, args, out),
         "tag" => memory.tag(args.first().map(String::as_str), out),
         "migrate-lens-tags" => {
@@ -129,11 +129,19 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
     Ok(0)
 }
 
-pub(super) fn report_text(report: CoverReport) -> String {
-    for diagnostic in report.diagnostics {
-        eprintln!("{diagnostic}");
+/// The exact charged cover text is the answer. Each diagnostic is about
+/// the cover (what it skipped, what a filter could not assess, how much of
+/// the budget it filled), so it is a note beside it on every frontend.
+pub(super) fn emit_context(report: CoverReport, out: &mut Out<'_>) -> Result<()> {
+    out.text(report.text)?;
+    note_diagnostics(report.diagnostics, out)
+}
+
+pub(super) fn note_diagnostics(diagnostics: Vec<String>, out: &mut Out<'_>) -> Result<()> {
+    for diagnostic in diagnostics {
+        out.note(diagnostic)?;
     }
-    report.text
+    Ok(())
 }
 
 fn literal_or_input(args: &[String], label: &str) -> Result<String> {

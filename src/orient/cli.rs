@@ -489,16 +489,8 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             // The daemon's one continuous observation, writing each report
             // to stdout instead of a callback: the same state machine that
             // repeated one-shot waits run, without re-opening the pile.
-            let mut deliver = |part| match part {
-                crate::out::Part::Text { text } if text.starts_with("note: ") => {
-                    // Maintenance diagnostics are not news and must not
-                    // become a line of the stream.
-                    use std::io::Write;
-                    std::io::stderr().lock().write_all(text.as_bytes())?;
-                    Ok(())
-                }
-                part => out.emit(part),
-            };
+            // A maintenance note is not news: the frontend delivers it as a
+            // note, never as a line of the stream.
             orient.daemon(
                 persona,
                 &WaitOptions {
@@ -506,7 +498,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     poll_interval: Duration::from_millis(poll_ms.max(1)),
                     form: NewsForm::Stream,
                 },
-                &mut crate::out::Out::new(&mut deliver),
+                out,
             )
         }
         Command::Daemon {
@@ -532,13 +524,6 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             // buffer survives known-unsent attempts; ordinary CLI/wake is unchanged.
             let mut pending_report: Option<String> = None;
             let mut deliver = |part| match part {
-                crate::out::Part::Text { text } if text.starts_with("note: ") => {
-                    // Maintenance diagnostics are not attention reports and
-                    // must not become another queued user message.
-                    use std::io::Write;
-                    std::io::stderr().lock().write_all(text.as_bytes())?;
-                    Ok(())
-                }
                 crate::out::Part::Text { text } => {
                     let timeout = retry.attempt_timeout(callback_timeout)?;
                     if pending_report.is_none() {
@@ -556,7 +541,9 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     result
                 }
                 crate::out::Part::Note { text } => {
-                    // A note about the output is not a report either.
+                    // A note about the output (such as maintenance that
+                    // failed) is not a report and must not become another
+                    // queued user message.
                     use std::io::Write;
                     let note = crate::out::labelled_note(&text);
                     writeln!(std::io::stderr().lock(), "{note}")?;

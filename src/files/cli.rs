@@ -4,7 +4,7 @@ use super::operations::{FetchOptions, Files, SimilarityOptions};
 use super::presentation::ViewOptions;
 use crate::out::Out;
 use crate::spec::{Invocation, Param, Spec, Verb};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 
 const SHARED: &[Param] = &[
@@ -304,21 +304,7 @@ fn execute_with_input(
                     .map(str::to_owned)
                     .collect();
                 let results = files.resolve(&selectors)?;
-                let mut resolved = 0;
-                for (selector, result) in selectors.iter().zip(results) {
-                    match result {
-                        Ok(reference) => {
-                            out.line(format!("{selector}\tfiles:{}", reference.hex()))?;
-                            resolved += 1;
-                        }
-                        Err(error) => eprintln!("UNRESOLVED: {selector} — {error}"),
-                    }
-                }
-                eprintln!(
-                    "{resolved} resolved, {} unresolved",
-                    selectors.len() - resolved
-                );
-                Ok(())
+                emit_resolved(&selectors, results, out)
             } else {
                 let mut results = files.resolve(&[selector.to_owned()])?;
                 out.line(results.remove(0)?.hex())
@@ -327,6 +313,33 @@ fn execute_with_input(
         "diff" => out.text(files.diff(invocation.require("left")?, invocation.require("right")?)?),
         other => bail!("Files CLI has no command {other:?}"),
     }
+}
+
+/// One line per resolved selector is the answer; a selector that resolves
+/// to nothing is omitted from it, which a note says, with a count when any
+/// is omitted. Stdout stays a list a script can read.
+pub(super) fn emit_resolved(
+    selectors: &[String],
+    results: Vec<Result<super::FileReference>>,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let mut resolved = 0;
+    for (selector, result) in selectors.iter().zip(results) {
+        match result {
+            Ok(reference) => {
+                out.line(format!("{selector}\tfiles:{}", reference.hex()))?;
+                resolved += 1;
+            }
+            Err(error) => out.note(format!("UNRESOLVED: {selector} — {error}"))?,
+        }
+    }
+    if resolved != selectors.len() {
+        out.note(format!(
+            "{resolved} resolved, {} unresolved",
+            selectors.len() - resolved
+        ))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
