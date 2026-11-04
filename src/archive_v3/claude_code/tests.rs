@@ -1667,3 +1667,95 @@ fn x2_continues_never_returns_to_its_start() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 3: real-sample paths classified with request-log or in-unit
+// structure evidence.
+
+/// shapeHash names a shape (it is the shape's content hash): a correlator,
+/// and one hash names one shape.
+#[test]
+fn a_shape_hash_names_one_shape() {
+    let named = |hash: &str, system: &str, second: u32| {
+        let mut record = shape(second, system, &[("Bash", "Run a command.")]);
+        record["shapeHash"] = json!(hash);
+        record
+    };
+    let source = jsonl(&[
+        named("h-1", "You are a helper.", 0),
+        user("u1", None, 1, json!("Hi.")),
+        assistant("a1", "u1", 2, "m1", said("Hello."), json!("end_turn")),
+        named("h-1", "You are a helper.", 3),
+    ]);
+    passes(&source);
+    let source = jsonl(&[
+        named("h-1", "You are a helper.", 0),
+        user("u1", None, 1, json!("Hi.")),
+        named("h-1", "You are someone else.", 2),
+    ]);
+    let failure = refused(&source);
+    assert_eq!(
+        (failure.path.as_str(), failure.reason),
+        (
+            "{api-request-shape}.shapeHash",
+            "one shape hash names two shapes"
+        )
+    );
+}
+
+/// The tools a compaction carries over render nothing of their own: the
+/// next shape and the messages hold what reached her.
+#[test]
+fn tools_discovered_before_compaction_render_nothing() {
+    let mut records = vec![
+        user("u1", None, 0, json!("First.")),
+        assistant("a1", "u1", 1, "m1", said("One."), json!("end_turn")),
+        user("u2", Some("a1"), 2, json!("Second.")),
+        assistant("a2", "u2", 3, "m2", said("Two."), json!("end_turn")),
+    ];
+    let mut cut = boundary("b1", Some("a2"), None);
+    cut["compactMetadata"]["preCompactDiscoveredTools"] = json!(["Bash", "Grep"]);
+    records.push(cut);
+    let mut summary = user("c1", Some("b1"), 5, json!("Summary of what came before."));
+    summary["isCompactSummary"] = json!(true);
+    records.push(summary);
+    let imported = passes(&jsonl(&records));
+    assert!(!continues_cycle(&imported));
+}
+
+/// A title written before every record restates a later one; alone, it
+/// has nothing to describe.
+#[test]
+fn an_early_title_restates_a_later_one() {
+    let title = json!({"type": "ai-title", "sessionId": "s-1", "aiTitle": "A synthetic chat"});
+    let mode = json!({"type": "mode", "sessionId": "s-1", "mode": "normal"});
+    let source = jsonl(&[
+        title.clone(),
+        mode.clone(),
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        title.clone(),
+    ]);
+    let imported = passes(&source);
+    assert_eq!(
+        glosses(&imported, v3::gloss::category::TITLE),
+        vec!["A synthetic chat"]
+    );
+    let alone = jsonl(&[
+        title.clone(),
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    assert_eq!(refused(&alone).path, "{ai-title}.aiTitle");
+    assert!(walk_rows(&alone).contains(&("{ai-title}.aiTitle".to_owned(), Kind::Placed)));
+    // A different later title does not restate it.
+    let mut other = title.clone();
+    other["aiTitle"] = json!("Another chat");
+    let source = jsonl(&[
+        title,
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        other,
+    ]);
+    assert_eq!(refused(&source).path, "{ai-title}.aiTitle");
+}

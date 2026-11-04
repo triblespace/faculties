@@ -1143,10 +1143,17 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
         "{attachment}.renderedRole",
         Class::Annotation(&[("raw_role", Decode::Text)]),
     ),
+    // Request logs (390 framed transcripts, 2026-11-04): where no tool
+    // result is beside it (a parent attachment, 402 of 404), her window held
+    // the rendered text plus a trailing newline as a text block among
+    // others in a user message, never the text alone; beside a tool result
+    // (19, 2 transcripts) it was the exact text after the message's last
+    // tool_result. Which text and place to build is a rendering rule not
+    // yet ruled, so it stays open.
     Entry::new(
         "{attachment}.renderedBesideToolResult",
         Class::Open(
-            "rendered beside a tool result that is mostly not its parent: its placement is unverified",
+            "rendered beside a tool result: the window holds its text with a trailing newline, or after the last tool_result; the rendering rule is not ruled",
         ),
     ),
 ];
@@ -1271,11 +1278,17 @@ const SYSTEM_FIELDS: &[Entry] = &[
         "{system}.compactMetadata.preservedMessages.anchorUuid",
         Class::Correlator,
     ),
+    // The client's list of tools loaded before compaction. In the first
+    // request after each such boundary (request logs, 2 transcripts,
+    // 5,463 names, 2026-11-04) a listed tool stands as an eager or
+    // deferred tool of the shape or as a tool_reference in a message, all
+    // kept from their own records, or nowhere (1,605): the list itself
+    // renders nothing.
     Entry::new(
         "{system}.compactMetadata.preCompactDiscoveredTools",
-        Class::Open(
-            "tools loaded before compaction and carried over: their placement is unverified",
-        ),
+        Class::Drop(DropReason::Machinery(
+            "the client's list of tools loaded before compaction; the next shape and messages hold what reached her",
+        )),
     ),
     Entry::new(
         "{system}.compactMetadata.preCompactDiscoveredTools",
@@ -1320,7 +1333,11 @@ const OTHER_RECORDS: &[Entry] = &[
         "{api-request-shape}.type",
         Class::Structure(Structure::Discriminator),
     ),
-    Entry::new("{api-request-shape}.shapeHash", Class::Open(NEVER_READ)),
+    // The content hash of the shape (sha256 of its sorted compact JSON in
+    // 771 of 771 shapes of 390 framed transcripts, 2026-11-04): the name a
+    // request gives its system section. The importer checks that one hash
+    // names one shape.
+    Entry::new("{api-request-shape}.shapeHash", Class::Correlator),
     Entry::new(
         "{api-request-shape}.sessionId",
         Class::Drop(DropReason::ProviderId),

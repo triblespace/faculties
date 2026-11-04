@@ -2368,6 +2368,7 @@ impl<'t> Walker<'t> {
                 std::mem::take(&mut out.records[record].deferred)
             {
                 let mut at_line = None;
+                let mut restated = false;
                 let items: Vec<usize> = match place {
                     Place::Claim | Place::LastOut => Vec::new(),
                     Place::Last => held.last().copied().into_iter().collect(),
@@ -2413,6 +2414,19 @@ impl<'t> Walker<'t> {
                             .rposition(|links| links.id.is_some())
                             .and_then(|at| out.records[at].id.as_deref())
                             .and_then(|id| out.first(id));
+                        // Before every record with an id: a restatement of
+                        // a later one that has a line.
+                        if at_line.is_none() {
+                            let first = out.records.iter().position(|links| links.id.is_some());
+                            restated = out.records.iter().enumerate().skip(record + 1).any(
+                                |(later, links)| {
+                                    first.is_some_and(|first| later > first)
+                                        && links.deferred.iter().any(|(again, place, ..)| {
+                                            *place == Place::FileTail && *again == token
+                                        })
+                                },
+                            );
+                        }
                         Vec::new()
                     }
                     Place::ParentTail => {
@@ -2423,7 +2437,7 @@ impl<'t> Walker<'t> {
                 let every = place == Place::Every;
                 if let Some(line) = at_line {
                     out.line_marks.push((line, token.clone()));
-                } else if items.is_empty() {
+                } else if items.is_empty() && !restated {
                     out.rows.push((path.clone(), Kind::Placed, label));
                 }
                 for item in items {

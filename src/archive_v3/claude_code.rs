@@ -413,6 +413,8 @@ struct Builder {
     node_glosses: Vec<(usize, Id, String)>,
     /// `(file position, title)`: resolved once every line is built.
     titles: Vec<(usize, String)>,
+    /// shapeHash -> the shape it names.
+    shape_hashes: HashMap<String, Json>,
     /// `(last item of a record opening the new context, boundary uuid)`
     continues: Vec<(usize, String)>,
     claims: HashMap<usize, WitnessAnnotations>,
@@ -529,6 +531,7 @@ impl Builder {
             item_glosses: Vec::new(),
             node_glosses: Vec::new(),
             titles: Vec::new(),
+            shape_hashes: HashMap::new(),
             continues: Vec::new(),
             claims: HashMap::new(),
         };
@@ -1768,6 +1771,21 @@ impl Builder {
     fn shape(&mut self, at: usize, record: &Json) -> Result<(), Failure> {
         use v3::fact::{direction::IN, modality::*};
         self.claims_of(at, record)?;
+        // The correlator a request names its shape by: one hash, one shape.
+        if let (Some(hash), Some(shape)) = (record.str_at("shapeHash"), record.get("shape")) {
+            match self.shape_hashes.get(hash) {
+                Some(seen) if !seen.same(shape) => {
+                    return Err(Failure::new(
+                        "{api-request-shape}.shapeHash",
+                        "one shape hash names two shapes",
+                    ))
+                }
+                Some(_) => {}
+                None => {
+                    self.shape_hashes.insert(hash.to_owned(), shape.clone());
+                }
+            }
+        }
         let mut prefix = Vec::new();
         for block in record.at("shape.system").map(Json::arr).unwrap_or(&[]) {
             let said = match block.get("text") {
@@ -2016,8 +2034,25 @@ impl Builder {
             }
         }
         // Titles: the nearest node on the parent chain of the record before
-        // the title in the file (I5).
-        for (at, title) in std::mem::take(&mut self.titles) {
+        // the title in the file (I5). A title before every record is a
+        // restatement (in 5 of 5 sampled files it recurs after records):
+        // it places nothing when a later title, with a record before it,
+        // says the same; otherwise it fails.
+        let titles = std::mem::take(&mut self.titles);
+        let first_id = records
+            .iter()
+            .position(|record| record.str_at("uuid").is_some());
+        for (at, title) in &titles {
+            let early = first_id.is_none_or(|first| *at < first);
+            if early {
+                let restated = titles.iter().any(|(later, again)| {
+                    first_id.is_some_and(|first| *later > first) && again == title
+                });
+                if restated {
+                    continue;
+                }
+            }
+            let (at, title) = (*at, title.clone());
             let place = records[..at]
                 .iter()
                 .rev()

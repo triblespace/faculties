@@ -189,7 +189,10 @@ pub enum Place {
     /// The last item of the request whose [`Requests::id`] the value names.
     Request,
     /// The end of the line of the latest record before this one in the
-    /// file that names itself ([`Order::Parents`]'s id).
+    /// file that names itself ([`Order::Parents`]'s id). Before every such
+    /// record there is no line: the value is a restatement and places
+    /// nothing when a later record of the file, with a line before it,
+    /// carries the same token; otherwise it fails.
     FileTail,
     /// The end of the line of the record's parent.
     ParentTail,
