@@ -231,6 +231,120 @@ pub fn namespace(table: &FieldTable) -> Token {
     }
 }
 
+/// The kind tag every entity of `kind` carries, as a pair of its tuple.
+pub fn tag(kind: &str) -> Token {
+    annotation_token("tag", Value::Term(kind.to_owned()))
+}
+
+fn annotation_token(attribute: &str, value: Value) -> Token {
+    Token {
+        modality: String::new(),
+        direction: String::new(),
+        attribute: attribute.to_owned(),
+        value,
+    }
+}
+
+fn entity_token(reached_as: &str, mut pairs: Vec<Token>) -> Token {
+    pairs.sort();
+    annotation_token(reached_as, Value::Tuple(pairs))
+}
+
+/// The tuple of the fact behind an item (G14): its tokens and its kind
+/// tag. Every item is one fact.
+pub fn fact_tuple(item: &Item) -> BTreeSet<Token> {
+    let mut tuple = item.tokens.clone();
+    tuple.insert(tag("fact"));
+    tuple
+}
+
+/// The tuple of an occurrence that makes `claims`: the claims and its kind
+/// tag. A record that holds an item has an occurrence even when it claims
+/// nothing (G16).
+pub fn occurrence_tuple(claims: &BTreeSet<Token>) -> BTreeSet<Token> {
+    let mut tuple = claims.clone();
+    tuple.insert(tag("occurrence"));
+    tuple
+}
+
+/// The entities the source places at one window position, from the
+/// annotations placed there (G14): the node, with its kind and every
+/// annotation of the node; a witness for the namespace claim a record that
+/// holds the item makes; a gloss for each gloss annotation.
+pub fn placed_entities(marks: &BTreeSet<Token>) -> BTreeMap<Token, usize> {
+    let mut out: BTreeMap<Token, usize> = BTreeMap::new();
+    let mut node = vec![tag("node")];
+    for mark in marks {
+        if mark.attribute == "source_namespace" {
+            *out.entry(entity_token("witness", vec![tag("witness"), mark.clone()]))
+                .or_default() += 1;
+        } else if let Some(category) = mark.attribute.strip_prefix("gloss:") {
+            let pairs = vec![
+                tag("gloss"),
+                annotation_token("category", Value::Term(category.to_owned())),
+                annotation_token("text", mark.value.clone()),
+            ];
+            *out.entry(entity_token("gloss", pairs)).or_default() += 1;
+        } else {
+            node.push(mark.clone());
+        }
+    }
+    *out.entry(entity_token("node", node)).or_default() += 1;
+    out
+}
+
+/// The named entities the unit's values refer to (G14), each once, as the
+/// constructors build them: a media type `{tag, name}`, and for a claimed
+/// one also its `essence` and the essence's own entity; a sense and a
+/// vendor model `{tag, name}`. Claims about one entity accumulate on it.
+pub fn named_entities(walked: &Walked) -> BTreeMap<Token, usize> {
+    type Entities = BTreeMap<(&'static str, String), BTreeSet<Token>>;
+    fn add<'e>(
+        entities: &'e mut Entities,
+        kind: &'static str,
+        name: &str,
+    ) -> &'e mut BTreeSet<Token> {
+        entities.entry((kind, name.to_owned())).or_insert_with(|| {
+            BTreeSet::from([
+                tag(kind),
+                annotation_token("name", Value::Text(name.to_owned())),
+            ])
+        })
+    }
+    let mut entities = Entities::new();
+    for token in walked.tokens.keys() {
+        let Value::Text(name) = &token.value else {
+            continue;
+        };
+        match token.attribute.as_str() {
+            "media_type" => {
+                add(&mut entities, "media-type", name);
+            }
+            "sense" => {
+                add(&mut entities, "sense", name);
+            }
+            "claimed_media_type" => {
+                let essence = name.split(';').next().unwrap_or(name).to_owned();
+                add(&mut entities, "media-type", name)
+                    .insert(annotation_token("essence", Value::Text(essence.clone())));
+                add(&mut entities, "media-type", &essence);
+            }
+            attribute
+                if attribute == "generated_by"
+                    || (attribute.starts_with("gloss:")
+                        && attribute.ends_with(":generated_by")) =>
+            {
+                add(&mut entities, "vendor-model", name);
+            }
+            _ => {}
+        }
+    }
+    entities
+        .into_values()
+        .map(|pairs| (entity_token("entity", pairs.into_iter().collect()), 1))
+        .collect()
+}
+
 /// Whether a token says only where a fact sits or that its body is
 /// unknown: compared in windows, never as a value.
 pub fn positional(token: &Token) -> bool {

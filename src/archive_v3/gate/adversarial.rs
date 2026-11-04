@@ -2,7 +2,8 @@
 //! the round-2 adversarial review's 25 cases, the round-3 review's 45
 //! (Claude Code and Codex, plus the importer refusal of a message whose
 //! content is a string), and the round-3 cases for report vocabulary (G8)
-//! and gap items (G9). Synthetic transcripts only.
+//! and gap items (G9), and the round-4 review's 50 attacks with its three
+//! controls (G17). Synthetic transcripts only.
 //!
 //! Each case imports a right transcript, then breaks the fragment (or the
 //! source) in one way an importer could, and asks the gate. A case passes
@@ -2238,4 +2239,1097 @@ fn the_gate_catches_every_round4_output() {
         assert!(leaks(&text).is_empty(), "{name} printed a value:\n{text}");
     }
     assert!(missed.is_empty(), "the gate missed {missed:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Round 4: the adversary's 50 attacks and 3 controls (G17). 26 wrong
+// outputs passed the round-4 gate, all renderer-side: JSON structure nodes,
+// named entities, witnesses and occurrences, kind tags, undecodable
+// structure links, facts per node and a merged gloss. The controls are a
+// break the gate always caught.
+
+mod round4 {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use triblespace::core::import::json_tree as jt;
+    use triblespace::prelude::inlineencodings::U256BE;
+
+    // Fresh ids, each minted with `trible genid` for the round-4 attack.
+    const R4_A: Id = triblespace::macros::id_hex!("7F68E249A9E04DB2C0C68453143B346D");
+    const R4_B: Id = triblespace::macros::id_hex!("EF667A1167D6A8B2B70B3D43C884EB1B");
+    const R4_C: Id = triblespace::macros::id_hex!("D001DD25F3D6CDEA274D9AD50F85294A");
+    const R4_D: Id = triblespace::macros::id_hex!("575773881E0A7B8D2DE2D55338E15F12");
+    const R4_E: Id = triblespace::macros::id_hex!("59B7A8E6100A5E5B84A816ACEC8819BA");
+    const R4_F: Id = triblespace::macros::id_hex!("378EB24706D672798A92124A0136F9C5");
+
+    enum Out {
+        Gated(Report),
+        Refused(String),
+        Crashed(String),
+        Baseline(String),
+    }
+
+    fn garbage() -> Inline<UnknownInline> {
+        Inline::new([0xFF; 32])
+    }
+
+    fn put_text(f: &mut Fragment, text: &str) -> Inline<Handle<UTF8String>> {
+        f.put::<UTF8String, _>(text.to_owned())
+    }
+
+    /// The call fact (tool_name and structure) and its structure root.
+    fn call_fact(f: &Fragment) -> (Id, Id) {
+        let named: Vec<Id> = subjects_any(f.facts(), v3::fact::tool_name.id());
+        subjects_of(f.facts(), v3::fact::structure.id())
+            .into_iter()
+            .find(|(fact, _)| named.contains(fact))
+            .expect("a call fact with a structure")
+    }
+
+    fn holder(f: &Fragment, fact: Id) -> Id {
+        subjects_with(f.facts(), v3::node::holds.id(), fact)[0]
+    }
+
+    fn drop_tag(f: &mut Fragment, e: Id, kind: Id) {
+        let gone: Vec<Trible> = of(f.facts(), e, metadata::tag.id())
+            .into_iter()
+            .filter(|t| t.v::<GenId>().try_from_inline::<Id>().ok() == Some(kind))
+            .collect();
+        assert!(!gone.is_empty(), "no such tag");
+        remove(f, &gone);
+    }
+
+    fn field_entry(i: &Imported, root: Id, name: &str) -> Id {
+        let f = &i.fragment;
+        for entry in ids(f.facts(), root, jt::object_field.id()) {
+            for t in of(f.facts(), entry, jt::field_name.id()) {
+                let h: Inline<Handle<UTF8String>> = *t.v::<Handle<UTF8String>>();
+                if text_of(i, h) == name {
+                    return entry;
+                }
+            }
+        }
+        panic!("no field {name}");
+    }
+
+    fn gated(source: &str, table: &FieldTable, f: Fragment) -> Out {
+        match catch_unwind(AssertUnwindSafe(|| run_on(table, source, f))) {
+            Ok(report) => Out::Gated(report),
+            Err(panic) => Out::Crashed(
+                panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// Import a source the importer should refuse (or whose output the gate
+    /// should fail).
+    fn fed(import: Importer, table: &FieldTable, source: &str) -> Out {
+        match import(source.as_bytes()) {
+            Err(failure) => {
+                let printed = gate::vocabulary(table, &failure.path);
+                if !leaks(&printed).is_empty() {
+                    return Out::Crashed(format!("LEAK in failure path: {printed}"));
+                }
+                Out::Refused(printed)
+            }
+            Ok(mut fragment) => {
+                let blobs = fragment.blobs_mut().snapshot().unwrap();
+                Out::Gated(gate::check(
+                    table,
+                    source.as_bytes(),
+                    fragment.facts(),
+                    &blobs,
+                ))
+            }
+        }
+    }
+
+    fn ok_or_baseline(import: Importer, table: &FieldTable, source: &str) -> Result<Imported, Out> {
+        match import(source.as_bytes()) {
+            Err(failure) => Err(Out::Baseline(format!("refused at {}", failure.path))),
+            Ok(mut fragment) => {
+                let blobs = fragment.blobs_mut().snapshot().unwrap();
+                let report = gate::check(table, source.as_bytes(), fragment.facts(), &blobs);
+                if !report.passed() {
+                    return Err(Out::Baseline(format!("baseline fails: {report}")));
+                }
+                Ok(Imported { fragment, blobs })
+            }
+        }
+    }
+
+    fn call_source(input: Value) -> String {
+        jsonl(&[
+            user("u1", None, 0, json!("Run.")),
+            assistant(
+                "a1",
+                "u1",
+                1,
+                "m1",
+                call("t1", "Bash", input),
+                json!("tool_use"),
+            ),
+            user("u2", Some("a1"), 2, result("t1", json!("out"))),
+            assistant("a2", "u2", 3, "m2", said("Done."), json!("end_turn")),
+        ])
+    }
+
+    /// Codex: two summary parts on one reasoning item.
+    fn cx_two_summaries() -> String {
+        let mut v: Vec<Value> = cx::g2()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        v[6]["payload"]["summary"] = json!([
+            {"type": "summary_text", "text": "**Looking** at it."},
+            {"type": "summary_text", "text": "**Then** fixing."}
+        ]);
+        let second = cx::line(
+            5,
+            "event_msg",
+            json!({"type": "agent_reasoning", "text": "**Then** fixing."}),
+        );
+        v.insert(8, second);
+        jsonl(&v)
+    }
+
+    fn cx_meta(second: u32, id: &str, base: &str) -> Value {
+        cx::line(
+            second,
+            "session_meta",
+            json!({"id": id, "timestamp": stamp(second), "cwd": "/synthetic",
+                "originator": "codex_cli_rs", "cli_version": "0.0.0", "model_provider": "openai",
+                "base_instructions": {"text": base}}),
+        )
+    }
+
+    fn cx_turn(second: u32, turn: &str) -> [Value; 2] {
+        [
+            cx::line(
+                second,
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            cx::line(
+                second,
+                "turn_context",
+                json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": turn}),
+            ),
+        ]
+    }
+
+    fn cx_user(second: u32, text: &str) -> Value {
+        cx::line(
+            second,
+            "response_item",
+            json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]}),
+        )
+    }
+
+    fn cx_said(second: u32, text: &str, phase: Option<&str>) -> Value {
+        let mut item = json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]});
+        if let Some(phase) = phase {
+            item["phase"] = json!(phase);
+        }
+        cx::line(second, "response_item", item)
+    }
+
+    fn cx_event_said(second: u32, text: &str, phase: &str) -> Value {
+        cx::line(
+            second,
+            "event_msg",
+            json!({"type": "agent_message", "message": text, "phase": phase}),
+        )
+    }
+
+    fn cx_head() -> Vec<Value> {
+        let mut r = vec![cx_meta(0, "77777777-7777-4777-8777-777777777777", "Sys.")];
+        r.extend(cx_turn(1, "t1"));
+        r
+    }
+
+    /// X9': a unit with a compaction whose guardian_history is `guardian`.
+    fn cx_guardian(guardian: Value) -> String {
+        let ask = json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "A."}]});
+        let said = json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "B."}]});
+        let mut r = cx_head();
+        r.push(cx::line(2, "response_item", ask.clone()));
+        r.push(cx::line(
+            2,
+            "event_msg",
+            json!({"type": "user_message", "message": "A.",
+            "images": [], "local_images": [], "text_elements": []}),
+        ));
+        r.push(cx::line(3, "response_item", said));
+        r.push(cx::line(
+            6,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+                ask, {"type": "compaction", "encrypted_content": cx::COMPACTION}],
+                "guardian_history": guardian}),
+        ));
+        r.push(cx_said(7, "E.", None));
+        jsonl(&r)
+    }
+
+    /// X8': a fork with the child's own unmatched copy at `at` in its own part.
+    fn cx_fork(own_before_task: &[Value], own_after_task: &[Value]) -> String {
+        let child = "88888888-8888-4888-8888-888888888888";
+        let parent = "99999999-9999-4999-8999-999999999999";
+        let mut meta = cx_meta(0, child, "Sys.");
+        meta["payload"]["forked_from_id"] = json!(parent);
+        let mut r = vec![meta, cx_meta(0, parent, "Sys.")];
+        r.extend(cx_turn(1, "t0"));
+        r.push(cx_user(2, "Parent asks."));
+        r.push(cx_event_said(3, "Parent answers.", "final_answer"));
+        r.push(cx_said(3, "Parent answers.", Some("final_answer")));
+        r.extend(cx_turn(4, "t1"));
+        r.extend(own_before_task.iter().cloned());
+        r.push(cx_user(5, "Child task."));
+        r.extend(own_after_task.iter().cloned());
+        r.push(cx::line(
+            6,
+            "response_item",
+            json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Child plan."}],
+                "content": null, "encrypted_content": cx::REASONING}),
+        ));
+        r.push(cx::line(
+            6,
+            "event_msg",
+            json!({"type": "agent_reasoning", "text": "Child plan."}),
+        ));
+        r.push(cx_said(7, "Done.", Some("final_answer")));
+        jsonl(&r)
+    }
+
+    fn attacks() -> Vec<(&'static str, &'static str, Out)> {
+        use crate::archive_v3::codex::import as cx_import;
+        use crate::schemas::blockdag as main;
+        let mut out: Vec<(&'static str, &'static str, Out)> = Vec::new();
+        let s = source();
+        let fresh = || import_ok(&s);
+
+        // ---- controls: the same helpers, a break the gate must catch
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let fact = holds(&f, again)[0];
+            add(&mut f, Trible::force(&fact, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "C1",
+                "control: fact gains an unknown attribute",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let leaf = subjects_any(f.facts(), jt::string.id())[0];
+            let old = of(f.facts(), leaf, jt::string.id());
+            remove(&mut f, &old);
+            let h = put_text(&mut f, "rm");
+            add(&mut f, Trible::force(&leaf, &jt::string.id(), &h));
+            out.push((
+                "C2",
+                "control: string leaf value changed",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            add(&mut f, Trible::force(&w, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "C3",
+                "control: witness gains an unknown attribute",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // ---- JSON structure (Claude Code call input)
+        // J1 an object field whose value node has no kind: an invented key.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (_, root) = call_fact(&f);
+            let name = put_text(&mut f, "sudo");
+            add(
+                &mut f,
+                Trible::force(&root, &jt::object_field.id(), &gv(R4_A)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_A, &jt::kind.id(), &gv(jt::kind_field)),
+            );
+            add(&mut f, Trible::force(&R4_A, &jt::field_name.id(), &name));
+            add(
+                &mut f,
+                Trible::force(&R4_A, &jt::field_value.id(), &gv(R4_B)),
+            );
+            out.push((
+                "J1",
+                "structure gains a field whose value has no kind",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // J2 an object field whose value is a string node with no string.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (_, root) = call_fact(&f);
+            let name = put_text(&mut f, "sudo");
+            add(
+                &mut f,
+                Trible::force(&root, &jt::object_field.id(), &gv(R4_A)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_A, &jt::kind.id(), &gv(jt::kind_field)),
+            );
+            add(&mut f, Trible::force(&R4_A, &jt::field_name.id(), &name));
+            add(
+                &mut f,
+                Trible::force(&R4_A, &jt::field_value.id(), &gv(R4_B)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_B, &jt::kind.id(), &gv(jt::kind_string)),
+            );
+            out.push((
+                "J2",
+                "structure gains a field: string node without a string",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // J3 an array entry whose value has no kind: an invented element.
+        {
+            let sa = call_source(json!({"command": "ls", "args": ["-l"]}));
+            match ok_or_baseline(import, &TABLE, &sa) {
+                Err(b) => out.push(("J3", "array gains a kindless element", b)),
+                Ok(i) => {
+                    let mut f = i.fragment;
+                    let array = subjects_with(f.facts(), jt::kind.id(), jt::kind_array)[0];
+                    let mut raw = [0u8; 32];
+                    raw[31] = 1;
+                    let index: Inline<U256BE> = Inline::new(raw);
+                    add(
+                        &mut f,
+                        Trible::force(&R4_A, &jt::array_parent.id(), &gv(array)),
+                    );
+                    add(&mut f, Trible::force(&R4_A, &jt::array_index.id(), &index));
+                    add(
+                        &mut f,
+                        Trible::force(&R4_A, &jt::array_value.id(), &gv(R4_B)),
+                    );
+                    add(
+                        &mut f,
+                        Trible::force(&R4_A, &jt::kind.id(), &gv(jt::kind_array_entry)),
+                    );
+                    out.push((
+                        "J3",
+                        "array gains a kindless element",
+                        gated(&sa, &TABLE, f),
+                    ));
+                }
+            }
+        }
+        // J4 a string leaf gains an unknown attribute.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let leaf = subjects_any(f.facts(), jt::string.id())[0];
+            add(&mut f, Trible::force(&leaf, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "J4",
+                "string leaf gains an unknown attribute",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // J5 a string leaf gains a number_raw value (A reads by kind only).
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let leaf = subjects_any(f.facts(), jt::string.id())[0];
+            let seven = put_text(&mut f, "7");
+            add(&mut f, Trible::force(&leaf, &jt::number_raw.id(), &seven));
+            out.push((
+                "J5",
+                "string leaf gains a number_raw value",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // J6 an object field entry gains an unknown attribute.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let entry = subjects_any(f.facts(), jt::field_name.id())[0];
+            add(&mut f, Trible::force(&entry, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "J6",
+                "field entry gains an unknown attribute",
+                gated(&s, &TABLE, f),
+            ));
+        }
+
+        // ---- named entities (media type, vendor model)
+        let ss = sealed_source();
+        // N1 a fact's media type entity gains an unknown attribute.
+        {
+            let i = import_ok(&ss);
+            let mut f = i.fragment;
+            let (_, mt) = subjects_of(f.facts(), v3::fact::media_type.id())[0];
+            add(&mut f, Trible::force(&mt, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "N1",
+                "media type entity gains an unknown attribute",
+                gated(&ss, &TABLE, f),
+            ));
+        }
+        // N2 a fact's media type entity loses its kind tag.
+        {
+            let i = import_ok(&ss);
+            let mut f = i.fragment;
+            let (_, mt) = subjects_of(f.facts(), v3::fact::media_type.id())[0];
+            drop_tag(&mut f, mt, v3::media_type::KIND);
+            out.push((
+                "N2",
+                "media type entity loses its kind tag",
+                gated(&ss, &TABLE, f),
+            ));
+        }
+        // N3 the vendor model entity gains an unknown attribute.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (_, model) = subjects_of(f.facts(), v3::witness::generated_by.id())[0];
+            add(&mut f, Trible::force(&model, &UNKNOWN_ATTR, &gv(R4_C)));
+            out.push((
+                "N3",
+                "vendor model entity gains an unknown attribute",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // N4 the vendor model entity loses its tags.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (_, model) = subjects_of(f.facts(), v3::witness::generated_by.id())[0];
+            let tags = of(f.facts(), model, metadata::tag.id());
+            assert!(!tags.is_empty());
+            remove(&mut f, &tags);
+            out.push((
+                "N4",
+                "vendor model entity loses its kind tag",
+                gated(&s, &TABLE, f),
+            ));
+        }
+
+        // ---- witnesses and occurrences
+        let sg = regenerated_source();
+        // W1 a bare second witness (no namespace) takes one of two occurrences.
+        {
+            let (i, hello, [_, late]) = regenerated();
+            let mut f = i.fragment;
+            add(
+                &mut f,
+                Trible::force(&R4_D, &v3::witness::projects_to.id(), &gv(hello)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_D, &metadata::tag.id(), &gv(v3::witness::KIND)),
+            );
+            set_id(&mut f, late, v3::occurrence::of.id(), R4_D);
+            out.push((
+                "W1",
+                "bare second witness takes an occurrence",
+                gated(&sg, &TABLE, f),
+            ));
+        }
+        // W2 a bare second witness alone on a witnessed node.
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            add(
+                &mut f,
+                Trible::force(&R4_D, &v3::witness::projects_to.id(), &gv(again)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_D, &metadata::tag.id(), &gv(v3::witness::KIND)),
+            );
+            out.push((
+                "W2",
+                "bare second witness on a witnessed node",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // W3 a bare occurrence (claims nothing) on a witness.
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            add(
+                &mut f,
+                Trible::force(&R4_E, &v3::occurrence::of.id(), &gv(w)),
+            );
+            add(
+                &mut f,
+                Trible::force(&R4_E, &metadata::tag.id(), &gv(v3::occurrence::KIND)),
+            );
+            out.push((
+                "W3",
+                "bare occurrence (no claims) on a witness",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // W4 a witness gains a second, undecodable projects_to.
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            add(
+                &mut f,
+                Trible::force(&w, &v3::witness::projects_to.id(), &garbage()),
+            );
+            out.push((
+                "W4",
+                "witness gains an undecodable projects_to",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // W5 an occurrence gains a second, undecodable of.
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let o = occ_of(&f, witness_of(&f, again)[0])[0];
+            add(
+                &mut f,
+                Trible::force(&o, &v3::occurrence::of.id(), &garbage()),
+            );
+            out.push((
+                "W5",
+                "occurrence gains an undecodable of",
+                gated(&s, &TABLE, f),
+            ));
+        }
+
+        // ---- kind tags lost
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let fact = holds(&f, again)[0];
+            drop_tag(&mut f, fact, v3::fact::KIND);
+            out.push(("K1", "fact loses its kind tag", gated(&s, &TABLE, f)));
+        }
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            drop_tag(&mut f, again, v3::node::KIND);
+            out.push(("K2", "node loses its kind tag", gated(&s, &TABLE, f)));
+        }
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let w = witness_of(&f, again)[0];
+            drop_tag(&mut f, w, v3::witness::KIND);
+            out.push(("K3", "witness loses its kind tag", gated(&s, &TABLE, f)));
+        }
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let o = occ_of(&f, witness_of(&f, again)[0])[0];
+            drop_tag(&mut f, o, v3::occurrence::KIND);
+            out.push(("K4", "occurrence loses its kind tag", gated(&s, &TABLE, f)));
+        }
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (g, _) = gloss_on(&f, v3::gloss::category::TITLE);
+            drop_tag(&mut f, g, v3::gloss::KIND);
+            out.push(("K5", "title gloss loses its kind tag", gated(&s, &TABLE, f)));
+        }
+
+        // ---- structure links with undecodable values
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            add(
+                &mut f,
+                Trible::force(&again, &v3::node::previous.id(), &garbage()),
+            );
+            out.push((
+                "L1",
+                "node gains an undecodable previous",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (g, _) = gloss_on(&f, v3::gloss::category::TITLE);
+            add(
+                &mut f,
+                Trible::force(&g, &v3::gloss::describes.id(), &garbage()),
+            );
+            out.push((
+                "L2",
+                "gloss gains an undecodable describes",
+                gated(&s, &TABLE, f),
+            ));
+        }
+
+        // ---- facts per node
+        // F1 the call fact split in two on its node.
+        {
+            let i = fresh();
+            let mut f = i.fragment;
+            let (fact, root) = call_fact(&f);
+            let node = holder(&f, fact);
+            for t in entity(f.facts(), fact) {
+                if *t.a() != v3::fact::tool_name.id() {
+                    add(&mut f, Trible::force(&R4_F, t.a(), t.v::<UnknownInline>()));
+                }
+            }
+            let st = of(f.facts(), fact, v3::fact::structure.id());
+            remove(&mut f, &st);
+            let _ = root;
+            add(
+                &mut f,
+                Trible::force(&node, &v3::node::holds.id(), &gv(R4_F)),
+            );
+            out.push((
+                "F1",
+                "call fact split into two facts on one node",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // F2 a fact duplicated under a second entity on its node.
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            let fact = holds(&f, again)[0];
+            clone_entity(&mut f, fact, R4_F);
+            add(
+                &mut f,
+                Trible::force(&again, &v3::node::holds.id(), &gv(R4_F)),
+            );
+            out.push((
+                "F2",
+                "fact duplicated under a second entity on its node",
+                gated(&s, &TABLE, f),
+            ));
+        }
+        // F3 the whole witnessed node duplicated (fresh node, witness, occurrence).
+        {
+            let i = fresh();
+            let again = one(&i, "Again.");
+            let mut f = i.fragment;
+            clone_entity(&mut f, again, R4_A);
+            let w = witness_of(&f, again)[0];
+            clone_entity(&mut f, w, R4_B);
+            set_id(&mut f, R4_B, v3::witness::projects_to.id(), R4_A);
+            let o = occ_of(&f, w)[0];
+            clone_entity(&mut f, o, R4_C);
+            set_id(&mut f, R4_C, v3::occurrence::of.id(), R4_B);
+            out.push((
+                "F3",
+                "witnessed node duplicated with its witness and occurrence",
+                gated(&s, &TABLE, f),
+            ));
+        }
+
+        // ---- Codex glosses
+        {
+            let x = cx_two_summaries();
+            match ok_or_baseline(cx_import, &CX, &x) {
+                Err(b) => out.push(("G1", "two summary glosses merged into one entity", b)),
+                Ok(i) => {
+                    let mut f = i.fragment;
+                    let gs: Vec<Id> = subjects_with(
+                        f.facts(),
+                        v3::gloss::category.id(),
+                        v3::gloss::category::REASONING_SUMMARY,
+                    );
+                    assert_eq!(gs.len(), 2, "two glosses");
+                    let text = of(f.facts(), gs[1], v3::gloss::text.id());
+                    let all = entity(f.facts(), gs[1]);
+                    remove(&mut f, &all);
+                    add(
+                        &mut f,
+                        Trible::force(&gs[0], text[0].a(), text[0].v::<UnknownInline>()),
+                    );
+                    out.push((
+                        "G1",
+                        "two summary glosses merged into one entity",
+                        gated(&x, &CX, f),
+                    ));
+                }
+            }
+        }
+        // G2 Codex: the two summaries' texts swapped between... a single gloss
+        // keeps both and the other is dropped is G1; here the second gloss
+        // moves its text onto a fresh gloss entity on another node (her answer).
+        // (placement; expected caught)
+
+        // ---- importer refusals: backup-snapshot shapes (Claude Code)
+        {
+            let cut = format!(
+                "{s}{}",
+                "{\"type\":\"user\",\"uuid\":\"u9\",\"parentUuid\":\"a5\",\"mess"
+            );
+            out.push((
+                "B1",
+                "a truncated last line (backup cut mid-write)",
+                fed(import, &TABLE, &cut),
+            ));
+        }
+        {
+            let mut lines: Vec<String> = s.lines().map(str::to_owned).collect();
+            let changed = lines[2].replace("Again.", "Changed.");
+            lines.push(changed);
+            let twice = lines.join("\n") + "\n";
+            out.push((
+                "B2",
+                "one uuid written twice with different text",
+                fed(import, &TABLE, &twice),
+            ));
+        }
+        {
+            let mut lines: Vec<String> = s.lines().map(str::to_owned).collect();
+            let mut v: Value = serde_json::from_str(&lines[1]).unwrap();
+            v["message"]["stop_reason"] = json!("max_tokens");
+            lines.push(serde_json::to_string(&v).unwrap());
+            let twice = lines.join("\n") + "\n";
+            out.push((
+                "B3",
+                "one uuid written twice, the second with another stop",
+                fed(import, &TABLE, &twice),
+            ));
+        }
+        {
+            let nul = s.replacen("\n", "\n\u{0}\n", 1);
+            out.push((
+                "B4",
+                "a NUL line (sparse backup tail) mid-file",
+                fed(import, &TABLE, &nul),
+            ));
+        }
+
+        // ---- importer refusals: Codex supply, guardian, errors, summaries
+        {
+            let mut r = cx_head();
+            r.push(cx_user(2, "Q."));
+            r.push(cx_said(3, "Looking.", None));
+            r.push(cx_event_said(3, "Looking.", "commentary"));
+            out.push((
+                "S1",
+                "phase copy after its message (text match only)",
+                fed(cx_import, &CX, &jsonl(&r)),
+            ));
+        }
+        {
+            let mut r = cx_head();
+            r.push(cx_user(2, "Q."));
+            r.push(cx_event_said(3, "Looking.", "commentary"));
+            r.push(cx::line(
+                3,
+                "response_item",
+                json!({"type": "function_call", "name": "ls",
+                "arguments": "{}", "call_id": "c1"}),
+            ));
+            r.push(cx::line(
+                3,
+                "response_item",
+                json!({"type": "function_call_output",
+                "call_id": "c1", "output": "x"}),
+            ));
+            r.push(cx_said(4, "Looking.", None));
+            out.push((
+                "S2",
+                "phase copy separated from its message by a call",
+                fed(cx_import, &CX, &jsonl(&r)),
+            ));
+        }
+        {
+            let mut r = cx_head();
+            r.push(cx_user(2, "Q."));
+            r.push(cx_event_said(3, "Same.", "commentary"));
+            r.push(cx_said(3, "Other.", None));
+            r.push(cx_said(4, "Same.", None));
+            out.push((
+                "S3",
+                "phase copy before another message, its text held later",
+                fed(cx_import, &CX, &jsonl(&r)),
+            ));
+        }
+        {
+            let ask = json!({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "A."}]});
+            out.push((
+                "H1",
+                "guardian_history holds one item twice",
+                fed(cx_import, &CX, &cx_guardian(json!([ask, ask]))),
+            ));
+        }
+        {
+            let event = json!({"type": "user_message", "message": "A.",
+                "images": [], "local_images": [], "text_elements": []});
+            out.push((
+                "H2",
+                "guardian_history holds an event payload, not an item",
+                fed(cx_import, &CX, &cx_guardian(json!([event]))),
+            ));
+        }
+        {
+            let comp = json!({"type": "compaction", "encrypted_content": cx::COMPACTION});
+            out.push((
+                "H3",
+                "guardian_history holds the replacement's own compaction item",
+                fed(cx_import, &CX, &cx_guardian(json!([comp]))),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[15]["payload"]["error"] = json!({});
+            out.push((
+                "E1",
+                "task_complete.error an empty object",
+                fed(cx_import, &CX, &jsonl(&v)),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[15]["payload"]["error"] = json!({"message": null, "codex_error_info": "other"});
+            out.push((
+                "E2",
+                "task_complete.error message null",
+                fed(cx_import, &CX, &jsonl(&v)),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[6]["payload"]["summary"] = json!([{"type": "summary_text", "text": null}]);
+            out.push((
+                "E3",
+                "summary part text null",
+                fed(cx_import, &CX, &jsonl(&v)),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[6]["payload"]["summary"] = json!([{"type": "summary_text", "text": ""}]);
+            out.push((
+                "E4",
+                "summary part text empty",
+                fed(cx_import, &CX, &jsonl(&v)),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[4]["payload"]["content"] = json!([{"type": "input_text", "text": ""}]);
+            out.push((
+                "E5",
+                "her prompt part text empty",
+                fed(cx_import, &CX, &jsonl(&v)),
+            ));
+        }
+        {
+            let thought = cx::line(
+                5,
+                "event_msg",
+                json!({"type": "agent_reasoning", "text": "Child's own aside."}),
+            );
+            out.push((
+                "X1",
+                "fork: child's unmatched reasoning copy after its own prompt",
+                fed(cx_import, &CX, &cx_fork(&[], &[thought])),
+            ));
+        }
+        {
+            let thought = cx::line(
+                4,
+                "event_msg",
+                json!({"type": "agent_reasoning", "text": "Child's own aside."}),
+            );
+            out.push((
+                "X2",
+                "fork: child's unmatched copy after its own task_started",
+                fed(cx_import, &CX, &cx_fork(&[thought], &[])),
+            ));
+        }
+        {
+            let comment = cx_event_said(5, "Child comments.", "commentary");
+            out.push((
+                "X3",
+                "fork: child's unmatched commentary copy after its own prompt",
+                fed(cx_import, &CX, &cx_fork(&[], &[comment])),
+            ));
+        }
+
+        // ---- report values
+        {
+            let sv = call_source(json!({"command": "ls", "hunter2key": "Bremen-secret"}));
+            match ok_or_baseline(import, &TABLE, &sv) {
+                Err(b) => out.push(("V1", "structure key named by a secret, dropped by A", b)),
+                Ok(i) => {
+                    let (_, root) = call_fact(&i.fragment);
+                    let entry = field_entry(&i, root, "hunter2key");
+                    let mut f = i.fragment;
+                    let t = Trible::force(&root, &jt::object_field.id(), &gv(entry));
+                    remove(&mut f, &[t]);
+                    out.push((
+                        "V1",
+                        "structure key named by a secret, dropped by A",
+                        gated(&sv, &TABLE, f),
+                    ));
+                }
+            }
+        }
+        {
+            let mut a1: Value = serde_json::from_str(s.lines().nth(1).unwrap()).unwrap();
+            a1["message"]["usage"]["a$Bremen"] = json!(1);
+            let mut lines: Vec<String> = s.lines().map(str::to_owned).collect();
+            lines[1] = serde_json::to_string(&a1).unwrap();
+            let mutated = lines.join("\n") + "\n";
+            out.push((
+                "V2",
+                "printable unknown key with a secret (nested)",
+                gated(&mutated, &TABLE, import_ok(&s).fragment),
+            ));
+            out.push((
+                "V2i",
+                "same, importer failure path",
+                fed(import, &TABLE, &mutated),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[3]["payload"]["sandbox_policy"]["Bremen_x"] = json!(true);
+            let mutated = jsonl(&v);
+            let x = cx::g2();
+            let base = import_with(cx_import, &x);
+            out.push((
+                "V3",
+                "Codex nested unknown key with a secret",
+                gated(&mutated, &CX, base.fragment),
+            ));
+            out.push((
+                "V3i",
+                "same, importer failure path",
+                fed(cx_import, &CX, &mutated),
+            ));
+        }
+        {
+            let mut v: Vec<Value> = cx::g2()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            v[1]["payload"]["role"] = json!("hunter2");
+            let mutated = jsonl(&v);
+            out.push((
+                "V4",
+                "Codex discriminator value a secret (role)",
+                fed(cx_import, &CX, &mutated),
+            ));
+        }
+        let _ = main::block::KIND;
+        out
+    }
+
+    /// Cases the rulings accept as no defect (rulings-r5: the X8' fork-boundary
+    /// cases, and unknown keys inside a subtree that is dropped whole). They
+    /// are run, and must neither crash nor print a value.
+    const ACCEPTED: &[&str] = &["X1", "X2", "X3", "V2", "V2i", "V3", "V3i"];
+    /// Cases an importer ruling of round 5 owns, not the gate: X15 (an error
+    /// whose `message` is no string fails). Asserted in their own test.
+    const IMPORTER: &[&str] = &["E2"];
+
+    #[test]
+    fn the_gate_catches_every_round4_attack() {
+        let cases = attacks();
+        assert_eq!(cases.len(), 53);
+        let mut missed = Vec::new();
+        for (code, name, outcome) in &cases {
+            match outcome {
+                Out::Gated(report) => {
+                    let text = format!("{report}");
+                    assert!(leaks(&text).is_empty(), "{code} printed a value:\n{text}");
+                    if report.passed() {
+                        println!("R4\t{code}\tpassed\t{name}");
+                        if !ACCEPTED.contains(code) && !IMPORTER.contains(code) {
+                            missed.push(*code);
+                        }
+                    } else {
+                        let mut kinds: Vec<String> = report
+                            .rows
+                            .iter()
+                            .map(|r| format!("{}:{}", r.kind, r.path))
+                            .collect();
+                        kinds.sort();
+                        kinds.dedup();
+                        println!("R4\t{code}\tcaught\t{name}\t{}", kinds.join(" | "));
+                    }
+                }
+                Out::Refused(path) => println!("R4\t{code}\trefused\t{name}\t{path}"),
+                Out::Crashed(why) => panic!("{code} crashed: {why}"),
+                Out::Baseline(why) => panic!("{code} has no right baseline: {why}"),
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "the gate missed {} of round 4: {missed:?}",
+            missed.len()
+        );
+    }
+
+    /// X15: an erred turn's `message` must be a JSON string; `null` fails.
+    /// The Codex importer applies it, not the gate.
+    #[test]
+    fn x15_an_error_message_that_is_no_string_fails() {
+        let cases = attacks();
+        let (_, _, outcome) = cases.iter().find(|(code, _, _)| *code == "E2").unwrap();
+        match outcome {
+            Out::Refused(_) => {}
+            Out::Gated(report) => assert!(!report.passed(), "E2 passed the gate"),
+            Out::Crashed(why) | Out::Baseline(why) => panic!("E2: {why}"),
+        }
+    }
 }

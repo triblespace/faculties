@@ -1125,6 +1125,16 @@ fn g4_what_no_window_reaches_is_reported() {
         let report = chain.check(&claude_code::TABLE, &control);
         eprintln!("g4 {what}:\n{report}");
         assert!(!report.passed(), "a stray {what} passed");
+        // G14: a trible no rendered tuple holds is reported by its
+        // attribute's name.
+        assert!(
+            report
+                .rows
+                .iter()
+                .any(|row| row.kind == Kind::Unrendered
+                    && row.path.starts_with("window:unrendered/")),
+            "a stray {what} is not unrendered:\n{report}"
+        );
     }
 }
 

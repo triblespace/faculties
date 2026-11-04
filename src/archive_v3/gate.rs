@@ -9,11 +9,14 @@
 //!   drops or correlates, asserts every mirror and empty drop, and fails any
 //!   path, discriminator or vocabulary value the table does not name.
 //! - **A** ([`render`]) reads only the `TribleSet` an importer produced. It
-//!   renders the window (`thread_to`) of every witnessed leaf and of every
-//!   `out` fact's predecessor as tokens: each fact's values with its
-//!   modality and direction, and the annotations of the nodes and witnesses
-//!   on the window. It renders every attribute it finds; one it does not
-//!   know becomes a token of its own, so nothing hides.
+//!   renders the window (`thread_to`) of every witnessed node, and every
+//!   entity it reaches renders as its whole tuple (G14): every trible the
+//!   entity has, its kind tag included, as one pair. After rendering, a
+//!   trible of an entity A never rendered is an *unrendered* row, so no
+//!   trible of the import escapes the comparison.
+//! - B emits the entity tuples its table implies ([`walk::fact_tuple`],
+//!   [`walk::occurrence_tuple`], [`walk::placed_entities`],
+//!   [`walk::named_entities`]).
 //!
 //! The two meet only in the [`Token`] type and in the term names of the v3
 //! vocabulary, which B reads from the table and A from the schema.
@@ -29,20 +32,27 @@
 //!    window behind its record, each as often as the source holds it and in
 //!    its order (else *count* or *order*), and every source window is held
 //!    by a witnessed window (else *unheld*);
-//! 4. every node holds, in place, exactly the annotations, links and
-//!    occurrences the source places at its window position (else *placed*),
-//!    and every link the source's correlators establish names an item in the
-//!    window of the item that links (else *link*);
-//! 5. every entity A was given is on a window, or annotates one (else
-//!    *unreached*);
-//! 6. B found nothing the table does not name, and every drop held.
+//! 4. every node holds, in place, exactly the entities (its own tuple, its
+//!    witnesses', glosses' and citations'), links and occurrences the
+//!    source places at its window position, each as a whole tuple (else
+//!    *placed*), and every link the source's correlators establish names an
+//!    item in the window of the item that links (else *link*);
+//! 5. no two nodes stand at one window position, so each source occurrence
+//!    is one occurrence entity on one node (G16; else *count*);
+//! 6. the named entities the unit refers to (media types, senses, vendor
+//!    models) are, as whole tuples, the ones the source implies (else
+//!    *invented* or *missing* at `window:entity/<kind>`);
+//! 7. every trible of the import is rendered (else *unrendered*, by
+//!    attribute name);
+//! 8. B found nothing the table does not name, and every drop held.
 //!
 //! Points 1 and 2 compare sets over the unit: copies of one item converge on
 //! one fact. Point 3 is what counts them: it compares per witness, never by
 //! collapsing the unit, so a repeated identical occurrence the importer lost
 //! is a missing occurrence there. A window is compared as the sequence of
-//! its items (the fact tokens of one node, the fact tokens of one source
-//! occurrence); `json_tree` objects compare order-free, because a structure
+//! its items: an item is the multiset of its facts' tuples (G15), A's each
+//! fact its node holds, B's the one fact of a source occurrence, so a fact
+//! split in two or held twice is another item; `json_tree` objects compare order-free, because a structure
 //! token names its leaf by key path. Every fact renders its shape (modality
 //! and direction), so every node is an item: a gap (`absent`) the rendering
 //! rule puts in her window ([`crate::archive_v3::fields::Gaps`]), and a
@@ -124,6 +134,9 @@ pub enum Value {
     /// A place in a window, named by the hash of the window that ends there
     /// (a link's target that is not on the linking node's own window).
     Place(String),
+    /// One entity's whole tuple: every (attribute, value) pair it has,
+    /// sorted, each as often as it has it (G14).
+    Tuple(Vec<Token>),
 }
 
 /// A JSON leaf; an empty container is a leaf of its own.
@@ -135,6 +148,11 @@ pub enum JsonLeaf {
     String(String),
     EmptyArray,
     EmptyObject,
+    /// A `json_tree` node whose tuple is no JSON value's: no kind or two,
+    /// an attribute of another kind or one no JSON value has, an entry
+    /// that is not exactly its kind, name or index and value. No source
+    /// has one.
+    Malformed,
 }
 
 /// What a report row says.
@@ -154,8 +172,8 @@ pub enum Kind {
     Count,
     /// A source window that no witnessed window holds.
     Unheld,
-    /// An entity A was given that no window reaches.
-    Unreached,
+    /// A trible of the import that no rendered tuple holds (G14).
+    Unrendered,
     /// The table names no class for a path (or for its discriminator).
     Unknown,
     /// A vocabulary value the table does not name.
@@ -189,7 +207,7 @@ impl fmt::Display for Kind {
             Kind::Order => "order",
             Kind::Count => "count",
             Kind::Unheld => "unheld",
-            Kind::Unreached => "unreached",
+            Kind::Unrendered => "unrendered",
             Kind::Unknown => "unknown",
             Kind::UnknownValue => "unknown-value",
             Kind::Mirror => "mirror",
@@ -493,6 +511,32 @@ pub fn compare(table: &FieldTable, walked: &walk::Walked, rendered: &render::Ren
         note(path, kind, what);
     }
 
+    // The named entities the unit's values refer to, each as its whole
+    // tuple, over the unit (G14): they are shared, so they have no place.
+    // Each is keyed by its kind tags and names. An entity A rendered that
+    // the source implies under the same key must be exactly the implied
+    // tuple, once; one under no implied key is invented. An implied entity
+    // A lacks needs no row of its own: the value that names it is then
+    // missing (or changed) above, or A holds it under another key.
+    let implied: BTreeMap<(Vec<Value>, Vec<Value>), Token> = walk::named_entities(walked)
+        .into_keys()
+        .map(|token| (entity_key(&token), token))
+        .collect();
+    let mut keyed: BTreeMap<(Vec<Value>, Vec<Value>), Vec<&Token>> = BTreeMap::new();
+    for (token, &n) in &rendered.entities {
+        for _ in 0..n {
+            keyed.entry(entity_key(token)).or_default().push(token);
+        }
+    }
+    for (ordinal, (key, tokens)) in keyed.iter().enumerate() {
+        let path = format!("window:entity/{}", tag_of(tokens[0]));
+        match implied.get(key) {
+            Some(want) if tokens.len() == 1 && tokens[0] == want => {}
+            Some(_) => note(path, Kind::Placed, ordinal.to_string()),
+            None => note(path, Kind::Invented, ordinal.to_string()),
+        }
+    }
+
     Report {
         rows: rows
             .into_iter()
@@ -543,20 +587,26 @@ fn occurrences(
     rendered: &render::Rendered,
 ) -> Vec<(String, Kind, String)> {
     let mut rows = Vec::new();
-    let facts: Vec<&BTreeSet<Token>> = rendered.graph.iter().map(|node| &node.facts).collect();
-    let mut ids: BTreeMap<&BTreeSet<Token>, u32> = BTreeMap::new();
-    let mut intern = |tokens| {
+    // An item is the multiset of its facts' tuples (G15): B's is the one
+    // fact of its source occurrence, A's each fact its node holds, as often
+    // as it holds one.
+    let mut ids: BTreeMap<Multiset<render::Tuple>, u32> = BTreeMap::new();
+    let mut intern = |item: Multiset<render::Tuple>| {
         let next = ids.len() as u32;
-        *ids.entry(tokens).or_insert(next)
+        *ids.entry(item).or_insert(next)
     };
     let item_ids: Vec<u32> = walked
         .items
         .iter()
-        .map(|item| intern(&item.tokens))
+        .map(|item| intern(Multiset::from([(walk::fact_tuple(item), 1)])))
         .collect();
     // Every node is an item: A renders a node that holds nothing as the
     // `empty` shape (G11), which no source item has.
-    let node_ids: Vec<u32> = facts.iter().map(|tokens| intern(tokens)).collect();
+    let node_ids: Vec<u32> = rendered
+        .graph
+        .iter()
+        .map(|node| intern(node.facts.clone()))
+        .collect();
 
     // A's window hashes, root first; a node is placed after its previous.
     let mut node_hash: Vec<Option<Hash>> = vec![None; rendered.graph.len()];
@@ -656,7 +706,14 @@ fn occurrences(
         ids
     };
     let path_of = |at: usize| -> String {
-        let valued = || facts[at].iter().filter(|token| !walk::positional(token));
+        let all = || {
+            rendered.graph[at]
+                .facts
+                .keys()
+                .flat_map(|tuple| tuple.iter())
+                .filter(|token| token.attribute != "tag")
+        };
+        let valued = || all().filter(|token| !walk::positional(token));
         valued()
             .find_map(|token| {
                 walked
@@ -667,7 +724,7 @@ fn occurrences(
             })
             .or_else(|| valued().next().map(window_path))
             .or_else(|| {
-                facts[at].iter().next().map(|token| {
+                all().next().map(|token| {
                     if *token == render::empty() {
                         "window:empty".to_owned()
                     } else {
@@ -784,11 +841,11 @@ fn occurrences(
         at.marks.extend(item.marks.iter().cloned());
         at.marks.extend(item.carried.iter().cloned());
         // The record's claims, and why its sampling of this item stopped.
+        // A record that holds the item is one occurrence of its witness,
+        // whatever it claims (G16).
         let mut claims = walked.records_claims(occurrence.record).clone();
         claims.extend(item.ends.iter().cloned());
-        if !claims.is_empty() {
-            at.occurrences.insert(claims);
-        }
+        at.occurrences.insert(claims);
         at.occurrences.extend(item.claims.iter().cloned());
         // A link: the latest candidate before the item in its window, by
         // how many places back it stands.
@@ -912,6 +969,19 @@ fn occurrences(
         }
     }
 
+    // One node per window position (G16): each source occurrence maps to
+    // exactly one occurrence entity on exactly one node. Two nodes of one
+    // window hash render alike in every trible, which an importer that
+    // derives each node's id from its content never makes; a node
+    // duplicated whole would otherwise pass in place twice.
+    let mut first_at: HashMap<Hash, usize> = HashMap::new();
+    for at in 0..rendered.graph.len() {
+        let Some(hash) = node_hash[at] else { continue };
+        if first_at.entry(hash).or_insert(at) != &at {
+            rows.push((path_of(at), Kind::Count, format!("node {at}")));
+        }
+    }
+
     // Every node against what the source places at its position.
     let none = Expect::default();
     for (at, node) in rendered.graph.iter().enumerate() {
@@ -921,14 +991,10 @@ fn occurrences(
         }
         let expected = expect.get(&hash).unwrap_or(&none);
         let label = format!("node {at}");
-        let marks: Multiset<Token> = expected.marks.iter().map(|t| (t.clone(), 1)).collect();
+        // The entities placed here, each as its whole tuple (G14).
+        let marks = walk::placed_entities(&expected.marks);
         for token in differing(&node.marks, &marks) {
-            let path = walked
-                .tokens
-                .get(token)
-                .and_then(|origins| origins.first())
-                .map_or_else(|| window_path(token), |origin| origin.path.clone());
-            rows.push((path, Kind::Placed, label.clone()));
+            rows.push((entity_path(walked, token), Kind::Placed, label.clone()));
         }
         let links: BTreeSet<Token> = node
             .links
@@ -962,7 +1028,8 @@ fn occurrences(
         // link where the source places none (extra) or the reverse.
         let shape = node
             .facts
-            .iter()
+            .keys()
+            .flat_map(|tuple| tuple.iter())
             .find(|token| token.attribute.is_empty())
             .map_or_else(String::new, |token| {
                 format!("{}/{}", token.modality, token.direction)
@@ -984,9 +1051,9 @@ fn occurrences(
         let tuples: Multiset<BTreeSet<Token>> = expected
             .occurrences
             .iter()
-            .map(|t| (t.clone(), 1))
+            .map(|claims| (walk::occurrence_tuple(claims), 1))
             .collect();
-        if node.witnessed && expected.witnessed && node.occurrences != tuples {
+        if node.occurrences != tuples {
             rows.push(("window:occurrence".to_owned(), Kind::Placed, label.clone()));
         }
     }
@@ -1002,6 +1069,65 @@ fn differing<'a, T: Ord>(a: &'a Multiset<T>, b: &'a Multiset<T>) -> Vec<&'a T> {
         .collect();
     out.extend(b.keys().filter(|t| !a.contains_key(*t)));
     out
+}
+
+/// The kind an entity token's tuple names, for a row: `untagged` when it
+/// has no kind tag.
+fn tag_of(token: &Token) -> String {
+    let Value::Tuple(pairs) = &token.value else {
+        return "untagged".to_owned();
+    };
+    pairs
+        .iter()
+        .find_map(|pair| match (&*pair.attribute, &pair.value) {
+            ("tag", Value::Term(kind)) => Some(kind.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "untagged".to_owned())
+}
+
+/// A named entity's key: its kind tags and its names.
+fn entity_key(token: &Token) -> (Vec<Value>, Vec<Value>) {
+    let Value::Tuple(pairs) = &token.value else {
+        return (Vec::new(), vec![token.value.clone()]);
+    };
+    let of = |attribute: &str| -> Vec<Value> {
+        pairs
+            .iter()
+            .filter(|pair| pair.attribute == attribute)
+            .map(|pair| pair.value.clone())
+            .collect()
+    };
+    (of("tag"), of("name"))
+}
+
+/// Where a placed entity that differs is reported: the source path of the
+/// first of its values B found, else the entity's kind.
+fn entity_path(walked: &walk::Walked, token: &Token) -> String {
+    if let Value::Tuple(pairs) = &token.value {
+        let category = pairs
+            .iter()
+            .find_map(|pair| match (&*pair.attribute, &pair.value) {
+                ("category", Value::Term(category)) => Some(category.clone()),
+                _ => None,
+            });
+        for pair in pairs {
+            if pair.attribute == "tag" {
+                continue;
+            }
+            let flat = match (&category, &*pair.attribute) {
+                (Some(category), "text") => Token {
+                    attribute: format!("gloss:{category}"),
+                    ..pair.clone()
+                },
+                _ => pair.clone(),
+            };
+            if let Some(origin) = walked.tokens.get(&flat).and_then(|o| o.first()) {
+                return origin.path.clone();
+            }
+        }
+    }
+    format!("window:entity/{}", token.attribute)
 }
 
 fn window_path(token: &Token) -> String {
