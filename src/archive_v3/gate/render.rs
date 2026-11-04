@@ -7,8 +7,9 @@
 //!
 //! - every attribute of every fact the node holds, under the fact's modality
 //!   and direction (a `structure` as its `json_tree` leaves);
-//! - the node's own annotations (`ends`, a time) and those of its witnesses
-//!   and glosses, as annotation tokens.
+//! - the node's own annotations (`ends`, `rendering`, a time) and those of
+//!   its glosses, and the claims of each occurrence of its witnesses, as
+//!   annotation tokens.
 //!
 //! Attributes that are structure (`previous`, `holds`, links between nodes,
 //! kind tags, a gap's `absent`, derived actor ids) render nothing. Every
@@ -241,6 +242,11 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     term(&specs, id)
                 });
                 tokens.insert(annotation("ends", name));
+            } else if attribute == v3::node::rendering.id() {
+                let name = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| {
+                    term(v3::node::rendering::SPECS, id)
+                });
+                tokens.insert(annotation("rendering", name));
             } else if attribute == main::block::timestamp.id() {
                 tokens.insert(annotation("timestamp", time(raw)));
             } else {
@@ -254,7 +260,16 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         .collect();
         for witness in witnesses {
             self.reached.insert(witness);
-            self.witness(witness, &mut tokens);
+            self.claims(witness, &mut tokens);
+            let occurrences: Vec<Id> = find!(
+                occurrence: Id,
+                pattern!(self.facts, [{ ?occurrence @ v3::occurrence::of: witness }])
+            )
+            .collect();
+            for occurrence in occurrences {
+                self.reached.insert(occurrence);
+                self.claims(occurrence, &mut tokens);
+            }
         }
         let glossed: Vec<Id> = find!(
             gloss: Id,
@@ -408,7 +423,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 values.push(((*name).to_owned(), value));
                 continue;
             }
-            let terms: [(&str, Id, &[(Id, &str)]); 4] = [
+            let terms: [(&str, Id, &[(Id, &str)]); 5] = [
                 ("status", v3::fact::status.id(), v3::fact::status::SPECS),
                 ("detail", v3::fact::detail.id(), v3::fact::detail::SPECS),
                 (
@@ -417,6 +432,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     v3::fact::register::SPECS,
                 ),
                 ("form", v3::fact::form.id(), v3::fact::form::SPECS),
+                ("effort", v3::fact::effort.id(), v3::fact::effort::SPECS),
             ];
             if let Some((name, _, specs)) = terms.iter().find(|(_, id, _)| *id == attribute) {
                 let value = Self::id(raw).map_or(Value::Raw(hex(&raw.raw)), |id| term(specs, id));
@@ -620,6 +636,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             (v3::fact::KIND, "fact"),
             (main::block::KIND, "node"),
             (main::source_projection::KIND, "witness"),
+            (v3::occurrence::KIND, "occurrence"),
             (v3::gloss::KIND, "gloss"),
             (v3::citation::KIND, "citation"),
         ];
@@ -644,11 +661,14 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
         }
     }
 
-    fn witness(&mut self, witness: Id, tokens: &mut BTreeSet<Token>) {
+    /// The claims on a witness or on one of its occurrences.
+    fn claims(&mut self, witness: Id, tokens: &mut BTreeSet<Token>) {
         for (attribute, raw) in self.attributes(witness) {
             let w = &main::source_projection::KIND;
             if attribute == main::source_projection::source_namespace.id()
                 || attribute == main::source_projection::projects_to.id()
+                || attribute == v3::occurrence::of.id()
+                || (attribute == metadata::tag.id() && Self::id(raw) == Some(v3::occurrence::KIND))
                 || attribute == main::source_projection::semantic_predecessor_support.id()
                 || attribute == main::source_projection::author.id()
                 || attribute == main::source_projection::experiencer.id()

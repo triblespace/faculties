@@ -17,13 +17,18 @@
 //!   tool calls. A `<synthetic>` record is harness text in her slot: `in`,
 //!   `form: voiced`.
 //! - `attachment`: exactly its `rendered[]` / `renderedInHumanTurn[]` text
-//!   when the client recorded it. Before that, the rendering of each kind is
-//!   unknown and the record is open.
+//!   when the client recorded it; every field of the data it was made from
+//!   is named per kind. Before that, the rendering is unknown: each named
+//!   field is a member of an `in` event fact, and the node says
+//!   `rendering: unrecorded`.
 //! - `api-request-shape`: the system prompt and the tool definitions she was
 //!   given. Request frames (`api-request`, `api-request-blob`) are open.
+//! - an assistant record's `effort`: the settings header of the window its
+//!   request was sampled from.
 //! - `system`: a compaction boundary (structure) and an away summary (a
 //!   gloss); every other subtype is client machinery.
-//! - `ai-title`: a gloss on the session's latest node.
+//! - `ai-title`: a gloss on the node the record before it in the file ends
+//!   its line on.
 //!
 //! Window changes the source marks (`input_transformations`,
 //! `context_management.applied_edits`) are structure: they shape the window
@@ -46,7 +51,17 @@ const STOP_REASONS: &[(&str, &str)] = &[
     ("max_tokens", "max_tokens"),
     ("refusal", "refusal"),
 ];
-const IS_ERROR: &[(&str, &str)] = &[("true", "error"), ("false", "ok")];
+const IS_ERROR: &[(&str, &str)] = &[("true", "error")];
+/// Reasoning effort: the source spelling is the term name (S1).
+const EFFORT: &[(&str, &str)] = &[
+    ("low", "low"),
+    ("medium", "medium"),
+    ("high", "high"),
+    ("xhigh", "xhigh"),
+    ("max", "max"),
+];
+const NOT_ERROR: &[Cond] = &[Cond::SiblingNot("is_error", "true")];
+const ERROR: &[Cond] = &[Cond::Sibling("is_error", "true")];
 const SYNTHETIC: &[Cond] = &[Cond::Is("message.model", "<synthetic>")];
 const SAMPLED: &[Cond] = &[Cond::IsNot("message.model", "<synthetic>")];
 const VOICED: &[(&str, Decode)] = &[("form", Decode::ConstTerm("voiced"))];
@@ -101,10 +116,6 @@ macro_rules! summarized {
 macro_rules! node_record {
     ($kind:literal) => {
         [
-            Entry::new(
-                concat!("{", $kind, "}.type"),
-                Class::Structure(Structure::Discriminator),
-            ),
             Entry::new(
                 concat!("{", $kind, "}.uuid"),
                 Class::Structure(Structure::Order),
@@ -209,9 +220,417 @@ macro_rules! shown_items {
     };
 }
 
-const USER: [Entry; 15] = node_record!("user");
-const ASSISTANT: [Entry; 15] = node_record!("assistant");
-const ATTACHMENT: [Entry; 15] = node_record!("attachment");
+const USER: [Entry; 14] = node_record!("user");
+const ASSISTANT: [Entry; 14] = node_record!("assistant");
+const ATTACHMENT: [Entry; 14] = node_record!("attachment");
+
+const RENDERED: &[Cond] = &[Cond::Present("rendered")];
+const HUMAN_ONLY: &[Cond] = &[
+    Cond::Absent("rendered"),
+    Cond::Present("renderedInHumanTurn"),
+];
+/// Recorded before the client recorded renderings (S3).
+const UNRECORDED: &[Cond] = &[
+    Cond::Absent("rendered"),
+    Cond::Absent("renderedInHumanTurn"),
+];
+const RENDERED_FROM: DropReason =
+    DropReason::Machinery("the data the rendered text was made from; she saw the rendering");
+
+const RECORD_TYPES: &[Entry] = &[
+    Entry::new("{user}.type", Class::Structure(Structure::Discriminator)),
+    Entry::new(
+        "{assistant}.type",
+        Class::Structure(Structure::Discriminator),
+    ),
+    Entry::new(
+        "{attachment}.type",
+        Class::Structure(Structure::Discriminator),
+    )
+    .when(RENDERED),
+    Entry::new(
+        "{attachment}.type",
+        Class::Structure(Structure::Discriminator),
+    )
+    .when(HUMAN_ONLY),
+    // Her window held a rendering of the data that the source did not keep.
+    Entry::new(
+        "{attachment}.type",
+        Class::Annotation(&[("rendering", Decode::ConstTerm("unrecorded"))]),
+    )
+    .when(UNRECORDED),
+];
+
+/// An attachment kind's own discriminator: in an unrecorded record, the
+/// kind is a member of its event fact.
+macro_rules! kind_type {
+    ($kind:literal) => {
+        [
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.type"),
+                Class::Structure(Structure::Discriminator),
+            )
+            .when(RENDERED),
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.type"),
+                Class::Structure(Structure::Discriminator),
+            )
+            .when(HUMAN_ONLY),
+            Entry::fact(
+                concat!("{attachment}.attachment{", $kind, "}.type"),
+                "event",
+                "in",
+                "structure",
+                Decode::Member("/type"),
+            )
+            .when(UNRECORDED),
+        ]
+    };
+}
+
+/// A field of an attachment kind.
+macro_rules! kept {
+    ($kind:literal, $field:literal, $pointer:literal) => {
+        [
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(RENDERED),
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(HUMAN_ONLY),
+            Entry::fact(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                "event",
+                "in",
+                "structure",
+                Decode::Member($pointer),
+            )
+            .when(UNRECORDED),
+        ]
+    };
+}
+
+/// A field of an attachment kind that is kept only as a scalar: any other
+/// shape is walked and must be named on its own.
+macro_rules! kept_scalar {
+    ($kind:literal, $field:literal, $pointer:literal) => {
+        [
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(&[
+                Cond::Present("rendered"),
+                Cond::Scalar(concat!("attachment.", $field)),
+            ]),
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(&[
+                Cond::Absent("rendered"),
+                Cond::Present("renderedInHumanTurn"),
+                Cond::Scalar(concat!("attachment.", $field)),
+            ]),
+            Entry::fact(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                "event",
+                "in",
+                "structure",
+                Decode::Member($pointer),
+            )
+            .when(&[
+                Cond::Absent("rendered"),
+                Cond::Absent("renderedInHumanTurn"),
+                Cond::Scalar(concat!("attachment.", $field)),
+            ]),
+        ]
+    };
+}
+
+/// Who sent a queued prompt: dropped beside its rendering; in an
+/// unrecorded record it is a relations author, as on a prompt.
+macro_rules! sender {
+    ($kind:literal, $field:literal, $pointer:literal) => {
+        [
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(RENDERED),
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Drop(RENDERED_FROM),
+            )
+            .when(HUMAN_ONLY),
+            Entry::new(
+                concat!("{attachment}.attachment{", $kind, "}.", $field),
+                Class::Open("the sender's identity: a relations author, not resolved here"),
+            )
+            .when(UNRECORDED),
+        ]
+    };
+}
+
+macro_rules! provider_id {
+    ($kind:literal, $field:literal) => {
+        Entry::new(
+            concat!("{attachment}.attachment{", $kind, "}.", $field),
+            Class::Drop(DropReason::ProviderId),
+        )
+    };
+}
+
+macro_rules! client {
+    ($kind:literal, $field:literal) => {
+        Entry::new(
+            concat!("{attachment}.attachment{", $kind, "}.", $field),
+            Class::Drop(DropReason::Machinery("client timing")),
+        )
+    };
+}
+
+/// The attachment kinds and their fields (I8, S3). In a record that holds
+/// its rendering, every field is the data the rendering was made from; in
+/// one recorded before renderings were (both rendering lists absent), each
+/// field is a member of the record's `in` event fact, so its information is
+/// kept. Provider ids and client timing are dropped either way. A kind or a
+/// field not named here fails.
+const ATTACHMENT_KINDS: &[&[Entry]] = &[
+    &kind_type!("agent_listing_delta"),
+    &kept!("agent_listing_delta", "addedLines", "/addedLines"),
+    &kept!("agent_listing_delta", "addedTypes", "/addedTypes"),
+    &kept!(
+        "agent_listing_delta",
+        "builtInPluginTypes",
+        "/builtInPluginTypes"
+    ),
+    &kept!("agent_listing_delta", "builtInTypes", "/builtInTypes"),
+    &kept!("agent_listing_delta", "isInitial", "/isInitial"),
+    &kept!("agent_listing_delta", "removedTypes", "/removedTypes"),
+    &kept!(
+        "agent_listing_delta",
+        "showConcurrencyNote",
+        "/showConcurrencyNote"
+    ),
+    &kind_type!("auto_mode"),
+    &kept!("auto_mode", "autoModeConsentFlow", "/autoModeConsentFlow"),
+    &kept!("auto_mode", "bashFirst", "/bashFirst"),
+    &kept!("auto_mode", "bashFirstSteer", "/bashFirstSteer"),
+    &kept!("auto_mode", "bypass", "/bypass"),
+    &kept!("auto_mode", "finishExposedWork", "/finishExposedWork"),
+    &kept!("auto_mode", "steerOnly", "/steerOnly"),
+    &kind_type!("bash_output_audience_note"),
+    &[provider_id!("bash_output_audience_note", "toolUseID")],
+    &kind_type!("batching_reminder_sent"),
+    &kept!("batching_reminder_sent", "clearAt", "/clearAt"),
+    &kept!("batching_reminder_sent", "model", "/model"),
+    &kept!("batching_reminder_sent", "text", "/text"),
+    &kind_type!("command_permissions"),
+    &kept!("command_permissions", "allowedTools", "/allowedTools"),
+    &kind_type!("compact_file_reference"),
+    &kept!("compact_file_reference", "displayPath", "/displayPath"),
+    &kept!("compact_file_reference", "filename", "/filename"),
+    &kind_type!("credential_org"),
+    &[provider_id!("credential_org", "organizationUuid")],
+    &kind_type!("date"),
+    &kept!("date", "changed", "/changed"),
+    &kept!("date", "date", "/date"),
+    &kind_type!("date_change"),
+    &kept!("date_change", "newDate", "/newDate"),
+    &kind_type!("deferred_tools_delta"),
+    &kept!("deferred_tools_delta", "addedLines", "/addedLines"),
+    &kept!("deferred_tools_delta", "addedNames", "/addedNames"),
+    &kept!(
+        "deferred_tools_delta",
+        "failedMcpServers",
+        "/failedMcpServers"
+    ),
+    &kept!(
+        "deferred_tools_delta",
+        "needsAuthMcpServers",
+        "/needsAuthMcpServers"
+    ),
+    &kept!(
+        "deferred_tools_delta",
+        "pendingMcpServers",
+        "/pendingMcpServers"
+    ),
+    &kept!("deferred_tools_delta", "readdedNames", "/readdedNames"),
+    &kept!("deferred_tools_delta", "removedNames", "/removedNames"),
+    &kept!(
+        "deferred_tools_delta",
+        "surfacedDefinitions",
+        "/surfacedDefinitions"
+    ),
+    &kept!("deferred_tools_delta", "surfacedNames", "/surfacedNames"),
+    &kept!(
+        "deferred_tools_delta",
+        "wireHiddenNames",
+        "/wireHiddenNames"
+    ),
+    &kind_type!("deferred_tools_record"),
+    &kept!("deferred_tools_record", "entries", "/entries"),
+    &kept!("deferred_tools_record", "toolInputCopies[].copy", "/copy"),
+    &[provider_id!(
+        "deferred_tools_record",
+        "toolInputCopies[].id"
+    )],
+    &kind_type!("edited_text_file"),
+    &kept!("edited_text_file", "filename", "/filename"),
+    &kept!("edited_text_file", "snippet", "/snippet"),
+    &kind_type!("environment"),
+    &kept!("environment", "changes", "/changes"),
+    &kept!("environment", "snapshot", "/snapshot"),
+    &kind_type!("file"),
+    &kept!("file", "content", "/content"),
+    &kept!("file", "displayPath", "/displayPath"),
+    &kept!("file", "filename", "/filename"),
+    &kind_type!("hook_additional_context"),
+    &kept!("hook_additional_context", "content", "/content"),
+    &kept!("hook_additional_context", "hookEvent", "/hookEvent"),
+    &kept!("hook_additional_context", "hookName", "/hookName"),
+    &[provider_id!("hook_additional_context", "toolUseID")],
+    &kind_type!("hook_blocking_error"),
+    &kept!("hook_blocking_error", "blockingError", "/blockingError"),
+    &kept!("hook_blocking_error", "hookEvent", "/hookEvent"),
+    &kept!("hook_blocking_error", "hookName", "/hookName"),
+    &[provider_id!("hook_blocking_error", "toolUseID")],
+    &kind_type!("hook_cancelled"),
+    &kept!("hook_cancelled", "command", "/command"),
+    &[client!("hook_cancelled", "durationMs")],
+    &kept!("hook_cancelled", "hookEvent", "/hookEvent"),
+    &kept!("hook_cancelled", "hookName", "/hookName"),
+    &kept!("hook_cancelled", "timedOut", "/timedOut"),
+    &kept!("hook_cancelled", "timeoutMs", "/timeoutMs"),
+    &[provider_id!("hook_cancelled", "toolUseID")],
+    &kind_type!("hook_non_blocking_error"),
+    &kept!("hook_non_blocking_error", "command", "/command"),
+    &kept!("hook_non_blocking_error", "exitCode", "/exitCode"),
+    &kept!("hook_non_blocking_error", "hookEvent", "/hookEvent"),
+    &kept!("hook_non_blocking_error", "hookName", "/hookName"),
+    &kept!("hook_non_blocking_error", "stderr", "/stderr"),
+    &kept!("hook_non_blocking_error", "stdout", "/stdout"),
+    &[provider_id!("hook_non_blocking_error", "toolUseID")],
+    &kind_type!("hook_success"),
+    &kept!("hook_success", "accountMemoryBatch", "/accountMemoryBatch"),
+    &kept!("hook_success", "command", "/command"),
+    &kept!("hook_success", "content", "/content"),
+    &[client!("hook_success", "durationMs")],
+    &kept!("hook_success", "exitCode", "/exitCode"),
+    &kept!("hook_success", "hookEvent", "/hookEvent"),
+    &kept!("hook_success", "hookName", "/hookName"),
+    &kept!("hook_success", "stderr", "/stderr"),
+    &kept!("hook_success", "stdout", "/stdout"),
+    &[provider_id!("hook_success", "toolUseID")],
+    &kind_type!("hook_system_message"),
+    &kept!("hook_system_message", "content", "/content"),
+    &kept!("hook_system_message", "hookEvent", "/hookEvent"),
+    &kept!("hook_system_message", "hookName", "/hookName"),
+    &[provider_id!("hook_system_message", "toolUseID")],
+    &kind_type!("instructions"),
+    &kept!("instructions", "files", "/files"),
+    &kind_type!("invoked_skills"),
+    &kept!("invoked_skills", "skills", "/skills"),
+    &kind_type!("mcp_instructions_delta"),
+    &kept!("mcp_instructions_delta", "addedBlocks", "/addedBlocks"),
+    &kept!("mcp_instructions_delta", "addedNames", "/addedNames"),
+    &kept!("mcp_instructions_delta", "removedNames", "/removedNames"),
+    &kind_type!("model"),
+    &kept!("model", "identity", "/identity"),
+    &kept!("model", "text", "/text"),
+    &kind_type!("nested_memory"),
+    &kept!("nested_memory", "content", "/content"),
+    &kept!("nested_memory", "displayPath", "/displayPath"),
+    &kept!("nested_memory", "path", "/path"),
+    &kind_type!("prompt_snapshot"),
+    &kept!("prompt_snapshot", "cliPrefix", "/cliPrefix"),
+    &kept!("prompt_snapshot", "contextRendering", "/contextRendering"),
+    &kept!(
+        "prompt_snapshot",
+        "echoWireToolInputs",
+        "/echoWireToolInputs"
+    ),
+    &kept!("prompt_snapshot", "inlineTools", "/inlineTools"),
+    &kept!("prompt_snapshot", "keptReminders", "/keptReminders"),
+    &kept!("prompt_snapshot", "reminderFold", "/reminderFold"),
+    &kept!("prompt_snapshot", "systemPrompt", "/systemPrompt"),
+    &kept!("prompt_snapshot", "systemTurns", "/systemTurns"),
+    &kept!("prompt_snapshot", "toolChangeHeader", "/toolChangeHeader"),
+    &kept!("prompt_snapshot", "tools", "/tools"),
+    &kind_type!("queued_command"),
+    &kept!("queued_command", "commandMode", "/commandMode"),
+    &[provider_id!("queued_command", "delivery_id")],
+    &kept!("queued_command", "humanTurn", "/humanTurn"),
+    &kept!("queued_command", "isMeta", "/isMeta"),
+    &kept!("queued_command", "origin.kind", "/origin/kind"),
+    &kept!("queued_command", "origin.producer", "/origin/producer"),
+    &kept!("queued_command", "origin.server", "/origin/server"),
+    &sender!("queued_command", "origin.from", "/origin/from"),
+    &sender!("queued_command", "origin.name", "/origin/name"),
+    &sender!("queued_command", "origin.body", "/origin/body"),
+    &[provider_id!("queued_command", "origin.senderTaskId")],
+    &[provider_id!("queued_command", "origin.runId")],
+    &kept_scalar!("queued_command", "prompt", "/prompt"),
+    &[provider_id!("queued_command", "runId")],
+    &[provider_id!("queued_command", "source_uuid")],
+    &kept!("queued_command", "timestamp", "/timestamp"),
+    &kept!("queued_command", "toolsUsedDelta", "/toolsUsedDelta"),
+    &[client!("queued_command", "usage")],
+    &kind_type!("read_truncation_notice"),
+    &kept!("read_truncation_notice", "banner", "/banner"),
+    &[provider_id!("read_truncation_notice", "toolUseID")],
+    &kind_type!("remote_session_change"),
+    &kept!("remote_session_change", "commit", "/commit"),
+    &kept!("remote_session_change", "managedCommit", "/managedCommit"),
+    &kept!("remote_session_change", "managedPr", "/managedPr"),
+    &kept!("remote_session_change", "pr", "/pr"),
+    &kept!(
+        "remote_session_change",
+        "sendUserFileHint",
+        "/sendUserFileHint"
+    ),
+    &kept!("remote_session_change", "url", "/url"),
+    &kind_type!("session_context"),
+    &kept!("session_context", "context", "/context"),
+    &kind_type!("silent_turn_reminder"),
+    &kept!("silent_turn_reminder", "text", "/text"),
+    &kind_type!("skill_listing"),
+    &kept!("skill_listing", "content", "/content"),
+    &kept!("skill_listing", "digests", "/digests"),
+    &kept!("skill_listing", "isInitial", "/isInitial"),
+    &kept!("skill_listing", "names", "/names"),
+    &kept!("skill_listing", "skillCount", "/skillCount"),
+    &kind_type!("structured_output"),
+    &kept!("structured_output", "data", "/data"),
+    &[provider_id!("structured_output", "toolUseID")],
+    &kind_type!("task_reminder"),
+    &kept!("task_reminder", "content", "/content"),
+    &kept!("task_reminder", "itemCount", "/itemCount"),
+    &kind_type!("task_status"),
+    &kept!("task_status", "deltaSummary", "/deltaSummary"),
+    &kept!("task_status", "description", "/description"),
+    &kept!("task_status", "outputFilePath", "/outputFilePath"),
+    &kept!("task_status", "status", "/status"),
+    &[provider_id!("task_status", "taskId")],
+    &kept!("task_status", "taskType", "/taskType"),
+    &kind_type!("total_tokens_reminder"),
+    &kept!("total_tokens_reminder", "text", "/text"),
+    &kind_type!("ultra_effort_enter"),
+    &kept!("ultra_effort_enter", "reminderType", "/reminderType"),
+];
+
+const QUEUED_PROMPT_PARTS: &[Entry] = &[Entry::new(
+    "{attachment}.attachment{queued_command}.prompt[]",
+    Class::Open(
+        "a queued prompt with parts: an image's place against the rendered text is unverified",
+    ),
+)];
+
 const USER_ITEMS: [Entry; 10] = shown_items!("{user}.message.content[]");
 const RESULT_ITEMS: [Entry; 10] = shown_items!("{user}.message.content[]{tool_result}.content[]");
 const THINKING: [Entry; 7] =
@@ -223,18 +642,29 @@ const USER_FIELDS: &[Entry] = &[
         "{assistant}.message{message}.content[]{thinking}.thinking",
         Class::Drop(DropReason::Empty),
     ),
-    // Shown in the transcript only and never sent: not in any window.
+    // Shown in the transcript only and never sent: not in any window. A
+    // compaction summary is the exception: the request log shows it sent
+    // (I6).
     Entry::new(
         "{user}",
         Class::Drop(DropReason::Machinery(
             "shown in the transcript only; the client never sent it",
         )),
     )
-    .when(&[Cond::Is("isVisibleInTranscriptOnly", "true")]),
+    .when(&[
+        Cond::Is("isVisibleInTranscriptOnly", "true"),
+        Cond::IsNot("isCompactSummary", "true"),
+    ]),
     Entry::new(
         "{user}.isVisibleInTranscriptOnly",
         Class::Structure(Structure::Vocabulary(&["false"])),
-    ),
+    )
+    .when(&[Cond::IsNot("isCompactSummary", "true")]),
+    Entry::new(
+        "{user}.isVisibleInTranscriptOnly",
+        Class::Structure(Structure::Vocabulary(&["true", "false"])),
+    )
+    .when(&[Cond::Is("isCompactSummary", "true")]),
     Entry::new(
         "{user}.message.role",
         Class::Annotation(&[("raw_role", Decode::Text)]),
@@ -247,10 +677,21 @@ const USER_FIELDS: &[Entry] = &[
         Decode::Text,
     ),
     Entry::new("{user}.message.content", Class::Drop(DropReason::Empty)),
+    // A result renders as ok unless it says it is an error (I2): the
+    // status is the rendering table's, whether or not `is_error` is there.
+    Entry::fact(
+        "{user}.message.content[]{tool_result}.type",
+        "tool-result",
+        "in",
+        "status",
+        Decode::ConstTerm("ok"),
+    )
+    .when(NOT_ERROR),
     Entry::new(
         "{user}.message.content[]{tool_result}.type",
         Class::Structure(Structure::Discriminator),
-    ),
+    )
+    .when(ERROR),
     Entry::new(
         "{user}.message.content[]{tool_result}.tool_use_id",
         Class::Correlator,
@@ -261,7 +702,13 @@ const USER_FIELDS: &[Entry] = &[
         "in",
         "status",
         Decode::Term(IS_ERROR),
-    ),
+    )
+    .when(ERROR),
+    Entry::new(
+        "{user}.message.content[]{tool_result}.is_error",
+        Class::Structure(Structure::Vocabulary(&["false"])),
+    )
+    .when(NOT_ERROR),
     Entry::fact(
         "{user}.message.content[]{tool_result}.content",
         "text",
@@ -312,9 +759,16 @@ const USER_FIELDS: &[Entry] = &[
         "{user}.interruptedMessageId",
         Class::Annotation(&[("ends", Decode::ConstTerm("interrupted"))]),
     ),
-    Entry::new("{user}.refusedMessageId", Class::Open(NEVER_READ)),
-    Entry::new("{user}.sourceToolAssistantUUID", Class::Open(NEVER_READ)),
-    Entry::new("{user}.sourceToolUseID", Class::Open(NEVER_READ)),
+    Entry::new(
+        "{user}.refusedMessageId",
+        Class::Open("the refused message of a refusal fallback: the fallback is not built (S4)"),
+    ),
+    // The record holding the call a result answers: the importer checks it
+    // against the call the result's tool_use_id names.
+    Entry::new("{user}.sourceToolAssistantUUID", Class::Correlator),
+    // The call a harness message follows: the importer checks the unit
+    // holds it.
+    Entry::new("{user}.sourceToolUseID", Class::Correlator),
     Entry::new("{user}.promptId", Class::Drop(DropReason::ProviderId)),
     Entry::new("{user}.imagePasteIds", Class::Drop(DropReason::ProviderId)),
     Entry::new(
@@ -618,13 +1072,19 @@ const ASSISTANT_FIELDS: &[Entry] = &[
     Entry::new("{assistant}.attributionMcpTool", Class::Drop(CLIENT)),
     Entry::new("{assistant}.attributionPlugin", Class::Drop(CLIENT)),
     Entry::new("{assistant}.attributionSkill", Class::Drop(CLIENT)),
-    Entry::new(
+    // The effort she was sampled under, rendered into her prompt (facts.md
+    // 1): the settings header of the request's window (S1).
+    Entry::fact(
         "{assistant}.effort",
-        Class::Open("effort is rendered into her prompt (facts.md §1); v3 has no home for it yet"),
+        "system",
+        "in",
+        "effort",
+        Decode::Term(EFFORT),
     ),
+    // The turn's own effort, when set, is the effort the request records.
     Entry::new(
         "{assistant}.perTurnEffort",
-        Class::Open("effort is rendered into her prompt (facts.md §1); v3 has no home for it yet"),
+        Class::Drop(DropReason::Mirror(Mirror::Sibling("effort"))),
     ),
     Entry::new("{assistant}.perTurnEffort", Class::Drop(DropReason::Empty)),
     Entry::new(
@@ -643,33 +1103,6 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
         )),
     )
     .when(&[Cond::Is("attachment.type", "thinking_drop")]),
-    Entry::new(
-        "{attachment}.attachment",
-        Class::Drop(DropReason::Machinery(
-            "the data the rendered text was made from; she saw the rendering",
-        )),
-    )
-    .when(&[Cond::Present("rendered")]),
-    Entry::new(
-        "{attachment}.attachment",
-        Class::Drop(DropReason::Machinery(
-            "the data the rendered text was made from; she saw the rendering",
-        )),
-    )
-    .when(&[
-        Cond::Absent("rendered"),
-        Cond::Present("renderedInHumanTurn"),
-    ]),
-    Entry::new(
-        "{attachment}.attachment",
-        Class::Open(
-            "an attachment recorded before rendered[]: its rendering per kind is not built",
-        ),
-    )
-    .when(&[
-        Cond::Absent("rendered"),
-        Cond::Absent("renderedInHumanTurn"),
-    ]),
     Entry::fact(
         "{attachment}.rendered[].content",
         "system",
@@ -705,7 +1138,7 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
     Entry::new(
         "{attachment}.renderedBesideToolResult",
         Class::Open(
-            "where the attachment renders beside a tool result: the importer never reads it (G3)",
+            "rendered beside a tool result that is mostly not its parent: its placement is unverified",
         ),
     ),
 ];
@@ -821,13 +1254,14 @@ const SYSTEM_FIELDS: &[Entry] = &[
         "{system}.compactMetadata.preservedMessages.uuids[]",
         Class::Correlator,
     ),
+    // The importer checks both against the preserved segment.
     Entry::new(
         "{system}.compactMetadata.preservedMessages.allUuids[]",
-        Class::Open(NEVER_READ),
+        Class::Correlator,
     ),
     Entry::new(
         "{system}.compactMetadata.preservedMessages.anchorUuid",
-        Class::Open(NEVER_READ),
+        Class::Correlator,
     ),
     Entry::new(
         "{system}.compactMetadata.preCompactDiscoveredTools",
@@ -1017,6 +1451,19 @@ const NEVER_READ: &str = "a correlator the importer never reads (G3): its meanin
 const DEFERRED: &str =
     "a deferred tool: its definition renders where a tool_reference loads it; not built";
 
+const fn total(parts: &[&[Entry]]) -> usize {
+    let mut n = 0;
+    let mut part = 0;
+    while part < parts.len() {
+        n += parts[part].len();
+        part += 1;
+    }
+    n
+}
+
+const ATTACHMENT_KIND_LEN: usize = total(ATTACHMENT_KINDS);
+const ATTACHMENT_KIND_ENTRIES: [Entry; ATTACHMENT_KIND_LEN] = concat_entries(ATTACHMENT_KINDS);
+
 const fn concat_entries<const N: usize>(parts: &[&[Entry]]) -> [Entry; N] {
     let mut out = [Entry::new("", Class::Correlator); N];
     let mut at = 0;
@@ -1044,7 +1491,10 @@ const LEN: usize = USER.len()
     + ASSISTANT_FIELDS.len()
     + ATTACHMENT_FIELDS.len()
     + SYSTEM_FIELDS.len()
-    + OTHER_RECORDS.len();
+    + OTHER_RECORDS.len()
+    + RECORD_TYPES.len()
+    + ATTACHMENT_KIND_LEN
+    + QUEUED_PROMPT_PARTS.len();
 const ENTRIES: [Entry; LEN] = concat_entries(&[
     &USER,
     &ASSISTANT,
@@ -1057,6 +1507,9 @@ const ENTRIES: [Entry; LEN] = concat_entries(&[
     ATTACHMENT_FIELDS,
     SYSTEM_FIELDS,
     OTHER_RECORDS,
+    RECORD_TYPES,
+    &ATTACHMENT_KIND_ENTRIES,
+    QUEUED_PROMPT_PARTS,
 ]);
 
 /// The Claude Code transcript field table.
@@ -1073,6 +1526,8 @@ pub const TABLE: FieldTable = FieldTable {
     windows: Windows {
         // The system prompt and tools she was given open every later window.
         prefix: &["api-request-shape"],
+        // Each request opens with the settings header it was sampled under.
+        header: Some("{assistant}.effort"),
         compaction: Some(Compaction {
             shape: "system",
             head: "compactMetadata.preservedSegment.headUuid",

@@ -9,8 +9,8 @@
 //!
 //! What goes into a fact core is decided by the importer's rendering table,
 //! never by which fields one file happens to record. [`FactCore`] holds only
-//! what her window rendered; a source's claims about an item go to
-//! [`WitnessAnnotations`].
+//! what her window rendered; a source record's claims about an item form one
+//! [`occurrence`] of the witness ([`WitnessAnnotations`]).
 //!
 //! Nothing here reads a store: no lookups, no validation of derived ids.
 
@@ -84,6 +84,9 @@ pub struct FactCore {
     pub form: Option<Id>,
     /// A [`schema::fact::absent`] term: this fact is a gap.
     pub absent: Option<Id>,
+    /// A [`schema::fact::effort`] term, on the system fact that renders a
+    /// request's settings.
+    pub effort: Option<Id>,
 }
 
 /// One fact, rooted at its intrinsic id.
@@ -144,6 +147,7 @@ pub fn fact(core: FactCore) -> Result<Fragment> {
         schema::fact::register?: core.register,
         schema::fact::form?: core.form,
         schema::fact::absent?: core.absent,
+        schema::fact::effort?: core.effort,
     };
     attach_kind(fragment, schema::fact::KIND, "fact")
 }
@@ -182,6 +186,8 @@ pub struct NodeAnnotations {
     pub recalls: Vec<Id>,
     /// [`schema::node::ends`] terms.
     pub ends: Vec<Id>,
+    /// [`schema::node::rendering`] terms.
+    pub rendering: Vec<Id>,
 }
 
 /// The annotations of `node`, as a fragment that exports nothing.
@@ -192,6 +198,7 @@ pub fn annotate_node(node: Id, annotations: &NodeAnnotations) -> Fragment {
         schema::node::spawned_by*: annotations.spawned_by.iter(),
         schema::node::recalls*: annotations.recalls.iter(),
         schema::node::ends*: annotations.ends.iter(),
+        schema::node::rendering*: annotations.rendering.iter(),
     })
 }
 
@@ -205,7 +212,8 @@ pub fn witness(source_namespace: Id, node: Id) -> Result<Fragment> {
     attach_kind(fragment, schema::witness::KIND, "witness")
 }
 
-/// One source occurrence's annotations of a witness.
+/// One source record's claims about a witnessed node: the core of one
+/// [`occurrence`].
 #[derive(Clone, Debug, Default)]
 pub struct WitnessAnnotations {
     /// Model labels, exactly as the source spells them, of the model that
@@ -230,9 +238,10 @@ pub struct WitnessAnnotations {
     pub compaction_summary: bool,
 }
 
-/// The annotations of `witness`, as a fragment that exports nothing. The
-/// vendor-model and media-type entities they point at ride along.
-pub fn annotate_witness(witness: Id, annotations: WitnessAnnotations) -> Result<Fragment> {
+/// One occurrence of `witness`: the claims of one source record, rooted at an
+/// id derived from the witness and all of them, so two records' claims never
+/// mix. The vendor-model and media-type entities they point at ride along.
+pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragment> {
     let mut fragment = Fragment::empty();
     let mut generated_by = Vec::new();
     for label in &annotations.generated_by {
@@ -270,7 +279,8 @@ pub fn annotate_witness(witness: Id, annotations: WitnessAnnotations) -> Result<
     let compaction = annotations
         .compaction_summary
         .then_some(schema::witness::COMPACTION_SUMMARY);
-    fragment += unexported(entity! { ExclusiveId::force_ref(&witness) @
+    let core = entity! { _ @
+        schema::occurrence::of: &witness,
         schema::witness::generated_by*: generated_by.iter(),
         schema::witness::raw_model?: raw_model,
         schema::witness::raw_role?: raw_role,
@@ -284,8 +294,12 @@ pub fn annotate_witness(witness: Id, annotations: WitnessAnnotations) -> Result<
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
         metadata::tag?: compaction,
-    });
-    Ok(fragment)
+    };
+    let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;
+    let root = rooted(&core, "occurrence")?;
+    fragment += unexported(core);
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    Ok(Fragment::rooted_from_parts(root, facts, metafacts, blobs))
 }
 
 /// One gloss: side-model `text` of `category` about `describes`.
@@ -343,6 +357,8 @@ pub fn vocabulary_fragment() -> Fragment {
         .chain(schema::fact::register::SPECS)
         .chain(schema::fact::form::SPECS)
         .chain(schema::fact::absent::SPECS)
+        .chain(schema::fact::effort::SPECS)
+        .chain(schema::node::rendering::SPECS)
         .chain(schema::gloss::category::SPECS);
     for &(id, name) in terms {
         let name = fragment.put::<UTF8String, _>(name.to_owned());

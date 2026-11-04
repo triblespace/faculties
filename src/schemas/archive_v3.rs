@@ -4,6 +4,7 @@
 //! fact     -- one datum as she experienced it: only what her window rendered
 //! node     -- one point of experience in one window (`previous` + `holds`)
 //! witness  -- one source held one node (`source_namespace` + `projects_to`)
+//! occurrence -- one source record's claims about a witnessed node, kept together
 //! gloss    -- text a side model wrote about a node; never hers, never replayed
 //! citation -- a span of her text the source marks as citing a uri
 //! ```
@@ -97,6 +98,30 @@ pub mod fact {
         /// CORE of a gap fact: something was in a window, its content is
         /// unknown. See [`absent`].
         "D7678E13C0A99A987DFBE7D5AF1C40B3" as pub absent: GenId;
+        /// CORE of the system fact that renders a request's settings: the
+        /// reasoning effort she was sampled under, see [`effort`]. The
+        /// provider renders it into the prompt (facts.md 1); its text and
+        /// place are unpublished, so the fact is a `system` body gap that
+        /// carries it.
+        "38D783B77132356BCE659D32C876D079" as pub effort: GenId;
+    }
+
+    /// Reasoning effort, bijective with the source spelling.
+    pub mod effort {
+        use super::*;
+        pub const LOW: Id = id_hex!("B6D71B59F1EE7C41D7A4BC82798BFD82");
+        pub const MEDIUM: Id = id_hex!("B219D5C463A640C9F2A4B9AE52616493");
+        pub const HIGH: Id = id_hex!("10863E513113BE5B3AE552AD2DFC4E8B");
+        pub const XHIGH: Id = id_hex!("DFE2D136739E4DB5B4BAF18F39FE79D8");
+        pub const MAX: Id = id_hex!("58D87F5B61B6E9D109FA2E42C457DB8F");
+
+        pub const SPECS: &[(Id, &str)] = &[
+            (LOW, "low"),
+            (MEDIUM, "medium"),
+            (HIGH, "high"),
+            (XHIGH, "xhigh"),
+            (MAX, "max"),
+        ];
     }
 
     /// Modalities. The first nine keep main's ids; `SYSTEM`, `DEVELOPER`
@@ -254,6 +279,21 @@ pub mod node {
         /// see [`ends`]. Whatever was rendered to her about it is an `in`
         /// fact of its own.
         "94D56771E2B6852DEBEB5F413EEA27ED" as pub ends: GenId;
+        /// ANNOTATION. How the source recorded what the node holds, see
+        /// [`rendering`]. A window holding a node marked `unrecorded` is
+        /// kept, and training skips it.
+        "53B8C70B6B20F6C148D2D5E8935C603C" as pub rendering: GenId;
+    }
+
+    /// How a node's content reached the source.
+    pub mod rendering {
+        use super::*;
+        /// The source kept the data an item was rendered from, not the
+        /// rendering she read: the facts hold the data's information as
+        /// `in` events, and the exact text she saw is unknown.
+        pub const UNRECORDED: Id = id_hex!("481642B1417277F071E58A46D1586111");
+
+        pub const SPECS: &[(Id, &str)] = &[(UNRECORDED, "unrecorded")];
     }
 
     /// Why a message ended.
@@ -296,42 +336,65 @@ pub mod node {
 /// A witness: one source held one node.
 ///
 /// CORE: `source_namespace` and `projects_to`, exactly main's importer
-/// receipt. Everything else is an ANNOTATION.
+/// receipt. What one source record claims about the node (its time, role,
+/// model, session) is not annotated on the witness, where the claims of two
+/// records holding the same node would mix: each record's claims form one
+/// [`super::occurrence`] of the witness.
 pub mod witness {
     use super::*;
 
-    /// ANNOTATION. The model that sampled the node (a vendor model entity).
+    /// OCCURRENCE CORE. The model that sampled the node (a vendor model entity).
     pub use crate::schemas::blockdag::source_projection::generated_by;
     /// CORE. The node the source held.
     pub use crate::schemas::blockdag::source_projection::projects_to;
-    /// ANNOTATION, leaves only. The session, rollout or conversation id.
+    /// OCCURRENCE CORE. The session, rollout or conversation id.
     pub use crate::schemas::blockdag::source_projection::source_locator;
     /// CORE. The source protocol/namespace.
     pub use crate::schemas::blockdag::source_projection::source_namespace;
-    /// ANNOTATION. A time this source asserted for the node. It lives on the
-    /// witness so the clock that asserted it (the source) stays known.
+    /// OCCURRENCE CORE. A time this source asserted for the node. It lives on
+    /// an occurrence so the clock that asserted it (the source) stays known.
     pub use crate::schemas::blockdag::source_projection::source_timestamp as timestamp;
-    /// ANNOTATION tag: the source marks this occurrence a compaction summary.
+    /// OCCURRENCE CORE tag: the source marks this occurrence a compaction summary.
     pub use crate::schemas::blockdag::source_projection::COMPACTION_SUMMARY;
     /// Nonidentity kind marker attached after construction. Same id as main.
     pub use crate::schemas::blockdag::source_projection::KIND;
-    /// ANNOTATION. Relations entities that produced and observed it.
+    /// OCCURRENCE CORE. Relations entities that produced and observed it.
     pub use crate::schemas::blockdag::source_projection::{author, experiencer};
-    /// ANNOTATION. Exact source spellings.
+    /// OCCURRENCE CORE. Exact source spellings.
     pub use crate::schemas::blockdag::source_projection::{raw_author, raw_model, raw_role};
 
     attributes! {
-        /// ANNOTATION. The provider's reference for content the source does
+        /// OCCURRENCE CORE. The provider's reference for content the source does
         /// not hold (an asset pointer, a file id, a template id). Exhaust
         /// only: a gap is resolved by re-importing its unit.
         "837794F3E64E4FEE63470D57780305C2" as pub pointer: Handle<UTF8String>;
-        /// ANNOTATION. A byte size the source claims for the held item.
+        /// OCCURRENCE CORE. A byte size the source claims for the held item.
         "5BB29D9B5ACB1ADB47A068B633137418" as pub claimed_size: U256BE;
-        /// ANNOTATION. A media type the source claims but her window did not
+        /// OCCURRENCE CORE. A media type the source claims but her window did not
         /// render.
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
-        /// ANNOTATION. A title the source gives that her window did not show.
+        /// OCCURRENCE CORE. A title the source gives that her window did not show.
         "7AB9F2216ED53D98D7DF446DE4DF63A1" as pub claimed_title: Handle<UTF8String>;
+    }
+}
+
+/// An occurrence: the claims one source record makes about a witnessed
+/// node, kept together as one tuple.
+///
+/// CORE: `of` (the witness) and every claim the record makes, with the
+/// witness attributes above (`timestamp`, `source_locator`, `raw_role`,
+/// `raw_model`, `raw_author`, `generated_by`, `pointer`, the `claimed_*`
+/// attributes and the compaction tag). Two records that hold the same node
+/// give two occurrences of its one witness unless they claim the same.
+pub mod occurrence {
+    use super::*;
+
+    /// Nonidentity kind marker attached after construction.
+    pub const KIND: Id = id_hex!("D94719250D524DEE209D9FD67C3CEA12");
+
+    attributes! {
+        /// CORE. The witness whose node the record held.
+        "8AB79AC0A9F1348292D6B75EED5F6D5D" as pub of: GenId;
     }
 }
 

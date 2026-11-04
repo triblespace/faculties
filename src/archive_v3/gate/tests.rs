@@ -22,7 +22,7 @@ use crate::archive_v3::fields::{
     Structure,
 };
 use crate::archive_v3::{
-    annotate_node, annotate_witness, fact, gloss, node, unexported, witness, FactCore, MediaType,
+    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
     NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
@@ -264,6 +264,7 @@ fn seed_tables_name_only_v3_terms() {
         "detail",
         "register",
         "form",
+        "effort",
     ];
     let mut annotations = vec![
         "raw_model".to_owned(),
@@ -278,6 +279,7 @@ fn seed_tables_name_only_v3_terms() {
         "claimed_title".to_owned(),
         "compaction_summary".to_owned(),
         "ends".to_owned(),
+        "rendering".to_owned(),
     ];
     annotations.extend(
         v3::gloss::category::SPECS
@@ -291,6 +293,8 @@ fn seed_tables_name_only_v3_terms() {
             "register" => v3::fact::register::SPECS.iter().map(|(_, n)| *n).collect(),
             "form" => v3::fact::form::SPECS.iter().map(|(_, n)| *n).collect(),
             "ends" => v3::node::ends::SPECS.iter().map(|(_, n, _)| *n).collect(),
+            "effort" => v3::fact::effort::SPECS.iter().map(|(_, n)| *n).collect(),
+            "rendering" => v3::node::rendering::SPECS.iter().map(|(_, n)| *n).collect(),
             _ => Vec::new(),
         }
     };
@@ -437,7 +441,7 @@ impl Chain {
         let witnessed = witness(self.namespace, id).unwrap();
         let witness_id = witnessed.root().unwrap();
         self.fragment += unexported(witnessed);
-        self.fragment += annotate_witness(witness_id, step.witness).unwrap();
+        self.fragment += unexported(occurrence(witness_id, step.witness).unwrap());
         self.nodes.push(id);
         id
     }
@@ -1092,29 +1096,21 @@ fn g5_report_paths_hold_no_ids() {
     assert_eq!(report.count("{user}.<id>", Kind::Unknown), 1, "{report}");
 }
 
-/// G3: an entry the importer never reads is no correlator. Each of these
-/// fails until the importer reads it or its meaning is verified.
+/// G3: an entry the importer never reads is no correlator, and fails until
+/// the importer reads it or its meaning is verified. The importer now
+/// checks four of them against what they correlate; the refused message
+/// stays open.
 #[test]
 fn g3_correlators_the_importer_never_reads_are_open() {
     let user = r#"{"type":"user","sessionId":"s-1","uuid":"u1","parentUuid":null,"timestamp":"2026-03-01T10:00:00.000Z","message":{"role":"user","content":"Hi."},"refusedMessageId":"m","sourceToolAssistantUUID":"a","sourceToolUseID":"t"}"#;
     let boundary = r#"{"type":"system","subtype":"compact_boundary","uuid":"b1","parentUuid":null,"logicalParentUuid":"a0","sessionId":"s-1","timestamp":"2026-03-01T10:00:04.000Z","content":"Conversation compacted","level":"info","isMeta":false,"compactMetadata":{"trigger":"auto","preTokens":100,"preservedSegment":{"headUuid":"a0","tailUuid":"a0","anchorUuid":"c1"},"preservedMessages":{"uuids":["a0"],"allUuids":["a0"],"anchorUuid":"c1"}}}"#;
     let source = format!("{user}\n{boundary}\n");
     let rows = kinds(&walk(&claude_code::TABLE, source.as_bytes()));
-    for open in [
-        "{user}.refusedMessageId",
-        "{user}.sourceToolAssistantUUID",
-        "{user}.sourceToolUseID",
-        "{system}.compactMetadata.preservedMessages.allUuids[]",
-        "{system}.compactMetadata.preservedMessages.anchorUuid",
-    ] {
-        assert!(
-            rows.contains(&(open.to_owned(), Kind::Open)),
-            "{open}: {rows:?}"
-        );
-    }
-    // The leaves the importer reads are correlators, and nothing else
-    // fails.
-    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert!(
+        rows.contains(&("{user}.refusedMessageId".to_owned(), Kind::Open)),
+        "{rows:?}"
+    );
+    assert_eq!(rows.len(), 1, "{rows:?}");
 }
 
 /// G3, statically: every correlator and order field of the Claude Code
@@ -1132,6 +1128,7 @@ fn g3_the_importer_reads_every_correlator_it_declares() {
             | Cond::Prefix(field, _)
             | Cond::Present(field)
             | Cond::Absent(field)
+            | Cond::Scalar(field)
             | Cond::Sibling(field, _)
             | Cond::SiblingNot(field, _) => Some(*field),
         })

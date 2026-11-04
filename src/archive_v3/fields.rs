@@ -79,6 +79,12 @@ pub struct Windows {
     /// Records of these shapes open every window that follows them in the
     /// file: the latest such record before a record is its window's prefix.
     pub prefix: &'static [&'static str],
+    /// The normalized path of a request record's field whose fact is the
+    /// request's settings header: it opens the window of the request and of
+    /// every record after it on the chain, before the prefix, and is none of
+    /// the record's own items. A request that records none opens with no
+    /// item there.
+    pub header: Option<&'static str>,
     pub compaction: Option<Compaction>,
     pub requests: Option<Requests>,
 }
@@ -87,6 +93,7 @@ impl Windows {
     /// A source whose windows are exactly its record chains.
     pub const NONE: Windows = Windows {
         prefix: &[],
+        header: None,
         compaction: None,
         requests: None,
     };
@@ -165,6 +172,8 @@ pub enum Cond {
     Present(&'static str),
     /// The field is absent.
     Absent(&'static str),
+    /// The field is a scalar (a string, number, `true`, `false` or `null`).
+    Scalar(&'static str),
     /// A member of the object that holds the value is a scalar with this
     /// value (for conditions inside arrays, where record fields cannot
     /// reach).
@@ -255,6 +264,11 @@ pub enum Decode {
     /// A constant vocabulary term the rendering rule fixes, whatever the
     /// value.
     ConstTerm(&'static str),
+    /// One named member of a structure fact the importer assembles from
+    /// several source fields: the value's JSON leaves under this JSON
+    /// Pointer (`/origin/kind`). The members of one object (one array
+    /// element, or the record outside every array) form one fact.
+    Member(&'static str),
 }
 
 /// Why a field is left out.

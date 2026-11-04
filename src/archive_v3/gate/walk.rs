@@ -60,6 +60,8 @@ pub struct Lines {
     line: Option<[u8; 32]>,
     unedited: [u8; 32],
     prefix: Option<usize>,
+    /// The settings header item the line opens with.
+    header: Option<usize>,
 }
 
 /// The fact tokens of one source occurrence (one modality at one place),
@@ -96,6 +98,9 @@ struct RecordLinks {
     results: Vec<Vec<(String, usize)>>,
     /// Its items, in record order.
     items: Vec<usize>,
+    /// The request's settings header ([`Windows::header`]), an item that is
+    /// none of its own.
+    header: Option<usize>,
 }
 
 /// Who an item in a window speaks for, as the window's messages count.
@@ -268,6 +273,18 @@ impl Walked {
         Some(Some(chain))
     }
 
+    /// The settings header a chain's window opens with: the header of the
+    /// first record of the latest request run on it.
+    fn header(&self, chain: &[usize]) -> Option<usize> {
+        let request = |at: usize| self.records[at].request.as_deref();
+        let end = chain.iter().rposition(|&at| request(at).is_some())?;
+        let mut start = end;
+        while start > 0 && request(chain[start - 1]) == request(chain[end]) {
+            start -= 1;
+        }
+        self.records[chain[start]].header
+    }
+
     /// The window behind `record`: the items before its own, and its own,
     /// as item indices. `None` when the edits the source marks cannot be
     /// applied to it (a row says where).
@@ -400,7 +417,8 @@ impl Walked {
                 Slot::Head(..) => None,
             })
         };
-        let mut before = prefix;
+        let mut before: Vec<usize> = self.header(&chain).into_iter().collect();
+        before.extend(prefix);
         before.extend(items(base));
         before.extend(items(tail));
         Some((before, own))
@@ -482,8 +500,15 @@ impl Walked {
         let continues_request =
             links.request.is_some() && parent_links.is_some_and(|p| p.request == links.request);
         let new_request = links.request.is_some() && !continues_request;
+        // The header this record's line opens with: its own when it starts
+        // a request, else its parent's line's.
+        let header = if new_request {
+            links.header
+        } else {
+            parent.and_then(|parent| parent.header)
+        };
         let quick = match parent {
-            Some(parent) if parent.prefix == prefix && !marks => {
+            Some(parent) if parent.prefix == prefix && parent.header == header && !marks => {
                 if new_request {
                     Some(parent.unedited)
                 } else {
@@ -520,7 +545,8 @@ impl Walked {
                         cursor = up;
                     }
                     chain.reverse();
-                    let mut items = prefix.map(|p| self.ordered(p)).unwrap_or_default();
+                    let mut items: Vec<usize> = self.header(&chain).into_iter().collect();
+                    items.extend(prefix.map(|p| self.ordered(p)).unwrap_or_default());
                     for (at, &link) in chain.iter().enumerate() {
                         items.extend(self.ordered(link));
                         if at + 1 < chain.len() {
@@ -540,6 +566,7 @@ impl Walked {
             line,
             unedited,
             prefix,
+            header,
         }
     }
 }
@@ -914,6 +941,7 @@ fn holds(
         Cond::Prefix(field, prefix) => scalars.get(*field).is_some_and(|v| v.starts_with(prefix)),
         Cond::Present(field) => present.contains(*field),
         Cond::Absent(field) => !present.contains(*field),
+        Cond::Scalar(field) => scalars.contains_key(*field),
     })
 }
 
@@ -937,7 +965,7 @@ fn applies(entry: &Entry, value: &J) -> bool {
 
 fn decode_applies(decode: Decode, value: &J) -> bool {
     match decode {
-        Decode::Json | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
+        Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
         Decode::Text | Decode::Base64 | Decode::MediaType | Decode::Timestamp => {
             matches!(value, J::Str(_))
         }
@@ -1163,7 +1191,24 @@ impl<'t> Walker<'t> {
     }
 
     fn emit(&mut self, token: Token, path: &str, ctx: &Ctx) {
-        if let (Some(record), false) = (ctx.record, token.modality.is_empty()) {
+        let header = self.table.windows.header == Some(path);
+        if let (Some(record), false, true) = (ctx.record, token.modality.is_empty(), header) {
+            let item = match self.out.records[record].header {
+                Some(item) => item,
+                None => {
+                    self.out.items.push(Item {
+                        record,
+                        levels: ctx.levels.clone(),
+                        modality: token.modality.clone(),
+                        tokens: BTreeSet::new(),
+                        path: path.to_owned(),
+                    });
+                    self.out.records[record].header = Some(self.out.items.len() - 1);
+                    self.out.items.len() - 1
+                }
+            };
+            self.out.items[item].tokens.insert(token.clone());
+        } else if let (Some(record), false) = (ctx.record, token.modality.is_empty()) {
             let links = &mut self.out.records[record];
             let found = links.items.iter().copied().find(|&item| {
                 self.out.items[item].levels == ctx.levels
@@ -1493,6 +1538,11 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
         (Decode::Json, value) => {
             let mut leaves = Vec::new();
             json_leaves(value, &mut String::new(), &mut leaves);
+            Ok(leaves)
+        }
+        (Decode::Member(pointer), value) => {
+            let mut leaves = Vec::new();
+            json_leaves(value, &mut pointer.to_owned(), &mut leaves);
             Ok(leaves)
         }
         (Decode::MediaType, J::Str(text)) => one(Value::Text(

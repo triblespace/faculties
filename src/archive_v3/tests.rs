@@ -199,7 +199,7 @@ fn annotations_never_change_an_id() {
     )
         .try_to_inline()
         .unwrap();
-    annotations += annotate_witness(
+    let claims = occurrence(
         witness_id,
         WitnessAnnotations {
             generated_by: vec!["synthetic-model-1".to_owned()],
@@ -216,6 +216,8 @@ fn annotations_never_change_an_id() {
         },
     )
     .unwrap();
+    let occurrence_id = claims.root().unwrap();
+    annotations += unexported(claims);
 
     // Every annotation landed, and nothing it added is a fact or node of the
     // chain or carries a new id the chain depends on.
@@ -225,7 +227,7 @@ fn annotations_never_change_an_id() {
     assert_eq!(union.len(), annotations.facts().len());
     assert_eq!(plain.nodes, annotated.nodes);
     assert_eq!(plain.facts, annotated.facts);
-    assert!(annotated_ids.contains(&witness_id));
+    assert!(annotated_ids.contains(&occurrence_id));
 
     // The witness keeps its id however much a source says about it.
     assert_eq!(
@@ -241,16 +243,23 @@ fn annotations_never_change_an_id() {
     assert_eq!(responds, vec![call]);
     let sizes: Vec<Inline<U256BE>> = find!(
         size: Inline<U256BE>,
-        pattern!(annotations.facts(), [{ witness_id @ schema::witness::claimed_size: ?size }])
+        pattern!(annotations.facts(), [{ occurrence_id @ schema::witness::claimed_size: ?size }])
     )
     .collect();
     assert_eq!(sizes.len(), 1);
     let tags: BTreeSet<Id> = find!(
         tag: Id,
-        pattern!(annotations.facts(), [{ witness_id @ metadata::tag: ?tag }])
+        pattern!(annotations.facts(), [{ occurrence_id @ metadata::tag: ?tag }])
     )
     .collect();
     assert!(tags.contains(&schema::witness::COMPACTION_SUMMARY));
+    // The claims are one occurrence of the witness, never on the witness.
+    let of: Vec<Id> = find!(
+        witness: Id,
+        pattern!(annotations.facts(), [{ occurrence_id @ schema::occurrence::of: ?witness }])
+    )
+    .collect();
+    assert_eq!(of, vec![witness_id]);
 }
 
 /// Critique F1: the same lived content converges whether or not a source
@@ -287,7 +296,7 @@ fn source_only_claims_never_split_lived_content() {
         } else {
             WitnessAnnotations::default()
         };
-        export_fragment += annotate_witness(witness_id, claims).unwrap();
+        export_fragment += unexported(occurrence(witness_id, claims).unwrap());
     }
     // A transcript of the same window that records none of it.
     let transcript = chain(lived());
@@ -515,6 +524,8 @@ fn senses_glosses_and_vocabulary_are_intrinsic() {
         schema::fact::register::SPECS,
         schema::fact::form::SPECS,
         schema::fact::absent::SPECS,
+        schema::fact::effort::SPECS,
+        schema::node::rendering::SPECS,
         schema::gloss::category::SPECS,
     ] {
         all.extend(specs.iter().map(|(id, _)| *id));

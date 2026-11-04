@@ -2,7 +2,12 @@
 //! must have exactly one class, every vocabulary value must be named, every
 //! empty drop must be empty and every mirror must equal what it mirrors. An
 //! open field fails. Errors name a path and a reason, never a value.
+//!
+//! It returns the values whose entry makes them members of an assembled
+//! structure fact ([`Decode::Member`]), each with the array levels it sits
+//! under, for the importer to build.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine;
@@ -51,25 +56,47 @@ fn fields(value: &Json, prefix: &str, record: &mut Record) {
     }
 }
 
+/// One value that is a member of an assembled structure fact.
+#[derive(Debug)]
+pub(super) struct Member<'a> {
+    /// `(array path, position)` of each array it sits in, outermost first.
+    pub levels: Vec<(String, usize)>,
+    /// Its JSON Pointer in the assembled structure.
+    pub pointer: &'static str,
+    pub modality: &'static str,
+    pub direction: &'static str,
+    pub value: &'a Json,
+}
+
 /// Check one record (one JSONL line) against `table`.
-pub(super) fn record(table: &FieldTable, root: &Json) -> Result<(), Failure> {
+pub(super) fn record<'a>(
+    table: &'static FieldTable,
+    root: &'a Json,
+) -> Result<Vec<Member<'a>>, Failure> {
     let mut record = Record {
         root,
         scalars: BTreeMap::new(),
         present: BTreeSet::new(),
     };
     fields(root, "", &mut record);
-    Checker { table, record }.value(root, "", None)
+    let checker = Checker {
+        table,
+        record,
+        members: RefCell::new(Vec::new()),
+    };
+    checker.value(root, "", None, &mut Vec::new())?;
+    Ok(checker.members.into_inner())
 }
 
 struct Checker<'a> {
-    table: &'a FieldTable,
+    table: &'static FieldTable,
     record: Record<'a>,
+    members: RefCell<Vec<Member<'a>>>,
 }
 
 fn takes(decode: Decode, value: &Json) -> bool {
     match decode {
-        Decode::Json | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
+        Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
         Decode::Text | Decode::Base64 | Decode::MediaType | Decode::Timestamp => {
             matches!(value, Json::Str(_))
         }
@@ -79,7 +106,7 @@ fn takes(decode: Decode, value: &Json) -> bool {
     }
 }
 
-impl Checker<'_> {
+impl<'a> Checker<'a> {
     fn holds(&self, when: &[Cond], parent: Option<&Json>) -> bool {
         let sibling = |name: &str| parent.and_then(|p| p.get(name)).and_then(Json::spelling);
         let scalar = |field: &str| self.record.scalars.get(field);
@@ -89,6 +116,7 @@ impl Checker<'_> {
             Cond::Prefix(field, prefix) => scalar(field).is_some_and(|v| v.starts_with(prefix)),
             Cond::Present(field) => self.record.present.contains(field),
             Cond::Absent(field) => !self.record.present.contains(field),
+            Cond::Scalar(field) => self.record.scalars.contains_key(field),
             Cond::Sibling(name, value) => sibling(name).is_some_and(|v| v == value),
             Cond::SiblingNot(name, value) => sibling(name).is_none_or(|v| v != value),
         })
@@ -137,7 +165,13 @@ impl Checker<'_> {
             })
     }
 
-    fn value(&self, value: &Json, path: &str, parent: Option<&Json>) -> Result<(), Failure> {
+    fn value(
+        &self,
+        value: &'a Json,
+        path: &str,
+        parent: Option<&'a Json>,
+        levels: &mut Vec<(String, usize)>,
+    ) -> Result<(), Failure> {
         let shaped = self.shape(value).map(|shape| format!("{path}{{{shape}}}"));
         let mut entries = match &shaped {
             Some(shaped) => self.entries(shaped, value, parent),
@@ -147,7 +181,24 @@ impl Checker<'_> {
             entries = self.entries(path, value, parent);
         }
         match entries.as_slice() {
-            [entry] => return self.apply(entry, value, entry.path, parent),
+            [entry] => {
+                if let Class::Fact {
+                    decode: Decode::Member(pointer),
+                    modality,
+                    direction,
+                    ..
+                } = entry.class
+                {
+                    self.members.borrow_mut().push(Member {
+                        levels: levels.clone(),
+                        pointer,
+                        modality,
+                        direction,
+                        value,
+                    });
+                }
+                return self.apply(entry, value, entry.path, parent);
+            }
             [] => {}
             _ => return Err(Failure::new(path, "several table entries apply")),
         }
@@ -162,14 +213,16 @@ impl Checker<'_> {
                     } else {
                         format!("{inner}.<key>")
                     };
-                    self.value(member, &child, Some(value))?;
+                    self.value(member, &child, Some(value), levels)?;
                 }
                 Ok(())
             }
             Json::Arr(elements) if !elements.is_empty() => {
                 let child = format!("{inner}[]");
-                for element in elements {
-                    self.value(element, &child, Some(value))?;
+                for (at, element) in elements.iter().enumerate() {
+                    levels.push((inner.clone(), at));
+                    self.value(element, &child, Some(value), levels)?;
+                    levels.pop();
                 }
                 Ok(())
             }
