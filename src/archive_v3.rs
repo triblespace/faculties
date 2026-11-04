@@ -237,6 +237,8 @@ pub struct WitnessAnnotations {
     pub claimed_title: Option<String>,
     /// The source marks this occurrence a compaction summary.
     pub compaction_summary: bool,
+    /// The source flags the held text as the harness's writing.
+    pub harness_written: bool,
 }
 
 /// One occurrence of `witness`: the claims of one source record, rooted at an
@@ -277,9 +279,19 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         .into_iter()
         .map(|pointer| fragment.put::<UTF8String, _>(pointer))
         .collect();
-    let compaction = annotations
-        .compaction_summary
-        .then_some(schema::witness::COMPACTION_SUMMARY);
+    let tags: Vec<Id> = [
+        (
+            annotations.compaction_summary,
+            schema::witness::COMPACTION_SUMMARY,
+        ),
+        (
+            annotations.harness_written,
+            schema::witness::HARNESS_WRITTEN,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(set, tag)| set.then_some(tag))
+    .collect();
     let core = entity! { _ @
         schema::occurrence::of: &witness,
         schema::witness::generated_by*: generated_by.iter(),
@@ -294,7 +306,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
-        metadata::tag?: compaction,
+        metadata::tag*: tags.iter(),
     };
     let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;
     let root = rooted(&core, "occurrence")?;

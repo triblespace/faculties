@@ -21,7 +21,8 @@ const PNG: &str = "iVBORw0KGgo=";
 const PDF: &str = "JVBERi0xLjQK";
 const SIGNATURE: &str = "c2lnbmVkIHRoaW5raW5n";
 /// The modality `window_before` reports for a span gap of unknown kind.
-const UNKNOWN: Id = triblespace::macros::id_hex!("00000000000000000000000000000001");
+/// Minted with `trible genid` (C7); it names nothing outside these tests.
+const UNKNOWN: Id = triblespace::macros::id_hex!("AD62B67CF8B7E4C7A0A6DA03F6A62A08");
 
 /// The system section before anything is recorded: the settings header
 /// gap, the system prompt gap and the tool definitions span.
@@ -775,7 +776,7 @@ fn titles_and_recaps_are_glosses() {
 }
 
 #[test]
-fn wire_inputs_must_mirror_the_call() {
+fn wire_inputs_that_equal_the_call_are_copies() {
     let mut a1 = assistant(
         "a1",
         "u1",
@@ -786,15 +787,14 @@ fn wire_inputs_must_mirror_the_call() {
     );
     a1["wireToolInputs"] = json!({"t1": {"command": "ls"}});
     let source = jsonl(&[user("u1", None, 0, json!("Run.")), a1]);
-    passes(&source);
+    let imported = passes(&source);
+    assert!(rewritten_calls(&imported).is_empty());
 
-    let differs = source.replace(
-        "\"wireToolInputs\":{\"t1\":{\"command\":\"ls\"}}",
-        "\"wireToolInputs\":{\"t1\":{\"command\":\"ls -l\"}}",
-    );
-    assert_ne!(differs, source);
-    assert_eq!(refused(&differs).path, "{assistant}.wireToolInputs");
-    assert!(walk_rows(&differs).contains(&("{assistant}.wireToolInputs".to_owned(), Kind::Mirror)));
+    // A member that names no call of its record fails, in both programs.
+    let stray = source.replace("\"wireToolInputs\":{\"t1\"", "\"wireToolInputs\":{\"t9\"");
+    assert_ne!(stray, source);
+    assert_eq!(refused(&stray).path, "{assistant}.wireToolInputs");
+    assert!(walk_rows(&stray).contains(&("{assistant}.wireToolInputs".to_owned(), Kind::Mirror)));
 }
 
 #[test]
@@ -1296,5 +1296,374 @@ fn real_sample() {
     println!("-- files that import and fail the gate");
     for file in &failing_files {
         println!("{file}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 3: C1-C7, S2, X2. Each fixture failed before its ruling was built.
+
+/// The facts in the fragment that are calls the client re-sent changed:
+/// their nodes.
+fn rewritten_calls(imported: &Imported) -> Vec<Id> {
+    let facts = imported.fragment.facts();
+    find!(
+        node: Id,
+        pattern!(facts, [
+            { ?node @ v3::node::holds: _?fact },
+            { _?fact @ v3::fact::form: (v3::fact::form::REWRITTEN) },
+        ])
+    )
+    .collect()
+}
+
+/// Whether some `continues` link returns to where it starts: from its
+/// target, following `previous` and `continues`, its own node is reached.
+fn continues_cycle(imported: &Imported) -> bool {
+    let facts = imported.fragment.facts();
+    let mut next: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+    for (node, previous) in find!(
+        (node: Id, previous: Id),
+        pattern!(facts, [{ ?node @ v3::node::previous: ?previous }])
+    ) {
+        next.entry(node).or_default().push(previous);
+    }
+    let links = annotated!(imported, v3::node::continues);
+    for &(node, target) in &links {
+        next.entry(node).or_default().push(target);
+    }
+    links.iter().any(|&(start, target)| {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![target];
+        while let Some(at) = stack.pop() {
+            if at == start {
+                return true;
+            }
+            if seen.insert(at) {
+                stack.extend(next.get(&at).into_iter().flatten().copied());
+            }
+        }
+        false
+    })
+}
+
+/// C1: a result names its call by a string, and the call stands in the
+/// result's own window; otherwise the unit fails.
+#[test]
+fn c1_a_result_names_a_call_of_its_window() {
+    let run = |content: Value| {
+        jsonl(&[
+            user("u1", None, 0, json!("Run.")),
+            assistant(
+                "a1",
+                "u1",
+                1,
+                "m1",
+                call("t1", "Bash", json!({"command": "ls"})),
+                json!("tool_use"),
+            ),
+            user("u2", Some("a1"), 2, content),
+        ])
+    };
+    let imported = passes(&run(result("t1", json!("listing"))));
+    assert_eq!(annotated!(imported, v3::node::responds_to).len(), 1);
+
+    let path = "{user}.message.content[]{tool_result}.tool_use_id";
+    let mut number = result("t1", json!("listing"));
+    number[0]["tool_use_id"] = json!(7);
+    assert_eq!(refused(&run(number)).path, path);
+    let mut object = result("t1", json!("listing"));
+    object[0]["tool_use_id"] = json!({"id": "t1"});
+    assert!(refused(&run(object)).path.starts_with(path));
+    let nowhere = refused(&run(result("t9", json!("listing"))));
+    assert_eq!(
+        (nowhere.path.as_str(), nowhere.reason),
+        (path, "a result names no call in the unit")
+    );
+
+    // A call on another branch is in the unit, not in the result's window.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Run.")),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            call("t1", "Bash", json!({"command": "ls"})),
+            json!("tool_use"),
+        ),
+        assistant("a2", "u1", 2, "m2", said("Instead."), json!("end_turn")),
+        user("u2", Some("a2"), 3, result("t1", json!("listing"))),
+    ]);
+    let elsewhere = refused(&source);
+    assert_eq!(
+        (elsewhere.path.as_str(), elsewhere.reason),
+        (path, "a result whose call is not in its window")
+    );
+}
+
+/// C2: no gloss names a model the source does not name.
+#[test]
+fn c2_glosses_name_no_invented_model() {
+    let title = json!({"type": "ai-title", "sessionId": "s-1", "aiTitle": "A synthetic chat"});
+    let recap = json!({
+        "type": "system", "subtype": "away_summary", "uuid": "r1", "parentUuid": "a2",
+        "sessionId": "s-1", "timestamp": stamp(3), "content": "While away: one answer.",
+        "isMeta": false
+    });
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", thinking("some thoughts"), json!(null)),
+        assistant("a2", "a1", 2, "m1", said("Hello."), json!("end_turn")),
+        title,
+        recap,
+    ]);
+    let imported = passes(&source);
+    assert_eq!(glosses(&imported, v3::gloss::category::TITLE).len(), 1);
+    assert_eq!(glosses(&imported, v3::gloss::category::RECAP).len(), 1);
+    assert_eq!(
+        glosses(&imported, v3::gloss::category::REASONING_SUMMARY).len(),
+        1
+    );
+    let facts = imported.fragment.facts();
+    let named: Vec<Id> = find!(
+        model: Id,
+        pattern!(facts, [{ _?gloss @ v3::gloss::describes: _?node, v3::gloss::generated_by: ?model }])
+    )
+    .collect();
+    assert!(named.is_empty(), "a gloss names a model");
+}
+
+/// C3: a text block without its text fails; an empty text holds nothing.
+#[test]
+fn c3_a_text_block_without_text_fails() {
+    let source = jsonl(&[user("u1", None, 0, json!([{"type": "text"}]))]);
+    assert_eq!(refused(&source).path, "{user}.message.content[]{text}.text");
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            json!({"type": "text"}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{assistant}.message{message}.content[]{text}.text"
+    );
+    let source = jsonl(&[user(
+        "u1",
+        None,
+        0,
+        json!([{"type": "text", "text": ""}, said("Hi.")]),
+    )]);
+    passes(&source);
+}
+
+/// C4: harness text is flagged on its occurrence; no author spelling is
+/// made up from the flag's name.
+#[test]
+fn c4_harness_text_is_flagged_not_spelled() {
+    let mut meta = user("u2", Some("a1"), 2, json!("<harness note>"));
+    meta["isMeta"] = json!(true);
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        assistant("a1", "u1", 1, "m1", said("Hello."), json!("end_turn")),
+        meta,
+    ]);
+    let imported = passes(&source);
+    let facts = imported.fragment.facts();
+    let authors: Vec<Inline<Handle<UTF8String>>> = find!(
+        author: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ _?occurrence @ v3::witness::raw_author: ?author }])
+    )
+    .collect();
+    assert!(authors.is_empty(), "an author spelling no source holds");
+    let flagged: Vec<Id> = find!(
+        occurrence: Id,
+        pattern!(facts, [{ ?occurrence @ triblespace::core::metadata::tag: (v3::witness::HARNESS_WRITTEN) }])
+    )
+    .collect();
+    assert_eq!(flagged.len(), 1);
+}
+
+/// C5: two items on one node each attach what they carry, whichever was
+/// placed first. Her regenerated answer and the copy a thinking drop
+/// re-presents converge; the copy still recalls its own place.
+#[test]
+fn c5_items_on_one_node_each_attach() {
+    let mut second = assistant(
+        "a3",
+        "u2",
+        5,
+        "m2",
+        said("Second answer."),
+        json!("end_turn"),
+    );
+    second["message"]["input_transformations"] = json!([
+        {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}
+    ]);
+    let source = jsonl(&[
+        user("u1", None, 0, json!("First.")),
+        assistant("a1", "u1", 1, "m1", thinking("first thoughts"), json!(null)),
+        assistant(
+            "a2",
+            "a1",
+            2,
+            "m1",
+            said("First answer."),
+            json!("end_turn"),
+        ),
+        // A regenerated answer without thinking: the same node as the
+        // copy below, placed before it.
+        assistant(
+            "a9",
+            "u1",
+            3,
+            "m9",
+            said("First answer."),
+            json!("end_turn"),
+        ),
+        user("u2", Some("a2"), 4, json!("Second.")),
+        second,
+    ]);
+    let imported = passes(&source);
+    let answers = nodes_saying(&imported, "First answer.");
+    assert_eq!(answers.len(), 2, "after the thinking, and without it");
+    let recalls = annotated!(imported, v3::node::recalls);
+    assert!(
+        recalls
+            .iter()
+            .any(|(node, original)| answers.contains(node) && answers.contains(original)),
+        "the re-presented answer recalls its own place"
+    );
+}
+
+/// C6: what the gate refuses, the importer refuses: a rendered attachment
+/// that renders nothing still makes claims no node can hold.
+#[test]
+fn c6_a_rendering_of_nothing_fails_at_import() {
+    let att = |parts: Value, role: Option<&str>| {
+        let mut record = json!({
+            "type": "attachment", "sessionId": "s-1", "uuid": "x1", "parentUuid": "u1",
+            "timestamp": stamp(1),
+            "attachment": {"type": "date", "date": "2026-03-01"},
+            "rendered": parts,
+        });
+        if let Some(role) = role {
+            record["renderedRole"] = json!(role);
+        }
+        jsonl(&[
+            user("u1", None, 0, json!("Hi.")),
+            record,
+            assistant("a1", "x1", 2, "m1", said("Hello."), json!("end_turn")),
+        ])
+    };
+    passes(&att(json!([{"content": "today"}]), Some("system")));
+    for role in [Some("system"), Some("user")] {
+        let source = att(json!([{"content": ""}]), role);
+        let failure = refused(&source);
+        assert_eq!(
+            (failure.path.as_str(), failure.reason),
+            ("{attachment}", "a record that holds nothing makes claims"),
+            "{role:?}"
+        );
+    }
+    // With no role, its slot is unverified: refused by both programs.
+    let source = att(json!([{"content": ""}]), None);
+    assert!(import(source.as_bytes()).is_err());
+    assert!(walk_rows(&source)
+        .iter()
+        .any(|(_, kind)| *kind == Kind::Open));
+}
+
+/// S2: the client re-sent her call changed. Her call keeps what she
+/// wrote; every later request holds the sent form in its place, `in` and
+/// `form: rewritten`, and what follows it there is a copy.
+#[test]
+fn s2_a_rewritten_call_is_a_marked_window_change() {
+    let mut a1 = assistant(
+        "a1",
+        "u1",
+        1,
+        "m1",
+        call("t1", "Bash", json!({"command": "ls"})),
+        json!("tool_use"),
+    );
+    a1["wireToolInputs"] = json!({"t1": {"command": "ls -l"}});
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Run.")),
+        a1,
+        user("u2", Some("a1"), 2, result("t1", json!("listing"))),
+        assistant("a2", "u2", 3, "m2", said("Listed."), json!("end_turn")),
+    ]);
+    let imported = passes(&source);
+    let sent = rewritten_calls(&imported);
+    assert_eq!(sent.len(), 1, "one node holds the sent form");
+    let listed = witnessed_saying(&imported, "Listed.");
+    let mut cursor = previous(&imported, listed);
+    let mut on_line = false;
+    while let Some(at) = cursor {
+        on_line |= at == sent[0];
+        cursor = previous(&imported, at);
+    }
+    assert!(on_line, "the later request holds the sent form");
+    // Her own call is still the one she wrote, and is not on that line.
+    let facts = imported.fragment.facts();
+    let calls: Vec<Id> = find!(
+        fact: Id,
+        pattern!(facts, [{ ?fact @ v3::fact::modality: (v3::fact::modality::TOOL_CALL) }])
+    )
+    .collect();
+    assert_eq!(calls.len(), 2, "what she wrote and what was sent");
+    // The result after the sent form is a copy of the result after hers.
+    let results = nodes_saying(&imported, "listing");
+    assert_eq!(results.len(), 2);
+    assert!(annotated!(imported, v3::node::recalls)
+        .iter()
+        .any(|(node, original)| results.contains(node) && results.contains(original)));
+}
+
+/// X2: `continues` sits at the first node of the new line that is not on
+/// the old line, so no continues path returns to its start. A new context
+/// that lies wholly on the old line has no such node and fails.
+#[test]
+fn x2_continues_never_returns_to_its_start() {
+    let mut summary = user("c1", Some("b1"), 5, json!("Summary of what came before."));
+    summary["isCompactSummary"] = json!(true);
+    let head = [
+        user("u1", None, 0, json!("First.")),
+        assistant("a1", "u1", 1, "m1", said("One."), json!("end_turn")),
+        user("u2", Some("a1"), 2, json!("Second.")),
+        assistant("a2", "u2", 3, "m2", said("Two."), json!("end_turn")),
+    ];
+    let mut records = head.to_vec();
+    records.push(boundary("b1", Some("a2"), Some("c1")));
+    records.push(summary);
+    records.push(user("u3", Some("c1"), 6, json!("Third.")));
+    let imported = passes(&jsonl(&records));
+    assert_eq!(annotated!(imported, v3::node::continues).len(), 1);
+    assert!(!continues_cycle(&imported));
+
+    // The summary says exactly what the old line's first prompt said: the
+    // new context's first node is on the old line, which it would continue
+    // into a cycle.
+    let mut echo = user("c1", Some("b1"), 5, json!("First."));
+    echo["isCompactSummary"] = json!(true);
+    let mut records = head.to_vec();
+    records.push(boundary("b1", Some("a2"), None));
+    records.push(echo);
+    let source = jsonl(&records);
+    match import(source.as_bytes()) {
+        Err(failure) => assert_eq!(failure.path, "{system}.logicalParentUuid"),
+        Ok(mut fragment) => {
+            let blobs = fragment.blobs_mut().snapshot().unwrap();
+            let imported = Imported { fragment, blobs };
+            assert!(!continues_cycle(&imported), "a continues cycle");
+            let report = gate(&source, &imported);
+            assert!(report.passed(), "{report}");
+        }
     }
 }

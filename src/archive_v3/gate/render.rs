@@ -751,6 +751,12 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 tokens.insert(annotation("compaction_summary", Value::Bool(true)));
                 continue;
             }
+            if attribute == metadata::tag.id()
+                && Self::id(raw) == Some(v3::witness::HARNESS_WRITTEN)
+            {
+                tokens.insert(annotation("harness_written", Value::Bool(true)));
+                continue;
+            }
             let text_attributes = [
                 ("raw_model", main::source_projection::raw_model.id()),
                 ("raw_role", main::source_projection::raw_role.id()),

@@ -233,9 +233,13 @@ impl<'a, 'u> Checker<'a, 'u> {
         match entry.class {
             Class::Fact { decode, .. } => takes(decode, value),
             Class::Annotation(list) => list.iter().all(|(_, decode)| takes(*decode, value)),
-            Class::Structure(_) => value.is_scalar() || value.is_empty(),
+            // A correlator names one id: an object or array under its path
+            // is walked member by member and fails where the table names
+            // nothing, as the gate's walker does (C1).
+            Class::Structure(_) | Class::Correlator => value.is_scalar() || value.is_empty(),
             Class::Drop(DropReason::Empty) => value.is_scalar() || value.is_empty(),
-            Class::Correlator | Class::Drop(_) | Class::Open(_) => true,
+            Class::Rewrite(_) => matches!(value, Json::Obj(_)),
+            Class::Drop(_) | Class::Open(_) => true,
         }
     }
 
@@ -478,6 +482,32 @@ impl<'a, 'u> Checker<'a, 'u> {
                 path,
                 "a children mirror is not checked by this importer",
             )),
+            // The importer builds the changed window; here each member must
+            // name a call of the record.
+            Class::Rewrite(rewrite) => {
+                let Json::Obj(sent) = value else {
+                    return Err(Failure::new(path, "a rewrite is not an object"));
+                };
+                let elements = self
+                    .record
+                    .root
+                    .at(rewrite.array)
+                    .map(Json::arr)
+                    .unwrap_or(&[]);
+                for (name, _) in sent {
+                    let named = elements
+                        .iter()
+                        .filter(|element| element.str_at(rewrite.key) == Some(name.as_str()))
+                        .count();
+                    if named != 1 {
+                        return Err(Failure::new(
+                            path,
+                            "a rewritten member names no single call of its record",
+                        ));
+                    }
+                }
+                Ok(())
+            }
             Class::Open(why) => Err(Failure::new(path, why)),
         }
     }

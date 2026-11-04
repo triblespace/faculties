@@ -67,8 +67,8 @@ use triblespace::prelude::*;
 use self::json::Json;
 use crate::archive_v3::fields::claude_code::{SUMMARIZED_THINKING, TABLE};
 use crate::archive_v3::{
-    annotate_gloss, annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore,
-    MediaType, NodeAnnotations, WitnessAnnotations,
+    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
+    NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -78,12 +78,6 @@ pub(crate) mod check;
 pub mod json;
 #[cfg(test)]
 mod tests;
-
-/// The side models whose text becomes a gloss, by the role they play. The
-/// sources do not name them.
-pub const THINKING_SUMMARIZER: &str = "anthropic thinking summarizer (unnamed)";
-pub const TITLE_MODEL: &str = "claude code ai-title model (unnamed)";
-pub const RECAP_MODEL: &str = "claude code away-summary model (unnamed)";
 
 /// Why a unit was refused: a normalized source path and a fixed reason.
 /// Neither ever holds a source value.
@@ -266,9 +260,11 @@ struct Item {
     /// The head whose part this is.
     part_of: Option<usize>,
     record: Option<usize>,
-    original: Option<Id>,
+    /// The position the item was first placed at: its own.
+    original: Option<usize>,
     ends: Vec<Id>,
-    responds_to: Option<usize>,
+    /// The call this result head answers, by its id in the unit (C1).
+    responds_to: Option<String>,
     /// The source kept the data, not the rendering she read.
     unrecorded: bool,
 }
@@ -303,11 +299,22 @@ fn insert(object: &mut Json, steps: &[&str], value: &Json) -> Result<(), &'stati
     insert(&mut members[at].1, rest, value)
 }
 
-/// The end of a line: its last node, the system section it was built on,
+/// One place in a window: an item after the place before it. Places are
+/// keyed by source position (the item and the place before it), never by
+/// the node id they derive (C5): items that converge on one node are two
+/// places with one node, and each attaches what it carries.
+#[derive(Clone, Copy, Debug)]
+struct Position {
+    previous: Option<usize>,
+    item: usize,
+    node: Id,
+}
+
+/// The end of a line: its last place, the system section it was built on,
 /// and the settings header that opens it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Tail {
-    node: Option<Id>,
+    node: Option<usize>,
     version: usize,
     header: usize,
 }
@@ -365,9 +372,13 @@ struct Builder {
     /// Every fact built, staged: only those a window holds are emitted.
     facts: HashMap<Id, Fragment>,
     items: Vec<Item>,
-    /// node -> (previous, item, the node itself). Lines are built as the
-    /// records come; only the nodes on a witnessed window are emitted.
-    nodes: HashMap<Id, (Option<Id>, usize, Fragment)>,
+    /// Every place built. Lines are built as the records come; only the
+    /// nodes on a witnessed window are emitted.
+    positions: Vec<Position>,
+    /// `(place before, item)` -> the place: one place per source position.
+    position_at: HashMap<(Option<usize>, usize), usize>,
+    /// Each node built, staged for output once.
+    built: HashMap<Id, Fragment>,
     /// Every record id in the unit.
     uuids: HashSet<String>,
     /// What each record contributed and the line it leaves.
@@ -384,7 +395,8 @@ struct Builder {
     headers: HashMap<Id, usize>,
     /// A span of unknown items.
     span_gap: usize,
-    calls: HashMap<String, usize>,
+    /// call id -> every call item with that id
+    calls: HashMap<String, Vec<usize>>,
     /// call id -> the record that holds the call
     call_records: HashMap<String, String>,
     messages: HashMap<String, Message>,
@@ -394,12 +406,14 @@ struct Builder {
     /// anchor uuid -> boundary uuid
     anchors: HashMap<String, String>,
     interrupted: Vec<String>,
-    /// `(item, category, text, model)`
-    item_glosses: Vec<(usize, Id, String, &'static str)>,
-    node_glosses: Vec<(Id, Id, String, &'static str)>,
+    /// `(item, category, text)`. No gloss names the model that wrote it:
+    /// the source never does (C2).
+    item_glosses: Vec<(usize, Id, String)>,
+    /// `(place, category, text)`
+    node_glosses: Vec<(usize, Id, String)>,
     /// `(file position, title)`: resolved once every line is built.
     titles: Vec<(usize, String)>,
-    /// `(first item of the new context, boundary uuid)`
+    /// `(last item of a record opening the new context, boundary uuid)`
     continues: Vec<(usize, String)>,
     claims: HashMap<usize, WitnessAnnotations>,
 }
@@ -492,7 +506,9 @@ impl Builder {
             out: Fragment::empty(),
             facts: HashMap::new(),
             items: Vec::new(),
-            nodes: HashMap::new(),
+            positions: Vec::new(),
+            position_at: HashMap::new(),
+            built: HashMap::new(),
             uuids,
             record_items: HashMap::new(),
             record_parent: HashMap::new(),
@@ -575,34 +591,42 @@ impl Builder {
         Ok(self.items.len() - 1)
     }
 
-    fn extend(&mut self, tail: Option<Id>, item: usize) -> Id {
-        let holds = Fragment::rooted(self.items[item].fact, TribleSet::new());
-        let built = node(tail, holds).expect("a node over one fact builds");
-        let id = built.root().expect("a node is rooted");
-        self.nodes
-            .entry(id)
-            .or_insert_with(|| (tail, item, unexported(built)));
-        if self.items[item].original.is_none() {
-            self.items[item].original = Some(id);
+    fn extend(&mut self, tail: Option<usize>, item: usize) -> usize {
+        if let Some(&at) = self.position_at.get(&(tail, item)) {
+            return at;
         }
-        id
+        let holds = Fragment::rooted(self.items[item].fact, TribleSet::new());
+        let previous = tail.map(|at| self.positions[at].node);
+        let built = node(previous, holds).expect("a node over one fact builds");
+        let id = built.root().expect("a node is rooted");
+        self.built.entry(id).or_insert_with(|| unexported(built));
+        let at = self.positions.len();
+        self.positions.push(Position {
+            previous: tail,
+            item,
+            node: id,
+        });
+        self.position_at.insert((tail, item), at);
+        if self.items[item].original.is_none() {
+            self.items[item].original = Some(at);
+        }
+        at
     }
 
-    fn build(&mut self, start: Option<Id>, sequence: &[usize]) -> Option<Id> {
+    fn build(&mut self, start: Option<usize>, sequence: &[usize]) -> Option<usize> {
         sequence
             .iter()
             .fold(start, |tail, &item| Some(self.extend(tail, item)))
     }
 
     /// The items of the line ending at `tail`, root first.
-    fn sequence(&self, tail: Option<Id>) -> Vec<usize> {
+    fn sequence(&self, tail: Option<usize>) -> Vec<usize> {
         let mut out = Vec::new();
         let mut cursor = tail;
-        while let Some(node) = cursor {
-            let (previous, item, _) = &self.nodes[&node];
-            out.push(*item);
-            let previous = *previous;
-            cursor = previous;
+        while let Some(at) = cursor {
+            let position = self.positions[at];
+            out.push(position.item);
+            cursor = position.previous;
         }
         out.reverse();
         out
@@ -745,9 +769,8 @@ impl Builder {
         match kind {
             "user" => {
                 claims.raw_role = record.str_at("message.role").map(str::to_owned);
-                if record.is_true("isMeta") {
-                    claims.raw_author.push("isMeta".to_owned());
-                }
+                // A flag, not a spelling (C4).
+                claims.harness_written = record.is_true("isMeta");
                 if let Some(kind) = record.str_at("origin.kind") {
                     claims.raw_author.push(kind.to_owned());
                 }
@@ -779,6 +802,30 @@ impl Builder {
             }
         }
         self.claims.insert(at, claims);
+        Ok(())
+    }
+
+    /// A record that holds no node makes no claim: its time, role or
+    /// session would have no occurrence to sit on, and the gate refuses it
+    /// (C6).
+    fn holds_its_claims(&self, at: usize, kind: &str, items: &[usize]) -> Result<(), Failure> {
+        let Some(claims) = self.claims.get(&at) else {
+            return Ok(());
+        };
+        let claims_something = !claims.timestamp.is_empty()
+            || claims.raw_role.is_some()
+            || claims.raw_model.is_some()
+            || claims.source_locator.is_some()
+            || !claims.generated_by.is_empty()
+            || !claims.raw_author.is_empty()
+            || claims.harness_written
+            || claims.compaction_summary;
+        if items.is_empty() && claims_something {
+            return Err(Failure::new(
+                &format!("{{{kind}}}"),
+                "a record that holds nothing makes claims",
+            ));
+        }
         Ok(())
     }
 
@@ -857,9 +904,20 @@ impl Builder {
                                 Some(at),
                                 &path,
                             )?;
-                            if let Some(call) = block.str_at("tool_use_id") {
-                                self.items[head].responds_to = self.calls.get(call).copied();
-                                results.push(call.to_owned());
+                            // The call it answers: a string naming a call
+                            // of the unit, resolved once every line is built
+                            // (C1). Anything else is refused.
+                            match block.get("tool_use_id") {
+                                Some(Json::Str(call)) => {
+                                    self.items[head].responds_to = Some(call.clone());
+                                    results.push(call.clone());
+                                }
+                                _ => {
+                                    return Err(Failure::new(
+                                        &format!("{path}.tool_use_id"),
+                                        "a result whose call id is not a string",
+                                    ))
+                                }
                             }
                             items.push(head);
                             let mut parts = Vec::new();
@@ -940,6 +998,7 @@ impl Builder {
         if let Some(message) = record.str_at("interruptedMessageId") {
             self.interrupted.push(message.to_owned());
         }
+        self.holds_its_claims(at, "user", &items)?;
         self.place(at, uuid, parent, items)
     }
 
@@ -950,9 +1009,17 @@ impl Builder {
         let kind = block.str_at("type").unwrap_or_default();
         let path = format!("{prefix}{{{kind}}}");
         let core = match kind {
-            "text" => match block.str_at("text") {
-                Some(shown) if !shown.is_empty() => text(TEXT, IN, shown),
-                _ => return Ok(None),
+            // `""` holds nothing; a text block without its text is refused,
+            // never skipped (C3).
+            "text" => match block.get("text") {
+                Some(Json::Str(shown)) if !shown.is_empty() => text(TEXT, IN, shown),
+                Some(Json::Str(_)) => return Ok(None),
+                _ => {
+                    return Err(Failure::new(
+                        &format!("{path}.text"),
+                        "a text block without its text",
+                    ))
+                }
             },
             "image" | "document" => FactCore {
                 blob: Some(bytes(block.at("source.data"), &path)?),
@@ -1165,13 +1232,22 @@ impl Builder {
         let message_id = record.str_at("message.id").unwrap_or_default().to_owned();
         let base = "{assistant}.message{message}.content[]";
         let mut items = Vec::new();
+        // This record's calls: id -> (item, block).
+        let mut own_calls: HashMap<&str, (usize, &Json)> = HashMap::new();
         for block in record.at("message.content").map(Json::arr).unwrap_or(&[]) {
             let kind = block.str_at("type").unwrap_or_default();
             let path = format!("{base}{{{kind}}}");
             match kind {
                 "text" => {
-                    let Some(said) = block.str_at("text").filter(|t| !t.is_empty()) else {
-                        continue;
+                    let said = match block.get("text") {
+                        Some(Json::Str(said)) if !said.is_empty() => said,
+                        Some(Json::Str(_)) => continue,
+                        _ => {
+                            return Err(Failure::new(
+                                &format!("{path}.text"),
+                                "a text block without its text",
+                            ))
+                        }
                     };
                     if synthetic {
                         let voiced = FactCore {
@@ -1214,7 +1290,6 @@ impl Builder {
                             item,
                             v3::gloss::category::REASONING_SUMMARY,
                             readable.to_owned(),
-                            THINKING_SUMMARIZER,
                         ));
                     }
                     items.push(item);
@@ -1232,7 +1307,13 @@ impl Builder {
                     };
                     let item = self.item(call, Role::Assistant, Some(at), &path)?;
                     if let Some(id) = block.str_at("id") {
-                        self.calls.insert(id.to_owned(), item);
+                        if own_calls.insert(id, (item, block)).is_some() {
+                            return Err(Failure::new(
+                                &format!("{path}.id"),
+                                "a record holds two calls with one id",
+                            ));
+                        }
+                        self.calls.entry(id.to_owned()).or_default().push(item);
                         if let Some(uuid) = &uuid {
                             self.call_records.insert(id.to_owned(), uuid.clone());
                         }
@@ -1281,9 +1362,43 @@ impl Builder {
             let entry = self.request_drops.entry(request.to_owned()).or_default();
             *entry = (*entry).max(drops);
         }
+        self.holds_its_claims(at, "assistant", &items)?;
         let markers = self.markers(record)?;
         let header = self.header(record)?;
         let version = self.version_at[at];
+        // What later requests hold: a call the client sent changed stands
+        // as what it sent (S2). Her call keeps what she wrote.
+        let mut wired = items.clone();
+        if let Some(sent) = record.get("wireToolInputs") {
+            let path = "{assistant}.wireToolInputs";
+            let Json::Obj(sent) = sent else {
+                return Err(Failure::new(path, "a rewrite is not an object"));
+            };
+            for (id, input) in sent {
+                let &(call, block) = own_calls.get(id.as_str()).ok_or_else(|| {
+                    Failure::new(
+                        path,
+                        "a rewritten member names no single call of its record",
+                    )
+                })?;
+                if block
+                    .get("input")
+                    .is_some_and(|written| written.same(input))
+                {
+                    continue;
+                }
+                let rewritten = FactCore {
+                    tool_name: block.str_at("name").map(str::to_owned),
+                    structure: Some(structure(input, path)?),
+                    form: Some(v3::fact::form::REWRITTEN),
+                    ..core(TOOL_CALL, IN)
+                };
+                let rewritten = self.item(rewritten, Role::Assistant, None, path)?;
+                for item in wired.iter_mut().filter(|item| **item == call) {
+                    *item = rewritten;
+                }
+            }
+        }
 
         // One API message spans the records that share its id; its window
         // is decided once, from the unedited history at the records'
@@ -1345,12 +1460,12 @@ impl Builder {
                 }
             }
         }
-        let same = edited == unedited;
+        let same = edited == unedited && wired == items;
         edited.node = self.build(edited.node, &items);
         if same {
             unedited = edited;
         } else {
-            unedited.node = self.build(unedited.node, &items);
+            unedited.node = self.build(unedited.node, &wired);
         }
         let mut line = Line { edited, unedited };
         if let Some(uuid) = &uuid {
@@ -1417,6 +1532,7 @@ impl Builder {
                 )?);
             }
         }
+        self.holds_its_claims(at, "attachment", &items)?;
         self.place(at, uuid, parent, items)
     }
 
@@ -1576,12 +1692,8 @@ impl Builder {
                         .ok_or_else(|| {
                             Failure::new("{system}.content", "a recap with no node to describe")
                         })?;
-                    self.node_glosses.push((
-                        node,
-                        v3::gloss::category::RECAP,
-                        recap.to_owned(),
-                        RECAP_MODEL,
-                    ));
+                    self.node_glosses
+                        .push((node, v3::gloss::category::RECAP, recap.to_owned()));
                 }
                 self.pass(at, uuid, parent)
             }
@@ -1594,13 +1706,14 @@ impl Builder {
     }
 
     /// A record whose parent is a compaction boundary opens the new context:
-    /// its first item `continues` from the old tail.
+    /// the first node of its line that is not on the old line `continues`
+    /// from the old tail (X2), found once every line is built.
     fn continue_compaction(&mut self, parent: Option<&str>, items: &[usize]) {
         let Some(parent) = parent else {
             return;
         };
-        if let (true, Some(&first)) = (self.boundaries.contains_key(parent), items.first()) {
-            self.continues.push((first, parent.to_owned()));
+        if let (true, Some(&last)) = (self.boundaries.contains_key(parent), items.last()) {
+            self.continues.push((last, parent.to_owned()));
         }
     }
 
@@ -1657,7 +1770,16 @@ impl Builder {
         self.claims_of(at, record)?;
         let mut prefix = Vec::new();
         for block in record.at("shape.system").map(Json::arr).unwrap_or(&[]) {
-            if let Some(said) = block.str_at("text").filter(|t| !t.is_empty()) {
+            let said = match block.get("text") {
+                Some(Json::Str(said)) => said,
+                _ => {
+                    return Err(Failure::new(
+                        "{api-request-shape}.shape.system[]{text}.text",
+                        "a text block without its text",
+                    ))
+                }
+            };
+            if !said.is_empty() {
                 prefix.push(self.item(
                     text(SYSTEM, IN, said),
                     Role::Prefix,
@@ -1722,70 +1844,101 @@ impl Builder {
         // line built along the way that no record's window holds (the
         // unedited history no later request used) is not emitted.
         let mut emitted: HashSet<Id> = HashSet::new();
+        let mut walked = vec![false; self.positions.len()];
         for item in &self.items {
-            let (Some(_), Some(node)) = (item.record, item.original) else {
+            let (Some(_), Some(at)) = (item.record, item.original) else {
                 continue;
             };
-            let mut cursor = Some(node);
+            let mut cursor = Some(at);
             while let Some(at) = cursor {
-                if !emitted.insert(at) {
+                if walked[at] {
                     break;
                 }
-                cursor = self.nodes[&at].0;
+                walked[at] = true;
+                emitted.insert(self.positions[at].node);
+                cursor = self.positions[at].previous;
             }
         }
+        let mut out = std::mem::replace(&mut self.out, Fragment::empty());
+        for node in &emitted {
+            out += self.built[node].clone();
+        }
+        // Each place whose node a window holds attaches what its item
+        // carries there, whichever item reached the node first (C5): its
+        // fact, a recall of its own place when it stands elsewhere and a
+        // record holds it (a header or a gap is held by none and has no
+        // original), and an unrecorded rendering.
         let mut held_facts: HashSet<Id> = HashSet::new();
-        for &node in &emitted {
-            let (_, item, built) = &self.nodes[&node];
-            self.out += built.clone();
-            let item = &self.items[*item];
-            if held_facts.insert(item.fact) {
-                self.out += self.facts[&item.fact].clone();
+        let mut marks: BTreeMap<Id, NodeAnnotations> = BTreeMap::new();
+        for position in &self.positions {
+            if !emitted.contains(&position.node) {
+                continue;
             }
-            if let Some(original) = item
-                .original
-                .filter(|original| *original != node && emitted.contains(original))
-            {
-                self.out += annotate_node(
-                    node,
-                    &NodeAnnotations {
-                        recalls: vec![original],
-                        ..NodeAnnotations::default()
-                    },
-                );
+            let item = &self.items[position.item];
+            if held_facts.insert(item.fact) {
+                out += self.facts[&item.fact].clone();
+            }
+            let at = marks.entry(position.node).or_default();
+            if let (Some(_), Some(original)) = (item.record, item.original) {
+                let original = self.positions[original].node;
+                if original != position.node && !at.recalls.contains(&original) {
+                    at.recalls.push(original);
+                }
+            }
+            if item.unrecorded && at.rendering.is_empty() {
+                at.rendering.push(v3::node::rendering::UNRECORDED);
             }
         }
-        let on_window = |node: Id, path: &str| -> Result<Id, Failure> {
-            if emitted.contains(&node) {
-                Ok(node)
-            } else {
-                Err(Failure::new(path, "a link to a node no window holds"))
-            }
-        };
         // Every compaction root whose old context is in the unit continues
-        // from its tail (I6).
+        // from its tail at the first node of the new line that is not on the
+        // old line (X2), so no continues path returns to where it starts.
         let continues = std::mem::take(&mut self.continues);
         let mut continued: HashSet<String> = HashSet::new();
-        for (first, boundary) in continues {
+        for (last, boundary) in continues {
             let old = &self.boundaries[&boundary].logical_parent;
             if !self.uuids.contains(old) {
                 continue;
             }
             let tail = self.lines.get(old).and_then(|line| line.edited.node);
-            let (Some(node), Some(tail)) = (self.items[first].original, tail) else {
+            let (Some(end), Some(tail)) = (self.items[last].original, tail) else {
                 return Err(Failure::new(
                     "{system}.logicalParentUuid",
                     "a compaction root that continues no node",
                 ));
             };
-            let tail = on_window(tail, "{system}.logicalParentUuid")?;
-            self.out += annotate_node(
-                node,
-                &NodeAnnotations {
-                    continues: vec![tail],
-                    ..NodeAnnotations::default()
-                },
-            );
+            let mut on_old: HashSet<Id> = HashSet::new();
+            let mut cursor = Some(tail);
+            while let Some(at) = cursor {
+                on_old.insert(self.positions[at].node);
+                cursor = self.positions[at].previous;
+            }
+            let mut new_line = Vec::new();
+            let mut cursor = Some(end);
+            while let Some(at) = cursor {
+                new_line.push(self.positions[at].node);
+                cursor = self.positions[at].previous;
+            }
+            let first = new_line
+                .into_iter()
+                .rev()
+                .find(|node| !on_old.contains(node))
+                .ok_or_else(|| {
+                    Failure::new(
+                        "{system}.logicalParentUuid",
+                        "a compaction whose new context lies on the old line",
+                    )
+                })?;
+            let tail = self.positions[tail].node;
+            if !emitted.contains(&tail) || !emitted.contains(&first) {
+                return Err(Failure::new(
+                    "{system}.logicalParentUuid",
+                    "a link to a node no window holds",
+                ));
+            }
+            let at = marks.entry(first).or_default();
+            if !at.continues.contains(&tail) {
+                at.continues.push(tail);
+            }
             continued.insert(boundary);
         }
         for (uuid, boundary) in &self.boundaries {
@@ -1796,48 +1949,53 @@ impl Builder {
                 ));
             }
         }
-        // Node annotations.
+        // Each item's own place: why its message ended, and the call it
+        // answers, the nearest place holding that call on its own line (C1).
         for at in 0..self.items.len() {
-            let Some(node) = self.items[at].original else {
+            let Some(own) = self.items[at].original else {
                 continue;
             };
-            let responds_to: Vec<Id> = self.items[at]
-                .responds_to
-                .and_then(|call| self.items[call].original)
-                .into_iter()
-                .collect();
+            let node = self.positions[own].node;
+            if let Some(call) = self.items[at].responds_to.clone() {
+                let path = "{user}.message.content[]{tool_result}.tool_use_id";
+                let calls = self
+                    .calls
+                    .get(&call)
+                    .ok_or_else(|| Failure::new(path, "a result names no call in the unit"))?;
+                let mut cursor = self.positions[own].previous;
+                let found = loop {
+                    match cursor {
+                        None => break None,
+                        Some(up) if calls.contains(&self.positions[up].item) => break Some(up),
+                        Some(up) => cursor = self.positions[up].previous,
+                    }
+                };
+                let found = found.ok_or_else(|| {
+                    Failure::new(path, "a result whose call is not in its window")
+                })?;
+                let target = self.positions[found].node;
+                let mark = marks.entry(node).or_default();
+                if !mark.responds_to.contains(&target) {
+                    mark.responds_to.push(target);
+                }
+            }
             let ends = self.items[at].ends.clone();
-            if !responds_to.is_empty() || !ends.is_empty() {
-                self.out += annotate_node(
-                    node,
-                    &NodeAnnotations {
-                        responds_to,
-                        ends,
-                        ..NodeAnnotations::default()
-                    },
-                );
+            let mark = marks.entry(node).or_default();
+            for term in ends {
+                if !mark.ends.contains(&term) {
+                    mark.ends.push(term);
+                }
             }
         }
-        // Every node holding an unrecorded rendering says so, copies too.
-        let unrecorded: Vec<Id> = emitted
-            .iter()
-            .filter(|node| self.items[self.nodes[*node].1].unrecorded)
-            .copied()
-            .collect();
-        for node in unrecorded {
-            self.out += annotate_node(
-                node,
-                &NodeAnnotations {
-                    rendering: vec![v3::node::rendering::UNRECORDED],
-                    ..NodeAnnotations::default()
-                },
-            );
+        for (node, annotations) in &marks {
+            out += annotate_node(*node, annotations);
         }
         // Witnesses: one per node a record holds, and one occurrence of it
         // per record, holding that record's claims together.
         let mut held: BTreeMap<usize, Vec<Id>> = BTreeMap::new();
         for item in &self.items {
-            if let (Some(record), Some(node)) = (item.record, item.original) {
+            if let (Some(record), Some(at)) = (item.record, item.original) {
+                let node = self.positions[at].node;
                 let nodes = held.entry(record).or_default();
                 if !nodes.contains(&node) {
                     nodes.push(node);
@@ -1850,17 +2008,17 @@ impl Builder {
                 let built = witness(SOURCE_CLAUDE_CODE, node)
                     .map_err(|_| Failure::new("<witness>", "a witness does not build"))?;
                 let id = built.root().expect("a witness is rooted");
-                self.out += unexported(built);
+                out += unexported(built);
                 let built = occurrence(id, claims.clone()).map_err(|_| {
                     Failure::new("<witness>", "a witness occurrence does not build")
                 })?;
-                self.out += unexported(built);
+                out += unexported(built);
             }
         }
         // Titles: the nearest node on the parent chain of the record before
         // the title in the file (I5).
         for (at, title) in std::mem::take(&mut self.titles) {
-            let node = records[..at]
+            let place = records[..at]
                 .iter()
                 .rev()
                 .find_map(|before| before.str_at("uuid"))
@@ -1870,24 +2028,26 @@ impl Builder {
                     Failure::new("{ai-title}.aiTitle", "a title with no node to describe")
                 })?;
             self.node_glosses
-                .push((node, v3::gloss::category::TITLE, title, TITLE_MODEL));
+                .push((place, v3::gloss::category::TITLE, title));
         }
-        // Glosses.
-        let mut glosses = std::mem::take(&mut self.node_glosses);
-        for (item, category, text, model) in std::mem::take(&mut self.item_glosses) {
-            if let Some(node) = self.items[item].original {
-                glosses.push((node, category, text, model));
+        // Glosses. None names its model: the source does not (C2).
+        let mut glosses: Vec<(Id, Id, String)> = std::mem::take(&mut self.node_glosses)
+            .into_iter()
+            .map(|(place, category, text)| (self.positions[place].node, category, text))
+            .collect();
+        for (item, category, text) in std::mem::take(&mut self.item_glosses) {
+            if let Some(own) = self.items[item].original {
+                glosses.push((self.positions[own].node, category, text));
             }
         }
-        for (node, category, text, model) in glosses {
-            let node = on_window(node, "<gloss>")?;
+        for (node, category, text) in glosses {
+            if !emitted.contains(&node) {
+                return Err(Failure::new("<gloss>", "a link to a node no window holds"));
+            }
             let built = gloss(node, category, &text)
                 .map_err(|_| Failure::new("<gloss>", "a gloss does not build"))?;
-            let id = built.root().expect("a gloss is rooted");
-            self.out += unexported(built);
-            self.out += annotate_gloss(id, model)
-                .map_err(|_| Failure::new("<gloss>", "a gloss annotation does not build"))?;
+            out += unexported(built);
         }
-        Ok(self.out)
+        Ok(out)
     }
 }

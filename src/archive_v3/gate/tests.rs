@@ -282,6 +282,7 @@ fn seed_tables_name_only_v3_terms() {
         "claimed_media_type".to_owned(),
         "claimed_title".to_owned(),
         "compaction_summary".to_owned(),
+        "harness_written".to_owned(),
         "ends".to_owned(),
         "rendering".to_owned(),
     ];
@@ -763,8 +764,9 @@ fn the_gate_reports_attributes_it_does_not_know() {
 }
 
 /// A fixed attribute id for the unknown-attribute test; never published.
+/// Minted with `trible genid` (C7).
 fn trible_genid_for_tests() -> Id {
-    triblespace::macros::id_hex!("0123456789ABCDEF0123456789ABCDEF")
+    triblespace::macros::id_hex!("84D649B371E88285D3DC3C552D7F8F64")
 }
 
 #[test]

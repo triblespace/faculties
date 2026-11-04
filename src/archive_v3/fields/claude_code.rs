@@ -36,7 +36,7 @@
 
 use super::{
     Beside, Class, Compaction, Cond, Decode, DropReason, Entry, FieldTable, Gap, GapRule, Gaps,
-    Link, Mirror, Order, Place, Requests, Structure, Windows,
+    Link, Mirror, Order, Place, Requests, Rewrite, Structure, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -733,10 +733,11 @@ const USER_FIELDS: &[Entry] = &[
         "tool_name",
         Decode::Text,
     ),
-    // Harness-written text in the user slot.
+    // Harness-written text in the user slot: a flag on the occurrence,
+    // never a spelling of who wrote it (C4).
     Entry::new(
         "{user}.isMeta",
-        Class::Annotation(&[("raw_author", Decode::TextMap(&[("true", "isMeta")]))]),
+        Class::Annotation(&[("harness_written", Decode::Bool)]),
     )
     .when(&[Cond::Is("isMeta", "true")]),
     Entry::new(
@@ -1051,13 +1052,20 @@ const ASSISTANT_FIELDS: &[Entry] = &[
     Entry::new("{assistant}.apiErrorStatus", Class::Drop(CLIENT)),
     Entry::new("{assistant}.error", Class::Drop(CLIENT)),
     Entry::new("{assistant}.errorDetails", Class::Drop(CLIENT)),
+    // The call input as the client sent it in later requests: where it
+    // differs from what she wrote, a marked window change (S2).
     Entry::new(
         "{assistant}.wireToolInputs",
-        Class::Drop(DropReason::Mirror(Mirror::Keyed {
+        Class::Rewrite(Rewrite {
             array: "message.content",
             key: "id",
             member: "input",
-        })),
+            name: ("name", "tool_name"),
+            value: ("structure", Decode::Json),
+            modality: "tool-call",
+            direction: "in",
+            with: &[("form", Decode::ConstTerm("rewritten"))],
+        }),
     ),
     Entry::new("{assistant}.wireIngestContext", Class::Drop(CLIENT)),
     Entry::new("{assistant}.advisorModel", Class::Drop(CLIENT)),

@@ -87,6 +87,9 @@ pub struct Walked {
     /// `to`.
     link_from: Vec<(usize, Vec<(String, usize)>, usize, String, String)>,
     link_to: HashMap<(usize, String), Vec<(usize, Vec<(String, usize)>)>>,
+    /// A call's item -> the item later requests hold in its place
+    /// ([`crate::archive_v3::fields::Rewrite`]).
+    wire: HashMap<usize, usize>,
 }
 
 /// A link of an item: its attribute, the items its correlator names (the
@@ -230,6 +233,9 @@ struct RecordLinks {
     /// Its claims: the annotation tokens [`Place::Claim`] places, as one
     /// tuple.
     pub claims: BTreeSet<Token>,
+    /// Calls the client sent changed in later requests: (the element's
+    /// index in its array, the modality, the sent form's tokens, path).
+    rewrites: Vec<(usize, String, BTreeSet<Token>, String)>,
     /// Annotations placed once the unit is read: (token, place, levels,
     /// the value's spelling, path, occurrence label).
     deferred: Vec<(
@@ -345,11 +351,16 @@ impl Walked {
             return Role::User;
         };
         let tokens = &self.items[item].tokens;
-        if tokens
-            .iter()
-            .any(|t| t.attribute == "form" && t.value == Value::Term("voiced".to_owned()))
-        {
+        let form = |term: &str| {
+            tokens
+                .iter()
+                .any(|t| t.attribute == "form" && t.value == Value::Term(term.to_owned()))
+        };
+        if form("voiced") {
             Role::Voiced
+        } else if form("rewritten") {
+            // Her call as the client re-sent it: in her message.
+            Role::Assistant
         } else if tokens.iter().any(|t| t.modality == "system") {
             Role::System
         } else if tokens.iter().any(|t| t.direction == "out") {
@@ -589,7 +600,16 @@ impl Walked {
                 (start, dropped, cleared)
             }
         };
-        let base = self.walk_records(&chain[..start])?;
+        // Earlier requests' records as this request sent them; the records
+        // of its own request as they were.
+        let base: Vec<(usize, Vec<(String, usize)>, Slot)> = self
+            .walk_records(&chain[..start])?
+            .into_iter()
+            .map(|(record, levels, slot)| match slot {
+                Slot::Item(item) => (record, levels, Slot::Item(self.wired(&[item])[0])),
+                head => (record, levels, head),
+            })
+            .collect();
         let tail = self.walk_records(&chain[start..chain.len() - 1])?;
         // Dropped blocks, by message and block in the base window.
         let mut drop = BTreeSet::new();
@@ -689,6 +709,15 @@ impl Walked {
             }
         }
         Some(out)
+    }
+
+    /// Items as a later request holds them: a call the client re-sent
+    /// changed stands as what it sent.
+    fn wired(&self, items: &[usize]) -> Vec<usize> {
+        items
+            .iter()
+            .map(|item| self.wire.get(item).copied().unwrap_or(*item))
+            .collect()
     }
 
     /// The record's items in window order.
@@ -923,7 +952,7 @@ impl Walked {
             .is_some_and(|shape| windows.prefix.contains(&shape));
         let (before, unedited) = match (quick, parent) {
             (Some(before), Some(parent)) if !is_prefix => {
-                (Some(before), fold(parent.unedited, &own))
+                (Some(before), fold(parent.unedited, &self.wired(&own)))
             }
             _ if self.is_repeat(record) => (None, [0; 32]),
             _ => {
@@ -946,7 +975,7 @@ impl Walked {
                     chain.reverse();
                     let mut items = self.opening(&chain, record);
                     for (at, &link) in chain.iter().enumerate() {
-                        items.extend(self.ordered(link));
+                        items.extend(self.wired(&self.ordered(link)));
                         if at + 1 < chain.len() {
                             items.extend(self.segment_items(link).unwrap_or_default());
                         }
@@ -1423,6 +1452,7 @@ fn applies(entry: &Entry, value: &J) -> bool {
         // walked like any other value, so nothing hides inside it.
         Class::Structure(_) | Class::Correlator => is_leaf(value),
         Class::Drop(DropReason::Empty) => is_leaf(value),
+        Class::Rewrite(_) => matches!(value, J::Obj(_)),
         Class::Drop(_) | Class::Open(_) => true,
     }
 }
@@ -2038,6 +2068,73 @@ impl<'t> Walker<'t> {
                     }
                 }
             },
+            Class::Rewrite(rewrite) => {
+                let (J::Obj(sent), Some(record)) = (value, ctx.record) else {
+                    self.row(path, Kind::Mirror, ctx);
+                    return;
+                };
+                let elements = elements(&ctx.root, rewrite.array);
+                for (name, sent) in sent {
+                    let named: Vec<(usize, &J)> = elements
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, element)| member(element, rewrite.key) == Some(name.as_str()))
+                        .collect();
+                    let [(at, element)] = named.as_slice() else {
+                        self.row(path, Kind::Mirror, ctx);
+                        continue;
+                    };
+                    let original = match element {
+                        J::Obj(members) => members.get(rewrite.member),
+                        _ => None,
+                    };
+                    if original.is_some_and(|original| same(original, sent)) {
+                        continue;
+                    }
+                    let token = |attribute: &str, value: Value| Token {
+                        modality: rewrite.modality.to_owned(),
+                        direction: rewrite.direction.to_owned(),
+                        attribute: attribute.to_owned(),
+                        value,
+                    };
+                    let mut tokens = BTreeSet::from([shape(rewrite.modality, rewrite.direction)]);
+                    let mut decoded = Vec::new();
+                    for (attribute, decode) in rewrite.with {
+                        decoded.push((*attribute, decode_values(*decode, sent)));
+                    }
+                    decoded.push((rewrite.value.0, decode_values(rewrite.value.1, sent)));
+                    for (attribute, values) in decoded {
+                        match values {
+                            Ok(values) => {
+                                tokens.extend(values.into_iter().map(|v| token(attribute, v)))
+                            }
+                            Err(failure) => self.fail(failure, path, ctx),
+                        }
+                    }
+                    if let Some(called) = member(element, rewrite.name.0) {
+                        tokens.insert(token(rewrite.name.1, Value::Text(called.to_owned())));
+                    }
+                    for token in &tokens {
+                        if !positional(token) {
+                            self.out
+                                .tokens
+                                .entry(token.clone())
+                                .or_default()
+                                .push(Origin {
+                                    path: path.to_owned(),
+                                    record: ctx.record,
+                                    index: ctx.index.clone(),
+                                });
+                        }
+                    }
+                    self.out.records[record].rewrites.push((
+                        *at,
+                        rewrite.modality.to_owned(),
+                        tokens,
+                        path.to_owned(),
+                    ));
+                }
+            }
             Class::Open(_) => self.row(path, Kind::Open, ctx),
         }
     }
@@ -2062,6 +2159,47 @@ impl<'t> Walker<'t> {
                 (&a.levels, a.order).cmp(&(&b.levels, b.order))
             });
             self.out.records[record].items = items;
+        }
+        // Each call the client re-sent changed: the item later requests
+        // hold in its place.
+        for record in 0..self.out.records.len() {
+            for (at, modality, tokens, path) in
+                std::mem::take(&mut self.out.records[record].rewrites)
+            {
+                let calls: Vec<usize> = self.out.records[record]
+                    .items
+                    .iter()
+                    .copied()
+                    .filter(|&item| {
+                        let item = &self.out.items[item];
+                        item.modality == modality
+                            && item.levels.len() == 1
+                            && item.levels[0].1 == at
+                    })
+                    .collect();
+                let [call] = calls.as_slice() else {
+                    self.out
+                        .rows
+                        .push((path, Kind::Mirror, format!("record {record}")));
+                    continue;
+                };
+                let levels = self.out.items[*call].levels.clone();
+                self.out.items.push(Item {
+                    record,
+                    levels,
+                    modality,
+                    tokens,
+                    path,
+                    held: false,
+                    order: 0,
+                    marks: BTreeSet::new(),
+                    carried: BTreeSet::new(),
+                    pairs: Vec::new(),
+                    claims: Vec::new(),
+                });
+                let sent = self.out.items.len() - 1;
+                self.out.wire.insert(*call, sent);
+            }
         }
         let windows = self.table.windows;
         let mut latest = None;

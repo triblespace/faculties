@@ -385,7 +385,8 @@ pub enum Class {
     /// Annotations of the witness or node, each `(attribute, decode)`:
     /// `raw_model`, `raw_role`, `raw_author`, `generated_by`,
     /// `source_locator`, `timestamp`, `pointer`, `claimed_size`,
-    /// `claimed_media_type`, `claimed_title`, `compaction_summary`, `ends`,
+    /// `claimed_media_type`, `claimed_title`, `compaction_summary`,
+    /// `harness_written`, `ends`,
     /// or `gloss:<category>`.
     Annotation(&'static [(&'static str, Decode)]),
     /// A provider id read only while parsing (pairing a call and its result,
@@ -393,9 +394,38 @@ pub enum Class {
     /// object or array at its path is walked member by member, and an entry
     /// the importer never reads is no correlator.
     Correlator,
+    /// A marked window change: what the client sent in later requests in
+    /// place of a call's member ([`Rewrite`]).
+    Rewrite(Rewrite),
     Drop(DropReason),
     /// Meaning not yet verified; fails until answered.
     Open(&'static str),
+}
+
+/// An object whose members, keyed by a call's id, hold what the client
+/// sent in later requests in place of member `member` of the element of the
+/// record-relative array `array` whose `key` member names it: Claude Code's
+/// `wireToolInputs` (ruling S2).
+///
+/// Where a member equals the call's (JSON order-free, numbers by token) it
+/// is a copy and holds nothing. Where it differs, the window changes: the
+/// record's own window and the rest of its request keep the call as she
+/// wrote it, and every later request's window holds, in the call's place,
+/// a fact of `modality` and `direction`, with the fixed attributes `with`,
+/// the call's member `name` as attribute `.1` of `name`, and the sent value
+/// as attribute `value.0` decoded by `value.1`. It is held by no record and
+/// recalls nothing: it is not her writing. A member that names no element
+/// fails. The array holds the calls directly, under no other array.
+#[derive(Clone, Copy, Debug)]
+pub struct Rewrite {
+    pub array: &'static str,
+    pub key: &'static str,
+    pub member: &'static str,
+    pub name: (&'static str, &'static str),
+    pub value: (&'static str, Decode),
+    pub modality: &'static str,
+    pub direction: &'static str,
+    pub with: &'static [(&'static str, Decode)],
 }
 
 /// What a structure field does.

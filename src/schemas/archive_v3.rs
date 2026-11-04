@@ -216,8 +216,17 @@ pub mod fact {
         /// Text the harness put in her slot (a synthetic error, a recall):
         /// always `in`, never trained on as hers.
         pub const VOICED: Id = id_hex!("413099935687BADC91932BD0634EC443");
+        /// Her call as the client sent it in later requests, where that
+        /// differs from what she wrote (Claude Code `wireToolInputs`): in her
+        /// message, `in`, never trained on as hers. Minted with `trible
+        /// genid` 2026-11-04.
+        pub const REWRITTEN: Id = id_hex!("746E7F7EB21EB35815580EDE3549A653");
 
-        pub const SPECS: &[(Id, &str)] = &[(INLINE, "inline"), (VOICED, "voiced")];
+        pub const SPECS: &[(Id, &str)] = &[
+            (INLINE, "inline"),
+            (VOICED, "voiced"),
+            (REWRITTEN, "rewritten"),
+        ];
     }
 
     /// Gaps.
@@ -363,6 +372,11 @@ pub mod witness {
     pub use crate::schemas::blockdag::source_projection::source_timestamp as timestamp;
     /// OCCURRENCE CORE tag: the source marks this occurrence a compaction summary.
     pub use crate::schemas::blockdag::source_projection::COMPACTION_SUMMARY;
+    /// OCCURRENCE CORE tag: the source flags the held text as written by the
+    /// harness, not by the person in that slot (Claude Code `isMeta`). A flag,
+    /// never a spelling of who wrote it. Minted with `trible genid`
+    /// 2026-11-04.
+    pub const HARNESS_WRITTEN: Id = id_hex!("1F44A09823DCDC73A2D7C48371BE8724");
     /// Nonidentity kind marker attached after construction. Same id as main.
     pub use crate::schemas::blockdag::source_projection::KIND;
     /// OCCURRENCE CORE. Relations entities that produced and observed it.
