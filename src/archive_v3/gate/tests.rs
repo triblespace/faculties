@@ -13,7 +13,7 @@ use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::core::repo::SnapshotSource;
-use triblespace::prelude::inlineencodings::{GenId, NsTAIInterval};
+use triblespace::prelude::inlineencodings::NsTAIInterval;
 
 use super::walk::{probe, walk};
 use super::*;
@@ -1258,63 +1258,4 @@ fn g5_no_table_path_looks_like_an_id() {
     ] {
         assert!(!id_like(name), "{name}");
     }
-}
-
-/// Ruling M1 on an importer's output that predates it: each node's `ends`
-/// moves onto the one occurrence of its one witness, which makes the right
-/// output the adversarial cases break and the real-sample programs gate
-/// (`AV3_M1`). A node whose `ends` no single record can be given is refused,
-/// never guessed. It does nothing once the importers place `ends` on
-/// occurrences themselves; delete it then.
-pub(crate) fn occurrence_ends(f: &mut Fragment) -> Result<(), &'static str> {
-    let subjects = |f: &Fragment, a: Id, v: Id| -> Vec<Id> {
-        f.facts()
-            .iter()
-            .filter(|t| *t.a() == a && t.v::<GenId>().try_from_inline::<Id>().ok() == Some(v))
-            .map(|t| *t.e())
-            .collect()
-    };
-    // `witness::ends` is the same attribute: an occurrence that already
-    // carries its own `ends` is left as it is.
-    let occurrences: std::collections::HashSet<Id> = f
-        .facts()
-        .iter()
-        .filter(|t| *t.a() == v3::occurrence::of.id())
-        .map(|t| *t.e())
-        .collect();
-    let on_nodes: Vec<Trible> = f
-        .facts()
-        .iter()
-        .filter(|t| *t.a() == v3::node::ends.id() && !occurrences.contains(t.e()))
-        .copied()
-        .collect();
-    for t in &on_nodes {
-        let witnesses = subjects(f, v3::witness::projects_to.id(), *t.e());
-        let [witness] = witnesses.as_slice() else {
-            return Err("ends on a node with no single witness");
-        };
-        let occurrences = subjects(f, v3::occurrence::of.id(), *witness);
-        let occurrence = match occurrences.as_slice() {
-            [one] => *one,
-            [] => {
-                let built = occurrence(*witness, WitnessAnnotations::default()).unwrap();
-                let id = built.root().unwrap();
-                *f += unexported(built);
-                id
-            }
-            _ => return Err("ends on a node several records hold: whose is it?"),
-        };
-        f.facts_mut().insert(&Trible::force(
-            &occurrence,
-            &v3::witness::ends.id(),
-            t.v::<GenId>(),
-        ));
-    }
-    let mut gone = TribleSet::new();
-    for t in &on_nodes {
-        gone.insert(t);
-    }
-    let kept = f.facts().difference(&gone);
-    *f.facts_mut() = kept;
-    Ok(())
 }

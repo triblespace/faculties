@@ -93,6 +93,7 @@ pub(crate) fn record_in<'a>(
         present: BTreeSet::new(),
     };
     fields(root, "", &mut record);
+    unit.records += 1;
     let checker = Checker {
         table,
         record,
@@ -109,8 +110,24 @@ pub(crate) struct UnitMirrors {
     /// The table's entries by path, in table order.
     by_path: HashMap<&'static str, Vec<&'static Entry>>,
     watched: HashMap<&'static str, (HashSet<[u8; 32]>, Vec<String>)>,
-    /// (path, mirror, the value's hash, the string when it is one)
-    pending: Vec<(String, Mirror, [u8; 32], Option<String>)>,
+    /// (path, mirror, the value's hash, the string when it is one, record)
+    pending: Vec<(String, Mirror, [u8; 32], Option<String>, usize)>,
+    /// Records seen so far.
+    records: usize,
+    /// [`Mirror::ForkCopy`]: the fork paths the first record holds, and the
+    /// first record holding a removed kind, by its `removed` list.
+    forked: HashSet<&'static str>,
+    first_removed: HashMap<usize, usize>,
+    forks: Vec<(
+        &'static str,
+        &'static [(&'static str, Option<&'static str>)],
+    )>,
+    /// [`Mirror::Earlier`]: the paths it compares against, the values seen
+    /// there in file order as (record, path, hash), and the copies to check
+    /// as (path, the paths, each element's hash, record).
+    earlier_paths: HashSet<&'static str>,
+    earlier: Vec<(usize, &'static str, [u8; 32])>,
+    earlier_pending: Vec<(String, &'static [&'static str], Vec<[u8; 32]>, usize)>,
 }
 
 impl UnitMirrors {
@@ -120,19 +137,40 @@ impl UnitMirrors {
         for entry in table.entries {
             by_path.entry(entry.path).or_default().push(entry);
         }
+        let mut forks: Vec<(
+            &'static str,
+            &'static [(&'static str, Option<&'static str>)],
+        )> = Vec::new();
+        let mut earlier_paths: HashSet<&'static str> = HashSet::new();
         for entry in table.entries {
-            if let Class::Drop(DropReason::Mirror(Mirror::Unit(paths) | Mirror::Within(paths))) =
-                entry.class
+            if let Class::Drop(DropReason::Mirror(
+                Mirror::Unit(paths) | Mirror::Within(paths) | Mirror::ForkCopy { of: paths, .. },
+            )) = entry.class
             {
                 for path in paths {
                     watched.entry(*path).or_insert_with(Default::default);
                 }
+            }
+            if let Class::Drop(DropReason::Mirror(Mirror::ForkCopy { fork, removed, .. })) =
+                entry.class
+            {
+                forks.push((fork, removed));
+            }
+            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) = entry.class {
+                earlier_paths.extend(paths.iter().copied());
             }
         }
         UnitMirrors {
             by_path,
             watched,
             pending: Vec::new(),
+            records: 0,
+            forked: HashSet::new(),
+            first_removed: HashMap::new(),
+            forks,
+            earlier_paths,
+            earlier: Vec::new(),
+            earlier_pending: Vec::new(),
         }
     }
 
@@ -143,17 +181,50 @@ impl UnitMirrors {
                 strings.push(text.clone());
             }
         }
+        let record = self.records.saturating_sub(1);
+        if let Some(&at) = self.earlier_paths.get(path) {
+            self.earlier.push((record, at, value.hash()));
+        }
+        for &(fork, removed) in &self.forks {
+            if record == 0 && path == fork && value.str().is_some_and(|text| !text.is_empty()) {
+                self.forked.insert(fork);
+            }
+            let hit = removed.iter().any(|(at, spelling)| {
+                *at == path
+                    && spelling.is_none_or(|spelling| value.spelling().as_deref() == Some(spelling))
+            });
+            if hit {
+                self.first_removed
+                    .entry(removed.as_ptr() as usize)
+                    .or_insert(record);
+            }
+        }
     }
 
     /// Every unit mirror equals (or sits inside) what it mirrors.
     pub(crate) fn verify(&self) -> Result<(), Failure> {
+        for (path, paths, hashes, record) in &self.earlier_pending {
+            let mut cursor = 0;
+            for hash in hashes {
+                let found = self.earlier[cursor..].iter().position(|(at, from, held)| {
+                    at < record && paths.contains(from) && held == hash
+                });
+                let Some(offset) = found else {
+                    return Err(Failure::new(
+                        path,
+                        "a copy of an earlier item the unit does not hold there, in order",
+                    ));
+                };
+                cursor += offset + 1;
+            }
+        }
         let mut done: HashSet<([u8; 32], usize)> = HashSet::new();
-        for (path, mirror, hash, text) in &self.pending {
+        for (path, mirror, hash, text, record) in &self.pending {
             let key = match mirror {
                 Mirror::Unit(paths) | Mirror::Within(paths) => (*hash, paths.as_ptr() as usize),
                 _ => (*hash, 0),
             };
-            if !done.insert(key) {
+            if matches!(mirror, Mirror::Unit(_) | Mirror::Within(_)) && !done.insert(key) {
                 continue;
             }
             let equal = |paths: &[&str]| {
@@ -165,6 +236,14 @@ impl UnitMirrors {
             };
             let held = match mirror {
                 Mirror::Unit(paths) => equal(paths),
+                Mirror::ForkCopy { of, fork, removed } => {
+                    equal(of)
+                        || (self.forked.contains(fork)
+                            && self
+                                .first_removed
+                                .get(&(removed.as_ptr() as usize))
+                                .is_some_and(|first| record < first))
+                }
                 Mirror::Within(paths) => {
                     equal(paths)
                         || text.as_deref().is_some_and(|text| {
@@ -457,15 +536,31 @@ impl<'a, 'u> Checker<'a, 'u> {
                 }
                 Ok(())
             }
-            Class::Drop(DropReason::Mirror(mirror @ (Mirror::Unit(_) | Mirror::Within(_)))) => {
+            Class::Drop(DropReason::Mirror(
+                mirror @ (Mirror::Unit(_) | Mirror::Within(_) | Mirror::ForkCopy { .. }),
+            )) => {
                 let text = value.str().map(str::to_owned);
                 if matches!(mirror, Mirror::Within(_)) && text.is_none() {
                     return Err(Failure::new(path, "a copy inside text is not text"));
                 }
-                self.unit
-                    .borrow_mut()
-                    .pending
-                    .push((path.to_owned(), mirror, value.hash(), text));
+                let mut unit = self.unit.borrow_mut();
+                let record = unit.records.saturating_sub(1);
+                unit.pending
+                    .push((path.to_owned(), mirror, value.hash(), text, record));
+                Ok(())
+            }
+            Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) => {
+                let Json::Arr(elements) = value else {
+                    return Err(Failure::new(path, "copies of earlier items are not a list"));
+                };
+                let mut unit = self.unit.borrow_mut();
+                let record = unit.records.saturating_sub(1);
+                unit.earlier_pending.push((
+                    path.to_owned(),
+                    paths,
+                    elements.iter().map(Json::hash).collect(),
+                    record,
+                ));
                 Ok(())
             }
             Class::Drop(DropReason::Mirror(Mirror::Field(field))) => {

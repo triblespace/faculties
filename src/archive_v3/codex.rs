@@ -33,9 +33,10 @@
 //!   last node a record holds (X2);
 //! - `task_started` marks a turn, and `thread_rolled_back` cuts the line
 //!   back to the start of its last turns: the next node branches there;
-//! - `turn_aborted` and an erred `task_complete` put `ends` on her last node
-//!   of the turn, when she produced one (X5, X6); an abort is also a claim
-//!   of its record.
+//! - `turn_aborted` and an erred `task_complete` put `ends` on the
+//!   occurrence of the record that holds her last item of the turn, when
+//!   she produced one, never on the node (X5, X6, M1); an abort is also a
+//!   claim of its record. An error that names no message fails (X11).
 //!
 //! When the header or the system section changes, the line is re-presented
 //! under the new one. Items are known by their place in the source, never
@@ -56,7 +57,10 @@
 //! next node the file places, or after the last one to that last node.
 //! Reasoning summaries are glosses of the sealed reasoning; the source does
 //! not name the model that wrote them, so they name none. Where her message
-//! holds no phase, its `agent_message` event's phase is its register (X1).
+//! holds no phase, its `agent_message` event's phase is its register (X1);
+//! the event names its message by structure, as the first item after it
+//! past her reasoning, never by text alone (X13). An empty sealed token is a
+//! body gap (X7, X12), and a text part without its text fails (X14).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -137,6 +141,13 @@ fn structure(value: &Json, path: &str) -> Result<Fragment, Failure> {
     Ok(tree)
 }
 
+/// A part's `text`, which must be there and be a string (X14: nothing is
+/// skipped silently).
+fn text_at<'a>(part: &'a Json, path: &str) -> Result<&'a str, Failure> {
+    part.str_at("text")
+        .ok_or_else(|| Failure::new(path, "a text part without its text"))
+}
+
 fn sealed_type(spelling: &str) -> MediaType {
     MediaType::parse(spelling).expect("the sealed media types are well formed")
 }
@@ -148,6 +159,27 @@ fn sealed_blob(value: Option<&Json>, path: &str) -> Result<anybytes::Bytes, Fail
     base64_url(text)
         .map(anybytes::Bytes::from)
         .ok_or_else(|| Failure::new(path, "a sealed token does not decode"))
+}
+
+/// A sealed token as a blob of `media_type`, or, where the token is the
+/// empty string, a body gap of the same fact (X7, X12).
+fn sealed_or_gap(
+    value: Option<&Json>,
+    path: &str,
+    media_type: &str,
+    base: FactCore,
+) -> Result<FactCore, Failure> {
+    Ok(match value {
+        Some(Json::Str(token)) if token.is_empty() => FactCore {
+            absent: Some(v3::fact::absent::BODY),
+            ..base
+        },
+        _ => FactCore {
+            blob: Some(sealed_blob(value, path)?),
+            media_type: Some(sealed_type(media_type)),
+            ..base
+        },
+    })
 }
 
 /// An image she was shown: a `data:` URI, rendered under its detail.
@@ -194,32 +226,59 @@ fn effort(term: &str) -> Option<Id> {
     })
 }
 
-/// X1: the phase of each of her messages that holds none, from the
-/// `agent_message` event that copies it. The event names its message by
-/// text: the nearest message before it holding that text (else the nearest
-/// after it). Where the message holds a phase, the copy must spell the same.
+/// The response item a record holds, if any: an envelope's payload, or a
+/// bare (G0/G1) item.
+fn item_of(record: &Json) -> Option<&Json> {
+    match (record.str_at("type"), record.get("payload")) {
+        (Some("response_item"), Some(payload)) => Some(payload),
+        (Some(_), Some(_)) => None,
+        (Some(_), None) => Some(record),
+        (None, _) => None,
+    }
+}
+
+/// Whether a record places an item on her line other than her reasoning:
+/// what lies between a client copy and the message it copies (X13).
+fn places_beyond_reasoning(record: &Json) -> bool {
+    if let Some(item) = item_of(record) {
+        return !matches!(item.str_at("type"), Some("reasoning" | "ghost_snapshot"));
+    }
+    match record.str_at("type") {
+        Some("compacted") => true,
+        Some("turn_context") => record.str_at("payload.effort").is_some(),
+        Some("session_meta") => record
+            .str_at("payload.base_instructions.text")
+            .is_some_and(|text| !text.is_empty()),
+        _ => false,
+    }
+}
+
+/// X1, X13: the phase of each of her messages that holds none, from the
+/// `agent_message` event that copies it. The copy names its message by
+/// structure: codex writes an item's events before the item
+/// (`handle_output_item_done`, codex-rs core/src/stream_events_utils.rs,
+/// emits the item-completed events, then `record_completed_response_item`
+/// persists the item), so its message is the first item after it, past only
+/// her reasoning (all 13,694 copies whose text the real sample holds). Where
+/// that item does not hold the copy's text but another does, the copy is
+/// matched by text alone and fails; where none does, it holds nothing (its
+/// mirror decides). Where the message holds a phase, the copy must spell the
+/// same.
 fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
     let path = "{event_msg}.payload{agent_message}.phase";
-    // (record, a text of her message, the phase the message holds)
-    let mut texts: Vec<(usize, &str, Option<&str>)> = Vec::new();
-    for (at, record) in records.iter().enumerate() {
-        let item = match record.get("payload") {
-            Some(payload) if record.str_at("type") == Some("response_item") => payload,
-            Some(_) => continue,
-            None => record,
-        };
+    let said = |item: &Json| -> Vec<String> {
         if item.str_at("type") != Some("message") || item.str_at("role") != Some("assistant") {
-            continue;
+            return Vec::new();
         }
-        for part in item.get("content").map(Json::arr).unwrap_or(&[]) {
-            if part.str_at("type") != Some("output_text") {
-                continue;
-            }
-            if let Some(text) = part.str_at("text") {
-                texts.push((at, text, item.str_at("phase")));
-            }
-        }
-    }
+        item.get("content")
+            .map(Json::arr)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|part| part.str_at("type") == Some("output_text"))
+            .filter_map(|part| part.str_at("text").map(str::to_owned))
+            .collect()
+    };
+    let held: HashSet<String> = records.iter().filter_map(item_of).flat_map(said).collect();
     let mut phases: HashMap<usize, String> = HashMap::new();
     for (at, record) in records.iter().enumerate() {
         if record.str_at("type") != Some("event_msg") {
@@ -238,17 +297,23 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
         if phase.is_empty() {
             continue;
         }
-        let named = texts.iter().filter(|(_, text, _)| *text == message);
-        let before = named
-            .clone()
-            .filter(|(holder, ..)| *holder < at)
-            .max_by_key(|t| t.0);
-        let after = named
-            .filter(|(holder, ..)| *holder > at)
-            .min_by_key(|t| t.0);
-        let Some(&(holder, _, own)) = before.or(after) else {
+        let next = records[at + 1..]
+            .iter()
+            .position(places_beyond_reasoning)
+            .map(|offset| at + 1 + offset);
+        let holder = next.filter(|&next| {
+            item_of(&records[next]).is_some_and(|item| said(item).iter().any(|t| t == message))
+        });
+        let Some(holder) = holder else {
+            if held.contains(message) {
+                return Err(Failure::new(
+                    path,
+                    "a phase copy whose message is not the item after it: matched by text alone",
+                ));
+            }
             continue;
         };
+        let own = item_of(&records[holder]).and_then(|item| item.str_at("phase"));
         let disagrees = match own {
             Some(own) => own != phase,
             None => phases
@@ -304,8 +369,9 @@ struct Item {
     held: bool,
     /// She produced it.
     out: bool,
-    /// The node its record held it in.
+    /// The node its record held it in, and that record.
     own: Option<Id>,
+    record: Option<usize>,
 }
 
 struct Builder {
@@ -342,7 +408,9 @@ struct Builder {
     /// call id -> (line position, call item)
     calls: HashMap<String, (usize, usize)>,
     responds: Vec<(Id, Id)>,
-    ends: Vec<(Id, Id)>,
+    /// (record, node, term): why the sampling of the item that record holds
+    /// at that node stopped, a claim of that occurrence (M1).
+    ends: Vec<(usize, Id, Id)>,
     glosses: Vec<(Id, String)>,
     continues: Vec<(Id, Id)>,
 }
@@ -366,6 +434,7 @@ impl Builder {
             held: false,
             out: false,
             own: None,
+            record: None,
         };
         let mut builder = Builder {
             out: Fragment::empty(),
@@ -408,6 +477,7 @@ impl Builder {
             held,
             out,
             own: None,
+            record: None,
         });
         self.items.len() - 1
     }
@@ -453,6 +523,7 @@ impl Builder {
 
     fn witness(&mut self, record: usize, item: usize, node: Id) {
         self.items[item].own = Some(node);
+        self.items[item].record = Some(record);
         self.held.push((record, node));
         self.last_node = Some(node);
         for claims in std::mem::take(&mut self.pending) {
@@ -511,15 +582,16 @@ impl Builder {
             .and_then(|(item, _)| self.items[*item].own)
     }
 
-    /// Her last item of the turn so far, at the node its record held: where
-    /// why the turn ended sits (X5, X6). None when she produced nothing.
-    fn last_out(&self) -> Option<Id> {
+    /// Her last item of the turn so far: the record that holds it and the
+    /// node it holds it in, whose occurrence says why the turn ended (X5,
+    /// X6, M1). None when she produced nothing.
+    fn last_out(&self) -> Option<(usize, Id)> {
         let since = self.turns.last().copied().unwrap_or(0).min(self.line.len());
         self.line[since..]
             .iter()
             .rev()
             .find(|(item, _)| self.items[*item].held && self.items[*item].out)
-            .and_then(|(item, _)| self.items[*item].own)
+            .and_then(|(item, _)| Some((self.items[*item].record?, self.items[*item].own?)))
     }
 
     fn record(&mut self, at: usize, record: &Json) -> Result<(), Failure> {
@@ -721,7 +793,7 @@ impl Builder {
                     let part_kind = part.str_at("type").unwrap_or_default();
                     match (role, part_kind) {
                         ("user" | "developer", "input_text") => {
-                            let text = part.str_at("text").unwrap_or_default();
+                            let text = text_at(part, &at(".content[]{input_text}.text"))?;
                             if !text.is_empty() {
                                 let modality = if role == "user" { TEXT } else { DEVELOPER };
                                 out.push(Placed::held(FactCore {
@@ -734,7 +806,7 @@ impl Builder {
                             out.push(Placed::held(image(part, &at(".content[]{input_image}"))?));
                         }
                         ("assistant", "output_text") => {
-                            let text = part.str_at("text").unwrap_or_default();
+                            let text = text_at(part, &at(".content[]{output_text}.text"))?;
                             if !text.is_empty() {
                                 // Her message's phase, else its event
                                 // copy's (X1).
@@ -771,14 +843,25 @@ impl Builder {
                 }
             }
             "reasoning" => {
-                let glosses: Vec<String> = item
-                    .get("summary")
-                    .map(Json::arr)
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|part| part.str_at("text"))
-                    .map(str::to_owned)
-                    .collect();
+                let mut glosses: Vec<String> = Vec::new();
+                match item.get("summary") {
+                    None | Some(Json::Null) => {}
+                    Some(Json::Arr(parts)) => {
+                        for part in parts {
+                            if part.str_at("type") != Some("summary_text") {
+                                return Err(Failure::new(
+                                    &at(".summary[]"),
+                                    "a summary part the importer does not name",
+                                ));
+                            }
+                            let text = text_at(part, &at(".summary[]{summary_text}.text"))?;
+                            glosses.push(text.to_owned());
+                        }
+                    }
+                    Some(_) => {
+                        return Err(Failure::new(&at(".summary"), "a summary that is no list"))
+                    }
+                }
                 // An empty token holds nothing (X7): a body gap, as when
                 // none is recorded.
                 let sealed = match item.get("encrypted_content") {
@@ -881,7 +964,7 @@ impl Builder {
                         for part in parts {
                             match part.str_at("type") {
                                 Some("input_text") => {
-                                    let text = part.str_at("text").unwrap_or_default();
+                                    let text = text_at(part, &at(".output[]{input_text}.text"))?;
                                     if !text.is_empty() {
                                         out.push(Placed::held(FactCore {
                                             payload: Some(text.to_owned()),
@@ -923,7 +1006,7 @@ impl Builder {
                 for part in item.get("content").map(Json::arr).unwrap_or(&[]) {
                     match part.str_at("type") {
                         Some("input_text") => {
-                            let text = part.str_at("text").unwrap_or_default();
+                            let text = text_at(part, &at(".content[]{input_text}.text"))?;
                             if !text.is_empty() {
                                 out.push(Placed::held(FactCore {
                                     payload: Some(text.to_owned()),
@@ -931,15 +1014,15 @@ impl Builder {
                                 }));
                             }
                         }
+                        // An empty sealed token holds nothing (X12): a body
+                        // gap, never a zero-byte blob.
                         Some("encrypted_content") => {
-                            out.push(Placed::held(FactCore {
-                                blob: Some(sealed_blob(
-                                    part.get("encrypted_content"),
-                                    &at(".content[]{encrypted_content}"),
-                                )?),
-                                media_type: Some(sealed_type(OPENAI_ENCRYPTED_CONTENT)),
-                                ..core(TEXT, IN)
-                            }));
+                            out.push(Placed::held(sealed_or_gap(
+                                part.get("encrypted_content"),
+                                &at(".content[]{encrypted_content}.encrypted_content"),
+                                OPENAI_ENCRYPTED_CONTENT,
+                                core(TEXT, IN),
+                            )?));
                         }
                         _ => {
                             return Err(Failure::new(
@@ -951,14 +1034,12 @@ impl Builder {
                 }
             }
             "compaction" | "compaction_summary" => {
-                out.push(Placed::held(FactCore {
-                    blob: Some(sealed_blob(
-                        item.get("encrypted_content"),
-                        &at(".encrypted_content"),
-                    )?),
-                    media_type: Some(sealed_type(sealed::OPENAI_COMPACTION)),
-                    ..core(THINKING, IN)
-                }));
+                out.push(Placed::held(sealed_or_gap(
+                    item.get("encrypted_content"),
+                    &at(".encrypted_content"),
+                    sealed::OPENAI_COMPACTION,
+                    core(THINKING, IN),
+                )?));
             }
             _ => {
                 return Err(Failure::new(
@@ -1075,8 +1156,8 @@ impl Builder {
                 };
                 // X5: on her last node of the turn, if she produced one; the
                 // abort is a claim of the record either way.
-                if let Some(node) = self.last_out() {
-                    self.ends.push((node, term));
+                if let Some((record, node)) = self.last_out() {
+                    self.ends.push((record, node, term));
                 }
                 self.pending.push(WitnessAnnotations {
                     turn_ends: vec![term],
@@ -1086,11 +1167,20 @@ impl Builder {
             }
             "task_complete" => {
                 // X6: `ends: error` on her last node of the turn; no fact.
-                let erred = payload
-                    .get("error")
-                    .is_some_and(|error| error.get("message").is_some());
-                if let (true, Some(node)) = (erred, self.last_out()) {
-                    self.ends.push((node, v3::node::ends::ERROR));
+                // X11: an error that names no message (only an error code,
+                // or a string) is a failed turn whose report is unverified:
+                // it fails, never machinery.
+                let erred =
+                    match payload.get("error") {
+                        None | Some(Json::Null) => false,
+                        Some(error @ Json::Obj(_)) if error.get("message").is_some() => true,
+                        Some(_) => return Err(Failure::new(
+                            "{event_msg}.payload{task_complete}.error",
+                            "a failed turn whose error names no message: what failed is unverified",
+                        )),
+                    };
+                if let (true, Some((record, node))) = (erred, self.last_out()) {
+                    self.ends.push((record, node, v3::node::ends::ERROR));
                 }
                 Ok(())
             }
@@ -1208,16 +1298,6 @@ impl Builder {
                 },
             );
         }
-        for (node, term) in std::mem::take(&mut self.ends) {
-            let node = on_window(node, "{event_msg}.payload")?;
-            self.out += annotate_node(
-                node,
-                &NodeAnnotations {
-                    ends: vec![term],
-                    ..NodeAnnotations::default()
-                },
-            );
-        }
         for (first, old) in std::mem::take(&mut self.continues) {
             let first = on_window(first, "{compacted}.payload")?;
             let old = on_window(old, "{compacted}.payload")?;
@@ -1230,10 +1310,28 @@ impl Builder {
             );
         }
         // Witnesses: one per node a record holds, one occurrence per record.
+        // Why her turn ended is a claim of the occurrence of the record that
+        // holds her last item, never of the node (M1).
+        let mut ends = std::mem::take(&mut self.ends);
         let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
         for &(record, node) in &self.held {
-            let claims = self.claims.get(&record).cloned().unwrap_or_default();
+            let mut claims = self.claims.get(&record).cloned().unwrap_or_default();
+            ends.retain(|&(by, at, term)| {
+                if (by, at) != (record, node) {
+                    return true;
+                }
+                if !claims.ends.contains(&term) {
+                    claims.ends.push(term);
+                }
+                false
+            });
             occurrences.push((node, claims));
+        }
+        if !ends.is_empty() {
+            return Err(Failure::new(
+                "{event_msg}.payload",
+                "a turn end on an item no record holds",
+            ));
         }
         occurrences.extend(std::mem::take(&mut self.extra));
         let mut witnesses: HashMap<Id, Id> = HashMap::new();

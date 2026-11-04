@@ -70,8 +70,31 @@ pub struct Walked {
     /// strings themselves.
     watched: HashMap<String, (std::collections::HashSet<[u8; 32]>, Vec<String>)>,
     /// Unit mirrors to check once the whole unit is read: (path, mirror,
-    /// the value's hash, the string when it is one, occurrence label).
-    pending: Vec<(String, Mirror, [u8; 32], Option<String>, String)>,
+    /// the value's hash, the string when it is one, occurrence label, the
+    /// record).
+    pending: Vec<(
+        String,
+        Mirror,
+        [u8; 32],
+        Option<String>,
+        String,
+        Option<usize>,
+    )>,
+    /// [`Mirror::ForkCopy`]: the fork paths the unit's first record holds,
+    /// and the first record holding a removed kind, by its `removed` list.
+    forked: std::collections::HashSet<&'static str>,
+    first_removed: HashMap<usize, usize>,
+    /// [`Mirror::Earlier`]: the values at its paths in file order, as
+    /// (record, path, hash), and the copies to check as (path, the paths,
+    /// each element's hash, record, label).
+    earlier: Vec<(usize, &'static str, [u8; 32])>,
+    earlier_pending: Vec<(
+        String,
+        &'static [&'static str],
+        Vec<[u8; 32]>,
+        usize,
+        String,
+    )>,
     /// The item of each gap the rendering rule makes and no record holds.
     gap_items: BTreeMap<Gap, usize>,
     /// Annotations placed at the end of a record's line (the record, the
@@ -1033,6 +1056,8 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         by_path: HashMap::new(),
         known: known_paths(table),
         supply_paths: HashMap::new(),
+        forks: Vec::new(),
+        earlier_paths: HashSet::new(),
     };
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
@@ -1366,6 +1391,13 @@ struct Walker<'t> {
     known: HashSet<String>,
     /// The text paths a [`Supply`] names, with the member field of each.
     supply_paths: HashMap<&'static str, &'static str>,
+    /// [`Mirror::ForkCopy`]: each one's fork path and removed kinds.
+    forks: Vec<(
+        &'static str,
+        &'static [(&'static str, Option<&'static str>)],
+    )>,
+    /// [`Mirror::Earlier`]: the paths its copies compare against.
+    earlier_paths: HashSet<&'static str>,
 }
 
 /// Every path the table names, and every prefix of one that ends before a
@@ -1582,12 +1614,21 @@ impl<'t> Walker<'t> {
     /// Note the paths whose values unit mirrors compare against.
     fn watch(&mut self) {
         for entry in self.table.entries {
-            if let Class::Drop(DropReason::Mirror(Mirror::Unit(paths) | Mirror::Within(paths))) =
-                entry.class
+            if let Class::Drop(DropReason::Mirror(
+                Mirror::Unit(paths) | Mirror::Within(paths) | Mirror::ForkCopy { of: paths, .. },
+            )) = entry.class
             {
                 for path in paths {
                     self.out.watched.entry((*path).to_owned()).or_default();
                 }
+            }
+            if let Class::Drop(DropReason::Mirror(Mirror::ForkCopy { fork, removed, .. })) =
+                entry.class
+            {
+                self.forks.push((fork, removed));
+            }
+            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) = entry.class {
+                self.earlier_paths.extend(paths.iter().copied());
             }
         }
     }
@@ -1606,6 +1647,27 @@ impl<'t> Walker<'t> {
             hashes.insert(value_hash(value));
             if let J::Str(text) = value {
                 strings.push(text.clone());
+            }
+        }
+        if let (Some(record), Some(&at)) = (ctx.record, self.earlier_paths.get(path)) {
+            self.out.earlier.push((record, at, value_hash(value)));
+        }
+        if let Some(record) = ctx.record {
+            for &(fork, removed) in &self.forks {
+                if record == 0 && path == fork && matches!(value, J::Str(text) if !text.is_empty())
+                {
+                    self.out.forked.insert(fork);
+                }
+                let hit = removed.iter().any(|(at, wanted)| {
+                    *at == path
+                        && wanted.is_none_or(|wanted| spelling(value).as_deref() == Some(wanted))
+                });
+                if hit {
+                    self.out
+                        .first_removed
+                        .entry(removed.as_ptr() as usize)
+                        .or_insert(record);
+                }
             }
         }
         let shape = self.discriminator(value, path);
@@ -2080,7 +2142,9 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
-                DropReason::Mirror(mirror @ (Mirror::Unit(_) | Mirror::Within(_))) => {
+                DropReason::Mirror(
+                    mirror @ (Mirror::Unit(_) | Mirror::Within(_) | Mirror::ForkCopy { .. }),
+                ) => {
                     let text = match value {
                         J::Str(text) => Some(text.clone()),
                         _ => None,
@@ -2095,6 +2159,21 @@ impl<'t> Walker<'t> {
                         mirror,
                         value_hash(value),
                         text,
+                        label,
+                        ctx.record,
+                    ));
+                }
+                DropReason::Mirror(Mirror::Earlier(paths)) => {
+                    let (J::Arr(elements), Some(record)) = (value, ctx.record) else {
+                        self.row(path, Kind::Mirror, ctx);
+                        return;
+                    };
+                    let label = format!("{}:{:?}", ctx.line, ctx.index);
+                    self.out.earlier_pending.push((
+                        path.to_owned(),
+                        paths,
+                        elements.iter().map(value_hash).collect(),
+                        record,
                         label,
                     ));
                 }
@@ -2241,22 +2320,31 @@ impl<'t> Walker<'t> {
         // equal.
         for (record, text, spelling, supply, path, label) in std::mem::take(&mut self.out.supplies)
         {
+            // X13: the copy's item is the first record after it that holds
+            // an item of her window other than those it may lie before.
+            let next = (record + 1..self.out.records.len()).find(|&at| {
+                self.out.records[at].items.iter().any(|&item| {
+                    let item = &self.out.items[item];
+                    item.held
+                        && !supply.past.iter().any(|(modality, direction)| {
+                            item.modality == *modality
+                                && item.tokens.iter().any(|t| t.direction == *direction)
+                        })
+                })
+            });
             let named = |at: &&(usize, [u8; 32], Option<String>)| at.1 == text;
-            let before = self
-                .out
-                .supply_texts
-                .iter()
-                .filter(named)
-                .filter(|at| at.0 < record)
-                .max_by_key(|at| at.0);
-            let after = self
-                .out
-                .supply_texts
-                .iter()
-                .filter(named)
-                .filter(|at| at.0 > record)
-                .min_by_key(|at| at.0);
-            let Some((holder, _, member)) = before.or(after).cloned() else {
+            let found = next.and_then(|next| {
+                self.out
+                    .supply_texts
+                    .iter()
+                    .filter(named)
+                    .find(|at| at.0 == next)
+                    .cloned()
+            });
+            let Some((holder, _, member)) = found else {
+                if self.out.supply_texts.iter().any(|at| at.1 == text) {
+                    rows.push((path, Kind::Mirror, label));
+                }
                 continue;
             };
             match member {
@@ -2408,12 +2496,52 @@ impl<'t> Walker<'t> {
                 last = Some(record);
             }
         }
+        // X9': copies of earlier items, each held there, in order.
+        for (path, paths, hashes, record, label) in std::mem::take(&mut self.out.earlier_pending) {
+            let mut cursor = 0;
+            for hash in &hashes {
+                let found = self.out.earlier[cursor..]
+                    .iter()
+                    .position(|(at, from, held)| {
+                        *at < record && paths.contains(from) && held == hash
+                    });
+                match found {
+                    Some(offset) => cursor += offset + 1,
+                    None => {
+                        rows.push((path.clone(), Kind::Mirror, label.clone()));
+                        break;
+                    }
+                }
+            }
+        }
         let mut memo: HashMap<([u8; 32], usize), bool> = HashMap::new();
-        for (path, mirror, hash, text, label) in std::mem::take(&mut self.out.pending) {
+        for (path, mirror, hash, text, label, record) in std::mem::take(&mut self.out.pending) {
             let key = match mirror {
                 Mirror::Unit(paths) | Mirror::Within(paths) => (hash, paths.as_ptr() as usize),
                 _ => (hash, 0),
             };
+            if let Mirror::ForkCopy { of, fork, removed } = mirror {
+                // X8': equal to an original, or a copy in the copied prefix
+                // of a fork, before the child's first item of a kind the
+                // fork filter removes.
+                let equal = of.iter().any(|at| {
+                    self.out
+                        .watched
+                        .get(*at)
+                        .is_some_and(|(hashes, _)| hashes.contains(&hash))
+                });
+                let prefix = self.out.forked.contains(fork)
+                    && record.is_some_and(|record| {
+                        self.out
+                            .first_removed
+                            .get(&(removed.as_ptr() as usize))
+                            .is_some_and(|first| record < *first)
+                    });
+                if !equal && !prefix {
+                    rows.push((path, Kind::Mirror, label));
+                }
+                continue;
+            }
             if let Some(&held) = memo.get(&key) {
                 if !held {
                     rows.push((path, Kind::Mirror, label));

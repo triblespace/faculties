@@ -90,6 +90,7 @@ const PHASE_COPY: Supply = Supply {
     decode: Decode::Term(REGISTERS),
     modality: "text",
     direction: "out",
+    past: &[("thinking", "out")],
 };
 const REASONING_SEAL: &[(&str, Decode)] =
     &[("media_type", Decode::ConstText(sealed::OPENAI_REASONING))];
@@ -409,6 +410,8 @@ macro_rules! items {
                 concat!($p, "{agent_message}.content[]{encrypted_content}.type"),
                 DISCRIMINATOR,
             ),
+            // An empty token holds nothing (X12): its empty drop, and the
+            // part is a body gap.
             Entry::fact_with(
                 concat!(
                     $p,
@@ -419,6 +422,14 @@ macro_rules! items {
                 "blob",
                 Decode::Base64Url,
                 CONTENT_SEAL,
+            )
+            .when(&[Cond::SiblingNot("encrypted_content", "")]),
+            Entry::new(
+                concat!(
+                    $p,
+                    "{agent_message}.content[]{encrypted_content}.encrypted_content"
+                ),
+                Class::Drop(DropReason::Empty),
             ),
         ]
     };
@@ -557,6 +568,8 @@ const RH_OTHER: &[Entry] = &[
         "{compacted}.payload.replacement_history[]{compaction}.internal_chat_message_metadata_passthrough",
         Class::Drop(PASSTHROUGH),
     ),
+    // An empty token holds nothing (X12): its empty drop, and the item is
+    // a body gap.
     Entry::fact_with(
         "{compacted}.payload.replacement_history[]{compaction}.encrypted_content",
         "thinking",
@@ -564,11 +577,18 @@ const RH_OTHER: &[Entry] = &[
         "blob",
         Decode::Base64Url,
         COMPACTION_SEAL,
+    )
+    .when(&[Cond::SiblingNot("encrypted_content", "")]),
+    Entry::new(
+        "{compacted}.payload.replacement_history[]{compaction}.encrypted_content",
+        Class::Drop(DropReason::Empty),
     ),
     Entry::new(
         "{compacted}.payload.replacement_history[]{compaction_summary}.type",
         DISCRIMINATOR,
     ),
+    // An empty token holds nothing (X12): its empty drop, and the item is
+    // a body gap.
     Entry::fact_with(
         "{compacted}.payload.replacement_history[]{compaction_summary}.encrypted_content",
         "thinking",
@@ -576,6 +596,11 @@ const RH_OTHER: &[Entry] = &[
         "blob",
         Decode::Base64Url,
         COMPACTION_SEAL,
+    )
+    .when(&[Cond::SiblingNot("encrypted_content", "")]),
+    Entry::new(
+        "{compacted}.payload.replacement_history[]{compaction_summary}.encrypted_content",
+        Class::Drop(DropReason::Empty),
     ),
 ];
 
@@ -634,19 +659,26 @@ const RESPONSE_ITEM: &[Entry] = &[
     ),
 ];
 
-/// X9 stays open on the source's own evidence: the field is not the
-/// reviewer's context. codex-rs history/src/guardian_history.rs documents
+/// X9': `guardian_history` is the approval reviewer's evidence, not a
+/// context of hers: codex-rs history/src/guardian_history.rs documents
 /// `GuardianHistoryCheckpoint` as "Model-invisible Guardian transcript
 /// checkpoints" holding the "Original review evidence, separate from the
-/// compacted model conversation": the reviewed thread's pre-compaction
-/// items (`ContextManager::guardian_history_checkpoint`,
-/// core/src/context_manager/history.rs). The reviewer reads it through
-/// `collect_guardian_prompt_items_with_parent_turn` (core/src/guardian/
-/// prompt.rs), which renders its own prompt from it; its own messages and
-/// reasoning are not in this field.
-const GUARDIAN_HISTORY: &str = "the reviewed thread's pre-compaction items kept as review \
-     evidence (model-invisible): not the reviewer's own context, and how they enter the \
-     reviewer's prompt is unverified";
+/// compacted model conversation". `TranscriptHistory::record`
+/// (guardian-context/src/history.rs) appends each item the thread records,
+/// in order, evicting only older entries of a kind, and
+/// `TranscriptHistory::checkpoint` writes them out. So each element is a
+/// copy of one of the unit's own earlier items, in order; the reviewer's
+/// own context is not in the rollout, so nothing is imported for it.
+/// Real sample (counts only): 48 of 53 lists are such copies; 5 lists hold
+/// 20 custom tool outputs whose `output` differs from the unit's item of
+/// the same call (`ContextManager::record_item_with_metadata`, core/src/
+/// context_manager/history.rs, truncates an output with
+/// `truncate_function_output_payload` before the review history records
+/// it), and those fail: what the reviewer read is not what she was shown.
+const GUARDIAN_COPIES: &[&str] = &[
+    "{response_item}.payload",
+    "{compacted}.payload.replacement_history[]",
+];
 
 const COMPACTED: &[Entry] = &[
     Entry::new("{compacted}.type", DISCRIMINATOR),
@@ -703,7 +735,11 @@ const COMPACTED: &[Entry] = &[
     ),
     Entry::new(
         "{compacted}.payload.guardian_history",
-        Class::Open(GUARDIAN_HISTORY),
+        Class::Drop(DropReason::Mirror(Mirror::Earlier(GUARDIAN_COPIES))),
+    ),
+    Entry::new(
+        "{compacted}.payload.guardian_history",
+        Class::Drop(DropReason::Empty),
     ),
 ];
 
@@ -995,6 +1031,41 @@ macro_rules! ui_event {
     };
 }
 
+/// X8': a fork copies its ancestors' records into the child's rollout
+/// through `keep_forked_rollout_item` (codex-rs core/src/agent/history.rs,
+/// used by `prepare_forked_history`). It keeps every `EventMsg`, but of the
+/// response items it keeps only messages (her own only with phase
+/// `final_answer` or `partial_answer`), outputs without a call id,
+/// additional tools and configuration updates: reasoning, calls, their
+/// outputs, commentary, inter-agent messages and compactions are removed.
+/// So the copied prefix holds `agent_reasoning` and commentary
+/// `agent_message` events whose items are gone. Real sample (241 rollouts,
+/// counts only): every such copy without an original (1,515,897 reasoning
+/// events, 101,356 commentary messages, 49 files) sits in a unit whose own
+/// `session_meta` names `forked_from_id`, before the unit's first
+/// response item of a removed kind; none after.
+const FORK: &str = "{session_meta}.payload.forked_from_id";
+const FORK_REMOVED: &[(&str, Option<&str>)] = &[
+    ("{response_item}.payload{reasoning}.type", None),
+    ("{response_item}.payload{function_call}.type", None),
+    ("{response_item}.payload{custom_tool_call}.type", None),
+    ("{response_item}.payload{local_shell_call}.type", None),
+    ("{response_item}.payload{web_search_call}.type", None),
+    (
+        "{response_item}.payload{function_call_output}.call_id",
+        None,
+    ),
+    (
+        "{response_item}.payload{custom_tool_call_output}.type",
+        None,
+    ),
+    ("{response_item}.payload{agent_message}.type", None),
+    (
+        "{response_item}.payload{message}{assistant}.phase",
+        Some("commentary"),
+    ),
+];
+
 const ERRED: &[Cond] = &[Cond::Present("payload.error.message")];
 const NOT_ERRED: &[Cond] = &[Cond::Absent("payload.error.message")];
 
@@ -1002,12 +1073,24 @@ const EVENT_MSG: &[Entry] = &[
     Entry::new("{event_msg}.type", DISCRIMINATOR),
     Entry::new("{event_msg}.ordinal", Class::Drop(ORDINAL)),
     Entry::new("{event_msg}.timestamp", Class::Drop(TIME)),
-    // The client's copies of items the unit holds.
+    // The client's copies of items the unit holds, or, in a fork's copied
+    // prefix, of items the fork filter removed (X8'). A final answer the
+    // filter keeps.
     Entry::new("{event_msg}.payload{agent_message}.type", DISCRIMINATOR),
     Entry::new(
         "{event_msg}.payload{agent_message}.message",
+        Class::Drop(DropReason::Mirror(Mirror::ForkCopy {
+            of: ASSISTANT_TEXTS,
+            fork: FORK,
+            removed: FORK_REMOVED,
+        })),
+    )
+    .when(&[Cond::IsNot("payload.phase", "final_answer")]),
+    Entry::new(
+        "{event_msg}.payload{agent_message}.message",
         Class::Drop(DropReason::Mirror(Mirror::Unit(ASSISTANT_TEXTS))),
-    ),
+    )
+    .when(&[Cond::Is("payload.phase", "final_answer")]),
     // The client's copy of her message's phase (X1): it must equal the
     // message's own, and where the message holds none it is the register's
     // source.
@@ -1026,7 +1109,11 @@ const EVENT_MSG: &[Entry] = &[
     Entry::new("{event_msg}.payload{agent_reasoning}.type", DISCRIMINATOR),
     Entry::new(
         "{event_msg}.payload{agent_reasoning}.text",
-        Class::Drop(DropReason::Mirror(Mirror::Unit(SUMMARY_TEXTS))),
+        Class::Drop(DropReason::Mirror(Mirror::ForkCopy {
+            of: SUMMARY_TEXTS,
+            fork: FORK,
+            removed: FORK_REMOVED,
+        })),
     ),
     Entry::new("{event_msg}.payload{user_message}.type", DISCRIMINATOR),
     Entry::new(
@@ -1104,7 +1191,23 @@ const EVENT_MSG: &[Entry] = &[
             "the client's report of a failed turn: an event, never a response item of her \
              window",
         )),
-    ),
+    )
+    .when(ERRED),
+    Entry::new(
+        "{event_msg}.payload{task_complete}.error",
+        Class::Drop(DropReason::Empty),
+    )
+    .when(&[Cond::Is("payload.error", "null")]),
+    // X11: an error that names no message (an error code alone, or a
+    // string) fails, never machinery.
+    Entry::new(
+        "{event_msg}.payload{task_complete}.error",
+        Class::Open("a failed turn whose error names no message: what failed is unverified"),
+    )
+    .when(&[
+        Cond::Absent("payload.error.message"),
+        Cond::IsNot("payload.error", "null"),
+    ]),
     Entry::new(
         "{event_msg}.payload{task_complete}.last_agent_message",
         Class::Drop(DropReason::Mirror(Mirror::Unit(ASSISTANT_TEXTS))),
@@ -1735,7 +1838,23 @@ const fn empty_sealed(path: &'static str) -> GapRule {
     }
 }
 
-const BESIDE: [GapRule; 15] = [
+/// A sealed item of `modality`, received, whose token is the empty string:
+/// a body gap (X12).
+const fn empty_received(path: &'static str, modality: &'static str) -> GapRule {
+    GapRule {
+        path,
+        when: &[Cond::Sibling("encrypted_content", "")],
+        at: Beside::Same,
+        gap: Gap {
+            modality,
+            direction: "in",
+            kind: "body",
+        },
+        held: true,
+    }
+}
+
+const BESIDE: [GapRule; 20] = [
     head("{function_call_output}.call_id"),
     head("{custom_tool_call_output}.call_id"),
     head("{response_item}.payload{function_call_output}.call_id"),
@@ -1749,6 +1868,23 @@ const BESIDE: [GapRule; 15] = [
     empty_sealed("{reasoning}.type"),
     empty_sealed("{response_item}.payload{reasoning}.type"),
     empty_sealed("{compacted}.payload.replacement_history[]{reasoning}.type"),
+    empty_received(
+        "{compacted}.payload.replacement_history[]{compaction}.type",
+        "thinking",
+    ),
+    empty_received(
+        "{compacted}.payload.replacement_history[]{compaction_summary}.type",
+        "thinking",
+    ),
+    empty_received("{agent_message}.content[]{encrypted_content}.type", "text"),
+    empty_received(
+        "{response_item}.payload{agent_message}.content[]{encrypted_content}.type",
+        "text",
+    ),
+    empty_received(
+        "{compacted}.payload.replacement_history[]{agent_message}.content[]{encrypted_content}.type",
+        "text",
+    ),
     // Before replacement histories: what the client kept is unrecorded,
     // then the summary.
     GapRule {

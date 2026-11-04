@@ -91,15 +91,8 @@ fn result(call: &str, content: Value) -> Value {
 
 fn import_with(import: Importer, source: &str) -> Imported {
     let mut fragment = import(source.as_bytes()).unwrap_or_else(|failure| panic!("{failure}"));
-    occurrence_ends(&mut fragment);
     let blobs = fragment.blobs_mut().snapshot().unwrap();
     Imported { fragment, blobs }
-}
-
-/// Ruling M1 on an importer's output that predates it
-/// ([`super::tests::occurrence_ends`]); it refuses what it cannot attribute.
-fn occurrence_ends(f: &mut Fragment) {
-    super::tests::occurrence_ends(f).unwrap_or_else(|why| panic!("{why}"));
 }
 
 /// The `ends` claims of an occurrence.
@@ -1087,15 +1080,15 @@ mod cx {
             ),
             line(
                 6,
-                "response_item",
-                json!({"type": "message", "role": "assistant", "phase": "commentary",
-                "content": [{"type": "output_text", "text": "Checking the parser."}]}),
-            ),
-            line(
-                6,
                 "event_msg",
                 json!({"type": "agent_message", "message": "Checking the parser.",
                 "phase": "commentary"}),
+            ),
+            line(
+                6,
+                "response_item",
+                json!({"type": "message", "role": "assistant", "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Checking the parser."}]}),
             ),
             line(
                 7,
@@ -1951,10 +1944,7 @@ fn round3_cases() -> Vec<(&'static str, Outcome)> {
                 assert!(leaks(&printed).is_empty(), "{name}: {printed}");
                 out.push((name, Outcome::Refused));
             }
-            Ok(mut fragment) => {
-                occurrence_ends(&mut fragment);
-                out.push((name, Outcome::Gated(run_on(&CX, &mutated, fragment))))
-            }
+            Ok(fragment) => out.push((name, Outcome::Gated(run_on(&CX, &mutated, fragment)))),
         }
     }
     out

@@ -167,6 +167,28 @@ macro_rules! annotated {
     }};
 }
 
+/// Why her samplings stopped (M1): `(node, term)` for every `ends` of an
+/// occurrence, by the node its witness projects to. No node carries one.
+fn ends_on(imported: &Imported) -> Vec<(Id, Id)> {
+    let facts = imported.fragment.facts();
+    let on_nodes = find!(
+        node: Id,
+        pattern!(facts, [{ ?node @ v3::node::holds: _?fact, v3::node::ends: _?term }])
+    )
+    .count();
+    assert_eq!(on_nodes, 0, "a node carries ends (M1)");
+    let mut found: Vec<(Id, Id)> = find!(
+        (node: Id, term: Id),
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: ?node },
+            { _?occurrence @ v3::occurrence::of: _?witness, v3::witness::ends: ?term },
+        ])
+    )
+    .collect();
+    found.sort();
+    found
+}
+
 fn glosses(imported: &Imported) -> Vec<String> {
     let facts = imported.fragment.facts();
     let found: Vec<Inline<Handle<UTF8String>>> = find!(
@@ -320,15 +342,15 @@ fn g2() -> String {
         ),
         line(
             6,
-            "response_item",
-            json!({"type": "message", "role": "assistant", "phase": "commentary",
-            "content": [{"type": "output_text", "text": "Checking the parser."}]}),
-        ),
-        line(
-            6,
             "event_msg",
             json!({"type": "agent_message", "message": "Checking the parser.",
             "phase": "commentary"}),
+        ),
+        line(
+            6,
+            "response_item",
+            json!({"type": "message", "role": "assistant", "phase": "commentary",
+            "content": [{"type": "output_text", "text": "Checking the parser."}]}),
         ),
         line(
             7,
@@ -383,7 +405,7 @@ fn g2_passes() {
     let imported = passes(&g2());
     // The aborted turn ends at her last node. The erred turn holds only his
     // prompt: no ends there, and no fact for the error (X5, X6).
-    let ends = annotated!(imported, v3::node::ends);
+    let ends = ends_on(&imported);
     let commentary = witnessed_saying(&imported, "Checking the parser.");
     assert!(ends.contains(&(commentary, v3::node::ends::INTERRUPTED)));
     assert_eq!(ends.len(), 1);
@@ -838,12 +860,12 @@ fn rv_cx2b_phase_only_on_event() {
     let mut records = Vec::new();
     rv_head(&mut records);
     records.push(rv_user(2, "Q."));
-    records.push(rv_said(3, "Looking.", None));
     records.push(line(
         3,
         "event_msg",
         json!({"type": "agent_message", "message": "Looking.", "phase": "commentary"}),
     ));
+    records.push(rv_said(3, "Looking.", None));
     let source = jsonl(&records);
     let imported = passes(&source);
     let looking = witnessed_saying(&imported, "Looking.");
@@ -865,18 +887,18 @@ fn rv_cx2_registers() {
     let mut records = Vec::new();
     rv_head(&mut records);
     records.push(rv_user(2, "Q."));
-    records.push(rv_said(3, "Looking.", Some("commentary")));
     records.push(line(
         3,
         "event_msg",
         json!({"type": "agent_message", "message": "Looking.", "phase": "commentary"}),
     ));
-    records.push(rv_said(4, "Answer.", Some("final_answer")));
+    records.push(rv_said(3, "Looking.", Some("commentary")));
     records.push(line(
         4,
         "event_msg",
         json!({"type": "agent_message", "message": "Answer.", "phase": "final_answer"}),
     ));
+    records.push(rv_said(4, "Answer.", Some("final_answer")));
     records.push(rv_said(5, "Bare.", None));
     let source = jsonl(&records);
     let imported = passes(&source);
@@ -898,7 +920,15 @@ fn rv_cx2_registers() {
         "{event_msg}.payload{agent_message}.phase".to_owned(),
         Kind::Mirror
     )));
-    let novel = source.replacen("\"phase\":\"commentary\"", "\"phase\":\"aside\"", 1);
+    // Her message (the copy before it keeps its phase) under a phase no
+    // entry names.
+    let mut novel = records.clone();
+    let at = novel
+        .iter()
+        .position(|record| record["payload"]["content"][0]["text"] == json!("Looking."))
+        .unwrap();
+    novel[at]["payload"]["phase"] = json!("aside");
+    let novel = jsonl(&novel);
     // Her text under a phase no entry names is unknown; so is the phase.
     refused(&novel);
     assert!(walk_rows(&novel).contains(&(
@@ -1140,7 +1170,7 @@ fn rv_cx7_aborted() {
     records.push(abort(17));
     let source = jsonl(&records);
     let imported = passes(&source);
-    let ends = annotated!(imported, v3::node::ends);
+    let ends = ends_on(&imported);
     let on = |text: &str| {
         let node = witnessed_saying(&imported, text);
         ends.iter().filter(|(n, _)| *n == node).count()
@@ -1180,10 +1210,7 @@ fn x6_a_failed_turn_ends_on_her_last_node() {
     ));
     let imported = passes(&jsonl(&records));
     let working = witnessed_saying(&imported, "Working.");
-    assert_eq!(
-        annotated!(imported, v3::node::ends),
-        vec![(working, v3::node::ends::ERROR)]
-    );
+    assert_eq!(ends_on(&imported), vec![(working, v3::node::ends::ERROR)]);
 }
 
 /// X7 (review CX-1): an empty sealed token takes its empty drop: the
@@ -1269,6 +1296,523 @@ fn x10_world_state_baseline_is_machinery() {
 }
 
 // ---------------------------------------------------------------------------
+// Round 4: M1, X8', X9', X11..X14, and the round-3 losslessness review's
+// PARTLY fixtures (r3l_*), each of which failed against the round-3
+// importer.
+
+/// Why each sampling `node` holds stopped: the `ends` of each occurrence of
+/// its witness, one sorted list per occurrence, sorted (M1).
+fn ends_by_occurrence(imported: &Imported, node: Id) -> Vec<Vec<Id>> {
+    let _ = ends_on(imported);
+    let facts = imported.fragment.facts();
+    let occurrences: BTreeSet<Id> = find!(
+        occurrence: Id,
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: node },
+            { ?occurrence @ v3::occurrence::of: _?witness },
+        ])
+    )
+    .collect();
+    let mut out: Vec<Vec<Id>> = occurrences
+        .into_iter()
+        .map(|occurrence| {
+            let mut ends: Vec<Id> = find!(
+                term: Id,
+                pattern!(facts, [{ occurrence @ v3::witness::ends: ?term }])
+            )
+            .collect();
+            ends.sort();
+            ends
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn blob_sizes(imported: &Imported, modality: Id) -> Vec<usize> {
+    use triblespace::prelude::blobencodings::RawBytes;
+    let facts = imported.fragment.facts();
+    let handles: Vec<Inline<Handle<RawBytes>>> = find!(
+        handle: Inline<Handle<RawBytes>>,
+        pattern!(facts, [{ _?fact @ v3::fact::modality: modality, v3::fact::blob: ?handle }])
+    )
+    .collect();
+    handles
+        .into_iter()
+        .map(|handle| {
+            imported
+                .blobs
+                .get::<anybytes::Bytes, RawBytes>(handle)
+                .unwrap()
+                .len()
+        })
+        .collect()
+}
+
+fn body_gaps(imported: &Imported, modality: Id) -> usize {
+    let facts = imported.fragment.facts();
+    find!(
+        fact: Id,
+        pattern!(facts, [{ ?fact @ v3::fact::modality: modality, v3::fact::absent: v3::fact::absent::BODY }])
+    )
+    .count()
+}
+
+/// M1: two records that converge on one node (the same prompt and answer
+/// after a rollback) keep each its own `ends`, on its own occurrence.
+#[test]
+fn m1_each_record_keeps_its_own_end() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "P."));
+    records.push(rv_said(3, "Same.", Some("commentary")));
+    records.push(line(
+        4,
+        "event_msg",
+        json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": "t1"}),
+    ));
+    records.push(line(
+        5,
+        "event_msg",
+        json!({"type": "thread_rolled_back", "num_turns": 1}),
+    ));
+    records.extend(rv_turn(6, "t2", "high"));
+    records.push(rv_user(7, "P."));
+    records.push(rv_said(8, "Same.", Some("commentary")));
+    records.push(line(
+        9,
+        "event_msg",
+        json!({"type": "task_complete", "turn_id": "t2", "last_agent_message": null,
+            "error": {"message": "stream disconnected", "codex_error_info": "other"}}),
+    ));
+    let imported = passes(&jsonl(&records));
+    let same = nodes_saying(&imported, "Same.");
+    assert_eq!(same.len(), 1, "one node, held by both records");
+    let mut expected = vec![
+        vec![v3::node::ends::ERROR],
+        vec![v3::node::ends::INTERRUPTED],
+    ];
+    expected.sort();
+    assert_eq!(ends_by_occurrence(&imported, same[0]), expected);
+}
+
+/// A fork (X8'): the child's own `session_meta` names `forked_from_id`, the
+/// copied prefix keeps the ancestor's events but not its reasoning or
+/// commentary, then the child's own turn.
+fn x8_fork(prefix: &[Value], own: &[Value]) -> Vec<Value> {
+    let child = "88888888-8888-4888-8888-888888888888";
+    let parent = "99999999-9999-4999-8999-999999999999";
+    let mut meta = rv_meta(0, child, "Sys.");
+    meta["payload"]["forked_from_id"] = json!(parent);
+    let mut records = vec![meta, rv_meta(0, parent, "Sys.")];
+    records.extend(rv_turn(1, "t0", "high"));
+    records.push(rv_user(2, "Parent asks."));
+    records.extend(prefix.iter().cloned());
+    records.push(line(
+        3,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Parent answers.", "phase": "final_answer"}),
+    ));
+    records.push(rv_said(3, "Parent answers.", Some("final_answer")));
+    records.extend(rv_turn(4, "t1", "high"));
+    records.push(rv_user(5, "Child task."));
+    records.push(line(
+        6,
+        "response_item",
+        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Child plan."}],
+            "content": null, "encrypted_content": REASONING}),
+    ));
+    records.push(line(
+        6,
+        "event_msg",
+        json!({"type": "agent_reasoning", "text": "Child plan."}),
+    ));
+    records.extend(own.iter().cloned());
+    records.push(rv_said(7, "Done.", Some("final_answer")));
+    records
+}
+
+#[test]
+fn x8_a_forks_copied_prefix_keeps_events_of_removed_items() {
+    let thought = line(
+        2,
+        "event_msg",
+        json!({"type": "agent_reasoning", "text": "Parent thinks."}),
+    );
+    let comment = line(
+        2,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Parent comments.", "phase": "commentary"}),
+    );
+    let source = jsonl(&x8_fork(&[thought.clone(), comment.clone()], &[]));
+    let imported = passes(&source);
+    // The removed items are not imported: her window never held them.
+    assert!(nodes_saying(&imported, "Parent comments.").is_empty());
+    assert_eq!(glosses(&imported), vec!["Child plan.".to_owned()]);
+    let rows =
+        |source: &str, path: &str| walk_rows(source).contains(&(path.to_owned(), Kind::Mirror));
+    let reasoning = "{event_msg}.payload{agent_reasoning}.text";
+    let message = "{event_msg}.payload{agent_message}.message";
+    // After the child's first item of a removed kind, a copy without its
+    // original is the child's own and fails.
+    let late = jsonl(&x8_fork(&[], &[thought.clone()]));
+    assert_eq!(refused(&late).path, reasoning);
+    assert!(rows(&late, reasoning));
+    let late = jsonl(&x8_fork(&[], &[comment.clone()]));
+    assert_eq!(refused(&late).path, message);
+    assert!(rows(&late, message));
+    // A unit that names no fork has no copied prefix.
+    let mut records = x8_fork(&[thought.clone(), comment.clone()], &[]);
+    records[0]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("forked_from_id");
+    let unforked = jsonl(&records);
+    assert_eq!(refused(&unforked).path, reasoning);
+    assert!(rows(&unforked, reasoning));
+    // A final answer the fork filter keeps: its copy needs its original.
+    let kept = line(
+        2,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Parent concludes.", "phase": "final_answer"}),
+    );
+    let kept = jsonl(&x8_fork(&[kept], &[]));
+    assert_eq!(refused(&kept).path, message);
+    assert!(rows(&kept, message));
+    // A child that makes no item of a removed kind leaves the prefix
+    // unbounded: the copy fails.
+    let records: Vec<Value> = x8_fork(&[thought], &[])
+        .into_iter()
+        .filter(|record| {
+            record["payload"]["type"] != json!("reasoning")
+                && record["payload"]["text"] != json!("Child plan.")
+        })
+        .collect();
+    let unbounded = jsonl(&records);
+    assert_eq!(refused(&unbounded).path, reasoning);
+    assert!(rows(&unbounded, reasoning));
+}
+
+/// X9': `guardian_history` copies the unit's own earlier items, in order;
+/// nothing is imported for it.
+#[test]
+fn x9_guardian_history_mirrors_earlier_items() {
+    let ask = json!({"type": "message", "role": "user",
+        "content": [{"type": "input_text", "text": "A."}]});
+    let call = json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "g1"});
+    let output = json!({"type": "function_call_output", "call_id": "g1", "output": "listing"});
+    let said = json!({"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "B."}]});
+    let build = |guardian: Option<Value>| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        for (second, item) in [(2, &ask), (3, &call), (4, &output), (5, &said)] {
+            records.push(line(second, "response_item", item.clone()));
+        }
+        let mut payload = json!({"message": "", "replacement_history": [
+            ask.clone(),
+            {"type": "compaction", "encrypted_content": COMPACTION}
+        ]});
+        if let Some(guardian) = guardian {
+            payload["guardian_history"] = guardian;
+        }
+        records.push(line(6, "compacted", payload));
+        records.push(rv_said(7, "E.", None));
+        jsonl(&records)
+    };
+    let bare = import_ok(&build(None));
+    for guardian in [
+        json!([ask, call, output, said]),
+        json!([call, said]),
+        json!([]),
+        json!(null),
+    ] {
+        let source = build(Some(guardian));
+        let imported = passes(&source);
+        let (a, b) = (imported.fragment.facts(), bare.fragment.facts());
+        assert_eq!(a.len(), b.len(), "nothing is imported for the copies");
+        assert_eq!(a.difference(b).len(), 0);
+    }
+    let path = "{compacted}.payload.guardian_history";
+    let approved = json!({"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": "Approved."}]});
+    for guardian in [
+        // Out of order.
+        json!([said, ask]),
+        // An item the unit does not hold.
+        json!([ask, approved]),
+        // A copy that differs from its item.
+        json!([{"type": "function_call_output", "call_id": "g1", "output": "list"}]),
+        // An item that is not earlier: her answer after the compaction.
+        json!([{"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "E."}]}]),
+    ] {
+        let source = build(Some(guardian));
+        assert_eq!(refused(&source).path, path);
+        assert!(walk_rows(&source).contains(&(path.to_owned(), Kind::Mirror)));
+    }
+}
+
+/// X6, X11 (review r3l_cx_task_error): a failed turn ends with `error` on
+/// her last item's occurrence, with no fact for the error; an error that
+/// names no message fails.
+#[test]
+fn r3l_cx_task_error() {
+    let done = |second: u32, error: Value| {
+        line(
+            second,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t", "last_agent_message": null,
+                "error": error}),
+        )
+    };
+    let build = |error: Value| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(2, "Go."));
+        records.push(line(
+            3,
+            "response_item",
+            json!({"type": "reasoning", "summary": [], "content": null,
+                "encrypted_content": REASONING}),
+        ));
+        records.push(line(
+            4,
+            "response_item",
+            json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "e1"}),
+        ));
+        records.push(line(
+            5,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "e1", "output": "out"}),
+        ));
+        records.push(done(6, error.clone()));
+        records.extend(rv_turn(7, "t2", "high"));
+        records.push(rv_user(8, "Again."));
+        records.push(done(9, error));
+        jsonl(&records)
+    };
+    let call_node = |imported: &Imported| {
+        let facts = imported.fragment.facts();
+        let calls: Vec<Id> = find!(
+            node: Id,
+            pattern!(facts, [
+                { ?node @ v3::node::holds: _?fact },
+                { _?fact @ v3::fact::modality: v3::fact::modality::TOOL_CALL },
+            ])
+        )
+        .collect();
+        calls
+    };
+    for error in [
+        json!({"message": "boom", "codex_error_info": "other"}),
+        json!({"message": ""}),
+    ] {
+        let imported = passes(&build(error));
+        let calls = call_node(&imported);
+        assert_eq!(calls.len(), 1);
+        // On her call (the turn's last item of hers), not on his prompt.
+        assert_eq!(ends_on(&imported), vec![(calls[0], v3::node::ends::ERROR)]);
+        let facts = imported.fragment.facts();
+        assert!(!exists!(
+            (),
+            pattern!(facts, [{ _?fact @ v3::fact::modality: v3::fact::modality::EVENT }])
+        ));
+        assert!(nodes_saying(&imported, "boom").is_empty());
+    }
+    let imported = passes(&build(json!(null)));
+    assert!(ends_on(&imported).is_empty());
+    let path = "{event_msg}.payload{task_complete}.error";
+    for error in [json!({"codex_error_info": "other"}), json!("boom")] {
+        let source = build(error);
+        assert_eq!(refused(&source).path, path);
+        assert!(walk_rows(&source).contains(&(path.to_owned(), Kind::Open)));
+    }
+}
+
+/// X7, X12 (review r3l_cx_empty_tokens): every empty sealed token is a
+/// body gap, never a zero-byte blob.
+#[test]
+fn r3l_cx_empty_tokens() {
+    // Reasoning with a summary and an empty token: a gap, and its gloss.
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Q."));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan."}],
+            "content": null, "encrypted_content": ""}),
+    ));
+    records.push(rv_said(4, "Done.", Some("final_answer")));
+    let imported = passes(&jsonl(&records));
+    assert!(blob_sizes(&imported, v3::fact::modality::THINKING).is_empty());
+    assert_eq!(body_gaps(&imported, v3::fact::modality::THINKING), 1);
+    assert_eq!(glosses(&imported), vec!["Plan.".to_owned()]);
+    // Reasoning with an empty token inside a replacement history.
+    let history = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C."}]},
+        {"type": "reasoning", "summary": [], "content": null, "encrypted_content": ""},
+        {"type": "compaction", "encrypted_content": COMPACTION}
+    ]);
+    let imported = passes(&rv_compaction_source(history, &[rv_said(8, "E.", None)]));
+    assert!(!blob_sizes(&imported, v3::fact::modality::THINKING).contains(&0));
+    // A compaction item whose token is empty.
+    let history = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C."}]},
+        {"type": "compaction", "encrypted_content": ""}
+    ]);
+    let imported = passes(&rv_compaction_source(history, &[rv_said(8, "E.", None)]));
+    assert!(blob_sizes(&imported, v3::fact::modality::THINKING).is_empty());
+    assert_eq!(body_gaps(&imported, v3::fact::modality::THINKING), 1);
+    // An inter-agent message whose sealed content is empty.
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Q."));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "agent_message", "author": "/root",
+            "content": [{"type": "encrypted_content", "encrypted_content": ""}]}),
+    ));
+    records.push(rv_said(4, "Done.", Some("final_answer")));
+    let imported = passes(&jsonl(&records));
+    assert!(blob_sizes(&imported, v3::fact::modality::TEXT).is_empty());
+    assert_eq!(body_gaps(&imported, v3::fact::modality::TEXT), 1);
+}
+
+/// X8', X13 (review r3l_cx_relayed_child_events): a relayed copy the unit
+/// does not hold fails; a copy whose text the unit holds, but not in the
+/// item after it, is matched by text alone and fails, so another agent's
+/// message never sets her register.
+#[test]
+fn r3l_cx_relayed_child_events() {
+    let build = |extra: Vec<Value>| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(2, "Delegate."));
+        records.push(line(
+            3,
+            "response_item",
+            json!({"type": "function_call", "name": "spawn_agent",
+                "arguments": "{\"task\":\"t\"}", "call_id": "s1"}),
+        ));
+        records.extend(extra);
+        records.push(line(
+            6,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "s1", "output": "child finished"}),
+        ));
+        records.push(rv_said(7, "Done.", None));
+        jsonl(&records)
+    };
+    let message = build(vec![line(
+        4,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Child text.", "phase": "commentary"}),
+    )]);
+    assert_eq!(
+        refused(&message).path,
+        "{event_msg}.payload{agent_message}.message"
+    );
+    let reasoning = build(vec![line(
+        4,
+        "event_msg",
+        json!({"type": "agent_reasoning", "text": "Child thinking."}),
+    )]);
+    assert_eq!(
+        refused(&reasoning).path,
+        "{event_msg}.payload{agent_reasoning}.text"
+    );
+    // The child's message happens to say what hers before it says.
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Delegate."));
+    records.push(rv_said(3, "Done.", None));
+    records.push(line(
+        4,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Done.", "phase": "commentary"}),
+    ));
+    let coinciding = jsonl(&records);
+    let phase = "{event_msg}.payload{agent_message}.phase";
+    assert_eq!(refused(&coinciding).path, phase);
+    assert!(walk_rows(&coinciding).contains(&(phase.to_owned(), Kind::Mirror)));
+    // Its copy written before it, as codex writes it, is hers.
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Delegate."));
+    records.push(line(
+        3,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Done.", "phase": "commentary"}),
+    ));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "reasoning", "summary": [], "content": null, "encrypted_content": REASONING}),
+    ));
+    records.push(rv_said(3, "Done.", None));
+    let imported = passes(&jsonl(&records));
+    assert_eq!(
+        registers(&imported, witnessed_saying(&imported, "Done.")),
+        vec![v3::fact::register::COMMENTARY]
+    );
+}
+
+/// X14: a text part without its text fails at its path, never skipped.
+#[test]
+fn x14_a_text_part_without_text_fails() {
+    let mut cases: Vec<(Value, &str)> = vec![
+        (
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text"}]}),
+            "{response_item}.payload{message}.content[]{input_text}.text",
+        ),
+        (
+            json!({"type": "message", "role": "developer", "content": [{"type": "input_text"}]}),
+            "{response_item}.payload{message}.content[]{input_text}.text",
+        ),
+        (
+            json!({"type": "message", "role": "assistant", "content": [{"type": "output_text"}]}),
+            "{response_item}.payload{message}.content[]{output_text}.text",
+        ),
+        (
+            json!({"type": "reasoning", "summary": [{"type": "summary_text"}], "content": null,
+                "encrypted_content": REASONING}),
+            "{response_item}.payload{reasoning}.summary[]{summary_text}.text",
+        ),
+        (
+            json!({"type": "agent_message", "author": "/root",
+                "content": [{"type": "input_text"}]}),
+            "{response_item}.payload{agent_message}.content[]{input_text}.text",
+        ),
+        // A text that is no string: the table names no class for it.
+        (
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": 7}]}),
+            "{response_item}.payload{message}{user}.content[]{input_text}.text",
+        ),
+    ];
+    cases.push((
+        json!({"type": "function_call_output", "call_id": "x1",
+            "output": [{"type": "input_text"}]}),
+        "{response_item}.payload{function_call_output}.output[]{input_text}.text",
+    ));
+    for (item, path) in cases {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(2, "Q."));
+        records.push(line(
+            3,
+            "response_item",
+            json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "x1"}),
+        ));
+        records.push(line(4, "response_item", item));
+        let source = jsonl(&records);
+        assert_eq!(refused(&source).path, path);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The real sample. Prints only paths, kinds and counts.
 
 #[test]
@@ -1283,8 +1827,6 @@ fn real_sample() {
     let mut passed = 0;
     let mut import_failed = 0;
     let mut gate_failed = 0;
-    let m1 = std::env::var_os("AV3_M1").is_some();
-    let mut unattributable = 0;
     let mut unread = 0;
     let mut skipped = 0;
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
@@ -1326,12 +1868,6 @@ fn real_sample() {
                     .or_default() += 1;
             }
             Ok(mut fragment) => {
-                // AV3_M1: gate the output with each node's `ends` moved to
-                // its one occurrence (ruling M1), to see what else fails.
-                if m1 && gate::tests::occurrence_ends(&mut fragment).is_err() {
-                    unattributable += 1;
-                    continue;
-                }
                 let blobs = fragment.blobs_mut().snapshot().unwrap();
                 let report = gate::check(&TABLE, &bytes, fragment.facts(), &blobs);
                 if report.passed() {
@@ -1357,9 +1893,6 @@ fn real_sample() {
                 }
             }
         }
-    }
-    if m1 {
-        println!("AV3_M1: ends moved to occurrences; unattributable {unattributable}");
     }
     println!(
         "files {} skipped-over-400MB {} unread {} passed {} import-failed {} gate-failed {}",
