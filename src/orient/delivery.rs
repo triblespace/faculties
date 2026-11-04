@@ -8,6 +8,44 @@ use anyhow::{Context, Result};
 use std::fmt;
 use std::time::{Duration, Instant};
 
+/// Private native Out handoff, consumed once by complete_report. The complete
+/// report is already owned by PendingNext; waiting here yields the shared
+/// runtime instead of blocking its I/O/timer driver inside the synchronous Out
+/// callback. This is acceptance of that report, never a retry or re-emission.
+pub(super) struct PreparedAcceptance {
+    accepted: tokio::sync::oneshot::Receiver<()>,
+    control: triblespace::core::repo::async_store::AcquiringReadControl,
+}
+
+impl PreparedAcceptance {
+    pub(super) fn new(accepted: tokio::sync::oneshot::Receiver<()>,
+        control: triblespace::core::repo::async_store::AcquiringReadControl) -> Self {
+        Self { accepted, control }
+    }
+
+    async fn wait(self) -> Result<()> {
+        self.control.check()?;
+        tokio::select! {
+            accepted = self.accepted => {
+                accepted.context("Orient complete report was not accepted for publication")?;
+                self.control.check()?;
+                Ok(())
+            }
+            _ = self.control.cancelled() => {
+                self.control.check()?;
+                unreachable!("sticky cancellation wakes only when cancelled")
+            }
+        }
+    }
+}
+impl fmt::Debug for PreparedAcceptance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("PreparedAcceptance") }
+}
+impl fmt::Display for PreparedAcceptance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("complete Orient report awaits caller acceptance") }
+}
+impl std::error::Error for PreparedAcceptance {}
+
 pub const KNOWN_NOT_SUBMITTED_EXIT: u8 = 75;
 
 /// A trusted callback explicitly promises it submitted no accepting request.
@@ -143,6 +181,11 @@ pub(crate) async fn complete_report(
             }
             Err(error) => error,
         };
+        if error.is::<PreparedAcceptance>() {
+            error.downcast::<PreparedAcceptance>().expect("checked handoff type").wait().await?;
+            on_delivery(DeliveryNotice::Accepted);
+            return Ok(());
+        }
         let Some(deferred) = error.downcast_ref::<DeferredNotSubmitted>() else {
             return Err(error).with_context(|| format!("deliver complete {description}"));
         };

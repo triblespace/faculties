@@ -15,7 +15,8 @@ pub enum NextKind { Report, Timeout }
 pub struct PreparedReport {
     parts: Vec<Part>,
     kind: NextKind,
-    accept: Sender<()>,
+    accept: tokio::sync::oneshot::Sender<()>,
+    owner: Arc<()>,
 }
 
 impl PreparedReport {
@@ -29,12 +30,14 @@ pub struct Next {
     persona: String,
     options: WaitOptions,
     control: AcquiringReadControl,
+    owner: Arc<()>,
 }
 
 /// The exact worker remains owned through preparation, publication, receipt
 /// completion and cancellation. No task is detached when a timeout is observed.
 pub struct PendingNext {
     control: AcquiringReadControl,
+    owner: Arc<()>,
     ready: Receiver<PreparedReport>,
     worker: Option<std::thread::JoinHandle<Result<()>>>,
 }
@@ -49,7 +52,7 @@ impl Orient {
         if persona.trim().is_empty() { bail!("Orient next requires an explicit zooid persona"); }
         if options.timeout.is_none() { bail!("Orient next requires a finite timeout"); }
         Ok(Next { orient: self.clone(), persona: persona.to_owned(), options: options.clone(),
-            control: AcquiringReadControl::new(deadline(options)?) })
+            control: AcquiringReadControl::new(deadline(options)?), owner: Arc::new(()) })
     }
 }
 
@@ -57,9 +60,10 @@ impl Next {
     pub fn start(self) -> Result<PendingNext> {
         let (send, ready) = mpsc::channel();
         let control = self.control.clone();
+        let owner = self.owner.clone();
         let worker = std::thread::Builder::new().name("orient-next".to_owned())
             .spawn(move || self.run(send)).context("start owned Orient next call")?;
-        Ok(PendingNext { control, ready, worker: Some(worker) })
+        Ok(PendingNext { control, owner, ready, worker: Some(worker) })
     }
 
     fn run(self, send: Sender<PreparedReport>) -> Result<()> {
@@ -70,7 +74,7 @@ impl Next {
             );
             let (mut store, signer, runtime) = match opened {
                 Ok(opened) => opened,
-                Err(error) if is_deadline(&error) => return offer_timeout(&send,
+                Err(error) if is_deadline(&error) => return offer_timeout(&send, self.owner.clone(),
                     vec![Part::Text { text: "Orient next reached its deadline before the shared store became available.\n".to_owned() }]),
                 Err(error) => return Err(error),
             };
@@ -86,7 +90,7 @@ impl Next {
                         self.control.check()?;
                         prepared.store(true, Ordering::Release);
                         offered.set(true);
-                        offer(&send, std::mem::take(&mut parts), &self.control.without_deadline())?;
+                        offer(&send, self.owner.clone(), std::mem::take(&mut parts), &self.control.without_deadline())?;
                     }
                     Ok(())
                 };
@@ -99,13 +103,13 @@ impl Next {
             match result {
                 Ok(outcome) if !outcome.news_printed => {
                     parts.push(Part::Text { text: format!("{}\n", outcome.timeout_text()) });
-                    offer_timeout(&send, parts)
+                    offer_timeout(&send, self.owner.clone(), parts)
                 }
                 Ok(_) => Ok(()),
                 Err(error) if !offered.get() && is_deadline(&error) => {
                     parts.push(Part::Text { text:
                         "Orient next reached its deadline before a complete readable report was accepted.\n".to_owned() });
-                    offer_timeout(&send, parts)
+                    offer_timeout(&send, self.owner.clone(), parts)
                 }
                 Err(error) => Err(error),
             }
@@ -118,28 +122,19 @@ pub(super) fn is_deadline(error: &anyhow::Error) -> bool {
         Some(AcquiringReadInterrupted::DeadlineExceeded)))
 }
 
-fn offer(send: &Sender<PreparedReport>, parts: Vec<Part>, control: &AcquiringReadControl) -> Result<()> {
+fn offer(send: &Sender<PreparedReport>, owner: Arc<()>, parts: Vec<Part>, control: &AcquiringReadControl) -> Result<()> {
     control.check()?;
-    let (accept, accepted) = mpsc::channel();
-    send.send(PreparedReport { parts, kind: NextKind::Report, accept })
+    let (accept, accepted) = tokio::sync::oneshot::channel();
+    send.send(PreparedReport { parts, kind: NextKind::Report, accept, owner })
         .map_err(|_| anyhow!("Orient result owner closed before publication"))?;
-    loop {
-        control.check()?;
-        match accepted.recv_timeout(Duration::from_millis(10)) {
-            Ok(()) => { control.check()?; return Ok(()); }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                bail!("Orient complete report was not accepted for publication");
-            }
-        }
-    }
+    Err(super::super::delivery::PreparedAcceptance::new(accepted, control.clone()).into())
 }
 
-fn offer_timeout(send: &Sender<PreparedReport>, parts: Vec<Part>) -> Result<()> {
+fn offer_timeout(send: &Sender<PreparedReport>, owner: Arc<()>, parts: Vec<Part>) -> Result<()> {
     // No pending Presented commit follows a quiet timeout. Its output remains
     // owned by the caller even though the observation worker can now finish.
-    let (accept, _) = mpsc::channel();
-    send.send(PreparedReport { parts, kind: NextKind::Timeout, accept })
+    let (accept, _) = tokio::sync::oneshot::channel();
+    send.send(PreparedReport { parts, kind: NextKind::Timeout, accept, owner })
         .map_err(|_| anyhow!("Orient result owner closed before timeout delivery"))
 }
 
@@ -162,6 +157,9 @@ impl PendingNext {
     /// the real Presented/close outcome. Publication is not rolled back if
     /// cancellation, receipt writing or close then fails.
     pub fn acknowledge(&mut self, report: PreparedReport) -> Result<()> {
+        if !Arc::ptr_eq(&self.owner, &report.owner) {
+            bail!("prepared Orient report belongs to another pending call");
+        }
         if report.kind == NextKind::Report && report.accept.send(()).is_err() {
             self.join()?;
             bail!("Orient receipt worker ended before acceptance");
@@ -332,5 +330,52 @@ mod tests {
             Ok(())
         }).unwrap();
         assert!(!fixture.presented());
+    }
+
+    #[test]
+    fn prepared_call_yields_shared_runtime_to_another_wait_timeout_and_cancel() {
+        let fixture = Fixture::new();
+        let mut first = fixture.start();
+        let report = first.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let quiet_persona = genid().id;
+        fixture.storage.with_store(|store, signer, runtime| {
+            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+            let (person, _, _) = relations::person_fragment(quiet_persona,
+                crate::relations::ProfileInput { label: "quiet-other-zooid".into(), ..Default::default() })?;
+            store.commit(sources.relations.source, signer, person)?;
+            Ok(())
+        }).unwrap();
+        let start = |seconds| Orient::with_storage(fixture.storage.clone())
+            .begin_next(&fmt_id(quiet_persona), &WaitOptions {
+                timeout: Some(Duration::from_secs(seconds)), poll_interval: Duration::from_millis(10),
+                ..Default::default()
+            }).unwrap().start().unwrap();
+        let mut second = start(1);
+        let timeout = second.ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(timeout.kind(), NextKind::Timeout);
+        second.acknowledge(timeout).unwrap();
+        assert!(second.is_settled());
+        let mut cancelled = start(20);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(cancelled.cancel_and_join().is_err());
+        assert!(cancelled.is_settled());
+        assert!(!first.is_settled());
+        assert!(!fixture.presented());
+        first.acknowledge(report).unwrap();
+        assert!(fixture.presented());
+    }
+
+    #[test]
+    fn prepared_report_cannot_acknowledge_a_different_pending_call() {
+        let fixture = Fixture::new();
+        let mut first = fixture.start();
+        let first_report = first.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut second = fixture.start();
+        let second_report = second.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(first.acknowledge(second_report).unwrap_err().to_string().contains("another pending call"));
+        assert!(second.join().is_err());
+        assert!(!fixture.presented());
+        first.acknowledge(first_report).unwrap();
+        assert!(fixture.presented());
     }
 }

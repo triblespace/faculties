@@ -11,6 +11,9 @@ All notable changes to this project will be documented in this file.
   whose existing Presented acknowledgment follows result publication. Buffering
   or dropping that report never records presentation; receipt/close errors remain
   visible. This is delivery acceptance, not model consumption or handled work.
+  Prepared acceptance yields the shared runtime's I/O/timer driver and remains
+  bound to its actual pending call; another waiter can expire or cancel while
+  the caller retains the first report for publication.
 
 - **Quota: provider-reported subscription usage in the pile.** A new `quota`
   faculty and collection (scope `6B6C08A47B334284A56279D961255250`, name
