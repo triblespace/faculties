@@ -577,12 +577,18 @@ pub mod renderer {
     pub const KIND: Id = id_hex!("EAA2A28546F7D87669DDA71A321B7F3A");
 
     attributes! {
-        /// CORE. The exact chat template text.
+        /// CORE. The exact text of the rules that rendered the window: a chat
+        /// template where one ran, or the source of a native renderer where
+        /// the rendering is code (Drive's `render_parts`, compiled in with
+        /// `include_str!`). Never a template that did not execute.
         "629E4E6A3350C57E2A01B5D828B392AD" as pub template: Handle<UTF8String>;
-        /// CORE. The exact tokenizer definition (for example `tokenizer.json`).
+        /// CORE. The exact tokenizer definition the renderer held (for example
+        /// `tokenizer.json`, or the definition a renderer reconstructed).
         "E1EA5A441C85450A384997B735B1C7DE" as pub tokenizer: Handle<UTF8String>;
         /// CORE. The codec that renders facts through the template, named by
-        /// its source identity (crate and exact revision).
+        /// its source identity: crate or module, the content hash of its
+        /// source, and the frozen build revision where one is known. Never a
+        /// runtime checkout assumed to equal the binary.
         "AB968DF7A83447132708ADC22DCBECA2" as pub codec: Handle<UTF8String>;
     }
 }
