@@ -1118,7 +1118,10 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
         "payload",
         Decode::Text,
     )
-    .when(&[Cond::Is("renderedRole", "system")]),
+    .when(&[
+        Cond::Is("renderedRole", "system"),
+        Cond::Absent("renderedBesideToolResult"),
+    ]),
     Entry::fact(
         "{attachment}.rendered[].content",
         "text",
@@ -1126,7 +1129,39 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
         "payload",
         Decode::Text,
     )
-    .when(&[Cond::Is("renderedRole", "user")]),
+    .when(&[
+        Cond::Is("renderedRole", "user"),
+        Cond::Absent("renderedBesideToolResult"),
+    ]),
+    // R1. Request logs (390 framed transcripts, 2026-11-04, counts only):
+    // every part marked `renderedBesideToolResult` that her window held on
+    // its own line held its text plus a trailing newline, as a text block of
+    // a user message: 403 parts with no result beside them, and the one
+    // part beside a result too. The exact text after a message's last
+    // tool_result (19 parts, 2 transcripts) occurs only in messages off the
+    // attachment's line, whose own line holds no result at all. So the
+    // rendering is the text plus a newline where no result is beside it on
+    // its line; the importer refuses the rest (beside a result, or after an
+    // unknown span), and any role but `user`.
+    Entry::fact(
+        "{attachment}.rendered[].content",
+        "text",
+        "in",
+        "payload",
+        Decode::TextThen("\n"),
+    )
+    .when(&[
+        Cond::Is("renderedRole", "user"),
+        Cond::Present("renderedBesideToolResult"),
+    ]),
+    Entry::new(
+        "{attachment}.rendered[].content",
+        Class::Open("a system rendering beside a tool result: no framed case shows its place"),
+    )
+    .when(&[
+        Cond::Is("renderedRole", "system"),
+        Cond::Present("renderedBesideToolResult"),
+    ]),
     Entry::new(
         "{attachment}.rendered[].content",
         Class::Open("rendered text with no rendered role: its slot is unverified"),
@@ -1138,23 +1173,22 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
         "in",
         "payload",
         Decode::Text,
-    ),
+    )
+    .when(&[Cond::Absent("renderedBesideToolResult")]),
+    Entry::new(
+        "{attachment}.renderedInHumanTurn[].content",
+        Class::Open("a human-turn rendering beside a tool result: no framed case shows its place"),
+    )
+    .when(&[Cond::Present("renderedBesideToolResult")]),
     Entry::new(
         "{attachment}.renderedRole",
         Class::Annotation(&[("raw_role", Decode::Text)]),
     ),
-    // Request logs (390 framed transcripts, 2026-11-04): where no tool
-    // result is beside it (a parent attachment, 402 of 404), her window held
-    // the rendered text plus a trailing newline as a text block among
-    // others in a user message, never the text alone; beside a tool result
-    // (19, 2 transcripts) it was the exact text after the message's last
-    // tool_result. Which text and place to build is a rendering rule not
-    // yet ruled, so it stays open.
+    // The mark that selects the R1 rendering of `rendered[]`. Every one in
+    // the framed transcripts is `true`; any other value fails.
     Entry::new(
         "{attachment}.renderedBesideToolResult",
-        Class::Open(
-            "rendered beside a tool result: the window holds its text with a trailing newline, or after the last tool_result; the rendering rule is not ruled",
-        ),
+        Class::Structure(Structure::Vocabulary(&["true"])),
     ),
 ];
 

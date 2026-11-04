@@ -1274,10 +1274,18 @@ pub(crate) fn occurrence_ends(f: &mut Fragment) -> Result<(), &'static str> {
             .map(|t| *t.e())
             .collect()
     };
+    // `witness::ends` is the same attribute: an occurrence that already
+    // carries its own `ends` is left as it is.
+    let occurrences: std::collections::HashSet<Id> = f
+        .facts()
+        .iter()
+        .filter(|t| *t.a() == v3::occurrence::of.id())
+        .map(|t| *t.e())
+        .collect();
     let on_nodes: Vec<Trible> = f
         .facts()
         .iter()
-        .filter(|t| *t.a() == v3::node::ends.id())
+        .filter(|t| *t.a() == v3::node::ends.id() && !occurrences.contains(t.e()))
         .copied()
         .collect();
     for t in &on_nodes {

@@ -199,6 +199,7 @@ fn takes(decode: Decode, value: &Json) -> bool {
     match decode {
         Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
         Decode::Text
+        | Decode::TextThen(_)
         | Decode::Base64
         | Decode::Base64Url
         | Decode::DataUri

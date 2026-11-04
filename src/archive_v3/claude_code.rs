@@ -48,7 +48,10 @@
 //!
 //! Each node a record holds gets a witness, and the record's claims (time,
 //! role, model, session) form one occurrence of it, so two records holding
-//! one node never mix their claims. Readable thinking, titles and away
+//! one node never mix their claims. Why a message ended (`stop_reason`, an
+//! API error, an interruption) is such a claim: it sits on the occurrence of
+//! the record that holds the message's last item, never on the node (M1).
+//! Readable thinking, titles and away
 //! recaps are glosses. An attachment recorded before the client kept its
 //! rendering keeps its data as `in` event facts whose nodes say the
 //! rendering is unrecorded.
@@ -418,6 +421,8 @@ struct Builder {
     /// `(last item of a record opening the new context, boundary uuid)`
     continues: Vec<(usize, String)>,
     claims: HashMap<usize, WitnessAnnotations>,
+    /// The file positions of attachment records.
+    attachments: HashSet<usize>,
 }
 
 fn core(modality: Id, direction: Id) -> FactCore {
@@ -534,6 +539,7 @@ impl Builder {
             shape_hashes: HashMap::new(),
             continues: Vec::new(),
             claims: HashMap::new(),
+            attachments: HashSet::new(),
         };
         use v3::fact::{absent, direction::IN, modality::*};
         let gap = |modality, kind| FactCore {
@@ -1494,6 +1500,7 @@ impl Builder {
     ) -> Result<(), Failure> {
         use v3::fact::{direction::IN, modality::*};
         self.claims_of(at, record)?;
+        self.attachments.insert(at);
         if record.get("rendered").is_none() && record.get("renderedInHumanTurn").is_none() {
             let items = self.unrecorded(at, members)?;
             return self.place(at, uuid, parent, items);
@@ -1510,15 +1517,34 @@ impl Builder {
                 ))
             }
         };
+        // R1: a rendering the client marks `renderedBesideToolResult` was,
+        // with no result beside it on its line, its text plus a trailing
+        // newline (403 of 403 framed parts whose own line holds them). Beside
+        // a result on its line the ruling names the exact text, but the one
+        // framed part there held the text plus a newline too, so that case
+        // stays open; so does a line whose place before it is unknown.
+        let beside = record.get("renderedBesideToolResult").is_some();
+        if beside {
+            let version = self.version_at[at];
+            let line = self.parent_line(parent.as_deref(), version)?;
+            self.beside_no_result(line.edited.node)?;
+        }
         let mut items = Vec::new();
         for shown in rendered {
-            if let Some(content) = shown.str_at("content").filter(|c| !c.is_empty()) {
-                items.push(self.item(
-                    text(modality, IN, content),
-                    role,
-                    Some(at),
-                    "{attachment}.rendered[].content",
-                )?);
+            let path = "{attachment}.rendered[].content";
+            match shown.str_at("content") {
+                Some("") if beside => return Err(Failure::new(
+                    path,
+                    "an empty rendering beside a tool result: what her window held is unverified",
+                )),
+                Some(content) if beside => {
+                    let shown = format!("{content}\n");
+                    items.push(self.item(text(modality, IN, &shown), role, Some(at), path)?);
+                }
+                Some(content) if !content.is_empty() => {
+                    items.push(self.item(text(modality, IN, content), role, Some(at), path)?);
+                }
+                _ => {}
             }
         }
         for shown in record
@@ -1537,6 +1563,39 @@ impl Builder {
         }
         self.holds_its_claims(at, "attachment", &items)?;
         self.place(at, uuid, parent, items)
+    }
+
+    /// R1: the place before a `renderedBesideToolResult` rendering, past
+    /// the renderings of the attachments before it, holds no tool result
+    /// and is known. Beside a result, or after a span of unknown items, the
+    /// rendering is not built.
+    fn beside_no_result(&self, tail: Option<usize>) -> Result<(), Failure> {
+        let path = "{attachment}.renderedBesideToolResult";
+        let mut cursor = tail;
+        while let Some(at) = cursor {
+            let item = &self.items[self.positions[at].item];
+            if item
+                .record
+                .is_some_and(|record| self.attachments.contains(&record))
+            {
+                cursor = self.positions[at].previous;
+                continue;
+            }
+            if item.head || item.part_of.is_some() {
+                return Err(Failure::new(
+                    path,
+                    "rendered beside a tool result: the one framed case held the text with a trailing newline, not the exact text; not built",
+                ));
+            }
+            if self.positions[at].item == self.span_gap {
+                return Err(Failure::new(
+                    path,
+                    "rendered after a span of unknown items: whether a tool result is beside it is unknown",
+                ));
+            }
+            break;
+        }
+        Ok(())
     }
 
     /// An attachment recorded before its rendering was (S3): the members
@@ -1967,8 +2026,8 @@ impl Builder {
                 ));
             }
         }
-        // Each item's own place: why its message ended, and the call it
-        // answers, the nearest place holding that call on its own line (C1).
+        // Each item's own place: the call it answers, the nearest place
+        // holding that call on its own line (C1).
         for at in 0..self.items.len() {
             let Some(own) = self.items[at].original else {
                 continue;
@@ -1997,37 +2056,53 @@ impl Builder {
                     mark.responds_to.push(target);
                 }
             }
-            let ends = self.items[at].ends.clone();
-            let mark = marks.entry(node).or_default();
-            for term in ends {
-                if !mark.ends.contains(&term) {
-                    mark.ends.push(term);
-                }
-            }
         }
         for (node, annotations) in &marks {
             out += annotate_node(*node, annotations);
         }
         // Witnesses: one per node a record holds, and one occurrence of it
-        // per record, holding that record's claims together.
-        let mut held: BTreeMap<usize, Vec<Id>> = BTreeMap::new();
+        // per record, holding that record's claims together. Why the
+        // sampling of an item stopped is a claim of its record's occurrence
+        // on the item's node, never of the node (M1): two records that
+        // converge on one node keep each its own `ends`.
+        let mut held: BTreeMap<usize, Vec<(Id, Vec<Id>)>> = BTreeMap::new();
         for item in &self.items {
-            if let (Some(record), Some(at)) = (item.record, item.original) {
-                let node = self.positions[at].node;
-                let nodes = held.entry(record).or_default();
-                if !nodes.contains(&node) {
-                    nodes.push(node);
+            let (Some(record), Some(at)) = (item.record, item.original) else {
+                if !item.ends.is_empty() {
+                    return Err(Failure::new(
+                        "{assistant}.message{message}.stop_reason",
+                        "a message end on an item no window holds",
+                    ));
+                }
+                continue;
+            };
+            let node = self.positions[at].node;
+            let nodes = held.entry(record).or_default();
+            let own = match nodes.iter().position(|(held, _)| *held == node) {
+                Some(own) => own,
+                None => {
+                    nodes.push((node, Vec::new()));
+                    nodes.len() - 1
+                }
+            };
+            for term in &item.ends {
+                if !nodes[own].1.contains(term) {
+                    nodes[own].1.push(*term);
                 }
             }
         }
         for (record, nodes) in held {
             let claims = self.claims.get(&record).cloned().unwrap_or_default();
-            for node in nodes {
+            for (node, ends) in nodes {
                 let built = witness(SOURCE_CLAUDE_CODE, node)
                     .map_err(|_| Failure::new("<witness>", "a witness does not build"))?;
                 let id = built.root().expect("a witness is rooted");
                 out += unexported(built);
-                let built = occurrence(id, claims.clone()).map_err(|_| {
+                let claims = WitnessAnnotations {
+                    ends,
+                    ..claims.clone()
+                };
+                let built = occurrence(id, claims).map_err(|_| {
                     Failure::new("<witness>", "a witness occurrence does not build")
                 })?;
                 out += unexported(built);

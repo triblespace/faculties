@@ -479,6 +479,9 @@ pub enum Structure {
 pub enum Decode {
     /// A string, exactly as decoded.
     Text,
+    /// A string followed by a constant text the rendering rule appends (a
+    /// rendering her window held with a trailing newline).
+    TextThen(&'static str),
     /// A base64 string: the decoded bytes, compared by hash.
     Base64,
     /// A number, by its exact token.

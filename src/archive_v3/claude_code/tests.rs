@@ -222,13 +222,46 @@ macro_rules! annotated {
     }};
 }
 
-fn ends_of(imported: &Imported, node: Id) -> Vec<Id> {
+/// Why the samplings held by `node` stopped: the `ends` of each occurrence
+/// of its witnesses, one list per occurrence, sorted (M1). The node itself
+/// never carries one.
+fn ends_by_occurrence(imported: &Imported, node: Id) -> Vec<Vec<Id>> {
     let facts = imported.fragment.facts();
-    find!(
+    let on_node: Vec<Id> = find!(
         term: Id,
         pattern!(facts, [{ node @ v3::node::ends: ?term }])
     )
-    .collect()
+    .collect();
+    assert!(on_node.is_empty(), "a node carries ends (M1)");
+    let occurrences: BTreeSet<Id> = find!(
+        occurrence: Id,
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: node },
+            { ?occurrence @ v3::occurrence::of: _?witness },
+        ])
+    )
+    .collect();
+    let mut out: Vec<Vec<Id>> = occurrences
+        .into_iter()
+        .map(|occurrence| {
+            let mut ends: Vec<Id> = find!(
+                term: Id,
+                pattern!(facts, [{ occurrence @ v3::witness::ends: ?term }])
+            )
+            .collect();
+            ends.sort();
+            ends
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The `ends` of the one occurrence `node` has.
+fn ends_of(imported: &Imported, node: Id) -> Vec<Id> {
+    let mut all = ends_by_occurrence(imported, node);
+    assert_eq!(all.len(), 1, "one occurrence");
+    all.pop().unwrap()
 }
 
 fn refused(source: &str) -> Failure {
@@ -504,6 +537,90 @@ fn rendered_attachments_are_what_she_saw() {
         refused(&source).path,
         "{attachment}.attachment{queued_command}.prompt[]"
     );
+}
+
+/// R1: a rendering marked `renderedBesideToolResult` with no result beside
+/// it on its line is its text plus a trailing newline. Beside a result, after
+/// an unknown span, in another role or with another mark it is refused.
+#[test]
+fn r1_a_rendering_beside_no_result_ends_with_a_newline() {
+    let moved = |uuid: &str, parent: &str, second: u32| {
+        json!({
+            "type": "attachment", "sessionId": "s-1", "uuid": uuid, "parentUuid": parent,
+            "timestamp": stamp(second), "cwd": "/synthetic", "version": "0.0.0",
+            "attachment": {"type": "remote_session_change", "url": "https://example.invalid/r"},
+            "rendered": [{"content": "Moved."}],
+            "renderedRole": "user",
+            "renderedBesideToolResult": true,
+        })
+    };
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Hi.")),
+        moved("x1", "u1", 1),
+        moved("x2", "x1", 2),
+        assistant("a1", "x2", 3, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    let imported = passes(&source);
+    assert_eq!(nodes_saying(&imported, "Moved.\n").len(), 2);
+    assert!(nodes_saying(&imported, "Moved.").is_empty());
+    let hello = witnessed_saying(&imported, "Hello.");
+    assert_eq!(window_before(&imported, hello).len(), 3 + 1 + 2);
+    // The gate holds the importer to it: the exact text fails.
+    let exact = source.replace(",\"renderedBesideToolResult\":true", "");
+    assert_ne!(exact, source);
+    let report = gate(&source, &import_ok(&exact));
+    assert!(!report.passed(), "the exact text passed the gate");
+
+    // Beside a result on its line, past another attachment's rendering.
+    let mut plain = moved("x0", "u2", 3);
+    plain
+        .as_object_mut()
+        .unwrap()
+        .remove("renderedBesideToolResult");
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Read it.")),
+        assistant(
+            "a1",
+            "u1",
+            1,
+            "m1",
+            call("t1", "Read", json!({"file_path": "/x"})),
+            json!("tool_use"),
+        ),
+        user("u2", Some("a1"), 2, result("t1", json!("x"))),
+        plain,
+        moved("x1", "x0", 4),
+        assistant("a2", "x1", 5, "m2", said("Read."), json!("end_turn")),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{attachment}.renderedBesideToolResult"
+    );
+    // After a span of unknown items.
+    let source = jsonl(&[
+        moved("x1", "outside", 1),
+        assistant("a1", "x1", 2, "m1", said("Hello."), json!("end_turn")),
+    ]);
+    assert_eq!(
+        refused(&source).path,
+        "{attachment}.renderedBesideToolResult"
+    );
+    // Another mark, another role, an empty part.
+    let mut other = moved("x1", "u1", 1);
+    other["renderedBesideToolResult"] = json!(false);
+    let source = jsonl(&[user("u1", None, 0, json!("Hi.")), other]);
+    assert_eq!(
+        refused(&source).path,
+        "{attachment}.renderedBesideToolResult"
+    );
+    let mut system = moved("x1", "u1", 1);
+    system["renderedRole"] = json!("system");
+    let source = jsonl(&[user("u1", None, 0, json!("Hi.")), system]);
+    assert_eq!(refused(&source).path, "{attachment}.rendered[].content");
+    let mut empty = moved("x1", "u1", 1);
+    empty["rendered"] = json!([{"content": ""}]);
+    let source = jsonl(&[user("u1", None, 0, json!("Hi.")), empty]);
+    assert_eq!(refused(&source).path, "{attachment}.rendered[].content");
 }
 
 /// S3: an attachment recorded before renderings were keeps its data as
@@ -951,6 +1068,39 @@ fn each_record_keeps_its_claims_together() {
     assert_ne!(claims[0].0, claims[1].0);
 }
 
+/// M1: why a sampling stopped is a claim of the record that holds it. Two
+/// records whose answers converge on one node keep each its own `ends`, on
+/// its own occurrence, and the node carries none.
+#[test]
+fn m1_each_record_keeps_its_own_end() {
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Say it.")),
+        assistant("a1", "u1", 1, "m1", said("Same."), json!("end_turn")),
+        assistant("a2", "u1", 2, "m2", said("Same."), json!("max_tokens")),
+    ]);
+    let imported = passes(&source);
+    let node = nodes_saying(&imported, "Same.");
+    assert_eq!(node.len(), 1, "one node, held by both records");
+    let mut expected = vec![
+        vec![v3::node::ends::END_TURN],
+        vec![v3::node::ends::MAX_TOKENS],
+    ];
+    expected.sort();
+    assert_eq!(ends_by_occurrence(&imported, node[0]), expected);
+    // A record whose message continues in a later record ends on the later
+    // record's item only: the first part's occurrence carries no end.
+    let source = jsonl(&[
+        user("u1", None, 0, json!("Go.")),
+        assistant("a1", "u1", 1, "m1", said("Part one."), json!(null)),
+        assistant("a2", "a1", 2, "m1", said("Part two."), json!("end_turn")),
+    ]);
+    let imported = passes(&source);
+    let one = witnessed_saying(&imported, "Part one.");
+    assert_eq!(ends_by_occurrence(&imported, one), vec![Vec::<Id>::new()]);
+    let two = witnessed_saying(&imported, "Part two.");
+    assert_eq!(ends_of(&imported, two), vec![v3::node::ends::END_TURN]);
+}
+
 /// I4: every record kind the table drops as machinery is one the importer
 /// names.
 #[test]
@@ -1223,8 +1373,6 @@ fn real_sample() {
     let mut passed = 0;
     let mut import_failed = 0;
     let mut gate_failed = 0;
-    let m1 = std::env::var_os("AV3_M1").is_some();
-    let mut unattributable = 0;
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let mut walk_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut gate_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -1252,12 +1400,6 @@ fn real_sample() {
                     .or_default() += 1;
             }
             Ok(mut fragment) => {
-                // AV3_M1: gate the output with each node's `ends` moved to
-                // its one occurrence (ruling M1), to see what else fails.
-                if m1 && gate::tests::occurrence_ends(&mut fragment).is_err() {
-                    unattributable += 1;
-                    continue;
-                }
                 let blobs = fragment.blobs_mut().snapshot().unwrap();
                 let report = gate::check(&TABLE, &bytes, fragment.facts(), &blobs);
                 if report.passed() {
@@ -1281,9 +1423,6 @@ fn real_sample() {
                 }
             }
         }
-    }
-    if m1 {
-        println!("AV3_M1: ends moved to occurrences; unattributable {unattributable}");
     }
     println!(
         "files {} passed {} import-failed {} gate-failed {}",

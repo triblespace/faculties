@@ -1505,6 +1505,7 @@ fn decode_applies(decode: Decode, value: &J) -> bool {
     match decode {
         Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
         Decode::Text
+        | Decode::TextThen(_)
         | Decode::Base64
         | Decode::Base64Url
         | Decode::DataUri
@@ -2860,6 +2861,9 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
         // `""` is never stored: it is no value.
         (Decode::Text, J::Str(text)) if text.is_empty() => Ok(Vec::new()),
         (Decode::Text, J::Str(text)) => one(Value::Text(text.clone())),
+        // What an empty rendering became is unverified: never a value.
+        (Decode::TextThen(_), J::Str(text)) if text.is_empty() => Err(Failure::Decode),
+        (Decode::TextThen(then), J::Str(text)) => one(Value::Text(format!("{text}{then}"))),
         (Decode::ConstText(text), _) => one(Value::Text(text.to_owned())),
         (Decode::ConstTerm(term), _) => one(Value::Term(term.to_owned())),
         (Decode::TextMap(map), value) => {

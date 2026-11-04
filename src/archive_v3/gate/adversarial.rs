@@ -2013,6 +2013,38 @@ fn import_raw(import: Importer, source: &str) -> Imported {
     Imported { fragment, blobs }
 }
 
+/// The output as importers placed it before M1: every occurrence's `ends`
+/// moved onto the node its witness projects to. The importer may already
+/// place them either way; the attack must move at least one.
+fn ends_on_nodes(mut f: Fragment) -> Fragment {
+    let occurrences: Vec<Id> = f
+        .facts()
+        .iter()
+        .filter(|t| *t.a() == v3::occurrence::of.id())
+        .map(|t| *t.e())
+        .collect();
+    let mut moved = 0;
+    for occurrence in occurrences {
+        let ends = of(f.facts(), occurrence, v3::witness::ends.id());
+        for witness in ids(f.facts(), occurrence, v3::occurrence::of.id()) {
+            for node in ids(f.facts(), witness, v3::witness::projects_to.id()) {
+                for t in &ends {
+                    add(&mut f, Trible::force(&node, t.a(), t.v::<GenId>()));
+                    moved += 1;
+                }
+            }
+        }
+        remove(&mut f, &ends);
+    }
+    let on_nodes = f
+        .facts()
+        .iter()
+        .filter(|t| *t.a() == v3::node::ends.id())
+        .count();
+    assert!(moved > 0 || on_nodes > 0, "no ends to move onto a node");
+    f
+}
+
 /// A regenerated answer: two records with the same text after one prompt,
 /// one stopping at its end and one at its token limit. They converge on one
 /// node.
@@ -2097,7 +2129,7 @@ fn round4_cases() -> Vec<(&'static str, Report)> {
     // M1b the stop on the node, as the importers placed it before M1.
     out.push((
         "M1b ends on the node, not on its occurrence",
-        run(&s, import_raw(import, &s).fragment),
+        run(&s, ends_on_nodes(import_raw(import, &s).fragment)),
     ));
     // M1c/M1d a regenerated answer: the two stops swapped between its
     // records, or both on the node.
@@ -2115,7 +2147,7 @@ fn round4_cases() -> Vec<(&'static str, Report)> {
     }
     out.push((
         "M1d a regeneration's two stops on its one node",
-        run(&sg, import_raw(import, &sg).fragment),
+        run(&sg, ends_on_nodes(import_raw(import, &sg).fragment)),
     ));
     // M1e Codex: the abort's stop on his prompt's occurrence (X5 under M1).
     {
