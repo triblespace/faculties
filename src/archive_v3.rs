@@ -24,6 +24,7 @@ use crate::blockdag;
 use crate::schemas::archive_v3 as schema;
 
 pub mod claude_code;
+pub mod codex;
 pub mod fields;
 pub mod gate;
 pub mod media_type;

@@ -29,7 +29,8 @@ use hifitime::{Duration, Epoch};
 
 use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
 use crate::archive_v3::fields::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order, Structure, Windows,
+    Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Mirror, Order, Structure,
+    Windows,
 };
 
 /// What B found in one unit.
@@ -44,10 +45,46 @@ pub struct Walked {
     records: Vec<RecordLinks>,
     ids: HashMap<String, Vec<usize>>,
     windows: Option<Windows>,
+    order: Option<Order>,
     /// Anchor id -> the first compaction record that names it.
     anchors: HashMap<String, usize>,
     /// Each record's prefix record: the latest one before it in the file.
     prefixes: Vec<Option<usize>>,
+    /// [`Order::File`]: the record before each one that holds items.
+    file_parent: Vec<Option<usize>>,
+    /// [`Order::File`]: what precedes each record's items, as the opening
+    /// (header and prefix items) and the line's last place in the arena.
+    file_trails: Vec<FileTrail>,
+    /// Places on a line: (item, previous place).
+    file_arena: Vec<(usize, Option<usize>)>,
+    /// Values at the paths unit mirrors name: path -> exact hashes, and the
+    /// strings themselves.
+    watched: HashMap<String, (std::collections::HashSet<[u8; 32]>, Vec<String>)>,
+    /// Unit mirrors to check once the whole unit is read: (path, mirror,
+    /// the value's hash, the string when it is one, occurrence label).
+    pending: Vec<(String, Mirror, [u8; 32], Option<String>, String)>,
+}
+
+/// What precedes one record's items under [`Order::File`].
+#[derive(Clone, Debug, Default)]
+struct FileTrail {
+    opening: Vec<usize>,
+    tail: Option<usize>,
+    /// A rollback the line could not take came before it.
+    broken: bool,
+}
+
+/// What a record is under [`Order::File`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FileKind {
+    #[default]
+    Content,
+    Header,
+    Prefix,
+    Replace,
+    Turn,
+    /// How many turns, when the count is one.
+    Rollback(Option<usize>),
 }
 
 /// The windows behind one record, as hashes: what precedes its own items
@@ -101,6 +138,8 @@ struct RecordLinks {
     /// The request's settings header ([`Windows::header`]), an item that is
     /// none of its own.
     header: Option<usize>,
+    /// Its kind under [`Order::File`].
+    file: FileKind,
 }
 
 /// Who an item in a window speaks for, as the window's messages count.
@@ -149,6 +188,9 @@ impl Walked {
 
     /// The record's parent by the order rule, when the unit holds it.
     pub fn parent(&self, record: usize) -> Option<usize> {
+        if let Some(Order::File(_)) = self.order {
+            return self.file_parent.get(record).copied().flatten();
+        }
         self.records[record]
             .parent
             .as_deref()
@@ -289,6 +331,9 @@ impl Walked {
     /// as item indices. `None` when the edits the source marks cannot be
     /// applied to it (a row says where).
     pub fn window(&self, record: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        if let Some(Order::File(_)) = self.order {
+            return self.file_window(record);
+        }
         let ordered = |at: usize| -> Vec<usize> {
             self.slots(at)
                 .into_iter()
@@ -456,6 +501,9 @@ impl Walked {
         id: &dyn Fn(usize) -> u32,
         step: &dyn Fn(&[u8; 32], u32) -> [u8; 32],
     ) -> Vec<Option<Lines>> {
+        if let Some(Order::File(_)) = self.order {
+            return self.file_lines(id, step);
+        }
         let fold = |hash: [u8; 32], items: &[usize]| {
             items.iter().fold(hash, |hash, &item| step(&hash, id(item)))
         };
@@ -483,6 +531,116 @@ impl Walked {
             }
         }
         lines
+    }
+
+    /// [`Order::File`]: the window behind `record`, from the trail the
+    /// walk left ([`Walker::trails`]).
+    fn file_window(&self, record: usize) -> Option<(Vec<usize>, Vec<usize>)> {
+        let trail = self.file_trails.get(record)?;
+        if trail.broken {
+            return None;
+        }
+        let mut line = Vec::new();
+        let mut cursor = trail.tail;
+        while let Some(at) = cursor {
+            line.push(self.file_arena[at].0);
+            cursor = self.file_arena[at].1;
+        }
+        line.reverse();
+        let mut before = trail.opening.clone();
+        before.extend(line);
+        Some((before, self.ordered(record)))
+    }
+
+    /// [`Order::File`]: the hash of the window behind every record, in one
+    /// pass.
+    fn file_lines(
+        &self,
+        id: &dyn Fn(usize) -> u32,
+        step: &dyn Fn(&[u8; 32], u32) -> [u8; 32],
+    ) -> Vec<Option<Lines>> {
+        let fold = |hash: [u8; 32], items: &[usize]| {
+            items.iter().fold(hash, |hash, &item| step(&hash, id(item)))
+        };
+        let lines_of = |before: Option<[u8; 32]>| Lines {
+            before,
+            line: None,
+            unedited: [0; 32],
+            prefix: None,
+            header: None,
+        };
+        let mut out = Vec::with_capacity(self.records.len());
+        let mut header: Vec<usize> = Vec::new();
+        let mut prefix: Vec<usize> = Vec::new();
+        let mut line: Vec<usize> = Vec::new();
+        // The hash after each item of the line.
+        let mut hashes: Vec<[u8; 32]> = Vec::new();
+        let mut base = [0u8; 32];
+        let mut turns: Vec<usize> = Vec::new();
+        let mut broken = false;
+        let rehash = |base: [u8; 32], line: &[usize], hashes: &mut Vec<[u8; 32]>| {
+            hashes.clear();
+            let mut hash = base;
+            for &item in line {
+                hash = step(&hash, id(item));
+                hashes.push(hash);
+            }
+        };
+        for at in 0..self.records.len() {
+            let own = self.ordered(at);
+            let tip = hashes.last().copied().unwrap_or(base);
+            match self.records[at].file {
+                FileKind::Header => {
+                    out.push(Some(lines_of(Some([0; 32]))));
+                    header = own;
+                }
+                FileKind::Prefix => {
+                    out.push(Some(lines_of(Some(fold([0; 32], &header)))));
+                    prefix = own;
+                }
+                FileKind::Replace => {
+                    out.push(Some(lines_of(Some(base))));
+                    line = own;
+                    turns.clear();
+                    broken = false;
+                    rehash(base, &line, &mut hashes);
+                }
+                FileKind::Turn => {
+                    out.push(Some(lines_of((!broken).then_some(tip))));
+                    turns.push(line.len());
+                }
+                FileKind::Rollback(count) => {
+                    out.push(Some(lines_of((!broken).then_some(tip))));
+                    match count {
+                        Some(0) => {}
+                        Some(count) if count <= turns.len() && !broken => {
+                            let keep = turns.len() - count;
+                            line.truncate(turns[keep]);
+                            hashes.truncate(turns[keep]);
+                            turns.truncate(keep);
+                        }
+                        _ => broken = true,
+                    }
+                }
+                FileKind::Content => {
+                    out.push(Some(lines_of((!broken).then_some(tip))));
+                    let mut hash = tip;
+                    for item in own {
+                        hash = step(&hash, id(item));
+                        line.push(item);
+                        hashes.push(hash);
+                    }
+                }
+            }
+            if matches!(self.records[at].file, FileKind::Header | FileKind::Prefix) {
+                let opened = fold(fold([0; 32], &header), &prefix);
+                if opened != base {
+                    base = opened;
+                    rehash(base, &line, &mut hashes);
+                }
+            }
+        }
+        out
     }
 
     fn line_of(
@@ -577,9 +735,16 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         table,
         out: Walked {
             windows: Some(table.windows),
+            order: Some(table.order),
             ..Walked::default()
         },
+        index: HashMap::new(),
+        by_path: HashMap::new(),
     };
+    for entry in table.entries {
+        walker.by_path.entry(entry.path).or_default().push(entry);
+    }
+    walker.watch();
     if table.jsonl {
         for (line, bytes) in source.split(|byte| *byte == b'\n').enumerate() {
             if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -847,6 +1012,10 @@ impl<'a> Parser<'a> {
 struct Walker<'t> {
     table: &'t FieldTable,
     out: Walked,
+    /// The current record's items by (levels, modality).
+    index: HashMap<(Vec<(String, usize)>, String), usize>,
+    /// The table's entries by path, in table order.
+    by_path: HashMap<&'static str, Vec<&'static Entry>>,
 }
 
 /// Where the walk is: the record, its scalar fields, array indices within
@@ -966,9 +1135,14 @@ fn applies(entry: &Entry, value: &J) -> bool {
 fn decode_applies(decode: Decode, value: &J) -> bool {
     match decode {
         Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
-        Decode::Text | Decode::Base64 | Decode::MediaType | Decode::Timestamp => {
-            matches!(value, J::Str(_))
-        }
+        Decode::Text
+        | Decode::Base64
+        | Decode::Base64Url
+        | Decode::DataUri
+        | Decode::DataUriType
+        | Decode::JsonText
+        | Decode::MediaType
+        | Decode::Timestamp => matches!(value, J::Str(_)),
         Decode::Number | Decode::UnixSeconds => matches!(value, J::Num(_)),
         Decode::Bool => matches!(value, J::Bool(_)),
         Decode::Term(_) | Decode::TextMap(_) => is_scalar(value),
@@ -1019,22 +1193,46 @@ impl<'t> Walker<'t> {
         }
     }
 
+    /// The object's shape: the value of each discriminator member it
+    /// carries, in table order, joined by `}{`.
     fn discriminator(&self, value: &J) -> Option<String> {
         let J::Obj(members) = value else { return None };
-        self.table
+        let shapes: Vec<String> = self
+            .table
             .discriminators
             .iter()
-            .find_map(|key| match members.get(*key) {
+            .filter_map(|key| match members.get(*key) {
                 Some(J::Str(shape)) if id_like(shape) => Some("<id>".to_owned()),
                 Some(J::Str(shape)) if printable(shape) => Some(shape.clone()),
                 Some(J::Str(_)) => Some("?".to_owned()),
                 _ => None,
             })
+            .collect();
+        (!shapes.is_empty()).then(|| shapes.join("}{"))
+    }
+
+    /// Note the paths whose values unit mirrors compare against.
+    fn watch(&mut self) {
+        for entry in self.table.entries {
+            if let Class::Drop(DropReason::Mirror(Mirror::Unit(paths) | Mirror::Within(paths))) =
+                entry.class
+            {
+                for path in paths {
+                    self.out.watched.entry((*path).to_owned()).or_default();
+                }
+            }
+        }
     }
 
     fn value(&mut self, value: &J, path: &str, parent: Option<&J>, mut ctx: Ctx) {
         if path == self.table.record && ctx.record.is_none() {
             ctx = self.start_record(value, ctx);
+        }
+        if let Some((hashes, strings)) = self.out.watched.get_mut(path) {
+            hashes.insert(value_hash(value));
+            if let J::Str(text) = value {
+                strings.push(text.clone());
+            }
         }
         let shape = self.discriminator(value);
         let shaped = shape.as_ref().map(|shape| format!("{path}{{{shape}}}"));
@@ -1044,11 +1242,13 @@ impl<'t> Walker<'t> {
             }
         }
 
-        let table: &'t FieldTable = self.table;
+        let by_path = &self.by_path;
         let candidates = |at: &str| -> Vec<&'t Entry> {
-            let mut entries: Vec<&'t Entry> = table
-                .entries
-                .iter()
+            let mut entries: Vec<&'t Entry> = by_path
+                .get(at)
+                .into_iter()
+                .flatten()
+                .copied()
                 .filter(|entry| {
                     entry.path == at
                         && applies(entry, value)
@@ -1129,16 +1329,22 @@ impl<'t> Walker<'t> {
         let mut fields = BTreeMap::new();
         let mut present = BTreeSet::new();
         scalars(value, "", &mut fields, &mut present);
-        let Order::Parents { id, parent } = self.table.order;
         let field = |name: &str| fields.get(name).filter(|v| *v != "null").cloned();
         let shape = self.discriminator(value);
         let windows = self.table.windows;
         let mut links = RecordLinks {
-            id: field(id),
-            parent: field(parent),
             shape: shape.clone(),
             ..RecordLinks::default()
         };
+        match self.table.order {
+            Order::Parents { id, parent } => {
+                links.id = field(id);
+                links.parent = field(parent);
+            }
+            Order::File(rules) => {
+                links.file = file_kind(&rules, &fields, &present);
+            }
+        }
         if let Some(compaction) = windows.compaction {
             if shape.as_deref() == Some(compaction.shape) {
                 if let (Some(head), Some(tail), Some(anchor)) = (
@@ -1177,6 +1383,7 @@ impl<'t> Walker<'t> {
             }
         }
         let record = self.out.records.len();
+        self.index = HashMap::new();
         if let Some(id) = &links.id {
             self.out.ids.entry(id.clone()).or_default().push(record);
         }
@@ -1210,10 +1417,8 @@ impl<'t> Walker<'t> {
             self.out.items[item].tokens.insert(token.clone());
         } else if let (Some(record), false) = (ctx.record, token.modality.is_empty()) {
             let links = &mut self.out.records[record];
-            let found = links.items.iter().copied().find(|&item| {
-                self.out.items[item].levels == ctx.levels
-                    && self.out.items[item].modality == token.modality
-            });
+            let key = (ctx.levels.clone(), token.modality.clone());
+            let found = self.index.get(&key).copied();
             let item = match found {
                 Some(item) => item,
                 None => {
@@ -1225,6 +1430,7 @@ impl<'t> Walker<'t> {
                         path: path.to_owned(),
                     });
                     links.items.push(self.out.items.len() - 1);
+                    self.index.insert(key, self.out.items.len() - 1);
                     self.out.items.len() - 1
                 }
             };
@@ -1365,6 +1571,29 @@ impl<'t> Walker<'t> {
                         }
                     }
                 }
+                DropReason::Mirror(mirror @ (Mirror::Unit(_) | Mirror::Within(_))) => {
+                    let text = match value {
+                        J::Str(text) => Some(text.clone()),
+                        _ => None,
+                    };
+                    if matches!(mirror, Mirror::Within(_)) && text.is_none() {
+                        self.row(path, Kind::Mirror, ctx);
+                        return;
+                    }
+                    let label = format!("{}:{:?}", ctx.line, ctx.index);
+                    self.out.pending.push((
+                        path.to_owned(),
+                        mirror,
+                        value_hash(value),
+                        text,
+                        label,
+                    ));
+                }
+                DropReason::Mirror(Mirror::Field(field)) => {
+                    if !field_at(&ctx.root, field).is_some_and(|original| same(original, value)) {
+                        self.row(path, Kind::Mirror, ctx);
+                    }
+                }
                 DropReason::Mirror(Mirror::Children) => {
                     let ids: Option<Vec<String>> = match value {
                         J::Arr(elements) => elements
@@ -1439,7 +1668,10 @@ impl<'t> Walker<'t> {
                     .collect()
             };
             if held(first) != held(record) {
-                let Order::Parents { id, .. } = self.table.order;
+                let id = match self.table.order {
+                    Order::Parents { id, .. } => id,
+                    Order::File(_) => "id",
+                };
                 let shape = self.out.records[record].shape.as_deref().unwrap_or("?");
                 rows.push((
                     format!("{{{shape}}}.{id}"),
@@ -1464,8 +1696,210 @@ impl<'t> Walker<'t> {
                 rows.push((path.clone(), Kind::Mirror, format!("record {at}")));
             }
         }
+        if let Order::File(_) = self.table.order {
+            self.trails();
+        }
+        let mut last = None;
+        for record in 0..self.out.records.len() {
+            self.out.file_parent.push(last);
+            if !self.out.records[record].items.is_empty() {
+                last = Some(record);
+            }
+        }
+        let mut memo: HashMap<([u8; 32], usize), bool> = HashMap::new();
+        for (path, mirror, hash, text, label) in std::mem::take(&mut self.out.pending) {
+            let key = match mirror {
+                Mirror::Unit(paths) | Mirror::Within(paths) => (hash, paths.as_ptr() as usize),
+                _ => (hash, 0),
+            };
+            if let Some(&held) = memo.get(&key) {
+                if !held {
+                    rows.push((path, Kind::Mirror, label));
+                }
+                continue;
+            }
+            let held = match mirror {
+                Mirror::Unit(paths) => paths.iter().any(|at| {
+                    self.out
+                        .watched
+                        .get(*at)
+                        .is_some_and(|(hashes, _)| hashes.contains(&hash))
+                }),
+                Mirror::Within(paths) => {
+                    paths.iter().any(|at| {
+                        self.out
+                            .watched
+                            .get(*at)
+                            .is_some_and(|(hashes, _)| hashes.contains(&hash))
+                    }) || text.as_deref().is_some_and(|text| {
+                        paths.iter().any(|at| {
+                            self.out.watched.get(*at).is_some_and(|(_, strings)| {
+                                strings.iter().any(|haystack| haystack.contains(text))
+                            })
+                        })
+                    })
+                }
+                _ => true,
+            };
+            memo.insert(key, held);
+            if !held {
+                rows.push((path, Kind::Mirror, label));
+            }
+        }
         self.out.rows.extend(rows);
     }
+}
+
+impl Walker<'_> {
+    /// [`Order::File`]: one pass over the records, leaving for each what
+    /// precedes its items.
+    fn trails(&mut self) {
+        let out = &mut self.out;
+        let mut header: Vec<usize> = Vec::new();
+        let mut prefix: Vec<usize> = Vec::new();
+        // The line's places in the arena, in order.
+        let mut line: Vec<usize> = Vec::new();
+        let mut turns: Vec<usize> = Vec::new();
+        let mut broken = false;
+        for at in 0..out.records.len() {
+            let own = out.ordered(at);
+            let opening = |header: &[usize], prefix: &[usize]| -> Vec<usize> {
+                header.iter().chain(prefix).copied().collect()
+            };
+            let kind = out.records[at].file;
+            let trail = match kind {
+                FileKind::Header => FileTrail::default(),
+                FileKind::Prefix => FileTrail {
+                    opening: header.clone(),
+                    ..FileTrail::default()
+                },
+                FileKind::Replace => FileTrail {
+                    opening: opening(&header, &prefix),
+                    ..FileTrail::default()
+                },
+                _ => FileTrail {
+                    opening: opening(&header, &prefix),
+                    tail: line.last().copied(),
+                    broken,
+                },
+            };
+            out.file_trails.push(trail);
+            let mut push = |line: &mut Vec<usize>, item: usize| {
+                let previous = line.last().copied();
+                out.file_arena.push((item, previous));
+                line.push(out.file_arena.len() - 1);
+            };
+            match kind {
+                FileKind::Header => header = own,
+                FileKind::Prefix => prefix = own,
+                FileKind::Replace => {
+                    line.clear();
+                    for item in own {
+                        push(&mut line, item);
+                    }
+                    turns.clear();
+                    broken = false;
+                }
+                FileKind::Turn => turns.push(line.len()),
+                FileKind::Rollback(count) => match count {
+                    Some(0) => {}
+                    Some(count) if count <= turns.len() && !broken => {
+                        let keep = turns.len() - count;
+                        line.truncate(turns[keep]);
+                        turns.truncate(keep);
+                    }
+                    _ => broken = true,
+                },
+                FileKind::Content => {
+                    for item in own {
+                        push(&mut line, item);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A record's kind under [`Order::File`]: the first rule whose conditions
+/// all hold.
+fn file_kind(
+    rules: &FileWindows,
+    fields: &BTreeMap<String, String>,
+    present: &BTreeSet<String>,
+) -> FileKind {
+    let is = |when: &[Cond]| !when.is_empty() && holds(when, fields, present, None);
+    if is(rules.header) {
+        FileKind::Header
+    } else if is(rules.prefix) {
+        FileKind::Prefix
+    } else if is(rules.replace) {
+        FileKind::Replace
+    } else if is(rules.turn) {
+        FileKind::Turn
+    } else if is(rules.rollback) {
+        FileKind::Rollback(
+            fields
+                .get(rules.rollback_count)
+                .and_then(|count| count.parse::<usize>().ok()),
+        )
+    } else {
+        FileKind::Content
+    }
+}
+
+/// A hash of a JSON value, members in name order, numbers by token.
+fn value_hash(value: &J) -> [u8; 32] {
+    fn feed(value: &J, hasher: &mut blake3::Hasher) {
+        match value {
+            J::Null => {
+                hasher.update(b"n");
+            }
+            J::Bool(b) => {
+                hasher.update(if *b { b"t" } else { b"f" });
+            }
+            J::Num(token) => {
+                hasher.update(b"#");
+                hasher.update(&(token.len() as u64).to_le_bytes());
+                hasher.update(token.as_bytes());
+            }
+            J::Str(text) => {
+                hasher.update(b"s");
+                hasher.update(&(text.len() as u64).to_le_bytes());
+                hasher.update(text.as_bytes());
+            }
+            J::Arr(elements) => {
+                hasher.update(b"[");
+                hasher.update(&(elements.len() as u64).to_le_bytes());
+                for element in elements {
+                    feed(element, hasher);
+                }
+            }
+            J::Obj(members) => {
+                hasher.update(b"{");
+                hasher.update(&(members.len() as u64).to_le_bytes());
+                for (name, member) in members {
+                    hasher.update(&(name.len() as u64).to_le_bytes());
+                    hasher.update(name.as_bytes());
+                    feed(member, hasher);
+                }
+            }
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    feed(value, &mut hasher);
+    *hasher.finalize().as_bytes()
+}
+
+/// The value at a record-relative member path.
+fn field_at<'j>(root: &'j J, path: &str) -> Option<&'j J> {
+    let mut at = Some(root);
+    for step in path.split('.') {
+        at = match at {
+            Some(J::Obj(members)) => members.get(step),
+            _ => None,
+        };
+    }
+    at
 }
 
 /// The elements of the array at a record-relative path (none when there is
@@ -1533,6 +1967,34 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
                 .map_err(|_| Failure::Decode)?;
             one(Value::Bytes(blake3::hash(&bytes).to_hex().to_string()))
         }
+        (Decode::Base64Url, J::Str(text)) => {
+            let engine = base64::engine::GeneralPurpose::new(
+                &base64::alphabet::URL_SAFE,
+                base64::engine::GeneralPurposeConfig::new()
+                    .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+            );
+            let bytes = engine.decode(text).map_err(|_| Failure::Decode)?;
+            one(Value::Bytes(blake3::hash(&bytes).to_hex().to_string()))
+        }
+        (Decode::DataUri, J::Str(text)) => {
+            let (_, data) = data_uri(text).ok_or(Failure::Decode)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .map_err(|_| Failure::Decode)?;
+            one(Value::Bytes(blake3::hash(&bytes).to_hex().to_string()))
+        }
+        (Decode::DataUriType, J::Str(text)) => {
+            let (media_type, _) = data_uri(text).ok_or(Failure::Decode)?;
+            one(Value::Text(
+                canonical_media_type(media_type).ok_or(Failure::Decode)?,
+            ))
+        }
+        (Decode::JsonText, J::Str(text)) => {
+            let parsed = Parser::document(text.as_bytes()).map_err(|_| Failure::Decode)?;
+            let mut leaves = Vec::new();
+            json_leaves(&parsed, &mut String::new(), &mut leaves);
+            Ok(leaves)
+        }
         (Decode::Number, J::Num(token)) => one(Value::Number(token.clone())),
         (Decode::Bool, J::Bool(b)) => one(Value::Bool(*b)),
         (Decode::Json, value) => {
@@ -1566,6 +2028,14 @@ fn decode_values(decode: Decode, value: &J) -> Result<Vec<Value>, Failure> {
         }
         _ => Err(Failure::Decode),
     }
+}
+
+/// A base64 `data:` URI's media type and data.
+fn data_uri(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("data:")?;
+    let (head, data) = rest.split_once(',')?;
+    let media_type = head.strip_suffix(";base64")?;
+    Some((media_type, data))
 }
 
 /// Every leaf of a JSON value under its JSON Pointer.

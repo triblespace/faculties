@@ -8,7 +8,7 @@
 //! under, for the importer to build.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use base64::Engine;
 
@@ -20,7 +20,7 @@ use crate::archive_v3::fields::{
 use crate::archive_v3::MediaType;
 
 /// A name safe to put in a path: field names and vocabulary only.
-pub(super) fn printable(name: &str) -> bool {
+pub(crate) fn printable(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
@@ -58,7 +58,7 @@ fn fields(value: &Json, prefix: &str, record: &mut Record) {
 
 /// One value that is a member of an assembled structure fact.
 #[derive(Debug)]
-pub(super) struct Member<'a> {
+pub(crate) struct Member<'a> {
     /// `(array path, position)` of each array it sits in, outermost first.
     pub levels: Vec<(String, usize)>,
     /// Its JSON Pointer in the assembled structure.
@@ -69,9 +69,23 @@ pub(super) struct Member<'a> {
 }
 
 /// Check one record (one JSONL line) against `table`.
-pub(super) fn record<'a>(
+pub(crate) fn record<'a>(
     table: &'static FieldTable,
     root: &'a Json,
+) -> Result<Vec<Member<'a>>, Failure> {
+    let mut unit = UnitMirrors::new(table);
+    let members = record_in(table, root, &mut unit)?;
+    unit.verify()?;
+    Ok(members)
+}
+
+/// Check one record of a unit whose mirrors may reach across records: the
+/// unit mirrors are verified by [`UnitMirrors::verify`] once every record is
+/// checked.
+pub(crate) fn record_in<'a>(
+    table: &'static FieldTable,
+    root: &'a Json,
+    unit: &mut UnitMirrors,
 ) -> Result<Vec<Member<'a>>, Failure> {
     let mut record = Record {
         root,
@@ -83,30 +97,122 @@ pub(super) fn record<'a>(
         table,
         record,
         members: RefCell::new(Vec::new()),
+        unit: RefCell::new(unit),
     };
     checker.value(root, "", None, &mut Vec::new())?;
     Ok(checker.members.into_inner())
 }
 
-struct Checker<'a> {
+/// The values a unit's mirrors compare against, and the mirrors still to
+/// check.
+pub(crate) struct UnitMirrors {
+    /// The table's entries by path, in table order.
+    by_path: HashMap<&'static str, Vec<&'static Entry>>,
+    watched: HashMap<&'static str, (HashSet<[u8; 32]>, Vec<String>)>,
+    /// (path, mirror, the value's hash, the string when it is one)
+    pending: Vec<(String, Mirror, [u8; 32], Option<String>)>,
+}
+
+impl UnitMirrors {
+    pub(crate) fn new(table: &'static FieldTable) -> Self {
+        let mut watched = HashMap::new();
+        let mut by_path: HashMap<&'static str, Vec<&'static Entry>> = HashMap::new();
+        for entry in table.entries {
+            by_path.entry(entry.path).or_default().push(entry);
+        }
+        for entry in table.entries {
+            if let Class::Drop(DropReason::Mirror(Mirror::Unit(paths) | Mirror::Within(paths))) =
+                entry.class
+            {
+                for path in paths {
+                    watched.entry(*path).or_insert_with(Default::default);
+                }
+            }
+        }
+        UnitMirrors {
+            by_path,
+            watched,
+            pending: Vec::new(),
+        }
+    }
+
+    fn see(&mut self, path: &str, value: &Json) {
+        if let Some((hashes, strings)) = self.watched.get_mut(path) {
+            hashes.insert(value.hash());
+            if let Json::Str(text) = value {
+                strings.push(text.clone());
+            }
+        }
+    }
+
+    /// Every unit mirror equals (or sits inside) what it mirrors.
+    pub(crate) fn verify(&self) -> Result<(), Failure> {
+        let mut done: HashSet<([u8; 32], usize)> = HashSet::new();
+        for (path, mirror, hash, text) in &self.pending {
+            let key = match mirror {
+                Mirror::Unit(paths) | Mirror::Within(paths) => (*hash, paths.as_ptr() as usize),
+                _ => (*hash, 0),
+            };
+            if !done.insert(key) {
+                continue;
+            }
+            let equal = |paths: &[&str]| {
+                paths.iter().any(|at| {
+                    self.watched
+                        .get(at)
+                        .is_some_and(|(hashes, _)| hashes.contains(hash))
+                })
+            };
+            let held = match mirror {
+                Mirror::Unit(paths) => equal(paths),
+                Mirror::Within(paths) => {
+                    equal(paths)
+                        || text.as_deref().is_some_and(|text| {
+                            paths.iter().any(|at| {
+                                self.watched.get(at).is_some_and(|(_, strings)| {
+                                    strings.iter().any(|haystack| haystack.contains(text))
+                                })
+                            })
+                        })
+                }
+                _ => true,
+            };
+            if !held {
+                return Err(Failure::new(
+                    path,
+                    "a copy the unit does not hold what it copies",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct Checker<'a, 'u> {
     table: &'static FieldTable,
     record: Record<'a>,
     members: RefCell<Vec<Member<'a>>>,
+    unit: RefCell<&'u mut UnitMirrors>,
 }
 
 fn takes(decode: Decode, value: &Json) -> bool {
     match decode {
         Decode::Json | Decode::Member(_) | Decode::ConstText(_) | Decode::ConstTerm(_) => true,
-        Decode::Text | Decode::Base64 | Decode::MediaType | Decode::Timestamp => {
-            matches!(value, Json::Str(_))
-        }
+        Decode::Text
+        | Decode::Base64
+        | Decode::Base64Url
+        | Decode::DataUri
+        | Decode::DataUriType
+        | Decode::JsonText
+        | Decode::MediaType
+        | Decode::Timestamp => matches!(value, Json::Str(_)),
         Decode::Number | Decode::UnixSeconds => matches!(value, Json::Num(_)),
         Decode::Bool => matches!(value, Json::Bool(_)),
         Decode::Term(_) | Decode::TextMap(_) => value.is_scalar(),
     }
 }
 
-impl<'a> Checker<'a> {
+impl<'a, 'u> Checker<'a, 'u> {
     fn holds(&self, when: &[Cond], parent: Option<&Json>) -> bool {
         let sibling = |name: &str| parent.and_then(|p| p.get(name)).and_then(Json::spelling);
         let scalar = |field: &str| self.record.scalars.get(field);
@@ -132,11 +238,15 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn entries(&self, at: &str, value: &Json, parent: Option<&Json>) -> Vec<&Entry> {
-        let mut found: Vec<&Entry> = self
-            .table
-            .entries
-            .iter()
+    fn entries(&self, at: &str, value: &Json, parent: Option<&Json>) -> Vec<&'static Entry> {
+        let mut found: Vec<&'static Entry> = self
+            .unit
+            .borrow()
+            .by_path
+            .get(at)
+            .into_iter()
+            .flatten()
+            .copied()
             .filter(|entry| entry.path == at)
             .filter(|entry| Self::takes(entry, value) && self.holds(entry.when, parent))
             .collect();
@@ -154,15 +264,20 @@ impl<'a> Checker<'a> {
         found
     }
 
+    /// The object's shape: each discriminator member it carries, in table
+    /// order, joined by `}{`.
     fn shape(&self, value: &Json) -> Option<String> {
-        self.table
+        let shapes: Vec<String> = self
+            .table
             .discriminators
             .iter()
-            .find_map(|key| match value.get(key) {
+            .filter_map(|key| match value.get(key) {
                 Some(Json::Str(shape)) if printable(shape) => Some(shape.clone()),
                 Some(Json::Str(_)) => Some("?".to_owned()),
                 _ => None,
             })
+            .collect();
+        (!shapes.is_empty()).then(|| shapes.join("}{"))
     }
 
     fn value(
@@ -172,6 +287,7 @@ impl<'a> Checker<'a> {
         parent: Option<&'a Json>,
         levels: &mut Vec<(String, usize)>,
     ) -> Result<(), Failure> {
+        self.unit.borrow_mut().see(path, value);
         let shaped = self.shape(value).map(|shape| format!("{path}{{{shape}}}"));
         let mut entries = match &shaped {
             Some(shaped) => self.entries(shaped, value, parent),
@@ -235,6 +351,10 @@ impl<'a> Checker<'a> {
             (Decode::Base64, Json::Str(text)) => base64::engine::general_purpose::STANDARD
                 .decode(text)
                 .is_ok(),
+            (Decode::Base64Url, Json::Str(text)) => base64_url(text).is_some(),
+            (Decode::DataUri, Json::Str(text)) => data_uri(text).is_some(),
+            (Decode::DataUriType, Json::Str(text)) => data_uri(text).is_some(),
+            (Decode::JsonText, Json::Str(text)) => super::json::parse(text.as_bytes()).is_some(),
             (Decode::MediaType, Json::Str(text)) => MediaType::parse(text).is_ok(),
             (Decode::Timestamp, Json::Str(text)) => super::time(text).is_some(),
             (Decode::Term(map) | Decode::TextMap(map), value) => {
@@ -330,6 +450,29 @@ impl<'a> Checker<'a> {
                 }
                 Ok(())
             }
+            Class::Drop(DropReason::Mirror(mirror @ (Mirror::Unit(_) | Mirror::Within(_)))) => {
+                let text = value.str().map(str::to_owned);
+                if matches!(mirror, Mirror::Within(_)) && text.is_none() {
+                    return Err(Failure::new(path, "a copy inside text is not text"));
+                }
+                self.unit
+                    .borrow_mut()
+                    .pending
+                    .push((path.to_owned(), mirror, value.hash(), text));
+                Ok(())
+            }
+            Class::Drop(DropReason::Mirror(Mirror::Field(field))) => {
+                if self
+                    .record
+                    .root
+                    .at(field)
+                    .is_some_and(|original| original.same(value))
+                {
+                    Ok(())
+                } else {
+                    Err(Failure::new(path, "a mirror differs from what it mirrors"))
+                }
+            }
             Class::Drop(DropReason::Mirror(Mirror::Children)) => Err(Failure::new(
                 path,
                 "a children mirror is not checked by this importer",
@@ -337,4 +480,25 @@ impl<'a> Checker<'a> {
             Class::Open(why) => Err(Failure::new(path, why)),
         }
     }
+}
+
+/// The bytes of a URL-safe base64 string, padding optional.
+pub(crate) fn base64_url(text: &str) -> Option<Vec<u8>> {
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    let engine = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+    engine.decode(text).ok()
+}
+
+/// The media type and bytes of a base64 `data:` URI.
+pub(crate) fn data_uri(text: &str) -> Option<(MediaType, Vec<u8>)> {
+    let rest = text.strip_prefix("data:")?;
+    let (head, data) = rest.split_once(',')?;
+    let media_type = MediaType::parse(head.strip_suffix(";base64")?).ok()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    Some((media_type, bytes))
 }

@@ -114,6 +114,10 @@ pub mod fact {
         pub const HIGH: Id = id_hex!("10863E513113BE5B3AE552AD2DFC4E8B");
         pub const XHIGH: Id = id_hex!("DFE2D136739E4DB5B4BAF18F39FE79D8");
         pub const MAX: Id = id_hex!("58D87F5B61B6E9D109FA2E42C457DB8F");
+        /// Codex spellings beyond Anthropic's.
+        pub const ULTRA: Id = id_hex!("BD341342AF01BD365306D6A254666130");
+        pub const MINIMAL: Id = id_hex!("01D175081F6BC4A578CB62D45FF006CC");
+        pub const NONE: Id = id_hex!("D27217B196C7BB2041EC1CAB75873373");
 
         pub const SPECS: &[(Id, &str)] = &[
             (LOW, "low"),
@@ -121,6 +125,9 @@ pub mod fact {
             (HIGH, "high"),
             (XHIGH, "xhigh"),
             (MAX, "max"),
+            (ULTRA, "ultra"),
+            (MINIMAL, "minimal"),
+            (NONE, "none"),
         ];
     }
 

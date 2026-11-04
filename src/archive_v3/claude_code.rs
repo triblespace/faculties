@@ -74,7 +74,7 @@ use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
 use crate::schemas::blockdag::source_projection::SOURCE_CLAUDE_CODE;
 
-mod check;
+pub(crate) mod check;
 pub mod json;
 #[cfg(test)]
 mod tests;

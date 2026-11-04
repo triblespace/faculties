@@ -28,7 +28,9 @@
 //!   ([`FieldTable::id_keyed`]);
 //! - `{value}` follows an object that carries a discriminator member
 //!   ([`FieldTable::discriminators`]), naming its shape: in Claude Code,
-//!   `{user}.message.content[]{tool_result}.content[]{text}.text`.
+//!   `{user}.message.content[]{tool_result}.content[]{text}.text`. An
+//!   object that carries several of them names each, in table order: in
+//!   Codex, `{response_item}.payload{message}{user}.content[]{input_text}.text`.
 //!
 //! The root of a JSONL line, and of a JSON document, is the empty path.
 //!
@@ -146,6 +148,39 @@ pub enum Order {
         id: &'static str,
         parent: &'static str,
     },
+    /// Records follow each other in file order: a record's items continue
+    /// the window the records before it left, shaped by the record kinds
+    /// [`FileWindows`] names. Within a record, array order holds.
+    File(FileWindows),
+}
+
+/// The window rules of a file-ordered source. Each kind is the records
+/// whose fields meet all its conditions.
+///
+/// A window is `header ++ prefix ++ line`:
+///
+/// - a `header` record's items become the header (none: no header), the
+///   settings she was sampled under; a later window opens with the latest;
+/// - a `prefix` record's items become the prefix (the system section);
+/// - a `replace` record starts a new line with its own items (a compaction
+///   installs what it holds);
+/// - a `turn` record marks where a turn starts on the line;
+/// - a `rollback` record cuts the line back to the start of its last
+///   `rollback_count` turns;
+/// - any other record's items extend the line.
+///
+/// When the header or the prefix changes, the line is the same items
+/// under the new one: a window that differs branches at the first
+/// difference.
+#[derive(Clone, Copy, Debug)]
+pub struct FileWindows {
+    pub header: &'static [Cond],
+    pub prefix: &'static [Cond],
+    pub replace: &'static [Cond],
+    pub turn: &'static [Cond],
+    pub rollback: &'static [Cond],
+    /// The record-relative field of a rollback that counts its turns.
+    pub rollback_count: &'static str,
 }
 
 /// One field path, under its conditions, and its class.
@@ -264,6 +299,16 @@ pub enum Decode {
     /// A constant vocabulary term the rendering rule fixes, whatever the
     /// value.
     ConstTerm(&'static str),
+    /// A URL-safe base64 string (padding optional): the decoded bytes,
+    /// compared by hash.
+    Base64Url,
+    /// A `data:` URI with base64 data: the decoded bytes, compared by hash.
+    DataUri,
+    /// The media type of a `data:` URI, in canonical spelling.
+    DataUriType,
+    /// A string that holds tool-defined JSON (call arguments she wrote), as
+    /// a `json_tree` like [`Decode::Json`].
+    JsonText,
     /// One named member of a structure fact the importer assembles from
     /// several source fields: the value's JSON leaves under this JSON
     /// Pointer (`/origin/kind`). The members of one object (one array
@@ -301,6 +346,16 @@ pub enum Mirror {
         key: &'static str,
         member: &'static str,
     },
+    /// Equal (JSON values order-free) to a value at one of these
+    /// normalized paths somewhere in the unit: a client log line that
+    /// copies a kept item.
+    Unit(&'static [&'static str]),
+    /// A string held inside a string at one of these normalized paths
+    /// somewhere in the unit: a setting the client rendered into a kept
+    /// message.
+    Within(&'static [&'static str]),
+    /// Equal to the record-relative field.
+    Field(&'static str),
 }
 
 impl Entry {
@@ -361,3 +416,4 @@ impl FieldTable {
 
 pub mod chatgpt;
 pub mod claude_code;
+pub mod codex;

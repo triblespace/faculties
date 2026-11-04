@@ -18,7 +18,7 @@ use triblespace::prelude::inlineencodings::NsTAIInterval;
 use super::walk::{probe, walk};
 use super::*;
 use crate::archive_v3::fields::{
-    chatgpt, claude_code, Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order,
+    chatgpt, claude_code, codex, Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Order,
     Structure,
 };
 use crate::archive_v3::{
@@ -298,7 +298,7 @@ fn seed_tables_name_only_v3_terms() {
             _ => Vec::new(),
         }
     };
-    for table in [&claude_code::TABLE, &chatgpt::TABLE, &TEST] {
+    for table in [&claude_code::TABLE, &chatgpt::TABLE, &codex::TABLE, &TEST] {
         for entry in table.entries {
             let check_term = |attribute: &str, decode: &Decode| {
                 if let Decode::Term(map) = decode {
@@ -1117,8 +1117,12 @@ fn g3_correlators_the_importer_never_reads_are_open() {
 /// table is named in the importer's source, or by a condition of the table.
 #[test]
 fn g3_the_importer_reads_every_correlator_it_declares() {
-    let importer = include_str!("../claude_code.rs");
-    let conditioned: Vec<&str> = claude_code::TABLE
+    unread_correlators(&claude_code::TABLE, include_str!("../claude_code.rs"));
+    unread_correlators(&codex::TABLE, include_str!("../codex.rs"));
+}
+
+fn unread_correlators(table: &'static FieldTable, importer: &str) {
+    let conditioned: Vec<&str> = table
         .entries
         .iter()
         .flat_map(|entry| entry.when.iter())
@@ -1134,7 +1138,7 @@ fn g3_the_importer_reads_every_correlator_it_declares() {
         })
         .collect();
     let mut unread = Vec::new();
-    for entry in claude_code::TABLE.entries {
+    for entry in table.entries {
         // A vocabulary reads its own value: the walk fails any value it
         // does not name.
         let declared = matches!(
@@ -1171,7 +1175,7 @@ fn g3_the_importer_reads_every_correlator_it_declares() {
 /// G5: the normalizer never touches a path the tables name.
 #[test]
 fn g5_no_table_path_looks_like_an_id() {
-    for table in [&claude_code::TABLE, &chatgpt::TABLE, &TEST] {
+    for table in [&claude_code::TABLE, &chatgpt::TABLE, &codex::TABLE, &TEST] {
         for entry in table.entries {
             assert_eq!(normalize(entry.path), entry.path);
         }

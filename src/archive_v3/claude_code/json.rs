@@ -90,6 +90,52 @@ impl Json {
         }
     }
 
+    /// A hash of the value: members in name order, numbers by token, so
+    /// two values hash alike exactly when [`Json::same`] holds.
+    pub fn hash(&self) -> [u8; 32] {
+        fn feed(value: &Json, hasher: &mut blake3::Hasher) {
+            match value {
+                Json::Null => {
+                    hasher.update(b"n");
+                }
+                Json::Bool(b) => {
+                    hasher.update(if *b { b"t" } else { b"f" });
+                }
+                Json::Num(token) => {
+                    hasher.update(b"#");
+                    hasher.update(&(token.len() as u64).to_le_bytes());
+                    hasher.update(token.as_bytes());
+                }
+                Json::Str(text) => {
+                    hasher.update(b"s");
+                    hasher.update(&(text.len() as u64).to_le_bytes());
+                    hasher.update(text.as_bytes());
+                }
+                Json::Arr(elements) => {
+                    hasher.update(b"[");
+                    hasher.update(&(elements.len() as u64).to_le_bytes());
+                    for element in elements {
+                        feed(element, hasher);
+                    }
+                }
+                Json::Obj(members) => {
+                    let mut sorted: Vec<&(String, Json)> = members.iter().collect();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    hasher.update(b"{");
+                    hasher.update(&(sorted.len() as u64).to_le_bytes());
+                    for (name, member) in sorted {
+                        hasher.update(&(name.len() as u64).to_le_bytes());
+                        hasher.update(name.as_bytes());
+                        feed(member, hasher);
+                    }
+                }
+            }
+        }
+        let mut hasher = blake3::Hasher::new();
+        feed(self, &mut hasher);
+        *hasher.finalize().as_bytes()
+    }
+
     /// JSON text with exact number tokens, for the `json_tree` importer.
     pub fn write(&self, out: &mut String) {
         match self {
