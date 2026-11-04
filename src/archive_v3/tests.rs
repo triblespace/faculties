@@ -924,7 +924,10 @@ fn two_originals_that_render_alike_share_the_fact_and_keep_two_occurrences() {
     let definition = fact(text(direction::IN, "exec: run a command")).unwrap();
     let held = node([], definition).unwrap();
     let node_id = held.root().unwrap();
-    let w = witness(SOURCE_CLAUDE_CODE, node_id).unwrap().root().unwrap();
+    let w = witness(SOURCE_CLAUDE_CODE, node_id)
+        .unwrap()
+        .root()
+        .unwrap();
     let padded = tree(r#"{"name":"exec","description":"run a command   "}"#);
     let plain = tree(r#"{"name":"exec","description":"run a command"}"#);
     let a = occurrence(
@@ -943,14 +946,21 @@ fn two_originals_that_render_alike_share_the_fact_and_keep_two_occurrences() {
         },
     )
     .unwrap();
-    assert_ne!(a.root(), b.root(), "each original is its own record's claim");
+    assert_ne!(
+        a.root(),
+        b.root(),
+        "each original is its own record's claim"
+    );
     // The original tree rides along with the occurrence that claims it.
     assert!(padded.facts().iter().all(|t| a.facts().contains(t)));
     // The node her window held is the same for both.
     assert_eq!(
-        node([], fact(text(direction::IN, "exec: run a command")).unwrap())
-            .unwrap()
-            .root(),
+        node(
+            [],
+            fact(text(direction::IN, "exec: run a command")).unwrap()
+        )
+        .unwrap()
+        .root(),
         Some(node_id)
     );
 }
