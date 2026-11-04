@@ -429,7 +429,11 @@ pub mod witness {
         /// valid or not. `claimed_media_type` holds the parsed reading of a
         /// valid one, so a record may carry both: the lexical claim and its
         /// meaning. The record's own claim, kept so a malformed spelling
-        /// never costs the bytes it labels. Minted with
+        /// never costs the bytes it labels. Also on a part
+        /// wrapper inside a `rendered_from` original: an intrinsic
+        /// `{ rendered_from: part, raw_media_type: spelling }`, a source's
+        /// claim about that one part, which keeps each spelling paired with
+        /// its part and leaves the part's own identity alone. Minted with
         /// `trible genid` 2026-11-04.
         "2E7CC61A930F8A142F9E65BB77D1D7AD" as pub raw_media_type: Handle<UTF8String>;
         /// OCCURRENCE CORE. A title the source gives that her window did not show.
@@ -451,7 +455,8 @@ pub mod witness {
         "3E44A059ADB3476BE9D32593ACB97912" as pub claimed_uri: Handle<UTF8String>;
         /// OCCURRENCE CORE. The original a fact her window held was rendered
         /// from: the root of any fragment that rides along with the
-        /// occurrence. A tool definition before the renderer trimmed its
+        /// occurrence. Inside such an original it also names the part a part
+        /// wrapper claims about (see `raw_media_type`). A tool definition before the renderer trimmed its
         /// description is a json_tree. A tool result whose parts she was
         /// not shown (an image to a text-only model) is a json_tree array
         /// whose entries' values are archive facts, typed with blob

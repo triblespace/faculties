@@ -3581,6 +3581,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "triblespace",
+ "triblespace-cxg",
  "triblespace-net",
  "triblespace-paths",
  "triblespace-search",
@@ -12349,6 +12350,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "triblespace-macros-common",
+]
+
+[[package]]
+name = "triblespace-cxg"
+version = "0.47.0"
+dependencies = [
+ "anybytes",
+ "ethnum",
+ "triblespace-core",
 ]
 
 [[package]]
