@@ -37,8 +37,8 @@ use hifitime::{Duration, Epoch};
 
 use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
 use crate::archive_v3::fields::{
-    Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps, Mirror,
-    Order, Place, Structure, Supply, Windows,
+    Beside, Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps,
+    Mirror, Order, Place, Structure, Supply, Windows,
 };
 
 /// What B found in one unit.
@@ -87,7 +87,7 @@ pub struct Walked {
     /// [`Mirror::Earlier`]: the values at its paths in file order, as
     /// (record, path, hash), and the copies to check as (path, the paths,
     /// each element's hash, record, label).
-    earlier: Vec<(usize, &'static str, [u8; 32])>,
+    earlier: Vec<(usize, &'static str, [u8; 32], Option<[u8; 32]>)>,
     earlier_pending: Vec<(
         String,
         &'static [&'static str],
@@ -1171,7 +1171,7 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         known: known_paths(table),
         supply_paths: HashMap::new(),
         forks: Vec::new(),
-        earlier_paths: HashSet::new(),
+        earlier_paths: HashMap::new(),
     };
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
@@ -1510,8 +1510,9 @@ struct Walker<'t> {
         &'static str,
         &'static [(&'static str, Option<&'static str>)],
     )>,
-    /// [`Mirror::Earlier`]: the paths its copies compare against.
-    earlier_paths: HashSet<&'static str>,
+    /// [`Mirror::Earlier`]: the paths its copies compare against, with the
+    /// copy forms each declares.
+    earlier_paths: HashMap<&'static str, &'static [CopyForm]>,
 }
 
 /// Every path the table names, and every prefix of one that ends before a
@@ -1741,8 +1742,10 @@ impl<'t> Walker<'t> {
             {
                 self.forks.push((fork, removed));
             }
-            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) = entry.class {
-                self.earlier_paths.extend(paths.iter().copied());
+            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths, forms))) = entry.class {
+                for path in paths {
+                    self.earlier_paths.insert(*path, forms);
+                }
             }
         }
     }
@@ -1763,8 +1766,14 @@ impl<'t> Walker<'t> {
                 strings.push(text.clone());
             }
         }
-        if let (Some(record), Some(&at)) = (ctx.record, self.earlier_paths.get(path)) {
-            self.out.earlier.push((record, at, value_hash(value)));
+        if let (Some(record), Some((&at, &forms))) =
+            (ctx.record, self.earlier_paths.get_key_value(path))
+        {
+            let form = forms
+                .iter()
+                .find_map(|form| copy_form(*form, value))
+                .map(|copy| value_hash(&copy));
+            self.out.earlier.push((record, at, value_hash(value), form));
         }
         if let Some(record) = ctx.record {
             for &(fork, removed) in &self.forks {
@@ -2277,7 +2286,7 @@ impl<'t> Walker<'t> {
                         ctx.record,
                     ));
                 }
-                DropReason::Mirror(Mirror::Earlier(paths)) => {
+                DropReason::Mirror(Mirror::Earlier(paths, _)) => {
                     let (J::Arr(elements), Some(record)) = (value, ctx.record) else {
                         self.row(path, Kind::Mirror, ctx);
                         return;
@@ -2616,8 +2625,10 @@ impl<'t> Walker<'t> {
             for hash in &hashes {
                 let found = self.out.earlier[cursor..]
                     .iter()
-                    .position(|(at, from, held)| {
-                        *at < record && paths.contains(from) && held == hash
+                    .position(|(at, from, held, form)| {
+                        *at < record
+                            && paths.contains(from)
+                            && (held == hash || form.as_ref() == Some(hash))
                     });
                 match found {
                     Some(offset) => cursor += offset + 1,
@@ -2748,7 +2759,9 @@ impl<'t> Walker<'t> {
                 let mut at_line = None;
                 let mut restated = false;
                 let items: Vec<usize> = match place {
-                    Place::Claim | Place::LastOut => Vec::new(),
+                    Place::Claim | Place::LastOut | Place::TurnTail | Place::TurnTailWithoutOut => {
+                        Vec::new()
+                    }
                     Place::Last => held.last().copied().into_iter().collect(),
                     Place::Every => held.clone(),
                     Place::Here => {
@@ -2913,19 +2926,44 @@ impl Walker<'_> {
             let since = turns.last().copied().unwrap_or(0);
             let deferred = std::mem::take(&mut out.records[at].deferred);
             for entry in deferred {
-                if entry.1 != Place::LastOut {
+                let place = entry.1;
+                if !matches!(
+                    place,
+                    Place::LastOut | Place::TurnTail | Place::TurnTailWithoutOut
+                ) {
                     out.records[at].deferred.push(entry);
                     continue;
                 }
                 let (token, _, _, _, path, _) = entry;
-                let last_out = line[since.min(line.len())..]
+                let turn: Vec<usize> = line[since.min(line.len())..]
                     .iter()
                     .rev()
                     .map(|&place| out.file_arena[place].0)
-                    .find(|&item| {
-                        out.items[item].held
-                            && out.items[item].tokens.iter().any(|t| t.direction == "out")
+                    .filter(|&item| out.items[item].held)
+                    .collect();
+                let last_out = turn
+                    .iter()
+                    .copied()
+                    .find(|&item| out.items[item].tokens.iter().any(|t| t.direction == "out"));
+                if place != Place::LastOut {
+                    // X15: a claim of the record, on the turn's last node,
+                    // or the next node placed when the turn holds none.
+                    if place == Place::TurnTailWithoutOut && last_out.is_some() {
+                        continue;
+                    }
+                    match turn.first() {
+                        Some(&item) => out.items[item].claims.push(BTreeSet::from([token.clone()])),
+                        None => {
+                            out.records[at].claims.insert(token.clone());
+                        }
+                    }
+                    out.tokens.entry(token).or_default().push(Origin {
+                        path,
+                        record: Some(at),
+                        index: Vec::new(),
                     });
+                    continue;
+                }
                 if let Some(item) = last_out {
                     out.items[item].ends.insert(token.clone());
                     out.tokens.entry(token).or_default().push(Origin {
@@ -3355,5 +3393,39 @@ pub(super) mod probe {
     }
     pub fn exact_nanoseconds(token: &str) -> Option<i128> {
         super::exact_nanoseconds(token)
+    }
+}
+
+/// The value in a declared [`CopyForm`], where that differs from the value
+/// (the gate's own reading of the declaration, apart from the importer's).
+fn copy_form(form: CopyForm, value: &J) -> Option<J> {
+    match form {
+        CopyForm::WithoutEmptyOutputText => {
+            let J::Obj(members) = value else {
+                return None;
+            };
+            let is = |member: &J, name: &str, text: &str| match member {
+                J::Obj(inner) => matches!(inner.get(name), Some(J::Str(found)) if found == text),
+                _ => false,
+            };
+            if !(is(value, "type", "function_call_output")
+                || is(value, "type", "custom_tool_call_output"))
+            {
+                return None;
+            }
+            let Some(J::Arr(parts)) = members.get("output") else {
+                return None;
+            };
+            let empty = |part: &J| is(part, "type", "input_text") && is(part, "text", "");
+            if !parts.iter().any(empty) {
+                return None;
+            }
+            let mut copy = members.clone();
+            copy.insert(
+                "output".to_owned(),
+                J::Arr(parts.iter().filter(|part| !empty(part)).cloned().collect()),
+            );
+            Some(J::Obj(copy))
+        }
     }
 }

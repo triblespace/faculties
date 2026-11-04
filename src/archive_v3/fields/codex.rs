@@ -31,8 +31,8 @@
 //! unit and each says why.
 
 use super::{
-    Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, GapRule, Gaps,
-    Link, Mirror, Order, Place, Structure, Supply, Windows,
+    Beside, Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, FileWindows, Gap,
+    GapRule, Gaps, Link, Mirror, Order, Place, Structure, Supply, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -54,6 +54,10 @@ const SETTING: DropReason = DropReason::Machinery(
 );
 const TIME: DropReason = DropReason::Machinery("the time a record that holds no item was written");
 const STATUS: DropReason = DropReason::Machinery("the client's item status");
+const BUDGET: DropReason = DropReason::Machinery(
+    "the history budget tool outputs are shortened to; the importer refuses an output it \
+     shortens, so every kept output is what her window held",
+);
 
 const DISCRIMINATOR: Class = Class::Structure(Structure::Discriminator);
 const EFFORT: &[(&str, &str)] = &[
@@ -641,7 +645,7 @@ const RESPONSE_ITEM: &[Entry] = &[
     ),
     Entry::new(
         "{response_item}.metadata.fallback_token_limit_override",
-        Class::Drop(USAGE),
+        Class::Drop(BUDGET),
     ),
     Entry::new(
         "{response_item}.metadata.mcp_attribution",
@@ -671,10 +675,16 @@ const RESPONSE_ITEM: &[Entry] = &[
 /// own context is not in the rollout, so nothing is imported for it.
 /// Real sample (counts only): 48 of 53 lists are such copies; 5 lists hold
 /// 20 custom tool outputs whose `output` differs from the unit's item of
-/// the same call (`ContextManager::record_item_with_metadata`, core/src/
-/// context_manager/history.rs, truncates an output with
-/// `truncate_function_output_payload` before the review history records
-/// it), and those fail: what the reviewer read is not what she was shown.
+/// the same call. X9'': `ContextManager::record_item_with_metadata`
+/// (core/src/context_manager/history.rs) passes each output through
+/// `truncate_function_output_payload` (utils/output-truncation/src/lib.rs)
+/// before both her live history and the review history record it, and the
+/// rollout keeps the full payload. All 20 equal their item with its empty
+/// `input_text` parts removed, the budget-free arm of
+/// `truncate_output_iter`, and none holds a truncation marker; no copy
+/// equal to its item had an empty part. That form is declared
+/// ([`CopyForm::WithoutEmptyOutputText`]); her window drops empty text parts
+/// too (no fact). A copy a budget shortened is not declared and fails.
 const GUARDIAN_COPIES: &[&str] = &[
     "{response_item}.payload",
     "{compacted}.payload.replacement_history[]",
@@ -735,7 +745,10 @@ const COMPACTED: &[Entry] = &[
     ),
     Entry::new(
         "{compacted}.payload.guardian_history",
-        Class::Drop(DropReason::Mirror(Mirror::Earlier(GUARDIAN_COPIES))),
+        Class::Drop(DropReason::Mirror(Mirror::Earlier(
+            GUARDIAN_COPIES,
+            &[CopyForm::WithoutEmptyOutputText],
+        ))),
     ),
     Entry::new(
         "{compacted}.payload.guardian_history",
@@ -843,9 +856,11 @@ const TURN_CONTEXT: &[Entry] = &[
         "{turn_context}.payload.network_sandbox_policy",
         Class::Drop(SETTING),
     ),
+    // X9'': not rendered into a message. It is the budget her live history
+    // shortens tool outputs to; the importer refuses an output it shortens.
     Entry::new(
         "{turn_context}.payload.truncation_policy",
-        Class::Drop(SETTING),
+        Class::Drop(BUDGET),
     ),
     Entry::new(
         "{turn_context}.payload.realtime_active",
@@ -1174,9 +1189,14 @@ const EVENT_MSG: &[Entry] = &[
         Class::Drop(TIME),
     ),
     Entry::new("{event_msg}.payload{task_complete}.type", DISCRIMINATOR).when(NOT_ERRED),
+    // X15: a failed turn in which she produced nothing is never lost: a
+    // `turn_ends` claim of the record, as an abort's.
     Entry::new(
         "{event_msg}.payload{task_complete}.type",
-        Class::Annotation(&[("ends", Decode::ConstTerm("error"))]),
+        Class::Annotation(&[
+            ("ends", Decode::ConstTerm("error")),
+            ("turn_ends", Decode::ConstTerm("error")),
+        ]),
     )
     .when(ERRED),
     // X6: why the turn failed is `ends: error` on her last node; whether
@@ -1769,6 +1789,19 @@ pub const TABLE: FieldTable = FieldTable {
             "{event_msg}.payload{task_complete}.type",
             "ends",
             Place::LastOut,
+        ),
+        // Why a turn ended, as a claim (X15, M2): on the turn's last node,
+        // or the next node placed when the turn holds none. An erred turn
+        // claims it only when she produced nothing in it.
+        (
+            "{event_msg}.payload{turn_aborted}.reason",
+            "turn_ends",
+            Place::TurnTail,
+        ),
+        (
+            "{event_msg}.payload{task_complete}.type",
+            "turn_ends",
+            Place::TurnTailWithoutOut,
         ),
     ],
     entries: &ENTRIES,

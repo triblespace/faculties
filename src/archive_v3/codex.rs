@@ -35,8 +35,11 @@
 //!   back to the start of its last turns: the next node branches there;
 //! - `turn_aborted` and an erred `task_complete` put `ends` on the
 //!   occurrence of the record that holds her last item of the turn, when
-//!   she produced one, never on the node (X5, X6, M1); an abort is also a
-//!   claim of its record. An error that names no message fails (X11).
+//!   she produced one, never on the node (X5, X6, M1). An abort, and an
+//!   erred turn in which she produced nothing, are also a `turn_ends` claim
+//!   of their record, on the turn's last node, or on the next node placed
+//!   when the turn holds none (X15). An error whose `message` is missing or
+//!   no string fails (X11, X15).
 //!
 //! When the header or the system section changes, the line is re-presented
 //! under the new one. Items are known by their place in the source, never
@@ -52,7 +55,10 @@
 //! compaction) fails the unit (X4).
 //!
 //! Each node a record holds gets a witness and one occurrence holding that
-//! record's claims. A record that holds no node (a header without effort, a
+//! record's claims. Why a sampling or turn ended annotates the occurrence
+//! and is no part of its id (M2), so two records whose own claims coincide
+//! on one node converge; where they ended differently the unit fails. A
+//! record that holds no node (a header without effort, a
 //! `session_meta` without instructions, an abort) gives its claims to the
 //! next node the file places, or after the last one to that last node.
 //! Reasoning summaries are glosses of the sealed reasoning; the source does
@@ -279,6 +285,15 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
             .collect()
     };
     let held: HashSet<String> = records.iter().filter_map(item_of).flat_map(said).collect();
+    // X13': her messages a compaction installs. A copy can name only an
+    // item of the file by position; one whose message only a replacement
+    // history holds has no structural match.
+    let installed: HashSet<String> = records
+        .iter()
+        .filter(|record| record.str_at("type") == Some("compacted"))
+        .filter_map(|record| record.at("payload.replacement_history"))
+        .flat_map(|history| history.arr().iter().flat_map(said))
+        .collect();
     let mut phases: HashMap<usize, String> = HashMap::new();
     for (at, record) in records.iter().enumerate() {
         if record.str_at("type") != Some("event_msg") {
@@ -311,6 +326,13 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
                     "a phase copy whose message is not the item after it: matched by text alone",
                 ));
             }
+            if installed.contains(message) {
+                return Err(Failure::new(
+                    path,
+                    "a phase copy whose message only a replacement history holds: no structural \
+                     match",
+                ));
+            }
             continue;
         };
         let own = item_of(&records[holder]).and_then(|item| item.str_at("phase"));
@@ -328,6 +350,74 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
         }
     }
     Ok(phases)
+}
+
+/// A tool output's history budget: in tokens, or in bytes.
+#[derive(Clone, Copy)]
+enum Budget {
+    Tokens(usize),
+    Bytes(usize),
+}
+
+impl Budget {
+    /// The turn's `truncation_policy` with codex's 20% serialization
+    /// allowance (`with_serialization_allowance`, rounded up).
+    fn of_policy(policy: &Json) -> Option<Budget> {
+        let limit = match policy.get("limit") {
+            Some(Json::Num(token)) => token.parse::<usize>().ok()?,
+            _ => return None,
+        };
+        let allowed = (limit as f64 * 1.2).ceil() as usize;
+        match policy.str_at("mode") {
+            Some("tokens") => Some(Budget::Tokens(allowed)),
+            Some("bytes") => Some(Budget::Bytes(allowed)),
+            _ => None,
+        }
+    }
+
+    /// The cost of a text under the budget's unit (codex's four bytes per
+    /// token, rounded up).
+    fn cost(self, text: &str) -> usize {
+        match self {
+            Budget::Tokens(_) => text.len().div_ceil(4),
+            Budget::Bytes(_) => text.len(),
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Budget::Tokens(limit) | Budget::Bytes(limit) => limit,
+        }
+    }
+
+    /// Whether `truncate_function_output_payload` shortens this output:
+    /// a text over the budget, or a list in which a non-empty text part no
+    /// longer fits (codex-rs utils/output-truncation/src/lib.rs,
+    /// `truncate_text` and `truncate_output_iter`). Empty text parts, which
+    /// it drops under any budget, hold no fact here either.
+    fn shortens(self, output: &Json) -> bool {
+        match output {
+            Json::Str(text) => self.cost(text) > self.limit(),
+            Json::Arr(parts) => {
+                let mut remaining = self.limit();
+                for part in parts {
+                    if part.str_at("type") != Some("input_text") {
+                        continue;
+                    }
+                    let Some(text) = part.str_at("text").filter(|text| !text.is_empty()) else {
+                        continue;
+                    };
+                    let cost = self.cost(text);
+                    if remaining == 0 || cost > remaining {
+                        return true;
+                    }
+                    remaining -= cost;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
 }
 
 /// One fact a record places on the line, and whether the record holds it
@@ -413,6 +503,8 @@ struct Builder {
     ends: Vec<(usize, Id, Id)>,
     glosses: Vec<(Id, String)>,
     continues: Vec<(Id, Id)>,
+    /// The history budget of the latest `turn_context` that records one.
+    budget: Option<Budget>,
 }
 
 impl Builder {
@@ -462,6 +554,7 @@ impl Builder {
             ends: Vec::new(),
             glosses: Vec::new(),
             continues: Vec::new(),
+            budget: None,
         };
         builder.root = builder.root_line();
         Ok(builder)
@@ -594,6 +687,25 @@ impl Builder {
             .and_then(|(item, _)| Some((self.items[*item].record?, self.items[*item].own?)))
     }
 
+    /// X15: where a record that ends the turn puts its `turn_ends` claim:
+    /// on the node its record held of the turn's last item a record holds,
+    /// or, when the turn holds none, on the next node placed (the next
+    /// header). Both lie in the file before or right after the record, so
+    /// a snapshot cut after it places the claim where the whole file does
+    /// (M2), as long as the turn holds a node.
+    fn end_turn(&mut self, claims: WitnessAnnotations) {
+        let since = self.turns.last().copied().unwrap_or(0).min(self.line.len());
+        let tail = self.line[since..]
+            .iter()
+            .rev()
+            .find(|(item, _)| self.items[*item].held)
+            .and_then(|(item, _)| self.items[*item].own);
+        match tail {
+            Some(node) => self.extra.push((node, claims)),
+            None => self.pending.push(claims),
+        }
+    }
+
     fn record(&mut self, at: usize, record: &Json) -> Result<(), Failure> {
         let kind = record.str_at("type");
         if let Some(payload) = record.get("payload") {
@@ -605,6 +717,7 @@ impl Builder {
                 Some("session_meta") => self.session(at, payload),
                 Some("turn_context") => self.turn_context(at, payload, claims),
                 Some("response_item") => {
+                    self.within_budget(record, payload)?;
                     let items =
                         self.items(payload, "{response_item}.payload", &mut claims, Some(at))?;
                     let ghost = payload.str_at("type") == Some("ghost_snapshot");
@@ -644,6 +757,41 @@ impl Builder {
                 self.place(at, items, "<item>")
             }
         }
+    }
+
+    /// The window she was sampled from holds a tool output as her live
+    /// history recorded it: `ContextManager::record_item_with_metadata`
+    /// (codex-rs core/src/context_manager/history.rs) passes it through
+    /// `truncate_function_output_payload` under the record's
+    /// `fallback_token_limit_override`, else the turn's `truncation_policy`
+    /// with its allowance, "preserving full rollout payloads". Where that
+    /// shortens an output, what she was shown is the truncated form, which
+    /// this importer does not build, so the unit fails rather than import
+    /// the full payload as her window. Where no budget is recorded it is
+    /// unknown, and nothing is claimed.
+    fn within_budget(&self, record: &Json, payload: &Json) -> Result<(), Failure> {
+        let kind = payload.str_at("type").unwrap_or_default();
+        if !matches!(kind, "function_call_output" | "custom_tool_call_output") {
+            return Ok(());
+        }
+        let budget = match record.at("metadata.fallback_token_limit_override") {
+            Some(Json::Num(token)) => token.parse::<usize>().ok().map(Budget::Tokens),
+            _ => self.budget,
+        };
+        let Some(budget) = budget else {
+            return Ok(());
+        };
+        if payload
+            .get("output")
+            .is_some_and(|output| budget.shortens(output))
+        {
+            return Err(Failure::new(
+                &format!("{{response_item}}.payload{{{kind}}}.output"),
+                "an output over its recorded history budget: her window held a truncated form \
+                 the importer does not build",
+            ));
+        }
+        Ok(())
     }
 
     fn session(&mut self, at: usize, payload: &Json) -> Result<(), Failure> {
@@ -731,6 +879,9 @@ impl Builder {
         mut claims: WitnessAnnotations,
     ) -> Result<(), Failure> {
         claims.raw_model = payload.str_at("model").map(str::to_owned);
+        if let Some(policy) = payload.get("truncation_policy") {
+            self.budget = Budget::of_policy(policy);
+        }
         let header = match payload.str_at("effort") {
             Some(term) => {
                 use v3::fact::{absent, direction::IN, modality::SYSTEM};
@@ -1155,11 +1306,11 @@ impl Builder {
                     }
                 };
                 // X5: on her last node of the turn, if she produced one; the
-                // abort is a claim of the record either way.
+                // abort is a claim of the record either way (X15).
                 if let Some((record, node)) = self.last_out() {
                     self.ends.push((record, node, term));
                 }
-                self.pending.push(WitnessAnnotations {
+                self.end_turn(WitnessAnnotations {
                     turn_ends: vec![term],
                     ..WitnessAnnotations::default()
                 });
@@ -1169,18 +1320,44 @@ impl Builder {
                 // X6: `ends: error` on her last node of the turn; no fact.
                 // X11: an error that names no message (only an error code,
                 // or a string) is a failed turn whose report is unverified:
-                // it fails, never machinery.
+                // it fails, never machinery. X15: the message must be a
+                // string; `null`, a number or anything else fails.
+                let path = "{event_msg}.payload{task_complete}.error";
                 let erred =
                     match payload.get("error") {
                         None | Some(Json::Null) => false,
-                        Some(error @ Json::Obj(_)) if error.get("message").is_some() => true,
+                        Some(error @ Json::Obj(_)) => match error.get("message") {
+                            Some(Json::Str(_)) => true,
+                            Some(_) => return Err(Failure::new(
+                                path,
+                                "a failed turn whose error message is no string: what failed is \
+                                 unverified",
+                            )),
+                            None => {
+                                return Err(Failure::new(
+                                    path,
+                                    "a failed turn whose error names no message: what failed is \
+                                 unverified",
+                                ))
+                            }
+                        },
                         Some(_) => return Err(Failure::new(
-                            "{event_msg}.payload{task_complete}.error",
+                            path,
                             "a failed turn whose error names no message: what failed is unverified",
                         )),
                     };
-                if let (true, Some((record, node))) = (erred, self.last_out()) {
-                    self.ends.push((record, node, v3::node::ends::ERROR));
+                if erred {
+                    match self.last_out() {
+                        Some((record, node)) => {
+                            self.ends.push((record, node, v3::node::ends::ERROR))
+                        }
+                        // X15: a failed turn in which she produced nothing
+                        // is never lost: a claim of the record, as an abort.
+                        None => self.end_turn(WitnessAnnotations {
+                            turn_ends: vec![v3::node::ends::ERROR],
+                            ..WitnessAnnotations::default()
+                        }),
+                    }
                 }
                 Ok(())
             }
@@ -1335,6 +1512,11 @@ impl Builder {
         }
         occurrences.extend(std::mem::take(&mut self.extra));
         let mut witnesses: HashMap<Id, Id> = HashMap::new();
+        // Why a sampling or turn ended annotates its occurrence and is no
+        // part of its id (M2). Two records whose own claims are the same
+        // converge on one occurrence; if they ended differently, which
+        // stopped which way would be lost, so the unit fails instead.
+        let mut ended: HashMap<Id, (Vec<Id>, Vec<Id>)> = HashMap::new();
         for (node, claims) in occurrences {
             let id = match witnesses.get(&node) {
                 Some(id) => *id,
@@ -1347,8 +1529,22 @@ impl Builder {
                     id
                 }
             };
+            let mut how = (claims.ends.clone(), claims.turn_ends.clone());
+            how.0.sort();
+            how.1.sort();
             let built = occurrence(id, claims)
                 .map_err(|_| Failure::new("<witness>", "a witness occurrence does not build"))?;
+            // The id only tells whether the store would merge the two
+            // (idempotence); nothing is looked up by it.
+            let at = built.root().expect("an occurrence is rooted");
+            if let Some(earlier) = ended.insert(at, how.clone()) {
+                if earlier != how {
+                    return Err(Failure::new(
+                        "{event_msg}.payload",
+                        "two records with the same claims end differently",
+                    ));
+                }
+            }
             self.out += unexported(built);
         }
         // Reasoning summaries: the source names no model that wrote them.

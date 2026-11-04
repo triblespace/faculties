@@ -15,7 +15,7 @@ use base64::Engine;
 use super::json::Json;
 use super::Failure;
 use crate::archive_v3::fields::{
-    Class, Cond, Decode, DropReason, Entry, FieldTable, Mirror, Structure,
+    Class, Cond, CopyForm, Decode, DropReason, Entry, FieldTable, Mirror, Structure,
 };
 use crate::archive_v3::MediaType;
 
@@ -125,8 +125,10 @@ pub(crate) struct UnitMirrors {
     /// [`Mirror::Earlier`]: the paths it compares against, the values seen
     /// there in file order as (record, path, hash), and the copies to check
     /// as (path, the paths, each element's hash, record).
-    earlier_paths: HashSet<&'static str>,
-    earlier: Vec<(usize, &'static str, [u8; 32])>,
+    earlier_paths: HashMap<&'static str, &'static [CopyForm]>,
+    /// (record, path, hash, the hash of its declared copy form where that
+    /// differs)
+    earlier: Vec<(usize, &'static str, [u8; 32], Option<[u8; 32]>)>,
     earlier_pending: Vec<(String, &'static [&'static str], Vec<[u8; 32]>, usize)>,
 }
 
@@ -141,7 +143,7 @@ impl UnitMirrors {
             &'static str,
             &'static [(&'static str, Option<&'static str>)],
         )> = Vec::new();
-        let mut earlier_paths: HashSet<&'static str> = HashSet::new();
+        let mut earlier_paths: HashMap<&'static str, &'static [CopyForm]> = HashMap::new();
         for entry in table.entries {
             if let Class::Drop(DropReason::Mirror(
                 Mirror::Unit(paths) | Mirror::Within(paths) | Mirror::ForkCopy { of: paths, .. },
@@ -156,8 +158,10 @@ impl UnitMirrors {
             {
                 forks.push((fork, removed));
             }
-            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) = entry.class {
-                earlier_paths.extend(paths.iter().copied());
+            if let Class::Drop(DropReason::Mirror(Mirror::Earlier(paths, forms))) = entry.class {
+                for path in paths {
+                    earlier_paths.insert(*path, forms);
+                }
             }
         }
         UnitMirrors {
@@ -182,8 +186,13 @@ impl UnitMirrors {
             }
         }
         let record = self.records.saturating_sub(1);
-        if let Some(&at) = self.earlier_paths.get(path) {
-            self.earlier.push((record, at, value.hash()));
+        if let Some((&at, &forms)) = self.earlier_paths.get_key_value(path) {
+            let form = forms
+                .iter()
+                .filter_map(|form| copy_form(*form, value))
+                .map(|copy| copy.hash())
+                .next();
+            self.earlier.push((record, at, value.hash(), form));
         }
         for &(fork, removed) in &self.forks {
             if record == 0 && path == fork && value.str().is_some_and(|text| !text.is_empty()) {
@@ -206,9 +215,13 @@ impl UnitMirrors {
         for (path, paths, hashes, record) in &self.earlier_pending {
             let mut cursor = 0;
             for hash in hashes {
-                let found = self.earlier[cursor..].iter().position(|(at, from, held)| {
-                    at < record && paths.contains(from) && held == hash
-                });
+                let found = self.earlier[cursor..]
+                    .iter()
+                    .position(|(at, from, held, form)| {
+                        at < record
+                            && paths.contains(from)
+                            && (held == hash || form.as_ref() == Some(hash))
+                    });
                 let Some(offset) = found else {
                     return Err(Failure::new(
                         path,
@@ -549,7 +562,7 @@ impl<'a, 'u> Checker<'a, 'u> {
                     .push((path.to_owned(), mirror, value.hash(), text, record));
                 Ok(())
             }
-            Class::Drop(DropReason::Mirror(Mirror::Earlier(paths))) => {
+            Class::Drop(DropReason::Mirror(Mirror::Earlier(paths, _))) => {
                 let Json::Arr(elements) = value else {
                     return Err(Failure::new(path, "copies of earlier items are not a list"));
                 };
@@ -632,4 +645,44 @@ pub(crate) fn data_uri(text: &str) -> Option<(MediaType, Vec<u8>)> {
         .decode(data)
         .ok()?;
     Some((media_type, bytes))
+}
+
+/// The value in a declared [`CopyForm`], where that differs from the value.
+fn copy_form(form: CopyForm, value: &Json) -> Option<Json> {
+    match form {
+        CopyForm::WithoutEmptyOutputText => {
+            let Json::Obj(members) = value else {
+                return None;
+            };
+            if !matches!(
+                value.str_at("type"),
+                Some("function_call_output" | "custom_tool_call_output")
+            ) {
+                return None;
+            }
+            let empty = |part: &Json| {
+                part.str_at("type") == Some("input_text") && part.str_at("text") == Some("")
+            };
+            let Some(Json::Arr(parts)) = value.get("output") else {
+                return None;
+            };
+            if !parts.iter().any(empty) {
+                return None;
+            }
+            let output = Json::Arr(parts.iter().filter(|part| !empty(part)).cloned().collect());
+            Some(Json::Obj(
+                members
+                    .iter()
+                    .map(|(name, member)| {
+                        let member = if name == "output" {
+                            output.clone()
+                        } else {
+                            member.clone()
+                        };
+                        (name.clone(), member)
+                    })
+                    .collect(),
+            ))
+        }
+    }
 }

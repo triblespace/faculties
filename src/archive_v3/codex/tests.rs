@@ -1185,9 +1185,36 @@ fn rv_cx7_aborted() {
         pattern!(facts, [{ ?occurrence @ v3::witness::turn_ends: v3::node::ends::INTERRUPTED }])
     )
     .collect();
-    // The first three go to the next header (one node, one claim tuple);
-    // the last, at the end of the file, to its last node.
-    assert_eq!(claimed.len(), 2);
+    // X15, M2: each on its turn's last node: her commentary, his second
+    // prompt, her call, his fifth prompt.
+    assert_eq!(claimed.len(), 4);
+    let on_turn_tail: Vec<Id> = turn_ends_on(&imported)
+        .into_iter()
+        .map(|(node, _)| node)
+        .collect();
+    let call = {
+        let facts = imported.fragment.facts();
+        let calls: Vec<Id> = find!(
+            node: Id,
+            pattern!(facts, [
+                { ?node @ v3::node::holds: _?fact },
+                { _?fact @ v3::fact::modality: v3::fact::modality::TOOL_CALL },
+            ])
+        )
+        .collect();
+        assert_eq!(calls.len(), 1);
+        calls[0]
+    };
+    let mut expected = vec![
+        witnessed_saying(&imported, "Thinking aloud."),
+        witnessed_saying(&imported, "P2."),
+        call,
+        witnessed_saying(&imported, "P5."),
+    ];
+    expected.sort();
+    let mut on_turn_tail = on_turn_tail;
+    on_turn_tail.sort();
+    assert_eq!(on_turn_tail, expected);
     let replaced = source.replacen("\"reason\":\"interrupted\"", "\"reason\":\"replaced\"", 1);
     assert_eq!(
         refused(&replaced).path,
@@ -1388,7 +1415,10 @@ fn m1_each_record_keeps_its_own_end() {
     let imported = passes(&jsonl(&records));
     let same = nodes_saying(&imported, "Same.");
     assert_eq!(same.len(), 1, "one node, held by both records");
+    // The abort's own `turn_ends` claim sits on the turn's last node too,
+    // as an occurrence without `ends` (X15).
     let mut expected = vec![
+        vec![],
         vec![v3::node::ends::ERROR],
         vec![v3::node::ends::INTERRUPTED],
     ];
@@ -1550,6 +1580,142 @@ fn x9_guardian_history_mirrors_earlier_items() {
         let source = build(Some(guardian));
         assert_eq!(refused(&source).path, path);
         assert!(walk_rows(&source).contains(&(path.to_owned(), Kind::Mirror)));
+    }
+}
+
+/// X9'': a guardian copy may hold a tool output as her live history did,
+/// through `truncate_function_output_payload`'s budget-free arm: its output
+/// list without the empty text parts (codex-rs utils/output-truncation,
+/// `truncate_output_iter`). Any other difference, a budget's truncation
+/// marker included, still fails, and each item is still copied once.
+#[test]
+fn x9pp_a_guardian_copy_may_drop_empty_output_text() {
+    let call = json!({"type": "custom_tool_call", "name": "exec", "input": "ls", "call_id": "g2"});
+    let part = |text: &str| json!({"type": "input_text", "text": text});
+    let output = |parts: Vec<Value>| json!({"type": "custom_tool_call_output", "call_id": "g2", "output": parts});
+    let full = output(vec![part(""), part("listing"), part("")]);
+    let build = |guardian: Option<Value>| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(2, "A."));
+        records.push(line(3, "response_item", call.clone()));
+        records.push(line(4, "response_item", full.clone()));
+        let mut payload = json!({"message": "", "replacement_history": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A."}]},
+            {"type": "compaction", "encrypted_content": COMPACTION}
+        ]});
+        if let Some(guardian) = guardian {
+            payload["guardian_history"] = guardian;
+        }
+        records.push(line(6, "compacted", payload));
+        records.push(rv_said(7, "E.", None));
+        jsonl(&records)
+    };
+    let bare = import_ok(&build(None));
+    for guardian in [
+        json!([call, output(vec![part("listing")])]),
+        json!([call, full]),
+    ] {
+        let imported = passes(&build(Some(guardian)));
+        let (a, b) = (imported.fragment.facts(), bare.fragment.facts());
+        assert_eq!(a.len(), b.len(), "nothing is imported for the copies");
+        assert_eq!(a.difference(b).len(), 0);
+    }
+    let path = "{compacted}.payload.guardian_history";
+    for guardian in [
+        // One empty part dropped, the other kept: no declared form.
+        json!([output(vec![part("listing"), part("")])]),
+        // A budget's truncation: not declared.
+        json!([output(vec![part(
+            "lis\u{2026}1 tokens truncated\u{2026}ng"
+        )])]),
+        // Both forms of one item: the item copied twice.
+        json!([output(vec![part("listing")]), full]),
+        // The text changed.
+        json!([output(vec![part("listings")])]),
+    ] {
+        let source = build(Some(guardian));
+        assert_eq!(refused(&source).path, path);
+        assert!(walk_rows(&source).contains(&(path.to_owned(), Kind::Mirror)));
+    }
+}
+
+/// X9'': her live history holds a tool output shortened to the recorded
+/// budget, and the rollout the full payload. An output the budget shortens
+/// fails (what she was shown is the truncated form, not built here); one
+/// within it, or under a larger per-record override, imports.
+#[test]
+fn x9pp_an_output_its_budget_shortens_fails() {
+    let build = |policy: Value, output: Value, metadata: Option<Value>| {
+        let mut records = Vec::new();
+        records.push(rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys."));
+        records.push(line(
+            1,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t1"}),
+        ));
+        records.push(line(
+            1,
+            "turn_context",
+            json!({"model": "gpt-5.5", "effort": "high", "summary": "auto", "turn_id": "t1",
+                "truncation_policy": policy}),
+        ));
+        records.push(rv_user(2, "Go."));
+        records.push(line(
+            3,
+            "response_item",
+            json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "o1"}),
+        ));
+        let mut out = line(
+            4,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": "o1", "output": output}),
+        );
+        if let Some(metadata) = metadata {
+            out["metadata"] = metadata;
+        }
+        records.push(out);
+        records.push(rv_said(5, "Done.", Some("final_answer")));
+        jsonl(&records)
+    };
+    let path = "{response_item}.payload{function_call_output}.output";
+    // Bytes 10 allow 12; tokens 2 allow 3, that is 12 bytes.
+    let bytes = json!({"mode": "bytes", "limit": 10});
+    let tokens = json!({"mode": "tokens", "limit": 2});
+    for policy in [&bytes, &tokens] {
+        passes(&build(policy.clone(), json!("x".repeat(12)), None));
+        assert_eq!(
+            refused(&build(policy.clone(), json!("x".repeat(13)), None)).path,
+            path
+        );
+        let parts = |a: usize, b: usize| {
+            json!([{"type": "input_text", "text": "x".repeat(a)}, {"type": "input_text", "text": ""},
+                {"type": "input_text", "text": "y".repeat(b)}])
+        };
+        passes(&build(policy.clone(), parts(8, 4), None));
+        assert_eq!(
+            refused(&build(policy.clone(), parts(8, 5), None)).path,
+            path
+        );
+        assert_eq!(
+            refused(&build(policy.clone(), parts(12, 1), None)).path,
+            path
+        );
+        // A per-record override in tokens: 100 tokens hold it.
+        passes(&build(
+            policy.clone(),
+            json!("x".repeat(13)),
+            Some(json!({"fallback_token_limit_override": 100})),
+        ));
+        assert_eq!(
+            refused(&build(
+                policy.clone(),
+                json!("x".repeat(13)),
+                Some(json!({"fallback_token_limit_override": 3})),
+            ))
+            .path,
+            path
+        );
     }
 }
 
@@ -1810,6 +1976,300 @@ fn x14_a_text_part_without_text_fails() {
         let source = jsonl(&records);
         assert_eq!(refused(&source).path, path);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Round 5: M2, X15, X13', each of which failed against the round-4
+// importer.
+
+/// The `turn_ends` claims of the import: `(node, term)` by the node the
+/// claiming occurrence's witness projects to.
+fn turn_ends_on(imported: &Imported) -> Vec<(Id, Id)> {
+    let facts = imported.fragment.facts();
+    let mut found: Vec<(Id, Id)> = find!(
+        (node: Id, term: Id),
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: ?node },
+            { _?occurrence @ v3::occurrence::of: _?witness, v3::witness::turn_ends: ?term },
+        ])
+    )
+    .collect();
+    found.sort();
+    found
+}
+
+/// M2: no prefix of a rollout (a backup snapshot cut anywhere) adds an
+/// occurrence, or any trible at all, to the full rollout's import. Why a
+/// sampling or a turn ended is known only from a later record (the abort,
+/// the erred completion), so it annotates the occurrence and is no part of
+/// its id, and a turn's end is claimed on the turn's own last node, which
+/// the snapshot already holds (X15). The round-4 losslessness review's
+/// `r4l_cx_backup_overlap`, kept as a permanent test.
+#[test]
+fn m2_every_prefix_adds_no_occurrence_to_the_full_import() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "P1."));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "reasoning", "summary": [{"type": "summary_text", "text": "Plan."}],
+            "content": null, "encrypted_content": REASONING}),
+    ));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "b1"}),
+    ));
+    records.push(line(
+        4,
+        "response_item",
+        json!({"type": "function_call_output", "call_id": "b1", "output": "o"}),
+    ));
+    records.push(line(
+        5,
+        "event_msg",
+        json!({"type": "agent_message", "message": "R1.", "phase": "commentary"}),
+    ));
+    records.push(rv_said(5, "R1.", None));
+    records.push(line(
+        6,
+        "event_msg",
+        json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": "t1"}),
+    ));
+    records.extend(rv_turn(7, "t2", "xhigh"));
+    records.push(rv_user(8, "P2."));
+    records.push(rv_said(9, "R2.", Some("final_answer")));
+    records.push(line(
+        10,
+        "event_msg",
+        json!({"type": "task_complete", "turn_id": "t2", "last_agent_message": "R2.",
+            "error": {"message": "boom", "codex_error_info": "other"}}),
+    ));
+    records.push(line(
+        11,
+        "compacted",
+        json!({"message": "", "replacement_history": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "P2."}]},
+            {"type": "compaction", "encrypted_content": COMPACTION}]}),
+    ));
+    records.extend(rv_turn(12, "t3", "high"));
+    records.push(rv_user(13, "P3."));
+    records.push(line(
+        14,
+        "event_msg",
+        json!({"type": "task_complete", "turn_id": "t3", "last_agent_message": null,
+            "error": {"message": "boom", "codex_error_info": "other"}}),
+    ));
+    records.extend(rv_turn(15, "t4", "high"));
+    records.push(rv_user(16, "P4."));
+    records.push(rv_said(17, "R4.", Some("final_answer")));
+    let full = jsonl(&records);
+    let live = passes(&full);
+    let r1 = witnessed_saying(&live, "R1.");
+    let p3 = witnessed_saying(&live, "P3.");
+    assert_eq!(turn_ends_on(&live), {
+        let mut expected = vec![
+            (r1, v3::node::ends::INTERRUPTED),
+            (p3, v3::node::ends::ERROR),
+        ];
+        expected.sort();
+        expected
+    });
+    let mut cuts = 0;
+    for k in 1..records.len() {
+        let prefix = jsonl(&records[..k]);
+        let Ok(fragment) = import(prefix.as_bytes()) else {
+            continue;
+        };
+        cuts += 1;
+        let extra = fragment.facts().difference(live.fragment.facts());
+        let facts = &extra;
+        let added = find!(
+            occurrence: Id,
+            pattern!(facts, [{ ?occurrence @ v3::occurrence::of: _?witness }])
+        )
+        .count();
+        assert_eq!(added, 0, "the prefix of {k} records adds an occurrence");
+        assert_eq!(extra.len(), 0, "the prefix of {k} records adds tribles");
+        let mut union = live.fragment.clone();
+        union += fragment;
+        let blobs = union.blobs_mut().snapshot().unwrap();
+        let union = Imported {
+            fragment: union,
+            blobs,
+        };
+        let report = gate(&full, &union);
+        assert!(
+            report.passed(),
+            "the union with the prefix of {k}: {report}"
+        );
+    }
+    assert!(cuts > 10, "only {cuts} prefixes import");
+}
+
+/// M2: two records whose own claims coincide (one node, the same second)
+/// converge on one occurrence; when they ended differently, which stopped
+/// which way would be lost, so the unit fails. Ending the same way, they
+/// are one occurrence, as before.
+#[test]
+fn m2_one_claim_set_that_ends_two_ways_fails() {
+    let build = |first: Value, second: Value| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(3, "P."));
+        records.push(rv_said(3, "Same.", Some("commentary")));
+        records.push(first);
+        records.push(line(
+            3,
+            "event_msg",
+            json!({"type": "thread_rolled_back", "num_turns": 1}),
+        ));
+        records.push(line(
+            3,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "t2"}),
+        ));
+        records.push(rv_user(3, "P."));
+        records.push(rv_said(3, "Same.", Some("commentary")));
+        records.push(second);
+        jsonl(&records)
+    };
+    let abort = json!({"timestamp": stamp(3), "type": "event_msg",
+        "payload": {"type": "turn_aborted", "reason": "interrupted", "turn_id": "t"}});
+    let erred = json!({"timestamp": stamp(3), "type": "event_msg",
+        "payload": {"type": "task_complete", "turn_id": "t", "last_agent_message": null,
+            "error": {"message": "stream disconnected", "codex_error_info": "other"}}});
+    assert_eq!(
+        refused(&build(abort.clone(), erred)).path,
+        "{event_msg}.payload"
+    );
+    let imported = passes(&build(abort.clone(), abort));
+    let same = nodes_saying(&imported, "Same.");
+    assert_eq!(same.len(), 1);
+    assert_eq!(
+        ends_by_occurrence(&imported, same[0]),
+        vec![vec![], vec![v3::node::ends::INTERRUPTED]]
+    );
+}
+
+/// X15 (review r4l_cx_task_error, refuted in round 4): a failed turn is
+/// never lost. An erred turn in which she produced nothing claims
+/// `turn_ends: error` on the turn's last node, or on the next header when
+/// the turn holds no node, and the gate tells it from a clean turn. The
+/// error's `message` must be a string.
+#[test]
+fn x15_a_failed_turn_is_never_lost() {
+    let done = |second: u32, error: Value| {
+        line(
+            second,
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": "t", "last_agent_message": null,
+                "error": error}),
+        )
+    };
+    let build = |error: Value, prompt: bool| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        if prompt {
+            records.push(rv_user(2, "Go."));
+        }
+        records.push(done(4, error));
+        records.extend(rv_turn(5, "t2", "xhigh"));
+        records.push(rv_user(6, "Next."));
+        records.push(rv_said(7, "Ok.", Some("final_answer")));
+        jsonl(&records)
+    };
+    let failed = json!({"message": "boom", "codex_error_info": "other"});
+    // Nothing of hers: the claim is on the turn's last node, his prompt.
+    let erred = build(failed.clone(), true);
+    let clean = build(json!(null), true);
+    let imported = passes(&erred);
+    let go = witnessed_saying(&imported, "Go.");
+    assert!(ends_on(&imported).is_empty());
+    assert_eq!(turn_ends_on(&imported), vec![(go, v3::node::ends::ERROR)]);
+    let report = gate(&clean, &imported);
+    assert!(
+        !report.passed(),
+        "the gate took an erred import for a clean turn"
+    );
+    let report = gate(&erred, &passes(&clean));
+    assert!(
+        !report.passed(),
+        "the gate took a clean import for an erred turn"
+    );
+    // A turn that holds no node: the claim is on the next header.
+    let headless = build(failed.clone(), false);
+    let imported = passes(&headless);
+    let facts = imported.fragment.facts();
+    let claimed: Vec<Id> = find!(
+        fact: Id,
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: _?node },
+            { _?occurrence @ v3::occurrence::of: _?witness, v3::witness::turn_ends: v3::node::ends::ERROR },
+            { _?node @ v3::node::holds: ?fact },
+            { ?fact @ v3::fact::effort: v3::fact::effort::XHIGH },
+        ])
+    )
+    .collect();
+    assert_eq!(claimed.len(), 1, "on the next header");
+    // With something of hers the turn ends on her item, and claims nothing
+    // more (X6).
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Go."));
+    records.push(rv_said(3, "Working.", Some("commentary")));
+    records.push(done(4, failed));
+    let imported = passes(&jsonl(&records));
+    let working = witnessed_saying(&imported, "Working.");
+    assert_eq!(ends_on(&imported), vec![(working, v3::node::ends::ERROR)]);
+    assert!(turn_ends_on(&imported).is_empty());
+    // The message is a string, or the unit fails.
+    let path = "{event_msg}.payload{task_complete}.error";
+    for error in [
+        json!({"message": null, "codex_error_info": "other"}),
+        json!({"message": 7}),
+        json!({"message": ["boom"]}),
+        json!({"message": {"text": "boom"}}),
+        json!({"message": true}),
+    ] {
+        assert_eq!(refused(&build(error.clone(), true)).path, path);
+        assert_eq!(refused(&build(error, false)).path, path);
+    }
+}
+
+/// X13' (review r4l_cx_followups): a phase copy whose message only a
+/// compaction's replacement history holds has no structural match, and
+/// fails; the same copy before the message itself still sets its register.
+#[test]
+fn x13p_a_copy_of_a_message_only_a_replacement_holds_fails() {
+    let build = |phase: Option<&str>| {
+        let mut records = Vec::new();
+        rv_head(&mut records);
+        records.push(rv_user(2, "Q."));
+        records.push(rv_said(3, "Done.", None));
+        let mut event = json!({"type": "agent_message", "message": "Kept."});
+        if let Some(phase) = phase {
+            event["phase"] = json!(phase);
+        }
+        records.push(line(4, "event_msg", event));
+        records.push(line(
+            5,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+                {"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Kept."}]},
+                {"type": "compaction", "encrypted_content": COMPACTION}
+            ]}),
+        ));
+        records.push(rv_said(6, "After.", None));
+        jsonl(&records)
+    };
+    let path = "{event_msg}.payload{agent_message}.phase";
+    assert_eq!(refused(&build(Some("commentary"))).path, path);
+    assert_eq!(refused(&build(Some("final_answer"))).path, path);
+    // No phase to supply: nothing is lost, and the copy is a mirror.
+    passes(&build(None));
 }
 
 // ---------------------------------------------------------------------------

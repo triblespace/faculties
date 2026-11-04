@@ -203,6 +203,14 @@ pub enum Place {
     /// The last `out` item of the line since the latest turn started
     /// ([`Order::File`]); nothing when the turn holds none.
     LastOut,
+    /// A claim of its record, as one tuple, on the last held item of the
+    /// line since the latest turn started ([`Order::File`]); when the turn
+    /// holds none, a [`Place::Claim`] (the next node the file places).
+    /// Codex X15: why a turn ended, known from a record after its items.
+    TurnTail,
+    /// [`Place::TurnTail`], but nothing when the turn holds an `out` item
+    /// (its `ends` says it): Codex X15, an erred turn with nothing of hers.
+    TurnTailWithoutOut,
 }
 
 impl Place {
@@ -590,8 +598,28 @@ pub enum Mirror {
     /// order-free, every member compared) a value at one of the normalized
     /// paths `of` in an earlier record, and in order: the elements are a
     /// subsequence of those values in file order. An element the unit does
-    /// not hold there, or holds only out of order, fails.
-    Earlier(&'static [&'static str]),
+    /// not hold there, or holds only out of order, fails. An element may
+    /// also equal an earlier value in one of the declared [`CopyForm`]s.
+    Earlier(&'static [&'static str], &'static [CopyForm]),
+}
+
+/// A declared mirror transform: a form in which a copy may hold the value it
+/// copies, applied to the original before comparing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyForm {
+    /// A tool output (`type` `function_call_output` or
+    /// `custom_tool_call_output`) whose `output` list holds no `input_text`
+    /// part with empty `text`. Codex X9'': the client records an output in
+    /// its live history, which the review history copies, through
+    /// `truncate_function_output_payload` (codex-rs
+    /// utils/output-truncation/src/lib.rs, called from
+    /// `ContextManager::record_item_with_metadata`, core/src/
+    /// context_manager/history.rs); for a content list,
+    /// `truncate_output_iter` drops every empty text part ("Empty text
+    /// contributes no model content") under any budget. The rollout keeps
+    /// the full payload. Only that budget-free arm is declared: a copy that
+    /// a budget shortened, with its truncation marker, still fails.
+    WithoutEmptyOutputText,
 }
 
 impl Entry {

@@ -2147,7 +2147,12 @@ fn round4_cases() -> Vec<(&'static str, Report)> {
         let fix = one(&i, "Fix the bug.");
         let checking = one(&i, "Checking the parser.");
         let mut f = i.fragment;
-        let from = occ_of(&f, witness_of(&f, checking)[0])[0];
+        // Her commentary's node also carries the abort's own `turn_ends`
+        // occurrence (X15), which has no `ends`: take her record's.
+        let from = occ_of(&f, witness_of(&f, checking)[0])
+            .into_iter()
+            .find(|&occurrence| !ends_of(&f, occurrence).is_empty())
+            .expect("her commentary's occurrence ends");
         let to = occ_of(&f, witness_of(&f, fix)[0])[0];
         let e = ends_of(&f, from);
         assert!(!e.is_empty(), "her commentary's occurrence ends");
