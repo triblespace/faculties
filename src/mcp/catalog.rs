@@ -65,6 +65,20 @@ impl Catalog {
     /// Use a launcher-owned shared storage context, including its explicit
     /// network routes. The supplied owner is also the one closed at shutdown.
     pub fn with_storage(config: Config, storage: Storage) -> Self {
+        let orient = orient::mcp::Orient::with_storage(storage.clone());
+        Self::with_orient(config, storage, orient)
+    }
+
+    /// Native model delivery accepts complete results after publication, not
+    /// at the generic adapter's output buffer. Select non-consuming Orient
+    /// overview/wake/poll schemas on the same registered adapter; next retains
+    /// its explicit prepared acceptance. Baseline remains explicit discard.
+    pub fn with_native_storage(config: Config, storage: Storage) -> Self {
+        let orient = orient::mcp::Orient::with_native_storage(storage.clone());
+        Self::with_orient(config, storage, orient)
+    }
+
+    fn with_orient(config: Config, storage: Storage, orient: orient::mcp::Orient) -> Self {
         let Config {
             pile: _,
             key: _,
@@ -80,7 +94,7 @@ impl Catalog {
             Some(token) => linkedin.with_token(token),
             None => linkedin,
         };
-        let orient = Arc::new(orient::mcp::Orient::with_storage(storage.clone()));
+        let orient = Arc::new(orient);
         let faculties: Vec<Box<dyn Faculty + Send + Sync>> = vec![
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),

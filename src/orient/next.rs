@@ -251,17 +251,78 @@ mod tests {
         }
 
         fn presented(&self) -> bool {
+            self.presented_event(self.event)
+        }
+
+        fn presented_event(&self, selected: Id) -> bool {
             self.storage.try_with_store(|store, signer, runtime| {
                 let source = runtime.block_on(ReceiptSource::open(&self.storage, store, signer))?.source;
                 let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
                 Ok(find!(event: Id, pattern!(&facts, [{ presentation::event: ?event }]))
-                    .any(|event| event == self.event))
+                    .any(|event| event == selected))
             }).unwrap().expect("prepared output must not hold the shared Storage borrow")
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) { self.storage.close().unwrap(); }
+    }
+
+    #[test]
+    fn native_catalog_observations_do_not_present_and_generic_delivery_still_does() {
+        use crate::mcp::catalog::{Catalog, Config};
+        for name in ["orient_show", "orient_wake", "orient_poll"] {
+            let fixture = Fixture::new();
+            let goal = fixture.storage.with_store(|store, signer, runtime| {
+                let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+                let (fragment, goal) = compass::goal_fragment("native overview goal",
+                    vec!["isolated-zooid".into()], None, clock::point_now()?)?;
+                store.commit(sources.compass.source, signer, fragment)?;
+                Ok(goal)
+            }).unwrap();
+            let native = Catalog::with_native_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
+            let generic = Catalog::with_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
+            let args = |peek: bool| {
+                let mut args = serde_json::json!({"persona": fmt_id(fixture.persona)});
+                match name {
+                    "orient_poll" => args["peek"] = peek.into(),
+                    "orient_wake" => args["chars"] = 0.into(),
+                    _ => {}
+                }
+                anybytes::Bytes::from(serde_json::to_vec(&args).unwrap())
+            };
+            let cancelled = AtomicBool::new(false);
+            assert!(!fixture.presented());
+            assert!(!fixture.presented_event(goal));
+            let result = native.invoke(name, args(true), crate::mcp::Limits::default(), &cancelled).unwrap();
+            assert!(!result.is_error);
+            assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+                if text.contains("native overview goal"))));
+            assert!(!fixture.presented(), "native {name} must not consume message attention");
+            assert!(!fixture.presented_event(goal), "native {name} must not consume goal attention");
+            let result = generic.invoke(name, args(false), crate::mcp::Limits::default(), &cancelled).unwrap();
+            assert!(!result.is_error);
+            assert!(fixture.presented_event(goal), "generic {name} keeps its accepted-output receipt");
+            assert_eq!(fixture.presented(), name != "orient_wake", "wake presents goals, not messages");
+        }
+    }
+
+    #[test]
+    fn native_catalog_rejects_consuming_poll_before_storage_or_output() {
+        use crate::mcp::catalog::{Catalog, Config};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-open.pile");
+        let catalog = Catalog::with_native_storage(Config::new(&path), Storage::shared(path.clone(), None));
+        let (tool, schema) = catalog.tools().find(|(tool, _)| tool.name == "orient_poll").unwrap();
+        let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
+        assert_eq!(schema["properties"]["peek"]["const"], true);
+        assert!(tool.description.contains("Only peek=true"));
+        let error = catalog.invoke("orient_poll", anybytes::Bytes::from(
+            br#"{"persona":"fixture-zooid","peek":false}"#.to_vec()),
+            crate::mcp::Limits::default(), &AtomicBool::new(false)).err().expect("consuming bypass must reject");
+        assert!(error.is::<crate::mcp::InvalidArguments>());
+        assert!(error.to_string().contains("only peek=true"));
+        assert!(!path.exists(), "rejection must precede Storage/output");
     }
 
     #[test]

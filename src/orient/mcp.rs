@@ -13,6 +13,8 @@ use std::time::Duration;
 
 pub struct Orient {
     operations: super::Orient,
+    native: bool,
+    tools: Vec<Tool>,
 }
 impl Orient {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -20,8 +22,36 @@ impl Orient {
     }
 
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self::configured(storage, false)
+    }
+
+    pub fn with_native_storage(storage: crate::storage::Storage) -> Self {
+        Self::configured(storage, true)
+    }
+
+    fn configured(storage: crate::storage::Storage, native: bool) -> Self {
+        // Immutable adapter definitions, not a projection of retained facts.
+        // Discovery and dispatch share this exact configured instance.
+        let tools = TOOLS.iter().map(|tool| {
+            let mut selected = Tool { name: tool.name, description: tool.description,
+                input_schema: tool.input_schema };
+            if native {
+                match tool.name {
+                    "orient_show" => selected.description = "Observe the same local health, messages, mail, goals, window and Quota overview with optional persona selection, without recording Presented. Habit conditions remain passive unless evaluate_habits=true explicitly requests their existing local execution. Source maintenance is unchanged. Use orient_next for acknowledged delivery.",
+                    "orient_wake" => selected.description = "Assemble the unchanged charged memory cover, cover-tagged Wiki beliefs and goals, with optional persona selection, without recording Presented. No Habit evaluation. Source maintenance is unchanged. Use orient_next for acknowledged delivery.",
+                    "orient_poll" => {
+                        selected.description = "One finite peek at directed news for an explicit persona, including the existing local-health priority. Never records Presented. Only peek=true is accepted; false is rejected, not rewritten. No health network probes, Habit scripts or server wait. Use orient_next for acknowledged delivery.";
+                        selected.input_schema = NATIVE_POLL_SCHEMA;
+                    }
+                    _ => {}
+                }
+            }
+            selected
+        }).collect();
         Self {
             operations: super::Orient::with_storage(storage),
+            native,
+            tools,
         }
     }
 
@@ -47,6 +77,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "orient_poll", description: "One finite directed-news observation for an explicit persona. Actionable local health alerts and reports older than health_max_age_secs (default 180) take priority over ordinary payload acquisition; routine progress, healthy heartbeats and recoveries are quiet. Health news contains only the changed alerts requiring attention; use orient_show for the full local snapshot. Defaults to non-consuming peek=true. peek=false records exact reported event IDs after output acceptance; unavailable selected payloads remain pending. No health network probes, Habit scripts or server wait.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"health_max_age_secs":{"type":"integer","minimum":0,"default":180},"peek":{"type":"boolean","default":true}},"required":["persona"],"additionalProperties":false}"# },
     Tool { name: "orient_baseline", description: "Explicitly discard the current attention backlog for this persona by recording exactly all currently visible events as presented, without displaying their content. Health freshness uses the reader's health_max_age_secs (default 180). Does not mark source messages read.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"health_max_age_secs":{"type":"integer","minimum":0,"default":180}},"required":["persona"],"additionalProperties":false}"# },
 ];
+const NATIVE_POLL_SCHEMA: &str = r#"{"type":"object","properties":{"persona":{"type":"string"},"health_max_age_secs":{"type":"integer","minimum":0,"default":180},"peek":{"type":"boolean","const":true,"default":true}},"required":["persona"],"additionalProperties":false}"#;
 fn ten() -> usize {
     10
 }
@@ -109,7 +140,7 @@ struct Persona {
 }
 impl Faculty for Orient {
     fn tools(&self) -> &[Tool] {
-        TOOLS
+        &self.tools
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
         match name {
@@ -128,36 +159,29 @@ impl Faculty for Orient {
             }
             "orient_show" => {
                 let a: Show = decode_arguments(arguments)?;
-                self.operations
+                let operations = self.operations
                     .clone()
                     .with_health_max_age(Duration::from_secs(
                         a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
-                    ))
-                    .show(
-                        a.persona.as_deref(),
-                        &ShowOptions {
-                            message_limit: a.message_limit,
-                            doing_limit: a.doing_limit,
-                            todo_limit: a.todo_limit,
-                            evaluate_habits: a.evaluate_habits,
-                        },
-                        out,
-                    )
+                    ));
+                let options = ShowOptions { message_limit: a.message_limit,
+                    doing_limit: a.doing_limit, todo_limit: a.todo_limit,
+                    evaluate_habits: a.evaluate_habits };
+                if self.native { operations.show_unpresented(a.persona.as_deref(), &options, out) }
+                else { operations.show(a.persona.as_deref(), &options, out) }
             }
             "orient_wake" => {
                 let a: Wake = decode_arguments(arguments)?;
-                self.operations.wake(
-                    a.persona.as_deref(),
-                    &WakeOptions {
-                        chars: a.chars,
-                        doing_limit: a.doing_limit,
-                        todo_limit: a.todo_limit,
-                    },
-                    out,
-                )
+                let options = WakeOptions { chars: a.chars, doing_limit: a.doing_limit,
+                    todo_limit: a.todo_limit };
+                if self.native { self.operations.wake_unpresented(a.persona.as_deref(), &options, out) }
+                else { self.operations.wake(a.persona.as_deref(), &options, out) }
             }
             "orient_poll" => {
                 let a: Poll = decode_arguments(arguments)?;
+                if self.native && !a.peek {
+                    return Err(crate::mcp::invalid_arguments("native orient_poll accepts only peek=true; use orient_next for acknowledged delivery"));
+                }
                 self.operations
                     .clone()
                     .with_health_max_age(Duration::from_secs(

@@ -265,8 +265,7 @@ pub struct WitnessAnnotations {
     pub pointer: Vec<String>,
     pub claimed_size: Option<u128>,
     pub claimed_media_type: Option<MediaType>,
-    /// A media type exactly as the source spells it, where it does not
-    /// parse.
+    /// A media type exactly as the source spells it, valid or not.
     pub raw_media_type: Option<String>,
     pub claimed_title: Option<String>,
     /// A result status the source records but her window did not render.

@@ -16,6 +16,11 @@ All notable changes to this project will be documented in this file.
   the caller retains the first report for publication.
   Quota's existing observation also uses this same borrowed store and controlled
   snapshot; resident upkeep releases its short borrow before byte acquisition.
+  The native Catalog projection keeps show/wake persona selection without
+  recording Presented and exposes/enforces peek-only poll. Explicit false is
+  rejected before Storage/output. Next owns deferred delivery acknowledgment;
+  baseline remains explicitly destructive. Ordinary CLI/MCP acceptance is
+  unchanged, and source upkeep/explicit Habit evaluation is not called pure.
 
 - **Quota: provider-reported subscription usage in the pile.** A new `quota`
   faculty and collection (scope `6B6C08A47B334284A56279D961255250`, name

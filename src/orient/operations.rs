@@ -144,6 +144,16 @@ impl Orient {
         options: &ShowOptions,
         out: &mut Out<'_>,
     ) -> Result<()> {
+        self.show_reporting(persona, options, true, out)
+    }
+    /// The same persona-filtered overview without recording Presented. Source
+    /// maintenance and explicitly requested Habit evaluation are unchanged.
+    pub fn show_unpresented(&self, persona: Option<&str>, options: &ShowOptions,
+        out: &mut Out<'_>) -> Result<()> {
+        self.show_reporting(persona, options, false, out)
+    }
+    fn show_reporting(&self, persona: Option<&str>, options: &ShowOptions,
+        record_presented: bool, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             // Quota acquires through the runtime, so it is read before entering it.
             let quota = quota_section(&self.storage, pile, signer, runtime);
@@ -160,6 +170,7 @@ impl Orient {
                 self.health_max_age,
                 self.service_events_collection,
                 &quota,
+                record_presented,
                 out,
             ))
         })
@@ -170,6 +181,16 @@ impl Orient {
         options: &WakeOptions,
         out: &mut Out<'_>,
     ) -> Result<()> {
+        self.wake_reporting(persona, options, true, out)
+    }
+    /// The same wake selection and output without recording shown Compass
+    /// attention. This does not change memory/goal selection or source upkeep.
+    pub fn wake_unpresented(&self, persona: Option<&str>, options: &WakeOptions,
+        out: &mut Out<'_>) -> Result<()> {
+        self.wake_reporting(persona, options, false, out)
+    }
+    fn wake_reporting(&self, persona: Option<&str>, options: &WakeOptions,
+        record_presented: bool, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_wake(
                 &self.storage,
@@ -179,6 +200,7 @@ impl Orient {
                 options.chars,
                 options.doing_limit,
                 options.todo_limit,
+                record_presented,
                 out,
             ))
         })
@@ -3768,6 +3790,7 @@ async fn cmd_show(
     health_max_age: Duration,
     service_events_collection: Option<CollectionHandle>,
     quota: &str,
+    record_presented: bool,
     output: &mut Out<'_>,
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -3786,7 +3809,7 @@ async fn cmd_show(
             &mut |_| {},
         )
         .await?;
-        if let Some(input) = persona {
+        if let Some(input) = persona.filter(|_| record_presented) {
             match health.persona_acquiring(pile, input).await {
                 Ok(_) => save_presentations(
                     pile,
@@ -3881,7 +3904,7 @@ async fn cmd_show(
 
         write_complete_report(output, &report, "Orient overview", &mut |_| {}).await?;
 
-        if persona_id.is_some() {
+        if record_presented && persona_id.is_some() {
             save_presentations(pile, signer, sources.presentations.source, shown)?;
         }
         Ok(())
@@ -5854,6 +5877,7 @@ async fn cmd_wake(
     chars: usize,
     doing_limit: usize,
     todo_limit: usize,
+    record_presented: bool,
     output: &mut Out<'_>,
 ) -> Result<()> {
     use std::fmt::Write as _;
@@ -5904,8 +5928,10 @@ async fn cmd_wake(
         ))?;
     }
 
-    if let Some((receipts, shown)) = selection.presented {
-        save_presentations(storage, signer, receipts, shown)?;
+    if record_presented {
+        if let Some((receipts, shown)) = selection.presented {
+            save_presentations(storage, signer, receipts, shown)?;
+        }
     }
     Ok(())
 }
@@ -6514,6 +6540,7 @@ mod tests {
                 0,
                 5,
                 5,
+                true,
                 &mut Out::new(&mut |part| {
                     let crate::out::Part::Text { text } = part else {
                         bail!("expected text")
@@ -7145,6 +7172,7 @@ mod tests {
                 0,
                 5,
                 5,
+                true,
                 &mut Out::new(&mut |part| {
                     let crate::out::Part::Text { text } = part else {
                         bail!("expected wake text")

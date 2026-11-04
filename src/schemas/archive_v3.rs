@@ -426,9 +426,10 @@ pub mod witness {
         /// render.
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
         /// OCCURRENCE CORE. A media type exactly as the source spells it,
-        /// where it does not parse as one (`claimed_media_type` holds the
-        /// parsed form of one that does). The record's own claim, kept so a
-        /// malformed spelling never costs the bytes it labels. Minted with
+        /// valid or not. `claimed_media_type` holds the parsed reading of a
+        /// valid one, so a record may carry both: the lexical claim and its
+        /// meaning. The record's own claim, kept so a malformed spelling
+        /// never costs the bytes it labels. Minted with
         /// `trible genid` 2026-11-04.
         "2E7CC61A930F8A142F9E65BB77D1D7AD" as pub raw_media_type: Handle<UTF8String>;
         /// OCCURRENCE CORE. A title the source gives that her window did not show.
