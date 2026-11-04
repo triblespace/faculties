@@ -239,6 +239,8 @@ pub struct WitnessAnnotations {
     pub compaction_summary: bool,
     /// The source flags the held text as the harness's writing.
     pub harness_written: bool,
+    /// Why the turn the record closes ended (an `ends` term).
+    pub turn_ends: Vec<Id>,
 }
 
 /// One occurrence of `witness`: the claims of one source record, rooted at an
@@ -306,6 +308,7 @@ pub fn occurrence(witness: Id, annotations: WitnessAnnotations) -> Result<Fragme
         schema::witness::claimed_size?: annotations.claimed_size,
         schema::witness::claimed_media_type?: claimed_media_type,
         schema::witness::claimed_title?: claimed_title,
+        schema::witness::turn_ends*: annotations.turn_ends.iter(),
         metadata::tag*: tags.iter(),
     };
     let core = attach_kind(core, schema::occurrence::KIND, "occurrence")?;

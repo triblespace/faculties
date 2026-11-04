@@ -38,7 +38,7 @@ use hifitime::{Duration, Epoch};
 use super::{id_like, JsonLeaf, Kind, Origin, Token, Value};
 use crate::archive_v3::fields::{
     Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, Gaps, Mirror,
-    Order, Place, Structure, Windows,
+    Order, Place, Structure, Supply, Windows,
 };
 
 /// What B found in one unit.
@@ -90,6 +90,12 @@ pub struct Walked {
     /// A call's item -> the item later requests hold in its place
     /// ([`crate::archive_v3::fields::Rewrite`]).
     wire: HashMap<usize, usize>,
+    /// Texts a [`Supply`] copy may name: (record, the text's hash, the
+    /// record's member, when it holds one).
+    supply_texts: Vec<(usize, [u8; 32], Option<String>)>,
+    /// Supply copies: (record, its text's hash, its spelling, the supply,
+    /// path, occurrence label).
+    supplies: Vec<(usize, [u8; 32], String, Supply, String, String)>,
 }
 
 /// A link of an item: its attribute, the items its correlator names (the
@@ -1012,9 +1018,15 @@ pub fn walk(table: &FieldTable, source: &[u8]) -> Walked {
         index: HashMap::new(),
         by_path: HashMap::new(),
         known: known_paths(table),
+        supply_paths: HashMap::new(),
     };
     for entry in table.entries {
         walker.by_path.entry(entry.path).or_default().push(entry);
+        if let Class::Supply(supply) = entry.class {
+            for (path, field) in supply.of {
+                walker.supply_paths.insert(path, field);
+            }
+        }
     }
     let gaps = table.gaps;
     for gap in gaps
@@ -1323,6 +1335,8 @@ struct Walker<'t> {
     /// Every path and path prefix the table names: a report prints a key or
     /// a discriminator value only when it is one of them.
     known: HashSet<String>,
+    /// The text paths a [`Supply`] names, with the member field of each.
+    supply_paths: HashMap<&'static str, &'static str>,
 }
 
 /// Every path the table names, and every prefix of one that ends before a
@@ -1453,6 +1467,7 @@ fn applies(entry: &Entry, value: &J) -> bool {
         Class::Structure(_) | Class::Correlator => is_leaf(value),
         Class::Drop(DropReason::Empty) => is_leaf(value),
         Class::Rewrite(_) => matches!(value, J::Obj(_)),
+        Class::Supply(supply) => is_leaf(value) && decode_applies(supply.decode, value),
         Class::Drop(_) | Class::Open(_) => true,
     }
 }
@@ -1550,6 +1565,12 @@ impl<'t> Walker<'t> {
     fn value(&mut self, value: &J, path: &str, parent: Option<&J>, mut ctx: Ctx) {
         if path == self.table.record && ctx.record.is_none() {
             ctx = self.start_record(value, ctx);
+        }
+        if let (Some(field), Some(record)) = (self.supply_paths.get(path), ctx.record) {
+            let member = ctx.scalars.get(*field).filter(|v| *v != "null").cloned();
+            self.out
+                .supply_texts
+                .push((record, value_hash(value), member));
         }
         if let Some((hashes, strings)) = self.out.watched.get_mut(path) {
             hashes.insert(value_hash(value));
@@ -2135,6 +2156,29 @@ impl<'t> Walker<'t> {
                     ));
                 }
             }
+            Class::Supply(supply) => {
+                let (Some(record), Some(spelling)) = (ctx.record, spelling(value)) else {
+                    self.row(path, Kind::Decode, ctx);
+                    return;
+                };
+                if let Err(failure) = decode_values(supply.decode, value) {
+                    self.fail(failure, path, ctx);
+                    return;
+                }
+                let Some(text) = field_at(&ctx.root, supply.text) else {
+                    self.row(path, Kind::Mirror, ctx);
+                    return;
+                };
+                let label = format!("{}:{:?}", ctx.line, ctx.index);
+                self.out.supplies.push((
+                    record,
+                    value_hash(text),
+                    spelling,
+                    supply,
+                    path.to_owned(),
+                    label,
+                ));
+            }
             Class::Open(_) => self.row(path, Kind::Open, ctx),
         }
     }
@@ -2159,6 +2203,64 @@ impl<'t> Walker<'t> {
                 (&a.levels, a.order).cmp(&(&b.levels, b.order))
             });
             self.out.records[record].items = items;
+        }
+        // Each supply copy: the member it supplies, or the member it must
+        // equal.
+        for (record, text, spelling, supply, path, label) in std::mem::take(&mut self.out.supplies)
+        {
+            let named = |at: &&(usize, [u8; 32], Option<String>)| at.1 == text;
+            let before = self
+                .out
+                .supply_texts
+                .iter()
+                .filter(named)
+                .filter(|at| at.0 < record)
+                .max_by_key(|at| at.0);
+            let after = self
+                .out
+                .supply_texts
+                .iter()
+                .filter(named)
+                .filter(|at| at.0 > record)
+                .min_by_key(|at| at.0);
+            let Some((holder, _, member)) = before.or(after).cloned() else {
+                continue;
+            };
+            match member {
+                Some(member) if member == spelling => {}
+                Some(_) => rows.push((path, Kind::Mirror, label)),
+                None => {
+                    let Ok(values) = decode_values(supply.decode, &J::Str(spelling)) else {
+                        continue;
+                    };
+                    for value in values {
+                        let token = Token {
+                            modality: supply.modality.to_owned(),
+                            direction: supply.direction.to_owned(),
+                            attribute: supply.attribute.to_owned(),
+                            value,
+                        };
+                        let items: Vec<usize> = self.out.records[holder]
+                            .items
+                            .iter()
+                            .copied()
+                            .filter(|&item| {
+                                let item = &self.out.items[item];
+                                item.modality == supply.modality
+                                    && item.tokens.iter().any(|t| t.direction == supply.direction)
+                            })
+                            .collect();
+                        for item in items {
+                            self.out.items[item].tokens.insert(token.clone());
+                        }
+                        self.out.tokens.entry(token).or_default().push(Origin {
+                            path: path.clone(),
+                            record: Some(record),
+                            index: Vec::new(),
+                        });
+                    }
+                }
+            }
         }
         // Each call the client re-sent changed: the item later requests
         // hold in its place.
@@ -2459,18 +2561,27 @@ impl<'t> Walker<'t> {
         }
         if let Order::File(_) = self.table.order {
             let mut pending: Vec<BTreeSet<Token>> = Vec::new();
+            // The last node the file placed, for claims after it.
+            let mut last = None;
             for record in 0..out.records.len() {
-                let first = out
+                let held: Vec<usize> = out
                     .ordered(record)
                     .into_iter()
-                    .find(|&item| out.items[item].held);
-                match first {
-                    Some(item) => out.items[item].claims.append(&mut pending),
+                    .filter(|&item| out.items[item].held)
+                    .collect();
+                match held.first() {
+                    Some(&item) => {
+                        out.items[item].claims.append(&mut pending);
+                        last = held.last().copied();
+                    }
                     None if !out.records[record].claims.is_empty() => {
                         pending.push(out.records[record].claims.clone());
                     }
                     None => {}
                 }
+            }
+            if let Some(item) = last {
+                out.items[item].claims.append(&mut pending);
             }
         }
     }

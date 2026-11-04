@@ -177,7 +177,8 @@ pub enum Place {
     /// A claim of its record: one occurrence (the record's claims as one
     /// tuple) of the witness of each node the record holds. Under
     /// [`Order::File`] a record that holds no node gives its claims to the
-    /// next node the file places.
+    /// next node the file places, or, after the file's last node, to that
+    /// last node.
     Claim,
     /// The record's last item.
     Last,
@@ -400,9 +401,34 @@ pub enum Class {
     /// A marked window change: what the client sent in later requests in
     /// place of a call's member ([`Rewrite`]).
     Rewrite(Rewrite),
+    /// A client copy of a member of a kept item, which is the member's
+    /// source where the item holds none ([`Supply`]).
+    Supply(Supply),
     Drop(DropReason),
     /// Meaning not yet verified; fails until answered.
     Open(&'static str),
+}
+
+/// A client copy of one member of a kept item: Codex's
+/// `agent_message.phase` (ruling X1).
+///
+/// The copy names its item by text: the record-relative field `text` of the
+/// copy's record equals a value at one of the normalized paths `of.0`; the
+/// nearest such value before the copy in the file (else the nearest after
+/// it) is its item's. Where that value's record holds the member, at its
+/// record-relative field `of.1`, the copy must spell the same, or it is a
+/// mirror fault. Where it holds none, the copy is the source of attribute
+/// `attribute`, decoded by `decode`, of every fact of `modality` and
+/// `direction` that record holds. A copy whose text names no value holds
+/// nothing of its own (its text's own mirror says whether that is a fault).
+#[derive(Clone, Copy, Debug)]
+pub struct Supply {
+    pub text: &'static str,
+    pub of: &'static [(&'static str, &'static str)],
+    pub attribute: &'static str,
+    pub decode: Decode,
+    pub modality: &'static str,
+    pub direction: &'static str,
 }
 
 /// An object whose members, keyed by a call's id, hold what the client

@@ -32,7 +32,7 @@
 
 use super::{
     Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, FileWindows, Gap, GapRule, Gaps,
-    Link, Mirror, Order, Place, Structure, Windows,
+    Link, Mirror, Order, Place, Structure, Supply, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -74,6 +74,23 @@ const DETAIL: &[(&str, &str)] = &[
 ];
 const ABORTED: &[(&str, &str)] = &[("interrupted", "interrupted")];
 const PHASES: &[&str] = &["commentary", "final_answer"];
+const REGISTERS: &[(&str, &str)] = &[("commentary", "commentary"), ("final_answer", "answer")];
+
+/// An `agent_message` event's phase, a copy of her message's (X1).
+const PHASE_COPY: Supply = Supply {
+    text: "payload.message",
+    of: &[
+        ("{message}{assistant}.content[]{output_text}.text", "phase"),
+        (
+            "{response_item}.payload{message}{assistant}.content[]{output_text}.text",
+            "payload.phase",
+        ),
+    ],
+    attribute: "register",
+    decode: Decode::Term(REGISTERS),
+    modality: "text",
+    direction: "out",
+};
 const REASONING_SEAL: &[(&str, Decode)] =
     &[("media_type", Decode::ConstText(sealed::OPENAI_REASONING))];
 const COMPACTION_SEAL: &[(&str, Decode)] =
@@ -217,6 +234,8 @@ macro_rules! items {
                 concat!($p, "{reasoning}.internal_chat_message_metadata_passthrough"),
                 Class::Drop(PASSTHROUGH),
             ),
+            // An empty token holds nothing (X7): its empty drop, and the
+            // reasoning is a body gap.
             Entry::fact_with(
                 concat!($p, "{reasoning}.encrypted_content"),
                 "thinking",
@@ -224,7 +243,8 @@ macro_rules! items {
                 "blob",
                 Decode::Base64Url,
                 REASONING_SEAL,
-            ),
+            )
+            .when(&[Cond::SiblingNot("encrypted_content", "")]),
             Entry::new(
                 concat!($p, "{reasoning}.encrypted_content"),
                 Class::Drop(DropReason::Empty),
@@ -614,6 +634,20 @@ const RESPONSE_ITEM: &[Entry] = &[
     ),
 ];
 
+/// X9 stays open on the source's own evidence: the field is not the
+/// reviewer's context. codex-rs history/src/guardian_history.rs documents
+/// `GuardianHistoryCheckpoint` as "Model-invisible Guardian transcript
+/// checkpoints" holding the "Original review evidence, separate from the
+/// compacted model conversation": the reviewed thread's pre-compaction
+/// items (`ContextManager::guardian_history_checkpoint`,
+/// core/src/context_manager/history.rs). The reviewer reads it through
+/// `collect_guardian_prompt_items_with_parent_turn` (core/src/guardian/
+/// prompt.rs), which renders its own prompt from it; its own messages and
+/// reasoning are not in this field.
+const GUARDIAN_HISTORY: &str = "the reviewed thread's pre-compaction items kept as review \
+     evidence (model-invisible): not the reviewer's own context, and how they enter the \
+     reviewer's prompt is unverified";
+
 const COMPACTED: &[Entry] = &[
     Entry::new("{compacted}.type", DISCRIMINATOR),
     Entry::new("{compacted}.ordinal", Class::Drop(ORDINAL)),
@@ -669,7 +703,7 @@ const COMPACTED: &[Entry] = &[
     ),
     Entry::new(
         "{compacted}.payload.guardian_history",
-        Class::Open("an approval reviewer's own context; whether it is hers is undecided"),
+        Class::Open(GUARDIAN_HISTORY),
     ),
 ];
 
@@ -967,31 +1001,23 @@ const NOT_ERRED: &[Cond] = &[Cond::Absent("payload.error.message")];
 const EVENT_MSG: &[Entry] = &[
     Entry::new("{event_msg}.type", DISCRIMINATOR),
     Entry::new("{event_msg}.ordinal", Class::Drop(ORDINAL)),
-    Entry::new(
-        "{event_msg}.timestamp",
-        Class::Annotation(&[("timestamp", Decode::Timestamp)]),
-    )
-    .when(&[
-        Cond::Is("payload.type", "task_complete"),
-        Cond::Present("payload.error.message"),
-    ]),
-    Entry::new("{event_msg}.timestamp", Class::Drop(TIME))
-        .when(&[Cond::IsNot("payload.type", "task_complete")]),
-    Entry::new("{event_msg}.timestamp", Class::Drop(TIME)).when(&[
-        Cond::Is("payload.type", "task_complete"),
-        Cond::Absent("payload.error.message"),
-    ]),
+    Entry::new("{event_msg}.timestamp", Class::Drop(TIME)),
     // The client's copies of items the unit holds.
     Entry::new("{event_msg}.payload{agent_message}.type", DISCRIMINATOR),
     Entry::new(
         "{event_msg}.payload{agent_message}.message",
         Class::Drop(DropReason::Mirror(Mirror::Unit(ASSISTANT_TEXTS))),
     ),
+    // The client's copy of her message's phase (X1): it must equal the
+    // message's own, and where the message holds none it is the register's
+    // source.
     Entry::new(
         "{event_msg}.payload{agent_message}.phase",
-        Class::Drop(DropReason::Machinery(
-            "the client's copy of the item's phase",
-        )),
+        Class::Supply(PHASE_COPY),
+    ),
+    Entry::new(
+        "{event_msg}.payload{agent_message}.phase",
+        Class::Drop(DropReason::Empty),
     ),
     Entry::new(
         "{event_msg}.payload{agent_message}.memory_citation",
@@ -1035,9 +1061,14 @@ const EVENT_MSG: &[Entry] = &[
     ),
     // Why a turn ended.
     Entry::new("{event_msg}.payload{turn_aborted}.type", DISCRIMINATOR),
+    // X5: on her last node of the turn when she produced one, and always a
+    // claim of the record (which holds no node).
     Entry::new(
         "{event_msg}.payload{turn_aborted}.reason",
-        Class::Annotation(&[("ends", Decode::Term(ABORTED))]),
+        Class::Annotation(&[
+            ("ends", Decode::Term(ABORTED)),
+            ("turn_ends", Decode::Term(ABORTED)),
+        ]),
     ),
     Entry::new(
         "{event_msg}.payload{turn_aborted}.turn_id",
@@ -1061,16 +1092,18 @@ const EVENT_MSG: &[Entry] = &[
         Class::Annotation(&[("ends", Decode::ConstTerm("error"))]),
     )
     .when(ERRED),
-    Entry::fact(
-        "{event_msg}.payload{task_complete}.error",
-        "event",
-        "in",
-        "structure",
-        Decode::Json,
-    ),
+    // X6: why the turn failed is `ends: error` on her last node; whether
+    // the client rendered the failure to her is unverified, so there is no
+    // fact. The model input is built from recorded response items, and an
+    // event is none (codex-rs core/src/session/mod.rs,
+    // `record_conversation_items` persists response items, events go
+    // through `send_event_raw`).
     Entry::new(
         "{event_msg}.payload{task_complete}.error",
-        Class::Drop(DropReason::Empty),
+        Class::Drop(DropReason::Machinery(
+            "the client's report of a failed turn: an event, never a response item of her \
+             window",
+        )),
     ),
     Entry::new(
         "{event_msg}.payload{task_complete}.last_agent_message",
@@ -1316,7 +1349,44 @@ const EVENT_MSG: &[Entry] = &[
 
 /// `world_state` (G3): the client's model of the environment, rendered
 /// into developer and user messages. What the census found inside a kept
-/// message is a mirror; the rest is open.
+/// message is a mirror.
+///
+/// X10, from the openai/codex source (codex-rs, main at 71a4c070,
+/// 2026-11-04): the record is the baseline the client diffs the next state
+/// against, never model input. `Session::record_context_updates_and_set_reference_context_item`
+/// and `Session::record_step_world_state_if_changed` (core/src/session/mod.rs)
+/// render each section's change (`render_diff`) into messages, record them
+/// with `record_conversation_items` (which persists them as response items,
+/// kept here), and only then persist the `WorldState` record ("Persist state
+/// only after any model-visible context generated from it"; "A snapshot can
+/// change without producing model-visible ... updates"). So a field the
+/// census found in no kept message is the snapshot's own machinery:
+const WORLD_STATE_BASELINE: DropReason = DropReason::Machinery(
+    "world-state baseline the client diffs against; its rendering is the response items \
+     recorded before it (codex-rs core/src/session/mod.rs, \
+     record_step_world_state_if_changed)",
+);
+/// Snapshot fingerprints: `collaboration_mode.instructions` and the
+/// permissions' `instructions` are a `WorldStateHash` (core/src/context/
+/// world_state/collaboration_mode.rs `CollaborationModeSnapshot`,
+/// permissions.rs `PermissionsSnapshot`, the SHA-1 in world_state/mod.rs),
+/// the usage hint's snapshot is `MultiAgentUsageHintState::fingerprint`
+/// (multi_agent_usage_hint.rs): hashes of text she was shown in a message,
+/// not the text.
+const WORLD_STATE_HASH: DropReason = DropReason::Machinery(
+    "a fingerprint of a section the client rendered into a recorded message; the hash is \
+     never model input (codex-rs core/src/context/world_state/mod.rs WorldStateHash)",
+);
+/// An environment's status: `push_environment_values` (core/src/context/
+/// world_state/environment.rs) renders it only as `<status>starting</status>`
+/// or `<status>failed</status>` inside the environment message, which is
+/// recorded as a response item.
+const WORLD_STATE_STATUS: DropReason = DropReason::Machinery(
+    "an environment's status in the baseline; its rendering, when it has one, is inside the \
+     environment message recorded before it (codex-rs core/src/context/world_state/\
+     environment.rs push_environment_values)",
+);
+
 const WORLD_STATE: &[Entry] = &[
     Entry::new("{world_state}.type", DISCRIMINATOR),
     Entry::new("{world_state}.ordinal", Class::Drop(ORDINAL)),
@@ -1361,11 +1431,11 @@ const WORLD_STATE: &[Entry] = &[
     ),
     Entry::new(
         "{world_state}.payload.state.environments.environments.local.status",
-        Class::Open("an environment's status: its rendering is unverified"),
+        Class::Drop(WORLD_STATE_STATUS),
     ),
     Entry::new(
         "{world_state}.payload.state.environments.subagents",
-        Class::Open("the subagent roster: the census found it in no kept message"),
+        Class::Drop(WORLD_STATE_BASELINE),
     ),
     Entry::new(
         "{world_state}.payload.state.environments.subagents",
@@ -1378,7 +1448,7 @@ const WORLD_STATE: &[Entry] = &[
     .when(&[Cond::Scalar("payload.state.collaboration_mode")]),
     Entry::new(
         "{world_state}.payload.state.collaboration_mode.instructions",
-        Class::Open("collaboration-mode instructions: the census found them in no kept message"),
+        Class::Drop(WORLD_STATE_HASH),
     ),
     Entry::new(
         "{world_state}.payload.state.collaboration_mode.mode",
@@ -1398,11 +1468,11 @@ const WORLD_STATE: &[Entry] = &[
     ),
     Entry::new(
         "{world_state}.payload.state.permissions",
-        Class::Open("permission instructions: the census found them in no kept message"),
+        Class::Drop(WORLD_STATE_HASH),
     ),
     Entry::new(
         "{world_state}.payload.state.multi_agent_usage_hint",
-        Class::Open("the multi-agent hint: the census found it in no kept message"),
+        Class::Drop(WORLD_STATE_HASH),
     ),
     Entry::new(
         "{world_state}.payload.state.managed_developer_instructions",
@@ -1410,7 +1480,7 @@ const WORLD_STATE: &[Entry] = &[
     ),
     Entry::new(
         "{world_state}.payload.state.model_catalog",
-        Class::Open("the model catalog: its rendering is unverified"),
+        Class::Drop(WORLD_STATE_BASELINE),
     ),
     Entry::new(
         "{world_state}.payload.state.persistent_mode",
@@ -1656,7 +1726,15 @@ const fn unsealed(path: &'static str) -> GapRule {
     }
 }
 
-const BESIDE: [GapRule; 12] = [
+/// Her reasoning happened; its token is the empty string (X7).
+const fn empty_sealed(path: &'static str) -> GapRule {
+    GapRule {
+        when: &[Cond::Sibling("encrypted_content", "")],
+        ..unsealed(path)
+    }
+}
+
+const BESIDE: [GapRule; 15] = [
     head("{function_call_output}.call_id"),
     head("{custom_tool_call_output}.call_id"),
     head("{response_item}.payload{function_call_output}.call_id"),
@@ -1667,6 +1745,9 @@ const BESIDE: [GapRule; 12] = [
     unsealed("{reasoning}.type"),
     unsealed("{response_item}.payload{reasoning}.type"),
     unsealed("{compacted}.payload.replacement_history[]{reasoning}.type"),
+    empty_sealed("{reasoning}.type"),
+    empty_sealed("{response_item}.payload{reasoning}.type"),
+    empty_sealed("{compacted}.payload.replacement_history[]{reasoning}.type"),
     // Before replacement histories: what the client kept is unrecorded,
     // then the summary.
     GapRule {
@@ -1718,7 +1799,3 @@ const LINKS: [Link; 4] = [
     answers("{response_item}.payload{function_call_output}.call_id"),
     answers("{response_item}.payload{custom_tool_call_output}.call_id"),
 ];
-
-/// The side model that writes reasoning summaries; the source does not
-/// name it.
-pub const REASONING_SUMMARIZER: &str = "openai reasoning summarizer (unnamed)";

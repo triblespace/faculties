@@ -283,6 +283,7 @@ fn seed_tables_name_only_v3_terms() {
         "claimed_title".to_owned(),
         "compaction_summary".to_owned(),
         "harness_written".to_owned(),
+        "turn_ends".to_owned(),
         "ends".to_owned(),
         "rendering".to_owned(),
     ];
@@ -297,7 +298,7 @@ fn seed_tables_name_only_v3_terms() {
             "detail" => v3::fact::detail::SPECS.iter().map(|(_, n)| *n).collect(),
             "register" => v3::fact::register::SPECS.iter().map(|(_, n)| *n).collect(),
             "form" => v3::fact::form::SPECS.iter().map(|(_, n)| *n).collect(),
-            "ends" => v3::node::ends::SPECS.iter().map(|(_, n, _)| *n).collect(),
+            "ends" | "turn_ends" => v3::node::ends::SPECS.iter().map(|(_, n, _)| *n).collect(),
             "effort" => v3::fact::effort::SPECS.iter().map(|(_, n)| *n).collect(),
             "rendering" => v3::node::rendering::SPECS.iter().map(|(_, n)| *n).collect(),
             _ => Vec::new(),

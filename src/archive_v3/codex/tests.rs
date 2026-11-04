@@ -3,7 +3,7 @@
 //! fixture is gated: the importer's fragment must pass the gate against the
 //! same source bytes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
 use serde_json::{json, Value};
@@ -381,11 +381,17 @@ fn g2() -> String {
 #[test]
 fn g2_passes() {
     let imported = passes(&g2());
-    // The aborted turn ends at her last node; the erred one at the prompt.
+    // The aborted turn ends at her last node. The erred turn holds only his
+    // prompt: no ends there, and no fact for the error (X5, X6).
     let ends = annotated!(imported, v3::node::ends);
     let commentary = witnessed_saying(&imported, "Checking the parser.");
     assert!(ends.contains(&(commentary, v3::node::ends::INTERRUPTED)));
-    assert_eq!(ends.len(), 2);
+    assert_eq!(ends.len(), 1);
+    let facts = imported.fragment.facts();
+    assert!(!exists!(
+        (),
+        pattern!(facts, [{ _?fact @ v3::fact::modality: v3::fact::modality::EVENT }])
+    ));
     // The effort change re-presents the line: the prompt has a copy that
     // recalls it.
     assert_eq!(nodes_saying(&imported, "Fix the bug.").len(), 2);
@@ -690,13 +696,14 @@ fn unknown_fields_and_kinds_fail() {
     let source = g4().replace("\"effort\":\"medium\"", "\"effort\":\"enormous\"");
     assert_eq!(refused(&source).path, "{turn_context}.payload.effort");
     // An open field fails.
-    let source = g3().replace(
-        "\"apps_instructions\":false",
-        "\"apps_instructions\":false,\"multi_agent_usage_hint\":\"hint\"",
+    let source = g4().replace(
+        "\"client_authored\":false",
+        "\"client_authored\":false,\"retained_source\":\"x\"",
     );
+    assert_ne!(source, g4());
     assert_eq!(
         refused(&source).path,
-        "{world_state}.payload.state.multi_agent_usage_hint"
+        "{response_item}.metadata.retained_source"
     );
 }
 
@@ -717,6 +724,551 @@ fn the_gate_catches_a_lost_item() {
 }
 
 // ---------------------------------------------------------------------------
+// Round 3: the rulings X1..X10, and the losslessness review's fixtures
+// (rv_*), each of which failed against the round-2 importer.
+
+fn rv_meta(second: u32, id: &str, base: &str) -> Value {
+    line(
+        second,
+        "session_meta",
+        json!({"id": id, "timestamp": stamp(second), "cwd": "/synthetic",
+            "originator": "codex_cli_rs", "cli_version": "0.0.0", "model_provider": "openai",
+            "base_instructions": {"text": base}}),
+    )
+}
+
+fn rv_turn(second: u32, turn: &str, effort: &str) -> [Value; 2] {
+    [
+        line(
+            second,
+            "event_msg",
+            json!({"type": "task_started", "turn_id": turn}),
+        ),
+        line(
+            second,
+            "turn_context",
+            json!({"model": "gpt-5.5", "effort": effort, "summary": "auto", "turn_id": turn}),
+        ),
+    ]
+}
+
+fn rv_user(second: u32, text: &str) -> Value {
+    line(
+        second,
+        "response_item",
+        json!({"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": text}]}),
+    )
+}
+
+fn rv_said(second: u32, text: &str, phase: Option<&str>) -> Value {
+    let mut item = json!({"type": "message", "role": "assistant",
+        "content": [{"type": "output_text", "text": text}]});
+    if let Some(phase) = phase {
+        item["phase"] = json!(phase);
+    }
+    line(second, "response_item", item)
+}
+
+fn rv_head(records: &mut Vec<Value>) {
+    records.push(rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys."));
+    records.extend(rv_turn(1, "t1", "high"));
+}
+
+fn chain(imported: &Imported, node: Id) -> Vec<Id> {
+    let mut out = vec![node];
+    let mut cursor = previous(imported, node);
+    while let Some(at) = cursor {
+        out.push(at);
+        cursor = previous(imported, at);
+    }
+    out
+}
+
+fn some(texts: &[Option<String>]) -> Vec<String> {
+    texts.iter().flatten().cloned().collect()
+}
+
+/// Whether a path along `previous` and `continues` returns to where a
+/// `continues` link starts.
+fn continues_cycle(imported: &Imported) -> bool {
+    let facts = imported.fragment.facts();
+    let mut next: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
+    for (node, previous) in find!(
+        (node: Id, previous: Id),
+        pattern!(facts, [{ ?node @ v3::node::previous: ?previous }])
+    ) {
+        next.entry(node).or_default().push(previous);
+    }
+    let links = annotated!(imported, v3::node::continues);
+    for &(node, target) in &links {
+        next.entry(node).or_default().push(target);
+    }
+    links.iter().any(|&(start, target)| {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![target];
+        while let Some(at) = stack.pop() {
+            if at == start {
+                return true;
+            }
+            if seen.insert(at) {
+                stack.extend(next.get(&at).into_iter().flatten().copied());
+            }
+        }
+        false
+    })
+}
+
+fn registers(imported: &Imported, node: Id) -> Vec<Id> {
+    let facts = imported.fragment.facts();
+    find!(
+        r: Id,
+        pattern!(facts, [
+            { node @ v3::node::holds: _?fact },
+            { _?fact @ v3::fact::register: ?r },
+        ])
+    )
+    .collect()
+}
+
+/// X1 (review CX-2b, refuted in round 2): the phase only the event copy
+/// carries is her message's register; the gate supplies it too.
+#[test]
+fn rv_cx2b_phase_only_on_event() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Q."));
+    records.push(rv_said(3, "Looking.", None));
+    records.push(line(
+        3,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Looking.", "phase": "commentary"}),
+    ));
+    let source = jsonl(&records);
+    let imported = passes(&source);
+    let looking = witnessed_saying(&imported, "Looking.");
+    assert_eq!(
+        registers(&imported, looking),
+        vec![v3::fact::register::COMMENTARY]
+    );
+    // The gate holds the importer to it: the same fragment against a source
+    // whose copy names the other phase fails.
+    let other = source.replace("\"phase\":\"commentary\"", "\"phase\":\"final_answer\"");
+    assert_ne!(other, source);
+    assert!(!gate(&other, &imported).passed());
+}
+
+/// X1 (review CX-2): where both hold the phase, a copy that disagrees, or
+/// one that names a phase the table does not, fails.
+#[test]
+fn rv_cx2_registers() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Q."));
+    records.push(rv_said(3, "Looking.", Some("commentary")));
+    records.push(line(
+        3,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Looking.", "phase": "commentary"}),
+    ));
+    records.push(rv_said(4, "Answer.", Some("final_answer")));
+    records.push(line(
+        4,
+        "event_msg",
+        json!({"type": "agent_message", "message": "Answer.", "phase": "final_answer"}),
+    ));
+    records.push(rv_said(5, "Bare.", None));
+    let source = jsonl(&records);
+    let imported = passes(&source);
+    let of = |text: &str| registers(&imported, witnessed_saying(&imported, text));
+    assert_eq!(of("Looking."), vec![v3::fact::register::COMMENTARY]);
+    assert_eq!(of("Answer."), vec![v3::fact::register::ANSWER]);
+    assert!(of("Bare.").is_empty());
+    let swapped = source.replacen(
+        "\"message\":\"Looking.\",\"phase\":\"commentary\"",
+        "\"message\":\"Looking.\",\"phase\":\"final_answer\"",
+        1,
+    );
+    assert_ne!(swapped, source);
+    assert_eq!(
+        refused(&swapped).path,
+        "{event_msg}.payload{agent_message}.phase"
+    );
+    assert!(walk_rows(&swapped).contains(&(
+        "{event_msg}.payload{agent_message}.phase".to_owned(),
+        Kind::Mirror
+    )));
+    let novel = source.replacen("\"phase\":\"commentary\"", "\"phase\":\"aside\"", 1);
+    // Her text under a phase no entry names is unknown; so is the phase.
+    refused(&novel);
+    assert!(walk_rows(&novel).contains(&(
+        "{response_item}.payload{message}{assistant}.phase".to_owned(),
+        Kind::UnknownValue
+    )));
+}
+
+fn rv_compaction_source(history: Value, after: &[Value]) -> String {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "A."));
+    records.push(rv_said(3, "B.", None));
+    records.extend(rv_turn(4, "t2", "high"));
+    records.push(rv_user(5, "C."));
+    records.push(rv_said(6, "D.", None));
+    records.push(line(
+        7,
+        "compacted",
+        json!({"message": "", "replacement_history": history}),
+    ));
+    records.extend(after.iter().cloned());
+    jsonl(&records)
+}
+
+/// X2 (review CX-3, keep-A refuted in round 2): `continues` sits on the
+/// first node of the new line that is not on the old line, so no continues
+/// path returns to its start, and a kept item is the compaction's own (no
+/// correlator names an original, so it recalls nothing).
+#[test]
+fn rv_cx3_replacement_history() {
+    let keep_c = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C."}]},
+        {"type": "compaction", "encrypted_content": COMPACTION}
+    ]);
+    let source = rv_compaction_source(keep_c, &[rv_said(8, "E.", None)]);
+    let imported = passes(&source);
+    let e = witnessed_saying(&imported, "E.");
+    let before = texts_before(&imported, e);
+    assert_eq!(some(&before), ["Sys.", "C."]);
+    assert_eq!(before.len(), 5);
+    let continues = annotated!(imported, v3::node::continues);
+    let d = witnessed_saying(&imported, "D.");
+    let c = nodes_saying(&imported, "C.");
+    assert_eq!(c.len(), 2);
+    assert_eq!(continues.len(), 1);
+    assert_eq!(continues[0].1, d);
+    assert!(c.contains(&continues[0].0));
+    assert!(!continues_cycle(&imported));
+    // Only the system prompt, re-presented under the first header, recalls.
+    let system = witnessed_saying(&imported, "Sys.");
+    assert!(annotated!(imported, v3::node::recalls)
+        .iter()
+        .all(|(_, original)| *original == system));
+
+    // The kept history starts with the line's own first prompt: the new
+    // line's first node is the old one, so `continues` sits on the next.
+    let keep_a = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A."}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C."}]},
+        {"type": "compaction", "encrypted_content": COMPACTION}
+    ]);
+    let source = rv_compaction_source(keep_a, &[rv_said(8, "E.", None)]);
+    let imported = passes(&source);
+    let continues = annotated!(imported, v3::node::continues);
+    let d = witnessed_saying(&imported, "D.");
+    assert_eq!(nodes_saying(&imported, "A.").len(), 1);
+    assert_eq!(continues.len(), 1);
+    assert_eq!(continues[0].1, d);
+    assert!(!chain(&imported, d).contains(&continues[0].0));
+    assert!(!continues_cycle(&imported));
+
+    // A new context that lies wholly on the old line has no node to carry
+    // `continues`, and fails.
+    let on_old = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "A."}]},
+    ]);
+    let source = rv_compaction_source(on_old, &[]);
+    assert_eq!(refused(&source).path, "{compacted}.payload");
+
+    // A kept message of hers with its phase is still open.
+    let phased = json!([
+        {"type": "message", "role": "assistant", "phase": "final_answer",
+         "content": [{"type": "output_text", "text": "D."}]},
+        {"type": "compaction", "encrypted_content": COMPACTION}
+    ]);
+    let source = rv_compaction_source(phased, &[rv_said(8, "E.", None)]);
+    assert_eq!(
+        refused(&source).path,
+        "{compacted}.payload.replacement_history[]{message}{assistant}.phase"
+    );
+
+    // A rollback reaching back over the compaction fails.
+    let keep_c = json!([
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "C."}]},
+        {"type": "compaction", "encrypted_content": COMPACTION}
+    ]);
+    let source = rv_compaction_source(
+        keep_c,
+        &[
+            rv_said(8, "E.", None),
+            line(
+                9,
+                "event_msg",
+                json!({"type": "thread_rolled_back", "num_turns": 1}),
+            ),
+            rv_user(10, "F."),
+        ],
+    );
+    assert_eq!(
+        refused(&source).path,
+        "{event_msg}.payload{thread_rolled_back}.num_turns"
+    );
+}
+
+/// X3 (review CX-4): a fork replays its ancestors' headers after its own.
+/// Where they agree, the replay converges with the ancestor's own rollout;
+/// where a replayed one differs, which records are the fork's own is
+/// unmarked and the unit fails.
+#[test]
+fn rv_cx4_ancestor_headers() {
+    let fork = |own: &str, ancestors: &[(&str, &str)]| {
+        let mut meta = rv_meta(0, "88888888-8888-4888-8888-888888888888", own);
+        meta["payload"]["forked_from_id"] = json!(ancestors[0].0);
+        let mut records = vec![meta];
+        for (id, base) in ancestors {
+            records.push(rv_meta(0, id, base));
+        }
+        records.extend(rv_turn(1, "t1", "high"));
+        records.push(rv_user(2, "Hi."));
+        records.push(rv_said(3, "Hello.", None));
+        records.extend(rv_turn(4, "t2", "high"));
+        records.push(rv_user(5, "Next."));
+        records.push(rv_said(6, "Answer.", None));
+        jsonl(&records)
+    };
+    let s1 = "99999999-9999-4999-8999-999999999999";
+    let s0 = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let imported = passes(&fork("Sys.", &[(s1, "Sys."), (s0, "Sys.")]));
+    let answer = witnessed_saying(&imported, "Answer.");
+    assert_eq!(
+        some(&texts_before(&imported, answer)),
+        ["Sys.", "Hi.", "Hello.", "Next."]
+    );
+    let mut own = vec![rv_meta(0, s1, "Sys.")];
+    own.extend(rv_turn(1, "t1", "high"));
+    own.push(rv_user(2, "Hi."));
+    own.push(rv_said(3, "Hello.", None));
+    let ancestor = passes(&jsonl(&own));
+    assert_eq!(
+        witnessed_saying(&imported, "Hello."),
+        witnessed_saying(&ancestor, "Hello.")
+    );
+    let differing = fork("New sys.", &[(s1, "Old sys.")]);
+    assert_eq!(
+        refused(&differing).path,
+        "{session_meta}.payload.base_instructions.text"
+    );
+}
+
+/// X4 (review CX-5): an output answering a call of a rolled-back turn
+/// fails; the rollback itself branches.
+#[test]
+fn rv_cx5_rollback() {
+    let mut records = vec![rv_meta(0, "77777777-7777-4777-8777-777777777777", "Sys.")];
+    records.extend(rv_turn(1, "t1", "medium"));
+    records.push(rv_user(2, "P1."));
+    records.push(rv_said(3, "R1.", None));
+    records.extend(rv_turn(4, "t2", "medium"));
+    records.push(rv_user(5, "P2."));
+    records.push(line(
+        6,
+        "response_item",
+        json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": "c9"}),
+    ));
+    records.extend(rv_turn(7, "t3", "high"));
+    records.push(rv_user(8, "P3."));
+    records.push(rv_said(9, "R3.", None));
+    records.push(line(
+        10,
+        "event_msg",
+        json!({"type": "thread_rolled_back", "num_turns": 2}),
+    ));
+    records.extend(rv_turn(11, "t4", "high"));
+    records.push(rv_user(12, "P4."));
+    records.push(rv_said(13, "R4.", None));
+    let imported = passes(&jsonl(&records));
+    let r4 = witnessed_saying(&imported, "R4.");
+    assert_eq!(
+        some(&texts_before(&imported, r4)),
+        ["Sys.", "P1.", "R1.", "P4."]
+    );
+    let mut late = records.clone();
+    late.push(line(
+        14,
+        "response_item",
+        json!({"type": "function_call_output", "call_id": "c9", "output": "x"}),
+    ));
+    let late = jsonl(&late);
+    assert_eq!(
+        refused(&late).path,
+        "{response_item}.payload{function_call_output}.call_id"
+    );
+}
+
+/// X5 (review CX-7): `ends` only on her nodes; a turn aborted before she
+/// produced anything carries none; every abort is a claim of its record,
+/// on the next node placed (or the last one, at the end of the file).
+#[test]
+fn rv_cx7_aborted() {
+    let abort = |second: u32| {
+        line(
+            second,
+            "event_msg",
+            json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": "t"}),
+        )
+    };
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "P1."));
+    records.push(rv_said(3, "Thinking aloud.", Some("commentary")));
+    records.push(abort(4));
+    records.extend(rv_turn(5, "t2", "high"));
+    records.push(rv_user(6, "P2."));
+    records.push(abort(7));
+    records.extend(rv_turn(8, "t3", "high"));
+    records.push(rv_user(9, "P3."));
+    records.push(line(
+        10,
+        "response_item",
+        json!({"type": "function_call", "name": "sleep", "arguments": "{}", "call_id": "c1"}),
+    ));
+    records.push(abort(11));
+    records.extend(rv_turn(12, "t4", "high"));
+    records.push(rv_user(13, "P4."));
+    records.push(rv_said(14, "Fine.", Some("final_answer")));
+    records.extend(rv_turn(15, "t5", "high"));
+    records.push(rv_user(16, "P5."));
+    records.push(abort(17));
+    let source = jsonl(&records);
+    let imported = passes(&source);
+    let ends = annotated!(imported, v3::node::ends);
+    let on = |text: &str| {
+        let node = witnessed_saying(&imported, text);
+        ends.iter().filter(|(n, _)| *n == node).count()
+    };
+    assert_eq!(ends.len(), 2);
+    assert_eq!(on("Thinking aloud."), 1);
+    assert_eq!(on("P2."), 0);
+    assert_eq!(on("P5."), 0);
+    let facts = imported.fragment.facts();
+    let claimed: Vec<Id> = find!(
+        occurrence: Id,
+        pattern!(facts, [{ ?occurrence @ v3::witness::turn_ends: v3::node::ends::INTERRUPTED }])
+    )
+    .collect();
+    // The first three go to the next header (one node, one claim tuple);
+    // the last, at the end of the file, to its last node.
+    assert_eq!(claimed.len(), 2);
+    let replaced = source.replacen("\"reason\":\"interrupted\"", "\"reason\":\"replaced\"", 1);
+    assert_eq!(
+        refused(&replaced).path,
+        "{event_msg}.payload{turn_aborted}.reason"
+    );
+}
+
+/// X6: a failed turn whose last item is hers ends there with `error`.
+#[test]
+fn x6_a_failed_turn_ends_on_her_last_node() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Go."));
+    records.push(rv_said(3, "Working.", Some("commentary")));
+    records.push(line(
+        4,
+        "event_msg",
+        json!({"type": "task_complete", "turn_id": "t1", "last_agent_message": null,
+            "error": {"message": "stream disconnected", "codex_error_info": "other"}}),
+    ));
+    let imported = passes(&jsonl(&records));
+    let working = witnessed_saying(&imported, "Working.");
+    assert_eq!(
+        annotated!(imported, v3::node::ends),
+        vec![(working, v3::node::ends::ERROR)]
+    );
+}
+
+/// X7 (review CX-1): an empty sealed token takes its empty drop: the
+/// reasoning is a body gap, never a zero-byte blob.
+#[test]
+fn x7_an_empty_token_is_no_blob() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Q."));
+    records.push(line(
+        3,
+        "response_item",
+        json!({"type": "reasoning", "summary": [], "content": null, "encrypted_content": ""}),
+    ));
+    records.push(rv_said(4, "Done.", Some("final_answer")));
+    let imported = passes(&jsonl(&records));
+    let facts = imported.fragment.facts();
+    let blobs = find!(
+        fact: Id,
+        pattern!(facts, [{ ?fact @ v3::fact::modality: v3::fact::modality::THINKING, v3::fact::blob: _?b }])
+    )
+    .count();
+    let gaps = find!(
+        fact: Id,
+        pattern!(facts, [{ ?fact @ v3::fact::modality: v3::fact::modality::THINKING, v3::fact::absent: _?a }])
+    )
+    .count();
+    assert_eq!((blobs, gaps), (0, 1));
+}
+
+/// C5 for Codex: items are known by their place, so two identical results
+/// (identical heads) and a repeated text are two items: none recalls the
+/// other. A header change re-presents them, and each copy recalls its own.
+#[test]
+fn identical_items_are_not_copies() {
+    let mut records = Vec::new();
+    rv_head(&mut records);
+    records.push(rv_user(2, "Twice."));
+    for (second, call) in [(3, "c1"), (5, "c2")] {
+        records.push(line(
+            second,
+            "response_item",
+            json!({"type": "function_call", "name": "ls", "arguments": "{}", "call_id": call}),
+        ));
+        records.push(line(
+            second + 1,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": call, "output": "a"}),
+        ));
+    }
+    records.push(rv_said(7, "Same.", Some("final_answer")));
+    let source = jsonl(&records);
+    let imported = passes(&source);
+    // Only the system prompt, re-presented under the first header, recalls.
+    assert_eq!(annotated!(imported, v3::node::recalls).len(), 1);
+    assert_eq!(annotated!(imported, v3::node::responds_to).len(), 2);
+    let mut later = records.clone();
+    later.extend(rv_turn(8, "t2", "low"));
+    later.push(rv_user(9, "Again."));
+    let imported = passes(&jsonl(&later));
+    // Under the new header: the system prompt, the prompt, two calls, two
+    // heads, two outputs and her answer, each recalling its own; and the
+    // system prompt under the first header.
+    assert_eq!(annotated!(imported, v3::node::recalls).len(), 10);
+}
+
+/// X10: world-state fields the codex source shows to be the client's
+/// baseline (an environment's status, section fingerprints, the roster,
+/// the model catalog) are machinery.
+#[test]
+fn x10_world_state_baseline_is_machinery() {
+    let source = g3().replace(
+        "\"apps_instructions\":false",
+        "\"apps_instructions\":false,\
+         \"collaboration_mode\":{\"instructions\":\"0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33\",\
+         \"mode\":\"default\",\"model\":\"gpt-5.5\"},\
+         \"environments\":{\"environments\":{\"local\":{\"status\":\"available\"}}},\
+         \"multi_agent_usage_hint\":\"62cdb7020ff920e5aa642c3d4066950dd1f01f4d\",\
+         \"permissions\":{\"instructions\":\"0beec7b5ea3f0fdbc95d0dd47f3c5bc275da8a33\"}",
+    );
+    assert_ne!(source, g3());
+    passes(&source);
+}
+
+// ---------------------------------------------------------------------------
 // The real sample. Prints only paths, kinds and counts.
 
 #[test]
@@ -732,12 +1284,17 @@ fn real_sample() {
     let mut import_failed = 0;
     let mut gate_failed = 0;
     let mut unread = 0;
+    let mut skipped = 0;
     let mut first_failures: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
     let mut walk_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut gate_failures: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut failing_files: Vec<String> = Vec::new();
     let mut by_month: BTreeMap<String, [usize; 3]> = BTreeMap::new();
     for file in &files {
+        if std::fs::metadata(file).is_ok_and(|meta| meta.len() > 400 * 1024 * 1024) {
+            skipped += 1;
+            continue;
+        }
         let Ok(bytes) = std::fs::read(file) else {
             unread += 1;
             continue;
@@ -794,8 +1351,9 @@ fn real_sample() {
         }
     }
     println!(
-        "files {} unread {} passed {} import-failed {} gate-failed {}",
+        "files {} skipped-over-400MB {} unread {} passed {} import-failed {} gate-failed {}",
         files.len(),
+        skipped,
         unread,
         passed,
         import_failed,

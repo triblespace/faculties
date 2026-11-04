@@ -396,6 +396,12 @@ pub mod witness {
         "04448D64216E7BAAE63543EB84015904" as pub claimed_media_type: GenId;
         /// OCCURRENCE CORE. A title the source gives that her window did not show.
         "7AB9F2216ED53D98D7DF446DE4DF63A1" as pub claimed_title: Handle<UTF8String>;
+        /// OCCURRENCE CORE. Why the turn the record closes ended, an
+        /// [`super::node::ends`] term, as a claim of a record that holds no
+        /// node: Codex's `turn_aborted` (ruling X5). Where she produced
+        /// something in the turn, her last node also carries `ends`.
+        /// Minted with `trible genid` 2026-11-04.
+        "6A57A45D78882898439B5B5ABF4DDD27" as pub turn_ends: GenId;
     }
 }
 

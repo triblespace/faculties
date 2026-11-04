@@ -20,28 +20,43 @@
 //!
 //! - `turn_context` sets the header: the effort she was sampled under, a
 //!   `system` body gap that carries it (S1);
-//! - `session_meta` sets the system section: `base_instructions` (or a
-//!   `system` body gap before they were recorded), then a `tool-definition`
-//!   span gap (tool definitions are never recorded);
+//! - `session_meta` sets the system section from its position on:
+//!   `base_instructions` (or a `system` body gap before they were recorded),
+//!   then a `tool-definition` span gap (tool definitions are never
+//!   recorded). A fork replays its ancestors' `session_meta` after its own;
+//!   where a replayed one's instructions differ from the unit's own, which
+//!   records the fork wrote itself is unmarked, and the unit fails (X3);
 //! - a response item extends the line, one node per fact;
 //! - `compacted` starts a new line holding exactly what it installs (its
-//!   replacement history, or a span gap and its summary), whose first node
-//!   `continues` the old tail;
+//!   replacement history, or a span gap and its summary); the first node of
+//!   the new line that is not on the old line `continues` the old line's
+//!   last node a record holds (X2);
 //! - `task_started` marks a turn, and `thread_rolled_back` cuts the line
 //!   back to the start of its last turns: the next node branches there;
-//! - `turn_aborted` and an erred `task_complete` annotate the last node with
-//!   why the turn ended; the error itself is an `in` event fact.
+//! - `turn_aborted` and an erred `task_complete` put `ends` on her last node
+//!   of the turn, when she produced one (X5, X6); an abort is also a claim
+//!   of its record.
 //!
 //! When the header or the system section changes, the line is re-presented
-//! under the new one: copies `recalls` their originals, and node ids being
-//! content addresses, shared prefixes are shared nodes. A fork or resume
-//! replays its ancestor's records, which therefore converge with the
-//! ancestor's own rollout by structure.
+//! under the new one. Items are known by their place in the source, never
+//! by their content: a record's item re-presented at another position
+//! `recalls` the node its record held, and two records that hold identical
+//! content are two items (C5). Node ids being content addresses, shared
+//! prefixes are shared nodes. A fork or resume replays its ancestor's
+//! records, which therefore converge with the ancestor's own rollout by
+//! structure.
+//!
+//! A result answers the call its correlator names on its own line; a call
+//! the line no longer holds (one in a rolled-back turn, or before a
+//! compaction) fails the unit (X4).
 //!
 //! Each node a record holds gets a witness and one occurrence holding that
 //! record's claims. A record that holds no node (a header without effort, a
-//! `session_meta` without instructions) gives its claims to the next node
-//! the file places. Reasoning summaries are glosses of the sealed reasoning.
+//! `session_meta` without instructions, an abort) gives its claims to the
+//! next node the file places, or after the last one to that last node.
+//! Reasoning summaries are glosses of the sealed reasoning; the source does
+//! not name the model that wrote them, so they name none. Where her message
+//! holds no phase, its `agent_message` event's phase is its register (X1).
 
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -55,10 +70,10 @@ use triblespace::prelude::*;
 use crate::archive_v3::claude_code::check::{self, base64_url, data_uri};
 use crate::archive_v3::claude_code::json::{self, Json};
 use crate::archive_v3::claude_code::Failure;
-use crate::archive_v3::fields::codex::{OPENAI_ENCRYPTED_CONTENT, REASONING_SUMMARIZER, TABLE};
+use crate::archive_v3::fields::codex::{OPENAI_ENCRYPTED_CONTENT, TABLE};
 use crate::archive_v3::{
-    annotate_gloss, annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore,
-    MediaType, NodeAnnotations, WitnessAnnotations,
+    annotate_node, fact, gloss, node, occurrence, unexported, witness, FactCore, MediaType,
+    NodeAnnotations, WitnessAnnotations,
 };
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
@@ -83,7 +98,8 @@ pub fn import(source: &[u8]) -> Result<Fragment, Failure> {
         check::record_in(&TABLE, record, &mut unit)?;
     }
     unit.verify()?;
-    let mut builder = Builder::new()?;
+    let phases = supplied_phases(&records)?;
+    let mut builder = Builder::new(phases)?;
     for (at, record) in records.iter().enumerate() {
         builder.record(at, record)?;
     }
@@ -178,6 +194,77 @@ fn effort(term: &str) -> Option<Id> {
     })
 }
 
+/// X1: the phase of each of her messages that holds none, from the
+/// `agent_message` event that copies it. The event names its message by
+/// text: the nearest message before it holding that text (else the nearest
+/// after it). Where the message holds a phase, the copy must spell the same.
+fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
+    let path = "{event_msg}.payload{agent_message}.phase";
+    // (record, a text of her message, the phase the message holds)
+    let mut texts: Vec<(usize, &str, Option<&str>)> = Vec::new();
+    for (at, record) in records.iter().enumerate() {
+        let item = match record.get("payload") {
+            Some(payload) if record.str_at("type") == Some("response_item") => payload,
+            Some(_) => continue,
+            None => record,
+        };
+        if item.str_at("type") != Some("message") || item.str_at("role") != Some("assistant") {
+            continue;
+        }
+        for part in item.get("content").map(Json::arr).unwrap_or(&[]) {
+            if part.str_at("type") != Some("output_text") {
+                continue;
+            }
+            if let Some(text) = part.str_at("text") {
+                texts.push((at, text, item.str_at("phase")));
+            }
+        }
+    }
+    let mut phases: HashMap<usize, String> = HashMap::new();
+    for (at, record) in records.iter().enumerate() {
+        if record.str_at("type") != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        if payload.str_at("type") != Some("agent_message") {
+            continue;
+        }
+        let (Some(phase), Some(message)) = (payload.str_at("phase"), payload.str_at("message"))
+        else {
+            continue;
+        };
+        if phase.is_empty() {
+            continue;
+        }
+        let named = texts.iter().filter(|(_, text, _)| *text == message);
+        let before = named
+            .clone()
+            .filter(|(holder, ..)| *holder < at)
+            .max_by_key(|t| t.0);
+        let after = named
+            .filter(|(holder, ..)| *holder > at)
+            .min_by_key(|t| t.0);
+        let Some(&(holder, _, own)) = before.or(after) else {
+            continue;
+        };
+        let disagrees = match own {
+            Some(own) => own != phase,
+            None => phases
+                .insert(holder, phase.to_owned())
+                .is_some_and(|known| known != phase),
+        };
+        if disagrees {
+            return Err(Failure::new(
+                path,
+                "a phase copy that disagrees with her message's phase",
+            ));
+        }
+    }
+    Ok(phases)
+}
+
 /// One fact a record places on the line, and whether the record holds it
 /// (a gap the rendering rule adds is held by no record).
 struct Placed {
@@ -185,8 +272,9 @@ struct Placed {
     held: bool,
     /// Glosses of the node, by a side model.
     glosses: Vec<String>,
-    /// A call this item answers, by its id; a call it opens.
-    answers: Option<String>,
+    /// A call this item answers: its id, and the correlator's path.
+    answers: Option<(String, String)>,
+    /// A call it opens, by its id.
     opens: Option<String>,
 }
 
@@ -209,33 +297,50 @@ impl Placed {
     }
 }
 
+/// One item: a fact a record places (or a gap no record holds), known by
+/// its place in the source, never by its content.
+struct Item {
+    fact: Id,
+    held: bool,
+    /// She produced it.
+    out: bool,
+    /// The node its record held it in.
+    own: Option<Id>,
+}
+
 struct Builder {
     out: Fragment,
     facts: HashMap<Id, Fragment>,
     /// node -> (previous, fact, the node itself)
     nodes: HashMap<Id, (Option<Id>, Id, Fragment)>,
-    header: Id,
-    header_gap: Id,
-    system: Id,
-    system_gap: Id,
-    tools: Id,
+    items: Vec<Item>,
+    /// X1: phases her messages take from their event copies, by record.
+    phases: HashMap<usize, String>,
+    header: usize,
+    header_gap: usize,
+    system: usize,
+    system_gap: usize,
+    tools: usize,
+    /// The unit's own instructions: its first `session_meta`'s (X3).
+    own_system: Option<Option<Id>>,
     /// The header and system section's last node.
     root: Option<Id>,
-    /// The line after it: (fact, node).
-    line: Vec<(Id, Id)>,
+    /// The line after it: (item, node).
+    line: Vec<(usize, Id)>,
     /// Where each turn starts on the line.
     turns: Vec<usize>,
-    /// fact -> the first node a record held it in.
-    original: HashMap<Id, Id>,
+    /// Every (node, item) placement, copies included.
+    placements: Vec<(Id, usize)>,
     /// (record, node) for every node a record holds.
     held: Vec<(usize, Id)>,
-    held_nodes: HashSet<Id>,
+    /// The last node a record held.
+    last_node: Option<Id>,
     claims: HashMap<usize, WitnessAnnotations>,
     /// Claims of records that hold no node, for the next node placed.
     pending: Vec<WitnessAnnotations>,
     extra: Vec<(Id, WitnessAnnotations)>,
-    /// call id -> (line position, call fact, call node)
-    calls: HashMap<String, (usize, Id, Id)>,
+    /// call id -> (line position, call item)
+    calls: HashMap<String, (usize, usize)>,
     responds: Vec<(Id, Id)>,
     ends: Vec<(Id, Id)>,
     glosses: Vec<(Id, String)>,
@@ -243,7 +348,7 @@ struct Builder {
 }
 
 impl Builder {
-    fn new() -> Result<Self, Failure> {
+    fn new(phases: HashMap<usize, String>) -> Result<Self, Failure> {
         use v3::fact::{absent, direction::IN, modality::*};
         let gap = |modality, kind| FactCore {
             absent: Some(kind),
@@ -256,21 +361,30 @@ impl Builder {
         // definitions are never recorded.
         let system_gap = put_fact(&mut facts, gap(SYSTEM, absent::BODY), "<system>")?;
         let tools = put_fact(&mut facts, gap(TOOL_DEFINITION, absent::SPAN), "<system>")?;
+        let unheld = |fact| Item {
+            fact,
+            held: false,
+            out: false,
+            own: None,
+        };
         let mut builder = Builder {
             out: Fragment::empty(),
             facts,
             nodes: HashMap::new(),
-            header: header_gap,
-            header_gap,
-            system: system_gap,
-            system_gap,
-            tools,
+            items: vec![unheld(header_gap), unheld(system_gap), unheld(tools)],
+            phases,
+            header: 0,
+            header_gap: 0,
+            system: 1,
+            system_gap: 1,
+            tools: 2,
+            own_system: None,
             root: None,
             line: Vec::new(),
             turns: Vec::new(),
-            original: HashMap::new(),
+            placements: Vec::new(),
             held: Vec::new(),
-            held_nodes: HashSet::new(),
+            last_node: None,
             claims: HashMap::new(),
             pending: Vec::new(),
             extra: Vec::new(),
@@ -288,6 +402,16 @@ impl Builder {
         put_fact(&mut self.facts, core, path)
     }
 
+    fn item(&mut self, fact: Id, held: bool, out: bool) -> usize {
+        self.items.push(Item {
+            fact,
+            held,
+            out,
+            own: None,
+        });
+        self.items.len() - 1
+    }
+
     fn extend(&mut self, tail: Option<Id>, fact: Id) -> Id {
         let holds = Fragment::rooted(fact, TribleSet::new());
         let built = node(tail, holds).expect("a node over one fact builds");
@@ -298,11 +422,18 @@ impl Builder {
         id
     }
 
+    /// Place `item` after `tail`.
+    fn at(&mut self, tail: Option<Id>, item: usize) -> Id {
+        let node = self.extend(tail, self.items[item].fact);
+        self.placements.push((node, item));
+        node
+    }
+
     /// The header and the system section, from no node.
     fn root_line(&mut self) -> Option<Id> {
-        let header = self.extend(None, self.header);
-        let system = self.extend(Some(header), self.system);
-        Some(self.extend(Some(system), self.tools))
+        let header = self.at(None, self.header);
+        let system = self.at(Some(header), self.system);
+        Some(self.at(Some(system), self.tools))
     }
 
     fn tip(&self) -> Option<Id> {
@@ -314,72 +445,86 @@ impl Builder {
         self.root = self.root_line();
         let mut tail = self.root;
         for at in 0..self.line.len() {
-            let node = self.extend(tail, self.line[at].0);
+            let node = self.at(tail, self.line[at].0);
             self.line[at].1 = node;
             tail = Some(node);
         }
     }
 
-    fn witness(&mut self, record: usize, node: Id) {
+    fn witness(&mut self, record: usize, item: usize, node: Id) {
+        self.items[item].own = Some(node);
         self.held.push((record, node));
-        self.held_nodes.insert(node);
+        self.last_node = Some(node);
         for claims in std::mem::take(&mut self.pending) {
             self.extra.push((node, claims));
         }
     }
 
     /// Place a record's items on the line.
-    fn place(&mut self, record: usize, items: Vec<Placed>, path: &str) -> Result<Vec<Id>, Failure> {
-        let mut nodes = Vec::new();
-        for item in items {
-            let fact = self.put(item.core, path)?;
-            let node = self.extend(self.tip(), fact);
-            if let Some(call) = &item.answers {
-                let found = self.calls.get(call).copied();
-                if let Some((at, call_fact, call_node)) = found {
-                    let current = self
-                        .line
-                        .get(at)
-                        .filter(|(fact, _)| *fact == call_fact)
-                        .map(|(_, node)| *node)
-                        .unwrap_or(call_node);
-                    self.responds.push((node, current));
-                }
+    fn place(&mut self, record: usize, items: Vec<Placed>, path: &str) -> Result<(), Failure> {
+        for placed in items {
+            let out = placed.core.direction == Some(v3::fact::direction::OUT);
+            let fact = self.put(placed.core, path)?;
+            let item = self.item(fact, placed.held, out);
+            let node = self.at(self.tip(), item);
+            if let Some((call, at)) = &placed.answers {
+                // X4: the call on her own line, else what she was shown is
+                // unknown.
+                let found = self
+                    .calls
+                    .get(call)
+                    .copied()
+                    .filter(|(position, call_item)| {
+                        self.line
+                            .get(*position)
+                            .is_some_and(|(there, _)| there == call_item)
+                    });
+                let Some((position, _)) = found else {
+                    return Err(Failure::new(
+                        at,
+                        "an output answers a call outside its window: what she was shown is open",
+                    ));
+                };
+                self.responds.push((node, self.line[position].1));
             }
-            self.line.push((fact, node));
-            if let Some(call) = item.opens {
-                self.calls.insert(call, (self.line.len() - 1, fact, node));
+            self.line.push((item, node));
+            if let Some(call) = placed.opens {
+                self.calls.insert(call, (self.line.len() - 1, item));
             }
-            if item.held {
-                self.original.entry(fact).or_insert(node);
-                self.witness(record, node);
+            if placed.held {
+                self.witness(record, item, node);
             }
-            for text in item.glosses.into_iter().filter(|text| !text.is_empty()) {
+            for text in placed.glosses.into_iter().filter(|text| !text.is_empty()) {
                 self.glosses.push((node, text));
             }
-            nodes.push(node);
         }
-        Ok(nodes)
+        Ok(())
     }
 
-    /// The last node of the line a record held: the node itself, or for a
-    /// copy under a new header its original (a copy is on a window only when
-    /// a later record extends it). For why a turn ended, and for the tail a
-    /// compaction continues.
+    /// The node its record held of the line's last item a record holds:
+    /// the tail a compaction continues.
     fn last_held(&self) -> Option<Id> {
-        self.line.iter().rev().find_map(|(fact, node)| {
-            if self.held_nodes.contains(node) {
-                Some(*node)
-            } else {
-                self.original.get(fact).copied()
-            }
-        })
+        self.line
+            .iter()
+            .rev()
+            .find(|(item, _)| self.items[*item].held)
+            .and_then(|(item, _)| self.items[*item].own)
+    }
+
+    /// Her last item of the turn so far, at the node its record held: where
+    /// why the turn ended sits (X5, X6). None when she produced nothing.
+    fn last_out(&self) -> Option<Id> {
+        let since = self.turns.last().copied().unwrap_or(0).min(self.line.len());
+        self.line[since..]
+            .iter()
+            .rev()
+            .find(|(item, _)| self.items[*item].held && self.items[*item].out)
+            .and_then(|(item, _)| self.items[*item].own)
     }
 
     fn record(&mut self, at: usize, record: &Json) -> Result<(), Failure> {
         let kind = record.str_at("type");
-        if record.get("payload").is_some() {
-            let payload = record.get("payload").expect("present");
+        if let Some(payload) = record.get("payload") {
             let mut claims = WitnessAnnotations::default();
             if let Some(stamp) = record.str_at("timestamp") {
                 claims.timestamp = time(stamp).into_iter().collect();
@@ -388,16 +533,16 @@ impl Builder {
                 Some("session_meta") => self.session(at, payload),
                 Some("turn_context") => self.turn_context(at, payload, claims),
                 Some("response_item") => {
-                    let items = self.items(payload, "{response_item}.payload", &mut claims)?;
+                    let items =
+                        self.items(payload, "{response_item}.payload", &mut claims, Some(at))?;
                     let ghost = payload.str_at("type") == Some("ghost_snapshot");
                     if !ghost {
                         self.claims.insert(at, claims);
                     }
-                    self.place(at, items, "{response_item}.payload")?;
-                    Ok(())
+                    self.place(at, items, "{response_item}.payload")
                 }
                 Some("compacted") => self.compacted(at, payload, claims),
-                Some("event_msg") => self.event(at, payload, claims),
+                Some("event_msg") => self.event(payload),
                 Some(
                     "world_state" | "inter_agent_communication_metadata" | "token_usage_record",
                 ) => Ok(()),
@@ -422,10 +567,9 @@ impl Builder {
             // G0/G1: a bare response item.
             Some(_) => {
                 let mut claims = WitnessAnnotations::default();
-                let items = self.items(record, "", &mut claims)?;
+                let items = self.items(record, "", &mut claims, Some(at))?;
                 self.claims.insert(at, claims);
-                self.place(at, items, "<item>")?;
-                Ok(())
+                self.place(at, items, "<item>")
             }
         }
     }
@@ -459,6 +603,7 @@ impl Builder {
                 }
             }
         }
+        let path = "{session_meta}.payload.base_instructions.text";
         let system = match payload.str_at("base_instructions.text") {
             Some(text) if !text.is_empty() => {
                 use v3::fact::{direction::IN, modality::SYSTEM};
@@ -467,13 +612,29 @@ impl Builder {
                         payload: Some(text.to_owned()),
                         ..core(SYSTEM, IN)
                     },
-                    "{session_meta}.payload.base_instructions.text",
+                    path,
                 )?)
             }
             _ => None,
         };
-        let next = system.unwrap_or(self.system_gap);
-        let changed = next != self.system;
+        // X3: the unit's own instructions are its first header's; a replayed
+        // ancestor's that differ leave the fork's own records unmarked.
+        match self.own_system {
+            None => self.own_system = Some(system),
+            Some(own) if own != system => {
+                return Err(Failure::new(
+                    path,
+                    "a replayed header's instructions differ from the unit's own: which records \
+                     the fork wrote itself is unmarked",
+                ))
+            }
+            Some(_) => {}
+        }
+        let next = match system {
+            Some(fact) => self.item(fact, true, false),
+            None => self.system_gap,
+        };
+        let changed = self.items[next].fact != self.items[self.system].fact;
         self.system = next;
         if changed {
             self.rebuild();
@@ -481,11 +642,10 @@ impl Builder {
         match system {
             Some(fact) => {
                 // The system node of the root line: header, then it.
-                let header = self.extend(None, self.header);
+                let header = self.extend(None, self.items[self.header].fact);
                 let node = self.extend(Some(header), fact);
-                self.original.entry(fact).or_insert(node);
                 self.claims.insert(at, claims);
-                self.witness(at, node);
+                self.witness(at, next, node);
             }
             None => self.pending.push(claims),
         }
@@ -519,17 +679,20 @@ impl Builder {
             }
             None => None,
         };
-        let next = header.unwrap_or(self.header_gap);
-        if next != self.header {
-            self.header = next;
+        let next = match header {
+            Some(fact) => self.item(fact, true, false),
+            None => self.header_gap,
+        };
+        let changed = self.items[next].fact != self.items[self.header].fact;
+        self.header = next;
+        if changed {
             self.rebuild();
         }
         match header {
             Some(fact) => {
                 let node = self.extend(None, fact);
-                self.original.entry(fact).or_insert(node);
                 self.claims.insert(at, claims);
-                self.witness(at, node);
+                self.witness(at, next, node);
             }
             None => {
                 claims.timestamp.clear();
@@ -538,7 +701,6 @@ impl Builder {
         }
         Ok(())
     }
-
     /// The facts of one response item at `path` (a bare line, an envelope's
     /// payload, a replacement history element), in source order.
     fn items(
@@ -546,6 +708,7 @@ impl Builder {
         item: &Json,
         path: &str,
         claims: &mut WitnessAnnotations,
+        record: Option<usize>,
     ) -> Result<Vec<Placed>, Failure> {
         use v3::fact::{direction::*, modality::*};
         let kind = item.str_at("type").unwrap_or_default();
@@ -573,7 +736,14 @@ impl Builder {
                         ("assistant", "output_text") => {
                             let text = part.str_at("text").unwrap_or_default();
                             if !text.is_empty() {
-                                let register = match item.str_at("phase") {
+                                // Her message's phase, else its event
+                                // copy's (X1).
+                                let phase = item.str_at("phase").or_else(|| {
+                                    record
+                                        .and_then(|at| self.phases.get(&at))
+                                        .map(String::as_str)
+                                });
+                                let register = match phase {
                                     None => None,
                                     Some("commentary") => Some(v3::fact::register::COMMENTARY),
                                     Some("final_answer") => Some(v3::fact::register::ANSWER),
@@ -609,8 +779,10 @@ impl Builder {
                     .filter_map(|part| part.str_at("text"))
                     .map(str::to_owned)
                     .collect();
+                // An empty token holds nothing (X7): a body gap, as when
+                // none is recorded.
                 let sealed = match item.get("encrypted_content") {
-                    Some(Json::Str(_)) => Some(sealed_blob(
+                    Some(Json::Str(token)) if !token.is_empty() => Some(sealed_blob(
                         item.get("encrypted_content"),
                         &at(".encrypted_content"),
                     )?),
@@ -691,7 +863,9 @@ impl Builder {
             }
             "function_call_output" | "custom_tool_call_output" => {
                 out.push(Placed {
-                    answers: item.str_at("call_id").map(str::to_owned),
+                    answers: item
+                        .str_at("call_id")
+                        .map(|call| (call.to_owned(), at(".call_id"))),
                     ..Placed::held(core(TOOL_RESULT, IN))
                 });
                 match item.get("output") {
@@ -808,7 +982,8 @@ impl Builder {
             .map(Json::arr)
             .unwrap_or(&[]);
         let summary = payload.str_at("message").unwrap_or_default();
-        let old = self.last_held().or_else(|| self.tip());
+        let old_tip = self.tip();
+        let tail = self.last_held().or(old_tip);
         let mut items = Vec::new();
         match (history.is_empty(), summary.is_empty()) {
             (false, true) => {
@@ -817,6 +992,7 @@ impl Builder {
                         element,
                         "{compacted}.payload.replacement_history[]",
                         &mut claims,
+                        None,
                     )?);
                 }
             }
@@ -856,19 +1032,35 @@ impl Builder {
         self.turns.clear();
         self.calls.clear();
         self.claims.insert(at, claims);
-        let nodes = self.place(at, items, path)?;
-        if let (Some(first), Some(old)) = (nodes.first(), old) {
-            self.continues.push((*first, old));
+        self.place(at, items, path)?;
+        // X2: the first node of the new line that is not on the old line
+        // continues the old tail, so no continues path returns to its start.
+        let mut on_old: HashSet<Id> = HashSet::new();
+        let mut cursor = old_tip;
+        while let Some(node) = cursor {
+            on_old.insert(node);
+            cursor = self.nodes[&node].0;
+        }
+        let mut new_line = Vec::new();
+        let mut cursor = self.tip();
+        while let Some(node) = cursor {
+            new_line.push(node);
+            cursor = self.nodes[&node].0;
+        }
+        let first = new_line
+            .into_iter()
+            .rev()
+            .find(|node| !on_old.contains(node))
+            .ok_or_else(|| {
+                Failure::new(path, "a compaction whose new context lies on the old line")
+            })?;
+        if let Some(tail) = tail {
+            self.continues.push((first, tail));
         }
         Ok(())
     }
 
-    fn event(
-        &mut self,
-        at: usize,
-        payload: &Json,
-        claims: WitnessAnnotations,
-    ) -> Result<(), Failure> {
+    fn event(&mut self, payload: &Json) -> Result<(), Failure> {
         let kind = payload.str_at("type").unwrap_or_default();
         match kind {
             "turn_aborted" => {
@@ -881,35 +1073,25 @@ impl Builder {
                         ))
                     }
                 };
-                let node = self.last_held().ok_or_else(|| {
-                    Failure::new(
-                        "{event_msg}.payload{turn_aborted}",
-                        "an aborted turn with nothing before it",
-                    )
-                })?;
-                self.ends.push((node, term));
+                // X5: on her last node of the turn, if she produced one; the
+                // abort is a claim of the record either way.
+                if let Some(node) = self.last_out() {
+                    self.ends.push((node, term));
+                }
+                self.pending.push(WitnessAnnotations {
+                    turn_ends: vec![term],
+                    ..WitnessAnnotations::default()
+                });
                 Ok(())
             }
             "task_complete" => {
-                let Some(error) = payload.get("error").filter(|e| e.get("message").is_some())
-                else {
-                    return Ok(());
-                };
-                let node = self.last_held().ok_or_else(|| {
-                    Failure::new(
-                        "{event_msg}.payload{task_complete}.error",
-                        "a failed turn with nothing before it",
-                    )
-                })?;
-                self.ends.push((node, v3::node::ends::ERROR));
-                use v3::fact::{direction::IN, modality::EVENT};
-                let path = "{event_msg}.payload{task_complete}.error";
-                let core = FactCore {
-                    structure: Some(structure(error, path)?),
-                    ..core(EVENT, IN)
-                };
-                self.claims.insert(at, claims);
-                self.place(at, vec![Placed::held(core)], path)?;
+                // X6: `ends: error` on her last node of the turn; no fact.
+                let erred = payload
+                    .get("error")
+                    .is_some_and(|error| error.get("message").is_some());
+                if let (true, Some(node)) = (erred, self.last_out()) {
+                    self.ends.push((node, v3::node::ends::ERROR));
+                }
                 Ok(())
             }
             "task_started" => {
@@ -962,6 +1144,12 @@ impl Builder {
     }
 
     fn finish(mut self) -> Result<Fragment, Failure> {
+        // Claims after the file's last node go to that node.
+        if let Some(node) = self.last_node {
+            for claims in std::mem::take(&mut self.pending) {
+                self.extra.push((node, claims));
+            }
+        }
         // The windows: every node on the line of a node a record holds.
         let mut emitted: HashSet<Id> = HashSet::new();
         for &(_, node) in &self.held {
@@ -987,15 +1175,21 @@ impl Builder {
             if held_facts.insert(*fact) {
                 self.out += self.facts[fact].clone();
             }
-            if let Some(original) = self
-                .original
-                .get(fact)
-                .filter(|original| **original != node && emitted.contains(*original))
-            {
+        }
+        // A record's item placed where its record did not hold it recalls
+        // the node its record held (a gap or an unheld header recalls
+        // nothing).
+        let mut recalled: HashSet<(Id, Id)> = HashSet::new();
+        for &(node, item) in &self.placements {
+            let item = &self.items[item];
+            let Some(own) = item.own.filter(|own| item.held && *own != node) else {
+                continue;
+            };
+            if emitted.contains(&node) && emitted.contains(&own) && recalled.insert((node, own)) {
                 self.out += annotate_node(
                     node,
                     &NodeAnnotations {
-                        recalls: vec![*original],
+                        recalls: vec![own],
                         ..NodeAnnotations::default()
                     },
                 );
@@ -1059,14 +1253,12 @@ impl Builder {
                 .map_err(|_| Failure::new("<witness>", "a witness occurrence does not build"))?;
             self.out += unexported(built);
         }
+        // Reasoning summaries: the source names no model that wrote them.
         for (node, text) in std::mem::take(&mut self.glosses) {
             let node = on_window(node, "<gloss>")?;
             let built = gloss(node, v3::gloss::category::REASONING_SUMMARY, &text)
                 .map_err(|_| Failure::new("<gloss>", "a gloss does not build"))?;
-            let id = built.root().expect("a gloss is rooted");
             self.out += unexported(built);
-            self.out += annotate_gloss(id, REASONING_SUMMARIZER)
-                .map_err(|_| Failure::new("<gloss>", "a gloss annotation does not build"))?;
         }
         Ok(self.out)
     }

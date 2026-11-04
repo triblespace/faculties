@@ -795,6 +795,18 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 }
                 continue;
             }
+            if attribute == v3::witness::turn_ends.id() {
+                let specs: Vec<(Id, &str)> = v3::node::ends::SPECS
+                    .iter()
+                    .map(|(id, name, _)| (*id, *name))
+                    .collect();
+                let value = match Self::id(raw) {
+                    Some(id) => term(&specs, id),
+                    None => Value::Raw(hex(&raw.raw)),
+                };
+                tokens.insert(annotation("turn_ends", value));
+                continue;
+            }
             if attribute == main::source_projection::source_timestamp.id() {
                 tokens.insert(annotation("timestamp", time(raw)));
                 continue;

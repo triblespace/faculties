@@ -239,6 +239,7 @@ impl<'a, 'u> Checker<'a, 'u> {
             Class::Structure(_) | Class::Correlator => value.is_scalar() || value.is_empty(),
             Class::Drop(DropReason::Empty) => value.is_scalar() || value.is_empty(),
             Class::Rewrite(_) => matches!(value, Json::Obj(_)),
+            Class::Supply(supply) => value.is_scalar() && takes(supply.decode, value),
             Class::Drop(_) | Class::Open(_) => true,
         }
     }
@@ -508,6 +509,9 @@ impl<'a, 'u> Checker<'a, 'u> {
                 }
                 Ok(())
             }
+            // The importer pairs a supply with its item itself; here its
+            // value must be one the table names.
+            Class::Supply(supply) => Self::decodes(supply.decode, value, path),
             Class::Open(why) => Err(Failure::new(path, why)),
         }
     }
