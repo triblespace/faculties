@@ -61,6 +61,11 @@ fn assistant(uuid: &str, parent: &str, second: u32, text: &str) -> Value {
 
 /// The unit's facts and relations together, or why the relations refused.
 fn built(source: &str) -> Result<Fragment, String> {
+    built_with(&TABLE, source)
+}
+
+/// [`built`], under another format's table.
+fn built_with(table: &'static FieldTable, source: &str) -> Result<Fragment, String> {
     let records: Vec<&str> = source.lines().filter(|l| !l.trim().is_empty()).collect();
     let array = format!("[{}]", records.join(","));
     let mut store = MemoryBlobStore::new();
@@ -69,11 +74,11 @@ fn built(source: &str) -> Result<Fragment, String> {
         .expect("synthetic JSON");
     let root = unit.root().expect("rooted");
     let blobs = unit.blobs().clone().snapshot().unwrap();
-    let grammar = compile(&TABLE).expect("the table compiles");
+    let grammar = compile(table).expect("the table compiles");
     let image = grammar
         .cover(Unit::new(unit.facts(), &blobs), root, &lines())
         .map_err(|findings| format!("{findings:?}"))?;
-    let relations = build(&TABLE, Unit::new(unit.facts(), &blobs), root, &image)?;
+    let relations = build(table, Unit::new(unit.facts(), &blobs), root, &image)?;
     Ok(image + relations)
 }
 
@@ -343,6 +348,24 @@ fn real_sample_relations() {
     let (mut built_files, mut same, mut ours_only, mut theirs_only) = (0, 0, 0, 0);
     let mut divergences: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut unstable = 0;
+    // The format: its table and its importer (AV3_FORMAT, Claude Code by
+    // default).
+    let codex = std::env::var("AV3_FORMAT").as_deref() == Ok("codex");
+    let table: &'static FieldTable = if codex {
+        &crate::archive_v3::fields::codex::TABLE
+    } else {
+        &TABLE
+    };
+    let import = |bytes: &[u8]| {
+        if codex {
+            crate::archive_v3::codex::import(bytes)
+        } else {
+            crate::archive_v3::claude_code::import(bytes)
+        }
+    };
+    // Files the importer refuses that the relations build, by the
+    // importer's failure (a table path and a fixed message, never a value).
+    let mut beyond: std::collections::BTreeMap<String, usize> = Default::default();
     // Occurrences and links, each as (shared, ours only, importer only).
     let (mut occurrences, mut links, mut annotations) = ((0, 0, 0), (0, 0, 0), (0, 0, 0));
     let mut by_kind: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
@@ -352,13 +375,19 @@ fn real_sample_relations() {
         let Ok(bytes) = std::fs::read(file) else {
             continue;
         };
-        let Ok(imported) = crate::archive_v3::claude_code::import(&bytes) else {
-            continue;
-        };
         let Ok(source) = std::str::from_utf8(&bytes) else {
             continue;
         };
-        match built(source) {
+        let imported = match import(&bytes) {
+            Ok(imported) => imported,
+            Err(failure) => {
+                if built_with(table, source).is_ok() {
+                    *beyond.entry(format!("{failure:?}")).or_default() += 1;
+                }
+                continue;
+            }
+        };
+        match built_with(table, source) {
             // A refusal reason is a table path or shape, never a value.
             Err(reason) => {
                 // "not built yet: <attribute or shape at path placed Place>"
@@ -379,7 +408,9 @@ fn real_sample_relations() {
             Ok(fragment) => {
                 built_files += 1;
                 // The same unit must build the same relations every time.
-                if built(source).map(|again| again.facts() == fragment.facts()) != Ok(true) {
+                if built_with(table, source).map(|again| again.facts() == fragment.facts())
+                    != Ok(true)
+                {
                     unstable += 1;
                 }
                 let ours = nodes_of(&fragment);
@@ -427,7 +458,8 @@ fn real_sample_relations() {
         }
     }
     println!(
-        "files built {built_files} (built differently twice: {unstable}); nodes: shared {same}, ours only {ours_only}, importer only {theirs_only}"
+        "files built {built_files} (built differently twice: {unstable}; built where the importer refuses: {}); nodes: shared {same}, ours only {ours_only}, importer only {theirs_only}",
+        beyond.values().sum::<usize>()
     );
     println!(
         "occurrences: shared {}, ours only {}, importer only {}; links: shared {}, ours only {}, importer only {}",
@@ -448,6 +480,10 @@ fn real_sample_relations() {
     println!("-- our extra nodes: count, parent holds, node holds");
     for ((parent, node), n) in &extra {
         println!("{n}\t{parent}\t{node}");
+    }
+    println!("-- built where the importer refuses: files, its failure");
+    for (failure, n) in &beyond {
+        println!("{n}\t{failure}");
     }
     println!("-- refused: files, reason");
     for (reason, n) in &reasons {
@@ -926,4 +962,391 @@ fn a_preserved_segment_is_re_presented_after_its_anchor() {
         2,
         "each copy recalls its original: {recalls:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Codex: one line in file order (Order::File).
+
+use crate::archive_v3::fields::codex::TABLE as CODEX;
+use v3::fact::modality::{TOOL_CALL, TOOL_RESULT};
+
+/// A Codex envelope.
+fn envelope(second: u32, kind: &str, payload: Value) -> Value {
+    json!({"timestamp": stamp(second), "type": kind, "payload": payload})
+}
+
+/// A message item: his `input_text`, or her `output_text`.
+fn says(role: &str, text: &str) -> Value {
+    let part = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    json!({"type": "message", "role": role, "content": [{"type": part, "text": text}]})
+}
+
+fn item(second: u32, role: &str, text: &str) -> Value {
+    envelope(second, "response_item", says(role, text))
+}
+
+fn event(second: u32, payload: Value) -> Value {
+    envelope(second, "event_msg", payload)
+}
+
+fn codex_built(records: &[Value]) -> Result<Fragment, String> {
+    built_with(&CODEX, &jsonl(records))
+}
+
+/// The turn ends claimed by the occurrences of `node`'s witnesses.
+fn turn_ends_on(fragment: &Fragment, node: Id) -> Vec<Id> {
+    let facts = fragment.facts();
+    let mut out: Vec<Id> = find!(
+        e: Id,
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: node },
+            { _?occurrence @ v3::occurrence::of: _?witness, v3::witness::turn_ends: ?e },
+        ])
+    )
+    .collect();
+    out.sort();
+    out
+}
+
+/// G0: a header line, then bare items. The window opens on the unrecorded
+/// header, system prompt and tool definitions; the output answers the call;
+/// the header line holds no node, so its claims go to the first node the
+/// file places, as an occurrence of their own.
+#[test]
+fn codex_items_extend_one_line_after_the_unrecorded_opening() {
+    let fragment = codex_built(&[
+        json!({"id": "11111111-1111-4111-8111-111111111111", "timestamp": "2025-07-07T20:00:00.000Z"}),
+        says("user", "List the files."),
+        json!({"type": "local_shell_call", "id": "lsh_1", "call_id": "call_1", "status": "completed",
+            "action": {"type": "exec", "command": ["ls"], "env": {}, "timeout_ms": 1000,
+                "user": null, "working_directory": null}}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": "a\nb\n"}),
+        says("assistant", "Two files."),
+    ])
+    .expect("builds");
+    let answer = node_saying(&fragment, "Two files.");
+    assert_eq!(
+        window_before(&fragment, answer),
+        section_then(&[
+            (TEXT, None),
+            (TOOL_CALL, None),
+            (TOOL_RESULT, None),
+            (TEXT, None),
+        ])
+    );
+    assert_eq!(links_of(&fragment).len(), 1, "the result answers the call");
+    let prompt = node_saying(&fragment, "List the files.");
+    assert_eq!(occurrences_of(&fragment, prompt).len(), 2);
+}
+
+fn session(second: u32, instructions: &str) -> Value {
+    envelope(
+        second,
+        "session_meta",
+        json!({"id": "33333333-3333-4333-8333-333333333333", "timestamp": stamp(second),
+            "cwd": "/synthetic", "originator": "codex_cli_rs", "cli_version": "0.0.0",
+            "source": "cli", "model_provider": "openai",
+            "base_instructions": {"text": instructions}}),
+    )
+}
+
+fn header(second: u32, effort: &str) -> Value {
+    envelope(
+        second,
+        "turn_context",
+        json!({"cwd": "/synthetic", "model": "gpt-5-codex", "effort": effort, "summary": "auto"}),
+    )
+}
+
+/// A recorded system prompt and settings header open the window; a new
+/// header re-presents the line under it, each copy recalling the node its
+/// record held.
+#[test]
+fn codex_a_new_header_re_presents_the_line() {
+    let fragment = codex_built(&[
+        session(0, "Be brief."),
+        header(1, "high"),
+        item(2, "user", "Hi."),
+        item(3, "assistant", "Hello."),
+        header(4, "xhigh"),
+        item(5, "user", "More."),
+        item(6, "assistant", "Done."),
+    ])
+    .expect("builds");
+    let done = node_saying(&fragment, "Done.");
+    assert_eq!(
+        window_before(&fragment, done),
+        vec![
+            (SYSTEM, Some(BODY)),
+            (SYSTEM, None),
+            (TOOL_DEFINITION, Some(SPAN)),
+            (TEXT, None),
+            (TEXT, None),
+            (TEXT, None),
+        ]
+    );
+    let his = nodes_saying(&fragment, "Hi.");
+    assert_eq!(
+        his.len(),
+        2,
+        "the prompt, and its copy under the new header"
+    );
+    let facts = fragment.facts();
+    let recalled: Vec<(Id, Id)> = find!(
+        (copy: Id, original: Id),
+        pattern!(facts, [{ ?copy @ v3::node::recalls: ?original }])
+    )
+    .filter(|(copy, _)| his.contains(copy))
+    .collect();
+    assert_eq!(recalled.len(), 1);
+    assert!(his.contains(&recalled[0].1), "the copy recalls the prompt");
+    // The system prompt stands under each header; its copies recall the
+    // node the session record held, under the header gap.
+    let system = nodes_saying(&fragment, "Be brief.");
+    assert_eq!(system.len(), 3);
+    let copies: Vec<(Id, Id)> = find!(
+        (copy: Id, original: Id),
+        pattern!(facts, [{ ?copy @ v3::node::recalls: ?original }])
+    )
+    .filter(|(copy, _)| system.contains(copy))
+    .collect();
+    assert_eq!(copies.len(), 2);
+    assert!(copies.iter().all(|(_, original)| *original == copies[0].1));
+    assert!(window_before(&fragment, copies[0].1)[0] == (SYSTEM, Some(BODY)));
+}
+
+/// A rollback removes the latest turns from the line; the next items
+/// follow what is left. One of more turns than the line holds is refused.
+#[test]
+fn codex_a_rollback_removes_the_latest_turns() {
+    let turn = |second, id: &str| event(second, json!({"type": "task_started", "turn_id": id}));
+    let back = |second, count: u32| {
+        event(
+            second,
+            json!({"type": "thread_rolled_back", "num_turns": count}),
+        )
+    };
+    let records = |count| {
+        vec![
+            turn(0, "t1"),
+            item(1, "user", "A"),
+            item(2, "assistant", "a"),
+            turn(3, "t2"),
+            item(4, "user", "B"),
+            item(5, "assistant", "b"),
+            back(6, count),
+            item(7, "user", "C"),
+            item(8, "assistant", "c"),
+        ]
+    };
+    let fragment = codex_built(&records(1)).expect("builds");
+    let c = node_saying(&fragment, "c");
+    let text = (TEXT, None);
+    assert_eq!(
+        window_before(&fragment, c),
+        section_then(&[text, text, text])
+    );
+    let b = node_saying(&fragment, "b");
+    assert_eq!(
+        window_before(&fragment, b),
+        section_then(&[text, text, text])
+    );
+    let facts = fragment.facts();
+    let (his, a) = (node_saying(&fragment, "C"), node_saying(&fragment, "a"));
+    let before: Vec<Id> =
+        find!(p: Id, pattern!(facts, [{ his @ v3::node::previous: ?p }])).collect();
+    assert_eq!(before, vec![a], "C follows a, not b");
+    let refused = codex_built(&records(3)).expect_err("refused");
+    assert!(refused.contains("more turns"), "{refused}");
+}
+
+/// X17: where no record marks a turn, his prompt after her answer starts
+/// one, so an abort after it ends no sampling of hers; it is claimed on the
+/// turn's last node.
+#[test]
+fn codex_an_abort_after_his_new_prompt_ends_none_of_hers() {
+    let abort = event(
+        3,
+        json!({"type": "turn_aborted", "reason": "interrupted", "turn_id": "t1"}),
+    );
+    let fragment = codex_built(&[
+        item(0, "user", "A"),
+        item(1, "assistant", "a"),
+        item(2, "user", "B"),
+        abort.clone(),
+    ])
+    .expect("builds");
+    let a = node_saying(&fragment, "a");
+    let b = node_saying(&fragment, "B");
+    assert!(occurrences_of(&fragment, a)
+        .iter()
+        .all(|(_, _, ends)| ends.is_empty()));
+    assert_eq!(
+        turn_ends_on(&fragment, b),
+        vec![v3::node::ends::INTERRUPTED]
+    );
+
+    // Marked turns: the turn holds her answer, which the abort ends.
+    let fragment = codex_built(&[
+        event(0, json!({"type": "task_started", "turn_id": "t1"})),
+        item(0, "user", "A"),
+        item(1, "assistant", "a"),
+        item(2, "user", "B"),
+        abort,
+    ])
+    .expect("builds");
+    let a = node_saying(&fragment, "a");
+    let b = node_saying(&fragment, "B");
+    assert!(occurrences_of(&fragment, a)
+        .iter()
+        .any(|(_, _, ends)| ends == &vec![v3::node::ends::INTERRUPTED]));
+    assert_eq!(
+        turn_ends_on(&fragment, b),
+        vec![v3::node::ends::INTERRUPTED]
+    );
+}
+
+/// A replacement history starts the line again after the opening; its
+/// first node not on the old line continues the old line's last node a
+/// record holds.
+#[test]
+fn codex_a_compaction_starts_the_line_again_and_continues_the_old() {
+    let fragment = codex_built(&[
+        item(0, "user", "A"),
+        item(1, "assistant", "a"),
+        envelope(
+            2,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+                says("user", "A"),
+                says("user", "Summary."),
+            ]}),
+        ),
+        item(3, "user", "B"),
+        item(4, "assistant", "b"),
+    ])
+    .expect("builds");
+    let b = node_saying(&fragment, "b");
+    let text = (TEXT, None);
+    assert_eq!(
+        window_before(&fragment, b),
+        section_then(&[text, text, text])
+    );
+    let summary = node_saying(&fragment, "Summary.");
+    let a = node_saying(&fragment, "a");
+    let facts = fragment.facts();
+    let continued: Vec<Id> =
+        find!(t: Id, pattern!(facts, [{ summary @ v3::node::continues: ?t }])).collect();
+    assert_eq!(continued, vec![a]);
+
+    // The old line is gone: a header after the compaction re-presents only
+    // the new one.
+    let fragment = codex_built(&[
+        item(0, "user", "A"),
+        item(1, "assistant", "a"),
+        envelope(
+            2,
+            "compacted",
+            json!({"message": "", "replacement_history": [says("user", "Summary.")]}),
+        ),
+        header(3, "high"),
+        item(4, "user", "B"),
+        item(5, "assistant", "b"),
+    ])
+    .expect("builds");
+    let b = node_saying(&fragment, "b");
+    assert_eq!(
+        window_before(&fragment, b),
+        vec![
+            (SYSTEM, Some(BODY)),
+            (SYSTEM, Some(BODY)),
+            (TOOL_DEFINITION, Some(SPAN)),
+            text,
+            text,
+        ]
+    );
+}
+
+/// A result after a header change answers the call as re-presented under
+/// the new header; one whose latest call a rollback removed is refused,
+/// even when an earlier call with its id still stands (X4).
+#[test]
+fn codex_a_result_answers_its_latest_call_on_the_line() {
+    let call = |second, id: &str| {
+        envelope(
+            second,
+            "response_item",
+            json!({"type": "function_call", "name": "f", "arguments": "{}", "call_id": id}),
+        )
+    };
+    let output = |second, id: &str| {
+        envelope(
+            second,
+            "response_item",
+            json!({"type": "function_call_output", "call_id": id, "output": "ok"}),
+        )
+    };
+    let fragment = codex_built(&[
+        header(0, "high"),
+        item(1, "user", "Go."),
+        call(2, "c1"),
+        header(3, "low"),
+        output(4, "c1"),
+    ])
+    .expect("builds");
+    // The result's head (before its text) answers the call right before
+    // it: the copy under the low header.
+    let text = node_saying(&fragment, "ok");
+    let facts = fragment.facts();
+    let previous = |at: Id| -> Vec<Id> {
+        find!(p: Id, pattern!(facts, [{ at @ v3::node::previous: ?p }])).collect()
+    };
+    let head = previous(text)[0];
+    assert_eq!(held_modality(&fragment, head), TOOL_RESULT);
+    let answered: Vec<Id> =
+        find!(t: Id, pattern!(facts, [{ head @ v3::node::responds_to: ?t }])).collect();
+    assert_eq!(answered, previous(head));
+    assert_eq!(
+        window_before(&fragment, answered[0])[0],
+        (SYSTEM, Some(BODY))
+    );
+
+    let turn = |second, id: &str| event(second, json!({"type": "task_started", "turn_id": id}));
+    let refused = codex_built(&[
+        turn(0, "t1"),
+        item(1, "user", "Go."),
+        call(2, "a"),
+        turn(3, "t2"),
+        call(4, "a"),
+        event(5, json!({"type": "thread_rolled_back", "num_turns": 1})),
+        output(6, "a"),
+    ])
+    .expect_err("refused");
+    assert!(refused.contains("not in its window"), "{refused}");
+}
+
+/// A record that holds no node claims for the next node placed when it
+/// opens the window (a header, a system prompt) or bears no item at all;
+/// an item whose values rendered nothing claims for none.
+#[test]
+fn codex_claims_of_a_record_that_holds_nothing() {
+    // An empty reply: its time is no claim of the next node.
+    let fragment =
+        codex_built(&[item(0, "assistant", ""), item(1, "user", "Hi.")]).expect("builds");
+    let hi = node_saying(&fragment, "Hi.");
+    assert_eq!(occurrences_of(&fragment, hi).len(), 1);
+
+    // A header with no settings item: its claims, empty or not, go to the
+    // next node, and a file that ends before one is refused (X19).
+    let bare = envelope(1, "turn_context", json!({"cwd": "/synthetic"}));
+    let fragment =
+        codex_built(&[item(0, "user", "A"), bare.clone(), item(2, "user", "B")]).expect("builds");
+    let b = node_saying(&fragment, "B");
+    assert_eq!(occurrences_of(&fragment, b).len(), 2);
+    let refused = codex_built(&[item(0, "user", "A"), bare]).expect_err("refused");
+    assert!(refused.contains("beyond the end of the file"), "{refused}");
 }

@@ -9,11 +9,10 @@
 //! one relational decision with its expected items written out (round-7
 //! design, wiki d3f1abd2).
 //!
-//! Built so far: records and their repeats, a record's items in record
-//! order, and nodes chained by `Order::Parents` behind the unrecorded
-//! section, with a span gap behind a parent the unit does not hold.
-//! Records the rest of the table governs (a system section, a settings
-//! header, a compaction) are refused as not built yet, never built wrong.
+//! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
+//! exact with its importer on the live samples where it builds. Still
+//! refused as not built yet, never built wrong: a history budget (X18) and
+//! a record's supplied members (`Class::Supply`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,11 +22,11 @@ use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
 use super::super::fields::{
-    Beside, Class, Decode, DropReason, FieldTable, Gap, Order, Place, Rewrite,
+    Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, Order, Place, Rewrite,
 };
 use super::super::{
-    annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
-    Model, NodeAnnotations, WitnessAnnotations,
+    annotate_node, ends_disagree, fact, gloss, gloss_part, node, occurrence, unexported, witness,
+    FactCore, Model, NodeAnnotations, WitnessAnnotations,
 };
 use super::{
     apply, decode_text, field_at, holds, json_text, kind, spelling, structure, term, text_of, Cat,
@@ -118,10 +117,15 @@ struct Item {
     /// The call ids it is a call of, and the call id a result names.
     calls: Vec<String>,
     answers: Option<String>,
-    /// Glosses describing it: (category, text).
-    glosses: Vec<(Id, String)>,
+    /// Glosses describing it: (category, text, its place among the parts
+    /// of a gloss written in parts).
+    glosses: Vec<(Id, String, Option<u64>)>,
     /// A record holds it (a gap beside a value may stand in no record).
     held: bool,
+    /// She produced it (direction `out`).
+    out: bool,
+    /// The assembly point it came from.
+    levels: Levels,
 }
 
 /// What one record holds and claims.
@@ -148,6 +152,15 @@ struct Parts {
     /// Facts the relations built for the record (gaps beside its values),
     /// staged with the lines.
     built: Vec<Fragment>,
+    /// Glosses at their own place (`Place::Here`), by the levels of the
+    /// value: (levels, category, text, path).
+    here: Vec<(Levels, Id, String, &'static str)>,
+    /// Why the turn ended, known from a record after its items
+    /// ([`Order::File`]'s turn places): (attribute, ends term, place, path).
+    turn: Vec<(&'static str, Id, Place, &'static str)>,
+    /// An entry that makes items consumed one of its values, whether or not
+    /// it rendered any.
+    bears: bool,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -160,9 +173,9 @@ fn ends_term(name: &str) -> Option<Id> {
 /// One annotation value of a record, by its attribute and place.
 fn annotate(
     parts: &mut Parts,
-    point_items: std::ops::Range<usize>,
+    levels: &Levels,
     path: &'static str,
-    attribute: &str,
+    attribute: &'static str,
     decode: Decode,
     place: Place,
     unit: &Unit,
@@ -190,17 +203,13 @@ fn annotate(
         if place != Place::Here {
             return not_built();
         }
-        // The item at the value's own place whose modality is the place's
-        // only one.
-        let at = point_items.clone();
-        if at.len() != 1 {
-            return not_built();
-        }
-        parts.items[at.start].glosses.push((category, text));
+        parts.here.push((levels.clone(), category, text, path));
         return Ok(());
     }
     match (attribute, place) {
-        ("ends", Place::Last) => {
+        ("ends", Place::Last)
+        | ("ends", Place::LastOut)
+        | ("turn_ends", Place::TurnTail | Place::TurnTailWithoutOut) => {
             let name = match decode {
                 Decode::ConstTerm(name) => name.to_owned(),
                 Decode::Term(map) => {
@@ -213,7 +222,11 @@ fn annotate(
                 }
                 _ => return not_built(),
             };
-            parts.ends.push(ends_term(&name).ok_or("an ends term")?);
+            let term = ends_term(&name).ok_or("an ends term")?;
+            match place {
+                Place::Last => parts.ends.push(term),
+                _ => parts.turn.push((attribute, term, place, path)),
+            }
         }
         ("rendering", Place::Every) => parts.unrecorded = true,
         ("ends", Place::Request) => {
@@ -284,7 +297,7 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
     found.sort_by(|a, b| a.0.cmp(&b.0));
     let result = t.table.windows.requests.map(|requests| requests.result);
     let mut parts = Parts::default();
-    for (_, value, at) in found {
+    for (levels, value, at) in found {
         let mut cores = t
             .assemble(unit, value, &at)
             .ok_or_else(|| format!("{}: a field needs a decode not built", at.path))?;
@@ -313,6 +326,7 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
         for core in cores {
             let modality = core.modality;
             let effort = core.effort.is_some();
+            let out = core.direction == Some(v3::fact::direction::OUT);
             let built = fact(core).map_err(|e| format!("{}: {e}", at.path))?;
             parts.items.push(Item {
                 fact: built.root().ok_or("a fact is rooted")?,
@@ -323,6 +337,8 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                 answers: None,
                 glosses: Vec::new(),
                 held: true,
+                out,
+                levels: levels.clone(),
             });
         }
         let mut consumed = Vec::new();
@@ -347,6 +363,8 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                     answers: None,
                     glosses: Vec::new(),
                     held: rule.held,
+                    out: rule.gap.direction == "out",
+                    levels: levels.clone(),
                 };
                 parts.built.push(built);
                 match rule.at {
@@ -357,19 +375,15 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
         }
         let mine = first..parts.items.len();
         for (entry, v, _) in consumed {
+            if matches!(entry.class, Class::Fact { .. } | Class::Structure(_)) {
+                parts.bears = true;
+            }
             match entry.class {
                 Class::Annotation(list) => {
                     for (attribute, decode) in list {
                         let place = t.table.place(entry.path, attribute);
                         annotate(
-                            &mut parts,
-                            mine.clone(),
-                            entry.path,
-                            attribute,
-                            *decode,
-                            place,
-                            unit,
-                            v,
+                            &mut parts, &levels, entry.path, attribute, *decode, place, unit, v,
                         )?;
                     }
                 }
@@ -411,6 +425,32 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                 _ => {}
             }
         }
+    }
+    // A gloss describes the one item a record holds at the value's own
+    // place, else at the nearest place enclosing it; one in an array below
+    // that item is one part of it, with its place there (X16).
+    for (levels, category, text, path) in std::mem::take(&mut parts.here) {
+        let mut found = Vec::new();
+        let mut depth = 0;
+        for d in (0..=levels.len()).rev() {
+            found = (0..parts.items.len())
+                .filter(|&i| parts.items[i].held && parts.items[i].levels[..] == levels[..d])
+                .collect();
+            if !found.is_empty() {
+                depth = d;
+                break;
+            }
+        }
+        let [item] = found[..] else {
+            return Err(format!(
+                "not built yet: a gloss at {path} on no single item"
+            ));
+        };
+        let part = (levels.len() > depth).then(|| {
+            let raw = levels[depth].1;
+            u64::from_be_bytes(raw[24..].try_into().expect("eight bytes"))
+        });
+        parts.items[item].glosses.push((category, text, part));
     }
     Ok(parts)
 }
@@ -714,6 +754,24 @@ impl Lines<'_> {
     }
 }
 
+/// What both orders leave for the end: the call ids each node holds, the
+/// results waiting for their call, and every occurrence.
+#[derive(Default)]
+struct Wiring {
+    calls_at: HashMap<Id, Vec<String>>,
+    answers: Vec<(Id, String)>,
+    occurrences: Vec<(Id, WitnessAnnotations)>,
+}
+
+/// A gloss of `node`, whole or as one part.
+fn described(node: Id, category: Id, text: &str, part: Option<u64>) -> Result<Fragment, String> {
+    let built = match part {
+        Some(part) => gloss_part(node, category, part, text),
+        None => gloss(node, category, text),
+    };
+    Ok(unexported(built.map_err(|e| format!("a gloss: {e}"))?))
+}
+
 /// The nodes, witnesses and occurrences of a unit whose facts `image`
 /// holds, or why the unit has none.
 pub fn build(
@@ -722,9 +780,6 @@ pub fn build(
     root: Id,
     _image: &Fragment,
 ) -> Result<Fragment, String> {
-    let Order::Parents { id, parent } = table.order else {
-        return Err("not built yet: a table ordered by file".to_owned());
-    };
     let t = Table::new(table);
     let facts = unit.facts;
     let mut records: Vec<(Inline<U256BE>, Id)> = find!(
@@ -742,12 +797,67 @@ pub fn build(
         record: None,
         parent: None,
     };
+    let mut lines = Lines {
+        table,
+        out: Fragment::empty(),
+        nodes: HashMap::new(),
+        facts: HashMap::new(),
+        places: HashMap::new(),
+        roots: HashMap::new(),
+        orphans: HashMap::new(),
+        marks: Default::default(),
+    };
+    // The settings header of a window whose request records none.
+    let header_gap = match &table.gaps.header {
+        Some(g) => lines.fact(gap(g)?)?,
+        None => return Err("not built yet: a table with no header gap".to_owned()),
+    };
+    let mut wiring = Wiring::default();
+    let records: Vec<Id> = records.into_iter().map(|(_, record)| record).collect();
+    match table.order {
+        Order::Parents { id, parent } => parents(
+            &t,
+            &unit,
+            &records,
+            &record_cat,
+            &mut lines,
+            header_gap,
+            (id, parent),
+            &mut wiring,
+        )?,
+        Order::File(rules) => file(
+            &t,
+            &unit,
+            &records,
+            &record_cat,
+            &mut lines,
+            header_gap,
+            &rules,
+            &mut wiring,
+        )?,
+    }
+    finish(table, lines, wiring)
+}
+
+/// [`Order::Parents`]: records chained by their parent ids.
+#[allow(clippy::too_many_arguments)]
+fn parents(
+    t: &Table,
+    unit: &Unit,
+    records: &[Id],
+    record_cat: &Cat,
+    lines: &mut Lines,
+    header_gap: Id,
+    (id, parent): (&'static str, &'static str),
+    wiring: &mut Wiring,
+) -> Result<(), String> {
+    let table = t.table;
     let read = |record: Id, field: &str| -> Option<String> {
         field_at(&unit, record, field)
             .and_then(|v| spelling(&unit, v))
             .filter(|s| s != "null")
     };
-    let all_ids: HashSet<String> = records.iter().filter_map(|(_, r)| read(*r, id)).collect();
+    let all_ids: HashSet<String> = records.iter().filter_map(|r| read(*r, id)).collect();
     let shape_of = |record: Id| -> String {
         field_at(&unit, record, "type")
             .and_then(|v| text_of(&unit, v))
@@ -758,7 +868,7 @@ pub fn build(
     // and a repeat must hold the same thing.
     let mut first: HashMap<String, Id> = HashMap::new();
     let mut repeat = vec![false; records.len()];
-    for (at, (_, record)) in records.iter().enumerate() {
+    for (at, record) in records.iter().enumerate() {
         let Some(own) = read(*record, id) else {
             continue;
         };
@@ -780,7 +890,7 @@ pub fn build(
     let mut order = Vec::with_capacity(records.len());
     let mut done: HashSet<String> = HashSet::new();
     let mut waiting: HashMap<String, Vec<usize>> = HashMap::new();
-    for (at, (_, record)) in records.iter().enumerate() {
+    for (at, record) in records.iter().enumerate() {
         if repeat[at] {
             continue;
         }
@@ -793,7 +903,7 @@ pub fn build(
         let mut stack = vec![at];
         while let Some(next) = stack.pop() {
             order.push(next);
-            if let Some(own) = read(records[next].1, id) {
+            if let Some(own) = read(records[next], id) {
                 done.insert(own.clone());
                 if let Some(children) = waiting.remove(&own) {
                     stack.extend(children.into_iter().rev());
@@ -807,21 +917,6 @@ pub fn build(
         ));
     }
 
-    let mut lines = Lines {
-        table,
-        out: Fragment::empty(),
-        nodes: HashMap::new(),
-        facts: HashMap::new(),
-        places: HashMap::new(),
-        roots: HashMap::new(),
-        orphans: HashMap::new(),
-        marks: Default::default(),
-    };
-    // The settings header of a window whose request records none.
-    let header_gap = match &table.gaps.header {
-        Some(g) => lines.fact(gap(g)?)?,
-        None => return Err("not built yet: a table with no header gap".to_owned()),
-    };
     let requests = table.windows.requests;
     let mut tails: HashMap<String, Line> = HashMap::new();
     // Each request's records so far, and the header it was sampled under;
@@ -838,15 +933,15 @@ pub fn build(
     let mut segments: HashMap<String, (String, String)> = HashMap::new();
     let mut record_items: HashMap<String, Vec<(Id, Id)>> = HashMap::new();
     let mut record_parent: HashMap<String, Option<String>> = HashMap::new();
-    // For links: the call ids each node holds, and the results waiting for
-    // their call.
-    let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
-    let mut answers: Vec<(Id, String)> = Vec::new();
-    let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
+    let Wiring {
+        calls_at,
+        answers,
+        occurrences,
+    } = wiring;
     // Glosses on the file's tail, by the file position of their record.
     let mut file_tail: Vec<(usize, Id, String, &'static str)> = Vec::new();
     for at in order {
-        let record = records[at].1;
+        let record = records[at];
         let shape = shape_of(record);
         if table.windows.prefix.contains(&shape.as_str()) {
             return Err(format!("not built yet: a system section ({{{shape}}})"));
@@ -898,6 +993,9 @@ pub fn build(
             }
         }
         let parts = record_parts(&t, &unit, record, &record_cat)?;
+        if !parts.turn.is_empty() {
+            return Err("not built yet: a turn place under parent order".to_owned());
+        }
         request_ends.extend(parts.request_ends.iter().cloned());
         for built in &parts.built {
             lines.fact(built.clone())?;
@@ -1015,9 +1113,8 @@ pub fn build(
             if let Some(call) = &item.answers {
                 answers.push((at, call.clone()));
             }
-            for (category, text) in &item.glosses {
-                lines.out +=
-                    unexported(gloss(at, *category, text).map_err(|e| format!("a gloss: {e}"))?);
+            for (category, text, part) in &item.glosses {
+                lines.out += described(at, *category, text, *part)?;
             }
             if parts.unrecorded {
                 let mark = lines.marks.entry(at).or_default();
@@ -1127,7 +1224,7 @@ pub fn build(
     let named: Vec<(usize, String)> = records
         .iter()
         .enumerate()
-        .filter_map(|(at, (_, record))| read(*record, id).map(|own| (at, own)))
+        .filter_map(|(at, record)| read(*record, id).map(|own| (at, own)))
         .collect();
     let mut placed: HashSet<(Id, String)> = HashSet::new();
     let mut restated: Vec<(Id, String, &'static str)> = Vec::new();
@@ -1208,6 +1305,410 @@ pub fn build(
             ends.push(term);
         }
     }
+    Ok(())
+}
+
+/// A record's kind under [`Order::File`]: the first rule whose conditions
+/// all hold.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileKind {
+    Header,
+    Prefix,
+    Replace,
+    Turn,
+    Rollback,
+    Content,
+}
+
+fn file_kind(rules: &FileWindows, unit: &Unit, record: Id) -> FileKind {
+    let is = |when: &[Cond]| !when.is_empty() && holds(when, unit, Some(record), None);
+    if is(rules.header) {
+        FileKind::Header
+    } else if is(rules.prefix) {
+        FileKind::Prefix
+    } else if is(rules.replace) {
+        FileKind::Replace
+    } else if is(rules.turn) {
+        FileKind::Turn
+    } else if is(rules.rollback) {
+        FileKind::Rollback
+    } else {
+        FileKind::Content
+    }
+}
+
+fn claims_something(claims: &WitnessAnnotations) -> bool {
+    !claims.timestamp.is_empty()
+        || claims.raw_role.is_some()
+        || claims.raw_model.is_some()
+        || claims.source_locator.is_some()
+        || !claims.generated_by.is_empty()
+        || !claims.raw_author.is_empty()
+        || !claims.pointer.is_empty()
+        || claims.harness_written
+        || claims.compaction_summary
+}
+
+/// One place on the line: its node, and the item there.
+#[derive(Clone, Copy)]
+struct Spot {
+    node: Id,
+    fact: Id,
+    held: bool,
+    out: bool,
+    /// The record that holds the item, and the node it holds it in.
+    own: Option<(usize, Id)>,
+}
+
+/// [`Order::File`]: one line, in file order. A header or prefix record
+/// sets its part of the opening and the line is re-presented under it; a
+/// replacement record starts the line again after the opening; a turn
+/// record marks where a turn starts, and a rollback removes the latest
+/// turns; any other record extends the line. Claims of a record that holds
+/// no node go to the next node the file places (X19 where the file ends
+/// before it).
+#[allow(clippy::too_many_arguments)]
+fn file(
+    t: &Table,
+    unit: &Unit,
+    records: &[Id],
+    record_cat: &Cat,
+    lines: &mut Lines,
+    header_gap: Id,
+    rules: &FileWindows,
+    wiring: &mut Wiring,
+) -> Result<(), String> {
+    let table = t.table;
+    // X18: a budget recorded on a header, or on a record, is not built yet.
+    if let Some(budget) = rules.budget {
+        for &record in records {
+            let header = file_kind(rules, unit, record) == FileKind::Header;
+            if header && field_at(unit, record, budget.policy.0).is_some() {
+                return Err(format!(
+                    "not built yet: a history budget ({})",
+                    budget.policy.1
+                ));
+            }
+            if field_at(unit, record, budget.limit.0).is_some() {
+                return Err(format!(
+                    "not built yet: a history budget ({})",
+                    budget.limit.1
+                ));
+            }
+        }
+    }
+    let marked = records
+        .iter()
+        .any(|&record| file_kind(rules, unit, record) == FileKind::Turn);
+    let mut header: Option<Id> = None;
+    let mut prefix: Vec<Id> = Vec::new();
+    // The opening's last node, and the nodes of the recorded prefix on it.
+    let opening = |lines: &mut Lines, header: Option<Id>, prefix: &[Id]| {
+        let mut tail = Some(lines.place(None, header.unwrap_or(header_gap), true, None)?);
+        let mut at_prefix = Vec::new();
+        if prefix.is_empty() {
+            for g in table.gaps.prefix {
+                let at = lines.fact(gap(g)?)?;
+                tail = Some(lines.place(tail, at, true, None)?);
+            }
+        } else {
+            for &fact_id in prefix {
+                let at = lines.place(tail, fact_id, true, None)?;
+                at_prefix.push(at);
+                tail = Some(at);
+            }
+        }
+        for g in table.gaps.after_prefix {
+            let at = lines.fact(gap(g)?)?;
+            tail = Some(lines.place(tail, at, true, None)?);
+        }
+        Ok::<_, String>((tail, at_prefix))
+    };
+    let (mut root, _) = opening(lines, None, &[])?;
+    let mut line: Vec<Spot> = Vec::new();
+    let mut turns: Vec<usize> = Vec::new();
+    // Every (record, node) a record holds, each record's claims, and the
+    // claims waiting for the next node placed.
+    let mut held: Vec<(usize, Id)> = Vec::new();
+    let mut claims_of: HashMap<usize, WitnessAnnotations> = HashMap::new();
+    let mut pending: Vec<(WitnessAnnotations, &'static str)> = Vec::new();
+    let mut extra: Vec<(Id, WitnessAnnotations)> = Vec::new();
+    // (record, node, term): why the sampling of what that record holds at
+    // that node stopped (M1).
+    let mut ends: Vec<(usize, Id, Id)> = Vec::new();
+    // Each call id's latest opening: its place on the line and its node.
+    let mut latest: HashMap<String, (usize, Id)> = HashMap::new();
+    // The node the prefix record held each recorded prefix item in.
+    let mut prefix_own: Vec<Option<Id>> = Vec::new();
+    let witness = |held: &mut Vec<(usize, Id)>,
+                   pending: &mut Vec<(WitnessAnnotations, &'static str)>,
+                   extra: &mut Vec<(Id, WitnessAnnotations)>,
+                   record: usize,
+                   node: Id| {
+        held.push((record, node));
+        for (claims, _) in pending.drain(..) {
+            extra.push((node, claims));
+        }
+    };
+    let since = |turns: &[usize], line: &[Spot]| turns.last().copied().unwrap_or(0).min(line.len());
+    for (at, &record) in records.iter().enumerate() {
+        let kind = file_kind(rules, unit, record);
+        let parts = record_parts(t, unit, record, record_cat)?;
+        if !parts.file_tail.is_empty()
+            || !parts.parent_tail.is_empty()
+            || !parts.rewrites.is_empty()
+            || !parts.request_ends.is_empty()
+            || parts.unrecorded
+        {
+            return Err("not built yet: a place only parent order names".to_owned());
+        }
+        for built in &parts.built {
+            lines.fact(built.clone())?;
+        }
+        let items: Vec<&Item> = parts.items.iter().collect();
+        let claims = parts.claims.clone();
+        // A header or prefix record that holds nothing, and a record that
+        // bears no item at all, claim for the next node placed; an item
+        // record whose values rendered nothing claims for none.
+        let opens = matches!(kind, FileKind::Header | FileKind::Prefix);
+        if !items.is_empty() {
+            claims_of.insert(at, claims.clone());
+        } else if opens || (!parts.bears && claims_something(&claims)) {
+            pending.push((claims.clone(), "<record>"));
+        }
+        // X17: his prompt after her answer starts a turn where the unit
+        // marks none.
+        let prompt = rules
+            .prompt
+            .iter()
+            .any(|when| !when.is_empty() && holds(when, unit, Some(record), None));
+        if !marked && prompt {
+            let from = since(&turns, &line);
+            if line[from..].iter().any(|spot| spot.held && spot.out) {
+                turns.push(line.len());
+            }
+        }
+        // Place the items after `tail`, extending the line.
+        let mut place_items = |lines: &mut Lines,
+                               line: &mut Vec<Spot>,
+                               latest: &mut HashMap<String, (usize, Id)>,
+                               tail: Option<Id>|
+         -> Result<(), String> {
+            let mut tail = tail;
+            for item in &items {
+                let node = lines.place(tail, item.fact, false, None)?;
+                tail = Some(node);
+                // X4: a result answers the latest call with its id, which
+                // must still stand on her line.
+                if let Some(call) = &item.answers {
+                    let found = latest.get(call).and_then(|&(position, own)| {
+                        line.get(position)
+                            .filter(|spot| spot.own.map(|(_, n)| n) == Some(own))
+                            .map(|spot| spot.node)
+                    });
+                    let Some(target) = found else {
+                        return Err("a result whose call is not in its window".to_owned());
+                    };
+                    let mark = lines.marks.entry(node).or_default();
+                    if !mark.responds_to.contains(&target) {
+                        mark.responds_to.push(target);
+                    }
+                }
+                for call in &item.calls {
+                    latest.insert(call.clone(), (line.len(), node));
+                }
+                for (category, text, part) in &item.glosses {
+                    lines.out += described(node, *category, text, *part)?;
+                }
+                line.push(Spot {
+                    node,
+                    fact: item.fact,
+                    held: item.held,
+                    out: item.out,
+                    own: item.held.then_some((at, node)),
+                });
+                if item.held {
+                    witness(&mut held, &mut pending, &mut extra, at, node);
+                }
+            }
+            Ok(())
+        };
+        match kind {
+            FileKind::Header | FileKind::Prefix => {
+                let facts: Vec<Id> = items.iter().map(|item| item.fact).collect();
+                if kind == FileKind::Header {
+                    if facts.len() > 1 {
+                        return Err("a header record that holds more than one item".to_owned());
+                    }
+                    header = facts.first().copied();
+                } else {
+                    prefix = facts;
+                    prefix_own.clear();
+                }
+                // The line re-presented under the new opening: each copy
+                // recalls the node its record held, the prefix's too.
+                let (tail, at_prefix) = opening(lines, header, &prefix)?;
+                for (node, own) in at_prefix.iter().zip(&prefix_own) {
+                    if let Some(own) = own {
+                        lines.copied(*node, *own);
+                    }
+                }
+                if tail != root {
+                    root = tail;
+                    let mut cursor = root;
+                    for spot in line.iter_mut() {
+                        let own = spot.own.map(|(_, own)| own);
+                        let node = lines.place(cursor, spot.fact, false, own)?;
+                        if let Some(own) = own {
+                            lines.copied(node, own);
+                        }
+                        spot.node = node;
+                        cursor = Some(node);
+                    }
+                }
+                if kind == FileKind::Header {
+                    if let Some(fact_id) = header {
+                        let node = lines.place(None, fact_id, true, None)?;
+                        witness(&mut held, &mut pending, &mut extra, at, node);
+                    }
+                } else {
+                    for (item, node) in items.iter().zip(at_prefix) {
+                        prefix_own.push(item.held.then_some(node));
+                        if item.held {
+                            witness(&mut held, &mut pending, &mut extra, at, node);
+                        }
+                    }
+                }
+            }
+            FileKind::Replace => {
+                if items.is_empty() {
+                    return Err("a compaction whose new context holds nothing".to_owned());
+                }
+                let old_tip = line.last().map(|spot| spot.node).or(root);
+                let tail = line
+                    .iter()
+                    .rev()
+                    .find_map(|spot| spot.own.map(|(_, own)| own))
+                    .or(old_tip);
+                line.clear();
+                turns.clear();
+                latest.clear();
+                place_items(lines, &mut line, &mut latest, root)?;
+                // X2: the first node of the new line that is not on the old
+                // line continues the old tail.
+                let mut on_old: HashSet<Id> = HashSet::new();
+                let mut cursor = old_tip;
+                while let Some(node) = cursor {
+                    on_old.insert(node);
+                    cursor = lines.places[&node].previous;
+                }
+                let mut new_line = Vec::new();
+                let mut cursor = line.last().map(|spot| spot.node);
+                while let Some(node) = cursor {
+                    new_line.push(node);
+                    cursor = lines.places[&node].previous;
+                }
+                let first = new_line
+                    .into_iter()
+                    .rev()
+                    .find(|node| !on_old.contains(node))
+                    .ok_or("a compaction whose new context lies on the old line")?;
+                if let Some(tail) = tail {
+                    let mark = lines.marks.entry(first).or_default();
+                    if !mark.continues.contains(&tail) {
+                        mark.continues.push(tail);
+                    }
+                }
+            }
+            FileKind::Turn => turns.push(line.len()),
+            FileKind::Rollback => {
+                let count = field_at(unit, record, rules.rollback_count)
+                    .and_then(|v| spelling(unit, v))
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .ok_or_else(|| {
+                        format!("{}: a rollback count is no count", rules.rollback_count)
+                    })?;
+                if count > turns.len() {
+                    return Err("a rollback of more turns than the line holds".to_owned());
+                }
+                if count > 0 {
+                    let keep = turns.len() - count;
+                    line.truncate(turns[keep]);
+                    turns.truncate(keep);
+                }
+            }
+            FileKind::Content => {
+                let tail = line.last().map(|spot| spot.node).or(root);
+                place_items(lines, &mut line, &mut latest, tail)?;
+            }
+        }
+        // Why the turn ended, from a record after its items: on her last
+        // item of the turn (`LastOut`), or a claim on the turn's last node,
+        // or on the next node placed when the turn holds none (X15).
+        for (_, term, place, path) in &parts.turn {
+            let from = since(&turns, &line);
+            let turn = &line[from..];
+            let last_out = turn
+                .iter()
+                .rev()
+                .find(|spot| spot.held && spot.out)
+                .and_then(|spot| spot.own);
+            match place {
+                Place::LastOut => {
+                    if let Some((by, node)) = last_out {
+                        ends.push((by, node, *term));
+                    }
+                }
+                Place::TurnTailWithoutOut if last_out.is_some() => {}
+                _ => {
+                    let claims = WitnessAnnotations {
+                        turn_ends: vec![*term],
+                        ..WitnessAnnotations::default()
+                    };
+                    match turn.iter().rev().find_map(|spot| spot.own) {
+                        Some((_, node)) => extra.push((node, claims)),
+                        None => pending.push((claims, path)),
+                    }
+                }
+            }
+        }
+    }
+    // X19: claims that wait for a node the file does not reach.
+    if !held.is_empty() {
+        if let Some((_, path)) = pending.first() {
+            return Err(format!(
+                "{path}: a record's claims wait for a node beyond the end of the file"
+            ));
+        }
+    }
+    for (record, node) in held {
+        let mut claims = claims_of.get(&record).cloned().unwrap_or_default();
+        ends.retain(|&(by, at, term)| {
+            if (by, at) != (record, node) {
+                return true;
+            }
+            if !claims.ends.contains(&term) {
+                claims.ends.push(term);
+            }
+            false
+        });
+        wiring.occurrences.push((node, claims));
+    }
+    if !ends.is_empty() {
+        return Err("a turn end on an item no record holds".to_owned());
+    }
+    wiring.occurrences.extend(extra);
+    Ok(())
+}
+
+/// What both orders end with: each result's link to its call, the nodes
+/// on the windows records hold, and the witnesses.
+fn finish(table: &FieldTable, mut lines: Lines, wiring: Wiring) -> Result<Fragment, String> {
+    let Wiring {
+        calls_at,
+        answers,
+        occurrences,
+    } = wiring;
     // Each result answers the nearest node on its own line holding the call
     // it names (C1). A copy holds what its original held.
     for (node, call) in answers {
