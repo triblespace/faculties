@@ -261,6 +261,21 @@ fn first_divergence(ours: &Fragment, theirs: &Fragment) -> Option<(String, Strin
     Some((name_of(held(theirs, child)), next_ours.join("|")))
 }
 
+/// The occurrence ids of a fragment, and its (from, to) links.
+fn occurrence_ids(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
+    let facts = fragment.facts();
+    find!(o: Id, pattern!(facts, [{ ?o @ v3::occurrence::of: _?w }])).collect()
+}
+
+fn links_of(fragment: &Fragment) -> std::collections::BTreeSet<(Id, Id)> {
+    let facts = fragment.facts();
+    find!(
+        (from: Id, to: Id),
+        pattern!(facts, [{ ?from @ v3::node::responds_to: ?to }])
+    )
+    .collect()
+}
+
 /// The node ids of a fragment.
 fn nodes_of(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
     let facts = fragment.facts();
@@ -280,6 +295,8 @@ fn real_sample_relations() {
     let (mut built_files, mut same, mut ours_only, mut theirs_only) = (0, 0, 0, 0);
     let mut divergences: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut unstable = 0;
+    // Occurrences and links, each as (shared, ours only, importer only).
+    let (mut occurrences, mut links) = ((0, 0, 0), (0, 0, 0));
     // Our extra nodes: what each holds, after what its parent holds.
     let mut extra: std::collections::BTreeMap<(String, String), usize> = Default::default();
     for file in &files {
@@ -314,6 +331,18 @@ fn real_sample_relations() {
                 let theirs = nodes_of(&imported);
                 same += ours.intersection(&theirs).count();
                 ours_only += ours.difference(&theirs).count();
+                for (count, (a, b)) in [(
+                    &mut occurrences,
+                    (occurrence_ids(&fragment), occurrence_ids(&imported)),
+                )] {
+                    count.0 += a.intersection(&b).count();
+                    count.1 += a.difference(&b).count();
+                    count.2 += b.difference(&a).count();
+                }
+                let (a, b) = (links_of(&fragment), links_of(&imported));
+                links.0 += a.intersection(&b).count();
+                links.1 += a.difference(&b).count();
+                links.2 += b.difference(&a).count();
                 let of = fragment.facts();
                 for &n in ours.difference(&theirs) {
                     let parent = find!(p: Id, pattern!(of, [{ n @ v3::node::previous: ?p }]))
@@ -335,6 +364,10 @@ fn real_sample_relations() {
     println!(
         "files built {built_files} (built differently twice: {unstable}); nodes: shared {same}, ours only {ours_only}, importer only {theirs_only}"
     );
+    println!(
+        "occurrences: shared {}, ours only {}, importer only {}; links: shared {}, ours only {}, importer only {}",
+        occurrences.0, occurrences.1, occurrences.2, links.0, links.1, links.2
+    );
     println!("-- first divergence: files, importer's next item, ours");
     for ((theirs, ours), n) in &divergences {
         println!("{n}\t{theirs}\t{ours}");
@@ -347,4 +380,97 @@ fn real_sample_relations() {
     for (reason, n) in &reasons {
         println!("{n}\t{reason}");
     }
+}
+
+/// The occurrences of `node`'s witnesses: each as (timestamps,
+/// generated_by, ends), sorted.
+fn occurrences_of(fragment: &Fragment, node: Id) -> Vec<(Vec<[u8; 32]>, Vec<Id>, Vec<Id>)> {
+    let facts = fragment.facts();
+    let mut out: Vec<(Vec<[u8; 32]>, Vec<Id>, Vec<Id>)> = find!(
+        occurrence: Id,
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: node },
+            { ?occurrence @ v3::occurrence::of: _?witness },
+        ])
+    )
+    .map(|o| {
+        let mut times: Vec<[u8; 32]> = find!(
+            t: Inline<inlineencodings::NsTAIInterval>,
+            pattern!(facts, [{ o @ v3::witness::timestamp: ?t }])
+        )
+        .map(|t| t.raw)
+        .collect();
+        times.sort();
+        let mut models: Vec<Id> =
+            find!(m: Id, pattern!(facts, [{ o @ v3::witness::generated_by: ?m }])).collect();
+        models.sort();
+        let mut ends: Vec<Id> =
+            find!(e: Id, pattern!(facts, [{ o @ v3::witness::ends: ?e }])).collect();
+        ends.sort();
+        (times, models, ends)
+    })
+    .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_reply_is_witnessed_with_its_record_s_claims_and_its_end() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+    ]);
+    let built = built(&source).expect("builds");
+    let hello = node_saying(&built, "Hello.");
+    let at = crate::archive_v3::claude_code::time(&stamp(1))
+        .expect("a time")
+        .raw;
+    let model = crate::archive_v3::Model::vendor("claude-opus-4-6")
+        .expect("a model")
+        .id;
+    assert_eq!(
+        occurrences_of(&built, hello),
+        vec![(vec![at], vec![model], vec![v3::node::ends::END_TURN])]
+    );
+    // Her prompt's record claims its time; no model sampled it, and it ends
+    // nothing.
+    let hi = node_saying(&built, "Hi.");
+    let at = crate::archive_v3::claude_code::time(&stamp(0))
+        .expect("a time")
+        .raw;
+    assert_eq!(occurrences_of(&built, hi), vec![(vec![at], vec![], vec![])]);
+}
+
+#[test]
+fn a_result_responds_to_the_call_it_names_on_its_own_line() {
+    let mut call = assistant("a1", "u1", 1, "unused");
+    call["message"]["content"] = json!([{"type": "tool_use", "id": "t1", "name": "Read",
+        "input": {"file_path": "/x"}, "caller": {"type": "direct"}}]);
+    call["message"]["stop_reason"] = json!("tool_use");
+    let mut result = user("u2", Some("a1"), 2, "unused");
+    result["message"]["content"] = json!([{"type": "tool_result", "tool_use_id": "t1",
+        "content": "fine", "is_error": false}]);
+    let source = jsonl(&[user("u1", None, 0, "Hi."), call, result]);
+    let built = built(&source).expect("builds");
+    let facts = built.facts();
+    let responds: Vec<(Id, Id)> = find!(
+        (from: Id, to: Id),
+        pattern!(facts, [{ ?from @ v3::node::responds_to: ?to }])
+    )
+    .collect();
+    assert_eq!(responds.len(), 1, "one result, one link");
+    let (from, to) = responds[0];
+    // The link runs from the result's head to the node holding the call.
+    assert_eq!(held_modality(&built, from), v3::fact::modality::TOOL_RESULT);
+    assert_eq!(held_modality(&built, to), v3::fact::modality::TOOL_CALL);
+}
+
+fn held_modality(fragment: &Fragment, node: Id) -> Id {
+    let facts = fragment.facts();
+    find!(
+        m: Id,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::modality: ?m }])
+    )
+    .next()
+    .expect("the node holds a fact")
 }

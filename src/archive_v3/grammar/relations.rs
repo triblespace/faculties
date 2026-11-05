@@ -22,9 +22,12 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::fields::{FieldTable, Gap, Order};
-use super::super::{fact, node, unexported, FactCore};
-use super::{field_at, kind, spelling, term, text_of, Cat, Table};
+use super::super::fields::{Class, Decode, FieldTable, Gap, Order, Place};
+use super::super::{
+    annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
+    Model, NodeAnnotations, WitnessAnnotations,
+};
+use super::{decode_text, field_at, kind, spelling, term, text_of, Cat, Table};
 use crate::schemas::archive_v3 as v3;
 
 type Name = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -98,15 +101,145 @@ fn points(
     }
 }
 
-/// A record's items in record order: the facts of the record outside every
-/// array first, then each array element's by (array path, index); within
-/// one assembly point, in the order they were assembled.
-fn items(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Vec<Id>, String> {
+/// One item of a record: its fact, and what the record says about it.
+struct Item {
+    fact: Id,
+    modality: Option<Id>,
+    /// The call ids it is a call of, and the call id a result names.
+    calls: Vec<String>,
+    answers: Option<String>,
+    /// Glosses describing it: (category, text).
+    glosses: Vec<(Id, String)>,
+}
+
+/// What one record holds and claims.
+#[derive(Default)]
+struct Parts {
+    items: Vec<Item>,
+    claims: WitnessAnnotations,
+    /// Why its last item's sampling stopped (`Place::Last`).
+    ends: Vec<Id>,
+    /// Its items' rendering is unrecorded (`Place::Every`).
+    unrecorded: bool,
+}
+
+fn ends_term(name: &str) -> Option<Id> {
+    v3::node::ends::SPECS
+        .iter()
+        .find(|(_, n, _)| *n == name)
+        .map(|(id, _, _)| *id)
+}
+
+/// One annotation value of a record, by its attribute and place.
+fn annotate(
+    parts: &mut Parts,
+    point_items: std::ops::Range<usize>,
+    path: &str,
+    attribute: &str,
+    decode: Decode,
+    place: Place,
+    unit: &Unit,
+    v: Id,
+) -> Result<(), String> {
+    let not_built = || {
+        Err(format!(
+            "not built yet: {attribute} at {path} placed {place:?}"
+        ))
+    };
+    let text = || {
+        decode_text(decode, unit, v).ok_or_else(|| format!("{path}: {attribute} does not decode"))
+    };
+    if let Some(category) = attribute.strip_prefix("gloss:") {
+        if place != Place::Here {
+            return not_built();
+        }
+        let category = term(v3::gloss::category::SPECS, category).ok_or("a gloss category")?;
+        let Some(text) = text()? else { return Ok(()) };
+        // The item at the value's own place whose modality is the place's
+        // only one.
+        let at = point_items.clone();
+        if at.len() != 1 {
+            return not_built();
+        }
+        parts.items[at.start].glosses.push((category, text));
+        return Ok(());
+    }
+    match (attribute, place) {
+        ("ends", Place::Last) => {
+            let name = match decode {
+                Decode::ConstTerm(name) => name.to_owned(),
+                Decode::Term(map) => {
+                    let spelled = spelling(unit, v).ok_or("an end has no spelling")?;
+                    map.iter()
+                        .find(|(from, _)| *from == spelled)
+                        .ok_or_else(|| format!("{path}: an end the table does not name"))?
+                        .1
+                        .to_owned()
+                }
+                _ => return not_built(),
+            };
+            parts.ends.push(ends_term(&name).ok_or("an ends term")?);
+        }
+        ("rendering", Place::Every) => parts.unrecorded = true,
+        (_, Place::Claim) => {
+            let claims = &mut parts.claims;
+            match (attribute, decode) {
+                ("timestamp", Decode::Timestamp) => {
+                    // A time is read as the string it is, not by a text
+                    // decode, which takes only text-shaped decodes.
+                    if let Some(at) = text_of(unit, v).filter(|t| !t.is_empty()) {
+                        claims.timestamp.push(
+                            crate::archive_v3::claude_code::time(&at)
+                                .ok_or_else(|| format!("{path}: a time does not parse"))?,
+                        );
+                    }
+                }
+                ("generated_by", Decode::VendorModel) => {
+                    if let Some(label) = text_of(unit, v).filter(|l| !l.is_empty()) {
+                        claims
+                            .generated_by
+                            .push(Model::vendor(&label).map_err(|e| format!("{path}: {e}"))?);
+                    }
+                }
+                ("harness_written" | "compaction_summary", Decode::Bool) => {
+                    let set = spelling(unit, v).as_deref() == Some("true");
+                    if attribute == "harness_written" {
+                        claims.harness_written |= set;
+                    } else {
+                        claims.compaction_summary |= set;
+                    }
+                }
+                ("raw_role" | "raw_model" | "source_locator" | "claimed_title", _) => {
+                    let value = text()?;
+                    let field = match attribute {
+                        "raw_role" => &mut claims.raw_role,
+                        "raw_model" => &mut claims.raw_model,
+                        "source_locator" => &mut claims.source_locator,
+                        _ => &mut claims.claimed_title,
+                    };
+                    if value.is_some() {
+                        *field = value;
+                    }
+                }
+                ("raw_author", _) => claims.raw_author.extend(text()?),
+                ("pointer", _) => claims.pointer.extend(text()?),
+                _ => return not_built(),
+            }
+        }
+        _ => return not_built(),
+    }
+    Ok(())
+}
+
+/// A record's items in record order (the facts of the record outside every
+/// array first, then each array element's by array path and index; within
+/// one assembly point, in the order they were assembled), and its claims.
+fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, String> {
     let mut found = vec![(Levels::new(), record, cat.clone())];
     points(t, unit, record, cat, &mut Levels::new(), &mut found);
     found.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = Vec::new();
     let result = t.table.windows.requests.map(|requests| requests.result);
+    let mut parts = Parts::default();
     for (_, value, at) in found {
         let mut cores = t
             .assemble(unit, value, &at)
@@ -132,12 +265,69 @@ fn items(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Vec<Id>, Strin
                 cores.insert(0, core);
             }
         }
+        let first = parts.items.len();
         for core in cores {
+            let modality = core.modality;
             let built = fact(core).map_err(|e| format!("{}: {e}", at.path))?;
-            out.push(built.root().ok_or("a fact is rooted")?);
+            parts.items.push(Item {
+                fact: built.root().ok_or("a fact is rooted")?,
+                modality,
+                calls: Vec::new(),
+                answers: None,
+                glosses: Vec::new(),
+            });
+        }
+        let mine = first..parts.items.len();
+        let mut consumed = Vec::new();
+        t.consumed(unit, value, &at, &mut consumed);
+        for (entry, v, _) in consumed {
+            match entry.class {
+                Class::Annotation(list) => {
+                    for (attribute, decode) in list {
+                        let place = t.table.place(entry.path, attribute);
+                        annotate(
+                            &mut parts,
+                            mine.clone(),
+                            entry.path,
+                            attribute,
+                            *decode,
+                            place,
+                            unit,
+                            v,
+                        )?;
+                    }
+                }
+                Class::Correlator => {
+                    let Some(id) = spelling(unit, v) else {
+                        continue;
+                    };
+                    for link in t.table.links {
+                        let modality = |name| term(v3::fact::modality::SPECS, name);
+                        if link.from == entry.path {
+                            let wanted = modality(link.from_modality);
+                            if let Some(item) = parts.items[mine.clone()]
+                                .iter_mut()
+                                .find(|i| i.modality == wanted)
+                            {
+                                item.answers = Some(id.clone());
+                            }
+                        }
+                        if link.to.contains(&entry.path) {
+                            let wanted = modality(link.to_modality);
+                            if let Some(item) = parts.items[mine.clone()]
+                                .iter_mut()
+                                .find(|i| i.modality == wanted)
+                            {
+                                item.calls.push(id.clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
-    Ok(out)
+    Ok(parts)
 }
 
 /// One node: `holds` the fact, after `previous`.
@@ -212,6 +402,13 @@ pub fn build(
     };
     let mut lines: HashMap<String, Option<Id>> = HashMap::new();
     let mut first: HashMap<String, Id> = HashMap::new();
+    // For links: each item node's predecessor and the call ids it holds,
+    // and the results waiting for their call.
+    let mut previous_of: HashMap<Id, Option<Id>> = HashMap::new();
+    let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
+    let mut answers: Vec<(Id, String)> = Vec::new();
+    let mut marks: std::collections::BTreeMap<Id, NodeAnnotations> = Default::default();
+    let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
     for (_, record) in records {
         let shape = field_at(&unit, record, "type")
             .and_then(|v| text_of(&unit, v))
@@ -232,8 +429,18 @@ pub fn build(
                 return Err(format!("not built yet: a compaction ({{{shape}}})"));
             }
         }
+        let parts = record_parts(&t, &unit, record, &record_cat)?;
+        let claims = &parts.claims;
+        let claims_something = !claims.timestamp.is_empty()
+            || claims.raw_role.is_some()
+            || claims.raw_model.is_some()
+            || claims.source_locator.is_some()
+            || !claims.generated_by.is_empty()
+            || !claims.raw_author.is_empty()
+            || claims.harness_written
+            || claims.compaction_summary;
         let Some(own) = read(record, id) else {
-            if !items(&t, &unit, record, &record_cat)?.is_empty() {
+            if !parts.items.is_empty() || claims_something {
                 return Err(format!(
                     "not built yet: a {{{shape}}} record without {id} that holds items"
                 ));
@@ -276,10 +483,96 @@ pub fn build(
                 },
             },
         };
-        for item in items(&t, &unit, record, &record_cat)? {
-            tail = Some(extend(&mut out, tail, item)?);
+        if parts.items.is_empty() && claims_something {
+            return Err(format!(
+                "{{{shape}}}: a record that holds nothing makes claims"
+            ));
+        }
+        // The nodes the record holds, each once, in record order.
+        let mut held: Vec<Id> = Vec::new();
+        for item in &parts.items {
+            let at = extend(&mut out, tail, item.fact)?;
+            previous_of.entry(at).or_insert(tail);
+            tail = Some(at);
+            calls_at
+                .entry(at)
+                .or_default()
+                .extend(item.calls.iter().cloned());
+            if let Some(call) = &item.answers {
+                answers.push((at, call.clone()));
+            }
+            for (category, text) in &item.glosses {
+                out += unexported(gloss(at, *category, text).map_err(|e| format!("a gloss: {e}"))?);
+            }
+            if parts.unrecorded {
+                let mark = marks.entry(at).or_default();
+                if mark.rendering.is_empty() {
+                    mark.rendering.push(v3::node::rendering::UNRECORDED);
+                }
+            }
+            if !held.contains(&at) {
+                held.push(at);
+            }
+        }
+        // Why the record's last sampling stopped is a claim of its
+        // occurrence on the last item's node (M1).
+        let last = held.last().copied();
+        for node in held {
+            let ends = if Some(node) == last {
+                parts.ends.clone()
+            } else {
+                Vec::new()
+            };
+            occurrences.push((
+                node,
+                WitnessAnnotations {
+                    ends,
+                    ..parts.claims.clone()
+                },
+            ));
         }
         lines.insert(own, tail);
+    }
+    // Each result answers the nearest node on its own line holding the call
+    // it names (C1).
+    for (node, call) in answers {
+        let mut cursor = previous_of.get(&node).copied().flatten();
+        let target = loop {
+            match cursor {
+                None => {
+                    return Err(format!(
+                        "a result whose call {} is not in its window",
+                        "named"
+                    ))
+                }
+                Some(at) if calls_at.get(&at).is_some_and(|c| c.contains(&call)) => break at,
+                Some(at) => cursor = previous_of.get(&at).copied().flatten(),
+            }
+        };
+        let mark = marks.entry(node).or_default();
+        if !mark.responds_to.contains(&target) {
+            mark.responds_to.push(target);
+        }
+    }
+    for (node, annotations) in &marks {
+        out += annotate_node(*node, annotations);
+    }
+    // Witnesses: one per node a record holds, and one occurrence of it per
+    // record. Two records whose own claims are the same converge on one
+    // occurrence; if they ended differently, the unit fails (M2, P1).
+    if ends_disagree(&occurrences) {
+        return Err("two records with the same claims end differently".to_owned());
+    }
+    let namespace = v3::witness::NAMESPACES
+        .iter()
+        .find(|(_, name)| *name == table.namespace)
+        .map(|(id, _)| *id)
+        .ok_or("the table's namespace is no witness namespace")?;
+    for (node, claims) in occurrences {
+        let built = witness(namespace, node).map_err(|e| format!("a witness: {e}"))?;
+        let at = built.root().ok_or("a witness is rooted")?;
+        out += unexported(built);
+        out += unexported(occurrence(at, claims).map_err(|e| format!("an occurrence: {e}"))?);
     }
     Ok(out)
 }
