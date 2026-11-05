@@ -105,6 +105,8 @@ fn points(
 struct Item {
     fact: Id,
     modality: Option<Id>,
+    /// It carries a request's settings (`effort`): the window's header.
+    effort: bool,
     /// The call ids it is a call of, and the call id a result names.
     calls: Vec<String>,
     answers: Option<String>,
@@ -268,10 +270,12 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
         let first = parts.items.len();
         for core in cores {
             let modality = core.modality;
+            let effort = core.effort.is_some();
             let built = fact(core).map_err(|e| format!("{}: {e}", at.path))?;
             parts.items.push(Item {
                 fact: built.root().ok_or("a fact is rooted")?,
                 modality,
+                effort,
                 calls: Vec::new(),
                 answers: None,
                 glosses: Vec::new(),
@@ -323,6 +327,14 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                         }
                     }
                 }
+                Class::Rewrite(_) | Class::Supply(_) => {
+                    return Err(
+                        format!("not built yet: a {:?} at {}", entry.class, entry.path)
+                            .chars()
+                            .take(160)
+                            .collect(),
+                    )
+                }
                 _ => {}
             }
         }
@@ -330,13 +342,137 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
     Ok(parts)
 }
 
-/// One node: `holds` the fact, after `previous`.
-fn extend(out: &mut Fragment, previous: Option<Id>, fact_id: Id) -> Result<Id, String> {
-    let holds = Fragment::rooted(fact_id, TribleSet::new());
-    let built = node(previous, holds).map_err(|e| format!("a node does not build: {e}"))?;
-    let id = built.root().ok_or("a node is rooted")?;
-    *out += unexported(built);
-    Ok(id)
+/// The end of a line, and the settings header that opens it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Tail {
+    node: Option<Id>,
+    header: Id,
+}
+
+/// What a node is: after what, holding which fact, whether it belongs to
+/// the section a window opens with (a header or a system section), and the
+/// node it re-presents, if any.
+#[derive(Clone, Copy)]
+struct Position {
+    previous: Option<Id>,
+    fact: Id,
+    section: bool,
+    original: Id,
+}
+
+/// The lines being built: every node with its place, the windows' roots per
+/// header, and the node annotations.
+struct Lines<'t> {
+    table: &'t FieldTable,
+    out: Fragment,
+    places: HashMap<Id, Position>,
+    roots: HashMap<Id, Option<Id>>,
+    orphans: HashMap<Id, Option<Id>>,
+    marks: std::collections::BTreeMap<Id, NodeAnnotations>,
+}
+
+impl Lines<'_> {
+    fn fact(&mut self, built: Fragment) -> Result<Id, String> {
+        let at = built.root().ok_or("a fact is rooted")?;
+        self.out += unexported(built);
+        Ok(at)
+    }
+
+    /// One node: `holds` the fact, after `previous`.
+    fn place(
+        &mut self,
+        previous: Option<Id>,
+        fact_id: Id,
+        section: bool,
+        original: Option<Id>,
+    ) -> Result<Id, String> {
+        let holds = Fragment::rooted(fact_id, TribleSet::new());
+        let built = node(previous, holds).map_err(|e| format!("a node does not build: {e}"))?;
+        let id = built.root().ok_or("a node is rooted")?;
+        self.out += unexported(built);
+        self.places.entry(id).or_insert(Position {
+            previous,
+            fact: fact_id,
+            section,
+            original: original.unwrap_or(id),
+        });
+        Ok(id)
+    }
+
+    /// A new root under `header`: the header, then the system section
+    /// recorded so far (the unrecorded one: its gaps).
+    fn root(&mut self, header: Id) -> Result<Option<Id>, String> {
+        if let Some(&tail) = self.roots.get(&header) {
+            return Ok(tail);
+        }
+        let mut tail = Some(self.place(None, header, true, None)?);
+        for g in self
+            .table
+            .gaps
+            .prefix
+            .iter()
+            .chain(self.table.gaps.after_prefix)
+        {
+            let at = self.fact(gap(g)?)?;
+            tail = Some(self.place(tail, at, true, None)?);
+        }
+        self.roots.insert(header, tail);
+        Ok(tail)
+    }
+
+    /// A new root under `header` after which a span of unknown items stands:
+    /// what a record outside the unit held.
+    fn orphan(&mut self, header: Id) -> Result<Option<Id>, String> {
+        if let Some(&tail) = self.orphans.get(&header) {
+            return Ok(tail);
+        }
+        let mut tail = self.root(header)?;
+        if let Some(g) = &self.table.gaps.orphan {
+            let at = self.fact(gap(g)?)?;
+            tail = Some(self.place(tail, at, false, None)?);
+        }
+        self.orphans.insert(header, tail);
+        Ok(tail)
+    }
+
+    /// The same line under another header: its items re-presented after
+    /// the new one, each recalling the node it copies.
+    fn rebuild(&mut self, tail: Tail, header: Id) -> Result<Tail, String> {
+        if tail.header == header {
+            return Ok(tail);
+        }
+        let mut sequence = Vec::new();
+        let mut cursor = tail.node;
+        while let Some(at) = cursor {
+            let place = self.places[&at];
+            if !place.section {
+                sequence.push(place);
+            }
+            cursor = place.previous;
+        }
+        sequence.reverse();
+        let mut node = self.root(header)?;
+        for item in sequence {
+            let at = self.place(node, item.fact, false, Some(item.original))?;
+            if at != item.original {
+                // A copy recalls what it re-presents, and keeps its rendering.
+                let rendering = self
+                    .marks
+                    .get(&item.original)
+                    .map(|m| m.rendering.clone())
+                    .unwrap_or_default();
+                let mark = self.marks.entry(at).or_default();
+                if !mark.recalls.contains(&item.original) {
+                    mark.recalls.push(item.original);
+                }
+                if mark.rendering.is_empty() {
+                    mark.rendering = rendering;
+                }
+            }
+            node = Some(at);
+        }
+        Ok(Tail { node, header })
+    }
 }
 
 /// The nodes, witnesses and occurrences of a unit whose facts `image`
@@ -374,40 +510,26 @@ pub fn build(
     };
     let all_ids: HashSet<String> = records.iter().filter_map(|(_, r)| read(*r, id)).collect();
 
-    let mut out = Fragment::empty();
-    // The unrecorded section (the settings header, then the system section)
-    // and the orphan span behind it, built only when a record starts there,
-    // as the importer builds them.
-    let mut root_tail: Option<Option<Id>> = None;
-    let mut orphan_tail: Option<Option<Id>> = None;
-    let mut root = |out: &mut Fragment| -> Result<Option<Id>, String> {
-        if let Some(tail) = root_tail {
-            return Ok(tail);
-        }
-        let mut tail = None;
-        for g in table
-            .gaps
-            .header
-            .iter()
-            .chain(table.gaps.prefix)
-            .chain(table.gaps.after_prefix)
-        {
-            let built = gap(g)?;
-            let at = built.root().ok_or("a gap is rooted")?;
-            *out += unexported(built);
-            tail = Some(extend(out, tail, at)?);
-        }
-        root_tail = Some(tail);
-        Ok(tail)
+    let mut lines = Lines {
+        table,
+        out: Fragment::empty(),
+        places: HashMap::new(),
+        roots: HashMap::new(),
+        orphans: HashMap::new(),
+        marks: Default::default(),
     };
-    let mut lines: HashMap<String, Option<Id>> = HashMap::new();
+    // The settings header of a window whose request records none.
+    let header_gap = match &table.gaps.header {
+        Some(g) => lines.fact(gap(g)?)?,
+        None => return Err("not built yet: a table with no header gap".to_owned()),
+    };
+    let requests = table.windows.requests;
+    let mut tails: HashMap<String, Tail> = HashMap::new();
     let mut first: HashMap<String, Id> = HashMap::new();
-    // For links: each item node's predecessor and the call ids it holds,
-    // and the results waiting for their call.
-    let mut previous_of: HashMap<Id, Option<Id>> = HashMap::new();
+    // For links: the call ids each node holds, and the results waiting for
+    // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
     let mut answers: Vec<(Id, String)> = Vec::new();
-    let mut marks: std::collections::BTreeMap<Id, NodeAnnotations> = Default::default();
     let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
     for (_, record) in records {
         let shape = field_at(&unit, record, "type")
@@ -416,17 +538,18 @@ pub fn build(
         if table.windows.prefix.contains(&shape.as_str()) {
             return Err(format!("not built yet: a system section ({{{shape}}})"));
         }
-        if let Some(header) = table.windows.header {
-            if header.starts_with(&format!("{{{shape}}}.")) {
-                let field = &header[shape.len() + 3..];
-                if field_at(&unit, record, field).is_some() {
-                    return Err(format!("not built yet: a settings header ({header})"));
-                }
-            }
-        }
         if let Some(compaction) = table.windows.compaction {
             if compaction.shape == shape && field_at(&unit, record, compaction.parent).is_some() {
                 return Err(format!("not built yet: a compaction ({{{shape}}})"));
+            }
+        }
+        let request = requests.filter(|r| r.shape == shape);
+        if let Some(r) = request {
+            // A request's own window edits are not built yet.
+            for field in [r.dropped.0, r.cleared.0] {
+                if field_at(&unit, record, field).is_some_and(|v| !super::is_empty(&unit, v)) {
+                    return Err(format!("not built yet: a request's window edits ({field})"));
+                }
             }
         }
         let parts = record_parts(&t, &unit, record, &record_cat)?;
@@ -458,42 +581,53 @@ pub fn build(
                 first.insert(own.clone(), record);
             }
         }
+        if parts.items.is_empty() && claims_something {
+            return Err(format!(
+                "{{{shape}}}: a record that holds nothing makes claims"
+            ));
+        }
+        // A request's settings head its window and are none of its items;
+        // a request that records none opens on the header gap.
+        let mut header = None;
+        let mut items = Vec::new();
+        for item in &parts.items {
+            if item.effort {
+                if request.is_none() || header.is_some() {
+                    return Err(format!(
+                        "{{{shape}}}: settings outside one request's header"
+                    ));
+                }
+                header = Some(item.fact);
+            } else {
+                items.push(item);
+            }
+        }
         let mut tail = match read(record, parent) {
-            None => root(&mut out)?,
-            Some(p) => match lines.get(&p) {
+            None => Tail {
+                node: lines.root(header_gap)?,
+                header: header_gap,
+            },
+            Some(p) => match tails.get(&p) {
                 Some(&tail) => tail,
                 None if all_ids.contains(&p) => {
                     return Err(format!(
                         "{{{shape}}}.{parent}: a record's parent is not built before it"
                     ))
                 }
-                None => match orphan_tail {
-                    Some(tail) => tail,
-                    None => {
-                        let mut tail = root(&mut out)?;
-                        if let Some(g) = &table.gaps.orphan {
-                            let built = gap(g)?;
-                            let at = built.root().ok_or("a gap is rooted")?;
-                            out += unexported(built);
-                            tail = Some(extend(&mut out, tail, at)?);
-                        }
-                        orphan_tail = Some(tail);
-                        tail
-                    }
+                None => Tail {
+                    node: lines.orphan(header_gap)?,
+                    header: header_gap,
                 },
             },
         };
-        if parts.items.is_empty() && claims_something {
-            return Err(format!(
-                "{{{shape}}}: a record that holds nothing makes claims"
-            ));
+        if request.is_some() {
+            tail = lines.rebuild(tail, header.unwrap_or(header_gap))?;
         }
         // The nodes the record holds, each once, in record order.
         let mut held: Vec<Id> = Vec::new();
-        for item in &parts.items {
-            let at = extend(&mut out, tail, item.fact)?;
-            previous_of.entry(at).or_insert(tail);
-            tail = Some(at);
+        for item in items {
+            let at = lines.place(tail.node, item.fact, false, None)?;
+            tail.node = Some(at);
             calls_at
                 .entry(at)
                 .or_default()
@@ -502,10 +636,11 @@ pub fn build(
                 answers.push((at, call.clone()));
             }
             for (category, text) in &item.glosses {
-                out += unexported(gloss(at, *category, text).map_err(|e| format!("a gloss: {e}"))?);
+                lines.out +=
+                    unexported(gloss(at, *category, text).map_err(|e| format!("a gloss: {e}"))?);
             }
             if parts.unrecorded {
-                let mark = marks.entry(at).or_default();
+                let mark = lines.marks.entry(at).or_default();
                 if mark.rendering.is_empty() {
                     mark.rendering.push(v3::node::rendering::UNRECORDED);
                 }
@@ -531,29 +666,30 @@ pub fn build(
                 },
             ));
         }
-        lines.insert(own, tail);
+        tails.insert(own, tail);
     }
     // Each result answers the nearest node on its own line holding the call
-    // it names (C1).
+    // it names (C1). A copy holds what its original held.
     for (node, call) in answers {
-        let mut cursor = previous_of.get(&node).copied().flatten();
+        let mut cursor = lines.places.get(&node).and_then(|p| p.previous);
         let target = loop {
             match cursor {
-                None => {
-                    return Err(format!(
-                        "a result whose call {} is not in its window",
-                        "named"
-                    ))
+                None => return Err("a result whose call is not in its window".to_owned()),
+                Some(at) => {
+                    let original = lines.places[&at].original;
+                    if calls_at.get(&original).is_some_and(|c| c.contains(&call)) {
+                        break at;
+                    }
+                    cursor = lines.places[&at].previous;
                 }
-                Some(at) if calls_at.get(&at).is_some_and(|c| c.contains(&call)) => break at,
-                Some(at) => cursor = previous_of.get(&at).copied().flatten(),
             }
         };
-        let mark = marks.entry(node).or_default();
+        let mark = lines.marks.entry(node).or_default();
         if !mark.responds_to.contains(&target) {
             mark.responds_to.push(target);
         }
     }
+    let Lines { mut out, marks, .. } = lines;
     for (node, annotations) in &marks {
         out += annotate_node(*node, annotations);
     }

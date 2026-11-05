@@ -270,13 +270,29 @@ fn occurrence_ids(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
 /// Annotations outside the identity cores, as (entity, value) pairs: the
 /// occurrences' ends and turn ends, the nodes' renderings, and the glosses
 /// (whose ids include the node they describe).
-fn annotations_of(fragment: &Fragment) -> std::collections::BTreeSet<(Id, Id)> {
+fn annotations_of(fragment: &Fragment) -> std::collections::BTreeSet<(&'static str, Id, Id)> {
     let facts = fragment.facts();
-    let mut out: std::collections::BTreeSet<(Id, Id)> =
-        find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::ends: ?e }])).collect();
-    out.extend(find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::turn_ends: ?e }])));
-    out.extend(find!((n: Id, r: Id), pattern!(facts, [{ ?n @ v3::node::rendering: ?r }])));
-    out.extend(find!((g: Id, n: Id), pattern!(facts, [{ ?g @ v3::gloss::describes: ?n }])));
+    let mut out = std::collections::BTreeSet::new();
+    out.extend(
+        find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::ends: ?e }]))
+            .map(|(a, b)| ("ends", a, b)),
+    );
+    out.extend(
+        find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::turn_ends: ?e }]))
+            .map(|(a, b)| ("turn_ends", a, b)),
+    );
+    out.extend(
+        find!((n: Id, r: Id), pattern!(facts, [{ ?n @ v3::node::rendering: ?r }]))
+            .map(|(a, b)| ("rendering", a, b)),
+    );
+    out.extend(
+        find!((g: Id, n: Id), pattern!(facts, [{ ?g @ v3::gloss::describes: ?n }]))
+            .map(|(a, b)| ("gloss", a, b)),
+    );
+    out.extend(
+        find!((n: Id, o: Id), pattern!(facts, [{ ?n @ v3::node::recalls: ?o }]))
+            .map(|(a, b)| ("recalls", a, b)),
+    );
     out
 }
 
@@ -310,6 +326,7 @@ fn real_sample_relations() {
     let mut unstable = 0;
     // Occurrences and links, each as (shared, ours only, importer only).
     let (mut occurrences, mut links, mut annotations) = ((0, 0, 0), (0, 0, 0), (0, 0, 0));
+    let mut by_kind: std::collections::BTreeMap<(&str, &str), usize> = Default::default();
     // Our extra nodes: what each holds, after what its parent holds.
     let mut extra: std::collections::BTreeMap<(String, String), usize> = Default::default();
     for file in &files {
@@ -362,6 +379,12 @@ fn real_sample_relations() {
                 annotations.0 += a.intersection(&b).count();
                 annotations.1 += a.difference(&b).count();
                 annotations.2 += b.difference(&a).count();
+                for (kind, _, _) in a.difference(&b) {
+                    *by_kind.entry(("ours", *kind)).or_default() += 1;
+                }
+                for (kind, _, _) in b.difference(&a) {
+                    *by_kind.entry(("importer", *kind)).or_default() += 1;
+                }
                 let (a, b) = (links_of(&fragment), links_of(&imported));
                 links.0 += a.intersection(&b).count();
                 links.1 += a.difference(&b).count();
@@ -392,9 +415,13 @@ fn real_sample_relations() {
         occurrences.0, occurrences.1, occurrences.2, links.0, links.1, links.2
     );
     println!(
-        "annotations (ends, turn ends, renderings, glosses): shared {}, ours only {}, importer only {}",
+        "annotations (ends, turn ends, renderings, glosses, recalls): shared {}, ours only {}, importer only {}",
         annotations.0, annotations.1, annotations.2
     );
+    println!("-- annotations on one side only: count, side, kind");
+    for ((side, kind), n) in &by_kind {
+        println!("{n}\t{side}\t{kind}");
+    }
     println!("-- first divergence: files, importer's next item, ours");
     for ((theirs, ours), n) in &divergences {
         println!("{n}\t{theirs}\t{ours}");
@@ -500,4 +527,67 @@ fn held_modality(fragment: &Fragment, node: Id) -> Id {
     )
     .next()
     .expect("the node holds a fact")
+}
+
+#[test]
+fn a_request_s_effort_heads_its_window_and_the_history_is_re_presented() {
+    let mut reply = assistant("a1", "u1", 1, "Hello.");
+    reply["effort"] = json!("high");
+    let source = jsonl(&[user("u1", None, 0, "Hi."), reply]);
+    let built = built(&source).expect("builds");
+    let facts = built.facts();
+    let hello = node_saying_in(&built, "Hello.", 1);
+    // The same shape as the unrecorded section, but headed by the effort.
+    assert_eq!(window_before(&built, hello), section_then(&[(TEXT, None)]));
+    let mut chain = Vec::new();
+    let mut cursor = Some(hello);
+    while let Some(at) = cursor {
+        chain.push(at);
+        cursor = find!(p: Id, pattern!(facts, [{ at @ v3::node::previous: ?p }])).next();
+    }
+    let root = *chain.last().unwrap();
+    let effort: Vec<Id> = find!(
+        e: Id,
+        pattern!(facts, [{ root @ v3::node::holds: _?f }, { _?f @ v3::fact::effort: ?e }])
+    )
+    .collect();
+    assert_eq!(
+        effort,
+        vec![v3::fact::effort::HIGH],
+        "the request's effort heads it"
+    );
+    // Her prompt stands twice: under the header gap where her record holds
+    // it, and re-presented under the effort, recalling the original.
+    let prompts = nodes_saying(&built, "Hi.");
+    assert_eq!(prompts.len(), 2, "the original and its copy");
+    let copy = chain[1];
+    assert!(prompts.contains(&copy));
+    let recalled: Vec<Id> =
+        find!(r: Id, pattern!(facts, [{ copy @ v3::node::recalls: ?r }])).collect();
+    assert_eq!(recalled.len(), 1);
+    assert!(prompts.contains(&recalled[0]) && recalled[0] != copy);
+}
+
+/// Every node holding the text fact `text`.
+fn nodes_saying(fragment: &Fragment, text: &str) -> Vec<Id> {
+    let handle = {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        blob.get_handle()
+    };
+    let facts = fragment.facts();
+    find!(
+        node: Id,
+        pattern!(facts, [
+            { ?node @ v3::node::holds: _?fact },
+            { _?fact @ v3::fact::payload: handle },
+        ])
+    )
+    .collect()
+}
+
+/// The one node holding `text`, asserting there are `count` in all.
+fn node_saying_in(fragment: &Fragment, text: &str, count: usize) -> Id {
+    let found = nodes_saying(fragment, text);
+    assert_eq!(found.len(), count, "{count} node(s) hold {text:?}");
+    found[0]
 }
