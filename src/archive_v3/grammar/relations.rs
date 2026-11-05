@@ -134,6 +134,9 @@ struct Parts {
     /// What the client sent in later requests in place of members of its
     /// calls (`Class::Rewrite`), with the object that holds it.
     rewrites: Vec<(Rewrite, &'static str, Id)>,
+    /// Glosses on the end of the line of the record's parent
+    /// (`Place::ParentTail`): (category, text, path).
+    parent_tail: Vec<(Id, String, &'static str)>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -167,6 +170,10 @@ fn annotate(
         let Some(text) = text()? else { return Ok(()) };
         if place == Place::FileTail {
             parts.file_tail.push((category, text, path));
+            return Ok(());
+        }
+        if place == Place::ParentTail {
+            parts.parent_tail.push((category, text, path));
             return Ok(());
         }
         if place != Place::Here {
@@ -852,6 +859,16 @@ pub fn build(
                 }),
             },
         };
+        // A gloss on the parent's tail describes the end of the parent's own
+        // line: never a root or an orphan span standing in for one.
+        for (category, text, path) in &parts.parent_tail {
+            let node = read(record, parent)
+                .and_then(|p| tails.get(&p))
+                .and_then(|line| line.edited.node)
+                .ok_or_else(|| format!("{path}: a gloss with no node to describe"))?;
+            lines.out +=
+                unexported(gloss(node, *category, text).map_err(|e| format!("a gloss: {e}"))?);
+        }
         let (mut edited, mut unedited) = (from.edited, from.unedited);
         if let Some(r) = request {
             // One request spans the records that share its id. Its window is

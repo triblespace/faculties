@@ -762,3 +762,55 @@ fn a_call_the_client_rewrote_stands_rewritten_in_later_requests_only() {
 fn built_facts(source: &str) -> TribleSet {
     built(source).expect("builds").facts().clone()
 }
+
+fn recap(uuid: &str, parent: &str, second: u32, text: &str) -> Value {
+    json!({"type": "system", "subtype": "away_summary", "uuid": uuid, "parentUuid": parent,
+        "timestamp": stamp(second), "sessionId": "s-1", "content": text})
+}
+
+/// The nodes a gloss of `category` with this text describes.
+fn glossed(fragment: &Fragment, category: Id, text: &str) -> Vec<Id> {
+    let handle = {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        blob.get_handle()
+    };
+    let facts = fragment.facts();
+    find!(
+        node: Id,
+        pattern!(facts, [{ _?g @
+            v3::gloss::describes: ?node,
+            v3::gloss::category: category,
+            v3::gloss::text: handle,
+        }])
+    )
+    .collect()
+}
+
+#[test]
+fn a_recap_describes_its_parent_s_line_and_passes_the_line_on() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        recap("s1", "a1", 2, "We said hello."),
+        user("u2", Some("s1"), 3, "Again."),
+    ]);
+    let fragment = built(&source).expect("builds");
+    let hello = node_saying(&fragment, "Hello.");
+    assert_eq!(
+        glossed(&fragment, v3::gloss::category::RECAP, "We said hello."),
+        vec![hello]
+    );
+    // The summary holds no node: its child continues after the reply.
+    let again = node_saying(&fragment, "Again.");
+    let facts = fragment.facts();
+    let before: Vec<Id> =
+        find!(p: Id, pattern!(facts, [{ again @ v3::node::previous: ?p }])).collect();
+    assert_eq!(before, vec![hello]);
+
+    let orphan = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        recap("s1", "gone", 2, "We said hello."),
+    ]);
+    let refused = built(&orphan).expect_err("refused");
+    assert!(refused.contains("no node to describe"), "{refused}");
+}
