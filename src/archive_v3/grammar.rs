@@ -14,6 +14,7 @@
 //! a unit this accepts may still fail the importer for one of those.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use triblespace::core::import::json_tree;
@@ -22,8 +23,10 @@ use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 use triblespace_cxg::{Category, Constituent, Construction, Grammar, PathStep, Role, Step, Unit};
 
-use super::fields::{Class, Cond, Decode, DropReason, Entry, FieldTable, Structure};
+use super::fields::{Beside, Class, Cond, Decode, DropReason, Entry, FieldTable, Structure};
 use super::gate::id_like;
+use super::{fact, unexported, FactCore};
+use crate::schemas::archive_v3 as v3;
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -390,6 +393,97 @@ impl Table {
         self.candidates(&cat.path, unit, v, cat)
     }
 
+    /// The chosen entry of every value under `v` that one entry consumes,
+    /// with the value: the walk of one assembly point, which never enters
+    /// an array (each element is an assembly point of its own).
+    fn consumed(&self, unit: &Unit, v: Id, cat: &Cat, out: &mut Vec<(&'static Entry, Id, Cat)>) {
+        let chosen = self.chosen(unit, v, cat);
+        if chosen.len() == 1 {
+            out.push((chosen[0], v, cat.clone()));
+            return;
+        }
+        if kind(unit, v) != Some(json_tree::kind_object) {
+            return;
+        }
+        let facts = unit.facts;
+        let members: Vec<(Name, Id)> = find!(
+            (name: Name, value: Id),
+            pattern!(facts, [
+                { v @ json_tree::object_field: _?field },
+                { _?field @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+            ])
+        )
+        .collect();
+        for (name, value) in members {
+            let child = self.child(unit, v, cat, &PathStep::Field(name));
+            if kind(unit, value) != Some(json_tree::kind_array) {
+                self.consumed(unit, value, &child, out);
+            }
+        }
+    }
+
+    /// The facts of one assembly point: its `Fact` entries grouped by
+    /// modality and direction. `None` when a field needs a decode not built.
+    fn assemble(&self, unit: &Unit, v: Id, cat: &Cat) -> Option<Vec<FactCore>> {
+        let mut consumed = Vec::new();
+        self.consumed(unit, v, cat, &mut consumed);
+        let mut cores: Vec<((&'static str, &'static str), FactCore)> = Vec::new();
+        // The fact of one modality and direction at this assembly point.
+        fn at<'c>(
+            cores: &'c mut Vec<((&'static str, &'static str), FactCore)>,
+            modality: &'static str,
+            direction: &'static str,
+        ) -> Option<&'c mut FactCore> {
+            let at = match cores
+                .iter()
+                .position(|(key, _)| *key == (modality, direction))
+            {
+                Some(at) => at,
+                None => {
+                    let core = FactCore {
+                        modality: Some(term(v3::fact::modality::SPECS, modality)?),
+                        direction: Some(term(v3::fact::direction::SPECS, direction)?),
+                        ..FactCore::default()
+                    };
+                    cores.push(((modality, direction), core));
+                    cores.len() - 1
+                }
+            };
+            Some(&mut cores[at].1)
+        }
+        for (entry, value, cat) in consumed {
+            // A gap the rendering rule puts on the value's own fact: its body
+            // is not in the source.
+            for rule in self.table.gaps.beside {
+                if rule.at == Beside::Same
+                    && rule.path == entry.path
+                    && holds(rule.when, unit, self.record_of(&cat, value), cat.parent)
+                {
+                    let core = at(&mut cores, rule.gap.modality, rule.gap.direction)?;
+                    if !rule.gap.kind.is_empty() {
+                        core.absent = Some(term(v3::fact::absent::SPECS, rule.gap.kind)?);
+                    }
+                }
+            }
+            let Class::Fact {
+                modality,
+                direction,
+                attribute,
+                decode,
+                with,
+            } = entry.class
+            else {
+                continue;
+            };
+            let core = at(&mut cores, modality, direction)?;
+            apply(core, attribute, decode, unit, value)?;
+            for (attribute, decode) in with {
+                apply(core, attribute, *decode, unit, value)?;
+            }
+        }
+        Some(cores.into_iter().map(|(_, core)| core).collect())
+    }
+
     /// The category of a member of the value at `cat`, by its step.
     fn child(&self, unit: &Unit, v: Id, cat: &Cat, step: &PathStep) -> Cat {
         let inner = match self.shape(unit, v, &cat.path) {
@@ -416,6 +510,75 @@ impl Table {
             parent: Some(v),
         }
     }
+}
+
+/// Assembly points the emits skipped because one of their fields needs a
+/// decode not built yet (bytes, media types, JSON structure, exit codes):
+/// none of their facts is emitted, so none can carry a wrong id.
+pub static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+
+fn term(specs: &[(Id, &str)], name: &str) -> Option<Id> {
+    specs.iter().find(|(_, n)| *n == name).map(|(id, _)| *id)
+}
+
+fn term_specs(attribute: &str) -> Option<&'static [(Id, &'static str)]> {
+    Some(match attribute {
+        "status" => v3::fact::status::SPECS,
+        "detail" => v3::fact::detail::SPECS,
+        "register" => v3::fact::register::SPECS,
+        "form" => v3::fact::form::SPECS,
+        "effort" => v3::fact::effort::SPECS,
+        _ => return None,
+    })
+}
+
+fn decode_text(decode: Decode, unit: &Unit, v: Id) -> Option<String> {
+    match decode {
+        Decode::Text => text_of(unit, v),
+        Decode::TextThen(then) => text_of(unit, v).map(|text| text + then),
+        Decode::ConstText(text) => Some(text.to_owned()),
+        Decode::TextMap(map) => {
+            let spelling = spelling(unit, v)?;
+            map.iter()
+                .find(|(from, _)| *from == spelling)
+                .map(|(_, to)| (*to).to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Sets one attribute of a fact from a value. `None`: a decode not built.
+fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: Id) -> Option<()> {
+    if let Some(specs) = term_specs(attribute) {
+        let name = match decode {
+            Decode::ConstTerm(name) => name.to_owned(),
+            Decode::Term(map) => {
+                let spelling = spelling(unit, v)?;
+                map.iter().find(|(from, _)| *from == spelling)?.1.to_owned()
+            }
+            _ => return None,
+        };
+        let id = term(specs, &name)?;
+        match attribute {
+            "status" => core.status = Some(id),
+            "detail" => core.detail = Some(id),
+            "register" => core.register = Some(id),
+            "form" => core.form = Some(id),
+            _ => core.effort = Some(id),
+        }
+        return Some(());
+    }
+    let text = decode_text(decode, unit, v)?;
+    match attribute {
+        "payload" => core.payload = Some(text),
+        "tool_name" => core.tool_name = Some(text),
+        "tool_namespace" => core.tool_namespace = Some(text),
+        "title" => core.title = Some(text),
+        "sense" => core.sense = Some(text),
+        "source_uri" => core.source_uri.push(text),
+        _ => return None,
+    }
+    Some(())
 }
 
 fn nothing(anchor: Id) -> Fragment {
@@ -469,6 +632,7 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
             emit: Box::new(|inst| nothing(inst.anchor)),
         });
         let anchor_table = Arc::clone(&t);
+        let emit_table = Arc::clone(&t);
         let field_table = Arc::clone(&t);
         let entry_table = Arc::clone(&t);
         constructions.push(Construction {
@@ -495,7 +659,31 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
                     )),
                 ),
             ],
-            emit: Box::new(|inst| nothing(inst.anchor)),
+            emit: Box::new(move |inst| {
+                // An array element, or the record outside every array, is an
+                // assembly point: its fields form its facts.
+                let cat = inst.category;
+                let point = cat.path.ends_with("[]") || cat.path == emit_table.table.record;
+                if !point || kind(&inst.unit, inst.anchor) != Some(json_tree::kind_object) {
+                    return nothing(inst.anchor);
+                }
+                let Some(cores) = emit_table.assemble(&inst.unit, inst.anchor, cat) else {
+                    SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return nothing(inst.anchor);
+                };
+                let mut out = Fragment::empty();
+                for core in cores {
+                    match fact(core) {
+                        Ok(built) => out += unexported(built),
+                        Err(_) => {
+                            SKIPPED.fetch_add(1, Ordering::Relaxed);
+                            return nothing(inst.anchor);
+                        }
+                    }
+                }
+                let (_, facts, metafacts, blobs) = out.into_parts();
+                Fragment::rooted_from_parts(inst.anchor, facts, metafacts, blobs)
+            }),
         });
     }
     Grammar::new(constructions).map_err(|e| anyhow::anyhow!("{e:?}"))

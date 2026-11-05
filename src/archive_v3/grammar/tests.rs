@@ -11,6 +11,8 @@ use triblespace::core::repo::BlobStore;
 use super::*;
 use crate::archive_v3::fields::claude_code::TABLE;
 use crate::archive_v3::gate::{self, Kind};
+use crate::schemas::archive_v3 as v3;
+use std::sync::atomic::Ordering;
 
 /// The walker's row kinds that are classification, the half compiled here.
 const CLASSIFICATION: &[Kind] = &[
@@ -249,5 +251,145 @@ fn real_sample_parity() {
     println!("-- grammar fails, walker accepts: first findings (files, finding)");
     for (row, n) in &grammar_only {
         println!("{n}\t{row}");
+    }
+}
+
+/// A fact attribute's name, for diagnostics that print schema, never values.
+fn attribute_name(a: Id) -> String {
+    let named = [
+        (v3::fact::modality.id(), "modality"),
+        (v3::fact::direction.id(), "direction"),
+        (v3::fact::payload.id(), "payload"),
+        (v3::fact::blob.id(), "blob"),
+        (v3::fact::media_type.id(), "media_type"),
+        (v3::fact::structure.id(), "structure"),
+        (v3::fact::tool_name.id(), "tool_name"),
+        (v3::fact::tool_namespace.id(), "tool_namespace"),
+        (v3::fact::status.id(), "status"),
+        (v3::fact::exit_code.id(), "exit_code"),
+        (v3::fact::source_uri.id(), "source_uri"),
+        (v3::fact::title.id(), "title"),
+        (v3::fact::sense.id(), "sense"),
+        (v3::fact::detail.id(), "detail"),
+        (v3::fact::register.id(), "register"),
+        (v3::fact::form.id(), "form"),
+        (v3::fact::absent.id(), "absent"),
+        (v3::fact::effort.id(), "effort"),
+        (triblespace::core::metadata::tag.id(), "tag"),
+    ];
+    named.iter().find(|(id, _)| *id == a).map_or_else(
+        || format!("{a:X}").chars().take(8).collect(),
+        |(_, n)| (*n).to_owned(),
+    )
+}
+
+/// The fact ids of a fragment, with each fact's modality term name.
+fn facts_of(fragment: &Fragment) -> BTreeMap<Id, String> {
+    let facts = fragment.facts();
+    let mut out = BTreeMap::new();
+    for (f, m) in find!(
+        (f: Id, m: Id),
+        pattern!(facts, [{ ?f @
+            triblespace::core::metadata::tag: (v3::fact::KIND),
+            v3::fact::modality: ?m,
+        }])
+    ) {
+        let name = v3::fact::modality::SPECS
+            .iter()
+            .find(|(id, _)| *id == m)
+            .map_or("?", |(_, n)| *n);
+        out.insert(f, name.to_owned());
+    }
+    out
+}
+
+#[test]
+#[ignore = "reads real transcripts named by AV3_SAMPLE; prints no values"]
+fn real_sample_facts() {
+    let list = std::env::var("AV3_SAMPLE").expect("AV3_SAMPLE names a file list");
+    let files: Vec<String> = std::fs::read_to_string(list)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let g = grammar();
+    let (mut compared, mut grammar_total, mut importer_total) = (0, 0, 0);
+    let mut grammar_only: BTreeMap<String, usize> = BTreeMap::new();
+    let mut importer_only: BTreeMap<String, usize> = BTreeMap::new();
+    // The attribute ids (schema, never values) of unmatched system facts.
+    let mut shapes: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let shape = |fragment: &Fragment, f: Id| -> String {
+        let mut attributes: Vec<String> = fragment
+            .facts()
+            .iter()
+            .filter(|t| *t.e() == f)
+            .map(|t| attribute_name(*t.a()))
+            .collect();
+        attributes.sort();
+        attributes.dedup();
+        attributes.join(",")
+    };
+    for file in &files {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        let Ok(imported) = crate::archive_v3::claude_code::import(&bytes) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let records: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let array = format!("[{}]", records.join(","));
+        let mut store = MemoryBlobStore::new();
+        let Ok(unit) = JsonTreeImporter::<_>::new(&mut store, None).import_str(&array) else {
+            continue;
+        };
+        let Some(root) = unit.root() else { continue };
+        let blobs = unit.blobs().clone().snapshot().unwrap();
+        let Ok(image) = g.cover(Unit::new(unit.facts(), &blobs), root, &lines()) else {
+            continue;
+        };
+        compared += 1;
+        let ours = facts_of(&image);
+        let theirs = facts_of(&imported);
+        grammar_total += ours.len();
+        importer_total += theirs.len();
+        for (id, modality) in &ours {
+            if !theirs.contains_key(id) {
+                *grammar_only.entry(modality.clone()).or_default() += 1;
+                if modality == "system" {
+                    *shapes
+                        .entry(("grammar".into(), shape(&image, *id)))
+                        .or_default() += 1;
+                }
+            }
+        }
+        for (id, modality) in &theirs {
+            if !ours.contains_key(id) {
+                *importer_only.entry(modality.clone()).or_default() += 1;
+                if modality == "system" {
+                    *shapes
+                        .entry(("importer".into(), shape(&imported, *id)))
+                        .or_default() += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "files compared {compared}; facts: grammar {grammar_total}, importer {importer_total}; assembly points skipped {}",
+        SKIPPED.load(Ordering::Relaxed)
+    );
+    println!("-- grammar facts the importer does not have, by modality (must be none)");
+    for (modality, n) in &grammar_only {
+        println!("{n}\t{modality}");
+    }
+    println!("-- importer facts the grammar does not have yet, by modality");
+    for (modality, n) in &importer_only {
+        println!("{n}\t{modality}");
+    }
+    println!("-- unmatched system facts: side, attribute id prefixes");
+    for ((side, attributes), n) in &shapes {
+        println!("{n}\t{side}\t{attributes}");
     }
 }
