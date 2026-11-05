@@ -373,7 +373,7 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
 /// A tool output's history budget: in tokens, or in bytes (codex-rs
 /// protocol/src/protocol.rs, `TruncationPolicy`).
 #[derive(Clone, Copy)]
-enum Budget {
+pub(crate) enum Budget {
     Tokens(usize),
     Bytes(usize),
 }
@@ -422,6 +422,36 @@ impl Budget {
                 token.parse::<usize>().ok().map(Budget::Tokens)
             }
             _ => None,
+        }
+    }
+
+    /// The budget a header records in its `truncation_policy`: none where
+    /// it records none (X18).
+    pub(crate) fn of_header(policy: Option<&Json>) -> Result<Option<Budget>, Failure> {
+        match policy {
+            None => Ok(None),
+            Some(policy) => Ok(Some(Budget::of_policy(policy).ok_or_else(|| {
+                Failure::new(
+                    "{turn_context}.payload.truncation_policy",
+                    "a history budget that does not parse: the importer cannot apply it",
+                )
+            })?)),
+        }
+    }
+
+    /// The budget of a response item: its own override, else its header's.
+    pub(crate) fn of_record(
+        limit: Option<&Json>,
+        header: Option<Budget>,
+    ) -> Result<Option<Budget>, Failure> {
+        match limit {
+            None => Ok(header),
+            Some(limit) => Ok(Some(Budget::of_override(limit).ok_or_else(|| {
+                Failure::new(
+                    "{response_item}.metadata.fallback_token_limit_override",
+                    "a history budget override that is no count",
+                )
+            })?)),
         }
     }
 
@@ -514,7 +544,7 @@ impl Budget {
 /// - A version that does not parse, `0.0.0` (a source build), or no
 ///   `session_meta` at all: any generation.
 #[derive(Clone, Copy, Default)]
-struct Unrecorded {
+pub(crate) struct Unrecorded {
     /// 0.51 to 0.58: 10 KiB or 256 lines.
     fixed: bool,
     /// 0.59 on: the model's policy, at least Bytes(12_000).
@@ -528,7 +558,7 @@ impl Unrecorded {
     /// 1.2 allowance; Tokens(10_000) likewise.
     const MODEL: [Budget; 2] = [Budget::Bytes(12_000), Budget::Tokens(12_000)];
 
-    fn of_clients<'a>(versions: impl Iterator<Item = Option<&'a str>>) -> Self {
+    pub(crate) fn of_clients<'a>(versions: impl Iterator<Item = Option<&'a str>>) -> Self {
         let mut out = Unrecorded::default();
         let mut any = false;
         for version in versions {
@@ -583,6 +613,62 @@ impl Unrecorded {
         (self.fixed
             && (texts().any(Self::fixed_cuts) || Budget::Bytes(Self::FIXED_BYTES).shortens(parts)))
             || (self.model && Self::MODEL.iter().any(|budget| budget.shortens(parts)))
+    }
+}
+
+/// X18, X18': the history one tool output entered her window through: its
+/// record's budget, the budgets its clients could have cut it under
+/// unrecorded, and whether its client recorded it as it entered her
+/// history. The importer's rule, and the relations' (`grammar::relations`).
+#[derive(Clone, Copy)]
+pub(crate) struct History {
+    pub(crate) budget: Option<Budget>,
+    pub(crate) unrecorded: Unrecorded,
+    pub(crate) recorded_here: bool,
+}
+
+impl History {
+    /// X18': where an output was recorded as it entered her history and no
+    /// budget is recorded, one her client could have cut fails.
+    fn unknown(self, cut: bool, path: &str) -> Result<(), Failure> {
+        if self.recorded_here && self.budget.is_none() && cut {
+            return Err(Failure::new(
+                path,
+                "an output a budget her client could have run under cuts, and the \
+                 rollout records none: the truncation is unrecorded, so what her \
+                 window held is unknown (X18')",
+            ));
+        }
+        Ok(())
+    }
+
+    /// What her window held of a text output: the text as the client's
+    /// history truncated it under the budget.
+    pub(crate) fn text(self, text: &str, path: &str) -> Result<String, Failure> {
+        self.unknown(self.unrecorded.cuts_text(text), path)?;
+        Ok(match self.budget {
+            Some(budget) => budget.truncate(text),
+            None => text.to_owned(),
+        })
+    }
+
+    /// A list output, before its parts are read (X18').
+    pub(crate) fn list(self, parts: &[Json], path: &str) -> Result<(), Failure> {
+        self.unknown(self.unrecorded.cuts_parts(parts), path)
+    }
+
+    /// A list output, after its parts are read: one the budget shortens
+    /// fails, since how to keep its full parts beside her window is not
+    /// modeled.
+    pub(crate) fn list_whole(self, parts: &[Json], path: &str) -> Result<(), Failure> {
+        if self.budget.is_some_and(|budget| budget.shortens(parts)) {
+            return Err(Failure::new(
+                path,
+                "a list output its history budget shortens: how to keep its \
+                 full parts beside her window is not modeled",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -977,15 +1063,10 @@ impl Builder {
                 Some("session_meta") => self.session(at, payload),
                 Some("turn_context") => self.turn_context(at, payload, claims),
                 Some("response_item") => {
-                    self.record_budget = match record.at("metadata.fallback_token_limit_override") {
-                        None => self.budget,
-                        Some(limit) => Some(Budget::of_override(limit).ok_or_else(|| {
-                            Failure::new(
-                                "{response_item}.metadata.fallback_token_limit_override",
-                                "a history budget override that is no count",
-                            )
-                        })?),
-                    };
+                    self.record_budget = Budget::of_record(
+                        record.at("metadata.fallback_token_limit_override"),
+                        self.budget,
+                    )?;
                     self.prompt_turn(payload);
                     let items =
                         self.items(payload, "{response_item}.payload", &mut claims, Some(at));
@@ -1139,15 +1220,7 @@ impl Builder {
         mut claims: WitnessAnnotations,
     ) -> Result<(), Failure> {
         claims.raw_model = payload.str_at("model").map(str::to_owned);
-        self.budget = match payload.get("truncation_policy") {
-            None => None,
-            Some(policy) => Some(Budget::of_policy(policy).ok_or_else(|| {
-                Failure::new(
-                    "{turn_context}.payload.truncation_policy",
-                    "a history budget that does not parse: the importer cannot apply it",
-                )
-            })?),
-        };
+        self.budget = Budget::of_header(payload.get("truncation_policy"))?;
         let header = match payload.str_at("effort") {
             Some(term) => {
                 use v3::fact::{absent, direction::IN, modality::SYSTEM};
@@ -1378,7 +1451,6 @@ impl Builder {
                 // src/lib.rs: "Tool output truncation applies only to live
                 // history, preserving full rollout payloads"). The full text
                 // she never saw is the record's claim beside it.
-                let budget = self.record_budget;
                 // X18': only a response item the client recorded as it
                 // entered her history. A `compacted` replacement history is
                 // installed as it stands (`ContextManager::replace`, codex-rs
@@ -1387,25 +1459,14 @@ impl Builder {
                 // wrapped rollout lines 0.50.0 already writes
                 // (`RolloutItem::ResponseItem`, core/src/codex.rs), so its
                 // client cut nothing when recording (before 0.51).
-                let recorded_here = path == "{response_item}.payload";
-                let unrecorded = |cut: bool| {
-                    if recorded_here && budget.is_none() && cut {
-                        return Err(Failure::new(
-                            &at(".output"),
-                            "an output a budget her client could have run under cuts, and the \
-                             rollout records none: the truncation is unrecorded, so what her \
-                             window held is unknown (X18')",
-                        ));
-                    }
-                    Ok(())
+                let history = History {
+                    budget: self.record_budget,
+                    unrecorded: self.unrecorded,
+                    recorded_here: path == "{response_item}.payload",
                 };
                 match item.get("output") {
                     Some(Json::Str(text)) => {
-                        unrecorded(self.unrecorded.cuts_text(text))?;
-                        let shown = match budget {
-                            Some(budget) => budget.truncate(text),
-                            None => text.clone(),
-                        };
+                        let shown = history.text(text, &at(".output"))?;
                         if shown != *text {
                             claims.untruncated = Some(text.clone());
                         }
@@ -1417,7 +1478,7 @@ impl Builder {
                         }
                     }
                     Some(Json::Arr(parts)) => {
-                        unrecorded(self.unrecorded.cuts_parts(parts))?;
+                        history.list(parts, &at(".output"))?;
                         for part in parts {
                             match part.str_at("type") {
                                 Some("input_text") => {
@@ -1443,13 +1504,7 @@ impl Builder {
                                 }
                             }
                         }
-                        if budget.is_some_and(|budget| budget.shortens(parts)) {
-                            return Err(Failure::new(
-                                &at(".output"),
-                                "a list output its history budget shortens: how to keep its \
-                                 full parts beside her window is not modeled",
-                            ));
-                        }
+                        history.list_whole(parts, &at(".output"))?;
                     }
                     Some(Json::Null) | None => {}
                     Some(_) => {

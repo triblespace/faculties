@@ -11,8 +11,8 @@
 //!
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still
-//! refused as not built yet, never built wrong: a history budget (X18) and
-//! a record's supplied members (`Class::Supply`).
+//! refused as not built yet, never built wrong: a record's supplied members
+//! (`Class::Supply`).
 //!
 //! Mirrors are not stated here a second time: the unit's records, read back
 //! as the JSON they hold, go through the importers' own record check
@@ -20,6 +20,12 @@
 //! is checked. That is the whole record check, not its mirrors alone, so a
 //! unit it refuses the importer refuses too, for the same reason; it stays
 //! shared until the rules replace it.
+//!
+//! Nor is a history budget (X18, X18'): the table's `HistoryBudget` says
+//! where a budget and the tool outputs it applies to are, and the Codex
+//! importer's own rule (`codex::Budget`, `codex::Unrecorded`,
+//! `codex::History`), over the same records read back, says what her window
+//! held of each output, or refuses where and as the importer refuses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -29,8 +35,11 @@ use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
 use super::super::claude_code::check;
+use super::super::claude_code::json::{self, Json};
+use super::super::codex::{Budget, History, Unrecorded};
 use super::super::fields::{
-    Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, Order, Place, Rewrite,
+    Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
+    Place, Rewrite,
 };
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, gloss_part, node, occurrence, unexported, witness,
@@ -157,8 +166,8 @@ struct Parts {
     /// Ends of the request a value names, on its last item
     /// (`Place::Request`): (ends term, the request's id, path).
     request_ends: Vec<(Id, String, &'static str)>,
-    /// Facts the relations built for the record (gaps beside its values),
-    /// staged with the lines.
+    /// Facts the relations built for the record (gaps beside its values,
+    /// outputs a history budget cut), staged with the lines.
     built: Vec<Fragment>,
     /// Glosses at their own place (`Place::Here`), by the levels of the
     /// value: (levels, category, text, path).
@@ -299,12 +308,22 @@ fn annotate(
 /// A record's items in record order (the facts of the record outside every
 /// array first, then each array element's by array path and index; within
 /// one assembly point, in the order they were assembled), and its claims.
-fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, String> {
+/// Under a history budget, the tool outputs the budget names are what her
+/// window held of them.
+fn record_parts(
+    t: &Table,
+    unit: &Unit,
+    record: Id,
+    cat: &Cat,
+    history: Option<(&HistoryBudget, History)>,
+) -> Result<Parts, String> {
     let mut found = vec![(Levels::new(), record, cat.clone())];
     points(t, unit, record, cat, &mut Levels::new(), &mut found);
     found.sort_by(|a, b| a.0.cmp(&b.0));
     let result = t.table.windows.requests.map(|requests| requests.result);
     let mut parts = Parts::default();
+    // The list outputs read, by their array.
+    let mut lists = HashSet::new();
     for (levels, value, at) in found {
         let mut cores = t
             .assemble(unit, value, &at)
@@ -330,6 +349,66 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                 cores.insert(0, core);
             }
         }
+        let mut consumed = Vec::new();
+        t.consumed(unit, value, &at, &mut consumed);
+        // X18, X18': an output as her client's history held it, by the
+        // importer's own rule. A text the budget cuts is her window's text,
+        // and its full text the record's claim (the image's fact of the full
+        // text stays, held by no node); where the importer refuses, the unit
+        // is refused as it refuses.
+        if let Some((budget, history)) = history {
+            for (entry, v, _) in &consumed {
+                if !budget.outputs.contains(&entry.path)
+                    || kind(unit, *v) != Some(json_tree::kind_string)
+                {
+                    continue;
+                }
+                let text = text_of(unit, *v).ok_or("an output's text")?;
+                let shown = history
+                    .text(&text, entry.path)
+                    .map_err(|failure| failure.to_string())?;
+                if shown == text {
+                    continue;
+                }
+                let Class::Fact {
+                    modality,
+                    direction,
+                    ..
+                } = entry.class
+                else {
+                    return Err(format!("{}: a cut output that is no fact", entry.path));
+                };
+                let held = (
+                    term(v3::fact::modality::SPECS, modality),
+                    term(v3::fact::direction::SPECS, direction),
+                );
+                let core = cores
+                    .iter_mut()
+                    .find(|core| (core.modality, core.direction) == held)
+                    .ok_or_else(|| format!("{}: a cut output holds no fact", entry.path))?;
+                core.payload = Some(shown);
+                parts
+                    .built
+                    .push(fact(core.clone()).map_err(|e| format!("{}: {e}", entry.path))?);
+                parts.claims.untruncated = Some(text);
+            }
+            // A list output's elements are assembly points of their own: the
+            // list is read once, at its first.
+            let output = at.path.strip_suffix("[]");
+            if let (Some(output), Some(list)) = (output, at.parent) {
+                if budget.outputs.contains(&output) && lists.insert(list) {
+                    let mut text = String::new();
+                    json_text(unit, list, &mut text)
+                        .ok_or("a list output is no json_tree value")?;
+                    let read =
+                        json::parse(text.as_bytes()).ok_or("a list output does not read back")?;
+                    history
+                        .list(read.arr(), output)
+                        .and_then(|()| history.list_whole(read.arr(), output))
+                        .map_err(|failure| failure.to_string())?;
+                }
+            }
+        }
         let first = parts.items.len();
         for core in cores {
             let modality = core.modality;
@@ -349,8 +428,6 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                 levels: levels.clone(),
             });
         }
-        let mut consumed = Vec::new();
-        t.consumed(unit, value, &at, &mut consumed);
         // Gaps the rendering rule puts beside a value: an item of their own
         // right before or after the point's items, held as the rule says.
         for (entry, v, cat) in &consumed {
@@ -803,13 +880,16 @@ pub fn build(
     // Mirrors: the importers' own check of each record, over the JSON the
     // unit holds, then of the copies that reach across it. One predicate,
     // so a copy is refused exactly where and as the importer refuses it.
+    // The records read back are kept for the history budget (X18).
     let mut mirrors = check::UnitMirrors::new(table);
+    let mut reads = Vec::with_capacity(records.len());
     for (_, record) in &records {
         let mut text = String::new();
         json_text(&unit, *record, &mut text).ok_or("a record is no json_tree value")?;
         let read = crate::archive_v3::claude_code::json::parse(text.as_bytes())
             .ok_or("a record does not read back as JSON")?;
         check::record_in(table, &read, &mut mirrors).map_err(|failure| failure.to_string())?;
+        reads.push(read);
     }
     mirrors.verify().map_err(|failure| failure.to_string())?;
     let record_cat = Cat {
@@ -849,6 +929,7 @@ pub fn build(
             &t,
             &unit,
             &records,
+            &reads,
             &record_cat,
             &mut lines,
             header_gap,
@@ -1012,7 +1093,7 @@ fn parents(
                 }
             }
         }
-        let parts = record_parts(&t, &unit, record, &record_cat)?;
+        let parts = record_parts(&t, &unit, record, &record_cat, None)?;
         if !parts.turn.is_empty() {
             return Err("not built yet: a turn place under parent order".to_owned());
         }
@@ -1386,12 +1467,13 @@ struct Spot {
 /// record marks where a turn starts, and a rollback removes the latest
 /// turns; any other record extends the line. Claims of a record that holds
 /// no node go to the next node the file places (X19 where the file ends
-/// before it).
+/// before it). `reads` are the records as the JSON they hold.
 #[allow(clippy::too_many_arguments)]
 fn file(
     t: &Table,
     unit: &Unit,
     records: &[Id],
+    reads: &[Json],
     record_cat: &Cat,
     lines: &mut Lines,
     header_gap: Id,
@@ -1399,24 +1481,19 @@ fn file(
     wiring: &mut Wiring,
 ) -> Result<(), String> {
     let table = t.table;
-    // X18: a budget recorded on a header, or on a record, is not built yet.
-    if let Some(budget) = rules.budget {
-        for &record in records {
-            let header = file_kind(rules, unit, record) == FileKind::Header;
-            if header && field_at(unit, record, budget.policy.0).is_some() {
-                return Err(format!(
-                    "not built yet: a history budget ({})",
-                    budget.policy.1
-                ));
-            }
-            if field_at(unit, record, budget.limit.0).is_some() {
-                return Err(format!(
-                    "not built yet: a history budget ({})",
-                    budget.limit.1
-                ));
-            }
-        }
-    }
+    // X18': the budgets the unit's clients could have cut an output under
+    // unrecorded, by the versions of the records that name them.
+    let unrecorded = rules.budget.as_ref().map(|budget| {
+        let ((field, client), version) = budget.client;
+        Unrecorded::of_clients(
+            reads
+                .iter()
+                .filter(|read| read.str_at(field) == Some(client))
+                .map(|read| read.str_at(version)),
+        )
+    });
+    // X18: the latest header's budget.
+    let mut header_budget: Option<Budget> = None;
     let marked = records
         .iter()
         .any(|&record| file_kind(rules, unit, record) == FileKind::Turn);
@@ -1473,7 +1550,27 @@ fn file(
     let since = |turns: &[usize], line: &[Spot]| turns.last().copied().unwrap_or(0).min(line.len());
     for (at, &record) in records.iter().enumerate() {
         let kind = file_kind(rules, unit, record);
-        let parts = record_parts(t, unit, record, record_cat)?;
+        // X18: a header sets the budget, a record's own limit overrides it.
+        // The outputs the table names are response items, each recorded as
+        // it entered her history (X18').
+        let history = match (&rules.budget, unrecorded) {
+            (Some(budget), Some(unrecorded)) => {
+                if kind == FileKind::Header {
+                    header_budget = Budget::of_header(reads[at].at(budget.policy.0))
+                        .map_err(|failure| failure.to_string())?;
+                }
+                let own = Budget::of_record(reads[at].at(budget.limit.0), header_budget)
+                    .map_err(|failure| failure.to_string())?;
+                let history = History {
+                    budget: own,
+                    unrecorded,
+                    recorded_here: true,
+                };
+                Some((budget, history))
+            }
+            _ => None,
+        };
+        let parts = record_parts(t, unit, record, record_cat, history)?;
         if !parts.file_tail.is_empty()
             || !parts.parent_tail.is_empty()
             || !parts.rewrites.is_empty()

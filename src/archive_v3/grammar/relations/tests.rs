@@ -1518,3 +1518,269 @@ fn codex_a_mirror_that_differs_from_its_record_s_field_is_refused() {
          from what it mirrors"
     );
 }
+
+/// The Codex build of `records` by the relations, which must be the
+/// importer's own: the same nodes, occurrences, links and annotations.
+fn codex_exact(records: &[Value]) -> Fragment {
+    let fragment = codex_built(records).expect("builds");
+    let imported = crate::archive_v3::codex::import(jsonl(records).as_bytes())
+        .expect("the importer builds it too");
+    assert_eq!(nodes_of(&fragment), nodes_of(&imported), "nodes");
+    assert_eq!(
+        occurrence_ids(&fragment),
+        occurrence_ids(&imported),
+        "occurrences"
+    );
+    assert_eq!(links_of(&fragment), links_of(&imported), "links");
+    assert_eq!(
+        annotations_of(&fragment),
+        annotations_of(&imported),
+        "annotations"
+    );
+    assert_eq!(
+        untruncated_of(&fragment),
+        untruncated_of(&imported),
+        "untruncated claims"
+    );
+    fragment
+}
+
+/// The full texts occurrences claim, as (occurrence, text handle) pairs
+/// (X18).
+fn untruncated_of(fragment: &Fragment) -> std::collections::BTreeSet<(Id, [u8; 32])> {
+    let facts = fragment.facts();
+    find!(
+        (o: Id, text: Name),
+        pattern!(facts, [{ ?o @ v3::witness::untruncated: ?text }])
+    )
+    .map(|(o, text)| (o, text.raw))
+    .collect()
+}
+
+/// The occurrences that claim `text` as the full text of an output her
+/// window held cut (X18): one per node its record holds, the result's head
+/// and the cut text, as the importer gives each its record's claims.
+fn claiming_untruncated(fragment: &Fragment, text: &str) -> usize {
+    let handle = {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        blob.get_handle()
+    };
+    let facts = fragment.facts();
+    find!(o: Id, pattern!(facts, [{ ?o @ v3::witness::untruncated: handle }])).count()
+}
+
+/// One tool output under a header that records `policy` (none: no budget),
+/// in a unit a client of `version` wrote; `metadata` is the output
+/// record's own.
+fn budgeted(
+    version: &str,
+    policy: Option<Value>,
+    output: Value,
+    metadata: Option<Value>,
+) -> Vec<Value> {
+    let mut opened = session(0, "Sys.");
+    opened["payload"]["cli_version"] = json!(version);
+    let mut context = header(1, "high");
+    if let Some(policy) = policy {
+        context["payload"]["truncation_policy"] = policy;
+    }
+    let mut out = envelope(
+        4,
+        "response_item",
+        json!({"type": "custom_tool_call_output", "call_id": "o1", "output": output}),
+    );
+    if let Some(metadata) = metadata {
+        out["metadata"] = metadata;
+    }
+    vec![
+        opened,
+        context,
+        item(2, "user", "Go."),
+        envelope(
+            3,
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "exec", "input": "ls", "call_id": "o1"}),
+        ),
+        out,
+        item(5, "assistant", "Done."),
+    ]
+}
+
+/// X18: her window holds a tool output as her client's history cut it
+/// under the latest header's budget, in bytes or in tokens with codex's 20%
+/// allowance, or under the record's own limit; the full text is the
+/// record's claim. An output within the budget, exactly at it too, is
+/// whole and claims nothing.
+#[test]
+fn codex_a_budget_cuts_an_output_to_what_her_window_held() {
+    let x = |n: usize| json!("x".repeat(n));
+    let bytes = |n: u64| Some(json!({"mode": "bytes", "limit": n}));
+    let tokens = |n: u64| Some(json!({"mode": "tokens", "limit": n}));
+    // Bytes 10 allow 12: 13 bytes keep 6 and 6, with a character count.
+    let cut = codex_exact(&budgeted("0.0.0", bytes(10), x(13), None));
+    node_saying_in(&cut, "xxxxxx\u{2026}1 chars truncated\u{2026}xxxxxx", 1);
+    assert!(nodes_saying(&cut, &"x".repeat(13)).is_empty());
+    assert_eq!(claiming_untruncated(&cut, &"x".repeat(13)), 2);
+    // Exactly at the allowance: whole.
+    let whole = codex_exact(&budgeted("0.0.0", bytes(10), x(12), None));
+    node_saying_in(&whole, &"x".repeat(12), 1);
+    assert_eq!(claiming_untruncated(&whole, &"x".repeat(12)), 0);
+    // Tokens 2 allow 3, 12 bytes; the cut keeps whole characters.
+    let cut = codex_exact(&budgeted(
+        "0.0.0",
+        tokens(2),
+        json!("\u{e9}".repeat(7)),
+        None,
+    ));
+    node_saying_in(
+        &cut,
+        "\u{e9}\u{e9}\u{e9}\u{2026}1 tokens truncated\u{2026}\u{e9}\u{e9}\u{e9}",
+        1,
+    );
+    assert_eq!(claiming_untruncated(&cut, &"\u{e9}".repeat(7)), 2);
+    let whole = codex_exact(&budgeted("0.0.0", tokens(2), x(12), None));
+    node_saying_in(&whole, &"x".repeat(12), 1);
+    // A budget of zero shows only the marker.
+    let cut = codex_exact(&budgeted("0.0.0", bytes(0), x(5), None));
+    node_saying_in(&cut, "\u{2026}5 chars truncated\u{2026}", 1);
+    // A record's own limit is in tokens and holds its allowance already.
+    let limit = |n: u64| Some(json!({"fallback_token_limit_override": n}));
+    let cut = codex_exact(&budgeted("0.0.0", bytes(10), x(13), limit(3)));
+    node_saying_in(&cut, "xxxxxx\u{2026}1 tokens truncated\u{2026}xxxxxx", 1);
+    let whole = codex_exact(&budgeted("0.0.0", bytes(1), x(13), limit(100)));
+    node_saying_in(&whole, &"x".repeat(13), 1);
+}
+
+/// A header that records no budget carries none from an earlier header:
+/// the output after it is whole, as without any budget.
+#[test]
+fn codex_a_header_without_a_budget_carries_none_into_its_turn() {
+    let x13 = json!("x".repeat(13));
+    let unbudgeted = codex_exact(&budgeted("0.0.0", None, x13.clone(), None));
+    node_saying_in(&unbudgeted, &"x".repeat(13), 1);
+    assert_eq!(claiming_untruncated(&unbudgeted, &"x".repeat(13)), 0);
+    let mut records = budgeted("0.0.0", None, x13, None);
+    let mut earlier = header(1, "high");
+    earlier["payload"]["truncation_policy"] = json!({"mode": "bytes", "limit": 10});
+    records.splice(
+        1..1,
+        [
+            earlier,
+            item(1, "user", "Hi."),
+            item(1, "assistant", "Hello."),
+        ],
+    );
+    let fragment = codex_exact(&records);
+    node_saying_in(&fragment, &"x".repeat(13), 1);
+    assert_eq!(claiming_untruncated(&fragment, &"x".repeat(13)), 0);
+}
+
+/// A budget the importer cannot apply, and a list output a budget would
+/// shorten, are refused where and as the importer refuses them.
+#[test]
+fn codex_a_budget_the_importer_cannot_apply_is_refused() {
+    let x13 = json!("x".repeat(13));
+    for bad in [
+        json!(null),
+        json!({"mode": "lines", "limit": 1}),
+        json!({"mode": "bytes", "limit": 1.5}),
+        json!({"mode": "bytes", "limit": "1"}),
+        json!({"mode": "bytes", "limit": -1}),
+        json!({"mode": "bytes"}),
+        json!({"mode": "bytes", "limit": 1, "extra": 1}),
+    ] {
+        assert_eq!(
+            codex_refused(&budgeted("0.0.0", Some(bad), x13.clone(), None)),
+            "{turn_context}.payload.truncation_policy: a history budget that does not parse: \
+             the importer cannot apply it"
+        );
+    }
+    let bytes = Some(json!({"mode": "bytes", "limit": 10}));
+    assert_eq!(
+        codex_refused(&budgeted(
+            "0.0.0",
+            bytes.clone(),
+            x13.clone(),
+            Some(json!({"fallback_token_limit_override": "3"}))
+        )),
+        "{response_item}.metadata.fallback_token_limit_override: a history budget override \
+         that is no count"
+    );
+    let parts = |texts: &[String]| {
+        let parts: Vec<Value> = texts
+            .iter()
+            .map(|text| json!({"type": "input_text", "text": text}))
+            .collect();
+        json!(parts)
+    };
+    // 8 and 4 bytes fit the 12 allowed; 8 and 5 do not, and once the
+    // budget is spent an empty part is omitted too.
+    codex_exact(&budgeted(
+        "0.0.0",
+        bytes.clone(),
+        parts(&["x".repeat(8), "y".repeat(4)]),
+        None,
+    ));
+    let shortened = "{response_item}.payload{custom_tool_call_output}.output: a list output its \
+                     history budget shortens: how to keep its full parts beside her window is \
+                     not modeled";
+    for texts in [
+        ["x".repeat(8), "y".repeat(5)],
+        ["x".repeat(12), String::new()],
+    ] {
+        assert_eq!(
+            codex_refused(&budgeted("0.0.0", bytes.clone(), parts(&texts), None)),
+            shortened
+        );
+    }
+}
+
+/// X18': where no budget is recorded, an output a budget her client could
+/// have run under would cut is refused where and as the importer refuses
+/// it: 0.59 on at 12,000 bytes, 0.51 to 0.58 at 10 KiB or 256 lines, an
+/// unknown client at either. At the bound, and before 0.51, it is whole.
+/// A bare item predates the clients that cut.
+#[test]
+fn codex_an_output_a_client_could_have_cut_unrecorded_is_refused() {
+    let x = |n: usize| json!("x".repeat(n));
+    let unknown = "{response_item}.payload{custom_tool_call_output}.output: an output a budget \
+                   her client could have run under cuts, and the rollout records none: the \
+                   truncation is unrecorded, so what her window held is unknown (X18')";
+    for (version, output) in [
+        ("0.140.0", x(13_000)),
+        ("0.70.0", x(13_000)),
+        ("0.55.0", x(11_000)),
+        ("0.55.0", json!("x\n".repeat(257))),
+        ("not a version", x(11_000)),
+        (
+            "0.140.0",
+            json!([{"type": "input_text", "text": "x".repeat(13_000)}]),
+        ),
+    ] {
+        assert_eq!(
+            codex_refused(&budgeted(version, None, output, None)),
+            unknown
+        );
+    }
+    for (version, n) in [("0.140.0", 12_000), ("0.55.0", 10_240), ("0.50.0", 50_000)] {
+        let fragment = codex_exact(&budgeted(version, None, x(n), None));
+        node_saying_in(&fragment, &"x".repeat(n), 1);
+    }
+    // A recorded budget is what her window held: no refusal.
+    codex_exact(&budgeted(
+        "0.140.0",
+        Some(json!({"mode": "bytes", "limit": 20_000})),
+        x(13_000),
+        None,
+    ));
+    let long = "x".repeat(50_000);
+    let bare = [
+        json!({"id": "11111111-1111-4111-8111-111111111111", "timestamp": "2025-07-07T20:00:00.000Z"}),
+        says("user", "List the files."),
+        json!({"type": "function_call", "name": "shell", "arguments": "{}", "call_id": "call_1"}),
+        json!({"type": "function_call_output", "call_id": "call_1", "output": long}),
+        says("assistant", "Done."),
+    ];
+    node_saying_in(&codex_built(&bare).expect("builds"), &long, 1);
+    crate::archive_v3::codex::import(jsonl(&bare).as_bytes()).expect("the importer builds it");
+}
