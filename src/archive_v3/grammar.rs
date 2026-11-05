@@ -614,6 +614,51 @@ fn structure(text: &str) -> Option<Fragment> {
     Some(tree)
 }
 
+/// A base64 `data:` URI's media type and data.
+fn data_uri(text: &str) -> Option<(&str, &str)> {
+    let rest = text.strip_prefix("data:")?;
+    let (head, data) = rest.split_once(',')?;
+    let media_type = head.strip_suffix(";base64")?;
+    Some((media_type, data))
+}
+
+/// The bytes a bytes decode reads from a value.
+fn decode_bytes(decode: Decode, unit: &Unit, v: Id) -> Option<anybytes::Bytes> {
+    use base64::Engine;
+    let text = text_of(unit, v)?;
+    let bytes = match decode {
+        Decode::Base64 => base64::engine::general_purpose::STANDARD
+            .decode(&text)
+            .ok()?,
+        Decode::Base64Url => base64::engine::GeneralPurpose::new(
+            &base64::alphabet::URL_SAFE,
+            base64::engine::GeneralPurposeConfig::new()
+                .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+        )
+        .decode(&text)
+        .ok()?,
+        Decode::DataUri => {
+            let (_, data) = data_uri(&text)?;
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?
+        }
+        _ => return None,
+    };
+    Some(anybytes::Bytes::from(bytes))
+}
+
+/// The media type a media-type decode reads from a value.
+fn decode_media_type(decode: Decode, unit: &Unit, v: Id) -> Option<super::media_type::MediaType> {
+    let text = match decode {
+        Decode::MediaType => text_of(unit, v)?,
+        Decode::ConstText(text) => text.to_owned(),
+        Decode::DataUriType => data_uri(&text_of(unit, v)?)?.0.to_owned(),
+        _ => return None,
+    };
+    super::media_type::MediaType::parse(&text).ok()
+}
+
 /// Sets one attribute of a fact from a value. `None`: a decode not built.
 fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: Id) -> Option<()> {
     if let Some(specs) = term_specs(attribute) {
@@ -633,6 +678,14 @@ fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: I
             "form" => core.form = Some(id),
             _ => core.effort = Some(id),
         }
+        return Some(());
+    }
+    if attribute == "blob" {
+        core.blob = Some(decode_bytes(decode, unit, v)?);
+        return Some(());
+    }
+    if attribute == "media_type" {
+        core.media_type = Some(decode_media_type(decode, unit, v)?);
         return Some(());
     }
     if attribute == "structure" {
