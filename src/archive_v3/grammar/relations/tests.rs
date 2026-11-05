@@ -325,13 +325,19 @@ fn real_sample_relations() {
         match built(source) {
             // A refusal reason is a table path or shape, never a value.
             Err(reason) => {
-                let reason = reason
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(120)
-                    .collect();
+                // "not built yet: <attribute or shape at path placed Place>"
+                // is vocabulary whole; any other reason, up to its first colon.
+                let reason: String = if reason.starts_with("not built yet") {
+                    reason.chars().take(160).collect()
+                } else {
+                    reason
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(120)
+                        .collect()
+                };
                 *reasons.entry(reason).or_default() += 1;
             }
             Ok(fragment) => {
