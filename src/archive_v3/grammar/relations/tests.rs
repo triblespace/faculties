@@ -308,6 +308,10 @@ fn annotations_of(fragment: &Fragment) -> std::collections::BTreeSet<(&'static s
         find!((n: Id, o: Id), pattern!(facts, [{ ?n @ v3::node::recalls: ?o }]))
             .map(|(a, b)| ("recalls", a, b)),
     );
+    out.extend(
+        find!((n: Id, t: Id), pattern!(facts, [{ ?n @ v3::node::continues: ?t }]))
+            .map(|(a, b)| ("continues", a, b)),
+    );
     out
 }
 
@@ -430,7 +434,7 @@ fn real_sample_relations() {
         occurrences.0, occurrences.1, occurrences.2, links.0, links.1, links.2
     );
     println!(
-        "annotations (ends, turn ends, renderings, glosses, recalls): shared {}, ours only {}, importer only {}",
+        "annotations (ends, turn ends, renderings, glosses, recalls, continues): shared {}, ours only {}, importer only {}",
         annotations.0, annotations.1, annotations.2
     );
     println!("-- annotations on one side only: count, side, kind");
@@ -839,4 +843,50 @@ fn an_interruption_ends_the_message_it_names_on_its_last_item() {
     ]);
     let refused = built(&source).expect_err("refused");
     assert!(refused.contains("interruptedMessageId"), "{refused}");
+}
+
+fn boundary(uuid: &str, replaces: &str, second: u32) -> Value {
+    json!({"type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": null,
+        "logicalParentUuid": replaces, "timestamp": stamp(second), "sessionId": "s-1",
+        "content": "Conversation compacted", "isMeta": false, "level": "info",
+        "compactMetadata": {"trigger": "auto", "preTokens": 1}})
+}
+
+#[test]
+fn a_compaction_opens_a_new_root_that_continues_the_old_tail() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        boundary("b1", "a1", 2),
+        user("u2", Some("b1"), 3, "Summary."),
+    ]);
+    let fragment = built(&source).expect("builds");
+    let summary = node_saying(&fragment, "Summary.");
+    // The new context holds none of the old: the section, then the summary.
+    assert_eq!(window_before(&fragment, summary), section_then(&[]));
+    // Its first node off the old line continues from the old tail.
+    let hello = node_saying(&fragment, "Hello.");
+    let facts = fragment.facts();
+    let continues: Vec<(Id, Id)> =
+        find!((n: Id, t: Id), pattern!(facts, [{ ?n @ v3::node::continues: ?t }])).collect();
+    assert_eq!(continues, vec![(summary, hello)]);
+}
+
+#[test]
+fn a_compaction_of_a_context_outside_the_unit_opens_on_a_span_and_continues_nothing() {
+    let source = jsonl(&[
+        boundary("b1", "gone", 2),
+        user("u2", Some("b1"), 3, "Summary."),
+    ]);
+    let fragment = built(&source).expect("builds");
+    let summary = node_saying(&fragment, "Summary.");
+    assert_eq!(
+        window_before(&fragment, summary),
+        section_then(&[(UNKNOWN, Some(SPAN))])
+    );
+    let facts = fragment.facts();
+    assert_eq!(
+        find!((n: Id, t: Id), pattern!(facts, [{ ?n @ v3::node::continues: ?t }])).count(),
+        0
+    );
 }

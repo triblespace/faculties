@@ -792,6 +792,10 @@ pub fn build(
     let mut messages: HashMap<String, (Id, HashSet<String>)> = HashMap::new();
     let mut message_last: HashMap<String, usize> = HashMap::new();
     let mut request_ends: Vec<(Id, String, &'static str)> = Vec::new();
+    // Each compaction boundary and the context it replaces, and the last
+    // node of each record that opens a new context under one.
+    let mut boundaries: HashMap<String, String> = HashMap::new();
+    let mut continuing: Vec<(Id, String)> = Vec::new();
     // For links: the call ids each node holds, and the results waiting for
     // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
@@ -805,9 +809,34 @@ pub fn build(
         if table.windows.prefix.contains(&shape.as_str()) {
             return Err(format!("not built yet: a system section ({{{shape}}})"));
         }
+        // A compaction boundary holds nothing: its children start a new
+        // root, on a span when the context it replaces is outside the unit.
         if let Some(compaction) = table.windows.compaction {
             if compaction.shape == shape && field_at(&unit, record, compaction.parent).is_some() {
-                return Err(format!("not built yet: a compaction ({{{shape}}})"));
+                let Some(own) = read(record, id) else {
+                    return Err(format!("{{{shape}}}.{id}: a compaction boundary has no id"));
+                };
+                if field_at(&unit, record, compaction.head).is_some() {
+                    return Err(format!(
+                        "not built yet: a preserved segment ({})",
+                        compaction.head
+                    ));
+                }
+                let replaces = read(record, compaction.parent).unwrap_or_default();
+                let node = if all_ids.contains(&replaces) {
+                    lines.root(header_gap)?
+                } else {
+                    lines.orphan(header_gap)?
+                };
+                tails.insert(
+                    own.clone(),
+                    Line::same(Tail {
+                        node,
+                        header: header_gap,
+                    }),
+                );
+                boundaries.insert(own, replaces);
+                continue;
             }
         }
         let request = requests.filter(|r| r.shape == shape);
@@ -948,6 +977,13 @@ pub fn build(
                 held.push(at);
             }
         }
+        // A record whose parent is a compaction boundary opens the new
+        // context (resolved once every line is built).
+        if let (Some(p), Some(&end)) = (read(record, parent), own_nodes.last()) {
+            if boundaries.contains_key(&p) {
+                continuing.push((end, p));
+            }
+        }
         if same {
             unedited = edited;
         } else {
@@ -1017,6 +1053,49 @@ pub fn build(
             return Err(format!(
                 "{path}: a title before every record that no later title restates"
             ));
+        }
+    }
+    // Every compaction root whose old context is in the unit continues from
+    // its tail at the first node of the new line that is not on the old
+    // line, so no continues path returns to where it starts.
+    let mut continued: HashSet<String> = HashSet::new();
+    for (end, boundary) in continuing {
+        let old = &boundaries[&boundary];
+        if !all_ids.contains(old) {
+            continue;
+        }
+        let Some(tail) = tails.get(old).and_then(|line| line.edited.node) else {
+            return Err(format!(
+                "{}: a compaction root that continues no node",
+                "logicalParentUuid"
+            ));
+        };
+        let mut on_old: HashSet<Id> = HashSet::new();
+        let mut cursor = Some(tail);
+        while let Some(at) = cursor {
+            on_old.insert(at);
+            cursor = lines.places[&at].previous;
+        }
+        let mut new_line = Vec::new();
+        let mut cursor = Some(end);
+        while let Some(at) = cursor {
+            new_line.push(at);
+            cursor = lines.places[&at].previous;
+        }
+        let first = new_line
+            .into_iter()
+            .rev()
+            .find(|node| !on_old.contains(node))
+            .ok_or("a compaction whose new context lies on the old line")?;
+        let mark = lines.marks.entry(first).or_default();
+        if !mark.continues.contains(&tail) {
+            mark.continues.push(tail);
+        }
+        continued.insert(boundary);
+    }
+    for (boundary, old) in &boundaries {
+        if all_ids.contains(old) && !continued.contains(boundary) {
+            return Err("a compaction whose new context holds nothing that continues".to_owned());
         }
     }
     // An end placed on a request: the occurrence of its last item.
