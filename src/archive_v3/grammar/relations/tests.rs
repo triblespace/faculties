@@ -814,3 +814,29 @@ fn a_recap_describes_its_parent_s_line_and_passes_the_line_on() {
     let refused = built(&orphan).expect_err("refused");
     assert!(refused.contains("no node to describe"), "{refused}");
 }
+
+#[test]
+fn an_interruption_ends_the_message_it_names_on_its_last_item() {
+    let mut cut = assistant("a1", "u1", 1, "Hel");
+    cut["message"]["stop_reason"] = json!(null);
+    let mut stop = user("u2", Some("a1"), 2, "Stop.");
+    stop["interruptedMessageId"] = json!("m1");
+    let source = jsonl(&[user("u1", None, 0, "Hi."), cut, stop]);
+    let fragment = built(&source).expect("builds");
+    let hel = node_saying(&fragment, "Hel");
+    let ends: Vec<Vec<Id>> = occurrences_of(&fragment, hel)
+        .into_iter()
+        .map(|o| o.2)
+        .collect();
+    assert_eq!(ends, vec![vec![v3::node::ends::INTERRUPTED]]);
+
+    let mut stray = user("u2", Some("a1"), 2, "Stop.");
+    stray["interruptedMessageId"] = json!("m9");
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        stray,
+    ]);
+    let refused = built(&source).expect_err("refused");
+    assert!(refused.contains("interruptedMessageId"), "{refused}");
+}

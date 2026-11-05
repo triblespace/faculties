@@ -137,6 +137,9 @@ struct Parts {
     /// Glosses on the end of the line of the record's parent
     /// (`Place::ParentTail`): (category, text, path).
     parent_tail: Vec<(Id, String, &'static str)>,
+    /// Ends of the request a value names, on its last item
+    /// (`Place::Request`): (ends term, the request's id, path).
+    request_ends: Vec<(Id, String, &'static str)>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -205,6 +208,15 @@ fn annotate(
             parts.ends.push(ends_term(&name).ok_or("an ends term")?);
         }
         ("rendering", Place::Every) => parts.unrecorded = true,
+        ("ends", Place::Request) => {
+            let name = match decode {
+                Decode::ConstTerm(name) => name,
+                _ => return not_built(),
+            };
+            let term = ends_term(name).ok_or("an ends term")?;
+            let message = spelling(unit, v).ok_or_else(|| format!("{path}: names no request"))?;
+            parts.request_ends.push((term, message, path));
+        }
         (_, Place::Claim) => {
             let claims = &mut parts.claims;
             match (attribute, decode) {
@@ -775,8 +787,11 @@ pub fn build(
     };
     let requests = table.windows.requests;
     let mut tails: HashMap<String, Line> = HashMap::new();
-    // Each request's records so far, and the header it was sampled under.
+    // Each request's records so far, and the header it was sampled under;
+    // and the occurrence of its last item.
     let mut messages: HashMap<String, (Id, HashSet<String>)> = HashMap::new();
+    let mut message_last: HashMap<String, usize> = HashMap::new();
+    let mut request_ends: Vec<(Id, String, &'static str)> = Vec::new();
     // For links: the call ids each node holds, and the results waiting for
     // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
@@ -805,6 +820,7 @@ pub fn build(
             }
         }
         let parts = record_parts(&t, &unit, record, &record_cat)?;
+        request_ends.extend(parts.request_ends.iter().cloned());
         for (category, text, path) in &parts.file_tail {
             file_tail.push((at, *category, text.clone(), path));
         }
@@ -947,6 +963,11 @@ pub fn build(
         // Why the record's last sampling stopped is a claim of its
         // occurrence on the last item's node (M1).
         let last = held.last().copied();
+        if let (Some(_), Some(r)) = (last, request) {
+            // The occurrence the loop below pushes for the last node.
+            let at = occurrences.len() + held.len() - 1;
+            message_last.insert(read(record, r.id).unwrap_or_default(), at);
+        }
         for node in held {
             let ends = if Some(node) == last {
                 parts.ends.clone()
@@ -996,6 +1017,16 @@ pub fn build(
             return Err(format!(
                 "{path}: a title before every record that no later title restates"
             ));
+        }
+    }
+    // An end placed on a request: the occurrence of its last item.
+    for (term, message, path) in request_ends {
+        let at = *message_last
+            .get(&message)
+            .ok_or_else(|| format!("{path}: the request it names is not in the unit"))?;
+        let ends = &mut occurrences[at].1.ends;
+        if !ends.contains(&term) {
+            ends.push(term);
         }
     }
     // Each result answers the nearest node on its own line holding the call
