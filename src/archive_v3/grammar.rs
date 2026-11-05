@@ -576,6 +576,20 @@ impl Table {
             parent: Some(v),
         }
     }
+
+    /// The category of an element of the array at `cat`: the same for every
+    /// index.
+    fn element(&self, unit: &Unit, v: Id, cat: &Cat) -> Cat {
+        let inner = match self.shape(unit, v, &cat.path) {
+            Some(shape) => format!("{}{{{shape}}}", cat.path),
+            None => cat.path.clone(),
+        };
+        Cat {
+            path: format!("{inner}[]"),
+            record: self.record_of(cat, v),
+            parent: Some(v),
+        }
+    }
 }
 
 /// Assembly points the emits skipped because one of their fields needs a

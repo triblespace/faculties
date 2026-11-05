@@ -148,7 +148,8 @@ fn a_record_whose_parent_comes_later_in_the_file_is_refused() {
         user("u1", None, 0, "Hi."),
     ]);
     let refused = built(&source).expect_err("refused");
-    assert!(refused.contains("{user}.parentUuid"), "{refused}");
+    // The refusal names the refusing record's own kind.
+    assert!(refused.contains("{assistant}.parentUuid"), "{refused}");
 }
 
 #[test]
@@ -187,4 +188,146 @@ fn a_missing_parent_opens_with_a_span_of_unknown_items() {
         window_before(&built, hello),
         section_then(&[(UNKNOWN, Some(SPAN)), (TEXT, None)])
     );
+}
+
+#[test]
+fn the_blocks_of_one_record_follow_each_other_in_array_order() {
+    let mut reply = assistant("a1", "u1", 1, "One.");
+    reply["message"]["content"] = json!([
+        {"type": "text", "text": "One."},
+        {"type": "text", "text": "Two."},
+    ]);
+    let source = jsonl(&[user("u1", None, 0, "Hi."), reply]);
+    let built = built(&source).expect("builds");
+    let two = node_saying(&built, "Two.");
+    assert_eq!(
+        window_before(&built, two),
+        section_then(&[(TEXT, None), (TEXT, None)])
+    );
+    let one = node_saying(&built, "One.");
+    assert_eq!(window_before(&built, one), section_then(&[(TEXT, None)]));
+}
+
+/// What a node holds, as (modality, gap kind): vocabulary, never values.
+fn held(fragment: &Fragment, node: Id) -> (Id, Option<Id>) {
+    let facts = fragment.facts();
+    let modality = find!(
+        m: Id,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::modality: ?m }])
+    )
+    .next();
+    let absent = find!(
+        a: Id,
+        pattern!(facts, [{ node @ v3::node::holds: _?f }, { _?f @ v3::fact::absent: ?a }])
+    )
+    .next();
+    (modality.unwrap_or(UNKNOWN), absent)
+}
+
+fn name_of(term: (Id, Option<Id>)) -> String {
+    let m = v3::fact::modality::SPECS
+        .iter()
+        .find(|(id, _)| *id == term.0)
+        .map_or("?", |(_, n)| *n);
+    let a = term
+        .1
+        .and_then(|a| v3::fact::absent::SPECS.iter().find(|(id, _)| *id == a))
+        .map_or("", |(_, n)| *n);
+    format!("{m}/{a}")
+}
+
+/// The first divergence: the importer's next item after the deepest node
+/// both share on a path from the root, and ours, as vocabulary.
+fn first_divergence(ours: &Fragment, theirs: &Fragment) -> Option<(String, String)> {
+    let shared = nodes_of(ours);
+    let tf = theirs.facts();
+    let of = ours.facts();
+    let mut best: Option<(usize, Id, Id)> = None;
+    for (child, parent) in find!(
+        (c: Id, p: Id),
+        pattern!(tf, [{ ?c @ v3::node::previous: ?p }])
+    ) {
+        if shared.contains(&parent) && !shared.contains(&child) {
+            let depth = window_before(theirs, child).len();
+            if best.is_none_or(|(d, _, _)| depth < d) {
+                best = Some((depth, child, parent));
+            }
+        }
+    }
+    let (_, child, parent) = best?;
+    let next_ours: Vec<String> = find!(c: Id, pattern!(of, [{ ?c @ v3::node::previous: parent }]))
+        .map(|c| name_of(held(ours, c)))
+        .collect();
+    Some((name_of(held(theirs, child)), next_ours.join("|")))
+}
+
+/// The node ids of a fragment.
+fn nodes_of(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
+    let facts = fragment.facts();
+    find!(n: Id, pattern!(facts, [{ ?n @ v3::node::holds: _?f }])).collect()
+}
+
+#[test]
+#[ignore = "reads real transcripts named by AV3_SAMPLE; prints no values"]
+fn real_sample_relations() {
+    let list = std::env::var("AV3_SAMPLE").expect("AV3_SAMPLE names a file list");
+    let files: Vec<String> = std::fs::read_to_string(list)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
+    let (mut built_files, mut same, mut ours_only, mut theirs_only) = (0, 0, 0, 0);
+    let mut divergences: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    let mut unstable = 0;
+    for file in &files {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        let Ok(imported) = crate::archive_v3::claude_code::import(&bytes) else {
+            continue;
+        };
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        match built(source) {
+            // A refusal reason is a table path or shape, never a value.
+            Err(reason) => {
+                let reason = reason
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect();
+                *reasons.entry(reason).or_default() += 1;
+            }
+            Ok(fragment) => {
+                built_files += 1;
+                // The same unit must build the same relations every time.
+                if built(source).map(|again| again.facts() == fragment.facts()) != Ok(true) {
+                    unstable += 1;
+                }
+                let ours = nodes_of(&fragment);
+                let theirs = nodes_of(&imported);
+                same += ours.intersection(&theirs).count();
+                ours_only += ours.difference(&theirs).count();
+                theirs_only += theirs.difference(&ours).count();
+                if let Some(d) = first_divergence(&fragment, &imported) {
+                    *divergences.entry(d).or_default() += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "files built {built_files} (built differently twice: {unstable}); nodes: shared {same}, ours only {ours_only}, importer only {theirs_only}"
+    );
+    println!("-- first divergence: files, importer's next item, ours");
+    for ((theirs, ours), n) in &divergences {
+        println!("{n}\t{theirs}\t{ours}");
+    }
+    println!("-- refused: files, reason");
+    for (reason, n) in &reasons {
+        println!("{n}\t{reason}");
+    }
 }
