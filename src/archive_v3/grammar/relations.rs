@@ -22,7 +22,7 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::fields::{Class, Decode, FieldTable, Gap, Order, Place};
+use super::super::fields::{Class, Decode, DropReason, FieldTable, Gap, Order, Place};
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
     Model, NodeAnnotations, WitnessAnnotations,
@@ -349,6 +349,49 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
     Ok(parts)
 }
 
+/// Whether two records with one id hold the same thing: the same shape,
+/// and every top-level member in which they differ is one the table drops
+/// as machinery or a provider id. Values compare by id, which json_tree
+/// derives from content.
+fn same_kept(table: &FieldTable, unit: &Unit, a: Id, b: Id) -> bool {
+    let facts = unit.facts;
+    let members = |record: Id| -> HashMap<String, Id> {
+        find!(
+            (name: Name, value: Id),
+            pattern!(facts, [
+                { record @ json_tree::object_field: _?field },
+                { _?field @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+            ])
+        )
+        .filter_map(|(name, value)| Some((unit.text(name)?, value)))
+        .collect()
+    };
+    let shape = |record: Id| field_at(unit, record, "type").and_then(|v| text_of(unit, v));
+    let (Some(kind), true) = (shape(a), shape(a) == shape(b)) else {
+        return false;
+    };
+    let (left, right) = (members(a), members(b));
+    let names: HashSet<&String> = left.keys().chain(right.keys()).collect();
+    names.into_iter().all(|name| {
+        if left.get(name) == right.get(name) {
+            return true;
+        }
+        let path = format!("{{{kind}}}.{name}");
+        let mut entries = table
+            .entries
+            .iter()
+            .filter(|entry| entry.path == path)
+            .peekable();
+        entries.peek().is_some()
+            && entries.all(|entry| {
+                matches!(
+                    entry.class,
+                    Class::Drop(DropReason::Machinery(_) | DropReason::ProviderId)
+                )
+            })
+    })
+}
+
 /// The end of a line, and the settings header that opens it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Tail {
@@ -516,6 +559,64 @@ pub fn build(
             .filter(|s| s != "null")
     };
     let all_ids: HashSet<String> = records.iter().filter_map(|(_, r)| read(*r, id)).collect();
+    let shape_of = |record: Id| -> String {
+        field_at(&unit, record, "type")
+            .and_then(|v| text_of(&unit, v))
+            .unwrap_or_default()
+    };
+
+    // Repeats, in file order: the first record with an id is the record,
+    // and a repeat must hold the same thing.
+    let mut first: HashMap<String, Id> = HashMap::new();
+    let mut repeat = vec![false; records.len()];
+    for (at, (_, record)) in records.iter().enumerate() {
+        let Some(own) = read(*record, id) else {
+            continue;
+        };
+        match first.get(&own) {
+            Some(&earlier) if same_kept(table, &unit, earlier, *record) => repeat[at] = true,
+            Some(_) => {
+                let shape = shape_of(*record);
+                return Err(format!(
+                    "{{{shape}}}.{id}: a record id repeats with other content"
+                ));
+            }
+            None => {
+                first.insert(own, *record);
+            }
+        }
+    }
+    // Parents before children; otherwise the file's order. A child whose
+    // parent the unit holds but has not built yet waits for it.
+    let mut order = Vec::with_capacity(records.len());
+    let mut done: HashSet<String> = HashSet::new();
+    let mut waiting: HashMap<String, Vec<usize>> = HashMap::new();
+    for (at, (_, record)) in records.iter().enumerate() {
+        if repeat[at] {
+            continue;
+        }
+        if let Some(p) = read(*record, parent) {
+            if all_ids.contains(&p) && !done.contains(&p) {
+                waiting.entry(p).or_default().push(at);
+                continue;
+            }
+        }
+        let mut stack = vec![at];
+        while let Some(next) = stack.pop() {
+            order.push(next);
+            if let Some(own) = read(records[next].1, id) {
+                done.insert(own.clone());
+                if let Some(children) = waiting.remove(&own) {
+                    stack.extend(children.into_iter().rev());
+                }
+            }
+        }
+    }
+    if !waiting.is_empty() {
+        return Err(format!(
+            "{{user}}.{parent}: records whose parent links form a cycle"
+        ));
+    }
 
     let mut lines = Lines {
         table,
@@ -532,21 +633,16 @@ pub fn build(
     };
     let requests = table.windows.requests;
     let mut tails: HashMap<String, Tail> = HashMap::new();
-    let mut first: HashMap<String, Id> = HashMap::new();
     // For links: the call ids each node holds, and the results waiting for
     // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
     let mut answers: Vec<(Id, String)> = Vec::new();
     let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
-    // The end of the line of the latest record so far that names itself,
-    // the file-tail glosses placed, and those before every such record.
-    let mut file_tail: Option<Option<Id>> = None;
-    let mut placed: HashSet<(Id, String)> = HashSet::new();
-    let mut restated: Vec<(Id, String, &'static str)> = Vec::new();
-    for (_, record) in records {
-        let shape = field_at(&unit, record, "type")
-            .and_then(|v| text_of(&unit, v))
-            .unwrap_or_default();
+    // Glosses on the file's tail, by the file position of their record.
+    let mut file_tail: Vec<(usize, Id, String, &'static str)> = Vec::new();
+    for at in order {
+        let record = records[at].1;
+        let shape = shape_of(record);
         if table.windows.prefix.contains(&shape.as_str()) {
             return Err(format!("not built yet: a system section ({{{shape}}})"));
         }
@@ -565,6 +661,9 @@ pub fn build(
             }
         }
         let parts = record_parts(&t, &unit, record, &record_cat)?;
+        for (category, text, path) in &parts.file_tail {
+            file_tail.push((at, *category, text.clone(), path));
+        }
         let claims = &parts.claims;
         let claims_something = !claims.timestamp.is_empty()
             || claims.raw_role.is_some()
@@ -574,22 +673,6 @@ pub fn build(
             || !claims.raw_author.is_empty()
             || claims.harness_written
             || claims.compaction_summary;
-        for (category, text, path) in &parts.file_tail {
-            match file_tail {
-                Some(node) => {
-                    let Some(node) = node else {
-                        return Err("not built yet: a title on an empty line".to_owned());
-                    };
-                    lines.out += unexported(
-                        gloss(node, *category, text).map_err(|e| format!("a gloss: {e}"))?,
-                    );
-                    placed.insert((*category, text.clone()));
-                }
-                // Before every record that names itself there is no line:
-                // a restatement, which a later title must say again.
-                None => restated.push((*category, text.clone(), path)),
-            }
-        }
         let Some(own) = read(record, id) else {
             if !parts.items.is_empty() || claims_something {
                 return Err(format!(
@@ -598,20 +681,6 @@ pub fn build(
             }
             continue;
         };
-        match first.get(&own) {
-            Some(&earlier) if earlier == record => {
-                file_tail = Some(tails[&own].node);
-                continue;
-            }
-            Some(_) => {
-                return Err(format!(
-                    "{{{shape}}}.{id}: a record id repeats with other content"
-                ))
-            }
-            None => {
-                first.insert(own.clone(), record);
-            }
-        }
         if parts.items.is_empty() && claims_something {
             return Err(format!(
                 "{{{shape}}}: a record that holds nothing makes claims"
@@ -640,11 +709,6 @@ pub fn build(
             },
             Some(p) => match tails.get(&p) {
                 Some(&tail) => tail,
-                None if all_ids.contains(&p) => {
-                    return Err(format!(
-                        "{{{shape}}}.{parent}: a record's parent is not built before it"
-                    ))
-                }
                 None => Tail {
                     node: lines.orphan(header_gap)?,
                     header: header_gap,
@@ -698,7 +762,34 @@ pub fn build(
             ));
         }
         tails.insert(own, tail);
-        file_tail = Some(tail.node);
+    }
+    // A gloss on the file's tail describes the end of the line of the latest
+    // record before it in the file that names itself. Before every such
+    // record there is no line: a restatement, which places nothing when a
+    // later gloss of its category, placed after a line, says the same.
+    let named: Vec<(usize, String)> = records
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (_, record))| read(*record, id).map(|own| (at, own)))
+        .collect();
+    let mut placed: HashSet<(Id, String)> = HashSet::new();
+    let mut restated: Vec<(Id, String, &'static str)> = Vec::new();
+    file_tail.sort_by_key(|(at, ..)| *at);
+    for (at, category, text, path) in file_tail {
+        let before = named.iter().rev().find(|(position, _)| *position < at);
+        match before {
+            Some((_, own)) => {
+                let Some(node) = tails.get(own).and_then(|tail| tail.node) else {
+                    return Err(format!(
+                        "not built yet: {path} on a line that holds nothing"
+                    ));
+                };
+                lines.out +=
+                    unexported(gloss(node, category, &text).map_err(|e| format!("a gloss: {e}"))?);
+                placed.insert((category, text));
+            }
+            None => restated.push((category, text, path)),
+        }
     }
     for (category, text, path) in restated {
         if !placed.contains(&(category, text)) {

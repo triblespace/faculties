@@ -141,15 +141,30 @@ fn a_reply_follows_its_prompt_after_the_unrecorded_section() {
     assert_eq!(window_before(&built, hello), section_then(&[(TEXT, None)]));
 }
 
+/// Records are built parents first, so a parent written after its child
+/// is still its parent; only parent links that form a cycle are refused.
+/// (This fixture first said the opposite: I had read one refusal in the
+/// importer's line lookup and missed that it orders records parents first,
+/// claude_code.rs ~163.)
 #[test]
-fn a_record_whose_parent_comes_later_in_the_file_is_refused() {
+fn a_record_whose_parent_comes_later_in_the_file_still_follows_it() {
     let source = jsonl(&[
         assistant("a1", "u1", 1, "Hello."),
         user("u1", None, 0, "Hi."),
     ]);
-    let refused = built(&source).expect_err("refused");
-    // The refusal names the refusing record's own kind.
-    assert!(refused.contains("{assistant}.parentUuid"), "{refused}");
+    let fragment = built(&source).expect("builds");
+    let hello = node_saying(&fragment, "Hello.");
+    assert_eq!(
+        window_before(&fragment, hello),
+        section_then(&[(TEXT, None)])
+    );
+
+    let cycle = jsonl(&[
+        assistant("a1", "u1", 1, "Hello."),
+        user("u1", Some("a1"), 0, "Hi."),
+    ]);
+    let refused = built(&cycle).expect_err("a cycle is refused");
+    assert!(refused.contains("cycle"), "{refused}");
 }
 
 #[test]
@@ -653,4 +668,24 @@ fn a_title_before_every_record_places_nothing_only_when_restated_later() {
 
 fn built_err(source: &str) -> String {
     built(source).expect_err("refused")
+}
+
+#[test]
+fn a_repeat_that_differs_only_in_machinery_is_the_same_record() {
+    let mut again = user("u1", None, 0, "Hi.");
+    again["cwd"] = json!("/elsewhere");
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        again,
+        assistant("a1", "u1", 1, "Hello."),
+    ]);
+    let once = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+    ]);
+    assert_eq!(
+        built(&source).expect("builds").facts(),
+        built(&once).expect("builds").facts(),
+        "a repeat differing only in the client envelope adds nothing"
+    );
 }
