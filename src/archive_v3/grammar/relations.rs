@@ -796,6 +796,11 @@ pub fn build(
     // node of each record that opens a new context under one.
     let mut boundaries: HashMap<String, String> = HashMap::new();
     let mut continuing: Vec<(Id, String)> = Vec::new();
+    // Preserved segments by their anchor: (head, tail); and each record's
+    // own items (fact, node) and parent, which a segment re-presents.
+    let mut segments: HashMap<String, (String, String)> = HashMap::new();
+    let mut record_items: HashMap<String, Vec<(Id, Id)>> = HashMap::new();
+    let mut record_parent: HashMap<String, Option<String>> = HashMap::new();
     // For links: the call ids each node holds, and the results waiting for
     // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
@@ -816,11 +821,18 @@ pub fn build(
                 let Some(own) = read(record, id) else {
                     return Err(format!("{{{shape}}}.{id}: a compaction boundary has no id"));
                 };
-                if field_at(&unit, record, compaction.head).is_some() {
-                    return Err(format!(
-                        "not built yet: a preserved segment ({})",
-                        compaction.head
-                    ));
+                // A preserved segment, re-presented after its anchor.
+                if let Some(head) = read(record, compaction.head) {
+                    let (Some(last), Some(anchor)) = (
+                        read(record, compaction.tail),
+                        read(record, compaction.anchor),
+                    ) else {
+                        return Err(format!(
+                            "{}: a preserved segment is incomplete",
+                            compaction.head
+                        ));
+                    };
+                    segments.insert(anchor, (head, last));
                 }
                 let replaces = read(record, compaction.parent).unwrap_or_default();
                 let node = if all_ids.contains(&replaces) {
@@ -1017,6 +1029,54 @@ pub fn build(
                     ..parts.claims.clone()
                 },
             ));
+        }
+        record_items.insert(
+            own.clone(),
+            own_facts
+                .iter()
+                .copied()
+                .zip(own_nodes.iter().copied())
+                .collect(),
+        );
+        record_parent.insert(own.clone(), read(record, parent));
+        // After the anchor of a preserved segment, the segment is
+        // re-presented: each of its records' items, head first, as copies.
+        if let Some((head, last)) = segments.get(&own).cloned() {
+            let mut chain = Vec::new();
+            let mut cursor = Some(last);
+            while let Some(at) = cursor {
+                chain.push(at.clone());
+                if at == head {
+                    break;
+                }
+                cursor = record_parent.get(&at).cloned().flatten();
+                if cursor.is_none() {
+                    return Err("the preserved segment does not reach its head".to_owned());
+                }
+            }
+            chain.reverse();
+            let mut sequence = Vec::new();
+            for at in &chain {
+                let items = record_items
+                    .get(at)
+                    .ok_or("a preserved record is not built before its anchor")?;
+                sequence.extend(items.iter().copied());
+            }
+            let same = edited == unedited;
+            for (fact_id, original) in &sequence {
+                let node = lines.place(edited.node, *fact_id, false, Some(*original))?;
+                lines.copied(node, *original);
+                edited.node = Some(node);
+            }
+            if same {
+                unedited = edited;
+            } else {
+                for (fact_id, original) in &sequence {
+                    let node = lines.place(unedited.node, *fact_id, false, Some(*original))?;
+                    lines.copied(node, *original);
+                    unedited.node = Some(node);
+                }
+            }
         }
         tails.insert(own, Line { edited, unedited });
     }

@@ -890,3 +890,40 @@ fn a_compaction_of_a_context_outside_the_unit_opens_on_a_span_and_continues_noth
         0
     );
 }
+
+#[test]
+fn a_preserved_segment_is_re_presented_after_its_anchor() {
+    let mut keep = boundary("b1", "u2", 3);
+    keep["compactMetadata"]["preservedSegment"] =
+        json!({"headUuid": "a1", "tailUuid": "u2", "anchorUuid": "s1"});
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        user("u2", Some("a1"), 2, "Keep."),
+        keep,
+        user("s1", Some("b1"), 4, "Summary."),
+        user("u3", Some("s1"), 5, "After."),
+    ]);
+    let fragment = built(&source).expect("builds");
+    let after = node_saying(&fragment, "After.");
+    // The summary, then the preserved segment re-presented after it.
+    assert_eq!(
+        window_before(&fragment, after),
+        section_then(&[(TEXT, None), (TEXT, None), (TEXT, None)])
+    );
+    let facts = fragment.facts();
+    let hellos = nodes_saying(&fragment, "Hello.");
+    let keeps = nodes_saying(&fragment, "Keep.");
+    assert_eq!(
+        (hellos.len(), keeps.len()),
+        (2, 2),
+        "originals and their copies"
+    );
+    let recalls: Vec<(Id, Id)> =
+        find!((n: Id, o: Id), pattern!(facts, [{ ?n @ v3::node::recalls: ?o }])).collect();
+    assert_eq!(
+        recalls.len(),
+        2,
+        "each copy recalls its original: {recalls:?}"
+    );
+}
