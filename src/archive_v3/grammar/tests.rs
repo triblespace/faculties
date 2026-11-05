@@ -9,7 +9,24 @@ use triblespace::core::import::json_tree::{self, JsonTreeImporter};
 use triblespace::core::repo::BlobStore;
 
 use super::*;
-use crate::archive_v3::fields::claude_code::TABLE;
+use crate::archive_v3::fields::FieldTable;
+
+/// The format the real-sample tests read: `AV3_FORMAT=codex`, or Claude Code
+/// by default. The synthetic tests are Claude Code only.
+fn table() -> &'static FieldTable {
+    match std::env::var("AV3_FORMAT").as_deref() {
+        Ok("codex") => &crate::archive_v3::fields::codex::TABLE,
+        _ => &crate::archive_v3::fields::claude_code::TABLE,
+    }
+}
+
+/// The importer of the format [`table`] names.
+fn import_with_importer(bytes: &[u8]) -> Option<Fragment> {
+    match std::env::var("AV3_FORMAT").as_deref() {
+        Ok("codex") => crate::archive_v3::codex::import(bytes).ok(),
+        _ => crate::archive_v3::claude_code::import(bytes).ok(),
+    }
+}
 use crate::archive_v3::gate::{self, Kind};
 use crate::schemas::archive_v3 as v3;
 use std::sync::atomic::Ordering;
@@ -69,7 +86,7 @@ fn result(call: &str, content: Value) -> Value {
 
 /// The walker's classification rows for a unit, as (path, kind).
 fn walker_rows(source: &[u8]) -> Vec<(String, String)> {
-    gate::walk::walk(&TABLE, source)
+    gate::walk::walk(table(), source)
         .rows
         .into_iter()
         .filter(|(_, kind, _)| CLASSIFICATION.contains(kind))
@@ -111,7 +128,7 @@ fn grammar_findings_timed(
                 .map(|f| {
                     let kind = format!("{:?}", f.problem);
                     let kind = kind.split([' ', '{']).next().unwrap_or("").to_owned();
-                    format!("{}\t{kind}", gate::vocabulary(&TABLE, &f.category.path))
+                    format!("{}\t{kind}", gate::vocabulary(table(), &f.category.path))
                 })
                 .collect(),
         ),
@@ -119,7 +136,7 @@ fn grammar_findings_timed(
 }
 
 fn grammar() -> Grammar<Cat> {
-    compile(&TABLE).expect("the Claude Code table compiles")
+    compile(table()).expect("the table compiles")
 }
 
 fn agree(source: &str) -> (Vec<(String, String)>, Vec<String>) {
@@ -196,7 +213,7 @@ fn real_sample_parity() {
         .map(str::to_owned)
         .collect();
     let g = grammar();
-    let mut table: BTreeMap<(bool, bool), usize> = BTreeMap::new();
+    let mut verdicts: BTreeMap<(bool, bool), usize> = BTreeMap::new();
     let mut walker_only: BTreeMap<String, usize> = BTreeMap::new();
     let mut grammar_only: BTreeMap<String, usize> = BTreeMap::new();
     let mut unreadable = 0;
@@ -218,11 +235,11 @@ fn real_sample_parity() {
         };
         let walker_fails = !rows.is_empty();
         let grammar_fails = !findings.is_empty();
-        *table.entry((walker_fails, grammar_fails)).or_default() += 1;
+        *verdicts.entry((walker_fails, grammar_fails)).or_default() += 1;
         if walker_fails && !grammar_fails {
             for (path, kind) in rows.iter().take(3) {
                 *walker_only
-                    .entry(format!("{}\t{kind}", gate::vocabulary(&TABLE, path)))
+                    .entry(format!("{}\t{kind}", gate::vocabulary(table(), path)))
                     .or_default() += 1;
             }
         }
@@ -241,7 +258,7 @@ fn real_sample_parity() {
         covering.as_secs_f64(),
         importing.as_secs_f64()
     );
-    for ((w, gr), n) in &table {
+    for ((w, gr), n) in &verdicts {
         println!("walker-fails {w} grammar-fails {gr}: {n}");
     }
     println!("-- walker fails, grammar accepts: first rows (files, path, kind)");
@@ -358,7 +375,7 @@ fn real_sample_facts() {
         let Ok(bytes) = std::fs::read(file) else {
             continue;
         };
-        let Ok(imported) = crate::archive_v3::claude_code::import(&bytes) else {
+        let Some(imported) = import_with_importer(&bytes) else {
             continue;
         };
         let Ok(text) = std::str::from_utf8(&bytes) else {
