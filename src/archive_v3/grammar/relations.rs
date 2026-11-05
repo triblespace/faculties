@@ -22,13 +22,16 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::fields::{Class, Decode, DropReason, FieldTable, Gap, Order, Place, Rewrite};
+use super::super::fields::{
+    Beside, Class, Decode, DropReason, FieldTable, Gap, Order, Place, Rewrite,
+};
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
     Model, NodeAnnotations, WitnessAnnotations,
 };
 use super::{
-    apply, decode_text, field_at, json_text, kind, spelling, structure, term, text_of, Cat, Table,
+    apply, decode_text, field_at, holds, json_text, kind, spelling, structure, term, text_of, Cat,
+    Table,
 };
 use crate::schemas::archive_v3 as v3;
 
@@ -117,6 +120,8 @@ struct Item {
     answers: Option<String>,
     /// Glosses describing it: (category, text).
     glosses: Vec<(Id, String)>,
+    /// A record holds it (a gap beside a value may stand in no record).
+    held: bool,
 }
 
 /// What one record holds and claims.
@@ -140,6 +145,9 @@ struct Parts {
     /// Ends of the request a value names, on its last item
     /// (`Place::Request`): (ends term, the request's id, path).
     request_ends: Vec<(Id, String, &'static str)>,
+    /// Facts the relations built for the record (gaps beside its values),
+    /// staged with the lines.
+    built: Vec<Fragment>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -314,11 +322,40 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                 calls: Vec::new(),
                 answers: None,
                 glosses: Vec::new(),
+                held: true,
             });
         }
-        let mine = first..parts.items.len();
         let mut consumed = Vec::new();
         t.consumed(unit, value, &at, &mut consumed);
+        // Gaps the rendering rule puts beside a value: an item of their own
+        // right before or after the point's items, held as the rule says.
+        for (entry, v, cat) in &consumed {
+            for rule in t.table.gaps.beside {
+                if rule.at == Beside::Same
+                    || rule.path != entry.path
+                    || !holds(rule.when, unit, t.record_of(cat, *v), cat.parent)
+                {
+                    continue;
+                }
+                let built = gap(&rule.gap)?;
+                let item = Item {
+                    fact: built.root().ok_or("a gap is rooted")?,
+                    modality: term(v3::fact::modality::SPECS, rule.gap.modality),
+                    element: value,
+                    effort: false,
+                    calls: Vec::new(),
+                    answers: None,
+                    glosses: Vec::new(),
+                    held: rule.held,
+                };
+                parts.built.push(built);
+                match rule.at {
+                    Beside::Before => parts.items.insert(first, item),
+                    _ => parts.items.push(item),
+                }
+            }
+        }
+        let mine = first..parts.items.len();
         for (entry, v, _) in consumed {
             match entry.class {
                 Class::Annotation(list) => {
@@ -862,6 +899,9 @@ pub fn build(
         }
         let parts = record_parts(&t, &unit, record, &record_cat)?;
         request_ends.extend(parts.request_ends.iter().cloned());
+        for built in &parts.built {
+            lines.fact(built.clone())?;
+        }
         for (category, text, path) in &parts.file_tail {
             file_tail.push((at, *category, text.clone(), path));
         }
@@ -985,7 +1025,7 @@ pub fn build(
                     mark.rendering.push(v3::node::rendering::UNRECORDED);
                 }
             }
-            if !held.contains(&at) {
+            if item.held && !held.contains(&at) {
                 held.push(at);
             }
         }
