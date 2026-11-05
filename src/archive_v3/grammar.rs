@@ -512,7 +512,15 @@ impl Table {
             let core = at(&mut cores, key.0, key.1)?;
             core.structure = Some(structure(&text)?);
         }
-        Some(cores.into_iter().map(|(_, core)| core).collect())
+        // A fact every field of which held no value is no fact: the walker
+        // renders nothing for it.
+        Some(
+            cores
+                .into_iter()
+                .map(|(_, core)| core)
+                .filter(|core| !holds_nothing(core))
+                .collect(),
+        )
     }
 
     /// The facts of the value an instance covers, when it sits at an
@@ -590,19 +598,26 @@ fn term_specs(attribute: &str) -> Option<&'static [(Id, &'static str)]> {
     })
 }
 
-fn decode_text(decode: Decode, unit: &Unit, v: Id) -> Option<String> {
-    match decode {
-        Decode::Text => text_of(unit, v),
-        Decode::TextThen(then) => text_of(unit, v).map(|text| text + then),
+/// The text a text decode reads, as the walker renders it: an empty `Text`
+/// is no value (`Some(None)`), and an empty `TextThen` fails, since what an
+/// empty rendering became is unverified.
+fn decode_text(decode: Decode, unit: &Unit, v: Id) -> Option<Option<String>> {
+    Some(match decode {
+        Decode::Text => Some(text_of(unit, v)?).filter(|text| !text.is_empty()),
+        Decode::TextThen(then) => {
+            let text = text_of(unit, v)?;
+            if text.is_empty() {
+                return None;
+            }
+            Some(text + then)
+        }
         Decode::ConstText(text) => Some(text.to_owned()),
         Decode::TextMap(map) => {
             let spelling = spelling(unit, v)?;
-            map.iter()
-                .find(|(from, _)| *from == spelling)
-                .map(|(_, to)| (*to).to_owned())
+            Some(map.iter().find(|(from, _)| *from == spelling)?.1.to_owned())
         }
-        _ => None,
-    }
+        _ => return None,
+    })
 }
 
 /// The JSON text of a json_tree value. Objects are sets, so member order
@@ -811,7 +826,9 @@ fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: I
         core.structure = Some(structure(&text)?);
         return Some(());
     }
-    let text = decode_text(decode, unit, v)?;
+    let Some(text) = decode_text(decode, unit, v)? else {
+        return Some(());
+    };
     match attribute {
         "payload" => core.payload = Some(text),
         "tool_name" => core.tool_name = Some(text),
@@ -822,6 +839,26 @@ fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: I
         _ => return None,
     }
     Some(())
+}
+
+/// Whether a fact holds nothing beyond its modality and direction.
+fn holds_nothing(core: &FactCore) -> bool {
+    core.payload.is_none()
+        && core.blob.is_none()
+        && core.structure.is_none()
+        && core.tool_name.is_none()
+        && core.tool_namespace.is_none()
+        && core.status.is_none()
+        && core.exit_code.is_none()
+        && core.media_type.is_none()
+        && core.source_uri.is_empty()
+        && core.title.is_none()
+        && core.sense.is_none()
+        && core.detail.is_none()
+        && core.register.is_none()
+        && core.form.is_none()
+        && core.absent.is_none()
+        && core.effort.is_none()
 }
 
 fn nothing(anchor: Id) -> Fragment {

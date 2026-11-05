@@ -387,7 +387,7 @@ fn real_sample_facts() {
                     *shapes
                         .entry(("grammar".into(), keys(&image, *id)))
                         .or_default() += 1;
-                } else if modality == "system" {
+                } else {
                     *shapes
                         .entry(("grammar".into(), shape(&image, *id)))
                         .or_default() += 1;
@@ -401,7 +401,7 @@ fn real_sample_facts() {
                     *shapes
                         .entry(("importer".into(), keys(&imported, *id)))
                         .or_default() += 1;
-                } else if modality == "system" {
+                } else {
                     *shapes
                         .entry(("importer".into(), shape(&imported, *id)))
                         .or_default() += 1;
@@ -421,7 +421,7 @@ fn real_sample_facts() {
     for (modality, n) in &importer_only {
         println!("{n}\t{modality}");
     }
-    println!("-- unmatched system and event facts: side, attribute names");
+    println!("-- unmatched facts: side, attribute names (events: their structure's keys)");
     for ((side, attributes), n) in &shapes {
         println!("{n}\t{side}\t{attributes}");
     }
