@@ -281,6 +281,9 @@ struct Table {
     /// present, which says nothing about another unit. Every entry anchor of
     /// a family asks the same question, so it is answered once.
     chosen: Mutex<(u64, HashMap<(Id, Cat), Vec<&'static Entry>>)>,
+    /// A value's shape at each path it was asked at, within one unit: every
+    /// member's child category asks for its parent's.
+    shapes: Mutex<(u64, HashMap<Id, HashMap<String, Option<String>>>)>,
 }
 
 impl Table {
@@ -294,6 +297,7 @@ impl Table {
             known: known_paths(table),
             by_path,
             chosen: Mutex::new((u64::MAX, HashMap::new())),
+            shapes: Mutex::new((u64::MAX, HashMap::new())),
         }
     }
 
@@ -310,6 +314,28 @@ impl Table {
         if kind(unit, v) != Some(json_tree::kind_object) {
             return None;
         }
+        {
+            let mut cache = self.shapes.lock().unwrap();
+            if cache.0 != unit.run() {
+                *cache = (unit.run(), HashMap::new());
+            }
+            if let Some(shape) = cache.1.get(&v).and_then(|known| known.get(path)) {
+                return shape.clone();
+            }
+        }
+        let shape = self.compute_shape(unit, v, path);
+        let mut cache = self.shapes.lock().unwrap();
+        if cache.0 == unit.run() {
+            cache
+                .1
+                .entry(v)
+                .or_default()
+                .insert(path.to_owned(), shape.clone());
+        }
+        shape
+    }
+
+    fn compute_shape(&self, unit: &Unit, v: Id, path: &str) -> Option<String> {
         let mut at = path.to_owned();
         let mut shapes = Vec::new();
         for key in self.table.discriminators {
