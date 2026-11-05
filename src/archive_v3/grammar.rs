@@ -946,5 +946,7 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
     Grammar::new(constructions).map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
+pub mod relations;
+
 #[cfg(test)]
 mod tests;
