@@ -689,3 +689,76 @@ fn a_repeat_that_differs_only_in_machinery_is_the_same_record() {
         "a repeat differing only in the client envelope adds nothing"
     );
 }
+
+/// Along the window before `node`, root first: each held fact's (modality,
+/// direction, form).
+fn window_forms(fragment: &Fragment, node: Id) -> Vec<(Option<Id>, Option<Id>, Option<Id>)> {
+    let facts = fragment.facts();
+    let previous = |at: Id| find!(p: Id, pattern!(facts, [{ at @ v3::node::previous: ?p }])).next();
+    let mut out = Vec::new();
+    let mut cursor = previous(node);
+    while let Some(at) = cursor {
+        let m = find!(m: Id, pattern!(facts, [{ at @ v3::node::holds: _?f }, { _?f @ v3::fact::modality: ?m }])).next();
+        let d = find!(d: Id, pattern!(facts, [{ at @ v3::node::holds: _?f }, { _?f @ v3::fact::direction: ?d }])).next();
+        let f = find!(f: Id, pattern!(facts, [{ at @ v3::node::holds: _?x }, { _?x @ v3::fact::form: ?f }])).next();
+        out.push((m, d, f));
+        cursor = previous(at);
+    }
+    out.reverse();
+    out
+}
+
+fn rewrite_transcript(sent: Value) -> String {
+    let mut call = assistant("a1", "u1", 1, "unused");
+    call["message"]["content"] = json!([{"type": "tool_use", "id": "t1", "name": "Read",
+        "input": {"file_path": "/x"}, "caller": {"type": "direct"}}]);
+    call["message"]["stop_reason"] = json!("tool_use");
+    if !sent.is_null() {
+        call["wireToolInputs"] = json!({"t1": sent});
+    }
+    let mut result = user("u2", Some("a1"), 2, "unused");
+    result["message"]["content"] = json!([{"type": "tool_result", "tool_use_id": "t1",
+        "content": "fine", "is_error": false}]);
+    let mut done = assistant("a2", "u2", 3, "Done.");
+    done["message"]["id"] = json!("m2");
+    done["requestId"] = json!("req-m2");
+    jsonl(&[user("u1", None, 0, "Hi."), call, result, done])
+}
+
+#[test]
+fn a_call_the_client_rewrote_stands_rewritten_in_later_requests_only() {
+    use v3::fact::{
+        direction::{IN, OUT},
+        form::REWRITTEN,
+        modality::TOOL_CALL,
+    };
+    let built = built(&rewrite_transcript(json!({"file_path": "/y"}))).expect("builds");
+    let done = node_saying(&built, "Done.");
+    let later = window_forms(&built, done);
+    assert!(
+        later.contains(&(Some(TOOL_CALL), Some(IN), Some(REWRITTEN))),
+        "the next request holds what the client sent: {later:?}"
+    );
+    assert!(!later.contains(&(Some(TOOL_CALL), Some(OUT), None)));
+    // The result's own window holds her call as she wrote it.
+    let facts = built.facts();
+    let heads: Vec<Id> = find!(
+        n: Id,
+        pattern!(facts, [{ ?n @ v3::node::responds_to: _?call }])
+    )
+    .collect();
+    assert_eq!(heads.len(), 1);
+    let own = window_forms(&built, heads[0]);
+    assert!(own.contains(&(Some(TOOL_CALL), Some(OUT), None)), "{own:?}");
+    assert!(!own.iter().any(|(_, _, f)| *f == Some(REWRITTEN)));
+
+    // A sent input the same as hers is a copy: it changes nothing.
+    assert_eq!(
+        built_facts(&rewrite_transcript(json!({"file_path": "/x"}))),
+        built_facts(&rewrite_transcript(Value::Null))
+    );
+}
+
+fn built_facts(source: &str) -> TribleSet {
+    built(source).expect("builds").facts().clone()
+}

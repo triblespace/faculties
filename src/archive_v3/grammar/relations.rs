@@ -22,12 +22,14 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::fields::{Class, Decode, DropReason, FieldTable, Gap, Order, Place};
+use super::super::fields::{Class, Decode, DropReason, FieldTable, Gap, Order, Place, Rewrite};
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
     Model, NodeAnnotations, WitnessAnnotations,
 };
-use super::{decode_text, field_at, kind, spelling, term, text_of, Cat, Table};
+use super::{
+    apply, decode_text, field_at, json_text, kind, spelling, structure, term, text_of, Cat, Table,
+};
 use crate::schemas::archive_v3 as v3;
 
 type Name = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -105,6 +107,9 @@ fn points(
 struct Item {
     fact: Id,
     modality: Option<Id>,
+    /// The value of the assembly point it came from: an array element, or
+    /// the record itself.
+    element: Id,
     /// It carries a request's settings (`effort`): the window's header.
     effort: bool,
     /// The call ids it is a call of, and the call id a result names.
@@ -126,6 +131,9 @@ struct Parts {
     /// Glosses on the end of the line of the latest record before it in
     /// the file that names itself (`Place::FileTail`): (category, text).
     file_tail: Vec<(Id, String, &'static str)>,
+    /// What the client sent in later requests in place of members of its
+    /// calls (`Class::Rewrite`), with the object that holds it.
+    rewrites: Vec<(Rewrite, &'static str, Id)>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -282,6 +290,7 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
             parts.items.push(Item {
                 fact: built.root().ok_or("a fact is rooted")?,
                 modality,
+                element: value,
                 effort,
                 calls: Vec::new(),
                 answers: None,
@@ -334,7 +343,8 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
                         }
                     }
                 }
-                Class::Rewrite(_) | Class::Supply(_) => {
+                Class::Rewrite(rewrite) => parts.rewrites.push((rewrite, entry.path, v)),
+                Class::Supply(_) => {
                     return Err(
                         format!("not built yet: a {:?} at {}", entry.class, entry.path)
                             .chars()
@@ -347,6 +357,101 @@ fn record_parts(t: &Table, unit: &Unit, record: Id, cat: &Cat) -> Result<Parts, 
         }
     }
     Ok(parts)
+}
+
+/// The items a record leaves for later requests: its own, except that a
+/// call whose member the client sent changed stands as what it sent
+/// (`Class::Rewrite`). A member equal to hers is a copy and changes
+/// nothing; one that names no call of the record is refused.
+fn wired(
+    unit: &Unit,
+    record: Id,
+    items: &[&Item],
+    rewrites: &[(Rewrite, &'static str, Id)],
+    staged: &mut HashMap<Id, Fragment>,
+) -> Result<Vec<Id>, String> {
+    let facts = unit.facts;
+    let mut out: Vec<Id> = items.iter().map(|item| item.fact).collect();
+    for (rewrite, path, object) in rewrites {
+        let calls: Vec<Id> = field_at(unit, record, rewrite.array)
+            .map(|array| {
+                find!(
+                    element: Id,
+                    pattern!(facts, [{ _?entry @
+                        json_tree::array_parent: array,
+                        json_tree::array_value: ?element,
+                    }])
+                )
+                .collect()
+            })
+            .unwrap_or_default();
+        let sent: Vec<(Name, Id)> = find!(
+            (name: Name, value: Id),
+            pattern!(facts, [
+                { *object @ json_tree::object_field: _?field },
+                { _?field @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+            ])
+        )
+        .collect();
+        for (name, value) in sent {
+            let key = unit.text(name).ok_or("a rewritten member's name")?;
+            let named: Vec<Id> = calls
+                .iter()
+                .copied()
+                .filter(|call| {
+                    field_at(unit, *call, rewrite.key)
+                        .and_then(|k| text_of(unit, k))
+                        .is_some_and(|k| k == key)
+                })
+                .collect();
+            let [call] = named.as_slice() else {
+                return Err(format!(
+                    "{path}: a rewritten member names no single call of its record"
+                ));
+            };
+            // The same value has the same id: json_tree derives it from
+            // content.
+            if field_at(unit, *call, rewrite.member) == Some(value) {
+                continue;
+            }
+            let mut core = FactCore {
+                modality: term(v3::fact::modality::SPECS, rewrite.modality),
+                direction: term(v3::fact::direction::SPECS, rewrite.direction),
+                ..FactCore::default()
+            };
+            let mut text = String::new();
+            json_text(unit, value, &mut text).ok_or_else(|| format!("{path}: the sent value"))?;
+            match rewrite.value {
+                ("structure", Decode::Json) => {
+                    core.structure =
+                        Some(structure(&text).ok_or_else(|| format!("{path}: the sent JSON"))?);
+                }
+                _ => {
+                    return Err(format!(
+                        "not built yet: a rewrite's value as {}",
+                        rewrite.value.0
+                    ))
+                }
+            }
+            if let Some(name) = field_at(unit, *call, rewrite.name.0) {
+                apply(&mut core, rewrite.name.1, Decode::Text, unit, name)
+                    .ok_or_else(|| format!("{path}: the call's name"))?;
+            }
+            for (attribute, decode) in rewrite.with {
+                apply(&mut core, attribute, *decode, unit, value)
+                    .ok_or_else(|| format!("{path}: {attribute}"))?;
+            }
+            let built = fact(core).map_err(|e| format!("{path}: {e}"))?;
+            let id = built.root().ok_or("a fact is rooted")?;
+            staged.insert(id, unexported(built));
+            for (at, item) in items.iter().enumerate() {
+                if item.element == *call {
+                    out[at] = id;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Whether two records with one id hold the same thing: the same shape,
@@ -410,11 +515,33 @@ struct Position {
     original: Id,
 }
 
+/// What a record leaves for its children: the line the source marks, and
+/// the same history as later requests are sent it (with the client's
+/// rewrites), which a new request starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Line {
+    edited: Tail,
+    unedited: Tail,
+}
+
+impl Line {
+    fn same(tail: Tail) -> Self {
+        Line {
+            edited: tail,
+            unedited: tail,
+        }
+    }
+}
+
 /// The lines being built: every node with its place, the windows' roots per
-/// header, and the node annotations.
+/// header, and the node annotations. Nodes, and the facts only relations
+/// build, are staged: only those on the line of a node a record holds are
+/// emitted.
 struct Lines<'t> {
     table: &'t FieldTable,
     out: Fragment,
+    nodes: HashMap<Id, Fragment>,
+    facts: HashMap<Id, Fragment>,
     places: HashMap<Id, Position>,
     roots: HashMap<Id, Option<Id>>,
     orphans: HashMap<Id, Option<Id>>,
@@ -424,7 +551,7 @@ struct Lines<'t> {
 impl Lines<'_> {
     fn fact(&mut self, built: Fragment) -> Result<Id, String> {
         let at = built.root().ok_or("a fact is rooted")?;
-        self.out += unexported(built);
+        self.facts.insert(at, unexported(built));
         Ok(at)
     }
 
@@ -439,7 +566,7 @@ impl Lines<'_> {
         let holds = Fragment::rooted(fact_id, TribleSet::new());
         let built = node(previous, holds).map_err(|e| format!("a node does not build: {e}"))?;
         let id = built.root().ok_or("a node is rooted")?;
-        self.out += unexported(built);
+        self.nodes.entry(id).or_insert_with(|| unexported(built));
         self.places.entry(id).or_insert(Position {
             previous,
             fact: fact_id,
@@ -485,6 +612,26 @@ impl Lines<'_> {
         Ok(tail)
     }
 
+    /// A copy of `original` at `node`, when they differ: it recalls what it
+    /// re-presents, and keeps its rendering.
+    fn copied(&mut self, node: Id, original: Id) {
+        if node == original {
+            return;
+        }
+        let rendering = self
+            .marks
+            .get(&original)
+            .map(|m| m.rendering.clone())
+            .unwrap_or_default();
+        let mark = self.marks.entry(node).or_default();
+        if !mark.recalls.contains(&original) {
+            mark.recalls.push(original);
+        }
+        if mark.rendering.is_empty() {
+            mark.rendering = rendering;
+        }
+    }
+
     /// The same line under another header: its items re-presented after
     /// the new one, each recalling the node it copies.
     fn rebuild(&mut self, tail: Tail, header: Id) -> Result<Tail, String> {
@@ -504,21 +651,7 @@ impl Lines<'_> {
         let mut node = self.root(header)?;
         for item in sequence {
             let at = self.place(node, item.fact, false, Some(item.original))?;
-            if at != item.original {
-                // A copy recalls what it re-presents, and keeps its rendering.
-                let rendering = self
-                    .marks
-                    .get(&item.original)
-                    .map(|m| m.rendering.clone())
-                    .unwrap_or_default();
-                let mark = self.marks.entry(at).or_default();
-                if !mark.recalls.contains(&item.original) {
-                    mark.recalls.push(item.original);
-                }
-                if mark.rendering.is_empty() {
-                    mark.rendering = rendering;
-                }
-            }
+            self.copied(at, item.original);
             node = Some(at);
         }
         Ok(Tail { node, header })
@@ -621,6 +754,8 @@ pub fn build(
     let mut lines = Lines {
         table,
         out: Fragment::empty(),
+        nodes: HashMap::new(),
+        facts: HashMap::new(),
         places: HashMap::new(),
         roots: HashMap::new(),
         orphans: HashMap::new(),
@@ -632,7 +767,9 @@ pub fn build(
         None => return Err("not built yet: a table with no header gap".to_owned()),
     };
     let requests = table.windows.requests;
-    let mut tails: HashMap<String, Tail> = HashMap::new();
+    let mut tails: HashMap<String, Line> = HashMap::new();
+    // Each request's records so far, and the header it was sampled under.
+    let mut messages: HashMap<String, (Id, HashSet<String>)> = HashMap::new();
     // For links: the call ids each node holds, and the results waiting for
     // their call.
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
@@ -702,27 +839,61 @@ pub fn build(
                 items.push(item);
             }
         }
-        let mut tail = match read(record, parent) {
-            None => Tail {
+        let from = match read(record, parent) {
+            None => Line::same(Tail {
                 node: lines.root(header_gap)?,
                 header: header_gap,
-            },
+            }),
             Some(p) => match tails.get(&p) {
-                Some(&tail) => tail,
-                None => Tail {
+                Some(&line) => line,
+                None => Line::same(Tail {
                     node: lines.orphan(header_gap)?,
                     header: header_gap,
-                },
+                }),
             },
         };
-        if request.is_some() {
-            tail = lines.rebuild(tail, header.unwrap_or(header_gap))?;
+        let (mut edited, mut unedited) = (from.edited, from.unedited);
+        if let Some(r) = request {
+            // One request spans the records that share its id. Its window is
+            // decided once, from the unedited history its first record
+            // continues; a record continuing it continues its parent's line.
+            let header = header.unwrap_or(header_gap);
+            let message = read(record, r.id).unwrap_or_default();
+            let continuing = read(record, parent).is_some_and(|p| {
+                messages
+                    .get(&message)
+                    .is_some_and(|(_, records)| records.contains(&p))
+            });
+            let from = if continuing {
+                from
+            } else {
+                Line::same(lines.rebuild(from.unedited, header)?)
+            };
+            let (sampled, records) = messages
+                .entry(message)
+                .or_insert_with(|| (header, HashSet::new()));
+            if *sampled != header {
+                return Err(format!(
+                    "{{{shape}}}: the records of one request name different settings"
+                ));
+            }
+            records.insert(own.clone());
+            edited = lines.rebuild(from.edited, header)?;
+            unedited = lines.rebuild(from.unedited, header)?;
         }
+        // What later requests hold: the same items, with the client's
+        // rewrites standing in for the calls it changed. Whether the two
+        // lines stay one is decided before either grows.
+        let wired = wired(&unit, record, &items, &parts.rewrites, &mut lines.facts)?;
+        let own_facts: Vec<Id> = items.iter().map(|item| item.fact).collect();
+        let same = edited == unedited && wired == own_facts;
         // The nodes the record holds, each once, in record order.
         let mut held: Vec<Id> = Vec::new();
-        for item in items {
-            let at = lines.place(tail.node, item.fact, false, None)?;
-            tail.node = Some(at);
+        let mut own_nodes: Vec<Id> = Vec::new();
+        for item in &items {
+            let at = lines.place(edited.node, item.fact, false, None)?;
+            edited.node = Some(at);
+            own_nodes.push(at);
             calls_at
                 .entry(at)
                 .or_default()
@@ -744,6 +915,18 @@ pub fn build(
                 held.push(at);
             }
         }
+        if same {
+            unedited = edited;
+        } else {
+            for (at, fact_id) in wired.iter().enumerate() {
+                let original = (*fact_id == own_facts[at]).then_some(own_nodes[at]);
+                let node = lines.place(unedited.node, *fact_id, false, original)?;
+                if let Some(original) = original {
+                    lines.copied(node, original);
+                }
+                unedited.node = Some(node);
+            }
+        }
         // Why the record's last sampling stopped is a claim of its
         // occurrence on the last item's node (M1).
         let last = held.last().copied();
@@ -761,7 +944,7 @@ pub fn build(
                 },
             ));
         }
-        tails.insert(own, tail);
+        tails.insert(own, Line { edited, unedited });
     }
     // A gloss on the file's tail describes the end of the line of the latest
     // record before it in the file that names itself. Before every such
@@ -779,7 +962,7 @@ pub fn build(
         let before = named.iter().rev().find(|(position, _)| *position < at);
         match before {
             Some((_, own)) => {
-                let Some(node) = tails.get(own).and_then(|tail| tail.node) else {
+                let Some(node) = tails.get(own).and_then(|line| line.edited.node) else {
                     return Err(format!(
                         "not built yet: {path} on a line that holds nothing"
                     ));
@@ -819,9 +1002,37 @@ pub fn build(
             mark.responds_to.push(target);
         }
     }
-    let Lines { mut out, marks, .. } = lines;
+    // Every node on the line of a node a record holds, and nothing else: a
+    // line built along the way that no record's window holds is not
+    // emitted.
+    let mut emitted: HashSet<Id> = HashSet::new();
+    for (node, _) in &occurrences {
+        let mut cursor = Some(*node);
+        while let Some(at) = cursor {
+            if !emitted.insert(at) {
+                break;
+            }
+            cursor = lines.places[&at].previous;
+        }
+    }
+    let Lines {
+        mut out,
+        marks,
+        nodes,
+        facts: staged,
+        places,
+        ..
+    } = lines;
+    for node in &emitted {
+        out += nodes[node].clone();
+        if let Some(held) = staged.get(&places[node].fact) {
+            out += held.clone();
+        }
+    }
     for (node, annotations) in &marks {
-        out += annotate_node(*node, annotations);
+        if emitted.contains(node) {
+            out += annotate_node(*node, annotations);
+        }
     }
     // Witnesses: one per node a record holds, and one occurrence of it per
     // record. Two records whose own claims are the same converge on one
