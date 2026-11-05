@@ -123,6 +123,9 @@ struct Parts {
     ends: Vec<Id>,
     /// Its items' rendering is unrecorded (`Place::Every`).
     unrecorded: bool,
+    /// Glosses on the end of the line of the latest record before it in
+    /// the file that names itself (`Place::FileTail`): (category, text).
+    file_tail: Vec<(Id, String, &'static str)>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -136,7 +139,7 @@ fn ends_term(name: &str) -> Option<Id> {
 fn annotate(
     parts: &mut Parts,
     point_items: std::ops::Range<usize>,
-    path: &str,
+    path: &'static str,
     attribute: &str,
     decode: Decode,
     place: Place,
@@ -152,11 +155,15 @@ fn annotate(
         decode_text(decode, unit, v).ok_or_else(|| format!("{path}: {attribute} does not decode"))
     };
     if let Some(category) = attribute.strip_prefix("gloss:") {
+        let category = term(v3::gloss::category::SPECS, category).ok_or("a gloss category")?;
+        let Some(text) = text()? else { return Ok(()) };
+        if place == Place::FileTail {
+            parts.file_tail.push((category, text, path));
+            return Ok(());
+        }
         if place != Place::Here {
             return not_built();
         }
-        let category = term(v3::gloss::category::SPECS, category).ok_or("a gloss category")?;
-        let Some(text) = text()? else { return Ok(()) };
         // The item at the value's own place whose modality is the place's
         // only one.
         let at = point_items.clone();
@@ -531,6 +538,11 @@ pub fn build(
     let mut calls_at: HashMap<Id, Vec<String>> = HashMap::new();
     let mut answers: Vec<(Id, String)> = Vec::new();
     let mut occurrences: Vec<(Id, WitnessAnnotations)> = Vec::new();
+    // The end of the line of the latest record so far that names itself,
+    // the file-tail glosses placed, and those before every such record.
+    let mut file_tail: Option<Option<Id>> = None;
+    let mut placed: HashSet<(Id, String)> = HashSet::new();
+    let mut restated: Vec<(Id, String, &'static str)> = Vec::new();
     for (_, record) in records {
         let shape = field_at(&unit, record, "type")
             .and_then(|v| text_of(&unit, v))
@@ -562,6 +574,22 @@ pub fn build(
             || !claims.raw_author.is_empty()
             || claims.harness_written
             || claims.compaction_summary;
+        for (category, text, path) in &parts.file_tail {
+            match file_tail {
+                Some(node) => {
+                    let Some(node) = node else {
+                        return Err("not built yet: a title on an empty line".to_owned());
+                    };
+                    lines.out += unexported(
+                        gloss(node, *category, text).map_err(|e| format!("a gloss: {e}"))?,
+                    );
+                    placed.insert((*category, text.clone()));
+                }
+                // Before every record that names itself there is no line:
+                // a restatement, which a later title must say again.
+                None => restated.push((*category, text.clone(), path)),
+            }
+        }
         let Some(own) = read(record, id) else {
             if !parts.items.is_empty() || claims_something {
                 return Err(format!(
@@ -571,7 +599,10 @@ pub fn build(
             continue;
         };
         match first.get(&own) {
-            Some(&earlier) if earlier == record => continue,
+            Some(&earlier) if earlier == record => {
+                file_tail = Some(tails[&own].node);
+                continue;
+            }
             Some(_) => {
                 return Err(format!(
                     "{{{shape}}}.{id}: a record id repeats with other content"
@@ -667,6 +698,14 @@ pub fn build(
             ));
         }
         tails.insert(own, tail);
+        file_tail = Some(tail.node);
+    }
+    for (category, text, path) in restated {
+        if !placed.contains(&(category, text)) {
+            return Err(format!(
+                "{path}: a title before every record that no later title restates"
+            ));
+        }
     }
     // Each result answers the nearest node on its own line holding the call
     // it names (C1). A copy holds what its original held.

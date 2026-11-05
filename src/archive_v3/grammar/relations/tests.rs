@@ -591,3 +591,66 @@ fn node_saying_in(fragment: &Fragment, text: &str, count: usize) -> Id {
     assert_eq!(found.len(), count, "{count} node(s) hold {text:?}");
     found[0]
 }
+
+fn title(text: &str) -> Value {
+    json!({"type": "ai-title", "aiTitle": text, "sessionId": "s-1"})
+}
+
+/// The nodes a title gloss with this text describes.
+fn titled(fragment: &Fragment, text: &str) -> Vec<Id> {
+    let handle = {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        blob.get_handle()
+    };
+    let facts = fragment.facts();
+    find!(
+        node: Id,
+        pattern!(facts, [{ _?g @
+            v3::gloss::describes: ?node,
+            v3::gloss::category: (v3::gloss::category::TITLE),
+            v3::gloss::text: handle,
+        }])
+    )
+    .collect()
+}
+
+#[test]
+fn a_title_describes_the_line_of_the_record_before_it_in_the_file() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        title("Greeting"),
+    ]);
+    let built = built(&source).expect("builds");
+    assert_eq!(
+        titled(&built, "Greeting"),
+        vec![node_saying(&built, "Hello.")]
+    );
+}
+
+#[test]
+fn a_title_before_every_record_places_nothing_only_when_restated_later() {
+    let restated = jsonl(&[
+        title("Greeting"),
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        title("Greeting"),
+    ]);
+    let built = built(&restated).expect("a restatement builds");
+    assert_eq!(
+        titled(&built, "Greeting"),
+        vec![node_saying(&built, "Hello.")]
+    );
+
+    let alone = jsonl(&[
+        title("Greeting"),
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+    ]);
+    let refused = built_err(&alone);
+    assert!(refused.contains("title"), "{refused}");
+}
+
+fn built_err(source: &str) -> String {
+    built(source).expect_err("refused")
+}
