@@ -416,9 +416,15 @@ impl Table {
         .collect();
         for (name, value) in members {
             let child = self.child(unit, v, cat, &PathStep::Field(name));
-            if kind(unit, value) != Some(json_tree::kind_array) {
-                self.consumed(unit, value, &child, out);
+            // An array an entry consumes whole (a structure member, tool
+            // JSON) belongs here. An array the walk descends into does not:
+            // each of its elements is an assembly point of its own.
+            if kind(unit, value) == Some(json_tree::kind_array)
+                && self.chosen(unit, value, &child).len() != 1
+            {
+                continue;
             }
+            self.consumed(unit, value, &child, out);
         }
     }
 
@@ -451,6 +457,7 @@ impl Table {
             };
             Some(&mut cores[at].1)
         }
+        let mut assembled: Vec<((&'static str, &'static str), Members)> = Vec::new();
         for (entry, value, cat) in consumed {
             // A gap the rendering rule puts on the value's own fact: its body
             // is not in the source.
@@ -476,12 +483,63 @@ impl Table {
                 continue;
             };
             let core = at(&mut cores, modality, direction)?;
+            if let Decode::Member(pointer) = decode {
+                // The importer splits the pointer as it is spelled.
+                let steps: Vec<&str> = pointer.split('/').skip(1).collect();
+                let mut text = String::new();
+                json_text(unit, value, &mut text)?;
+                let tree = match assembled
+                    .iter()
+                    .position(|(key, _)| *key == (modality, direction))
+                {
+                    Some(at) => &mut assembled[at].1,
+                    None => {
+                        assembled.push(((modality, direction), Members::Object(Vec::new())));
+                        &mut assembled.last_mut()?.1
+                    }
+                };
+                tree.insert(&steps, text)?;
+                continue;
+            }
             apply(core, attribute, decode, unit, value)?;
             for (attribute, decode) in with {
                 apply(core, attribute, *decode, unit, value)?;
             }
         }
+        for (key, tree) in assembled {
+            let mut text = String::new();
+            tree.render(&mut text)?;
+            let core = at(&mut cores, key.0, key.1)?;
+            core.structure = Some(structure(&text)?);
+        }
         Some(cores.into_iter().map(|(_, core)| core).collect())
+    }
+
+    /// The facts of the value an instance covers, when it sits at an
+    /// assembly point: an array element, or the record outside every array.
+    /// Either construction can cover one, since a scalar element is
+    /// consumed whole by its entry.
+    fn emit_point(&self, inst: &triblespace_cxg::Instance<Cat>) -> Fragment {
+        let cat = inst.category;
+        if !(cat.path.ends_with("[]") || cat.path == self.table.record) {
+            return nothing(inst.anchor);
+        }
+        let Some(cores) = self.assemble(&inst.unit, inst.anchor, cat) else {
+            SKIPPED.fetch_add(1, Ordering::Relaxed);
+            return nothing(inst.anchor);
+        };
+        let mut out = Fragment::empty();
+        for core in cores {
+            match fact(core) {
+                Ok(built) => out += unexported(built),
+                Err(_) => {
+                    SKIPPED.fetch_add(1, Ordering::Relaxed);
+                    return nothing(inst.anchor);
+                }
+            }
+        }
+        let (_, facts, metafacts, blobs) = out.into_parts();
+        Fragment::rooted_from_parts(inst.anchor, facts, metafacts, blobs)
     }
 
     /// The category of a member of the value at `cat`, by its step.
@@ -612,6 +670,58 @@ fn structure(text: &str) -> Option<Fragment> {
         .ok()?;
     tree.blobs_mut().union(store);
     Some(tree)
+}
+
+/// A structure assembled from members (`Decode::Member`), kept as JSON text
+/// so numbers keep their exact token.
+enum Members {
+    Leaf(String),
+    Object(Vec<(String, Members)>),
+}
+
+impl Members {
+    /// Places `value` at the pointer's steps, with the importer's rules: a
+    /// member inside a value that is no object, or named twice, fails.
+    fn insert(&mut self, steps: &[&str], value: String) -> Option<()> {
+        let Members::Object(members) = self else {
+            return None;
+        };
+        let (first, rest) = steps.split_first()?;
+        let at = match members.iter().position(|(name, _)| name == first) {
+            Some(at) => at,
+            None => {
+                if rest.is_empty() {
+                    members.push(((*first).to_owned(), Members::Leaf(value)));
+                    return Some(());
+                }
+                members.push(((*first).to_owned(), Members::Object(Vec::new())));
+                members.len() - 1
+            }
+        };
+        if rest.is_empty() {
+            return None;
+        }
+        members[at].1.insert(rest, value)
+    }
+
+    fn render(&self, out: &mut String) -> Option<()> {
+        match self {
+            Members::Leaf(text) => out.push_str(text),
+            Members::Object(members) => {
+                out.push('{');
+                for (i, (name, member)) in members.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&serde_json::to_string(name).ok()?);
+                    out.push(':');
+                    member.render(out)?;
+                }
+                out.push('}');
+            }
+        }
+        Some(())
+    }
 }
 
 /// A base64 `data:` URI's media type and data.
@@ -751,6 +861,7 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
         // family needs no construction per entry, and its anchor asks the
         // question once.
         let entry_table = Arc::clone(&t);
+        let entry_emit = Arc::clone(&t);
         constructions.push(Construction {
             name: "entry",
             category: family.clone(),
@@ -762,7 +873,7 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
                 Constituent::new(Step::EachField, Role::Value),
                 Constituent::new(Step::Each, Role::Value),
             ],
-            emit: Box::new(|inst| nothing(inst.anchor)),
+            emit: Box::new(move |inst| entry_emit.emit_point(inst)),
         });
         let anchor_table = Arc::clone(&t);
         let emit_table = Arc::clone(&t);
@@ -792,31 +903,7 @@ pub fn compile(table: &'static FieldTable) -> anyhow::Result<Grammar<Cat>> {
                     )),
                 ),
             ],
-            emit: Box::new(move |inst| {
-                // An array element, or the record outside every array, is an
-                // assembly point: its fields form its facts.
-                let cat = inst.category;
-                let point = cat.path.ends_with("[]") || cat.path == emit_table.table.record;
-                if !point || kind(&inst.unit, inst.anchor) != Some(json_tree::kind_object) {
-                    return nothing(inst.anchor);
-                }
-                let Some(cores) = emit_table.assemble(&inst.unit, inst.anchor, cat) else {
-                    SKIPPED.fetch_add(1, Ordering::Relaxed);
-                    return nothing(inst.anchor);
-                };
-                let mut out = Fragment::empty();
-                for core in cores {
-                    match fact(core) {
-                        Ok(built) => out += unexported(built),
-                        Err(_) => {
-                            SKIPPED.fetch_add(1, Ordering::Relaxed);
-                            return nothing(inst.anchor);
-                        }
-                    }
-                }
-                let (_, facts, metafacts, blobs) = out.into_parts();
-                Fragment::rooted_from_parts(inst.anchor, facts, metafacts, blobs)
-            }),
+            emit: Box::new(move |inst| emit_table.emit_point(inst)),
         });
     }
     Grammar::new(constructions).map_err(|e| anyhow::anyhow!("{e:?}"))

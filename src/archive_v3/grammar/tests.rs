@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 use triblespace::core::blob::MemoryBlobStore;
-use triblespace::core::import::json_tree::JsonTreeImporter;
+use triblespace::core::import::json_tree::{self, JsonTreeImporter};
 use triblespace::core::repo::BlobStore;
 
 use super::*;
@@ -318,6 +318,31 @@ fn real_sample_facts() {
     let mut importer_only: BTreeMap<String, usize> = BTreeMap::new();
     // The attribute ids (schema, never values) of unmatched system facts.
     let mut shapes: BTreeMap<(String, String), usize> = BTreeMap::new();
+    // The top-level member names of an event fact's structure: names the
+    // table's member pointers spell, so vocabulary, never values.
+    let keys = |fragment: &Fragment, f: Id| -> String {
+        use triblespace::core::repo::BlobStoreGet;
+        type Text = triblespace::prelude::blobencodings::UTF8String;
+        let facts = fragment.facts();
+        let reader = fragment.blobs().clone().snapshot().unwrap();
+        let mut names: Vec<String> = find!(
+            (name: Inline<triblespace::prelude::inlineencodings::Handle<Text>>),
+            pattern!(facts, [
+                { f @ v3::fact::structure: _?root },
+                { _?root @ json_tree::object_field: _?field },
+                { _?field @ json_tree::field_name: ?name },
+            ])
+        )
+        .filter_map(|(h,)| {
+            reader
+                .get::<anybytes::View<str>, Text>(h)
+                .ok()
+                .map(|t| t.as_ref().to_owned())
+        })
+        .collect();
+        names.sort();
+        format!("keys[{}]", names.join(","))
+    };
     let shape = |fragment: &Fragment, f: Id| -> String {
         let mut attributes: Vec<String> = fragment
             .facts()
@@ -358,7 +383,11 @@ fn real_sample_facts() {
         for (id, modality) in &ours {
             if !theirs.contains_key(id) {
                 *grammar_only.entry(modality.clone()).or_default() += 1;
-                if modality == "system" {
+                if modality == "event" {
+                    *shapes
+                        .entry(("grammar".into(), keys(&image, *id)))
+                        .or_default() += 1;
+                } else if modality == "system" {
                     *shapes
                         .entry(("grammar".into(), shape(&image, *id)))
                         .or_default() += 1;
@@ -368,7 +397,11 @@ fn real_sample_facts() {
         for (id, modality) in &theirs {
             if !ours.contains_key(id) {
                 *importer_only.entry(modality.clone()).or_default() += 1;
-                if modality == "system" {
+                if modality == "event" {
+                    *shapes
+                        .entry(("importer".into(), keys(&imported, *id)))
+                        .or_default() += 1;
+                } else if modality == "system" {
                     *shapes
                         .entry(("importer".into(), shape(&imported, *id)))
                         .or_default() += 1;
@@ -388,7 +421,7 @@ fn real_sample_facts() {
     for (modality, n) in &importer_only {
         println!("{n}\t{modality}");
     }
-    println!("-- unmatched system facts: side, attribute id prefixes");
+    println!("-- unmatched system and event facts: side, attribute names");
     for ((side, attributes), n) in &shapes {
         println!("{n}\t{side}\t{attributes}");
     }
