@@ -267,6 +267,19 @@ fn occurrence_ids(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
     find!(o: Id, pattern!(facts, [{ ?o @ v3::occurrence::of: _?w }])).collect()
 }
 
+/// Annotations outside the identity cores, as (entity, value) pairs: the
+/// occurrences' ends and turn ends, the nodes' renderings, and the glosses
+/// (whose ids include the node they describe).
+fn annotations_of(fragment: &Fragment) -> std::collections::BTreeSet<(Id, Id)> {
+    let facts = fragment.facts();
+    let mut out: std::collections::BTreeSet<(Id, Id)> =
+        find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::ends: ?e }])).collect();
+    out.extend(find!((o: Id, e: Id), pattern!(facts, [{ ?o @ v3::witness::turn_ends: ?e }])));
+    out.extend(find!((n: Id, r: Id), pattern!(facts, [{ ?n @ v3::node::rendering: ?r }])));
+    out.extend(find!((g: Id, n: Id), pattern!(facts, [{ ?g @ v3::gloss::describes: ?n }])));
+    out
+}
+
 fn links_of(fragment: &Fragment) -> std::collections::BTreeSet<(Id, Id)> {
     let facts = fragment.facts();
     find!(
@@ -296,7 +309,7 @@ fn real_sample_relations() {
     let mut divergences: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut unstable = 0;
     // Occurrences and links, each as (shared, ours only, importer only).
-    let (mut occurrences, mut links) = ((0, 0, 0), (0, 0, 0));
+    let (mut occurrences, mut links, mut annotations) = ((0, 0, 0), (0, 0, 0), (0, 0, 0));
     // Our extra nodes: what each holds, after what its parent holds.
     let mut extra: std::collections::BTreeMap<(String, String), usize> = Default::default();
     for file in &files {
@@ -339,6 +352,10 @@ fn real_sample_relations() {
                     count.1 += a.difference(&b).count();
                     count.2 += b.difference(&a).count();
                 }
+                let (a, b) = (annotations_of(&fragment), annotations_of(&imported));
+                annotations.0 += a.intersection(&b).count();
+                annotations.1 += a.difference(&b).count();
+                annotations.2 += b.difference(&a).count();
                 let (a, b) = (links_of(&fragment), links_of(&imported));
                 links.0 += a.intersection(&b).count();
                 links.1 += a.difference(&b).count();
@@ -367,6 +384,10 @@ fn real_sample_relations() {
     println!(
         "occurrences: shared {}, ours only {}, importer only {}; links: shared {}, ours only {}, importer only {}",
         occurrences.0, occurrences.1, occurrences.2, links.0, links.1, links.2
+    );
+    println!(
+        "annotations (ends, turn ends, renderings, glosses): shared {}, ours only {}, importer only {}",
+        annotations.0, annotations.1, annotations.2
     );
     println!("-- first divergence: files, importer's next item, ours");
     for ((theirs, ours), n) in &divergences {
