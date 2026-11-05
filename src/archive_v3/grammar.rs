@@ -63,30 +63,29 @@ fn name(text: &str) -> Name {
 }
 
 thread_local! {
-    /// Node kinds by node. A json_tree id derives from its content, kind
-    /// included, so an answer holds in every unit; the cache is only ever
-    /// emptied to bound its size.
-    static KINDS: std::cell::RefCell<HashMap<Id, Option<Id>>> = std::cell::RefCell::new(HashMap::new());
+    /// Node kinds read in one unit ([`Unit::run`]). A reading, an absence
+    /// above all, says nothing about another unit, so the cache starts over
+    /// with every unit.
+    static KINDS: std::cell::RefCell<(u64, HashMap<Id, Option<Id>>)> =
+        std::cell::RefCell::new((u64::MAX, HashMap::new()));
 }
 
-/// The most node kinds [`KINDS`] keeps before it starts over.
-const KIND_CACHE: usize = 1 << 22;
-
 fn kind(unit: &Unit, e: Id) -> Option<Id> {
-    if let Some(k) = KINDS.with(|kinds| kinds.borrow().get(&e).copied()) {
+    let cached = KINDS.with(|kinds| {
+        let mut kinds = kinds.borrow_mut();
+        if kinds.0 != unit.run() {
+            *kinds = (unit.run(), HashMap::new());
+        }
+        kinds.1.get(&e).copied()
+    });
+    if let Some(k) = cached {
         return k;
     }
     let facts = unit.facts;
     let k = find!((k: Id), pattern!(facts, [{ e @ json_tree::kind: ?k }]))
         .map(|(k,)| k)
         .next();
-    KINDS.with(|kinds| {
-        let mut kinds = kinds.borrow_mut();
-        if kinds.len() >= KIND_CACHE {
-            kinds.clear();
-        }
-        kinds.insert(e, k);
-    });
+    KINDS.with(|kinds| kinds.borrow_mut().1.insert(e, k));
     k
 }
 
@@ -274,16 +273,12 @@ struct Table {
     table: &'static FieldTable,
     known: HashSet<String>,
     by_path: HashMap<&'static str, Vec<&'static Entry>>,
-    /// The entries chosen for a value, by (value, category). Every entry
-    /// anchor of a family asks the same question, so it is answered once.
-    /// json_tree ids derive from content, and so do the record and parent
-    /// ids in a category, so an answer holds in every unit; the cache is
-    /// only ever emptied to bound its size.
-    chosen: Mutex<HashMap<(Id, Cat), Vec<&'static Entry>>>,
+    /// The entries chosen for a value, by (value, category), within one
+    /// unit ([`Unit::run`]): the answer depends on the whole subtree being
+    /// present, which says nothing about another unit. Every entry anchor of
+    /// a family asks the same question, so it is answered once.
+    chosen: Mutex<(u64, HashMap<(Id, Cat), Vec<&'static Entry>>)>,
 }
-
-/// The most answers the chosen-entry cache keeps before it starts over.
-const CHOSEN_CACHE: usize = 1 << 20;
 
 impl Table {
     fn new(table: &'static FieldTable) -> Self {
@@ -295,7 +290,7 @@ impl Table {
             table,
             known: known_paths(table),
             by_path,
-            chosen: Mutex::new(HashMap::new()),
+            chosen: Mutex::new((u64::MAX, HashMap::new())),
         }
     }
 
@@ -367,15 +362,20 @@ impl Table {
     /// at its own path when none does there.
     fn chosen(&self, unit: &Unit, v: Id, cat: &Cat) -> Vec<&'static Entry> {
         let key = (v, cat.clone());
-        if let Some(entries) = self.chosen.lock().unwrap().get(&key) {
-            return entries.clone();
+        {
+            let mut cache = self.chosen.lock().unwrap();
+            if cache.0 != unit.run() {
+                *cache = (unit.run(), HashMap::new());
+            }
+            if let Some(entries) = cache.1.get(&key) {
+                return entries.clone();
+            }
         }
         let entries = self.choose(unit, v, cat);
         let mut cache = self.chosen.lock().unwrap();
-        if cache.len() >= CHOSEN_CACHE {
-            cache.clear();
+        if cache.0 == unit.run() {
+            cache.1.insert(key, entries.clone());
         }
-        cache.insert(key, entries.clone());
         entries
     }
 
