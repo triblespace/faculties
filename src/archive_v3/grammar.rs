@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use triblespace::core::import::json_tree;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::inlineencodings::{Handle, U256BE};
 use triblespace::prelude::*;
 use triblespace_cxg::{Category, Constituent, Construction, Grammar, PathStep, Role, Step, Unit};
 
@@ -547,6 +547,73 @@ fn decode_text(decode: Decode, unit: &Unit, v: Id) -> Option<String> {
     }
 }
 
+/// The JSON text of a json_tree value. Objects are sets, so member order
+/// does not matter to the tree it imports back to; numbers keep their exact
+/// token. `None` when a node is not a json_tree node.
+fn json_text(unit: &Unit, v: Id, out: &mut String) -> Option<()> {
+    let facts = unit.facts;
+    let k = kind(unit, v)?;
+    if k == json_tree::kind_string {
+        out.push_str(&serde_json::to_string(&text_of(unit, v)?).ok()?);
+    } else if k == json_tree::kind_number || k == json_tree::kind_bool || k == json_tree::kind_null
+    {
+        out.push_str(&spelling(unit, v)?);
+    } else if k == json_tree::kind_object {
+        out.push('{');
+        let members: Vec<(Name, Id)> = find!(
+            (name: Name, value: Id),
+            pattern!(facts, [
+                { v @ json_tree::object_field: _?field },
+                { _?field @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+            ])
+        )
+        .collect();
+        for (i, (name, value)) in members.into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str(&serde_json::to_string(&unit.text(name)?).ok()?);
+            out.push(':');
+            json_text(unit, value, out)?;
+        }
+        out.push('}');
+    } else if k == json_tree::kind_array {
+        // U256BE is big-endian, so the raw index orders as the number does.
+        let mut entries: Vec<(Inline<U256BE>, Id)> = find!(
+            (index: Inline<U256BE>, value: Id),
+            pattern!(facts, [{ _?entry @
+                json_tree::array_parent: v,
+                json_tree::array_index: ?index,
+                json_tree::array_value: ?value,
+            }])
+        )
+        .collect();
+        entries.sort_by(|a, b| (a.0.raw, a.1).cmp(&(b.0.raw, b.1)));
+        out.push('[');
+        for (i, (_, value)) in entries.into_iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            json_text(unit, value, out)?;
+        }
+        out.push(']');
+    } else {
+        return None;
+    }
+    Some(())
+}
+
+/// A json_tree value as its own imported tree, exactly as the importer
+/// builds a structure: the same unsalted import of the same JSON.
+fn structure(text: &str) -> Option<Fragment> {
+    let mut store = triblespace::core::blob::MemoryBlobStore::new();
+    let mut tree = triblespace::core::import::json_tree::JsonTreeImporter::new(&mut store, None)
+        .import_str(text)
+        .ok()?;
+    tree.blobs_mut().union(store);
+    Some(tree)
+}
+
 /// Sets one attribute of a fact from a value. `None`: a decode not built.
 fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: Id) -> Option<()> {
     if let Some(specs) = term_specs(attribute) {
@@ -566,6 +633,19 @@ fn apply(core: &mut FactCore, attribute: &str, decode: Decode, unit: &Unit, v: I
             "form" => core.form = Some(id),
             _ => core.effort = Some(id),
         }
+        return Some(());
+    }
+    if attribute == "structure" {
+        let text = match decode {
+            Decode::Json => {
+                let mut text = String::new();
+                json_text(unit, v, &mut text)?;
+                text
+            }
+            Decode::JsonText => text_of(unit, v)?,
+            _ => return None,
+        };
+        core.structure = Some(structure(&text)?);
         return Some(());
     }
     let text = decode_text(decode, unit, v)?;
