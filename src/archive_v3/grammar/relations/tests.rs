@@ -280,6 +280,8 @@ fn real_sample_relations() {
     let (mut built_files, mut same, mut ours_only, mut theirs_only) = (0, 0, 0, 0);
     let mut divergences: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut unstable = 0;
+    // Our extra nodes: what each holds, after what its parent holds.
+    let mut extra: std::collections::BTreeMap<(String, String), usize> = Default::default();
     for file in &files {
         let Ok(bytes) = std::fs::read(file) else {
             continue;
@@ -312,6 +314,17 @@ fn real_sample_relations() {
                 let theirs = nodes_of(&imported);
                 same += ours.intersection(&theirs).count();
                 ours_only += ours.difference(&theirs).count();
+                let of = fragment.facts();
+                for &n in ours.difference(&theirs) {
+                    let parent = find!(p: Id, pattern!(of, [{ n @ v3::node::previous: ?p }]))
+                        .next()
+                        .map_or("root".to_owned(), |p| name_of(held(&fragment, p)));
+                    let at = if theirs.contains(&n) { "" } else { "" };
+                    let _ = at;
+                    *extra
+                        .entry((parent, name_of(held(&fragment, n))))
+                        .or_default() += 1;
+                }
                 theirs_only += theirs.difference(&ours).count();
                 if let Some(d) = first_divergence(&fragment, &imported) {
                     *divergences.entry(d).or_default() += 1;
@@ -325,6 +338,10 @@ fn real_sample_relations() {
     println!("-- first divergence: files, importer's next item, ours");
     for ((theirs, ours), n) in &divergences {
         println!("{n}\t{theirs}\t{ours}");
+    }
+    println!("-- our extra nodes: count, parent holds, node holds");
+    for ((parent, node), n) in &extra {
+        println!("{n}\t{parent}\t{node}");
     }
     println!("-- refused: files, reason");
     for (reason, n) in &reasons {

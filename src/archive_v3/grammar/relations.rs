@@ -185,33 +185,31 @@ pub fn build(
     let all_ids: HashSet<String> = records.iter().filter_map(|(_, r)| read(*r, id)).collect();
 
     let mut out = Fragment::empty();
-    // The unrecorded section: the settings header, then the system section.
-    let mut section = Vec::new();
-    for g in table
-        .gaps
-        .header
-        .iter()
-        .chain(table.gaps.prefix)
-        .chain(table.gaps.after_prefix)
-    {
-        let built = gap(g)?;
-        section.push(built.root().ok_or("a gap is rooted")?);
-        out += unexported(built);
-    }
-    let mut root_tail = None;
-    for &g in &section {
-        root_tail = Some(extend(&mut out, root_tail, g)?);
-    }
-    let orphan_tail = match &table.gaps.orphan {
-        Some(g) => {
+    // The unrecorded section (the settings header, then the system section)
+    // and the orphan span behind it, built only when a record starts there,
+    // as the importer builds them.
+    let mut root_tail: Option<Option<Id>> = None;
+    let mut orphan_tail: Option<Option<Id>> = None;
+    let mut root = |out: &mut Fragment| -> Result<Option<Id>, String> {
+        if let Some(tail) = root_tail {
+            return Ok(tail);
+        }
+        let mut tail = None;
+        for g in table
+            .gaps
+            .header
+            .iter()
+            .chain(table.gaps.prefix)
+            .chain(table.gaps.after_prefix)
+        {
             let built = gap(g)?;
             let at = built.root().ok_or("a gap is rooted")?;
-            out += unexported(built);
-            Some(extend(&mut out, root_tail, at)?)
+            *out += unexported(built);
+            tail = Some(extend(out, tail, at)?);
         }
-        None => root_tail,
+        root_tail = Some(tail);
+        Ok(tail)
     };
-
     let mut lines: HashMap<String, Option<Id>> = HashMap::new();
     let mut first: HashMap<String, Id> = HashMap::new();
     for (_, record) in records {
@@ -254,7 +252,7 @@ pub fn build(
             }
         }
         let mut tail = match read(record, parent) {
-            None => root_tail,
+            None => root(&mut out)?,
             Some(p) => match lines.get(&p) {
                 Some(&tail) => tail,
                 None if all_ids.contains(&p) => {
@@ -262,7 +260,20 @@ pub fn build(
                         "{{{shape}}}.{parent}: a record's parent is not built before it"
                     ))
                 }
-                None => orphan_tail,
+                None => match orphan_tail {
+                    Some(tail) => tail,
+                    None => {
+                        let mut tail = root(&mut out)?;
+                        if let Some(g) = &table.gaps.orphan {
+                            let built = gap(g)?;
+                            let at = built.root().ok_or("a gap is rooted")?;
+                            out += unexported(built);
+                            tail = Some(extend(&mut out, tail, at)?);
+                        }
+                        orphan_tail = Some(tail);
+                        tail
+                    }
+                },
             },
         };
         for item in items(&t, &unit, record, &record_cat)? {
