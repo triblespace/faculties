@@ -964,6 +964,35 @@ fn a_preserved_segment_is_re_presented_after_its_anchor() {
     );
 }
 
+/// A turn's own effort is a copy of the request's: equal to it, it is
+/// dropped and adds nothing; different, the unit is refused where and as
+/// the importer refuses it.
+#[test]
+fn a_mirror_that_differs_from_its_sibling_is_refused() {
+    let source = |turn: Option<&str>| {
+        let mut reply = assistant("a1", "u1", 1, "Hello.");
+        reply["effort"] = json!("high");
+        if let Some(turn) = turn {
+            reply["perTurnEffort"] = json!(turn);
+        }
+        jsonl(&[user("u1", None, 0, "Hi."), reply])
+    };
+    assert_eq!(
+        built_facts(&source(Some("high"))),
+        built_facts(&source(None)),
+        "an equal copy adds nothing"
+    );
+    let differs = source(Some("low"));
+    let refused = built_err(&differs);
+    assert_eq!(
+        refused,
+        "{assistant}.perTurnEffort: a mirror differs from what it mirrors"
+    );
+    let importer = crate::archive_v3::claude_code::import(differs.as_bytes())
+        .expect_err("the importer refuses it too");
+    assert_eq!(importer.to_string(), refused);
+}
+
 // ---------------------------------------------------------------------------
 // Codex: one line in file order (Order::File).
 
@@ -1349,4 +1378,143 @@ fn codex_claims_of_a_record_that_holds_nothing() {
     assert_eq!(occurrences_of(&fragment, b).len(), 2);
     let refused = codex_built(&[item(0, "user", "A"), bare]).expect_err("refused");
     assert!(refused.contains("beyond the end of the file"), "{refused}");
+}
+
+/// The Codex refusal of `records` by the relations, which must be the
+/// importer's own, word for word.
+fn codex_refused(records: &[Value]) -> String {
+    let refused = codex_built(records).expect_err("refused");
+    let importer = crate::archive_v3::codex::import(jsonl(records).as_bytes())
+        .expect_err("the importer refuses it too");
+    assert_eq!(importer.to_string(), refused);
+    refused
+}
+
+/// Her text, as output text parts of one message.
+fn her_parts(second: u32, parts: &[&str]) -> Value {
+    let content: Vec<Value> = parts
+        .iter()
+        .map(|text| json!({"type": "output_text", "text": text}))
+        .collect();
+    envelope(
+        second,
+        "response_item",
+        json!({"type": "message", "role": "assistant", "content": content}),
+    )
+}
+
+/// A client copy of her text is dropped where its own unit holds a value
+/// equal to it at a path the mirror names, anywhere in the file, and adds
+/// nothing. Otherwise the unit is refused where and as the importer refuses
+/// it.
+#[test]
+fn codex_a_copy_is_dropped_only_where_its_own_unit_holds_its_own_value() {
+    let copy =
+        |second, text: &str| event(second, json!({"type": "agent_message", "message": text}));
+    let unheld =
+        "{event_msg}.payload{agent_message}.message: a copy the unit does not hold what it copies";
+    let (hi, hello) = (item(0, "user", "Hi."), item(1, "assistant", "Hello."));
+    let plain = codex_built(&[hi.clone(), hello.clone()])
+        .expect("builds")
+        .facts()
+        .clone();
+    for records in [
+        vec![hi.clone(), hello.clone(), copy(2, "Hello.")],
+        // No order is involved: a copy may come before what it copies.
+        vec![copy(0, "Hello."), hi.clone(), hello.clone()],
+    ] {
+        let fragment = codex_built(&records).expect("builds");
+        assert_eq!(fragment.facts(), &plain, "the copy adds nothing");
+        node_saying_in(&fragment, "Hello.", 1);
+    }
+    // A value the unit does not hold.
+    assert_eq!(
+        codex_refused(&[hi.clone(), hello.clone(), copy(2, "Goodbye.")]),
+        unheld
+    );
+    // A held copy backs no other copy of the same mirror.
+    assert_eq!(
+        codex_refused(&[
+            hi.clone(),
+            hello.clone(),
+            copy(2, "Hello."),
+            copy(3, "Goodbye."),
+        ]),
+        unheld
+    );
+    // A value the unit holds at no path the mirror names: his text.
+    assert_eq!(
+        codex_refused(&[hi.clone(), hello.clone(), copy(2, "Hi.")]),
+        unheld
+    );
+    // An original that holds two values backs each of them, never the two
+    // as one.
+    let two = her_parts(1, &["Hello.", "Again."]);
+    codex_built(&[hi.clone(), two.clone(), copy(2, "Again.")]).expect("builds");
+    assert_eq!(
+        codex_refused(&[hi.clone(), two, copy(2, "Hello.Again.")]),
+        unheld
+    );
+    // What one unit holds backs nothing in the next: built one after the
+    // other, the unit without the original is refused.
+    codex_built(&[item(0, "assistant", "Hello."), copy(1, "Hello.")]).expect("builds");
+    assert_eq!(codex_refused(&[hi, copy(1, "Hello.")]), unheld);
+}
+
+/// A client copy of part of his text is held as an exact substring of a
+/// value at a path the mirror names, and refused otherwise.
+#[test]
+fn codex_a_copy_within_his_text_is_held_only_inside_it() {
+    let copy = |second, text: &str| event(second, json!({"type": "user_message", "message": text}));
+    let unheld =
+        "{event_msg}.payload{user_message}.message: a copy the unit does not hold what it copies";
+    let his = item(0, "user", "Fix the bug, please.");
+    codex_built(&[his.clone(), copy(1, "Fix the bug")]).expect("builds");
+    // Exact: case counts.
+    assert_eq!(
+        codex_refused(&[his.clone(), copy(1, "fix the bug")]),
+        unheld
+    );
+    // Inside her text, which the mirror does not name.
+    assert_eq!(
+        codex_refused(&[his, item(1, "assistant", "Fixed it."), copy(2, "Fixed it")]),
+        unheld
+    );
+}
+
+/// A header's collaboration settings copy its own fields: equal, they are
+/// dropped and add nothing; different, the unit is refused where and as the
+/// importer refuses it.
+#[test]
+fn codex_a_mirror_that_differs_from_its_record_s_field_is_refused() {
+    let collaborating = |effort: &str| {
+        envelope(
+            1,
+            "turn_context",
+            json!({"cwd": "/synthetic", "model": "gpt-5-codex", "effort": "high",
+                "summary": "auto", "collaboration_mode": {"mode": "default",
+                    "settings": {"model": "gpt-5-codex", "reasoning_effort": effort}}}),
+        )
+    };
+    let records = |header: Value| {
+        vec![
+            item(0, "user", "Hi."),
+            header,
+            item(2, "assistant", "Hello."),
+        ]
+    };
+    assert_eq!(
+        codex_built(&records(collaborating("high")))
+            .expect("builds")
+            .facts(),
+        codex_built(&records(header(1, "high")))
+            .expect("builds")
+            .facts(),
+        "an equal copy adds nothing"
+    );
+    assert_eq!(
+        codex_refused(&records(collaborating("low"))),
+        "{turn_context}.payload.collaboration_mode.settings.reasoning_effort: a mirror differs \
+         from what it mirrors"
+    );
 }

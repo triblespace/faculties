@@ -13,6 +13,13 @@
 //! exact with its importer on the live samples where it builds. Still
 //! refused as not built yet, never built wrong: a history budget (X18) and
 //! a record's supplied members (`Class::Supply`).
+//!
+//! Mirrors are not stated here a second time: the unit's records, read back
+//! as the JSON they hold, go through the importers' own record check
+//! (`claude_code::check`), whose unit mirrors are verified once every record
+//! is checked. That is the whole record check, not its mirrors alone, so a
+//! unit it refuses the importer refuses too, for the same reason; it stays
+//! shared until the rules replace it.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +28,7 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
+use super::super::claude_code::check;
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, Order, Place, Rewrite,
 };
@@ -792,6 +800,18 @@ pub fn build(
     )
     .collect();
     records.sort_by(|a, b| a.0.raw.cmp(&b.0.raw));
+    // Mirrors: the importers' own check of each record, over the JSON the
+    // unit holds, then of the copies that reach across it. One predicate,
+    // so a copy is refused exactly where and as the importer refuses it.
+    let mut mirrors = check::UnitMirrors::new(table);
+    for (_, record) in &records {
+        let mut text = String::new();
+        json_text(&unit, *record, &mut text).ok_or("a record is no json_tree value")?;
+        let read = crate::archive_v3::claude_code::json::parse(text.as_bytes())
+            .ok_or("a record does not read back as JSON")?;
+        check::record_in(table, &read, &mut mirrors).map_err(|failure| failure.to_string())?;
+    }
+    mirrors.verify().map_err(|failure| failure.to_string())?;
     let record_cat = Cat {
         path: table.record.to_owned(),
         record: None,
