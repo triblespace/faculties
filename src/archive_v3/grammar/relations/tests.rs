@@ -337,6 +337,110 @@ fn nodes_of(fragment: &Fragment) -> std::collections::BTreeSet<Id> {
 
 #[test]
 #[ignore = "reads real transcripts named by AV3_SAMPLE; prints no values"]
+fn real_sample_timing() {
+    // What the grammar costs against the importer, per phase, over the
+    // files the importer accepts (AV3_FORMAT as for the census). The grammar
+    // is compiled once, as an import would; each file is read once by each
+    // side. Times are wall-clock sums, in seconds, on one thread.
+    use std::time::{Duration, Instant};
+    let list = std::env::var("AV3_SAMPLE").expect("AV3_SAMPLE names a file list");
+    let codex = std::env::var("AV3_FORMAT").as_deref() == Ok("codex");
+    let table: &'static FieldTable = if codex {
+        &crate::archive_v3::fields::codex::TABLE
+    } else {
+        &TABLE
+    };
+    let started = Instant::now();
+    let grammar = compile(table).expect("the table compiles");
+    let compiled = started.elapsed();
+    let (mut files, mut built, mut bytes_total) = (0usize, 0usize, 0usize);
+    let (mut importer, mut tree, mut cover, mut relations) = (
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
+    // Per file, grammar time over importer time.
+    let mut ratios: Vec<f64> = Vec::new();
+    for file in std::fs::read_to_string(list).unwrap().lines() {
+        let Ok(bytes) = std::fs::read(file) else {
+            continue;
+        };
+        let Ok(source) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        let started = Instant::now();
+        let accepted = if codex {
+            crate::archive_v3::codex::import(&bytes).is_ok()
+        } else {
+            crate::archive_v3::claude_code::import(&bytes).is_ok()
+        };
+        let imported = started.elapsed();
+        if !accepted {
+            continue;
+        }
+        files += 1;
+        bytes_total += bytes.len();
+        importer += imported;
+        let started = Instant::now();
+        let records: Vec<&str> = source.lines().filter(|l| !l.trim().is_empty()).collect();
+        let array = format!("[{}]", records.join(","));
+        let mut store = MemoryBlobStore::new();
+        let unit = JsonTreeImporter::<_>::new(&mut store, None)
+            .import_str(&array)
+            .expect("synthetic JSON");
+        let root = unit.root().expect("rooted");
+        let blobs = unit.blobs().clone().snapshot().unwrap();
+        let read = started.elapsed();
+        tree += read;
+        let started = Instant::now();
+        let image = grammar.cover(Unit::new(unit.facts(), &blobs), root, &lines());
+        let covered = started.elapsed();
+        cover += covered;
+        let Ok(image) = image else {
+            continue;
+        };
+        let started = Instant::now();
+        let ok = build(table, Unit::new(unit.facts(), &blobs), root, &image).is_ok();
+        let related = started.elapsed();
+        relations += related;
+        if ok {
+            built += 1;
+        }
+        let ours = (read + covered + related).as_secs_f64();
+        ratios.push(ours / imported.as_secs_f64().max(1e-9));
+    }
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let at = |q: f64| {
+        ratios
+            .get(((ratios.len() as f64 - 1.0) * q).round() as usize)
+            .copied()
+    };
+    let ours = tree + cover + relations;
+    println!(
+        "timing: {files} files the importer accepts ({} MB), {built} built; compile {:.3}s once",
+        bytes_total / 1_000_000,
+        compiled.as_secs_f64()
+    );
+    println!(
+        "timing: importer {:.1}s; grammar {:.1}s = json tree {:.1}s + cover {:.1}s + relations {:.1}s; total ratio {:.1}x",
+        importer.as_secs_f64(),
+        ours.as_secs_f64(),
+        tree.as_secs_f64(),
+        cover.as_secs_f64(),
+        relations.as_secs_f64(),
+        ours.as_secs_f64() / importer.as_secs_f64().max(1e-9)
+    );
+    println!(
+        "timing: per-file ratio median {:.1}x, p90 {:.1}x, max {:.1}x",
+        at(0.5).unwrap_or(0.0),
+        at(0.9).unwrap_or(0.0),
+        at(1.0).unwrap_or(0.0)
+    );
+}
+
+#[test]
+#[ignore = "reads real transcripts named by AV3_SAMPLE; prints no values"]
 fn real_sample_relations() {
     let list = std::env::var("AV3_SAMPLE").expect("AV3_SAMPLE names a file list");
     let files: Vec<String> = std::fs::read_to_string(list)
