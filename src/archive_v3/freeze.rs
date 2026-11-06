@@ -532,7 +532,10 @@ fn open_records(directory: &Path) -> Result<(File, HashSet<(String, String)>)> {
         }
         let record: Value = serde_json::from_slice(line).context("a complete record line")?;
         let path = record["path"].as_str().context("a record without a path")?;
-        if let Some(sha256) = record["sha256"].as_str() {
+        // Only an importer verdict is reusable: a changed file was never
+        // imported, and an operational record says nothing about the bytes.
+        let verdict = matches!(record["outcome"].as_str(), Some("accepted" | "refused"));
+        if let (true, Some(sha256)) = (verdict, record["sha256"].as_str()) {
             done.insert((path.to_owned(), sha256.to_owned()));
         }
     }

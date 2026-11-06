@@ -299,6 +299,27 @@ fn a_resume_skips_a_file_only_when_its_fresh_sha256_matches() {
 }
 
 #[test]
+fn a_resume_examines_again_a_file_whose_record_is_not_a_verdict() {
+    let corpus = Corpus::new(&[
+        ("rollout-a.jsonl", g0().as_str()),
+        ("rollout-b.jsonl", g1().as_str()),
+    ]);
+    assert_eq!(freeze(corpus.start()).accepted, 2);
+    // Rewrite the second record as an operational one, same path and sha256.
+    let path = corpus.generation.join(RECORDS);
+    let mut lines: Vec<Value> = records(&corpus.generation).unwrap();
+    lines[1]["outcome"] = json!("operational");
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(&path, text).unwrap();
+    let resumed = freeze(corpus.resume());
+    assert_eq!((resumed.skipped, resumed.accepted), (1, 1));
+    let records = records(&corpus.generation).unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[2]["path"], records[1]["path"]);
+    assert_eq!(records[2]["outcome"], "accepted");
+}
+
+#[test]
 fn an_interrupted_run_resumes_to_the_same_records() {
     let corpus = Corpus::new(&[
         ("rollout-a.jsonl", g0().as_str()),
@@ -389,5 +410,17 @@ fn freeze_real_corpus() {
     let mut generation = Generation::open(&directory, format, build, source).unwrap();
     let tally = generation.run().unwrap();
     generation.close().unwrap();
-    eprintln!("freeze: done, {tally:?}");
+    // The completion record a driver gates on: written only after the
+    // last record and the pile are synced and closed.
+    let completed = json!({
+        "completed": chrono::Utc::now().to_rfc3339(),
+        "accepted": tally.accepted,
+        "refused": tally.refused,
+        "changed": tally.changed,
+        "operational": tally.operational,
+        "skipped": tally.skipped,
+        "bytes_read": tally.bytes_read,
+    });
+    append_to(&directory, RUNS, &completed).unwrap();
+    println!("freeze_complete {completed}");
 }
