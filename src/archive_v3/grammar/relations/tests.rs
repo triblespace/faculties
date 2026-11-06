@@ -993,6 +993,375 @@ fn a_mirror_that_differs_from_its_sibling_is_refused() {
     assert_eq!(importer.to_string(), refused);
 }
 
+/// The Claude Code build of `source` by the relations, which must be the
+/// importer's own: the same nodes, occurrences, links and annotations.
+fn cc_exact(source: &str) -> Fragment {
+    let fragment = built(source).expect("builds");
+    let imported = crate::archive_v3::claude_code::import(source.as_bytes())
+        .expect("the importer builds it too");
+    assert_eq!(nodes_of(&fragment), nodes_of(&imported), "nodes");
+    assert_eq!(
+        occurrence_ids(&fragment),
+        occurrence_ids(&imported),
+        "occurrences"
+    );
+    assert_eq!(links_of(&fragment), links_of(&imported), "links");
+    assert_eq!(
+        annotations_of(&fragment),
+        annotations_of(&imported),
+        "annotations"
+    );
+    fragment
+}
+
+/// The Claude Code refusal of `source` by the relations, which must be the
+/// importer's own, word for word.
+fn cc_refused(source: &str) -> String {
+    let refused = built_err(source);
+    let importer = crate::archive_v3::claude_code::import(source.as_bytes())
+        .expect_err("the importer refuses it too");
+    assert_eq!(importer.to_string(), refused);
+    refused
+}
+
+/// Her record of request `message`, holding one content block.
+fn hers(uuid: &str, parent: &str, second: u32, message: &str, block: Value, stop: Value) -> Value {
+    let mut record = assistant(uuid, parent, second, "unused");
+    record["requestId"] = json!(format!("req-{message}"));
+    record["message"]["id"] = json!(message);
+    record["message"]["content"] = json!([block]);
+    record["message"]["stop_reason"] = stop;
+    record
+}
+
+/// His record holding `content` as it stands: a string or blocks.
+fn his(uuid: &str, parent: Option<&str>, second: u32, content: Value) -> Value {
+    let mut record = user(uuid, parent, second, "unused");
+    record["message"]["content"] = content;
+    record
+}
+
+/// An attachment the client marks rendered beside a tool result (R1).
+fn beside(uuid: &str, parent: &str, second: u32) -> Value {
+    json!({
+        "type": "attachment", "sessionId": "s-1", "uuid": uuid, "parentUuid": parent,
+        "timestamp": stamp(second), "cwd": "/synthetic", "version": "0.0.0",
+        "attachment": {"type": "remote_session_change", "url": "https://example.invalid/r"},
+        "rendered": [{"content": "Moved."}],
+        "renderedRole": "user",
+        "renderedBesideToolResult": true,
+    })
+}
+
+/// Her call `t1`, as request `m1`.
+fn called(uuid: &str, parent: &str, second: u32) -> Value {
+    hers(
+        uuid,
+        parent,
+        second,
+        "m1",
+        json!({"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/x"},
+            "caller": {"type": "direct"}}),
+        json!("tool_use"),
+    )
+}
+
+/// His record of the result of `t1`.
+fn answered(uuid: &str, parent: &str, second: u32) -> Value {
+    his(
+        uuid,
+        Some(parent),
+        second,
+        json!([{"type": "tool_result", "tool_use_id": "t1", "content": "x", "is_error": false}]),
+    )
+}
+
+/// The R1 refusal: a beside-mark the importer does not build, and why.
+fn not_beside(why: &str) -> String {
+    format!("{{attachment}}.renderedBesideToolResult: {why}")
+}
+
+/// R1: a rendering marked beside a tool result, after his prompt written
+/// as a plain string, past the renderings of the attachments before it, is
+/// its text plus a trailing newline, as the importer builds it.
+#[test]
+fn a_beside_mark_after_his_plain_prompt_is_built_as_the_importer_builds_it() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        beside("x1", "u1", 1),
+        beside("x2", "x1", 2),
+        assistant("a1", "x2", 3, "Hello."),
+    ]);
+    let fragment = cc_exact(&source);
+    assert_eq!(nodes_saying(&fragment, "Moved.\n").len(), 2);
+    assert!(nodes_saying(&fragment, "Moved.").is_empty());
+    let hello = node_saying(&fragment, "Hello.");
+    assert_eq!(
+        window_before(&fragment, hello),
+        section_then(&[(TEXT, None), (TEXT, None), (TEXT, None)])
+    );
+}
+
+/// R1'': a beside-mark after harness text (`isMeta`), as blocks or as a
+/// string, is refused where and as the importer refuses it. The census
+/// found this one built on the local sample before the relations called
+/// the importer's look-back.
+#[test]
+fn a_beside_mark_after_harness_text_is_refused() {
+    for content in [
+        json!([{"type": "text", "text": "<system-reminder>x</system-reminder>"}]),
+        json!("<system-reminder>x</system-reminder>"),
+    ] {
+        let mut meta = his("u2", Some("a1"), 2, content);
+        meta["isMeta"] = json!(true);
+        let source = jsonl(&[
+            user("u1", None, 0, "Hi."),
+            assistant("a1", "u1", 1, "Hello."),
+            meta,
+            beside("x1", "u2", 3),
+            hers(
+                "a2",
+                "x1",
+                4,
+                "m2",
+                json!({"type": "text", "text": "Ok."}),
+                json!("end_turn"),
+            ),
+        ]);
+        assert_eq!(
+            cc_refused(&source),
+            not_beside(
+                "rendered after harness text: what her window held there is unverified; not built"
+            )
+        );
+    }
+}
+
+/// R1'': a beside-mark after a compaction summary is refused where and as
+/// the importer refuses it.
+#[test]
+fn a_beside_mark_after_a_compaction_summary_is_refused() {
+    let mut summary = user("c1", Some("b1"), 3, "Summary.");
+    summary["isCompactSummary"] = json!(true);
+    let source = jsonl(&[
+        user("u1", None, 0, "First."),
+        assistant("a1", "u1", 1, "Two."),
+        boundary("b1", "a1", 2),
+        summary,
+        beside("x1", "c1", 4),
+        hers(
+            "a2",
+            "x1",
+            5,
+            "m2",
+            json!({"type": "text", "text": "Ok."}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside(
+            "rendered after a compaction summary: what her window held there is unverified; \
+             not built"
+        )
+    );
+}
+
+/// R1''': a beside-mark after his prompt written as blocks, not as the
+/// plain string, is refused where and as the importer refuses it.
+#[test]
+fn a_beside_mark_after_a_prompt_of_blocks_is_refused() {
+    let source = jsonl(&[
+        his("u1", None, 0, json!([{"type": "text", "text": "Hi."}])),
+        beside("x1", "u1", 1),
+        assistant("a1", "x1", 2, "Hello."),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside(
+            "rendered after a prompt of blocks: every real mark follows a plain string prompt; \
+             not built"
+        )
+    );
+}
+
+/// R1: a beside-mark after a span of unknown items (its parent is outside
+/// the unit) is refused where and as the importer refuses it.
+#[test]
+fn a_beside_mark_after_an_unknown_span_is_refused() {
+    let source = jsonl(&[
+        beside("x1", "outside", 1),
+        assistant("a1", "x1", 2, "Hello."),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside(
+            "rendered after a span of unknown items: whether a tool result is beside it is unknown"
+        )
+    );
+}
+
+/// R1: a beside-mark after a tool result, its head or a part of it, past an
+/// unmarked attachment's rendering, is refused where and as the importer
+/// refuses it.
+#[test]
+fn a_beside_mark_after_a_tool_result_is_refused() {
+    let mut plain = beside("x0", "u2", 3);
+    plain
+        .as_object_mut()
+        .unwrap()
+        .remove("renderedBesideToolResult");
+    let refused = not_beside(
+        "rendered beside a tool result: the one framed case held the text with a trailing \
+         newline, not the exact text; not built",
+    );
+    // After its part (the result's text), past the unmarked rendering.
+    let source = jsonl(&[
+        user("u1", None, 0, "Read it."),
+        called("a1", "u1", 1),
+        answered("u2", "a1", 2),
+        plain,
+        beside("x1", "x0", 4),
+        hers(
+            "a2",
+            "x1",
+            5,
+            "m2",
+            json!({"type": "text", "text": "Read."}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(cc_refused(&source), refused);
+    // After its head: a result that holds nothing.
+    let mut empty = answered("u2", "a1", 2);
+    empty["message"]["content"][0]["content"] = json!("");
+    let source = jsonl(&[
+        user("u1", None, 0, "Read it."),
+        called("a1", "u1", 1),
+        empty,
+        beside("x1", "u2", 3),
+        hers(
+            "a2",
+            "x1",
+            4,
+            "m2",
+            json!({"type": "text", "text": "Read."}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(cc_refused(&source), refused);
+}
+
+/// R1': a beside-mark between a call and its result, past another marked
+/// rendering, is refused where and as the importer refuses it.
+#[test]
+fn a_beside_mark_between_a_call_and_its_result_is_refused() {
+    let source = jsonl(&[
+        user("u1", None, 0, "Read it."),
+        called("a1", "u1", 1),
+        beside("x0", "a1", 2),
+        beside("x1", "x0", 3),
+        answered("u2", "x1", 4),
+        hers(
+            "a2",
+            "u2",
+            5,
+            "m2",
+            json!({"type": "text", "text": "Read."}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside(
+            "rendered between a call and its result: no real mark follows anything but a typed \
+             prompt; not built"
+        )
+    );
+}
+
+/// R1'': a beside-mark after anything else (her text, her thinking, the
+/// opening of a window) is refused where and as the importer refuses it.
+#[test]
+fn a_beside_mark_after_anything_but_his_prompt_is_refused() {
+    let refused = not_beside(
+        "rendered after something other than his typed prompt: no real mark stands there; not \
+         built",
+    );
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        beside("x1", "a1", 2),
+        user("u2", Some("x1"), 3, "Next."),
+    ]);
+    assert_eq!(cc_refused(&source), refused);
+    let sealed = json!({"type": "thinking", "thinking": "", "signature": "c2lnbmVkIHRoaW5raW5n"});
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        hers("a1", "u1", 1, "m1", sealed, Value::Null),
+        beside("x1", "a1", 2),
+        assistant("a2", "x1", 3, "Hello."),
+    ]);
+    assert_eq!(cc_refused(&source), refused);
+    let mut first = beside("x1", "unused", 0);
+    first["parentUuid"] = Value::Null;
+    let source = jsonl(&[first, assistant("a1", "x1", 1, "Hello.")]);
+    assert_eq!(cc_refused(&source), refused);
+}
+
+/// R1'': a beside-mark in the middle of one message (the message began
+/// before the mark, after his prompt, and continues after it) is refused
+/// where and as the importer refuses it, though the place before the mark
+/// holds his prompt.
+#[test]
+fn a_beside_mark_in_the_middle_of_one_message_is_refused() {
+    let sealed = json!({"type": "thinking", "thinking": "", "signature": "c2lnbmVkIHRoaW5raW5n"});
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        hers("a1", "u1", 1, "m1", sealed, Value::Null),
+        beside("x1", "u1", 2),
+        assistant("a2", "x1", 3, "Hello."),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside("rendered in the middle of one message: no real mark stands there; not built")
+    );
+}
+
+/// S3: an attachment recorded before its rendering was is not looked back
+/// from, marked or not: after her text it builds, as the importer builds
+/// it. An empty rendering beside a tool result is refused on both sides,
+/// but not yet in the importer's words: the image refuses the empty text
+/// first (`Decode::TextThen`).
+#[test]
+fn a_beside_mark_the_look_back_does_not_reach() {
+    let old = json!({
+        "type": "attachment", "sessionId": "s-1", "uuid": "x1", "parentUuid": "a1",
+        "timestamp": stamp(2), "cwd": "/synthetic",
+        "attachment": {"type": "hook_success", "hookName": "SessionStart", "hookEvent": "SessionStart",
+            "toolUseID": "toolu_01AbCdEfGhIjKlMnOp", "command": "echo hi", "content": "",
+            "stdout": "hi\n", "stderr": "", "exitCode": 0, "durationMs": 12},
+        "renderedBesideToolResult": true,
+    });
+    cc_exact(&jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        old,
+        user("u2", Some("x1"), 3, "Next."),
+    ]));
+    let mut empty = beside("x1", "u1", 1);
+    empty["rendered"] = json!([{"content": ""}]);
+    let source = jsonl(&[user("u1", None, 0, "Hi."), empty]);
+    built(&source).expect_err("refused");
+    assert_eq!(
+        crate::archive_v3::claude_code::import(source.as_bytes())
+            .expect_err("the importer refuses it too")
+            .to_string(),
+        "{attachment}.rendered[].content: an empty rendering beside a tool result: what her \
+         window held is unverified"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Codex: one line in file order (Order::File).
 

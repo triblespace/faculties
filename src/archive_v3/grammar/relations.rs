@@ -12,7 +12,9 @@
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still
 //! refused as not built yet, never built wrong: a record's supplied members
-//! under parent order, or of an attribute but a register (`Class::Supply`).
+//! under parent order, or of an attribute but a register (`Class::Supply`),
+//! and a beside-mark whose look-back reaches a node two records hold as
+//! different items (R1).
 //!
 //! Mirrors are not stated here a second time: the unit's records, read back
 //! as the JSON they hold, go through the importers' own record check
@@ -33,6 +35,14 @@
 //! over the same records read back, says which message each copy names and
 //! what register its phase is, or refuses where and as the importer
 //! refuses.
+//!
+//! Nor is a rendering the client marks beside a tool result (R1, R1',
+//! R1'', R1'''): the Claude Code importer's own look-back
+//! (`claude_code::beside_his_prompt`, `claude_code::in_one_message`) reads
+//! the places before it on its parent's line, each as the importer reads
+//! its item (`claude_code::typed_prompt`, its record's claims), and builds
+//! it only after his prompt written as a plain string, or refuses where
+//! and as the importer refuses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,8 +51,10 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::claude_code::check;
 use super::super::claude_code::json::{self, Json};
+use super::super::claude_code::{
+    beside_his_prompt, beside_marked, check, in_one_message, typed_prompt, Before,
+};
 use super::super::codex::{phase_register, supplied_phases, Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
@@ -148,6 +160,8 @@ struct Item {
     held: bool,
     /// She produced it (direction `out`).
     out: bool,
+    /// It is inside a result and not its head (`Requests::result`).
+    part: bool,
     /// The assembly point it came from.
     levels: Levels,
 }
@@ -335,6 +349,8 @@ fn record_parts(
     let mut parts = Parts::default();
     // The list outputs read, by their array.
     let mut lists = HashSet::new();
+    // The results' assembly points: every other item inside one is a part.
+    let mut results: Vec<Levels> = Vec::new();
     for (levels, value, at) in found {
         let mut cores = t
             .assemble(unit, value, &at)
@@ -342,6 +358,7 @@ fn record_parts(
         // A result's head is the item of its head modality it holds
         // directly: it comes first, and counts even when it holds no value
         // (Requests::result).
+        let mut headed = false;
         if let Some((path, head)) = result {
             let shaped = match t.shape(unit, value, &at.path) {
                 Some(shape) => format!("{}{{{shape}}}", at.path),
@@ -358,8 +375,11 @@ fn record_parts(
                     },
                 };
                 cores.insert(0, core);
+                results.push(levels.clone());
+                headed = true;
             }
         }
+        let inside = results.iter().any(|point| levels.starts_with(point));
         let mut consumed = Vec::new();
         t.consumed(unit, value, &at, &mut consumed);
         // X1: her text at a path the supply names takes the phase as its
@@ -453,7 +473,7 @@ fn record_parts(
             }
         }
         let first = parts.items.len();
-        for core in cores {
+        for (n, core) in cores.into_iter().enumerate() {
             let modality = core.modality;
             let effort = core.effort.is_some();
             let out = core.direction == Some(v3::fact::direction::OUT);
@@ -468,6 +488,7 @@ fn record_parts(
                 glosses: Vec::new(),
                 held: true,
                 out,
+                part: inside && !(headed && n == 0),
                 levels: levels.clone(),
             });
         }
@@ -492,6 +513,7 @@ fn record_parts(
                     glosses: Vec::new(),
                     held: rule.held,
                     out: rule.gap.direction == "out",
+                    part: inside,
                     levels: levels.clone(),
                 };
                 parts.built.push(built);
@@ -965,6 +987,7 @@ pub fn build(
             &t,
             &unit,
             &records,
+            &reads,
             &record_cat,
             &mut lines,
             header_gap,
@@ -986,18 +1009,21 @@ pub fn build(
     finish(table, lines, wiring)
 }
 
-/// [`Order::Parents`]: records chained by their parent ids.
+/// [`Order::Parents`]: records chained by their parent ids. `reads` are
+/// the records as the JSON they hold.
 #[allow(clippy::too_many_arguments)]
 fn parents(
     t: &Table,
     unit: &Unit,
     records: &[Id],
+    reads: &[Json],
     record_cat: &Cat,
     lines: &mut Lines,
     header_gap: Id,
     (id, parent): (&'static str, &'static str),
     wiring: &mut Wiring,
 ) -> Result<(), String> {
+    use v3::fact::modality::{TEXT, TOOL_CALL, TOOL_RESULT};
     let table = t.table;
     let read = |record: Id, field: &str| -> Option<String> {
         field_at(&unit, record, field)
@@ -1080,6 +1106,12 @@ fn parents(
     let mut segments: HashMap<String, (String, String)> = HashMap::new();
     let mut record_items: HashMap<String, Vec<(Id, Id)>> = HashMap::new();
     let mut record_parent: HashMap<String, Option<String>> = HashMap::new();
+    // R1: each node a record holds, as the importer's look-back before a
+    // beside-mark reads its item (none where two records hold it as
+    // different items); and each attachment's parent, and whether it is
+    // beside-marked (R1'').
+    let mut as_before: HashMap<Id, Option<Before>> = HashMap::new();
+    let mut attachment_parents: HashMap<String, (Option<String>, bool)> = HashMap::new();
     let Wiring {
         calls_at,
         answers,
@@ -1201,6 +1233,57 @@ fn parents(
                 }),
             },
         };
+        // R1'': an attachment's parent and its mark, as the importer keeps
+        // them (a thinking drop is no attachment to it).
+        let read_back = &reads[at];
+        let attachment =
+            shape == "attachment" && read_back.str_at("attachment.type") != Some("thinking_drop");
+        if attachment {
+            let beside = matches!(
+                read_back.get("renderedBesideToolResult"),
+                Some(Json::Bool(true))
+            );
+            attachment_parents.insert(own.clone(), (read(record, parent), beside));
+        }
+        // R1, R1', R1''': a rendering the client marks beside a tool result,
+        // recorded with its rendering (S3), is built only where the
+        // importer's own look-back builds it, over the places before it on
+        // its parent's line; where it refuses, the unit is refused as it
+        // refuses. A window's opening holds no item the look-back reads; a
+        // node outside it that no record holds is the span of unknown items.
+        if attachment
+            && !parts.unrecorded
+            && beside_marked(read_back).map_err(|failure| failure.to_string())?
+        {
+            let mut twice = false;
+            let places = &lines.places;
+            let line =
+                std::iter::successors(from.edited.node, |at| places[at].previous).map_while(|at| {
+                    let place = places[&at];
+                    match as_before
+                        .get(&at)
+                        .or_else(|| as_before.get(&place.original))
+                    {
+                        Some(&Some(item)) => Some(item),
+                        Some(None) => {
+                            twice = true;
+                            None
+                        }
+                        None => Some(Before {
+                            span: !place.section,
+                            ..Before::default()
+                        }),
+                    }
+                });
+            let decided = beside_his_prompt(line);
+            if twice {
+                return Err(
+                    "not built yet: a beside-mark after a node two records hold as different items"
+                        .to_owned(),
+                );
+            }
+            decided.map_err(|failure| failure.to_string())?;
+        }
         // A gloss on the parent's tail describes the end of the parent's own
         // line: never a root or an orphan span standing in for one.
         for (category, text, path) in &parts.parent_tail {
@@ -1218,6 +1301,14 @@ fn parents(
             // continues; a record continuing it continues its parent's line.
             let header = header.unwrap_or(header_gap);
             let message = read(record, r.id).unwrap_or_default();
+            // R1'': a beside-mark in the middle of one request, by the
+            // importer's own rule.
+            in_one_message(
+                messages.contains_key(&message),
+                read(record, parent).as_deref(),
+                &attachment_parents,
+            )
+            .map_err(|failure| failure.to_string())?;
             let continuing = read(record, parent).is_some_and(|p| {
                 messages
                     .get(&message)
@@ -1253,6 +1344,26 @@ fn parents(
             let at = lines.place(edited.node, item.fact, false, None)?;
             edited.node = Some(at);
             own_nodes.push(at);
+            // R1: the item as the importer's look-back reads it: his typed
+            // prompt by the importer's own rule, the claims its record's.
+            let head = item.modality == Some(TOOL_RESULT);
+            let (prompt, plain_prompt) = if shape == "user" {
+                typed_prompt(read_back, item.modality == Some(TEXT), head, item.part)
+            } else {
+                (false, false)
+            };
+            let mark = Before {
+                attachment,
+                head,
+                part: item.part,
+                call: item.modality == Some(TOOL_CALL),
+                span: false,
+                prompt,
+                plain_prompt,
+                harness_written: parts.claims.harness_written,
+                compaction_summary: parts.claims.compaction_summary,
+            };
+            read_before(&mut as_before, at, mark);
             calls_at
                 .entry(at)
                 .or_default()
@@ -1286,8 +1397,18 @@ fn parents(
             for (at, fact_id) in wired.iter().enumerate() {
                 let original = (*fact_id == own_facts[at]).then_some(own_nodes[at]);
                 let node = lines.place(unedited.node, *fact_id, false, original)?;
-                if let Some(original) = original {
-                    lines.copied(node, original);
+                match original {
+                    Some(original) => lines.copied(node, original),
+                    // R1: a call the client rewrote is, to the importer, a
+                    // call of no record.
+                    None => read_before(
+                        &mut as_before,
+                        node,
+                        Before {
+                            call: true,
+                            ..Before::default()
+                        },
+                    ),
                 }
                 unedited.node = Some(node);
             }
@@ -1453,6 +1574,15 @@ fn parents(
         }
     }
     Ok(())
+}
+
+/// What the R1 look-back reads at `node`: none where two records hold it
+/// as different items.
+fn read_before(as_before: &mut HashMap<Id, Option<Before>>, node: Id, item: Before) {
+    let known = as_before.entry(node).or_insert(Some(item));
+    if *known != Some(item) {
+        *known = None;
+    }
 }
 
 /// A record's kind under [`Order::File`]: the first rule whose conditions

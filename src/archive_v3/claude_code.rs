@@ -520,6 +520,157 @@ const MACHINERY_SUBTYPES: &[&str] = &[
     "scheduled_task_fire",
 ];
 
+/// One place on the line before a beside-mark, as the R1 look-back reads
+/// it: what its item is, and what the item's record claims. The importer's,
+/// and the relations' (`grammar::relations`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Before {
+    /// An item of an attachment record.
+    pub(crate) attachment: bool,
+    /// The head of a tool result, and a part of one.
+    pub(crate) head: bool,
+    pub(crate) part: bool,
+    /// A tool call.
+    pub(crate) call: bool,
+    /// The span of unknown items a record outside the unit held.
+    pub(crate) span: bool,
+    /// A text of his typed prompt, and one of a prompt written as the plain
+    /// string ([`typed_prompt`]).
+    pub(crate) prompt: bool,
+    pub(crate) plain_prompt: bool,
+    /// Its record claims harness text, or a compaction summary.
+    pub(crate) harness_written: bool,
+    pub(crate) compaction_summary: bool,
+}
+
+/// R1'', R1''': whether an item of a `user` record is a text of his typed
+/// prompt (`text`, outside any tool result: neither its `head` nor a
+/// `part`), and whether the prompt is written as the plain string, not
+/// blocks. The importer's rule, and the relations' (`grammar::relations`).
+pub(crate) fn typed_prompt(record: &Json, text: bool, head: bool, part: bool) -> (bool, bool) {
+    // His typed prompt: the record's own text, unless it is harness text
+    // or a compaction summary (R1'').
+    let typed = !record.is_true("isMeta") && !record.is_true("isCompactSummary");
+    let plain = matches!(record.at("message.content"), Some(Json::Str(_)));
+    let prompt = typed && text && !head && !part;
+    (prompt, prompt && plain)
+}
+
+/// R1': whether the client marks an attachment's rendering
+/// `renderedBesideToolResult`. The mark is the JSON boolean `true`; any
+/// other spelling fails. The importer's rule, and the relations'
+/// (`grammar::relations`).
+pub(crate) fn beside_marked(record: &Json) -> Result<bool, Failure> {
+    Ok(match record.get("renderedBesideToolResult") {
+        None => false,
+        Some(Json::Bool(true)) => true,
+        Some(_) => {
+            return Err(Failure::new(
+                "{attachment}.renderedBesideToolResult",
+                "a beside-mark that is not the boolean true",
+            ))
+        }
+    })
+}
+
+/// R1: the place before a `renderedBesideToolResult` rendering, past
+/// the renderings of the attachments before it, holds his typed prompt
+/// (R1''), written as a plain string (R1''': every real mark in the
+/// round-6 sample follows one; a prompt of blocks fails). Beside a result, between a call and its result (R1'), after
+/// a span of unknown items, or after anything else (her text, harness
+/// text, a compaction summary, the start of her message), the
+/// rendering is not built. Of the 727 marks in the live transcripts
+/// under 60 MB (round 6, counts only), 720 follow his prompt, 4 harness
+/// text and 3 a compaction summary; none follows anything else.
+/// `line` is the places before it, last first. The importer's rule, and
+/// the relations' (`grammar::relations`).
+pub(crate) fn beside_his_prompt(line: impl IntoIterator<Item = Before>) -> Result<(), Failure> {
+    let path = "{attachment}.renderedBesideToolResult";
+    for item in line {
+        if item.attachment {
+            continue;
+        }
+        if item.head || item.part {
+            return Err(Failure::new(
+                path,
+                "rendered beside a tool result: the one framed case held the text with a trailing newline, not the exact text; not built",
+            ));
+        }
+        if item.call {
+            return Err(Failure::new(
+                path,
+                "rendered between a call and its result: no real mark follows anything but a typed prompt; not built",
+            ));
+        }
+        if item.span {
+            return Err(Failure::new(
+                path,
+                "rendered after a span of unknown items: whether a tool result is beside it is unknown",
+            ));
+        }
+        if item.plain_prompt {
+            return Ok(());
+        }
+        // R1''': every real mark follows a prompt written as a plain
+        // string; one of blocks (an image beside his text, a result
+        // before it) is unverified.
+        if item.prompt {
+            return Err(Failure::new(
+                path,
+                "rendered after a prompt of blocks: every real mark follows a plain string prompt; not built",
+            ));
+        }
+        // Real marks do follow harness text and compaction summaries,
+        // but what her window held there is unverified.
+        if item.harness_written {
+            return Err(Failure::new(
+                path,
+                "rendered after harness text: what her window held there is unverified; not built",
+            ));
+        }
+        if item.compaction_summary {
+            return Err(Failure::new(
+                path,
+                "rendered after a compaction summary: what her window held there is unverified; not built",
+            ));
+        }
+        break;
+    }
+    Err(Failure::new(
+        path,
+        "rendered after something other than his typed prompt: no real mark stands there; not built",
+    ))
+}
+
+/// R1'': a beside-mark in the middle of one message: the message began
+/// before the mark (`begun`) and the record after it continues it, up from
+/// its `parent` through the attachments (`attachment_parents`: uuid -> its
+/// parent's uuid, whether it is beside-marked). The importer's rule, and
+/// the relations' (`grammar::relations`).
+pub(crate) fn in_one_message(
+    begun: bool,
+    parent: Option<&str>,
+    attachment_parents: &HashMap<String, (Option<String>, bool)>,
+) -> Result<(), Failure> {
+    if begun {
+        let mut cursor = parent;
+        // At most one step per attachment, whatever their parents say.
+        for _ in 0..attachment_parents.len() {
+            let Some((up, beside)) = cursor.and_then(|at| attachment_parents.get(at)) else {
+                break;
+            };
+            if *beside {
+                return Err(Failure::new(
+                    "{attachment}.renderedBesideToolResult",
+                    "rendered in the middle of one message: no real mark stands there; not built",
+                ));
+            }
+            cursor = up.as_deref();
+        }
+    }
+    Ok(())
+}
+
 impl Builder {
     fn new(uuids: HashSet<String>) -> Result<Self, Failure> {
         let mut builder = Builder {
@@ -1003,14 +1154,11 @@ impl Builder {
                 ))
             }
         }
-        // His typed prompt: the record's own text, unless it is harness text
-        // or a compaction summary (R1'').
-        let typed = !record.is_true("isMeta") && !record.is_true("isCompactSummary");
-        let plain = matches!(record.at("message.content"), Some(Json::Str(_)));
+        // His typed prompt (R1'', R1''').
         for &item in &items {
             let item = &mut self.items[item];
-            item.prompt = typed && item.text && !item.head && item.part_of.is_none();
-            item.plain_prompt = item.prompt && plain;
+            (item.prompt, item.plain_prompt) =
+                typed_prompt(record, item.text, item.head, item.part_of.is_some());
         }
         // Correlators: the record that holds the call this result answers,
         // and the call a harness message follows.
@@ -1460,23 +1608,11 @@ impl Builder {
 
         // A beside-mark in the middle of one message: the message began
         // before the mark and this record continues it after (R1'').
-        if self.messages.contains_key(&message_id) {
-            let mut cursor = parent.as_deref();
-            // At most one step per attachment, whatever their parents say.
-            for _ in 0..self.attachment_parents.len() {
-                let Some((up, beside)) = cursor.and_then(|at| self.attachment_parents.get(at))
-                else {
-                    break;
-                };
-                if *beside {
-                    return Err(Failure::new(
-                        "{attachment}.renderedBesideToolResult",
-                        "rendered in the middle of one message: no real mark stands there; not built",
-                    ));
-                }
-                cursor = up.as_deref();
-            }
-        }
+        in_one_message(
+            self.messages.contains_key(&message_id),
+            parent.as_deref(),
+            &self.attachment_parents,
+        )?;
         // One API message spans the records that share its id; its window
         // is decided once, from the unedited history at the records'
         // common base.
@@ -1602,20 +1738,11 @@ impl Builder {
         // mark is the JSON boolean `true`; any other spelling fails (R1').
         // It is built only directly after his typed prompt (R1''), where
         // 720 of the 727 real marks stand.
-        let beside = match record.get("renderedBesideToolResult") {
-            None => false,
-            Some(Json::Bool(true)) => true,
-            Some(_) => {
-                return Err(Failure::new(
-                    "{attachment}.renderedBesideToolResult",
-                    "a beside-mark that is not the boolean true",
-                ))
-            }
-        };
+        let beside = beside_marked(record)?;
         if beside {
             let version = self.version_at[at];
             let line = self.parent_line(parent.as_deref(), version)?;
-            self.beside_his_prompt(line.edited.node)?;
+            beside_his_prompt(self.before(line.edited.node))?;
         }
         let mut items = Vec::new();
         for shown in rendered {
@@ -1653,78 +1780,26 @@ impl Builder {
         self.place(at, uuid, parent, items)
     }
 
-    /// R1: the place before a `renderedBesideToolResult` rendering, past
-    /// the renderings of the attachments before it, holds his typed prompt
-    /// (R1''), written as a plain string (R1''': every real mark in the
-    /// round-6 sample follows one; a prompt of blocks fails). Beside a result, between a call and its result (R1'), after
-    /// a span of unknown items, or after anything else (her text, harness
-    /// text, a compaction summary, the start of her message), the
-    /// rendering is not built. Of the 727 marks in the live transcripts
-    /// under 60 MB (round 6, counts only), 720 follow his prompt, 4 harness
-    /// text and 3 a compaction summary; none follows anything else.
-    fn beside_his_prompt(&self, tail: Option<usize>) -> Result<(), Failure> {
-        let path = "{attachment}.renderedBesideToolResult";
-        let mut cursor = tail;
-        while let Some(at) = cursor {
+    /// The places on the line ending at `tail`, last first, as the R1
+    /// look-back reads them ([`beside_his_prompt`]).
+    fn before(&self, tail: Option<usize>) -> impl Iterator<Item = Before> + '_ {
+        std::iter::successors(tail, move |&at| self.positions[at].previous).map(move |at| {
             let item = &self.items[self.positions[at].item];
-            if item
-                .record
-                .is_some_and(|record| self.attachments.contains(&record))
-            {
-                cursor = self.positions[at].previous;
-                continue;
-            }
-            if item.head || item.part_of.is_some() {
-                return Err(Failure::new(
-                    path,
-                    "rendered beside a tool result: the one framed case held the text with a trailing newline, not the exact text; not built",
-                ));
-            }
-            if item.call {
-                return Err(Failure::new(
-                    path,
-                    "rendered between a call and its result: no real mark follows anything but a typed prompt; not built",
-                ));
-            }
-            if self.positions[at].item == self.span_gap {
-                return Err(Failure::new(
-                    path,
-                    "rendered after a span of unknown items: whether a tool result is beside it is unknown",
-                ));
-            }
-            if item.plain_prompt {
-                return Ok(());
-            }
-            // R1''': every real mark follows a prompt written as a plain
-            // string; one of blocks (an image beside his text, a result
-            // before it) is unverified.
-            if item.prompt {
-                return Err(Failure::new(
-                    path,
-                    "rendered after a prompt of blocks: every real mark follows a plain string prompt; not built",
-                ));
-            }
-            // Real marks do follow harness text and compaction summaries,
-            // but what her window held there is unverified.
             let claims = item.record.and_then(|record| self.claims.get(&record));
-            if claims.is_some_and(|claims| claims.harness_written) {
-                return Err(Failure::new(
-                    path,
-                    "rendered after harness text: what her window held there is unverified; not built",
-                ));
+            Before {
+                attachment: item
+                    .record
+                    .is_some_and(|record| self.attachments.contains(&record)),
+                head: item.head,
+                part: item.part_of.is_some(),
+                call: item.call,
+                span: self.positions[at].item == self.span_gap,
+                prompt: item.prompt,
+                plain_prompt: item.plain_prompt,
+                harness_written: claims.is_some_and(|claims| claims.harness_written),
+                compaction_summary: claims.is_some_and(|claims| claims.compaction_summary),
             }
-            if claims.is_some_and(|claims| claims.compaction_summary) {
-                return Err(Failure::new(
-                    path,
-                    "rendered after a compaction summary: what her window held there is unverified; not built",
-                ));
-            }
-            break;
-        }
-        Err(Failure::new(
-            path,
-            "rendered after something other than his typed prompt: no real mark stands there; not built",
-        ))
+        })
     }
 
     /// An attachment recorded before its rendering was (S3): the members
