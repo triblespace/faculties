@@ -1784,3 +1784,218 @@ fn codex_an_output_a_client_could_have_cut_unrecorded_is_refused() {
     node_saying_in(&codex_built(&bare).expect("builds"), &long, 1);
     crate::archive_v3::codex::import(jsonl(&bare).as_bytes()).expect("the importer builds it");
 }
+
+/// The client's copy of her message's phase (X1): an `agent_message`
+/// event.
+fn phase_copy(second: u32, text: &str, phase: &str) -> Value {
+    event(
+        second,
+        json!({"type": "agent_message", "message": text, "phase": phase}),
+    )
+}
+
+/// Her message, with its own phase or none.
+fn her_phased(second: u32, text: &str, phase: Option<&str>) -> Value {
+    let mut said = says("assistant", text);
+    if let Some(phase) = phase {
+        said["phase"] = json!(phase);
+    }
+    envelope(second, "response_item", said)
+}
+
+/// Her sealed reasoning, which codex writes between a copy and its message.
+fn reasoning(second: u32) -> Value {
+    envelope(
+        second,
+        "response_item",
+        json!({"type": "reasoning", "summary": [], "content": null,
+            "encrypted_content": "c2VhbGVkIHJlYXNvbmluZyA_Pn4g-_8="}),
+    )
+}
+
+/// The registers of the facts the nodes holding `text` hold (X1).
+fn registers_saying(fragment: &Fragment, text: &str) -> Vec<Id> {
+    let handle = {
+        let blob: Blob<blobencodings::UTF8String> = text.to_blob();
+        blob.get_handle()
+    };
+    let facts = fragment.facts();
+    let found: std::collections::BTreeSet<Id> = find!(
+        r: Id,
+        pattern!(facts, [
+            { _?node @ v3::node::holds: _?fact },
+            { _?fact @ v3::fact::payload: handle, v3::fact::register: ?r },
+        ])
+    )
+    .collect();
+    found.into_iter().collect()
+}
+
+/// A session and header, then his question.
+fn asked() -> Vec<Value> {
+    vec![session(0, "Sys."), header(1, "high"), item(2, "user", "Q.")]
+}
+
+/// X1, X13: her message that holds no phase takes its event copy's as the
+/// register of every text it holds, the copy naming the first item after it
+/// past her reasoning. Without the copy her text holds no register.
+#[test]
+fn codex_a_phase_copy_supplies_the_register_of_the_message_after_it() {
+    use v3::fact::register::{ANSWER, COMMENTARY};
+    for (phase, register) in [("commentary", COMMENTARY), ("final_answer", ANSWER)] {
+        let mut records = asked();
+        records.extend([
+            phase_copy(3, "Looking.", phase),
+            reasoning(3),
+            her_phased(3, "Looking.", None),
+        ]);
+        let fragment = codex_exact(&records);
+        node_saying_in(&fragment, "Looking.", 1);
+        assert_eq!(registers_saying(&fragment, "Looking."), vec![register]);
+    }
+    // Every text of her message, the copy matching one of them.
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "commentary"),
+        her_parts(3, &["Looking.", "More."]),
+    ]);
+    let fragment = codex_exact(&records);
+    assert_eq!(registers_saying(&fragment, "Looking."), vec![COMMENTARY]);
+    assert_eq!(registers_saying(&fragment, "More."), vec![COMMENTARY]);
+    let mut records = asked();
+    records.extend([reasoning(3), her_phased(3, "Looking.", None)]);
+    let fragment = codex_exact(&records);
+    assert!(registers_saying(&fragment, "Looking.").is_empty());
+}
+
+/// Where her message holds its own phase, a copy that agrees adds nothing:
+/// her text's register is her message's own.
+#[test]
+fn codex_a_phase_copy_that_agrees_with_her_message_adds_nothing() {
+    let mut records = asked();
+    records.push(her_phased(3, "Looking.", Some("commentary")));
+    let plain = codex_exact(&records);
+    records.insert(3, phase_copy(3, "Looking.", "commentary"));
+    let fragment = codex_exact(&records);
+    assert_eq!(fragment.facts(), plain.facts(), "the copy adds nothing");
+    assert_eq!(
+        registers_saying(&fragment, "Looking."),
+        vec![v3::fact::register::COMMENTARY]
+    );
+}
+
+/// A copy that disagrees with her message's phase, or with another copy
+/// of the same message, is refused where and as the importer refuses it.
+#[test]
+fn codex_a_phase_copy_that_disagrees_is_refused() {
+    let disagrees =
+        "{event_msg}.payload{agent_message}.phase: a phase copy that disagrees with her message's \
+         phase";
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "commentary"),
+        her_phased(3, "Looking.", Some("final_answer")),
+    ]);
+    assert_eq!(codex_refused(&records), disagrees);
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "commentary"),
+        phase_copy(3, "Looking.", "final_answer"),
+        her_phased(3, "Looking.", None),
+    ]);
+    assert_eq!(codex_refused(&records), disagrees);
+}
+
+/// X13, X13': a copy names its message by structure. One whose message is
+/// not the item after it, though another record holds its text, is matched
+/// by text alone; one whose message only a compaction's replacement
+/// history holds has no structural match. Both are refused where and as the
+/// importer refuses them.
+#[test]
+fn codex_a_phase_copy_matched_by_text_alone_is_refused() {
+    let alone = "{event_msg}.payload{agent_message}.phase: a phase copy whose message is not the \
+                 item after it: matched by text alone";
+    let mut records = asked();
+    records.extend([
+        her_phased(3, "Done.", None),
+        phase_copy(4, "Done.", "commentary"),
+    ]);
+    assert_eq!(codex_refused(&records), alone);
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Done.", "commentary"),
+        item(4, "user", "More."),
+        her_phased(5, "Done.", None),
+    ]);
+    assert_eq!(codex_refused(&records), alone);
+    let mut records = asked();
+    records.extend([
+        her_phased(3, "Done.", None),
+        phase_copy(4, "Kept.", "commentary"),
+        envelope(
+            5,
+            "compacted",
+            json!({"message": "", "replacement_history": [
+                says("assistant", "Kept."),
+                {"type": "compaction", "encrypted_content": "c2VhbGVkIGNvbXBhY3Rpb24g--8="},
+            ]}),
+        ),
+        her_phased(6, "After.", None),
+    ]);
+    assert_eq!(
+        codex_refused(&records),
+        "{event_msg}.payload{agent_message}.phase: a phase copy whose message only a \
+         replacement history holds: no structural match"
+    );
+}
+
+/// A copy whose text no record holds (a fork's copied prefix, X8') holds
+/// nothing: the message after it takes no register, and the unit builds.
+#[test]
+fn codex_a_phase_copy_whose_text_no_record_holds_holds_nothing() {
+    let records = |copy: bool| {
+        let mut forked = session(0, "Sys.");
+        forked["payload"]["forked_from_id"] = json!("99999999-9999-4999-8999-999999999999");
+        let mut records = vec![forked, header(1, "high"), item(2, "user", "Parent asks.")];
+        if copy {
+            records.push(phase_copy(2, "Parent comments.", "commentary"));
+        }
+        records.extend([
+            item(3, "user", "Child task."),
+            reasoning(4),
+            her_phased(5, "Done.", None),
+        ]);
+        records
+    };
+    let fragment = codex_exact(&records(true));
+    assert!(nodes_saying(&fragment, "Parent comments.").is_empty());
+    assert!(registers_saying(&fragment, "Done.").is_empty());
+    assert_eq!(
+        fragment.facts(),
+        codex_exact(&records(false)).facts(),
+        "the copy adds nothing"
+    );
+}
+
+/// A phase the table does not name, on a copy or on her message, is
+/// refused where and as the importer refuses it.
+#[test]
+fn codex_a_phase_the_table_does_not_name_is_refused() {
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "aside"),
+        her_phased(3, "Looking.", None),
+    ]);
+    assert_eq!(
+        codex_refused(&records),
+        "{event_msg}.payload{agent_message}.phase: a vocabulary value the table does not name"
+    );
+    // Her own message's unnamed phase, no copy: refused on both sides, but
+    // not yet in the importer's words. The image refuses the value before
+    // the relations read it, and says so in its construction findings.
+    let mut records = asked();
+    records.push(her_phased(3, "Looking.", Some("aside")));
+    codex_built(&records).expect_err("refused");
+    crate::archive_v3::codex::import(jsonl(&records).as_bytes())
+        .expect_err("the importer refuses it too");
+}

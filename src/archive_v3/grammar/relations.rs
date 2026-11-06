@@ -12,7 +12,7 @@
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still
 //! refused as not built yet, never built wrong: a record's supplied members
-//! (`Class::Supply`).
+//! under parent order, or of an attribute but a register (`Class::Supply`).
 //!
 //! Mirrors are not stated here a second time: the unit's records, read back
 //! as the JSON they hold, go through the importers' own record check
@@ -26,6 +26,13 @@
 //! importer's own rule (`codex::Budget`, `codex::Unrecorded`,
 //! `codex::History`), over the same records read back, says what her window
 //! held of each output, or refuses where and as the importer refuses.
+//!
+//! Nor is a supplied member (X1, X13): the table's `Supply` says which
+//! facts of her message a copy's member is the source of, and the Codex
+//! importer's own rule (`codex::supplied_phases`, `codex::phase_register`),
+//! over the same records read back, says which message each copy names and
+//! what register its phase is, or refuses where and as the importer
+//! refuses.
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,10 +43,10 @@ use triblespace_cxg::{PathStep, Unit};
 
 use super::super::claude_code::check;
 use super::super::claude_code::json::{self, Json};
-use super::super::codex::{Budget, History, Unrecorded};
+use super::super::codex::{phase_register, supplied_phases, Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
-    Place, Rewrite,
+    Place, Rewrite, Supply,
 };
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, gloss_part, node, occurrence, unexported, witness,
@@ -167,7 +174,8 @@ struct Parts {
     /// (`Place::Request`): (ends term, the request's id, path).
     request_ends: Vec<(Id, String, &'static str)>,
     /// Facts the relations built for the record (gaps beside its values,
-    /// outputs a history budget cut), staged with the lines.
+    /// outputs a history budget cut, texts a supply registers), staged with
+    /// the lines.
     built: Vec<Fragment>,
     /// Glosses at their own place (`Place::Here`), by the levels of the
     /// value: (levels, category, text, path).
@@ -309,13 +317,16 @@ fn annotate(
 /// array first, then each array element's by array path and index; within
 /// one assembly point, in the order they were assembled), and its claims.
 /// Under a history budget, the tool outputs the budget names are what her
-/// window held of them.
+/// window held of them. Where the unit's supply is built, its copies hold
+/// nothing, and the phase the record's message takes from its copy is the
+/// register of its facts the supply names.
 fn record_parts(
     t: &Table,
     unit: &Unit,
     record: Id,
     cat: &Cat,
     history: Option<(&HistoryBudget, History)>,
+    supplied: Option<(&Supply, Option<&str>)>,
 ) -> Result<Parts, String> {
     let mut found = vec![(Levels::new(), record, cat.clone())];
     points(t, unit, record, cat, &mut Levels::new(), &mut found);
@@ -351,6 +362,38 @@ fn record_parts(
         }
         let mut consumed = Vec::new();
         t.consumed(unit, value, &at, &mut consumed);
+        // X1: her text at a path the supply names takes the phase as its
+        // register, by the importer's own rule; the facts are the supply's
+        // modality and direction, staged with the lines (the image's fact
+        // without the register stays, held by no node). A failure names
+        // the phase of the message holding the text, as the importer names
+        // it.
+        if let Some((supply, Some(phase))) = supplied {
+            for (entry, _, _) in &consumed {
+                if !supply.of.iter().any(|(text, _)| *text == entry.path) {
+                    continue;
+                }
+                let (item, _) = entry
+                    .path
+                    .split_once("{message}")
+                    .ok_or_else(|| format!("{}: a supplied text outside a message", entry.path))?;
+                let register = phase_register(Some(phase), &format!("{item}{{message}}.phase"))
+                    .map_err(|failure| failure.to_string())?;
+                let held = (
+                    term(v3::fact::modality::SPECS, supply.modality),
+                    term(v3::fact::direction::SPECS, supply.direction),
+                );
+                for core in cores
+                    .iter_mut()
+                    .filter(|core| (core.modality, core.direction) == held)
+                {
+                    core.register = register;
+                    parts
+                        .built
+                        .push(fact(core.clone()).map_err(|e| format!("{}: {e}", entry.path))?);
+                }
+            }
+        }
         // X18, X18': an output as her client's history held it, by the
         // importer's own rule. A text the budget cuts is her window's text,
         // and its full text the record's claim (the image's fact of the full
@@ -499,6 +542,9 @@ fn record_parts(
                     }
                 }
                 Class::Rewrite(rewrite) => parts.rewrites.push((rewrite, entry.path, v)),
+                // X1: a copy holds nothing of its own; its phase is her
+                // message's register (above).
+                Class::Supply(_) if supplied.is_some() => {}
                 Class::Supply(_) => {
                     return Err(
                         format!("not built yet: a {:?} at {}", entry.class, entry.path)
@@ -1093,7 +1139,7 @@ fn parents(
                 }
             }
         }
-        let parts = record_parts(&t, &unit, record, &record_cat, None)?;
+        let parts = record_parts(&t, &unit, record, &record_cat, None, None)?;
         if !parts.turn.is_empty() {
             return Err("not built yet: a turn place under parent order".to_owned());
         }
@@ -1494,6 +1540,23 @@ fn file(
     });
     // X18: the latest header's budget.
     let mut header_budget: Option<Budget> = None;
+    // X1, X13: the phase each of her messages that holds none takes from
+    // the copy that names it, by record, under the table's one supply.
+    let mut supplies = table.entries.iter().filter_map(|entry| match &entry.class {
+        Class::Supply(supply) => Some(supply),
+        _ => None,
+    });
+    let supply = supplies.next();
+    if supplies.next().is_some() {
+        return Err("not built yet: several supplies".to_owned());
+    }
+    let phases = match supply {
+        Some(supply) if supply.attribute != "register" => {
+            return Err(format!("not built yet: a supply of {}", supply.attribute))
+        }
+        Some(_) => supplied_phases(reads).map_err(|failure| failure.to_string())?,
+        None => HashMap::new(),
+    };
     let marked = records
         .iter()
         .any(|&record| file_kind(rules, unit, record) == FileKind::Turn);
@@ -1570,7 +1633,8 @@ fn file(
             }
             _ => None,
         };
-        let parts = record_parts(t, unit, record, record_cat, history)?;
+        let supplied = supply.map(|supply| (supply, phases.get(&at).map(String::as_str)));
+        let parts = record_parts(t, unit, record, record_cat, history, supplied)?;
         if !parts.file_tail.is_empty()
             || !parts.parent_tail.is_empty()
             || !parts.rewrites.is_empty()

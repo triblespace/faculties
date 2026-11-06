@@ -287,8 +287,8 @@ fn places_beyond_reasoning(record: &Json) -> bool {
 /// that item does not hold the copy's text but another does, the copy is
 /// matched by text alone and fails; where none does, it holds nothing (its
 /// mirror decides). Where the message holds a phase, the copy must spell the
-/// same.
-fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
+/// same. The importer's rule, and the relations' (`grammar::relations`).
+pub(crate) fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
     let path = "{event_msg}.payload{agent_message}.phase";
     let said = |item: &Json| -> Vec<String> {
         if item.str_at("type") != Some("message") || item.str_at("role") != Some("assistant") {
@@ -368,6 +368,18 @@ fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> 
         }
     }
     Ok(phases)
+}
+
+/// X1: the register of her text under her message's phase, or its event
+/// copy's: none where neither holds one. The importer's rule, and the
+/// relations' (`grammar::relations`).
+pub(crate) fn phase_register(phase: Option<&str>, path: &str) -> Result<Option<Id>, Failure> {
+    Ok(match phase {
+        None => None,
+        Some("commentary") => Some(v3::fact::register::COMMENTARY),
+        Some("final_answer") => Some(v3::fact::register::ANSWER),
+        Some(_) => return Err(Failure::new(path, "a phase the table does not name")),
+    })
 }
 
 /// A tool output's history budget: in tokens, or in bytes (codex-rs
@@ -1305,17 +1317,7 @@ impl Builder {
                                         .and_then(|at| self.phases.get(&at))
                                         .map(String::as_str)
                                 });
-                                let register = match phase {
-                                    None => None,
-                                    Some("commentary") => Some(v3::fact::register::COMMENTARY),
-                                    Some("final_answer") => Some(v3::fact::register::ANSWER),
-                                    Some(_) => {
-                                        return Err(Failure::new(
-                                            &at(".phase"),
-                                            "a phase the table does not name",
-                                        ))
-                                    }
-                                };
+                                let register = phase_register(phase, &at(".phase"))?;
                                 out.push(Placed::held(FactCore {
                                     payload: Some(text.to_owned()),
                                     register,
