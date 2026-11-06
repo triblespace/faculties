@@ -2237,6 +2237,60 @@ fn codex_a_phase_copy_supplies_the_register_of_the_message_after_it() {
     assert!(registers_saying(&fragment, "Looking.").is_empty());
 }
 
+/// X13: a copy names the first record after it that places an item her
+/// window holds, whatever kind of record that is. One that places none (a
+/// turn's start) lies between as her reasoning does; one that places
+/// another item (a settings header) is the record it names, so her message
+/// after it is matched by text alone.
+#[test]
+fn codex_a_phase_copy_names_the_next_record_that_holds_an_item() {
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "commentary"),
+        event(3, json!({"type": "task_started", "turn_id": "t1"})),
+        her_phased(3, "Looking.", None),
+    ]);
+    let fragment = codex_exact(&records);
+    assert_eq!(
+        registers_saying(&fragment, "Looking."),
+        vec![v3::fact::register::COMMENTARY]
+    );
+    let mut records = asked();
+    records.extend([
+        phase_copy(3, "Looking.", "commentary"),
+        header(3, "high"),
+        her_phased(3, "Looking.", None),
+    ]);
+    assert_eq!(
+        codex_refused(&records),
+        "{event_msg}.payload{agent_message}.phase: a phase copy whose message is not the item \
+         after it: matched by text alone"
+    );
+}
+
+/// X13: her message that renders nothing (its only text empty, or no part
+/// at all) is her message all the same: a copy before it names it, not the
+/// message after it that holds the copy's text, so the copy is matched by
+/// text alone and refused, where and as the importer refuses it. The
+/// relations judge the record by the table's paths, not by the facts it
+/// rendered.
+#[test]
+fn codex_a_phase_copy_does_not_reach_past_her_empty_message() {
+    for empty in [her_parts(3, &[""]), her_parts(3, &[])] {
+        let mut records = asked();
+        records.extend([
+            phase_copy(3, "Looking.", "commentary"),
+            empty,
+            her_phased(3, "Looking.", None),
+        ]);
+        assert_eq!(
+            codex_refused(&records),
+            "{event_msg}.payload{agent_message}.phase: a phase copy whose message is not the \
+             item after it: matched by text alone"
+        );
+    }
+}
+
 /// Where her message holds its own phase, a copy that agrees adds nothing:
 /// her text's register is her message's own.
 #[test]

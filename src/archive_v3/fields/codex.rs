@@ -95,6 +95,9 @@ const PHASE_COPY: Supply = Supply {
     modality: "text",
     direction: "out",
     past: &[("thinking", "out")],
+    installed: &[
+        "{compacted}.payload.replacement_history[]{message}{assistant}.content[]{output_text}.text",
+    ],
 };
 const REASONING_SEAL: &[(&str, Decode)] =
     &[("media_type", Decode::ConstText(sealed::OPENAI_REASONING))];

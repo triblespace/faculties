@@ -12,9 +12,16 @@
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still
 //! refused as not built yet, never built wrong: a record's supplied members
-//! under parent order, or of an attribute but a register (`Class::Supply`),
-//! and a beside-mark whose look-back reaches a node two records hold as
-//! different items (R1).
+//! under parent order (`Class::Supply`), and a beside-mark whose look-back
+//! reaches a node two records hold as different items (R1).
+//!
+//! A supplied member (X1, X13, X13') is built from the table's `Supply`
+//! alone: which record a copy names, by the places of items each record
+//! is in the table's paths (rendered or not) and the texts at the supply's
+//! paths; the facts it is the source of; and their value, by the supply's
+//! own decode. The Codex importer's rule
+//! (`codex::supplied_phases`) is no longer called here; it is the oracle
+//! the fixtures compare against.
 //!
 //! Mirrors are not stated here a second time: the unit's records, read back
 //! as the JSON they hold, go through the importers' own record check
@@ -28,13 +35,6 @@
 //! importer's own rule (`codex::Budget`, `codex::Unrecorded`,
 //! `codex::History`), over the same records read back, says what her window
 //! held of each output, or refuses where and as the importer refuses.
-//!
-//! Nor is a supplied member (X1, X13): the table's `Supply` says which
-//! facts of her message a copy's member is the source of, and the Codex
-//! importer's own rule (`codex::supplied_phases`, `codex::phase_register`),
-//! over the same records read back, says which message each copy names and
-//! what register its phase is, or refuses where and as the importer
-//! refuses.
 //!
 //! Nor is a rendering the client marks beside a tool result (R1, R1',
 //! R1'', R1'''): the Claude Code importer's own look-back
@@ -54,7 +54,7 @@ use triblespace_cxg::{PathStep, Unit};
 use super::super::claude_code::{
     beside_his_prompt, beside_marked, in_one_message, typed_prompt, Before,
 };
-use super::super::codex::{phase_register, supplied_phases, Budget, History, Unrecorded};
+use super::super::codex::{Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
     Place, Rewrite, Supply,
@@ -66,8 +66,8 @@ use super::super::{
     FactCore, Model, NodeAnnotations, WitnessAnnotations,
 };
 use super::{
-    apply, decode_text, field_at, holds, json_text, kind, spelling, structure, term, text_of, Cat,
-    Table,
+    apply, decode_text, field_at, holds, is_empty, json_text, kind, member, spelling, structure,
+    term, text_of, Cat, Table,
 };
 use crate::schemas::archive_v3 as v3;
 
@@ -189,8 +189,8 @@ struct Parts {
     /// (`Place::Request`): (ends term, the request's id, path).
     request_ends: Vec<(Id, String, &'static str)>,
     /// Facts the relations built for the record (gaps beside its values,
-    /// outputs a history budget cut, texts a supply registers), staged with
-    /// the lines.
+    /// outputs a history budget cut, facts a copy supplies), staged with the
+    /// lines.
     built: Vec<Fragment>,
     /// Glosses at their own place (`Place::Here`), by the levels of the
     /// value: (levels, category, text, path).
@@ -201,6 +201,23 @@ struct Parts {
     /// An entry that makes items consumed one of its values, whether or not
     /// it rendered any.
     bears: bool,
+    /// What it holds of the unit's supply.
+    supply: Supplied,
+}
+
+/// What one record holds of the unit's [`Supply`] (X1, X13, X13').
+#[derive(Default)]
+struct Supplied {
+    /// Its copies: (path, the copied value).
+    copies: Vec<(&'static str, Id)>,
+    /// Her texts at the supply's `of` paths, each with the record-relative
+    /// member that holds her item's own value.
+    texts: Vec<(String, &'static str)>,
+    /// Her texts at the supply's `installed` paths.
+    installed: Vec<String>,
+    /// Its items of the supply's modality and direction, where it holds a
+    /// text at an `of` path: (the image's fact, its core).
+    cores: Vec<(Id, FactCore)>,
 }
 
 fn ends_term(name: &str) -> Option<Id> {
@@ -333,21 +350,28 @@ fn annotate(
 /// one assembly point, in the order they were assembled), and its claims.
 /// Under a history budget, the tool outputs the budget names are what her
 /// window held of them. Where the unit's supply is built, its copies hold
-/// nothing, and the phase the record's message takes from its copy is the
-/// register of its facts the supply names.
+/// nothing, and the record says what a copy needs to name it
+/// ([`Supplied`]); what a copy supplies is set after every record is read
+/// ([`supplied`]).
 fn record_parts(
     t: &Table,
     unit: &Unit,
     record: Id,
     cat: &Cat,
     history: Option<(&HistoryBudget, History)>,
-    supplied: Option<(&Supply, Option<&str>)>,
+    supply: Option<&Supply>,
 ) -> Result<Parts, String> {
     let mut found = vec![(Levels::new(), record, cat.clone())];
     points(t, unit, record, cat, &mut Levels::new(), &mut found);
     found.sort_by(|a, b| a.0.cmp(&b.0));
     let result = t.table.windows.requests.map(|requests| requests.result);
     let mut parts = Parts::default();
+    let pair = |modality: &str, direction: &str| {
+        (
+            term(v3::fact::modality::SPECS, modality),
+            term(v3::fact::direction::SPECS, direction),
+        )
+    };
     // The list outputs read, by their array.
     let mut lists = HashSet::new();
     // The results' assembly points: every other item inside one is a part.
@@ -383,35 +407,17 @@ fn record_parts(
         let inside = results.iter().any(|point| levels.starts_with(point));
         let mut consumed = Vec::new();
         t.consumed(unit, value, &at, &mut consumed);
-        // X1: her text at a path the supply names takes the phase as its
-        // register, by the importer's own rule; the facts are the supply's
-        // modality and direction, staged with the lines (the image's fact
-        // without the register stays, held by no node). A failure names
-        // the phase of the message holding the text, as the importer names
-        // it.
-        if let Some((supply, Some(phase))) = supplied {
-            for (entry, _, _) in &consumed {
-                if !supply.of.iter().any(|(text, _)| *text == entry.path) {
-                    continue;
-                }
-                let (item, _) = entry
-                    .path
-                    .split_once("{message}")
-                    .ok_or_else(|| format!("{}: a supplied text outside a message", entry.path))?;
-                let register = phase_register(Some(phase), &format!("{item}{{message}}.phase"))
-                    .map_err(|failure| failure.to_string())?;
-                let held = (
-                    term(v3::fact::modality::SPECS, supply.modality),
-                    term(v3::fact::direction::SPECS, supply.direction),
-                );
-                for core in cores
-                    .iter_mut()
-                    .filter(|core| (core.modality, core.direction) == held)
-                {
-                    core.register = register;
+        // X13, X13': her texts a copy can name her item by, and those a
+        // compaction installs, which no copy can.
+        if let Some(supply) = supply {
+            for (entry, v, _) in &consumed {
+                if let Some((_, member)) = supply.of.iter().find(|(text, _)| *text == entry.path) {
                     parts
-                        .built
-                        .push(fact(core.clone()).map_err(|e| format!("{}: {e}", entry.path))?);
+                        .supply
+                        .texts
+                        .extend(text_of(unit, *v).map(|text| (text, *member)));
+                } else if supply.installed.contains(&entry.path) {
+                    parts.supply.installed.extend(text_of(unit, *v));
                 }
             }
         }
@@ -478,9 +484,18 @@ fn record_parts(
             let modality = core.modality;
             let effort = core.effort.is_some();
             let out = core.direction == Some(v3::fact::direction::OUT);
+            let shape = (core.modality, core.direction);
+            // X1: an item a copy can be the source of an attribute of.
+            let supplied = supply
+                .filter(|supply| pair(supply.modality, supply.direction) == shape)
+                .map(|_| core.clone());
             let built = fact(core).map_err(|e| format!("{}: {e}", at.path))?;
+            let fact_id = built.root().ok_or("a fact is rooted")?;
+            if let Some(core) = supplied {
+                parts.supply.cores.push((fact_id, core));
+            }
             parts.items.push(Item {
-                fact: built.root().ok_or("a fact is rooted")?,
+                fact: fact_id,
                 modality,
                 element: value,
                 effort,
@@ -565,9 +580,9 @@ fn record_parts(
                     }
                 }
                 Class::Rewrite(rewrite) => parts.rewrites.push((rewrite, entry.path, v)),
-                // X1: a copy holds nothing of its own; its phase is her
-                // message's register (above).
-                Class::Supply(_) if supplied.is_some() => {}
+                // X1: a copy holds nothing of its own; what it supplies is
+                // set where the record it names is placed (`supplied`).
+                Class::Supply(_) if supply.is_some() => parts.supply.copies.push((entry.path, v)),
                 Class::Supply(_) => {
                     return Err(
                         format!("not built yet: a {:?} at {}", entry.class, entry.path)
@@ -605,6 +620,10 @@ fn record_parts(
             u64::from_be_bytes(raw[24..].try_into().expect("eight bytes"))
         });
         parts.items[item].glosses.push((category, text, part));
+    }
+    // Only a record that holds a copy's text takes what the copy supplies.
+    if parts.supply.texts.is_empty() {
+        parts.supply.cores.clear();
     }
     Ok(parts)
 }
@@ -1627,6 +1646,203 @@ fn claims_something(claims: &WitnessAnnotations) -> bool {
         || claims.compaction_summary
 }
 
+/// X13: whether the value at `cat` is a place of an item, by the table's
+/// `paths` and not by what the value rendered: one of them is its own
+/// path, or continues it through a discriminator, member or element it
+/// lacks or holds empty, or through one it holds that is such a place in
+/// turn. So her message whose only text is empty, or which holds no part,
+/// is her message all the same, and a copy names no record past it, as the
+/// Codex importer's rule stops at every item but her reasoning
+/// (`codex::places_beyond_reasoning`). Where the table expects more below a
+/// value than it holds, it is a place: a copy may name too early, and is
+/// then refused, but never too late.
+fn places(t: &Table, unit: &Unit, v: Id, cat: &Cat, paths: &[&str]) -> bool {
+    let shaped = match t.shape(unit, v, &cat.path) {
+        Some(shape) => format!("{}{{{shape}}}", cat.path),
+        None => cat.path.clone(),
+    };
+    let rests: Vec<&str> = paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(shaped.as_str()))
+        .filter(|rest| rest.is_empty() || rest.starts_with(['.', '[', '{']))
+        .collect();
+    if rests.is_empty() {
+        return false;
+    }
+    let facts = unit.facts;
+    match kind(unit, v) {
+        Some(k) if k == json_tree::kind_object => {
+            let lacks = rests.iter().any(|rest| match rest.strip_prefix('.') {
+                Some(rest) => {
+                    let name = rest.split(['.', '[', '{']).next().unwrap_or_default();
+                    member(unit, v, name).is_none_or(|value| is_empty(unit, value))
+                }
+                None => true,
+            });
+            if lacks {
+                return true;
+            }
+            let members: Vec<(Name, Id)> = find!(
+                (name: Name, value: Id),
+                pattern!(facts, [
+                    { v @ json_tree::object_field: _?field },
+                    { _?field @ json_tree::field_name: ?name, json_tree::field_value: ?value },
+                ])
+            )
+            .collect();
+            members.into_iter().any(|(name, value)| {
+                let child = t.child(unit, v, cat, &PathStep::Field(name));
+                places(t, unit, value, &child, paths)
+            })
+        }
+        Some(k) if k == json_tree::kind_array => {
+            if rests.iter().any(|rest| !rest.starts_with("[]")) {
+                return true;
+            }
+            let elements: Vec<Id> = find!(
+                element: Id,
+                pattern!(facts, [{ _?entry @
+                    json_tree::array_parent: v,
+                    json_tree::array_value: ?element,
+                }])
+            )
+            .collect();
+            let at = t.element(unit, v, cat);
+            elements.is_empty()
+                || elements
+                    .into_iter()
+                    .any(|element| places(t, unit, element, &at, paths))
+        }
+        _ => true,
+    }
+}
+
+/// X1, X13, X13': what each copy of the unit's [`Supply`] supplies, by the
+/// record it names: (the copied value, the copy's path). The copy names the
+/// first record after its own that is a place of an item beyond the
+/// supply's `past` ([`places`]), whether or not that item rendered a fact,
+/// and that record must hold the copy's text at one of its `of` paths.
+/// Where it does not, a copy whose text another record holds there is
+/// matched by text alone, one whose text only an `installed` path holds has
+/// no structural match, and both are refused; one whose text no record
+/// holds holds nothing. A copy that differs from its item's own member, or
+/// from another copy of the same item, is refused. Copies are read in file
+/// order and refused as the Codex importer refuses them, in its words
+/// (`codex::supplied_phases`, the oracle). A record whose parts fail leaves
+/// the copies before it that reach it unread: the line refuses the unit
+/// there, and no copy can supply a record past it.
+fn supplied(
+    t: &Table,
+    supply: &Supply,
+    unit: &Unit,
+    records: &[Id],
+    record_cat: &Cat,
+    all: &[Result<Parts, String>],
+) -> Result<HashMap<usize, (Id, &'static str)>, String> {
+    // X13: every path the table places an item at, other than the pairs a
+    // copy may lie past: its facts, the gaps beside values, results' heads.
+    let past = |modality: &str, direction: &str| {
+        supply
+            .past
+            .iter()
+            .any(|&pair| pair == (modality, direction))
+    };
+    let table = t.table;
+    let mut paths: Vec<&'static str> = Vec::new();
+    for entry in table.entries {
+        if let Class::Fact {
+            modality,
+            direction,
+            ..
+        } = entry.class
+        {
+            if !past(modality, direction) {
+                paths.push(entry.path);
+            }
+        }
+    }
+    for rule in table.gaps.beside {
+        if !past(rule.gap.modality, rule.gap.direction) {
+            paths.push(rule.path);
+        }
+    }
+    if let Some(requests) = table.windows.requests {
+        let (path, head) = requests.result;
+        if !past(head, "in") {
+            paths.push(path);
+        }
+    }
+    let mut held: HashSet<&str> = HashSet::new();
+    let mut installed: HashSet<&str> = HashSet::new();
+    for parts in all.iter().flatten() {
+        held.extend(parts.supply.texts.iter().map(|(text, _)| text.as_str()));
+        installed.extend(parts.supply.installed.iter().map(String::as_str));
+    }
+    let mut values: HashMap<usize, (Id, &'static str)> = HashMap::new();
+    for (at, parts) in all.iter().enumerate() {
+        let Ok(parts) = parts else {
+            continue;
+        };
+        for &(path, value) in &parts.supply.copies {
+            let text = field_at(unit, records[at], supply.text);
+            let (Some(copied), Some(text)) = (
+                text_of(unit, value),
+                text.and_then(|text| text_of(unit, text)),
+            ) else {
+                continue;
+            };
+            // The first record after it that places an item beyond `past`,
+            // or one whose parts fail, which leaves the copy unread.
+            let next = (at + 1..all.len()).find(|&later| {
+                all[later].is_err() || places(t, unit, records[later], record_cat, &paths)
+            });
+            let next = match next {
+                None => None,
+                Some(next) => match &all[next] {
+                    Ok(later) => Some((next, later)),
+                    Err(_) => continue,
+                },
+            };
+            let holder = next.and_then(|(next, later)| {
+                later
+                    .supply
+                    .texts
+                    .iter()
+                    .find(|(said, _)| *said == text)
+                    .map(|&(_, member)| (next, member))
+            });
+            let Some((holder, member)) = holder else {
+                if held.contains(text.as_str()) {
+                    return Err(format!(
+                        "{path}: a phase copy whose message is not the item after it: matched by \
+                         text alone"
+                    ));
+                }
+                if installed.contains(text.as_str()) {
+                    return Err(format!(
+                        "{path}: a phase copy whose message only a replacement history holds: no \
+                         structural match"
+                    ));
+                }
+                continue;
+            };
+            let own = field_at(unit, records[holder], member).and_then(|own| text_of(unit, own));
+            let disagrees = match own {
+                Some(own) => own != copied,
+                None => values
+                    .insert(holder, (value, path))
+                    .is_some_and(|(known, _)| text_of(unit, known).as_ref() != Some(&copied)),
+            };
+            if disagrees {
+                return Err(format!(
+                    "{path}: a phase copy that disagrees with her message's phase"
+                ));
+            }
+        }
+    }
+    Ok(values)
+}
+
 /// One place on the line: its node, and the item there.
 #[derive(Clone, Copy)]
 struct Spot {
@@ -1669,10 +1885,7 @@ fn file(
                 .map(|read| read.str_at(version)),
         )
     });
-    // X18: the latest header's budget.
-    let mut header_budget: Option<Budget> = None;
-    // X1, X13: the phase each of her messages that holds none takes from
-    // the copy that names it, by record, under the table's one supply.
+    // X1, X13: the table's one supply.
     let mut supplies = table.entries.iter().filter_map(|entry| match &entry.class {
         Class::Supply(supply) => Some(supply),
         _ => None,
@@ -1681,11 +1894,42 @@ fn file(
     if supplies.next().is_some() {
         return Err("not built yet: several supplies".to_owned());
     }
-    let phases = match supply {
-        Some(supply) if supply.attribute != "register" => {
-            return Err(format!("not built yet: a supply of {}", supply.attribute))
-        }
-        Some(_) => supplied_phases(reads).map_err(|failure| failure.to_string())?,
+    // Every record's parts, read before the line places any, since a copy
+    // supplies a record after its own (X13). A record whose parts fail is
+    // refused where the line reaches it.
+    // X18: the latest header's budget.
+    let mut header_budget: Option<Budget> = None;
+    let mut parts_of = |at: usize, record: Id| -> Result<Parts, String> {
+        // X18: a header sets the budget, a record's own limit overrides it.
+        // The outputs the table names are response items, each recorded as
+        // it entered her history (X18').
+        let history = match (&rules.budget, unrecorded) {
+            (Some(budget), Some(unrecorded)) => {
+                if file_kind(rules, unit, record) == FileKind::Header {
+                    header_budget = Budget::of_header(reads[at].at(budget.policy.0))
+                        .map_err(|failure| failure.to_string())?;
+                }
+                let own = Budget::of_record(reads[at].at(budget.limit.0), header_budget)
+                    .map_err(|failure| failure.to_string())?;
+                let history = History {
+                    budget: own,
+                    unrecorded,
+                    recorded_here: true,
+                };
+                Some((budget, history))
+            }
+            _ => None,
+        };
+        record_parts(t, unit, record, record_cat, history, supply)
+    };
+    let all: Vec<Result<Parts, String>> = records
+        .iter()
+        .enumerate()
+        .map(|(at, &record)| parts_of(at, record))
+        .collect();
+    // X1, X13, X13': what each copy supplies, by the record it names.
+    let values = match supply {
+        Some(supply) => supplied(t, supply, unit, records, record_cat, &all)?,
         None => HashMap::new(),
     };
     let marked = records
@@ -1742,30 +1986,31 @@ fn file(
         }
     };
     let since = |turns: &[usize], line: &[Spot]| turns.last().copied().unwrap_or(0).min(line.len());
-    for (at, &record) in records.iter().enumerate() {
+    for ((at, &record), parts) in records.iter().enumerate().zip(all) {
         let kind = file_kind(rules, unit, record);
-        // X18: a header sets the budget, a record's own limit overrides it.
-        // The outputs the table names are response items, each recorded as
-        // it entered her history (X18').
-        let history = match (&rules.budget, unrecorded) {
-            (Some(budget), Some(unrecorded)) => {
-                if kind == FileKind::Header {
-                    header_budget = Budget::of_header(reads[at].at(budget.policy.0))
-                        .map_err(|failure| failure.to_string())?;
+        let mut parts = parts?;
+        // X1: the value a copy supplies, as the supply's attribute by its
+        // decode, of every item of its modality and direction the record
+        // holds; staged with the lines (the image's fact without it stays,
+        // held by no node).
+        if let (Some(supply), Some(&(value, path))) = (supply, values.get(&at)) {
+            for (image, mut core) in std::mem::take(&mut parts.supply.cores) {
+                apply(&mut core, supply.attribute, supply.decode, unit, value).ok_or_else(
+                    || {
+                        format!(
+                            "not built yet: a supply of {} from {path}",
+                            supply.attribute
+                        )
+                    },
+                )?;
+                let built = fact(core).map_err(|e| format!("{path}: {e}"))?;
+                let id = built.root().ok_or("a fact is rooted")?;
+                for item in parts.items.iter_mut().filter(|item| item.fact == image) {
+                    item.fact = id;
                 }
-                let own = Budget::of_record(reads[at].at(budget.limit.0), header_budget)
-                    .map_err(|failure| failure.to_string())?;
-                let history = History {
-                    budget: own,
-                    unrecorded,
-                    recorded_here: true,
-                };
-                Some((budget, history))
+                parts.built.push(built);
             }
-            _ => None,
-        };
-        let supplied = supply.map(|supply| (supply, phases.get(&at).map(String::as_str)));
-        let parts = record_parts(t, unit, record, record_cat, history, supplied)?;
+        }
         if !parts.file_tail.is_empty()
             || !parts.parent_tail.is_empty()
             || !parts.rewrites.is_empty()

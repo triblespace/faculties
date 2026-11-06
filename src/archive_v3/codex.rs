@@ -287,8 +287,9 @@ fn places_beyond_reasoning(record: &Json) -> bool {
 /// that item does not hold the copy's text but another does, the copy is
 /// matched by text alone and fails; where none does, it holds nothing (its
 /// mirror decides). Where the message holds a phase, the copy must spell the
-/// same. The importer's rule, and the relations' (`grammar::relations`).
-pub(crate) fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
+/// same. The importer's rule; the relations build the table's `Supply`
+/// themselves, and this is their oracle (`grammar::relations::supplied`).
+fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>, Failure> {
     let path = "{event_msg}.payload{agent_message}.phase";
     let said = |item: &Json| -> Vec<String> {
         if item.str_at("type") != Some("message") || item.str_at("role") != Some("assistant") {
@@ -371,9 +372,8 @@ pub(crate) fn supplied_phases(records: &[Json]) -> Result<HashMap<usize, String>
 }
 
 /// X1: the register of her text under her message's phase, or its event
-/// copy's: none where neither holds one. The importer's rule, and the
-/// relations' (`grammar::relations`).
-pub(crate) fn phase_register(phase: Option<&str>, path: &str) -> Result<Option<Id>, Failure> {
+/// copy's: none where neither holds one.
+fn phase_register(phase: Option<&str>, path: &str) -> Result<Option<Id>, Failure> {
     Ok(match phase {
         None => None,
         Some("commentary") => Some(v3::fact::register::COMMENTARY),

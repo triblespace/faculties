@@ -471,17 +471,20 @@ pub enum Class {
 ///
 /// The copy names its item by structure, never by text alone: its item is
 /// the first record after the copy's that holds an item her window holds,
-/// other than items of the `(modality, direction)` pairs `past` (her
-/// reasoning, which codex writes between). That record must hold the
-/// copy's text (the record-relative field `text`) at one of the normalized
-/// paths `of.0`; where it does not but another record holds it, the copy is
-/// matched by text alone and is a mirror fault. Where that record holds the
-/// member, at its record-relative field `of.1`, the copy must spell the
-/// same, or it is a mirror fault. Where it holds none, the copy is the
+/// whether or not the item renders a fact (her message whose text is empty
+/// is her message), other than items of the `(modality, direction)` pairs
+/// `past` (her reasoning, which codex writes between). That record must
+/// hold the copy's text (the record-relative field `text`) at one of the
+/// normalized paths `of.0`; where it does not but another record holds it,
+/// the copy is matched by text alone and is a mirror fault. Where that
+/// record holds the member, at its record-relative field `of.1`, the copy
+/// must spell the same, or it is a mirror fault. Where it holds none, the copy is the
 /// source of attribute `attribute`, decoded by `decode`, of every fact of
-/// `modality` and `direction` that record holds. A copy whose text no
-/// record holds holds nothing of its own (its text's own mirror says
-/// whether that is a fault).
+/// `modality` and `direction` that record holds. Where no record holds the
+/// text at those paths but one holds it at a normalized path `installed`
+/// (an item a compaction installs, X13'), no structure names its item and
+/// it is a mirror fault. A copy whose text no record holds holds nothing of
+/// its own (its text's own mirror says whether that is a fault).
 #[derive(Clone, Copy, Debug)]
 pub struct Supply {
     pub text: &'static str,
@@ -491,6 +494,7 @@ pub struct Supply {
     pub modality: &'static str,
     pub direction: &'static str,
     pub past: &'static [(&'static str, &'static str)],
+    pub installed: &'static [&'static str],
 }
 
 /// An object whose members, keyed by a call's id, hold what the client
