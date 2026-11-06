@@ -160,6 +160,12 @@ pub struct ObservedMessage {
     /// Every reply target the observation asserts; ordinarily none or one.
     pub reply_to: BTreeSet<Id>,
     pub attachments: BTreeSet<Id>,
+    /// Each of `attachments` as the store holds it ([`AttachmentView`]).
+    pub attached: Vec<AttachmentView>,
+    /// The Discord message ids the anchor asserts, read only for a message
+    /// with attachments: what resolves one back to the message it came with.
+    /// Sorted and deduplicated, ready to render.
+    pub message_ids: Vec<String>,
     /// Somebody coming into or leaving a voice channel, when the message is
     /// that notice: presented as the event, never as its (empty) content.
     pub presence: Option<discord_model::Presence>,
@@ -169,6 +175,17 @@ pub struct ObservedMessage {
     /// ([`discord_model::SelectedMessageVersion::alternative_index`]).
     pub alternative_index: usize,
     pub alternative_count: usize,
+}
+
+/// One attachment of a shown message, as intake stored it: every name and
+/// every stored content it asserts (ordinarily one of each, possibly none),
+/// each list sorted and deduplicated, ready to render. Read from the stored
+/// relations only; nothing is fetched or guessed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentView {
+    pub attachment: Id,
+    pub names: Vec<String>,
+    pub contents: Vec<file_capability::ContentHandle>,
 }
 /// Something one user said in a voice channel: what `discord live` hears,
 /// stored as a message in that channel ([`Discord::observe_utterance`]).
@@ -1876,7 +1893,20 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             .cloned()
             .unwrap_or_else(|| format!("{}", message.author));
         let channel_name = channel_names.get(&message.channel).cloned();
-        rows.push(observed_message(message, channel_name, author, content));
+        let attached = attachment_views(&view.facts, &view.reader, &message.attachments);
+        let message_ids = if attached.is_empty() {
+            Vec::new()
+        } else {
+            message_ids_of(&view.facts, &view.reader, message.anchor)
+        };
+        rows.push(observed_message(
+            message,
+            channel_name,
+            author,
+            content,
+            attached,
+            message_ids,
+        ));
     }
     Ok(History {
         channel_id: options.channel_id.clone(),
@@ -1890,6 +1920,8 @@ fn observed_message(
     channel_name: Option<String>,
     author: String,
     content: String,
+    attached: Vec<AttachmentView>,
+    message_ids: Vec<String>,
 ) -> ObservedMessage {
     ObservedMessage {
         observation: message.observation,
@@ -1902,12 +1934,83 @@ fn observed_message(
         content,
         reply_to: message.reply_to,
         attachments: message.attachments,
+        attached,
+        message_ids,
         presence: message.presence,
         variant_index: message.variant_index,
         variant_count: message.variant_count,
         alternative_index: message.alternative_index,
         alternative_count: message.alternative_count,
     }
+}
+
+/// The attachments `attachments` names, each with every name and stored
+/// content the store asserts for it. A name whose text cannot be read is
+/// shown as unreadable, with the reason, rather than failing the read; the
+/// sets here are construction scratch only.
+fn attachment_views<P, R>(facts: &P, reader: &R, attachments: &BTreeSet<Id>) -> Vec<AttachmentView>
+where
+    P: TriblePattern,
+    R: BlobStoreGet,
+{
+    attachments
+        .iter()
+        .map(|&attachment| {
+            let names: BTreeSet<String> = find!(
+                name: discord_model::TextHandle,
+                pattern!(facts, [{ attachment @ archive::attachment_name: ?name }])
+            )
+            .map(|name| readable(reader, name, "name", "Discord attachment name"))
+            .collect();
+            let contents: BTreeSet<file_capability::ContentHandle> = find!(
+                content: file_capability::ContentHandle,
+                pattern!(facts, [
+                    { attachment @ archive::attachment_file: _?file },
+                    { _?file @ file::content: ?content },
+                ])
+            )
+            .collect();
+            AttachmentView {
+                attachment,
+                names: names.into_iter().collect(),
+                contents: contents.into_iter().collect(),
+            }
+        })
+        .collect()
+}
+
+/// The Discord message ids `anchor` asserts (ordinarily one), sorted.
+fn message_ids_of<P, R>(facts: &P, reader: &R, anchor: Id) -> Vec<String>
+where
+    P: TriblePattern,
+    R: BlobStoreGet,
+{
+    let ids: BTreeSet<String> = find!(
+        id: discord_model::TextHandle,
+        pattern!(facts, [{ anchor @ discord::message_id: ?id }])
+    )
+    .map(|id| readable(reader, id, "message id", "Discord message id"))
+    .collect();
+    ids.into_iter().collect()
+}
+
+/// A text the store names, or what stopped it being read: "unreadable" with
+/// the reason, never a claim that the blob is absent.
+fn readable<R: BlobStoreGet>(
+    reader: &R,
+    handle: discord_model::TextHandle,
+    what: &str,
+    label: &str,
+) -> String {
+    discord_model::read_text(reader, handle, label).unwrap_or_else(|error| {
+        format!(
+            "({what} {} unreadable: {})",
+            hex::encode_upper(handle.raw),
+            // The whole cause chain on one line ("context: cause: ..."),
+            // not only the outermost context.
+            format!("{error:#}").replace('\n', " ")
+        )
+    })
 }
 
 struct VisibleChannel {
@@ -2149,7 +2252,14 @@ mod tests {
             .into_iter()
             .map(|message| {
                 let content: anybytes::View<str> = reader.get(message.content).unwrap();
-                observed_message(message, None, "author".to_owned(), content.to_string())
+                observed_message(
+                    message,
+                    None,
+                    "author".to_owned(),
+                    content.to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                )
             })
             .collect();
         let mut rendered = String::new();
@@ -2187,6 +2297,339 @@ mod tests {
             "{rendered}"
         );
     }
+    /// `history` as text, through the same renderer `read` uses.
+    fn rendered(messages: Vec<ObservedMessage>) -> String {
+        let mut text = String::new();
+        super::super::render::history(
+            &History {
+                channel_id: None,
+                messages,
+            },
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text: line } = part {
+                    text.push_str(&line);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        text
+    }
+
+    /// Every message of `fragment` as `read` builds it: content, attachments
+    /// and their message ids resolved from the fragment's own facts and blobs.
+    fn observed(fragment: &Fragment) -> Vec<ObservedMessage> {
+        use triblespace::core::repo::BlobStoreGet as _;
+        let mut staged = fragment.clone();
+        let reader = staged.blobs_mut().snapshot().unwrap();
+        discord_model::select_messages(fragment.facts(), None, None)
+            .unwrap()
+            .into_iter()
+            .map(|message| {
+                let content: anybytes::View<str> = reader.get(message.content).unwrap();
+                let attached = attachment_views(fragment.facts(), &reader, &message.attachments);
+                let ids = if attached.is_empty() {
+                    Vec::new()
+                } else {
+                    message_ids_of(fragment.facts(), &reader, message.anchor)
+                };
+                observed_message(
+                    message,
+                    None,
+                    "author".to_owned(),
+                    content.to_string(),
+                    attached,
+                    ids,
+                )
+            })
+            .collect()
+    }
+
+    /// A message without attachments reads exactly as before: one line.
+    #[test]
+    fn a_message_without_attachments_renders_one_line() {
+        let fragment = discord_model::utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            discord_model::heard_from(1553506755164504063),
+            "no attachments here",
+            None,
+            None,
+        )
+        .unwrap();
+        let messages = observed(&fragment);
+        assert!(messages[0].attached.is_empty());
+        let text = rendered(messages);
+        assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), 1, "{text}");
+        // The content itself says "attachments"; what must not appear is an
+        // attachment line.
+        assert!(
+            !text.lines().any(|line| line.starts_with("  attachment ")),
+            "{text}"
+        );
+    }
+
+    /// Two attachments a pull stored: each on its own line, with its name,
+    /// its stored content's handle, and the message it came with.
+    #[test]
+    fn every_attachment_shows_its_name_content_and_message() {
+        let channel = "100000000000000014";
+        let fragment = build_ingest_fragment(
+            &parse_messages(
+                vec![message_json(
+                    "100000000000000015",
+                    channel,
+                    "two files",
+                    None,
+                    json!([
+                        {"id": "100000000000000016", "url": "https://cdn.example/a",
+                         "filename": "photo.png", "content_type": "image/png", "size": 5},
+                        {"id": "100000000000000017", "url": "https://cdn.example/b",
+                         "filename": "scan.pdf", "content_type": "application/pdf", "size": 4},
+                    ]),
+                )],
+                channel,
+            )
+            .unwrap(),
+            None,
+            None,
+            |url, _| {
+                Ok(if url.ends_with("/a") {
+                    b"image".to_vec()
+                } else {
+                    b"scan".to_vec()
+                })
+            },
+        )
+        .unwrap();
+        let messages = observed(&fragment);
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        let handle = |bytes: &[u8]| -> file_capability::ContentHandle {
+            bytes.to_vec().to_blob().get_handle()
+        };
+        let shown: BTreeSet<(Vec<String>, Vec<file_capability::ContentHandle>)> = message
+            .attached
+            .iter()
+            .map(|a| (a.names.clone(), a.contents.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            BTreeSet::from([
+                (vec!["photo.png".to_owned()], vec![handle(b"image")]),
+                (vec!["scan.pdf".to_owned()], vec![handle(b"scan")]),
+            ])
+        );
+        assert_eq!(message.message_ids, vec!["100000000000000015".to_owned()]);
+        let anchor = message.anchor;
+        let text = rendered(messages);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].ends_with(": two files"), "{text}");
+        for (name, bytes) in [("photo.png", &b"image"[..]), ("scan.pdf", &b"scan"[..])] {
+            let line = lines[1..]
+                .iter()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no line for {name}: {text}"));
+            assert!(line.starts_with("  attachment "), "{text}");
+            assert!(
+                line.contains(&hex::encode_upper(handle(bytes).raw)),
+                "{text}"
+            );
+            assert!(line.contains("message 100000000000000015"), "{text}");
+            assert!(line.contains(&format!("anchor {anchor:x}")), "{text}");
+        }
+    }
+
+    /// An attachment with no name and no stored file says so, and one that
+    /// asserts two names shows both; a message no snowflake names has no
+    /// message id, which is said too. Nothing is filled in.
+    #[test]
+    fn a_missing_name_or_file_is_said_and_divergent_names_are_all_shown() {
+        let bare = entity! { _ @ metadata::tag: archive::kind_attachment };
+        let bare_id = bare.root().unwrap();
+        let mut fragment = discord_model::utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            discord_model::heard_from(1553506755164504063),
+            "a voice message",
+            None,
+            Some(bare_id),
+        )
+        .unwrap();
+        fragment += bare;
+        let observation =
+            discord_model::select_messages(fragment.facts(), None, None).unwrap()[0].observation;
+        let named = entity! { _ @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_name: "first.ogg",
+        };
+        let named_id = named.root().unwrap();
+        fragment += named;
+        // A second name asserted for the same attachment (two observations
+        // disagreeing about it, say): both are shown.
+        fragment += entity! { ExclusiveId::force_ref(&named_id) @
+            archive::attachment_name: "second.ogg",
+        };
+        fragment +=
+            entity! { ExclusiveId::force_ref(&observation) @ archive::attachment: named_id };
+        let messages = observed(&fragment);
+        assert_eq!(messages.len(), 1);
+        let views: BTreeMap<Id, &AttachmentView> = messages[0]
+            .attached
+            .iter()
+            .map(|a| (a.attachment, a))
+            .collect();
+        assert_eq!(views.len(), 2);
+        assert!(views[&bare_id].names.is_empty() && views[&bare_id].contents.is_empty());
+        assert_eq!(
+            views[&named_id].names,
+            vec!["first.ogg".to_owned(), "second.ogg".to_owned()]
+        );
+        assert!(views[&named_id].contents.is_empty());
+        assert!(messages[0].message_ids.is_empty());
+        let text = rendered(messages);
+        let bare_line = text
+            .lines()
+            .find(|line| line.contains(&format!("attachment {bare_id:x}")))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            bare_line.contains("(no name); content (no stored content); message (no message id)"),
+            "{text}"
+        );
+        assert!(text.contains("first.ogg / second.ogg"), "{text}");
+    }
+
+    /// A name whose text the store cannot give back is shown as unreadable,
+    /// with the reason, not as absent and not as a failed read.
+    #[test]
+    fn an_unreadable_name_is_said_with_its_reason() {
+        let ghost: discord_model::TextHandle = "ghost.png".to_owned().to_blob().get_handle();
+        let attachment = entity! { _ @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_name: ghost,
+        };
+        let id = attachment.root().unwrap();
+        let mut fragment = discord_model::utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            discord_model::heard_from(1553506755164504063),
+            "a voice message",
+            None,
+            Some(id),
+        )
+        .unwrap();
+        fragment += attachment;
+        let messages = observed(&fragment);
+        let names = &messages[0].attached[0].names;
+        assert_eq!(names.len(), 1);
+        // "Unreadable", then the whole cause chain: the context this reader
+        // adds, and below it whatever the store itself says (for a blob that
+        // was never put, that it is not resident in this snapshot).
+        assert!(
+            names[0].starts_with(&format!(
+                "(name {} unreadable: read Discord attachment name blob ",
+                hex::encode_upper(ghost.raw)
+            )),
+            "{names:?}"
+        );
+        assert!(
+            names[0].matches(": ").count() >= 2,
+            "a cause below the context: {names:?}"
+        );
+    }
+
+    /// An attachment whose file entities assert two contents shows both,
+    /// sorted, joined on its one line.
+    #[test]
+    fn several_stored_contents_are_all_shown() {
+        let first: file_capability::ContentHandle = b"one".to_vec().to_blob().get_handle();
+        let second: file_capability::ContentHandle = b"two".to_vec().to_blob().get_handle();
+        let file_one = entity! { _ @ file::content: first };
+        let file_two = entity! { _ @ file::content: second };
+        let (one, two) = (file_one.root().unwrap(), file_two.root().unwrap());
+        let attachment = entity! { _ @
+            metadata::tag: archive::kind_attachment,
+            archive::attachment_name: "both.bin",
+            archive::attachment_file: one,
+        };
+        let id = attachment.root().unwrap();
+        let mut fragment = discord_model::utterance_fragment(
+            "100000000000000201",
+            "100000000000000400",
+            discord_model::heard_from(1553506755164504063),
+            "a voice message",
+            None,
+            Some(id),
+        )
+        .unwrap();
+        fragment += attachment;
+        fragment += entity! { ExclusiveId::force_ref(&id) @ archive::attachment_file: two };
+        fragment += file_one;
+        fragment += file_two;
+        let messages = observed(&fragment);
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(messages[0].attached[0].contents, expected);
+        let text = rendered(messages);
+        let joined = expected
+            .iter()
+            .map(|handle| hex::encode_upper(handle.raw))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        assert!(text.contains(&format!("content {joined};")), "{text}");
+    }
+
+    /// Two observations of one message that disagree about its attachment
+    /// are two divergent rows, and each row lists its own observation's
+    /// attachment, never the other's.
+    #[test]
+    fn divergent_observations_each_show_their_own_attachment() {
+        let channel = "100000000000000014";
+        let observation = |filename: &str, bytes: &'static [u8]| {
+            build_ingest_fragment(
+                &parse_messages(
+                    vec![message_json(
+                        "100000000000000015",
+                        channel,
+                        "one message",
+                        None,
+                        json!([{"id": "100000000000000016", "url": "https://cdn.example/a",
+                                "filename": filename, "content_type": "image/png", "size": bytes.len()}]),
+                    )],
+                    channel,
+                )
+                .unwrap(),
+                None,
+                None,
+                move |_, _| Ok(bytes.to_vec()),
+            )
+            .unwrap()
+        };
+        let mut fragment = observation("left.png", b"left");
+        fragment += observation("right.png", b"right");
+        let messages = observed(&fragment);
+        assert_eq!(messages.len(), 2, "two divergent rows");
+        let mut seen: Vec<Vec<String>> = messages
+            .iter()
+            .map(|message| {
+                assert_eq!(
+                    message.attached.len(),
+                    1,
+                    "each row only its own attachment"
+                );
+                message.attached[0].names.clone()
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [vec!["left.png".to_owned()], vec!["right.png".to_owned()]]
+        );
+        let text = rendered(messages);
+        assert_eq!(text.matches("DIVERGENT").count(), 2, "{text}");
+    }
+
     use std::fs::File;
     use triblespace::prelude::inlineencodings::U256BE;
     fn message_json(

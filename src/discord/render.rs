@@ -95,6 +95,45 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
             format_interval(message.created_at),
             message.author,
         ))?;
+        // Each attachment on its own line under the message, with what
+        // resolves it: the stored content handle, and the message it came
+        // with (Discord id and anchor). A missing name or content is said.
+        for attachment in &message.attached {
+            let names = if attachment.names.is_empty() {
+                "(no name)".to_owned()
+            } else {
+                attachment
+                    .names
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            let contents = if attachment.contents.is_empty() {
+                "(no stored content)".to_owned()
+            } else {
+                attachment
+                    .contents
+                    .iter()
+                    .map(|handle| hex::encode_upper(handle.raw))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            let ids = if message.message_ids.is_empty() {
+                "(no message id)".to_owned()
+            } else {
+                message
+                    .message_ids
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            out.line(format!(
+                "  attachment {:x}: {names}; content {contents}; message {ids}, anchor {:x}",
+                attachment.attachment, message.anchor
+            ))?;
+        }
     }
     Ok(())
 }
