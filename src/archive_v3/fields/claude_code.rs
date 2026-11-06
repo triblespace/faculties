@@ -36,7 +36,7 @@
 
 use super::{
     Beside, Class, Compaction, Cond, Decode, DropReason, Entry, FieldTable, Gap, GapRule, Gaps,
-    Link, Mirror, Order, Place, Requests, Rewrite, Structure, Windows,
+    Link, LookBack, Mirror, Order, Place, Requests, Rewrite, Structure, Windows,
 };
 use crate::schemas::blockdag::content_fact::sealed;
 
@@ -1224,6 +1224,23 @@ const ATTACHMENT_FIELDS: &[Entry] = &[
     ),
 ];
 
+/// R1, R1', R1'', R1''': where the R1 rendering of `rendered[]` is built.
+/// Of the 727 marks in the live transcripts under 60 MB (round 6, counts
+/// only), 720 follow his prompt, 4 harness text and 3 a compaction summary;
+/// every real one after his prompt follows one written as a plain string.
+/// A thinking drop is client telemetry, no attachment of her window.
+pub const BESIDE_MARK: LookBack = LookBack {
+    shape: "attachment",
+    except: &[&[Cond::Is("attachment.type", "thinking_drop")]],
+    mark: (
+        "renderedBesideToolResult",
+        "{attachment}.renderedBesideToolResult",
+    ),
+    prompt: "user",
+    unprompted: &["isMeta", "isCompactSummary"],
+    plain: "message.content",
+};
+
 /// A record kind that is client machinery as a whole.
 macro_rules! machinery {
     ($kind:literal, $why:literal) => {
@@ -1640,6 +1657,9 @@ pub const TABLE: FieldTable = FieldTable {
             result: ("{user}.message.content[]{tool_result}", "tool-result"),
             thinking: "thinking",
         }),
+        // A rendering marked beside a tool result is built only after his
+        // prompt (R1).
+        look_back: Some(BESIDE_MARK),
     },
     gaps: Gaps {
         // The settings header of a request that records no effort.

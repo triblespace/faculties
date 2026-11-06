@@ -12,8 +12,9 @@
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still
 //! refused as not built yet, never built wrong: a record's supplied members
-//! under parent order (`Class::Supply`), and a beside-mark whose look-back
-//! reaches a node two records hold as different items (R1).
+//! under parent order (`Class::Supply`), a beside-mark whose look-back
+//! reaches a node two records hold as different items (R1), and a
+//! look-back under file order.
 //!
 //! A supplied member (X1, X13, X13') is built from the table's `Supply`
 //! alone: which record a copy names, by the places of items each record
@@ -37,12 +38,14 @@
 //! held of each output, or refuses where and as the importer refuses.
 //!
 //! Nor is a rendering the client marks beside a tool result (R1, R1',
-//! R1'', R1'''): the Claude Code importer's own look-back
-//! (`claude_code::beside_his_prompt`, `claude_code::in_one_message`) reads
-//! the places before it on its parent's line, each as the importer reads
-//! its item (`claude_code::typed_prompt`, its record's claims), and builds
-//! it only after his prompt written as a plain string, or refuses where
-//! and as the importer refuses.
+//! R1'', R1'''): the table's `LookBack` says which records carry the mark,
+//! at which field, and which records hold his prompts; the shared look-back
+//! (`record::look_back::beside_his_prompt`, `record::look_back::in_one_message`)
+//! reads the places before it on its parent's line, each as the importer
+//! reads its item (`record::look_back::typed_prompt`, its record's claims),
+//! and builds it only after his prompt written as a plain string, or
+//! refuses where and as the importer refuses. A table that declares no
+//! `LookBack` looks back from nothing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -51,9 +54,6 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::claude_code::{
-    beside_his_prompt, beside_marked, in_one_message, typed_prompt, Before,
-};
 use super::super::codex::{Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
@@ -61,6 +61,9 @@ use super::super::fields::{
 };
 use super::super::record::check;
 use super::super::record::json::{self, Json};
+use super::super::record::look_back::{
+    beside_his_prompt, beside_marked, in_one_message, typed_prompt, Before,
+};
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, gloss_part, node, occurrence, unexported, witness,
     FactCore, Model, NodeAnnotations, WitnessAnnotations,
@@ -1111,6 +1114,7 @@ fn parents(
     }
 
     let requests = table.windows.requests;
+    let look_back = table.windows.look_back;
     let mut tails: HashMap<String, Line> = HashMap::new();
     // Each request's records so far, and the header it was sampled under;
     // and the occurrence of its last item.
@@ -1128,7 +1132,7 @@ fn parents(
     let mut record_parent: HashMap<String, Option<String>> = HashMap::new();
     // R1: each node a record holds, as the importer's look-back before a
     // beside-mark reads its item (none where two records hold it as
-    // different items); and each attachment's parent, and whether it is
+    // different items); and each carrier's parent, and whether it is
     // beside-marked (R1'').
     let mut as_before: HashMap<Id, Option<Before>> = HashMap::new();
     let mut attachment_parents: HashMap<String, (Option<String>, bool)> = HashMap::new();
@@ -1253,16 +1257,18 @@ fn parents(
                 }),
             },
         };
-        // R1'': an attachment's parent and its mark, as the importer keeps
-        // them (a thinking drop is no attachment to it).
+        // R1'': a carrier's parent and its mark, as the importer keeps
+        // them (a record the look-back excepts, a thinking drop, is none).
         let read_back = &reads[at];
-        let attachment =
-            shape == "attachment" && read_back.str_at("attachment.type") != Some("thinking_drop");
-        if attachment {
-            let beside = matches!(
-                read_back.get("renderedBesideToolResult"),
-                Some(Json::Bool(true))
-            );
+        let carrier = look_back.filter(|look_back| {
+            look_back.shape == shape
+                && !look_back
+                    .except
+                    .iter()
+                    .any(|when| holds(when, unit, Some(record), None))
+        });
+        if let Some(look_back) = &carrier {
+            let beside = matches!(read_back.at(look_back.mark.0), Some(Json::Bool(true)));
             attachment_parents.insert(own.clone(), (read(record, parent), beside));
         }
         // R1, R1', R1''': a rendering the client marks beside a tool result,
@@ -1271,10 +1277,13 @@ fn parents(
         // its parent's line; where it refuses, the unit is refused as it
         // refuses. A window's opening holds no item the look-back reads; a
         // node outside it that no record holds is the span of unknown items.
-        if attachment
-            && !parts.unrecorded
-            && beside_marked(read_back).map_err(|failure| failure.to_string())?
-        {
+        let marked = match &carrier {
+            Some(look_back) if !parts.unrecorded => {
+                beside_marked(look_back, read_back).map_err(|failure| failure.to_string())?
+            }
+            _ => false,
+        };
+        if let Some(look_back) = carrier.filter(|_| marked) {
             let mut twice = false;
             let places = &lines.places;
             let line =
@@ -1295,7 +1304,7 @@ fn parents(
                         }),
                     }
                 });
-            let decided = beside_his_prompt(line);
+            let decided = beside_his_prompt(&look_back, line);
             if twice {
                 return Err(
                     "not built yet: a beside-mark after a node two records hold as different items"
@@ -1323,12 +1332,15 @@ fn parents(
             let message = read(record, r.id).unwrap_or_default();
             // R1'': a beside-mark in the middle of one request, by the
             // importer's own rule.
-            in_one_message(
-                messages.contains_key(&message),
-                read(record, parent).as_deref(),
-                &attachment_parents,
-            )
-            .map_err(|failure| failure.to_string())?;
+            if let Some(look_back) = &look_back {
+                in_one_message(
+                    look_back,
+                    messages.contains_key(&message),
+                    read(record, parent).as_deref(),
+                    &attachment_parents,
+                )
+                .map_err(|failure| failure.to_string())?;
+            }
             let continuing = read(record, parent).is_some_and(|p| {
                 messages
                     .get(&message)
@@ -1367,13 +1379,18 @@ fn parents(
             // R1: the item as the importer's look-back reads it: his typed
             // prompt by the importer's own rule, the claims its record's.
             let head = item.modality == Some(TOOL_RESULT);
-            let (prompt, plain_prompt) = if shape == "user" {
-                typed_prompt(read_back, item.modality == Some(TEXT), head, item.part)
-            } else {
-                (false, false)
+            let (prompt, plain_prompt) = match &look_back {
+                Some(look_back) if look_back.prompt == shape => typed_prompt(
+                    look_back,
+                    read_back,
+                    item.modality == Some(TEXT),
+                    head,
+                    item.part,
+                ),
+                _ => (false, false),
             };
             let mark = Before {
-                attachment,
+                attachment: carrier.is_some(),
                 head,
                 part: item.part,
                 call: item.modality == Some(TOOL_CALL),
@@ -1874,6 +1891,11 @@ fn file(
     wiring: &mut Wiring,
 ) -> Result<(), String> {
     let table = t.table;
+    // R1 looks back along a parent's line, which file order has no rule
+    // for.
+    if table.windows.look_back.is_some() {
+        return Err("not built yet: a look-back under file order (R1)".to_owned());
+    }
     // X18': the budgets the unit's clients could have cut an output under
     // unrecorded, by the versions of the records that name them.
     let unrecorded = rules.budget.as_ref().map(|budget| {

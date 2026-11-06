@@ -242,6 +242,10 @@ pub struct Windows {
     pub header: Option<&'static str>,
     pub compaction: Option<Compaction>,
     pub requests: Option<Requests>,
+    /// Where a rendering a record marks is built only after his prompt
+    /// (R1). It shapes no window, so the gate's walker does not read it;
+    /// a source that declares none builds every rendering by its entries.
+    pub look_back: Option<LookBack>,
 }
 
 impl Windows {
@@ -251,6 +255,7 @@ impl Windows {
         header: None,
         compaction: None,
         requests: None,
+        look_back: None,
     };
 }
 
@@ -294,6 +299,35 @@ pub struct Requests {
     pub result: (&'static str, &'static str),
     /// The modality of the blocks a drop may name.
     pub thinking: &'static str,
+}
+
+/// A mark on a record whose rendering stands beside what her window held
+/// before it, though the source does not say what that was: Claude Code's
+/// `renderedBesideToolResult` (rulings R1, R1', R1'', R1''').
+///
+/// Records of `shape` carry the mark at the record-relative field `mark.0`,
+/// which a failure names by the normalized path `mark.1`; a record of that
+/// shape where one of the conjunctions `except` holds is none of them (a
+/// thinking drop's telemetry). The mark is the JSON boolean `true`; any
+/// other value fails. A marked record whose rendering is unrecorded (S3) is
+/// not looked back from. A marked rendering is built only where the
+/// look-back over the places before it on its parent's line, past the
+/// items of the other records of `shape`, reaches his typed prompt written
+/// as a plain string. Beside a result, between a call and its result,
+/// after a span of unknown items, after a prompt of blocks or anything
+/// else, and in the middle of one request ([`Requests`]), it is refused.
+/// His typed prompt is a text, outside any result, of a record of shape
+/// `prompt` where none of the record-relative fields `unprompted` is `true`
+/// (harness text, a compaction summary); it is plain where the
+/// record-relative field `plain` is a string, not blocks.
+#[derive(Clone, Copy, Debug)]
+pub struct LookBack {
+    pub shape: &'static str,
+    pub except: &'static [&'static [Cond]],
+    pub mark: (&'static str, &'static str),
+    pub prompt: &'static str,
+    pub unprompted: &'static [&'static str],
+    pub plain: &'static str,
 }
 
 /// How a source orders its records.

@@ -1362,6 +1362,51 @@ fn a_beside_mark_the_look_back_does_not_reach() {
     );
 }
 
+/// The Claude Code table without its look-back (R1).
+static UNMARKED: FieldTable = FieldTable {
+    windows: crate::archive_v3::fields::Windows {
+        look_back: None,
+        ..TABLE.windows
+    },
+    ..TABLE
+};
+
+/// R1 is the table's: where it declares no look-back, a beside-mark after
+/// harness text, which the Claude Code table refuses, is built by its
+/// entries alone, as its text plus a trailing newline.
+#[test]
+fn a_beside_mark_is_looked_back_from_only_where_the_table_says() {
+    let mut meta = his(
+        "u2",
+        Some("a1"),
+        2,
+        json!([{"type": "text", "text": "<system-reminder>x</system-reminder>"}]),
+    );
+    meta["isMeta"] = json!(true);
+    let source = jsonl(&[
+        user("u1", None, 0, "Hi."),
+        assistant("a1", "u1", 1, "Hello."),
+        meta,
+        beside("x1", "u2", 3),
+        hers(
+            "a2",
+            "x1",
+            4,
+            "m2",
+            json!({"type": "text", "text": "Ok."}),
+            json!("end_turn"),
+        ),
+    ]);
+    assert_eq!(
+        cc_refused(&source),
+        not_beside(
+            "rendered after harness text: what her window held there is unverified; not built"
+        )
+    );
+    let fragment = built_with(&UNMARKED, &source).expect("builds without a look-back");
+    assert_eq!(nodes_saying(&fragment, "Moved.\n").len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Codex: one line in file order (Order::File).
 
