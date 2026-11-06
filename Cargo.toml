@@ -203,6 +203,7 @@ faculties-secrets = { version = "0.1.0", path = "faculties-secrets" }  # secrets
 anybytes = { version = "0.20.3", path = "../anybytes" }
 base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
+sha2 = "0.10"               # archive v3 reference freezer (sha256 of input bytes and fact sets)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # wiki
 ctrlc = "3.5"               # body (graceful close for kept touch loops)

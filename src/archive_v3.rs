@@ -26,6 +26,8 @@ use crate::schemas::archive_v3 as schema;
 pub mod claude_code;
 pub mod codex;
 pub mod fields;
+#[cfg(test)]
+mod freeze;
 pub mod gate;
 pub mod grammar;
 pub mod media_type;
