@@ -1781,6 +1781,25 @@ const ROLLED_BACK: &[Cond] = &[
     Cond::Is("payload.type", "thread_rolled_back"),
 ];
 
+/// X18, X18': where her history's budget, a record's own limit, the
+/// outputs it applies to and the client versions are. The truncation itself
+/// is `record::history`'s rule.
+pub const HISTORY: HistoryBudget = HistoryBudget {
+    policy: (
+        "payload.truncation_policy",
+        "{turn_context}.payload.truncation_policy",
+    ),
+    limit: (
+        "metadata.fallback_token_limit_override",
+        "{response_item}.metadata.fallback_token_limit_override",
+    ),
+    outputs: &[
+        "{response_item}.payload{function_call_output}.output",
+        "{response_item}.payload{custom_tool_call_output}.output",
+    ],
+    client: (("type", "session_meta"), "payload.cli_version"),
+};
+
 /// The Codex rollout field table.
 pub const TABLE: FieldTable = FieldTable {
     jsonl: true,
@@ -1806,21 +1825,7 @@ pub const TABLE: FieldTable = FieldTable {
             ],
             &[Cond::Is("type", "message"), Cond::Is("role", "user")],
         ],
-        budget: Some(HistoryBudget {
-            policy: (
-                "payload.truncation_policy",
-                "{turn_context}.payload.truncation_policy",
-            ),
-            limit: (
-                "metadata.fallback_token_limit_override",
-                "{response_item}.metadata.fallback_token_limit_override",
-            ),
-            outputs: &[
-                "{response_item}.payload{function_call_output}.output",
-                "{response_item}.payload{custom_tool_call_output}.output",
-            ],
-            client: (("type", "session_meta"), "payload.cli_version"),
-        }),
+        budget: Some(HISTORY),
     }),
     windows: Windows::NONE,
     gaps: Gaps {

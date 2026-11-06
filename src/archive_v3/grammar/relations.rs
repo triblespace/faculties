@@ -32,10 +32,11 @@
 //! shared until the rules replace it.
 //!
 //! Nor is a history budget (X18, X18'): the table's `HistoryBudget` says
-//! where a budget and the tool outputs it applies to are, and the Codex
-//! importer's own rule (`codex::Budget`, `codex::Unrecorded`,
-//! `codex::History`), over the same records read back, says what her window
-//! held of each output, or refuses where and as the importer refuses.
+//! where a budget and the tool outputs it applies to are, and the shared
+//! history rule (`record::history::Budget`, `record::history::Unrecorded`,
+//! `record::history::History`), over the same records read back, says what
+//! her window held of each output, or refuses where and as the importer
+//! refuses.
 //!
 //! Nor is a rendering the client marks beside a tool result (R1, R1',
 //! R1'', R1'''): the table's `LookBack` says which records carry the mark,
@@ -54,12 +55,12 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::codex::{Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
     Place, Rewrite, Supply,
 };
 use super::super::record::check;
+use super::super::record::history::{Budget, History, Unrecorded};
 use super::super::record::json::{self, Json};
 use super::super::record::look_back::{
     beside_his_prompt, beside_marked, in_one_message, typed_prompt, Before,
@@ -1898,15 +1899,10 @@ fn file(
     }
     // X18': the budgets the unit's clients could have cut an output under
     // unrecorded, by the versions of the records that name them.
-    let unrecorded = rules.budget.as_ref().map(|budget| {
-        let ((field, client), version) = budget.client;
-        Unrecorded::of_clients(
-            reads
-                .iter()
-                .filter(|read| read.str_at(field) == Some(client))
-                .map(|read| read.str_at(version)),
-        )
-    });
+    let unrecorded = rules
+        .budget
+        .as_ref()
+        .map(|budget| Unrecorded::of_clients(budget, reads));
     // X1, X13: the table's one supply.
     let mut supplies = table.entries.iter().filter_map(|entry| match &entry.class {
         Class::Supply(supply) => Some(supply),
@@ -1928,10 +1924,10 @@ fn file(
         let history = match (&rules.budget, unrecorded) {
             (Some(budget), Some(unrecorded)) => {
                 if file_kind(rules, unit, record) == FileKind::Header {
-                    header_budget = Budget::of_header(reads[at].at(budget.policy.0))
+                    header_budget = Budget::of_header(budget, &reads[at])
                         .map_err(|failure| failure.to_string())?;
                 }
-                let own = Budget::of_record(reads[at].at(budget.limit.0), header_budget)
+                let own = Budget::of_record(budget, &reads[at], header_budget)
                     .map_err(|failure| failure.to_string())?;
                 let history = History {
                     budget: own,
