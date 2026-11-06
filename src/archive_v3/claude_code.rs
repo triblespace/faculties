@@ -57,18 +57,15 @@
 //! rendering is unrecorded.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fmt;
-use std::str::FromStr;
 
 use base64::Engine;
-use hifitime::Epoch;
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::import::json_tree::JsonTreeImporter;
-use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
-use self::json::Json;
 use crate::archive_v3::fields::claude_code::{SUMMARIZED_THINKING, TABLE};
+use crate::archive_v3::record::json::{self, Json};
+use crate::archive_v3::record::{check, time, Failure};
 use crate::archive_v3::{
     annotate_node, ends_disagree, fact, gloss, node, occurrence, unexported, witness, FactCore,
     MediaType, Model, NodeAnnotations, WitnessAnnotations,
@@ -77,40 +74,8 @@ use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::content_fact::sealed;
 use crate::schemas::blockdag::source_projection::SOURCE_CLAUDE_CODE;
 
-pub(crate) mod check;
-pub mod json;
 #[cfg(test)]
 mod tests;
-
-/// Why a unit was refused: a normalized source path and a fixed reason.
-/// Neither ever holds a source value.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub path: String,
-    pub reason: &'static str,
-}
-
-impl Failure {
-    pub(crate) fn new(path: &str, reason: &'static str) -> Self {
-        Failure {
-            path: path.to_owned(),
-            reason,
-        }
-    }
-}
-
-impl fmt::Display for Failure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.path, self.reason)
-    }
-}
-
-impl std::error::Error for Failure {}
-
-pub(crate) fn time(text: &str) -> Option<Inline<NsTAIInterval>> {
-    let epoch = Epoch::from_str(text.trim()).ok()?;
-    (epoch, epoch).try_to_inline().ok()
-}
 
 /// Import one Claude Code transcript file.
 pub fn import(source: &[u8]) -> Result<Fragment, Failure> {

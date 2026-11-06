@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 
 use super::*;
 use crate::archive_v3::gate::{self, Kind, Report};

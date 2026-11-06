@@ -531,7 +531,7 @@ fn a_reply_is_witnessed_with_its_record_s_claims_and_its_end() {
     ]);
     let built = built(&source).expect("builds");
     let hello = node_saying(&built, "Hello.");
-    let at = crate::archive_v3::claude_code::time(&stamp(1))
+    let at = crate::archive_v3::record::time(&stamp(1))
         .expect("a time")
         .raw;
     let model = crate::archive_v3::Model::vendor("claude-opus-4-6")
@@ -544,7 +544,7 @@ fn a_reply_is_witnessed_with_its_record_s_claims_and_its_end() {
     // Her prompt's record claims its time; no model sampled it, and it ends
     // nothing.
     let hi = node_saying(&built, "Hi.");
-    let at = crate::archive_v3::claude_code::time(&stamp(0))
+    let at = crate::archive_v3::record::time(&stamp(0))
         .expect("a time")
         .raw;
     assert_eq!(occurrences_of(&built, hi), vec![(vec![at], vec![], vec![])]);

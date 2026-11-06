@@ -29,6 +29,7 @@ pub mod fields;
 pub mod gate;
 pub mod grammar;
 pub mod media_type;
+pub mod record;
 #[cfg(test)]
 mod tests;
 

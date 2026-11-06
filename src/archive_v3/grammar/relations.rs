@@ -18,7 +18,7 @@
 //!
 //! Mirrors are not stated here a second time: the unit's records, read back
 //! as the JSON they hold, go through the importers' own record check
-//! (`claude_code::check`), whose unit mirrors are verified once every record
+//! (`record::check`), whose unit mirrors are verified once every record
 //! is checked. That is the whole record check, not its mirrors alone, so a
 //! unit it refuses the importer refuses too, for the same reason; it stays
 //! shared until the rules replace it.
@@ -51,15 +51,16 @@ use triblespace::prelude::inlineencodings::U256BE;
 use triblespace::prelude::*;
 use triblespace_cxg::{PathStep, Unit};
 
-use super::super::claude_code::json::{self, Json};
 use super::super::claude_code::{
-    beside_his_prompt, beside_marked, check, in_one_message, typed_prompt, Before,
+    beside_his_prompt, beside_marked, in_one_message, typed_prompt, Before,
 };
 use super::super::codex::{phase_register, supplied_phases, Budget, History, Unrecorded};
 use super::super::fields::{
     Beside, Class, Cond, Decode, DropReason, FieldTable, FileWindows, Gap, HistoryBudget, Order,
     Place, Rewrite, Supply,
 };
+use super::super::record::check;
+use super::super::record::json::{self, Json};
 use super::super::{
     annotate_node, ends_disagree, fact, gloss, gloss_part, node, occurrence, unexported, witness,
     FactCore, Model, NodeAnnotations, WitnessAnnotations,
@@ -285,7 +286,7 @@ fn annotate(
                     // decode, which takes only text-shaped decodes.
                     if let Some(at) = text_of(unit, v).filter(|t| !t.is_empty()) {
                         claims.timestamp.push(
-                            crate::archive_v3::claude_code::time(&at)
+                            crate::archive_v3::record::time(&at)
                                 .ok_or_else(|| format!("{path}: a time does not parse"))?,
                         );
                     }
@@ -954,7 +955,7 @@ pub fn build(
     for (_, record) in &records {
         let mut text = String::new();
         json_text(&unit, *record, &mut text).ok_or("a record is no json_tree value")?;
-        let read = crate::archive_v3::claude_code::json::parse(text.as_bytes())
+        let read = crate::archive_v3::record::json::parse(text.as_bytes())
             .ok_or("a record does not read back as JSON")?;
         check::record_in(table, &read, &mut mirrors).map_err(|failure| failure.to_string())?;
         reads.push(read);

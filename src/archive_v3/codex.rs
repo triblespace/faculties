@@ -84,10 +84,10 @@ use triblespace::core::import::json_tree::JsonTreeImporter;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
-use crate::archive_v3::claude_code::check::{self, base64_url, data_uri};
-use crate::archive_v3::claude_code::json::{self, Json};
-use crate::archive_v3::claude_code::Failure;
 use crate::archive_v3::fields::codex::{OPENAI_ENCRYPTED_CONTENT, TABLE};
+use crate::archive_v3::record::check::{self, base64_url, data_uri};
+use crate::archive_v3::record::json::{self, Json};
+use crate::archive_v3::record::Failure;
 use crate::archive_v3::{
     annotate_node, ends_disagree, fact, gloss_part, node, occurrence, unexported, witness,
     FactCore, MediaType, NodeAnnotations, WitnessAnnotations,

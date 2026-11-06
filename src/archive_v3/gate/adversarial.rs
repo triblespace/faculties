@@ -20,11 +20,12 @@ use triblespace::prelude::inlineencodings::{GenId, Handle};
 use triblespace::prelude::*;
 
 use crate::archive_v3 as av3;
-use crate::archive_v3::claude_code::{import, Failure};
+use crate::archive_v3::claude_code::import;
 use crate::archive_v3::fields::claude_code::TABLE;
 use crate::archive_v3::fields::codex::TABLE as CX;
 use crate::archive_v3::fields::FieldTable;
 use crate::archive_v3::gate::{self, Report};
+use crate::archive_v3::record::Failure;
 use crate::schemas::archive_v3 as v3;
 use crate::schemas::blockdag::source_projection::{SOURCE_CHATGPT, SOURCE_CODEX};
 
