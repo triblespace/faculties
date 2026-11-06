@@ -71,6 +71,68 @@ const FORWARD_PAGES: usize = 10;
 /// application command. Every other type is a system notice.
 const WRITTEN_MESSAGE_TYPES: [u64; 4] = [0, 19, 20, 23];
 
+/// Bounded upload budget, including all files in one message. This leaves
+/// room for multipart framing under Discord's 25 MiB request limit.
+pub const MAX_SEND_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+pub const MAX_SEND_ATTACHMENTS: usize = 10;
+
+/// Caller-owned upload bytes. Paths and base64 decoding belong to frontends.
+#[derive(Clone)]
+pub struct SendAttachment {
+    pub filename: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+impl std::fmt::Debug for SendAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendAttachment")
+            .field("filename", &self.filename)
+            .field("media_type", &self.media_type)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// Validate before credentials, collection access, or external side effects.
+pub fn validate_send(channel_id: &str, text: &str, attachments: &[SendAttachment]) -> Result<()> {
+    discord_model::validate_snowflake(channel_id)?;
+    ensure!(
+        !text.trim().is_empty() || !attachments.is_empty(),
+        "empty message body: provide text or attachments"
+    );
+    ensure!(
+        text.chars().count() <= 2000,
+        "message body exceeds 2000 characters"
+    );
+    ensure!(
+        attachments.len() <= MAX_SEND_ATTACHMENTS,
+        "at most {MAX_SEND_ATTACHMENTS} attachments per message"
+    );
+    let mut total = 0usize;
+    for attachment in attachments {
+        let name = &attachment.filename;
+        ensure!(
+            !name.trim().is_empty() && name.len() <= 255 && name != "." && name != ".."
+                && !name.contains(['/', '\\']) && !name.chars().any(char::is_control),
+            "attachment filename must be a leaf name of at most 255 bytes without control characters"
+        );
+        ensure!(
+            attachment.media_type.len() <= 255,
+            "attachment media type is too long"
+        );
+        file_capability::normalize_media_type(&attachment.media_type)?;
+        total = total
+            .checked_add(attachment.bytes.len())
+            .ok_or_else(|| anyhow!("attachment size overflow"))?;
+        ensure!(
+            total <= MAX_SEND_ATTACHMENT_BYTES,
+            "attachments exceed the 20 MiB total upload limit"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct SendReceipt {
     pub message_id: String,
@@ -398,20 +460,37 @@ impl Discord {
     }
     /// Post literal text, after proving collection WRITE admission, then persist the returned observation.
     pub fn send(&self, channel_id: &str, text: &str) -> Result<SendReceipt> {
-        self.send_using(channel_id, text, post_message)
+        self.send_attachments(channel_id, text, &[])
+    }
+    /// Send text and/or files through the same authentication and observation path.
+    /// Never retry automatically: an uncertain response or failed retention can
+    /// follow a successful external send.
+    pub fn send_attachments(
+        &self,
+        channel_id: &str,
+        text: &str,
+        attachments: &[SendAttachment],
+    ) -> Result<SendReceipt> {
+        self.send_using(channel_id, text, attachments, post_message_attachments)
     }
     fn send_using(
         &self,
         channel_id: &str,
         text: &str,
-        post: impl FnOnce(&str, &str, &str) -> Result<JsonValue>,
+        attachments: &[SendAttachment],
+        post: impl FnOnce(&str, &str, &str, &[SendAttachment]) -> Result<JsonValue>,
     ) -> Result<SendReceipt> {
-        discord_model::validate_snowflake(channel_id)?;
-        if text.trim().is_empty() {
-            bail!("empty message body");
-        }
+        validate_send(channel_id, text, attachments)?;
         self.preflight_write()?;
-        send_with(self.storage(), &self.token()?, channel_id, text, post)
+        send_with(
+            self.storage(),
+            &self.token()?,
+            channel_id,
+            text,
+            attachments,
+            post,
+            fetch_attachment_bytes,
+        )
     }
     /// Observe the resident collection; this never lists guilds, fetches messages, or opens credentials.
     pub fn read(&self, options: ReadOptions) -> Result<History> {
@@ -983,51 +1062,111 @@ fn send_with(
     token: &str,
     channel_id: &str,
     text: &str,
-    post: impl FnOnce(&str, &str, &str) -> Result<JsonValue>,
+    attachments: &[SendAttachment],
+    post: impl FnOnce(&str, &str, &str, &[SendAttachment]) -> Result<JsonValue>,
+    fetch: impl FnMut(&str, u64) -> Result<Vec<u8>>,
 ) -> Result<SendReceipt> {
-    discord_model::validate_snowflake(channel_id).context("invalid channel id")?;
-    if text.trim().is_empty() {
-        bail!("empty message body");
-    }
-
+    validate_send(channel_id, text, attachments)?;
     storage
         .preflight_write()
         .context("preflight Discord collection WRITE admission")?;
-    let payload = post(token, channel_id, text)?;
-    let messages = parse_messages(vec![payload], channel_id)?;
-    let message = messages
-        .first()
-        .ok_or_else(|| anyhow!("Discord send response contained no message"))?;
-    let message_id = message.external_id.as_str();
-    let mut fragment = build_ingest_fragment(&messages, None, None, fetch_attachment_bytes)?;
-    // The bot wrote this message, so its author is the pile's own account.
-    fragment += discord_model::bot_account_fragment(&message.author_external_id)?;
-    let commit = storage.publish(
-        fragment,
-        format!("discord: sent and observed message {message_id} in channel {channel_id}"),
-    )?;
-    Ok(SendReceipt {
-        message_id: message_id.to_owned(),
-        channel_id: channel_id.to_owned(),
-        commit,
-    })
+    let payload = post(token, channel_id, text, attachments)?;
+    let remote_id = payload
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("(unavailable)")
+        .to_owned();
+    (|| -> Result<SendReceipt> {
+        let messages = parse_messages(vec![payload], channel_id)?;
+        let message = messages.first().ok_or_else(|| anyhow!("Discord send response contained no message"))?;
+        let message_id = message.external_id.as_str();
+        // Observe what Discord returned, using ordinary intake, including CDN
+        // bytes. Upload bytes are not evidence of a server's returned content.
+        let mut fragment = build_ingest_fragment(&messages, None, None, fetch)?;
+        fragment += discord_model::bot_account_fragment(&message.author_external_id)?;
+        let commit = storage.publish(
+            fragment,
+            format!("discord: sent and observed message {message_id} in channel {channel_id}"),
+        )?;
+        Ok(SendReceipt {
+            message_id: message_id.to_owned(),
+            channel_id: channel_id.to_owned(),
+            commit,
+        })
+    })().with_context(|| format!(
+        "Discord message {remote_id} was sent in channel {channel_id}, but retention failed; do not resend"
+    ))
 }
 
 pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
+    post_message_attachments(token, channel_id, text, &[])
+}
+
+fn message_request(
+    client: &Client,
+    url: &str,
+    token: &str,
+    channel_id: &str,
+    text: &str,
+    attachments: &[SendAttachment],
+) -> Result<reqwest::blocking::RequestBuilder> {
+    validate_send(channel_id, text, attachments)?;
+    let request = client
+        .post(url)
+        .header("Authorization", authorization(token)?);
+    if attachments.is_empty() {
+        return Ok(request.json(&json!({ "content": text })));
+    }
+    // https://docs.discord.com/developers/reference#uploading-files
+    // Each attachment id names its matching files[n] multipart part.
+    let metadata: Vec<_> = attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| json!({"id": index, "filename": attachment.filename}))
+        .collect();
+    let mut payload = json!({"attachments": metadata});
+    if !text.is_empty() {
+        payload["content"] = json!(text);
+    }
+    let mut form = reqwest::blocking::multipart::Form::new().part(
+        "payload_json",
+        reqwest::blocking::multipart::Part::text(payload.to_string())
+            .mime_str("application/json")?,
+    );
+    for (index, attachment) in attachments.iter().enumerate() {
+        let media_type = file_capability::normalize_media_type(&attachment.media_type)?;
+        form = form.part(
+            format!("files[{index}]"),
+            reqwest::blocking::multipart::Part::bytes(attachment.bytes.clone())
+                .file_name(attachment.filename.clone())
+                .mime_str(&media_type)?,
+        );
+    }
+    Ok(request.multipart(form))
+}
+
+fn post_message_attachments(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+    attachments: &[SendAttachment],
+) -> Result<JsonValue> {
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-    let response = client
-        .post(&url)
-        .header("Authorization", authorization(token)?)
-        .header("Content-Type", "application/json")
-        .body(json!({ "content": text }).to_string())
+    let response = message_request(&client, &url, token, channel_id, text, attachments)?
         .send()
-        .with_context(|| format!("POST {url}"))?;
+        .with_context(|| {
+            format!(
+                "Discord send outcome unknown in channel {channel_id}; do not resend automatically"
+            )
+        })?;
     if !response.status().is_success() {
         let status = response.status();
-        bail!("discord send failed ({status})");
+        bail!("discord send failed ({status}) in channel {channel_id}; do not retry automatically");
     }
-    response.json().context("parse send response")
+    response.json().with_context(|| format!(
+        "Discord accepted the send in channel {channel_id}, but its response could not be decoded; retention failed; do not resend"
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -2769,16 +2908,21 @@ mod tests {
         );
         let channel = "100000000000000002";
         let sent = operations
-            .send_using(channel, "literal message", |token, channel, body| {
-                assert_eq!(token, "synthetic-second-token");
-                Ok(message_json(
-                    "100000000000000001",
-                    channel,
-                    body,
-                    None,
-                    json!([]),
-                ))
-            })
+            .send_using(
+                channel,
+                "literal message",
+                &[],
+                |token, channel, body, _| {
+                    assert_eq!(token, "synthetic-second-token");
+                    Ok(message_json(
+                        "100000000000000001",
+                        channel,
+                        body,
+                        None,
+                        json!([]),
+                    ))
+                },
+            )
             .unwrap();
         assert_eq!(sent.channel_id, channel);
         assert!(!format!("{operations:?}").contains("synthetic"));
@@ -2802,7 +2946,7 @@ mod tests {
         let operations = Discord::with_storage(storage.clone());
         let assert_no_post = || {
             let error = operations
-                .send_using("1", "body", |_, _, _| {
+                .send_using("1", "body", &[], |_, _, _, _| {
                     panic!("authentication failure must precede HTTP")
                 })
                 .unwrap_err();
@@ -2903,7 +3047,9 @@ mod tests {
             )
             .unwrap();
         let error = operations
-            .send_using("1", "body", |_, _, _| panic!("cold auth reached HTTP"))
+            .send_using("1", "body", &[], |_, _, _, _| {
+                panic!("cold auth reached HTTP")
+            })
             .unwrap_err();
         assert!(!format!("{error:#}").contains("synthetic-cold-token"));
         let secrets = crate::secrets::Secrets::with_storage(storage.clone());
@@ -2934,7 +3080,8 @@ mod tests {
             "fixture-token",
             channel,
             "@-",
-            |token, actual_channel, body| {
+            &[],
+            |token, actual_channel, body, _| {
                 assert_eq!(token, "fixture-token");
                 assert_eq!(actual_channel, channel);
                 assert_eq!(body, "@-");
@@ -2946,6 +3093,7 @@ mod tests {
                     json!([]),
                 ))
             },
+            |_, _| unreachable!("text has no attachments"),
         )
         .unwrap();
         assert_eq!(receipt.message_id, "100000000000000001");
@@ -2977,14 +3125,210 @@ mod tests {
             "unused-token",
             "100000000000000002",
             "must not leave this process",
-            |_, _, _| {
+            &[upload("private.bin", b"private attachment")],
+            |_, _, _, _| {
                 posts += 1;
                 Ok(json!({}))
             },
+            |_, _| unreachable!("unauthorized send cannot fetch"),
         );
         let error = result.unwrap_err();
         assert!(error.to_string().contains("WRITE admission"), "{error:#}");
         assert_eq!(posts, 0, "authorization failure must precede HTTP POST");
+    }
+
+    fn upload(filename: &str, bytes: &[u8]) -> SendAttachment {
+        SendAttachment {
+            filename: filename.to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn send_requests_preserve_text_and_frame_indexed_binary_parts() {
+        let client = build_client().unwrap();
+        let url = "https://discord.invalid/channels/1/messages";
+        let mut text = message_request(&client, url, "fixture", "1", "@-", &[])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(text.headers()["content-type"], "application/json");
+        assert_eq!(text.headers()["authorization"], "Bot fixture");
+        let body: JsonValue =
+            serde_json::from_slice(text.body_mut().as_mut().unwrap().buffer().unwrap()).unwrap();
+        assert_eq!(body, json!({"content": "@-"}));
+
+        // Duplicate leaf names still have distinct multipart indices.
+        let attachments = [
+            upload("same.bin", &[0, 255, 10]),
+            upload("same.bin", b"second"),
+        ];
+        for content in ["", "literal @-"] {
+            let mut request = message_request(&client, url, "fixture", "1", content, &attachments)
+                .unwrap()
+                .build()
+                .unwrap();
+            let content_type = request.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let boundary = content_type
+                .strip_prefix("multipart/form-data; boundary=")
+                .unwrap();
+            let body = request.body_mut().as_mut().unwrap().buffer().unwrap();
+            assert!(body.ends_with(format!("--{boundary}--\r\n").as_bytes()));
+            let rendered = String::from_utf8_lossy(body);
+            assert!(rendered.contains("name=\"payload_json\""));
+            assert!(
+                rendered.contains("Content-Type: application/json")
+                    || rendered.contains("content-type: application/json")
+            );
+            for index in 0..2 {
+                assert!(
+                    rendered.contains(&format!("name=\"files[{index}]\"; filename=\"same.bin\""))
+                );
+            }
+            let start = rendered.find("{\"attachments\"").unwrap();
+            let end = rendered[start..].find("\r\n").unwrap() + start;
+            let payload: JsonValue = serde_json::from_str(&rendered[start..end]).unwrap();
+            assert_eq!(
+                payload["attachments"],
+                json!([
+                    {"id": 0, "filename": "same.bin"}, {"id": 1, "filename": "same.bin"}
+                ])
+            );
+            if content.is_empty() {
+                assert!(payload.get("content").is_none());
+            } else {
+                assert_eq!(payload["content"], content);
+            }
+            assert!(body.windows(3).any(|bytes| bytes == [0, 255, 10]));
+        }
+    }
+
+    #[test]
+    fn attachment_send_validates_before_storage_or_transport() {
+        let directory = tempfile::tempdir().unwrap();
+        // No pile or key exists. Invalid arguments must fail before opening it.
+        let operations = Discord::new(directory.path().join("absent"), None);
+        for attachments in [
+            vec![upload("../escape", b"x")],
+            vec![upload("bad\nheader", b"x")],
+            vec![upload("x", b""); MAX_SEND_ATTACHMENTS + 1],
+            vec![upload("x", &vec![0; MAX_SEND_ATTACHMENT_BYTES + 1])],
+            vec![SendAttachment {
+                media_type: "not a mime".into(),
+                ..upload("x", b"x")
+            }],
+        ] {
+            let error = operations
+                .send_using("1", "", &attachments, |_, _, _, _| {
+                    panic!("invalid upload reached transport")
+                })
+                .unwrap_err();
+            assert!(!error.to_string().contains("pile"), "{error:#}");
+        }
+        assert!(validate_send("1", "   ", &[]).is_err());
+        assert!(validate_send("1", &"x".repeat(2001), &[]).is_err());
+        assert!(validate_send("1", "", &[upload("empty.txt", b"")]).is_ok());
+        assert!(!directory.path().join("absent").exists());
+    }
+
+    #[test]
+    fn attachment_only_send_retains_the_returned_observation_and_downloaded_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile, Some(key));
+        let storage = test_storage(&owner);
+        let receipt = send_with(
+            storage,
+            "fixture",
+            "2",
+            "",
+            &[upload("image.png", b"uploaded")],
+            |_, _, body, attachments| {
+                assert!(body.is_empty());
+                assert_eq!(attachments[0].bytes, b"uploaded");
+                Ok(message_json(
+                    "1",
+                    "2",
+                    body,
+                    None,
+                    json!([{
+                        "id": "3", "filename": "image.png", "content_type": "image/png",
+                        "size": 8, "url": "https://cdn.discordapp.com/returned"
+                    }]),
+                ))
+            },
+            |url, limit| {
+                assert_eq!(url, "https://cdn.discordapp.com/returned");
+                assert_eq!(limit, MAX_ATTACHMENT_BYTES);
+                Ok(b"returned".to_vec())
+            },
+        )
+        .unwrap();
+        assert_eq!(receipt.message_id, "1");
+        let view = storage.view().unwrap();
+        let history = read_history(&view, &ReadOptions::default()).unwrap();
+        assert_eq!(history.messages.len(), 1);
+        assert!(history.messages[0].content.is_empty());
+        let attached = &history.messages[0].attached[0];
+        assert_eq!(attached.names, ["image.png"]);
+        let bytes = view
+            .reader
+            .get::<Bytes, RawBytes>(attached.contents[0])
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"returned");
+    }
+
+    #[test]
+    fn post_send_retention_failure_names_remote_message_and_never_posts_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile, Some(key));
+        let storage = test_storage(&owner);
+        let mut posts = 0;
+        let error = send_with(
+            storage,
+            "fixture",
+            "2",
+            "",
+            &[upload("x", b"x")],
+            |_, _, _, _| {
+                posts += 1;
+                Ok(message_json(
+                    "1",
+                    "2",
+                    "",
+                    None,
+                    json!([{
+                        "id": "3", "filename": "x", "size": 1, "url": "https://cdn.discordapp.com/x"
+                    }]),
+                ))
+            },
+            |_, _| bail!("fixture CDN failure"),
+        )
+        .unwrap_err();
+        assert_eq!(posts, 1);
+        assert!(
+            error
+                .to_string()
+                .contains("message 1 was sent in channel 2"),
+            "{error:#}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("retention failed; do not resend"),
+            "{error:#}"
+        );
+        assert!(
+            read_history(&storage.view().unwrap(), &ReadOptions::default())
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     #[test]

@@ -196,8 +196,11 @@ enum CommandMode {
     Send {
         /// Channel id (global Discord snowflake).
         channel_id: String,
-        /// Message body. Use @path for file input or @- for stdin.
-        text: String,
+        /// Optional message body. Use @path for text input or @- for stdin.
+        text: Option<String>,
+        /// Attach a local file (repeatable, at most 10; 20 MiB total).
+        #[arg(long = "file", value_name = "PATH")]
+        files: Vec<PathBuf>,
     },
     /// Pull one complete forward interval plus a bounded recent window.
     Read {
@@ -333,9 +336,21 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 ))
             }
         },
-        CommandMode::Send { channel_id, text } => {
-            let text = crate::text_arg(&text, "message text")?;
-            render::sent(&operations.send(&channel_id, &text)?, out)
+        CommandMode::Send {
+            channel_id,
+            text,
+            files,
+        } => {
+            let text = text
+                .as_deref()
+                .map(|text| crate::text_arg(text, "message text"))
+                .transpose()?
+                .unwrap_or_default();
+            let attachments = load_attachments(&files)?;
+            render::sent(
+                &operations.send_attachments(&channel_id, &text, &attachments)?,
+                out,
+            )
         }
         CommandMode::Read {
             channel_id,
@@ -672,6 +687,40 @@ fn warm_hearing(
     bail!("warm --hear needs a build with the discord-hearing and voice-breeze features")
 }
 
+fn load_attachments(paths: &[PathBuf]) -> Result<Vec<SendAttachment>> {
+    if paths.len() > MAX_SEND_ATTACHMENTS {
+        bail!("at most {MAX_SEND_ATTACHMENTS} attachments per message");
+    }
+    let mut attachments = Vec::with_capacity(paths.len());
+    let mut remaining = MAX_SEND_ATTACHMENT_BYTES;
+    for path in paths {
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("attachment path needs a UTF-8 filename: {}", path.display()))?
+            .to_owned();
+        let file =
+            fs::File::open(path).with_context(|| format!("open attachment {}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            bail!("attachment must be a regular file: {}", path.display());
+        }
+        let mut bytes = Vec::new();
+        file.take(remaining as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read attachment {}", path.display()))?;
+        if bytes.len() > remaining {
+            bail!("attachments exceed the 20 MiB total upload limit");
+        }
+        remaining -= bytes.len();
+        attachments.push(SendAttachment {
+            filename,
+            media_type: crate::files::infer_media_type(path).to_owned(),
+            bytes,
+        });
+    }
+    Ok(attachments)
+}
+
 fn require_token(cli: &Cli) -> Result<String> {
     if cli.token.is_none() {
         let pile = cli.pile.clone().ok_or_else(|| anyhow!(
@@ -713,6 +762,48 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_parses_repeatable_files_and_optional_text() {
+        for args in [
+            vec![
+                "discord",
+                "send",
+                "1",
+                "--file",
+                "first.txt",
+                "--file",
+                "second.png",
+            ],
+            vec![
+                "discord",
+                "send",
+                "1",
+                "hello",
+                "--file",
+                "first.txt",
+                "--file",
+                "second.png",
+            ],
+            vec!["discord", "send", "1", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            let Some(Command::Collection(CommandMode::Send { text, files, .. })) = cli.command
+            else {
+                panic!("expected send")
+            };
+            assert_eq!(text.as_deref(), args.contains(&"hello").then_some("hello"));
+            assert_eq!(files.len(), if args.contains(&"--file") { 2 } else { 0 });
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        fs::write(&path, [0, 255, 10]).unwrap();
+        let loaded = load_attachments(&[path]).unwrap();
+        assert_eq!(loaded[0].filename, "image.png");
+        assert_eq!(loaded[0].media_type, "image/png");
+        assert_eq!(loaded[0].bytes, [0, 255, 10]);
+        assert!(load_attachments(&[directory.path().to_owned()]).is_err());
+    }
 
     #[test]
     fn say_parses_delivery_without_changing_message_send() {
