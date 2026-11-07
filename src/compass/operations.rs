@@ -167,6 +167,30 @@ impl Compass {
         )
     }
 
+    /// Show priority layers and direct relations across status columns.
+    /// Filters select displayed goals, never remove ordering evidence.
+    pub fn priorities(&self, options: ListOptions<'_>) -> Result<Board> {
+        let statuses: Vec<String> = options
+            .statuses
+            .iter()
+            .cloned()
+            .map(normalize_status)
+            .collect();
+        for status in &statuses {
+            validate_label("status", status)?;
+        }
+        self.storage().with_view(|space, reader, status_register| {
+            render_priorities(
+                reader,
+                space,
+                status_register,
+                &statuses,
+                options.tags,
+                options.all,
+            )
+        })
+    }
+
     pub fn move_goal(&self, id: &str, status: &str, persona: Option<&str>) -> Result<MovedGoal> {
         move_goal(self.storage(), id.to_owned(), status.to_owned(), persona)
     }
@@ -188,12 +212,22 @@ impl Compass {
         show(self.storage(), id.to_owned())
     }
 
-    pub fn prioritize(&self, higher: &str, lower: &str) -> Result<PriorityChange> {
-        prioritize(self.storage(), higher.to_owned(), lower.to_owned())
+    pub fn prioritize(
+        &self,
+        higher: &str,
+        lower: &str,
+        persona: Option<&str>,
+    ) -> Result<PriorityChange> {
+        prioritize(self.storage(), higher.to_owned(), lower.to_owned(), persona)
     }
 
-    pub fn deprioritize(&self, higher: &str, lower: &str) -> Result<PriorityChange> {
-        deprioritize(self.storage(), higher.to_owned(), lower.to_owned())
+    pub fn deprioritize(
+        &self,
+        higher: &str,
+        lower: &str,
+        persona: Option<&str>,
+    ) -> Result<PriorityChange> {
+        deprioritize(self.storage(), higher.to_owned(), lower.to_owned(), persona)
     }
 
     pub fn resolve(&self, prefix: &str) -> Result<Id> {
@@ -683,6 +717,102 @@ fn note_supersedes<P: TriblePattern>(space: &P, note_id: Id) -> Vec<Id> {
     predecessors.sort();
     predecessors.dedup();
     predecessors
+}
+
+fn render_priorities<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    status_register: &LwwQuery,
+    status_filter: &[String],
+    tag_filter: &[String],
+    show_done: bool,
+) -> Result<Board> {
+    let goals = all_goal_ids(space);
+    let explicit = compass::active_priority_edges(space);
+    let edges = compass::goal_priority_edges(space);
+    let ranks = compass::priority_ranks(goals.iter().copied(), &edges);
+    let notes = compass::priority_notes(space, goals.iter().copied(), &edges);
+    let text_handle = crate::schemas::compass::text_handle;
+    let mut selected = BTreeSet::new();
+    for &goal in &goals {
+        let status = latest_status_event(space, status_register, goal)
+            .map(|(_, status, _)| status)
+            .unwrap_or_else(|| text_handle("todo"));
+        if status_filter.is_empty() {
+            if !show_done && status == text_handle("done") {
+                continue;
+            }
+        } else if !status_filter.iter().any(|s| text_handle(s) == status) {
+            continue;
+        }
+        if !tag_filter.is_empty()
+            && !tag_filter
+                .iter()
+                .any(|tag| exists!(pattern!(space, [{ goal @ board::tag: tag.as_str() }])))
+        {
+            continue;
+        }
+        selected.insert(goal);
+    }
+
+    let mut text = String::from(
+        "Priority layers use the full board, including filtered goals.\n\
+         Goals within an acyclic layer are incomparable; different layers can also be incomparable.\n\
+         Direct relations below are the ordering evidence. ID order within a layer is display only.\n\
+         Goals on or below a cycle share the final layer; see diagnostics.\n",
+    );
+    // Only ids and graph ranks are sorted; goal payloads are read at rendering.
+    let mut ordered: Vec<_> = selected.iter().copied().collect();
+    ordered.sort_by_key(|goal| (ranks[goal], *goal));
+    let mut layer = None;
+    for goal in ordered {
+        let rank = ranks[&goal];
+        if layer != Some(rank) {
+            writeln!(text, "\n== LAYER {} ==", rank + 1)?;
+            layer = Some(rank);
+        }
+        let status = latest_status_event(space, status_register, goal)
+            .map(|(_, status, _)| status)
+            .unwrap_or_else(|| text_handle("todo"));
+        writeln!(
+            text,
+            "- [{goal:x}] {} ({})",
+            task_title(reader, space, goal)?,
+            word(reader, status, &DEFAULT_STATUSES)?
+        )?;
+    }
+    if selected.is_empty() {
+        writeln!(text, "\nNo matching goals.")?;
+    }
+    writeln!(
+        text,
+        "\nDirect relations (higher > lower; * = outside selection):"
+    )?;
+    let mut any = false;
+    for &(higher, lower) in &edges {
+        if !selected.contains(&higher) && !selected.contains(&lower) {
+            continue;
+        }
+        let structural = exists!(pattern!(space, [{
+            higher @ metadata::tag: &KIND_GOAL_ID, board::parent: &lower
+        }, { lower @ metadata::tag: &KIND_GOAL_ID }]));
+        let kind = match (explicit.contains(&(higher, lower)), structural) {
+            (true, true) => "explicit + child-before-parent",
+            (true, false) => "explicit",
+            _ => "child-before-parent",
+        };
+        writeln!(
+            text,
+            "- [{higher:x}]{} > [{lower:x}]{} ({kind})",
+            if selected.contains(&higher) { "" } else { "*" },
+            if selected.contains(&lower) { "" } else { "*" }
+        )?;
+        any = true;
+    }
+    if !any {
+        writeln!(text, "(none touching selected goals)")?;
+    }
+    Ok(Board { text, notes })
 }
 
 fn render_board<P: TriblePattern>(
@@ -1310,11 +1440,12 @@ fn prioritize(
     storage: CompassStorage<'_>,
     higher_input: String,
     lower_input: String,
+    persona: Option<&str>,
 ) -> Result<PriorityChange> {
     storage.update(
-        None,
+        persona,
         &[],
-        |space, reader, _, _| {
+        |space, reader, by_id, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
             let lower_id = resolve_task_id(&lower_input, space)?;
 
@@ -1351,11 +1482,12 @@ fn prioritize(
                 task_title(reader, space, higher_id)?,
                 task_title(reader, space, lower_id)?,
                 plan,
+                by_id,
             ))
         },
-        |(higher_id, lower_id, higher_title, lower_title, plan)| {
+        |(higher_id, lower_id, higher_title, lower_title, plan, by_id)| {
             let mut change = compass::kind_catalog_fragment();
-            let (record, event) = author_priority(plan, higher_id, clock::point_now()?);
+            let (record, event) = author_priority(plan, higher_id, clock::point_now()?, by_id);
             change += record;
             Ok((
                 Some(change),
@@ -1415,13 +1547,19 @@ fn priority_plan<P: TriblePattern>(
 }
 
 /// The facts of a planned priority write, and the new snapshot's id.
-fn author_priority(plan: PriorityPlan, goal: Id, at: IntervalValue) -> (Fragment, Id) {
+fn author_priority(
+    plan: PriorityPlan,
+    goal: Id,
+    at: IntervalValue,
+    by: Option<Id>,
+) -> (Fragment, Id) {
     let mut fragment = Fragment::empty();
     let mut over = BTreeSet::new();
     for (lower, current) in plan.over {
         if current.is_empty() {
             let (bottom, snapshot) = compass::priority_snapshot_fragment(lower, [], at);
             fragment += bottom;
+            fragment += entity! { snapshot @ board::by?: by.as_ref() };
             over.insert(snapshot);
         } else {
             over.extend(current);
@@ -1429,6 +1567,8 @@ fn author_priority(plan: PriorityPlan, goal: Id, at: IntervalValue) -> (Fragment
     }
     let (record, snapshot) = compass::priority_snapshot_fragment(goal, over, at);
     fragment += record;
+    // Authorship annotates the snapshot; it never changes the identity core.
+    fragment += entity! { snapshot @ board::by?: by.as_ref() };
     (fragment, snapshot)
 }
 
@@ -1436,11 +1576,12 @@ fn deprioritize(
     storage: CompassStorage<'_>,
     higher_input: String,
     lower_input: String,
+    persona: Option<&str>,
 ) -> Result<PriorityChange> {
     storage.update(
-        None,
+        persona,
         &[],
-        |space, reader, _, _| {
+        |space, reader, by_id, _| {
             let higher_id = resolve_task_id(&higher_input, space)?;
             let lower_id = resolve_task_id(&lower_input, space)?;
 
@@ -1455,11 +1596,12 @@ fn deprioritize(
                 task_title(reader, space, higher_id)?,
                 task_title(reader, space, lower_id)?,
                 priority_plan(space, higher_id, None, Some(lower_id)),
+                by_id,
             ))
         },
-        |(higher_id, lower_id, higher_title, lower_title, plan)| {
+        |(higher_id, lower_id, higher_title, lower_title, plan, by_id)| {
             let mut change = compass::kind_catalog_fragment();
-            let (record, event) = author_priority(plan, higher_id, clock::point_now()?);
+            let (record, event) = author_priority(plan, higher_id, clock::point_now()?, by_id);
             change += record;
             Ok((
                 Some(change),
@@ -1729,6 +1871,43 @@ mod tests {
         assert_eq!(store.requested, vec![title.transmute()]);
         assert!(!view.store_snapshot().contains_blob(title).unwrap());
         assert_eq!(store.snapshot().unwrap().wants().unwrap().count(), 0);
+    }
+
+    #[test]
+    fn priorities_do_not_acquire_hidden_relation_endpoint_titles() {
+        let (mut fragment, parent) =
+            compass::goal_fragment("hidden parent", vec![], None, point(1.0)).unwrap();
+        let (child, selected) = compass::goal_fragment(
+            "selected child",
+            vec!["shown".to_owned()],
+            Some(parent),
+            point(2.0),
+        )
+        .unwrap();
+        fragment += child;
+        let title = find!(handle: TextHandle,
+            pattern!(fragment.facts(), [{ selected @ board::title: ?handle }]))
+        .next()
+        .unwrap();
+        let (mut store, view, _, _) = sparse_view(fragment);
+        let output =
+            pollster::block_on(storage::read(&mut store, view.store_snapshot(), |reader| {
+                render_priorities(
+                    reader,
+                    view.facts(),
+                    view.status_register(),
+                    &[],
+                    &["shown".to_owned()],
+                    false,
+                )
+            }))
+            .unwrap();
+        assert!(output.text.contains("selected child"));
+        assert!(!output.text.contains("hidden parent"));
+        assert!(output.text.contains(&format!(
+            "[{selected:x}] > [{parent:x}]* (child-before-parent)"
+        )));
+        assert_eq!(store.requested, vec![title.transmute()]);
     }
 
     #[test]
@@ -2380,9 +2559,9 @@ mod tests {
         let (_directory, storage) = raw_pile(fragment);
         let handle = CompassStorage { storage: &storage };
 
-        let change = prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
+        let change = prioritize(handle, format!("{a:x}"), format!("{b:x}"), None).unwrap();
         assert!(change.active);
-        let second = prioritize(handle, format!("{a:x}"), format!("{x:x}")).unwrap();
+        let second = prioritize(handle, format!("{a:x}"), format!("{x:x}"), None).unwrap();
         handle
             .with_view(|facts, _, _| {
                 assert!(!exists!(pattern!(facts, [{ _?event @
@@ -2401,7 +2580,7 @@ mod tests {
             })
             .unwrap();
 
-        let removed = deprioritize(handle, format!("{a:x}"), format!("{x:x}")).unwrap();
+        let removed = deprioritize(handle, format!("{a:x}"), format!("{x:x}"), None).unwrap();
         assert!(!removed.active);
         handle
             .with_view(|facts, _, _| {
@@ -2415,7 +2594,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert!(deprioritize(handle, format!("{a:x}"), format!("{x:x}")).is_err());
+        assert!(deprioritize(handle, format!("{a:x}"), format!("{x:x}"), None).is_err());
 
         let board = board(handle, vec![], vec![], false).unwrap();
         assert!(board.notes.is_empty(), "{:?}", board.notes);
@@ -2459,8 +2638,8 @@ mod tests {
         let (_directory, storage) = raw_pile(fragment);
         let handle = CompassStorage { storage: &storage };
 
-        prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
-        let flipped = prioritize(handle, format!("{b:x}"), format!("{a:x}")).unwrap();
+        prioritize(handle, format!("{a:x}"), format!("{b:x}"), None).unwrap();
+        let flipped = prioritize(handle, format!("{b:x}"), format!("{a:x}"), None).unwrap();
         assert_eq!((flipped.higher, flipped.lower), (b, a));
         handle
             .with_view(|facts, _, _| {
@@ -2479,7 +2658,7 @@ mod tests {
             board.text
         );
         // Flipping back is a flip too.
-        prioritize(handle, format!("{a:x}"), format!("{b:x}")).unwrap();
+        prioritize(handle, format!("{a:x}"), format!("{b:x}"), None).unwrap();
         handle
             .with_view(|facts, _, _| {
                 assert_eq!(
@@ -2523,12 +2702,12 @@ mod tests {
             })
             .unwrap();
 
-        let refused = prioritize(handle, format!("{b:x}"), format!("{a:x}")).unwrap_err();
+        let refused = prioritize(handle, format!("{b:x}"), format!("{a:x}"), None).unwrap_err();
         assert!(
             format!("{refused:#}").contains("priority cycle"),
             "{refused:#}"
         );
-        let refused = prioritize(handle, format!("{a:x}"), format!("{child:x}")).unwrap_err();
+        let refused = prioritize(handle, format!("{a:x}"), format!("{child:x}"), None).unwrap_err();
         assert!(
             format!("{refused:#}").contains("children are implicitly prioritized"),
             "{refused:#}"
@@ -2560,6 +2739,43 @@ mod tests {
             "{:?}",
             first.notes
         );
+        let priorities = Compass::with_storage(storage)
+            .priorities(ListOptions::default())
+            .unwrap();
+        assert_eq!(priorities.notes, first.notes);
+        assert!(priorities.text.contains(&format!("[{a:x}] alpha")));
+        assert!(priorities.text.contains(&format!("[{b:x}] beta")));
+        assert!(priorities
+            .text
+            .contains(&format!("[{a:x}] > [{b:x}] (explicit)")));
+        assert!(priorities
+            .text
+            .contains(&format!("[{b:x}] > [{a:x}] (explicit)")));
+    }
+
+    #[test]
+    fn priority_authorship_annotates_every_new_snapshot_without_changing_identity() {
+        let higher = genid().id;
+        let lower = genid().id;
+        let actor = genid().id;
+        let plan = || PriorityPlan {
+            over: BTreeMap::from([(lower, BTreeSet::new())]),
+        };
+        let (plain, plain_id) = author_priority(plan(), higher, point(1.0), None);
+        let (authored, authored_id) = author_priority(plan(), higher, point(1.0), Some(actor));
+        assert_eq!(plain_id, authored_id);
+        let plain_reading = compass::priority_reading(plain.facts());
+        assert_eq!(plain_reading, compass::priority_reading(authored.facts()));
+        for snapshots in plain_reading.current.values() {
+            for &snapshot in snapshots {
+                assert!(exists!(
+                    pattern!(authored.facts(), [{ snapshot @ board::by: &actor }])
+                ));
+            }
+        }
+        assert!(!exists!(
+            pattern!(plain.facts(), [{ _?snapshot @ board::by: _?actor }])
+        ));
     }
 
     /// Where no priorities are involved the board is exactly what it was,

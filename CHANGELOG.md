@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `compass priorities` and MCP `compass_priorities` show priority layers across
+  status columns and the direct relations behind them, distinguishing explicit
+  assertions from child-before-parent ordering. Filters select displayed goals
+  without discarding hidden ordering evidence; cycles retain their diagnostics.
+  Layers do not invent a total order. Priority writes now accept the acting
+  persona and annotate every authored snapshot without changing its identity.
+
 - Native applications can invoke the actual Faculty catalog with ordered resident
   output and the same bounded MCP error/cancellation policy. `orient_next` is a
   finite explicit-persona wait: observation steps release the existing shared

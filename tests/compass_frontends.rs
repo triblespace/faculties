@@ -457,19 +457,19 @@ fn direct_operations_return_action_ids_and_preserve_additive_semantics() {
         .unwrap();
     assert_eq!(noted.goal, parent.goal);
     assert_ne!(Some(noted.note), parent.note);
-    assert!(operations.prioritize(&parent_id, &child_id).is_err());
+    assert!(operations.prioritize(&parent_id, &child_id, None).is_err());
 
     let other = operations.add("Other", AddOptions::default()).unwrap();
     let other_id = format!("{:x}", other.goal);
-    let priority = operations.prioritize(&child_id, &other_id).unwrap();
+    let priority = operations.prioritize(&child_id, &other_id, None).unwrap();
     assert_eq!(
         (priority.higher, priority.lower, priority.active),
         (child.goal, other.goal, true)
     );
-    let removed = operations.deprioritize(&child_id, &other_id).unwrap();
+    let removed = operations.deprioritize(&child_id, &other_id, None).unwrap();
     assert!(!removed.active);
     assert_ne!(priority.event, removed.event);
-    assert!(operations.deprioritize(&child_id, &other_id).is_err());
+    assert!(operations.deprioritize(&child_id, &other_id, None).is_err());
 
     let show = operations.show(&parent_id).unwrap();
     assert!(show.contains("initial note"));
@@ -529,6 +529,14 @@ fn cli_mcp_and_direct_reads_agree() {
         operations.list(ListOptions::default()).unwrap()
     );
     assert_eq!(
+        fixture.cli(&["priorities"], None),
+        operations.priorities(ListOptions::default()).unwrap().text
+    );
+    assert_eq!(
+        call(&faculty, "compass_priorities", serde_json::json!({})),
+        operations.priorities(ListOptions::default()).unwrap().text
+    );
+    assert_eq!(
         fixture.cli(&["resolve", &id[..12]], None),
         format!("{id}\n")
     );
@@ -540,6 +548,138 @@ fn cli_mcp_and_direct_reads_agree() {
         ),
         format!("{id}\n")
     );
+}
+
+#[test]
+fn priority_layers_preserve_hidden_paths_and_distinguish_structural_edges() {
+    let fixture = Fixture::new();
+    let operations = fixture.operations();
+    let tags = vec!["selected".to_owned()];
+    let first = operations
+        .add(
+            "first",
+            AddOptions {
+                tags: &tags,
+                status: "doing",
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let hidden = operations
+        .add(
+            "hidden",
+            AddOptions {
+                status: "done",
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let last = operations
+        .add(
+            "last",
+            AddOptions {
+                tags: &tags,
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let unrelated = operations
+        .add(
+            "unrelated",
+            AddOptions {
+                tags: &tags,
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let parent_id = format!("{:x}", first.goal);
+    let child = operations
+        .add(
+            "child",
+            AddOptions {
+                tags: &tags,
+                parent: Some(&parent_id),
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    let hidden_id = format!("{:x}", hidden.goal);
+    let last_id = format!("{:x}", last.goal);
+    operations.prioritize(&parent_id, &hidden_id, None).unwrap();
+    operations.prioritize(&hidden_id, &last_id, None).unwrap();
+    operations
+        .prioritize(&format!("{:x}", child.goal), &parent_id, None)
+        .unwrap();
+    let before = fixture.snapshot().0;
+    let view = operations
+        .priorities(ListOptions {
+            tags: &tags,
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert!(view.notes.is_empty());
+    let layer1 = view
+        .text
+        .split("== LAYER 1 ==")
+        .nth(1)
+        .unwrap()
+        .split("== LAYER 2 ==")
+        .next()
+        .unwrap();
+    assert!(layer1.contains(&format!("[{:x}] child", child.goal)));
+    assert!(layer1.contains(&format!("[{:x}] unrelated", unrelated.goal)));
+    assert!(view
+        .text
+        .contains(&format!("== LAYER 2 ==\n- [{parent_id}] first (doing)")));
+    assert!(!view.text.contains("== LAYER 3 =="));
+    assert!(view
+        .text
+        .contains(&format!("== LAYER 4 ==\n- [{last_id}] last (todo)")));
+    assert!(!view.text.contains("] hidden (done)"));
+    assert!(view
+        .text
+        .contains(&format!("[{parent_id}] > [{hidden_id}]* (explicit)")));
+    assert!(view
+        .text
+        .contains(&format!("[{hidden_id}]* > [{last_id}] (explicit)")));
+    assert!(view.text.contains("(explicit + child-before-parent)"));
+    assert!(view
+        .text
+        .contains("different layers can also be incomparable"));
+    assert_eq!(
+        fixture.cli(&["priorities", "--tag", "selected"], None),
+        view.text
+    );
+    assert_eq!(
+        call(
+            &fixture.mcp(),
+            "compass_priorities",
+            serde_json::json!({"tags":["selected"]})
+        ),
+        view.text
+    );
+    assert_eq!(
+        before,
+        fixture.snapshot().0,
+        "priority reads append no source facts"
+    );
+    assert!(operations
+        .priorities(ListOptions {
+            all: true,
+            ..ListOptions::default()
+        })
+        .unwrap()
+        .text
+        .contains("] hidden (done)"));
+    let done = vec![" DONE ".to_owned()];
+    let view = operations
+        .priorities(ListOptions {
+            statuses: &done,
+            ..ListOptions::default()
+        })
+        .unwrap();
+    assert!(view.text.contains("] hidden (done)"));
+    assert!(!view.text.contains("] first (doing)"));
 }
 
 #[test]
@@ -660,6 +800,7 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
         [
             "compass_add",
             "compass_list",
+            "compass_priorities",
             "compass_move",
             "compass_note",
             "compass_show",
@@ -674,6 +815,7 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
         ("compass_add", r#"{"title":"ok","persona":true}"#),
         ("compass_list", r#"{"all":"true"}"#),
         ("compass_list", r#"{"tags":[1]}"#),
+        ("compass_priorities", r#"{"tags":[1]}"#),
         ("compass_move", r#"{"id":"x","status":1}"#),
         (
             "compass_note",
@@ -685,6 +827,10 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
         ),
         ("compass_show", r#"{"id":"x","key":"wrong"}"#),
         ("compass_prioritize", r#"{"higher":"x","over":[]}"#),
+        (
+            "compass_prioritize",
+            r#"{"higher":"x","over":"y","persona":true}"#,
+        ),
         ("compass_deprioritize", r#"{"higher":"x"}"#),
         (
             "compass_resolve",
@@ -749,6 +895,66 @@ fn explicit_mcp_persona_attributes_add_move_and_note_events() {
 }
 
 #[test]
+fn priority_writes_attribute_cli_and_mcp_snapshots() {
+    let fixture = Fixture::new();
+    let (actor, _, _, _) = mention_roster(&fixture);
+    let operations = fixture.operations();
+    let higher = operations.add("higher", AddOptions::default()).unwrap();
+    let lower = operations.add("lower", AddOptions::default()).unwrap();
+    let higher_id = format!("{:x}", higher.goal);
+    let lower_id = format!("{:x}", lower.goal);
+    fixture.cli(
+        &[
+            "--persona",
+            "ada",
+            "prioritize",
+            &higher_id,
+            "--over",
+            &lower_id,
+        ],
+        None,
+    );
+    let (facts, _) = fixture.snapshot();
+    let first = compass::priority_reading(&facts);
+    for snapshots in first.current.values() {
+        for &snapshot in snapshots {
+            assert!(exists!(
+                pattern!(&facts, [{ snapshot @ board::by: &actor }])
+            ));
+        }
+    }
+    call(
+        &fixture.mcp(),
+        "compass_deprioritize",
+        serde_json::json!({
+            "higher": higher_id, "over": lower_id, "persona": "ada"
+        }),
+    );
+    let (facts, _) = fixture.snapshot();
+    let removed = compass::priority_reading(&facts);
+    assert!(removed.edges.is_empty());
+    assert_ne!(first.current[&higher.goal], removed.current[&higher.goal]);
+    for &snapshot in &removed.current[&higher.goal] {
+        assert!(exists!(
+            pattern!(&facts, [{ snapshot @ board::by: &actor }])
+        ));
+    }
+    call(
+        &fixture.mcp(),
+        "compass_prioritize",
+        serde_json::json!({
+            "higher": higher_id, "over": lower_id, "persona": format!("{actor:x}")
+        }),
+    );
+    let (facts, _) = fixture.snapshot();
+    for &snapshot in &compass::priority_reading(&facts).current[&higher.goal] {
+        assert!(exists!(
+            pattern!(&facts, [{ snapshot @ board::by: &actor }])
+        ));
+    }
+}
+
+#[test]
 fn mcp_never_uses_ambient_persona_for_attribution() {
     if std::env::var_os("FACULTIES_COMPASS_PERSONA_CHILD").is_none() {
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -773,8 +979,31 @@ fn mcp_never_uses_ambient_persona_for_attribution() {
         "compass_add",
         serde_json::json!({"title":"unattributed","note":"literal"}),
     );
+    let higher = *compass::goal_ids(&fixture.snapshot().0)
+        .iter()
+        .next()
+        .unwrap();
+    let lower = fixture
+        .operations()
+        .add("other", AddOptions::default())
+        .unwrap()
+        .goal;
+    call(
+        &faculty,
+        "compass_prioritize",
+        serde_json::json!({
+            "higher": format!("{higher:x}"), "over": format!("{lower:x}")
+        }),
+    );
+    call(
+        &faculty,
+        "compass_deprioritize",
+        serde_json::json!({
+            "higher": format!("{higher:x}"), "over": format!("{lower:x}")
+        }),
+    );
     let (facts, _) = fixture.snapshot();
-    assert_eq!(compass::goal_ids(&facts).len(), 1);
+    assert_eq!(compass::goal_ids(&facts).len(), 2);
     assert!(!exists!(
         pattern!(&facts, [{ _?event @ board::by: _?actor }])
     ));

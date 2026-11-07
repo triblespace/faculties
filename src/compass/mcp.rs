@@ -23,6 +23,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"all":{"type":"boolean","default":false},"tags":{"type":"array","items":{"type":"string"},"default":[]},"statuses":{"type":"array","items":{"type":"string"},"default":[]}},"additionalProperties":false}"#,
     },
     Tool {
+        name: "compass_priorities",
+        description: "Show full-board priority layers and direct explicit/child-before-parent relations. Different layers can still contain incomparable goals. Filters select displayed goals, preserving hidden ordering evidence and off-filter relation endpoint ids; cycles remain visible with diagnostics.",
+        input_schema: r#"{"type":"object","properties":{"all":{"type":"boolean","default":false},"tags":{"type":"array","items":{"type":"string"},"default":[]},"statuses":{"type":"array","items":{"type":"string"},"default":[]}},"additionalProperties":false}"#,
+    },
+    Tool {
         name: "compass_move",
         description: "Append a status event to a goal.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"persona":{"type":"string","description":"Optional active Relations persona label or full id for cooperative attribution; never read from the server's PERSONA environment."}},"required":["id","status"],"additionalProperties":false}"#,
@@ -40,12 +45,12 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "compass_prioritize",
         description: "Assert one goal is more important than another; reject priority cycles and conflicts with child-before-parent ordering.",
-        input_schema: r#"{"type":"object","properties":{"higher":{"type":"string"},"over":{"type":"string"}},"required":["higher","over"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"higher":{"type":"string"},"over":{"type":"string"},"persona":{"type":"string","description":"Optional active Relations persona label or full id; never read from the server's PERSONA environment."}},"required":["higher","over"],"additionalProperties":false}"#,
     },
     Tool {
         name: "compass_deprioritize",
         description: "Append a retraction of an active explicit priority relationship.",
-        input_schema: r#"{"type":"object","properties":{"higher":{"type":"string"},"over":{"type":"string"}},"required":["higher","over"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"higher":{"type":"string"},"over":{"type":"string"},"persona":{"type":"string","description":"Optional active Relations persona label or full id; never read from the server's PERSONA environment."}},"required":["higher","over"],"additionalProperties":false}"#,
     },
     Tool {
         name: "compass_resolve",
@@ -115,6 +120,7 @@ struct ShowArguments {
 struct PriorityArguments {
     higher: String,
     over: String,
+    persona: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -171,6 +177,17 @@ impl Faculty for Compass {
                     output,
                 )
             }
+            "compass_priorities" => {
+                let args: ListArguments = decode_arguments(arguments)?;
+                render::board(
+                    &self.operations.priorities(ListOptions {
+                        statuses: &args.statuses,
+                        tags: &args.tags,
+                        all: args.all,
+                    })?,
+                    output,
+                )
+            }
             "compass_move" => {
                 let args: MoveArguments = decode_arguments(arguments)?;
                 render::moved(
@@ -201,14 +218,22 @@ impl Faculty for Compass {
             "compass_prioritize" => {
                 let args: PriorityArguments = decode_arguments(arguments)?;
                 render::prioritized(
-                    &self.operations.prioritize(&args.higher, &args.over)?,
+                    &self.operations.prioritize(
+                        &args.higher,
+                        &args.over,
+                        args.persona.as_deref(),
+                    )?,
                     output,
                 )
             }
             "compass_deprioritize" => {
                 let args: PriorityArguments = decode_arguments(arguments)?;
                 render::prioritized(
-                    &self.operations.deprioritize(&args.higher, &args.over)?,
+                    &self.operations.deprioritize(
+                        &args.higher,
+                        &args.over,
+                        args.persona.as_deref(),
+                    )?,
                     output,
                 )
             }

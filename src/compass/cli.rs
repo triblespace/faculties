@@ -33,7 +33,7 @@ pub struct Cli {
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
     /// Acting persona (relations label or 32-char hex id). When set,
-    /// status and note events record who made them — the audit trail gains the
+    /// status, note, and priority events record who made them — the audit trail gains the
     /// actor, and `orient wait` watchers can absorb their own edits.
     #[arg(long, env = "PERSONA")]
     persona: Option<String>,
@@ -70,6 +70,17 @@ enum Command {
         #[arg(long)]
         all: bool,
         /// Filter by tag (repeatable, shows goals matching any)
+        #[arg(long)]
+        tag: Vec<String>,
+        #[arg(value_name = "STATUS")]
+        status: Vec<String>,
+    },
+    /// Show priority layers and explicit/child-before-parent relations
+    Priorities {
+        /// Show done goals too; hidden goals still contribute ordering evidence
+        #[arg(long)]
+        all: bool,
+        /// Filter displayed goals by tag (repeatable, matching any)
         #[arg(long)]
         tag: Vec<String>,
         #[arg(value_name = "STATUS")]
@@ -170,6 +181,14 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             })?,
             output,
         ),
+        Command::Priorities { status, tag, all } => render::board(
+            &compass.priorities(ListOptions {
+                statuses: &status,
+                tags: &tag,
+                all,
+            })?,
+            output,
+        ),
         Command::Move { id, status } => {
             render::moved(&compass.move_goal(&id, &status, persona)?, output)
         }
@@ -195,10 +214,10 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
         }
         Command::Show { id } => output.text(compass.show(&id)?),
         Command::Prioritize { higher, over } => {
-            render::prioritized(&compass.prioritize(&higher, &over)?, output)
+            render::prioritized(&compass.prioritize(&higher, &over, persona)?, output)
         }
         Command::Deprioritize { higher, over } => {
-            render::prioritized(&compass.deprioritize(&higher, &over)?, output)
+            render::prioritized(&compass.deprioritize(&higher, &over, persona)?, output)
         }
         Command::Resolve { prefix } => output.line(format!("{:x}", compass.resolve(&prefix)?)),
     }
