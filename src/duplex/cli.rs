@@ -93,13 +93,13 @@ struct RunArgs {
     voice_prompt: PathBuf,
     /// Text tokenizer file, overriding the copy inside `--weights`.
     ///
-    /// Needed because the two halves of the weight pile drifted apart: the
-    /// codec loader wants a `mary-model-bundles` collection and the pile-side
-    /// SPM loader still wants the `mary-model-graph` the bundle migration
-    /// replaced, so no pile on this machine satisfies both. Whatever is loaded
-    /// is checked against the model's own `TEXT_CARD` below, so a wrong
-    /// tokenizer is a loud failure rather than gibberish. `mary`'s own
-    /// PersonaPlex bins take the same flag.
+    /// The codec, the model and the pile-side SPM loader all read the weight
+    /// pile's one `models` collection, so this is an override, not a repair
+    /// (it was needed while the codec read `mary-model-bundles` and the SPM
+    /// loader `mary-model-graph`, which no pile satisfied together).
+    /// Whatever is loaded is checked against the model's own `TEXT_CARD`
+    /// below, so a wrong tokenizer is a loud failure rather than
+    /// gibberish. `mary`'s own PersonaPlex bins take the same flag.
     #[arg(long, env = "PERSONAPLEX_SPM")]
     spm: Option<PathBuf>,
     /// Base URL of the Soma that owns the microphone. This process opens no

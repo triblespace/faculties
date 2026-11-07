@@ -3,7 +3,7 @@
 //! (`crate::wemm`).
 //!
 //! The nomic models live in the working pile itself, as roots of its
-//! `mary-model-graph` collection, and replication carries them to every
+//! `models` collection, and replication carries them to every
 //! machine (JP, 2026-09-13: "I wouldn't load it from a separate pile, I'd just
 //! put it into self.pile because it's small enough and then let replication
 //! take care of the rest"; and: "let's not fall back to a model directory, we
@@ -52,21 +52,28 @@ fn select_weights<R: BlobStoreGet>(
 ) -> Result<std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>> {
     for quantization in NOMIC_QUANTIZATIONS {
         let roots = mary::selection::matching_model_roots_acquiring(
-            snapshot.facts(), snapshot.store(),
-            ModelSelector::Source { source, quantization },
+            snapshot.facts(),
+            snapshot.store(),
+            ModelSelector::Source {
+                source,
+                quantization,
+            },
         )?;
         if roots.is_empty() {
             continue;
         }
-        return mary::selection::load_keymap_for_roots(
-            snapshot.facts(), snapshot.store(), &roots,
-        ).with_context(|| format!(
-            "select {quantization} {source} weights from {}", pile.display(),
-        ));
+        return mary::selection::load_keymap_for_roots(snapshot.facts(), snapshot.store(), &roots)
+            .with_context(|| {
+                format!(
+                    "select {quantization} {source} weights from {}",
+                    pile.display(),
+                )
+            });
     }
     Err(anyhow!(
         "{} carries no {source} root labelled {} (pack it in with nomic_pack --append)",
-        pile.display(), NOMIC_QUANTIZATIONS.join(" or "),
+        pile.display(),
+        NOMIC_QUANTIZATIONS.join(" or "),
     ))
 }
 
@@ -77,7 +84,9 @@ fn select_weights<R: BlobStoreGet>(
 /// rather than adding a compatibility path to ordinary inference.
 pub fn load_text_embedder() -> Result<mary::embed::NomicTextEmbedder<mary::nn::backend::B>> {
     let pile = working_pile()?;
-    crate::model_storage::with_snapshot(&pile, NOMIC_TEXT_MODEL, |snapshot| text_embedder_from(snapshot, &pile))
+    crate::model_storage::with_snapshot(&pile, NOMIC_TEXT_MODEL, |snapshot| {
+        text_embedder_from(snapshot, &pile)
+    })
 }
 
 fn text_embedder_from<R: BlobStoreGet>(
@@ -132,27 +141,37 @@ mod tests {
     #[test]
     fn preferred_quantization_never_falls_back_after_a_label_read_failure() {
         use triblespace::core::blob::{Blob, IntoBlob};
-        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionStoreExt,
+        };
         use triblespace::core::repo::memoryrepo::MemoryRepo;
         let mut repo = MemoryRepo::default();
         let key = SigningKey::from_bytes(&[37; 32]);
-        let collection = repo.collection(
-            mary::model_collection::mary_model_graph_name(),
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(key.verifying_key()),
-                AdmissionPolicy::direct(key.verifying_key()),
-            ),
-        ).unwrap();
+        let collection = repo
+            .collection(
+                mary::model_collection::model_collection_name(),
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(key.verifying_key()),
+                    AdmissionPolicy::direct(key.verifying_key()),
+                ),
+            )
+            .unwrap();
         let native = weight_fragment(NOMIC_TEXT_MODEL, "native.weight", 1.0);
         repo.commit(collection, &key, native).unwrap();
         let absent: Blob<UTF8String> = "an unread packed-model label".to_owned().to_blob();
-        repo.commit(collection, &key, entity! {
-            attrs::source: absent.get_handle(),
-            attrs::quantization: NOMIC_QUANTIZATIONS[0],
-            attrs::member: fucid(),
-        }).unwrap();
+        repo.commit(
+            collection,
+            &key,
+            entity! {
+                attrs::source: absent.get_handle(),
+                attrs::quantization: NOMIC_QUANTIZATIONS[0],
+                attrs::member: fucid(),
+            },
+        )
+        .unwrap();
         let frozen = repo.snapshot().unwrap();
-        let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(&frozen).unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_acquiring_in(&frozen).unwrap();
         let error = select_weights(&snapshot, NOMIC_TEXT_MODEL, Path::new("fixture")).unwrap_err();
         assert!(
             format!("{error:#}").contains("read source label"),
@@ -162,7 +181,8 @@ mod tests {
         // is now justified without changing the collection's records.
         repo.put::<UTF8String, _>(absent).unwrap();
         let available = repo.snapshot().unwrap();
-        let snapshot = mary::model_collection::snapshot_model_collection_acquiring_in(&available).unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_acquiring_in(&available).unwrap();
         assert!(select_weights(&snapshot, NOMIC_TEXT_MODEL, Path::new("fixture")).is_ok());
     }
 
@@ -220,9 +240,8 @@ mod tests {
             .expect("publish fixture root fragment");
         for (index, fragment) in fragments.enumerate() {
             let signer = SigningKey::from_bytes(&[0x31 + index as u8; 32]);
-            let collection =
-                mary::model_collection::model_graph_collection_or_create(&mut pile, &root)
-                    .expect("open synthetic model policy collection");
+            let collection = mary::model_collection::model_collection_or_create(&mut pile, &root)
+                .expect("open synthetic model policy collection");
             triblespace::core::collection::grant_collection_write(
                 &mut pile,
                 collection.handle(),

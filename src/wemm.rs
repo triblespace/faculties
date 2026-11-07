@@ -13,7 +13,7 @@
 
 use crate::out::Out;
 use crate::storage::{AcquiringReader, FacultyStore};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::qwen3_5::input_codec::InputCodec;
 use mary::models::qwen3_5::native::{device_identity, Assets, NativeWemm};
@@ -96,14 +96,7 @@ impl Session {
         let backing = backing(&model)?;
         distinct_files(&backing, writable)?;
         let source = mary::persist::read_model_pile_read_only(&model)?;
-        let [contributing] = source.collections.as_slice() else {
-            bail!(
-                "{} holds {} model collections; the WeMM pile holds one",
-                model.display(),
-                source.collections.len()
-            );
-        };
-        let collection = contributing.collection;
+        let collection = source.collection;
         let selected =
             mary::model_collection::snapshot_model_collection_for(&source.store, collection)?;
         anyhow::ensure!(
