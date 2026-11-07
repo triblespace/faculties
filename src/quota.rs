@@ -18,6 +18,7 @@
 //! the quota and never mistaken for a measurement of ours.
 
 pub mod cli;
+pub mod history;
 pub mod mcp;
 pub mod operations;
 pub mod render;

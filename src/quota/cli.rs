@@ -65,6 +65,16 @@ enum Command {
         #[arg(long)]
         host: Option<String>,
     },
+    /// Export all recorded quota observations as JSON in [since, until).
+    /// Readings are not consumption totals; gaps and resets remain explicit.
+    History {
+        /// Inclusive observation time, Unix seconds.
+        #[arg(long)]
+        since: i64,
+        /// Exclusive observation time, Unix seconds.
+        #[arg(long)]
+        until: i64,
+    },
     /// Show the latest reading per provider, account, window and bucket, and
     /// the latest reading of each provider's own status page.
     Show {
@@ -128,6 +138,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 bail!("status page unreadable for {failed}; nothing recorded for {failed}");
             }
             Ok(())
+        }
+        Command::History { since, until } => {
+            super::history::show_json(&operations.history(since, until)?, output)
         }
         Command::Show { json } => {
             let view = operations.show()?;

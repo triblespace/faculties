@@ -107,8 +107,11 @@ struct Derived {
     stale: bool,
     /// Present only when exactly one reset time is recorded.
     elapsed: Option<f64>,
+    remaining_seconds: Option<i64>,
     /// Present only when exactly one used value and one reset time exist.
     pace: Option<Pace>,
+    /// Used minus elapsed, only for an unexpired, unambiguous window.
+    pace_delta: Option<f64>,
 }
 
 fn derive(now: i128, group: &QuotaGroup) -> Derived {
@@ -122,11 +125,65 @@ fn derive(now: i128, group: &QuotaGroup) -> Derived {
         ([used], [resets]) => Some(quota::pace(now, *used, *resets, window)),
         _ => None,
     };
+    let remaining_seconds = match group.resets_at.as_slice() {
+        [resets] => Some(
+            i64::try_from(resets.saturating_sub(now).max(0) / NANOS_PER_SECOND).unwrap_or(i64::MAX),
+        ),
+        _ => None,
+    };
+    let pace_delta = match (group.used_percent.as_slice(), elapsed, pace) {
+        ([used], Some(elapsed), Some(verdict)) if verdict != Pace::Reset => Some(used - elapsed),
+        _ => None,
+    };
     Derived {
         age_seconds,
         stale: age_seconds > STALE_AFTER_SECONDS,
         elapsed,
+        remaining_seconds,
         pace,
+        pace_delta,
+    }
+}
+
+fn remaining_percent(used: f64) -> f64 {
+    (100.0 - used).max(0.0)
+}
+
+fn quota_summary(group: &QuotaGroup) -> String {
+    joined(&group.used_percent, |used| {
+        format!(
+            "{} remaining ({} used)",
+            format_percent(remaining_percent(*used)),
+            format_percent(*used),
+        )
+    })
+}
+
+fn window_summary(derived: &Derived) -> String {
+    match (derived.elapsed, derived.remaining_seconds) {
+        (Some(elapsed), Some(seconds)) => {
+            let left = if seconds >= 86_400 {
+                format!("{}d{:02}h", seconds / 86_400, seconds % 86_400 / 3_600)
+            } else {
+                format_age(seconds)
+            };
+            format!(
+                "{} remaining ({} elapsed; {left} left)",
+                format_percent(100.0 - elapsed),
+                format_percent(elapsed),
+            )
+        }
+        _ => "remaining unknown".to_owned(),
+    }
+}
+
+fn pace_summary(derived: &Derived) -> String {
+    match (derived.pace, derived.pace_delta) {
+        (Some(pace), Some(delta)) => {
+            format!("{delta:+.2} pp vs even usage ({})", pace.label())
+        }
+        (Some(pace), None) => pace.label().to_owned(),
+        _ => "no verdict".to_owned(),
     }
 }
 
@@ -168,7 +225,8 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
         view.groups.len()
     ))?;
     output.line(format!(
-        "pace is a planning heuristic relative to the window: used% against elapsed% of it, \
+        "pace is a planning heuristic: signed percentage points (pp) = used% minus elapsed%, \
+         positive means faster usage than an even pace, negative means slower; \
          under/over pace when they differ by more than {PACE_MARGIN_POINTS} points, otherwise \
          on pace. age is the age of the last recorded observation; STALE after {}h.",
         STALE_AFTER_SECONDS / 3_600
@@ -178,24 +236,16 @@ pub fn show(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
     }
     for group in &view.groups {
         let derived = derive(view.now, group);
-        let elapsed = derived
-            .elapsed
-            .map(|value| format!("{value:.0}%"))
-            .unwrap_or_else(|| "missing".to_owned());
-        let pace = derived
-            .pace
-            .map(|pace| pace.label())
-            .unwrap_or("no verdict");
         let stale = if derived.stale { " STALE" } else { "" };
         output.line(format!(
-            "{} {}{} acct {}: used {}, elapsed {}, {}; age {}{}; resets {}; host {}",
+            "{} {}{} acct {}: quota {}; window {}; pace {}; age {}{}; resets {}; host {}",
             provider_label(&group.provider_name, group.provider),
             format_window(group.window_secs),
             bucket_label(group.bucket.as_deref()),
             short_account(&group.account),
-            joined(&group.used_percent, |used| format_percent(*used)),
-            elapsed,
-            pace,
+            quota_summary(group),
+            window_summary(&derived),
+            pace_summary(&derived),
             format_age(derived.age_seconds),
             stale,
             joined(&group.resets_at, |at| format_instant(
@@ -322,16 +372,14 @@ pub fn section(view: &QuotaView) -> String {
             String::new()
         };
         text.push_str(&format!(
-            "- {} {}{}{}: used {}, {}; age {}{}; resets {}\n",
+            "- {} {}{}{}: quota {}; window {}; pace {}; age {}{}; resets {}\n",
             provider_label(&group.provider_name, group.provider),
             format_window(group.window_secs),
             bucket_label(group.bucket.as_deref()),
             account,
-            joined(&group.used_percent, |used| format_percent(*used)),
-            derived
-                .pace
-                .map(|pace| pace.label())
-                .unwrap_or("no verdict"),
+            quota_summary(group),
+            window_summary(&derived),
+            pace_summary(&derived),
             format_age(derived.age_seconds),
             if derived.stale { " STALE" } else { "" },
             joined(&group.resets_at, |at| format_instant(
@@ -367,6 +415,11 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
                 .map(|at| quota::tai_ns_to_unix(*at))
                 .collect();
             let resets_text: Vec<String> = resets.iter().map(|at| format_instant(*at)).collect();
+            let remaining: Vec<f64> = group
+                .used_percent
+                .iter()
+                .map(|used| remaining_percent(*used))
+                .collect();
             json!({
                 "event": format!("{:x}", group.event),
                 "provider": provider_label(&group.provider_name, group.provider),
@@ -375,7 +428,11 @@ pub fn show_json(view: &QuotaView, output: &mut Out<'_>) -> Result<()> {
                 "window_secs": group.window_secs,
                 "bucket": group.bucket,
                 "used_percent": one_or_many(&group.used_percent),
+                "remaining_percent": one_or_many(&remaining),
                 "elapsed_percent": derived.elapsed,
+                "window_remaining_percent": derived.elapsed.map(|elapsed| 100.0 - elapsed),
+                "window_remaining_secs": derived.remaining_seconds,
+                "pace_delta_points": derived.pace_delta,
                 "pace": derived.pace.map(Pace::label),
                 "observed_at": quota::tai_ns_to_unix(group.observed),
                 "age_secs": derived.age_seconds,
@@ -492,14 +549,73 @@ mod tests {
         assert_eq!(
             text,
             "Quota:\n\
-             - claude 5h: used 9%, under pace; age 1m; resets 2026-10-25 01:57 UTC = Sun \
+             - claude 5h: quota 91% remaining (9% used); window 40% remaining \
+             (60% elapsed; 2h00m left); pace -51.00 pp vs even usage (under pace); \
+             age 1m; resets 2026-10-25 01:57 UTC = Sun \
              2026-10-25 02:57 CET\n\
-             - codex 7d bucket codex_other: used 64%, over pace; age 7h00m STALE; resets \
+             - codex 7d bucket codex_other: quota 36% remaining (64% used); window \
+             71.43% remaining (28.57% elapsed; 5d00h left); pace +35.43 pp vs even usage \
+             (over pace); age 7h00m STALE; resets \
              2026-10-29 23:57 UTC = Fri 2026-10-30 00:57 CET\n",
             "{text}"
         );
         view.groups[1].account = "f0e1d2c3".to_owned();
-        assert!(section(&view).contains("- claude 5h acct a1b2c3d4: used 9%"));
+        assert!(section(&view).contains("- claude 5h acct a1b2c3d4: quota 91% remaining (9% used)"));
+        let mut json_text = String::new();
+        show_json(
+            &view,
+            &mut Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    json_text.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(&json_text).unwrap();
+        let first = &document["groups"][0];
+        assert_eq!(first["used_percent"], 9.0);
+        assert_eq!(first["remaining_percent"], 91.0);
+        assert_eq!(first["elapsed_percent"], 60.0);
+        assert_eq!(first["window_remaining_percent"], 40.0);
+        assert_eq!(first["window_remaining_secs"], 7200);
+        assert_eq!(first["pace_delta_points"], -51.0);
+        assert_eq!(first["pace"], "under pace");
+        assert_eq!(document["groups"][1]["stale"], true);
+
+        // An expired reading remains visible, but cannot describe current pace.
+        view.groups[0].resets_at = vec![view.now];
+        let reset = derive(view.now, &view.groups[0]);
+        assert_eq!(reset.remaining_seconds, Some(0));
+        assert_eq!(reset.elapsed, Some(100.0));
+        assert_eq!(reset.pace_delta, None);
+        assert_eq!(pace_summary(&reset), "reset since observed");
+        assert!(section(&view)
+            .contains("window 0% remaining (100% elapsed; 0s left); pace reset since observed"));
+
+        // Keep an overage as reported; available allowance cannot be negative.
+        view.groups[0].used_percent = vec![104.5];
+        assert_eq!(quota_summary(&view.groups[0]), "0% remaining (104.5% used)");
+
+        // Do not pick a winner or invent a pace for missing/repeated values.
+        view.groups[0].resets_at.clear();
+        let missing = derive(view.now, &view.groups[0]);
+        assert_eq!(window_summary(&missing), "remaining unknown");
+        assert_eq!(pace_summary(&missing), "no verdict");
+        view.groups[0].resets_at = vec![view.now + 100, view.now + 200];
+        assert_eq!(derive(view.now, &view.groups[0]).remaining_seconds, None);
+        view.groups[0].resets_at = vec![quota::unix_to_tai_ns(NOW + 7200)];
+        view.groups[0].used_percent = vec![9.0, 10.0];
+        assert_eq!(derive(view.now, &view.groups[0]).pace_delta, None);
+        assert_eq!(
+            quota_summary(&view.groups[0]),
+            "91% remaining (9% used)|90% remaining (10% used) (2 values)"
+        );
+        view.groups[0].used_percent = vec![60.0];
+        assert_eq!(
+            pace_summary(&derive(view.now, &view.groups[0])),
+            "+0.00 pp vs even usage (on pace)"
+        );
         view.groups.clear();
         assert_eq!(section(&view), "");
 

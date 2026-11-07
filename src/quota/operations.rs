@@ -197,6 +197,16 @@ impl Quota {
         })
     }
 
+    /// Read all matching observations, without collapsing reset windows or
+    /// selecting a latest value. Bounds are Unix seconds, [since, until).
+    pub fn history(&self, since: i64, until: i64) -> Result<super::history::HistoryView> {
+        anyhow::ensure!(since < until, "since must be before until");
+        self.storage.with_store(|pile, signer, runtime| {
+            let (facts, snapshot) = maintain_and_observe(&self.storage, pile, signer, runtime)?;
+            super::history::observe(&facts, &snapshot, since, until)
+        })
+    }
+
     pub fn show(&self) -> Result<QuotaView> {
         self.show_at(crate::clock::tai_nanoseconds_now()?)
     }
@@ -396,7 +406,7 @@ fn observe_statuses(
 }
 
 /// This build's name for a provider, else the name the pile carries for it.
-fn provider_name(
+pub(super) fn provider_name(
     facts: &FactArchive,
     snapshot: &AcquiringReader<FacultySnapshot>,
     provider: Id,
@@ -413,7 +423,7 @@ fn provider_name(
     }
 }
 
-fn read_text<Store>(reader: &Store, handle: TextHandle, what: &str) -> Result<String>
+pub(super) fn read_text<Store>(reader: &Store, handle: TextHandle, what: &str) -> Result<String>
 where
     Store: BlobStoreGet + ?Sized,
 {
@@ -431,16 +441,21 @@ fn maintain_and_observe(
     runtime: &Arc<tokio::runtime::Runtime>,
 ) -> Result<(FactArchive, AcquiringReader<FacultySnapshot>)> {
     let control = pile.read_control();
-    let source = if let (Some(control), Some(handle)) =
-        (control.clone(), storage.collection_handle(DEFAULT_SCOPE_ID)?)
-    {
+    let source = if let (Some(control), Some(handle)) = (
+        control.clone(),
+        storage.collection_handle(DEFAULT_SCOPE_ID)?,
+    ) {
         // The borrowed Orient caller must keep its one acquisition deadline
         // and cancellation through exact descriptor/proof reads too. The
         // frozen reader runs outside the shared store's short local borrow.
-        let reader = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime))
-            .with_control(control);
+        let reader =
+            AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime)).with_control(control);
         if storage.collection_routes().is_some() {
-            crate::collection_names::open_workspace_read_in(&reader, signer.verifying_key(), handle)?
+            crate::collection_names::open_workspace_read_in(
+                &reader,
+                signer.verifying_key(),
+                handle,
+            )?
         } else {
             crate::collection_names::open_exact_in(&reader, DEFAULT_SCOPE_ID, handle)?
         }
@@ -596,6 +611,87 @@ mod tests {
         assert_eq!(quota::tai_ns_to_unix(group.observed), NOW - 60);
         assert_eq!(group.resets_at.len(), 1);
         assert_eq!(quota::tai_ns_to_unix(group.resets_at[0]), NOW + 2 * HOUR);
+    }
+
+    #[test]
+    fn history_keeps_resets_and_buckets_and_uses_half_open_bounds() {
+        let fixture = fixture();
+        fixture
+            .quota
+            .record(reading(604_800, 10.0, NOW - 601))
+            .unwrap();
+        let first = fixture
+            .quota
+            .record(reading(604_800, 30.0, NOW - 600))
+            .unwrap();
+        let mut reset = reading(604_800, 1.0, NOW - 300);
+        reset.resets_at += 604_800;
+        let second = fixture.quota.record(reset).unwrap();
+        let mut other = reading(604_800, 80.0, NOW - 300);
+        other.bucket = Some("other".to_owned());
+        fixture.quota.record(other).unwrap();
+        fixture.quota.record(reading(604_800, 2.0, NOW)).unwrap();
+
+        let view = fixture.quota.history(NOW - 600, NOW).unwrap();
+        assert_eq!(view.observations, 3);
+        assert_eq!(view.rows.len(), 3);
+        assert_eq!(view.rows[0].event, first.event);
+        assert!(view.rows.iter().any(|row| row.event == second.event));
+        assert_eq!(
+            view.rows.iter().filter(|row| row.bucket.is_some()).count(),
+            1
+        );
+        assert_ne!(
+            view.rows[0].resets_at,
+            view.rows
+                .iter()
+                .find(|row| row.event == second.event)
+                .unwrap()
+                .resets_at
+        );
+        assert!(fixture.quota.history(NOW, NOW).is_err());
+        assert!(fixture.quota.history(NOW, NOW - 1).is_err());
+    }
+
+    #[test]
+    fn history_preserves_repeated_missing_and_unknown_attributes() {
+        let fixture = fixture();
+        let event = ufoid();
+        // Nonpoint timestamps are selected by their lower bound, just like
+        // the latest reader. The interval may extend past the requested end.
+        let observed: quota::IntervalValue = (
+            hifitime::Epoch::from_unix_seconds((NOW - 1) as f64),
+            hifitime::Epoch::from_unix_seconds((NOW + 60) as f64),
+        )
+            .try_to_inline()
+            .unwrap();
+        let fragment = entity! { &event @
+            metadata::tag: crate::schemas::quota::KIND_QUOTA_OBSERVATION,
+            attributes::provider: PROVIDER_CLAUDE,
+            attributes::account: "test-digest",
+            attributes::window: 604_800_000_000_000i128,
+            metadata::created_at: observed,
+            attributes::used_percent*: [10.0f64, 11.0],
+            attributes::resets_at*: [quota::unix_point(NOW + 60).unwrap(), quota::unix_point(NOW + 120).unwrap()],
+            attributes::bucket*: ["a", "b"],
+            metadata::name: "unknown annotation, deliberately ignored",
+        };
+        fixture
+            .quota
+            .storage
+            .with_store(|pile, signer, runtime| {
+                commit_quota(&fixture.quota.storage, pile, signer, fragment, runtime)
+            })
+            .unwrap();
+        let view = fixture.quota.history(NOW - 1, NOW).unwrap();
+        assert_eq!(view.observations, 1);
+        assert_eq!(view.rows.len(), 2);
+        for row in &view.rows {
+            assert_eq!(row.event, event.id);
+            assert_eq!(row.used_percent.len(), 2);
+            assert_eq!(row.resets_at.len(), 2);
+            assert!(row.host.is_empty());
+        }
     }
 
     #[test]
@@ -764,7 +860,7 @@ mod tests {
             "{text}"
         );
         let weekly = text.lines().find(|line| line.contains(" 7d ")).unwrap();
-        assert!(weekly.contains("used 40%"), "{text}");
+        assert!(weekly.contains("60% remaining (40% used)"), "{text}");
         assert!(weekly.contains("STALE"), "{text}");
         let five_hour = text.lines().find(|line| line.contains(" 5h ")).unwrap();
         assert!(!five_hour.contains("STALE"), "{text}");

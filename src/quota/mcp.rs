@@ -17,8 +17,13 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "quota_show",
-        description: "Show the latest reading per provider, account, window and bucket: used %, elapsed % of the window, a pace verdict (a planning heuristic with a 5-point margin), the age of the last recorded observation (STALE after 6 h, never dropped), and the reset time in UTC and Europe/Berlin. When any were recorded, also the latest reading of each provider's own public status page (the provider's claim, not a measurement; STALE after 1 h). States how many observations it examined.",
+        description: "Show the latest reading per provider, account, window and bucket: quota remaining/used %, window remaining/elapsed % and time left, signed pace in percentage points (used minus elapsed: positive is faster usage than an even pace, negative is slower; a planning heuristic with a 5-point margin), the age of the last recorded observation (STALE after 6 h, never dropped), and the reset time in UTC and Europe/Berlin. When any were recorded, also the latest reading of each provider's own public status page (the provider's claim, not a measurement; STALE after 1 h). States how many observations it examined.",
         input_schema: r#"{"type":"object","properties":{"json":{"type":"boolean","default":false}},"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "quota_history",
+        description: "Read all stored quota observations in the half-open observed-time interval [since, until), as JSON. Both bounds are Unix seconds. Keeps provider, account, window and bucket separate, preserves repeated recorded values, and does not interpolate missing history or fetch provider data.",
+        input_schema: r#"{"type":"object","properties":{"since":{"type":"integer"},"until":{"type":"integer"}},"required":["since","until"],"additionalProperties":false}"#,
     },
 ];
 
@@ -40,6 +45,13 @@ struct RecordArguments {
 struct ShowArguments {
     #[serde(default)]
     json: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryArguments {
+    since: i64,
+    until: i64,
 }
 
 pub struct Quota {
@@ -83,6 +95,11 @@ impl Faculty for Quota {
                 };
                 render::record(&self.operations.record(observation)?, output)
             }
+            "quota_history" => {
+                let args: HistoryArguments = decode_arguments(arguments)?;
+                let view = self.operations.history(args.since, args.until)?;
+                super::history::show_json(&view, output)
+            }
             "quota_show" => {
                 let args: ShowArguments = decode_arguments(arguments)?;
                 let view = self.operations.show()?;
@@ -94,5 +111,32 @@ impl Faculty for Quota {
             }
             other => bail!("Quota MCP has no tool {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_is_registered_and_rejects_reversed_bounds_before_storage() {
+        let adapter = Quota::new(PathBuf::from("unused.pile"), None);
+        assert!(adapter
+            .tools()
+            .iter()
+            .any(|tool| tool.name == "quota_history"));
+        let error = adapter
+            .call(
+                "quota_history",
+                Bytes::from(br#"{"since":200,"until":100}"#.to_vec()),
+                &mut Out::new(&mut |_| Ok(())),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("since must be before until"));
+        assert!(serde_json::from_str::<HistoryArguments>(r#"{"since":100}"#).is_err());
+        assert!(serde_json::from_str::<HistoryArguments>(
+            r#"{"since":100,"until":200,"pile":"elsewhere"}"#,
+        )
+        .is_err());
     }
 }
