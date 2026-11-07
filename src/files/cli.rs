@@ -110,7 +110,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "similar",
-        about: "Rank stored files by meaning against a file or a --text query, in the one WeMM space for text, images and documents (requires the wemm build, WEMM_PILE, WEMM_ASSETS and WEMM_ROOT)",
+        about: "Rank stored files by meaning against a file or a --text query, in the one WeMM space for text, images and documents (requires the wemm build and WEMM_ROOT naming the complete root in the models collection)",
         params: &[
             Param::caller("id", "Entity id/content hash or prefix; omit with --text")
                 .positional()
@@ -125,7 +125,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "index",
-        about: "Derive the WeMM index over every stored file's content, whoever saved it: images whole, text, HTML text and PDF text layers in windows, one model (requires the wemm build on a GB10, WEMM_PILE, WEMM_ASSETS and WEMM_ROOT). Resumable; prints the foundations still to derive",
+        about: "Derive the WeMM index over every stored file's content, whoever saved it: images whole, text, HTML text and PDF text layers in windows, one model (requires the wemm build on a GB10 and WEMM_ROOT naming the complete root in the models collection). Resumable; prints the foundations still to derive",
         params: &[],
     },
     Verb {

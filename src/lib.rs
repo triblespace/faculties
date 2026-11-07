@@ -81,7 +81,8 @@ pub mod message;
     feature = "local-embed",
     feature = "voice",
     feature = "imagine",
-    feature = "discord-hearing"
+    feature = "discord-hearing",
+    feature = "wemm"
 ))]
 mod model_storage;
 #[cfg(feature = "local-embed")]

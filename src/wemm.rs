@@ -5,11 +5,22 @@
 //! [`triblespace_search::semantic_wemm`], keyed by content handle, and join it
 //! at the point of use with `find!`.
 //!
-//! The model lives in its own pile, outside the working pile, named by
-//! `WEMM_PILE` together with its pinned assets (`WEMM_ASSETS`) and model root
-//! (`WEMM_ROOT`). Binding aliases that pile's mapped pages straight into CUDA,
-//! so the operator keeps its complete prefix unchanged until the process ends;
-//! the checks below are diagnostics, not proof of that.
+//! The model lives in the working pile's `models` collection, the exact
+//! descriptor `TRIBLESPACE_COLLECTION_MODELS` names, like every other model,
+//! and `WEMM_ROOT` names its complete root. Its tokenizer, configuration and
+//! chat template are part of that root ([`mary::ingest::RootParts`]) and are
+//! read from the same facts as the weights; there is no asset directory.
+//!
+//! Binding aliases the pile's mapped pages straight into CUDA, so those pages
+//! must not change until the process ends. A dedicated model pile met that by
+//! never being written. The working pile meets it by being append-only: every
+//! writer appends after the prefix this binding observed, a compaction writes
+//! a new file (renaming it over the path leaves this process's mapping on the
+//! old inode, intact, until it exits), and the one operation that shortens a
+//! pile in place, `trible pile amputate`, is a manual repair of a torn tail,
+//! which lies after any prefix a snapshot could observe. Nobody may run it, or
+//! truncate the file any other way, while a WeMM process is bound. The checks
+//! below are diagnostics, not proof of that.
 
 use crate::out::Out;
 use crate::storage::{AcquiringReader, FacultyStore};
@@ -22,7 +33,6 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use triblespace::core::blob::encodings::rawbytes::RawBytes;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
@@ -30,7 +40,7 @@ use triblespace::core::collection::{
     CollectionStoreExt, DeriveMapping,
 };
 use triblespace::core::inline::encodings::UnknownInline;
-use triblespace::core::repo::{BlobStoreGet, BlobStorePut, StoreRead};
+use triblespace::core::repo::StoreRead;
 use triblespace::core::trible::Fragment;
 use triblespace::prelude::*;
 use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
@@ -61,54 +71,62 @@ pub struct Session {
     identity: WemmIdentity,
     model: PathBuf,
     backing: BackingIdentity,
-    _source: mary::persist::ModelPileSource,
-    assets: [Blob<RawBytes>; 3],
-    descriptor: Blob<SimpleArchive>,
+    _source: mary::model_collection::ModelPileSnapshot,
+}
+
+/// Everything a binding needs that is decided on the CPU: the frozen model
+/// collection, the selected root, and the assets read from that root.
+pub struct Resolved {
+    pub snapshot: mary::model_collection::ModelPileSnapshot,
+    pub collection: Collection<SimpleArchive>,
+    pub root: Id,
+    pub assets: Assets,
+}
+
+/// Resolve the model `root` from the `models` collection `handle` of the pile
+/// at `pile`, with no device: open the pile read-only, freeze that exact
+/// collection, require the root to be stated by it, and read its tokenizer,
+/// configuration and chat template from its core (refused when it has none:
+/// a member-only root is not a complete WeMM model).
+pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolved> {
+    let snapshot = crate::model_storage::models_in(pile, handle)?;
+    let collection = Collection::<SimpleArchive>::open(snapshot.store(), handle)
+        .map_err(|error| anyhow::anyhow!("open the model collection: {error}"))?;
+    anyhow::ensure!(
+        find!((attribute: Id, value: Inline<UnknownInline>),
+            snapshot.facts().pattern::<UnknownInline>(root.to_inline(), attribute, value)
+        )
+        .next()
+        .is_some(),
+        "WEMM_ROOT {root:X} is not stated by the model collection of {}",
+        pile.display()
+    );
+    let assets = Assets::from_model_root(snapshot.facts(), snapshot.store(), root)
+        .map_err(anyhow::Error::msg)?;
+    Ok(Resolved {
+        snapshot,
+        collection,
+        root,
+        assets,
+    })
 }
 
 impl Session {
-    /// Bind the model `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT` name, for
-    /// indexes in the pile at `writable`. The model pile holds one model
-    /// collection, and that is the one selected.
-    pub fn from_env(writable: &Path) -> Result<Self> {
-        let path = |name: &str| {
-            std::env::var_os(name)
-                .map(PathBuf::from)
-                .with_context(|| format!("{name} is not set; it names the WeMM model"))
-        };
-        let model = path("WEMM_PILE")?;
-        let assets = path("WEMM_ASSETS")?;
+    /// Bind the model `WEMM_ROOT` names from the `models` collection of the
+    /// pile at `pile`, the pile its indexes are written to as well.
+    pub fn from_env(pile: &Path) -> Result<Self> {
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
-        let read = |name: &str| {
-            std::fs::read(assets.join(name))
-                .with_context(|| format!("read WeMM asset {}", assets.join(name).display()))
-        };
-        let (config, tokenizer, template) = (
-            read("config.json")?,
-            read("tokenizer.json")?,
-            read("chat_template.jinja")?,
-        );
-        let pinned =
-            Assets::from_bytes(&config, &tokenizer, &template).map_err(anyhow::Error::msg)?;
-        let codec = InputCodec::from_assets(&tokenizer, &template).map_err(anyhow::Error::msg)?;
+        let model = pile.to_path_buf();
         let backing = backing(&model)?;
-        distinct_files(&backing, writable)?;
-        let source = mary::persist::read_model_pile_read_only(&model)?;
-        let collection = source.collection;
-        let selected =
-            mary::model_collection::snapshot_model_collection_for(&source.store, collection)?;
-        anyhow::ensure!(
-            find!((attribute: Id, value: Inline<UnknownInline>),
-                selected.facts().pattern::<UnknownInline>(root.to_inline(), attribute, value)
-            )
-            .next()
-            .is_some(),
-            "WEMM_ROOT {root:X} is not stated by the model collection of {}",
-            model.display()
-        );
-        let descriptor: Blob<SimpleArchive> = source.store.get(collection.handle())?;
+        let Resolved {
+            snapshot,
+            root,
+            assets,
+            ..
+        } = resolve(&model, crate::model_storage::models_handle()?, root)?;
+        let codec: InputCodec = assets.codec().clone();
         let device = Default::default();
         let observed = device_identity(&device).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
@@ -118,15 +136,15 @@ impl Session {
         let mut aliases = CudaBf16Aliases::new(device, ROLES).map_err(anyhow::Error::msg)?;
         let started = std::time::Instant::now();
         let mut roles = 0usize;
-        // SAFETY: the operator who names WEMM_PILE keeps that dedicated,
-        // finished model pile's complete prefix unchanged until this process
-        // ends; nothing here writes, compacts or truncates it.
+        // SAFETY: the pile is append-only and is neither truncated nor
+        // rewritten in place while this process runs (module docs); every
+        // aliased leaf lies in the prefix `snapshot` observed.
         let native = unsafe {
             NativeWemm::from_frozen(
-                &source.facts,
-                &source.store,
+                snapshot.facts(),
+                snapshot.store(),
                 root,
-                pinned,
+                assets,
                 &mut aliases,
                 |_, _, _, _| {
                     roles += 1;
@@ -134,26 +152,9 @@ impl Session {
                 },
             )
         }?;
-        let handles = native.asset_handles();
-        let assets = [config, tokenizer, template].map(|bytes| Blob::<RawBytes>::new(bytes.into()));
-        anyhow::ensure!(
-            [
-                handles.config,
-                handles.tokenizer_json,
-                handles.chat_template
-            ] == assets.each_ref().map(Blob::get_handle),
-            "bound WeMM asset handles differ from the asset bytes read"
-        );
-        anyhow::ensure!(
-            self::backing(&model)? == backing,
-            "the WeMM model file changed while it was bound"
-        );
+        backing.require_still(&model)?;
         let identity = WemmIdentity {
-            model_collection: collection.handle(),
             model_root: native.model_root(),
-            config: handles.config,
-            tokenizer_json: handles.tokenizer_json,
-            chat_template: handles.chat_template,
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         };
         let runtime = WemmRuntime::from_native(identity, native, codec)?;
@@ -167,15 +168,13 @@ impl Session {
             identity,
             model,
             backing,
-            _source: source,
-            assets,
-            descriptor,
+            _source: snapshot,
         })
     }
 
     /// The index over `attributes` of `source`: one descriptor from every
-    /// machine, registered idempotently. The descriptor names the model
-    /// collection and assets, so they are put here too.
+    /// machine, registered idempotently. The descriptor names the model by
+    /// its complete root alone, so it carries no blob of its own.
     fn register(
         &self,
         store: &mut FacultyStore,
@@ -183,14 +182,7 @@ impl Session {
         attributes: &[Id],
         reader: &impl StoreRead,
     ) -> Result<(Index, Target)> {
-        anyhow::ensure!(
-            backing(&self.model)? == self.backing,
-            "the WeMM model file changed under the bound session; refusing further model use"
-        );
-        for blob in &self.assets {
-            let _: Inline<inlineencodings::Handle<RawBytes>> = store.put(blob.clone())?;
-        }
-        let _: CollectionHandle = store.put(self.descriptor.clone())?;
+        self.backing.require_still(&self.model)?;
         let mapping = Index::new(
             attributes.iter().copied(),
             self.identity,
@@ -324,7 +316,10 @@ struct BackingIdentity {
 fn backing(path: &Path) -> Result<BackingIdentity> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    anyhow::ensure!(meta.is_file(), "the WeMM model must be an ordinary file");
+    anyhow::ensure!(
+        meta.is_file(),
+        "the WeMM model pile must be an ordinary file"
+    );
     Ok(BackingIdentity {
         device: meta.dev(),
         inode: meta.ino(),
@@ -332,18 +327,26 @@ fn backing(path: &Path) -> Result<BackingIdentity> {
     })
 }
 
-/// The model pile is never the pile the indexes are written to, hard links
-/// included. A pile that does not exist yet is distinct.
-fn distinct_files(model: &BackingIdentity, writable: &Path) -> Result<()> {
-    if !writable.exists() {
-        return Ok(());
+impl BackingIdentity {
+    /// The pile at `path` is still this file, at least as long as it was:
+    /// appends are expected (the working pile grows), a replaced or shortened
+    /// file is not.
+    fn require_still(&self, path: &Path) -> Result<()> {
+        let now = backing(path)?;
+        anyhow::ensure!(
+            (now.device, now.inode) == (self.device, self.inode),
+            "the WeMM model pile {} was replaced under the bound session; refusing further model use",
+            path.display()
+        );
+        anyhow::ensure!(
+            now.bytes >= self.bytes,
+            "the WeMM model pile {} shrank under the bound session ({} -> {} bytes); refusing further model use",
+            path.display(),
+            self.bytes,
+            now.bytes
+        );
+        Ok(())
     }
-    let other = backing(writable)?;
-    anyhow::ensure!(
-        (model.device, model.inode) != (other.device, other.inode),
-        "the WeMM model pile cannot be the pile its indexes are written to"
-    );
-    Ok(())
 }
 
 #[cfg(test)]
@@ -351,32 +354,109 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_and_writable_hardlinks_are_refused_before_gpu_work() {
+    fn a_grown_pile_is_still_bound_and_a_replaced_or_shortened_one_is_not() {
         let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("model.pile");
-        let files = dir.path().join("files.pile");
-        std::fs::write(&model, b"fixture").unwrap();
-        std::fs::hard_link(&model, &files).unwrap();
-        assert!(distinct_files(&backing(&model).unwrap(), &files).is_err());
-        assert!(distinct_files(&backing(&model).unwrap(), &dir.path().join("new.pile")).is_ok());
+        let pile = dir.path().join("self.pile");
+        std::fs::write(&pile, b"prefix").unwrap();
+        let bound = backing(&pile).unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&pile)
+            .unwrap()
+            .write_all(b" appended")
+            .unwrap();
+        bound.require_still(&pile).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pile)
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        assert!(bound.require_still(&pile).is_err(), "shortened");
+        let other = dir.path().join("compacted.pile");
+        std::fs::write(&other, b"prefix appended and more").unwrap();
+        std::fs::rename(&other, &pile).unwrap();
+        assert!(bound.require_still(&pile).is_err(), "replaced");
+    }
+
+    /// The CPU half of a binding against a real pile: the complete root
+    /// resolves from `WEMM_RESOLVE_PILE`'s collection `WEMM_RESOLVE_MODELS`
+    /// (64 hex digits), its assets validate, and the rebuilt tokenizer frames
+    /// text exactly like the checkpoint's `tokenizer.json` at
+    /// `WEMM_RESOLVE_TOKENIZER_JSON` with the template at
+    /// `WEMM_RESOLVE_TEMPLATE`. No device is touched.
+    #[test]
+    #[ignore = "requires a pile holding the complete WeMM root"]
+    fn the_complete_root_resolves_without_a_device() {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name}"));
+        let handle =
+            mary::model_collection::parse_collection_handle(&var("WEMM_RESOLVE_MODELS")).unwrap();
+        let root = Id::from_hex(&var("WEMM_RESOLVE_ROOT")).unwrap();
+        let started = std::time::Instant::now();
+        let resolved = resolve(Path::new(&var("WEMM_RESOLVE_PILE")), handle, root).unwrap();
+        eprintln!(
+            "resolved root {root:X} from collection {} ({} facts) in {:.1} s",
+            hex::encode(resolved.collection.handle().raw),
+            resolved.snapshot.facts().len(),
+            started.elapsed().as_secs_f64()
+        );
+        let reference = InputCodec::from_assets(
+            &std::fs::read(var("WEMM_RESOLVE_TOKENIZER_JSON")).unwrap(),
+            &std::fs::read(var("WEMM_RESOLVE_TEMPLATE")).unwrap(),
+        )
+        .unwrap();
+        let codec = resolved.assets.codec();
+        let texts = [
+            "hello",
+            "a red crab with claws",
+            "The Rust borrow checker enforces ownership: one mutable reference or many shared ones.",
+            "  naïve façade, 漢字, emoji 🦀, tabs\tand\nnewlines  ",
+            "<think>x</think> <tool_call>y</tool_call>",
+        ];
+        for text in texts {
+            assert_eq!(
+                codec.text(text).unwrap().as_slice(),
+                reference.text(text).unwrap().as_slice(),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            codec.image().unwrap().as_slice(),
+            reference.image().unwrap().as_slice()
+        );
+        assert!(codec.text("<embedding>").is_err());
+        let ids = codec.text("hello").unwrap();
+        eprintln!(
+            "{} texts and the image placeholder framed identically; \"hello\" -> {:?}",
+            texts.len(),
+            ids.as_slice()
+        );
     }
 
     /// The real model on a scratch pile: five memories (one a wordless image
     /// of a red crab), three wiki fragments and two files, indexed through one
     /// bound session, then found again by text queries. Needs a GB10 under
-    /// the gb10 lock, WEMM_PILE, WEMM_ASSETS, WEMM_ROOT, and WEMM_GATE_PNG
-    /// naming a PNG of a red crab.
+    /// the gb10 lock, `WEMM_MODEL_PILE` (a pile whose `models` collection
+    /// holds the complete root; its contents are copied into the scratch pile
+    /// first), `TRIBLESPACE_COLLECTION_MODELS`, `WEMM_ROOT`, and
+    /// `WEMM_GATE_PNG` naming a PNG of a red crab.
     #[test]
-    #[ignore = "requires a GB10, the WeMM model pile and WEMM_GATE_PNG"]
+    #[ignore = "requires a GB10, a pile holding the complete WeMM root and WEMM_GATE_PNG"]
     fn memory_wiki_and_files_answer_text_queries_on_a_scratch_pile() {
         use crate::memory::operations::parse_time_range;
         use crate::out::Part;
 
         let png = std::fs::read(std::env::var("WEMM_GATE_PNG").unwrap()).unwrap();
+        let model_pile = std::env::var("WEMM_MODEL_PILE").unwrap();
+        let models = std::env::var("TRIBLESPACE_COLLECTION_MODELS").unwrap();
         crate::test_support::clear_ambient_environment();
         let dir = tempfile::tempdir().unwrap();
         let pile = dir.path().join("scratch.pile");
-        std::fs::File::create(&pile).unwrap();
+        // The model lives in the pile its indexes are written to; a copy, so
+        // the test's writes never reach the model pile it was given.
+        std::fs::copy(&model_pile, &pile).unwrap();
+        std::env::set_var("TRIBLESPACE_COLLECTION_MODELS", models);
         crate::storage::initialize_signer(&pile, None).unwrap();
         let storage = crate::storage::Storage::shared(pile.clone(), None);
         let memory = crate::memory::Memory::with_storage(storage.clone());

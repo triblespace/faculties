@@ -84,7 +84,7 @@ static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "memory_index",
-        description: "Derive the WeMM index over every memory chunk's prose and image. Requires the wemm build on a GB10 and the WEMM_PILE, WEMM_ASSETS and WEMM_ROOT model environment; binds the model (tens of seconds) and may run for hours.",
+        description: "Derive the WeMM index over every memory chunk's prose and image. Requires the wemm build on a GB10, the complete WeMM root in the pile's models collection, and WEMM_ROOT naming it; binds the model (tens of seconds) and may run for hours.",
         input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#,
     },
     Tool {
@@ -202,8 +202,9 @@ impl Faculty for Memory {
         match name {
             "memory_raw" => {
                 let args: Id = decode_arguments(arguments)?;
-                let id = triblespace::prelude::Id::from_hex(&args.id)
-                    .ok_or_else(|| invalid_arguments("id must be a full nonzero 32-hex memory id"))?;
+                let id = triblespace::prelude::Id::from_hex(&args.id).ok_or_else(|| {
+                    invalid_arguments("id must be a full nonzero 32-hex memory id")
+                })?;
                 memory.raw(id, out)
             }
             "memory_show" => {

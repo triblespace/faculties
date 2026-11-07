@@ -154,7 +154,8 @@ enum Command {
         all: bool,
     },
     /// Derive the WeMM index over every revision's text (wemm build on a
-    /// GB10; WEMM_PILE, WEMM_ASSETS, WEMM_ROOT). Resumable; prints the
+    /// GB10; WEMM_ROOT names the complete root in the models collection).
+    /// Resumable; prints the
     /// commits still to derive.
     Index,
     /// Rank current revisions by meaning against the WeMM index.

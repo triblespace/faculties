@@ -59,7 +59,7 @@ const TOOLS: &[Tool] = &[
         name: "files_search", description: "Search stored file names, media types, and tags.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
-    Tool { name: "files_index", description: "Derive the WeMM index over every stored file's content, whoever saved it: images, text, HTML text and PDF text layers through one model. Requires the wemm build on a GB10 and the WEMM_PILE, WEMM_ASSETS and WEMM_ROOT model environment; binds the model (tens of seconds) and may run for hours.", input_schema: EMPTY_SCHEMA },
+    Tool { name: "files_index", description: "Derive the WeMM index over every stored file's content, whoever saved it: images, text, HTML text and PDF text layers through one model. Requires the wemm build on a GB10, the complete WeMM root in the pile's models collection, and WEMM_ROOT naming it; binds the model (tens of seconds) and may run for hours.", input_schema: EMPTY_SCHEMA },
     Tool {
         name: "files_similar", description: "Rank stored files by meaning in the one WeMM space for text, images and documents. Supply exactly one of id or text. Scores are reconstructed cosines, not calibrated relevance; floor is an optional cosine in [-1,1]. A content held by several files is one hit. Requires the wemm build on a GB10 and binds the model per call.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":-1,"maximum":1},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"additionalProperties":false}"#,

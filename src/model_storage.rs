@@ -20,17 +20,44 @@ use {
 /// Local only, on purpose: a model that has not finished replicating here
 /// fails to load rather than loading partly or from the network. Speech and
 /// hearing copy every selected tensor to the device, so nothing stays aliased
-/// to the pile once a model has loaded.
-#[cfg(any(feature = "voice-breeze", feature = "discord-hearing"))]
+/// to the pile once a model has loaded. WeMM does alias its tensors' mapped
+/// pages; `crate::wemm` states what that asks of the pile.
+#[cfg(any(
+    feature = "voice-breeze",
+    feature = "discord-hearing",
+    feature = "wemm"
+))]
 pub(crate) fn models(path: &Path) -> Result<mary::model_collection::ModelPileSnapshot> {
+    models_in(path, models_handle()?)
+}
+
+/// The descriptor `TRIBLESPACE_COLLECTION_MODELS` names.
+#[cfg(any(
+    feature = "voice-breeze",
+    feature = "discord-hearing",
+    feature = "wemm"
+))]
+pub(crate) fn models_handle() -> Result<triblespace::core::collection::CollectionHandle> {
     use crate::schemas::models::COLLECTION_SCOPE_ID;
-    let handle =
-        crate::collection_names::configured_handle(COLLECTION_SCOPE_ID)?.with_context(|| {
-            format!(
-                "{} must name the model collection's exact descriptor",
-                crate::collection_names::override_env_name(COLLECTION_SCOPE_ID)
-            )
-        })?;
+    crate::collection_names::configured_handle(COLLECTION_SCOPE_ID)?.with_context(|| {
+        format!(
+            "{} must name the model collection's exact descriptor",
+            crate::collection_names::override_env_name(COLLECTION_SCOPE_ID)
+        )
+    })
+}
+
+/// [`models`] with the descriptor named explicitly.
+#[cfg(any(
+    feature = "voice-breeze",
+    feature = "discord-hearing",
+    feature = "wemm"
+))]
+pub(crate) fn models_in(
+    path: &Path,
+    handle: triblespace::core::collection::CollectionHandle,
+) -> Result<mary::model_collection::ModelPileSnapshot> {
+    use crate::schemas::models::COLLECTION_SCOPE_ID;
     let store = mary::persist::read_model_pile_snapshot_read_only(path)?;
     let collection = crate::collection_names::open_exact_in(&store, COLLECTION_SCOPE_ID, handle)
         .with_context(|| format!("open the model collection in {}", path.display()))?;

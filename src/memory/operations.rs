@@ -96,7 +96,10 @@ impl Memory {
             }
             let handle = chunk_summary_handle(&loaded.memory.facts, id)
                 .with_context(|| format!("memory {id:x} has no text summary"))?;
-            let summary: View<str> = loaded.memory.reader.get(handle)
+            let summary: View<str> = loaded
+                .memory
+                .reader
+                .get(handle)
                 .context("read raw Memory summary")?;
             out.text(summary.as_ref())
         })
@@ -1009,7 +1012,7 @@ fn chunk_cosines<P: TriblePattern>(
     best
 }
 
-/// `memory context`'s scores by meaning: none unless `WEMM_PILE` names the
+/// `memory context`'s scores by meaning: none unless `WEMM_ROOT` names the
 /// model and the index has rows, so the cover falls back to BM25. The model is
 /// bound on the first call and kept for the rest of the cover.
 #[cfg(feature = "wemm")]
@@ -1019,7 +1022,7 @@ fn semantic_scores(
     session: &mut Option<crate::wemm::Session>,
     query: &str,
 ) -> Result<Option<std::collections::HashMap<Id, f32>>> {
-    if std::env::var_os("WEMM_PILE").is_none() {
+    if std::env::var_os("WEMM_ROOT").is_none() {
         return Ok(None);
     }
     if session.is_none() {
@@ -3352,14 +3355,26 @@ mod tests {
         // Raw answer bytes stay separate from the same frontend-neutral
         // incomplete-view evidence; there is no fabricated terminal newline.
         let mut raw_parts = Vec::new();
-        memory.raw(warm, &mut Out::new(&mut |part| {
-            raw_parts.push(part);
-            Ok(())
-        })).unwrap();
-        assert_eq!(raw_parts, vec![
-            crate::out::Part::Note { text: notes[0].clone() },
-            crate::out::Part::Text { text: "already resident history".into() },
-        ]);
+        memory
+            .raw(
+                warm,
+                &mut Out::new(&mut |part| {
+                    raw_parts.push(part);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_parts,
+            vec![
+                crate::out::Part::Note {
+                    text: notes[0].clone()
+                },
+                crate::out::Part::Text {
+                    text: "already resident history".into()
+                },
+            ]
+        );
         // A write depends on absence, so it still refuses and names the
         // unread member.
         for summary in [

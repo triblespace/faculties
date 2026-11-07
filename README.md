@@ -129,7 +129,7 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | --- | --- |
 | Discord bot access | Pile-backed `discord auth set <exact-secrets-version>`; no launcher token |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
-| Files, Memory and Wiki semantic index and search | With the `wemm` feature on a GB10: `WEMM_PILE` (the dedicated WeMM model pile), `WEMM_ASSETS` (its pinned config/tokenizer/template directory) and `WEMM_ROOT` (the model root). Other machines carry the replicated index rows but cannot query them |
+| Files, Memory and Wiki semantic index and search | With the `wemm` feature on a GB10: `WEMM_ROOT`, the complete WeMM model root (weights, tokenizer, configuration and chat template) in the working pile's `models` collection, which `TRIBLESPACE_COLLECTION_MODELS` names. Other machines carry the replicated index rows but cannot query them |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 
@@ -166,12 +166,15 @@ per commit, and prints the commits it still has to derive; saving never embeds.
 Scores are reconstructed NVFP4 cosines, not calibrated relevance; `similar`
 ranks top-k unless given an explicit floor.
 
-Supply `WEMM_PILE`, `WEMM_ASSETS` and `WEMM_ROOT`; the model collection is the
-model pile's single collection. A bind costs 30 to 110 s, paid by every
-command. The model pile must be a dedicated finished artifact, different from
-the writable pile even through hard links, and the operator must prevent
-mutation, compaction and truncation of its mapped prefix until the process
-ends; read-only opening and inode/size checks do not prove that.
+Supply `WEMM_ROOT`; the model is read from the working pile's `models`
+collection (`TRIBLESPACE_COLLECTION_MODELS`), tokenizer, configuration and chat
+template included, and the index descriptors name it by that root alone. A
+bind costs 30 to 110 s, paid by every command. Binding aliases the pile's
+mapped pages into CUDA, so the pile must not be truncated or rewritten in place
+until the process ends: appends are fine, a compaction into a new file renamed
+over the path leaves the bound mapping intact, and `trible pile amputate` must
+not run while a WeMM process is bound. The inode/size checks are diagnostics,
+not proof.
 
 Prefer the token environment variables to visible argv; help hides their
 values. Discovery needs neither tokens nor model assets. Resident Discord and
