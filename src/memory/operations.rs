@@ -322,7 +322,7 @@ impl Memory {
             Ok(())
         })
     }
-    /// EXPERIMENTAL: replay the greedy walk beside nine tiled configurations
+    /// EXPERIMENTAL: replay the greedy walk beside the append-only open slot (clock-closed) and full-closed runs
     /// (shares, arrival policy, in-tile target, deferral cap).
     pub fn churn_tiled(
         &self,
@@ -337,48 +337,54 @@ impl Memory {
         let moment = (crate::memory::MOMENT_SECONDS * 1e9) as i128;
         let unit = crate::memory_cover::REPLAY_QUANTUM_NS;
         let cap = Some(64 * unit); // 12.1 d: levels 4 and up re-read at least this often
-        let cfg = |anchor_ns, frozen, uniform, cap_ns| TiledOpts {
-            anchor_ns,
-            frozen,
-            uniform,
-            cap_ns,
-            closed_fraction: None,
-        };
-        let ratio = |frozen, cap_ns| TiledOpts {
+        let base = TiledOpts {
             anchor_ns: moment,
-            frozen,
+            frozen: false,
             uniform: true,
-            cap_ns,
-            closed_fraction: Some(2.0 / 3.0),
+            cap_ns: None,
+            closed_fraction: None,
+            open_append: None,
+            deep_weights: false,
+            runs: None,
         };
+        let _ = (unit, cap);
         let configs = vec![
             (
-                "ratio-2/3/b/uniform (primary)".to_owned(),
-                ratio(false, None),
-            ),
-            ("ratio-2/3/a/uniform/cap-12d".to_owned(), ratio(true, cap)),
-            (
-                "moment/a/log-target (report 2)".to_owned(),
-                cfg(moment, true, false, None),
-            ),
-            ("moment/a/uniform".to_owned(), cfg(moment, true, true, None)),
-            (
-                "moment/a/uniform/cap-12d".to_owned(),
-                cfg(moment, true, true, cap),
+                "reference: ratio-2/3/b/uniform, open walk (report 3 primary)".to_owned(),
+                TiledOpts {
+                    closed_fraction: Some(2.0 / 3.0),
+                    ..base.clone()
+                },
             ),
             (
-                "moment/b/log-target".to_owned(),
-                cfg(moment, false, false, None),
+                "clock-closed append-only, reserve 4%, equal closed shares".to_owned(),
+                TiledOpts {
+                    open_append: Some(0.04),
+                    ..base.clone()
+                },
             ),
             (
-                "moment/b/uniform".to_owned(),
-                cfg(moment, false, true, None),
+                "clock-closed append-only, reserve 4%, deep-weighted closed shares".to_owned(),
+                TiledOpts {
+                    open_append: Some(0.04),
+                    deep_weights: true,
+                    ..base.clone()
+                },
             ),
             (
-                "unit/a/uniform/cap-12d".to_owned(),
-                cfg(unit, true, true, cap),
+                "full-closed runs, open = 1/3 (JP)".to_owned(),
+                TiledOpts {
+                    runs: Some(1.0 / 3.0),
+                    ..base.clone()
+                },
             ),
-            ("unit/b/uniform".to_owned(), cfg(unit, false, true, None)),
+            (
+                "full-closed runs, open = 1/8".to_owned(),
+                TiledOpts {
+                    runs: Some(1.0 / 8.0),
+                    ..base.clone()
+                },
+            ),
         ];
         self.with_operation(|storage| {
             let loaded = storage.load()?;
