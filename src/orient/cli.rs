@@ -157,14 +157,14 @@ enum Command {
         /// Mark the recalls of the cover's SEALED HEAD with `"sealed": true`,
         /// so a harness can keep one saved prompt prefix at the head's end
         /// across wakes. The head leads the recalls: with the grid, every
-        /// level up to the young end of level 1. Implies `--selector grid`
-        /// unless `--selector` is given; with `--selector walk` (the rollback)
-        /// nothing is sealed and the pairs are byte-identical to a wake
-        /// without this flag. Only with `--pairs`.
+        /// level up to the young end of level 1. It selects nothing: only
+        /// `--selector grid` has a head, and with the walk (the default and
+        /// the rollback) nothing is sealed and the pairs are byte-identical to
+        /// a wake without this flag. Only with `--pairs`.
         #[arg(long, requires = "pairs")]
         sealed_head: bool,
         /// The rule that selects the memory cover: `walk` (today's greedy
-        /// walk; the default without `--sealed-head`, and the rollback) or
+        /// walk; the default and the rollback) or
         /// `grid` (the clock-closed geometric grid over lived time). Only with
         /// `--pairs`.
         #[arg(long, requires = "pairs", value_parser = ["walk", "grid"])]

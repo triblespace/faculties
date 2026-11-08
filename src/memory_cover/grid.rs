@@ -25,6 +25,13 @@ pub const GRID_OPEN_RESERVE: f64 = 0.04;
 /// the 2026-11-08 replays.
 pub const GRID_HEAD_LEVEL: u32 = 1;
 
+/// The deepest level the grid builds: `4^(GRID_MAX_LEVEL + 1)` units of
+/// `GRID_UNIT_NS` still fit an `i128` of nanoseconds. A journal reaching
+/// across the grid's origin (signed TAI before its epoch) never shares a
+/// block with a later unit, so the level search stops here and an apex tile
+/// holds what lies before the top level.
+const GRID_MAX_LEVEL: u32 = 38;
+
 /// The start of the level-`level` block holding unit `n`, in units:
 /// `floor(n / 4^level) * 4^level`.
 fn block(n: i128, level: u32) -> i128 {
@@ -41,6 +48,44 @@ fn range_time_sort(entries: &mut [usize], spans: &[(i128, i128, Id)]) {
             .then(spans[b].1.cmp(&spans[a].1))
             .then(spans[a].2.cmp(&spans[b].2))
     });
+}
+
+/// One tile `[ta, tb)`: today's walk over the eligible memories that START in
+/// it, against UNIFORM targets clipped to lived time (they begin at
+/// `max(ta, earliest)`, so no target character falls before the journal
+/// began). Returns the characters spent, at most `tile_space`.
+#[allow(clippy::too_many_arguments)]
+fn walk_tile(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    selected: &mut [bool],
+    cover: &mut Vec<usize>,
+    earliest: i128,
+    ta: i128,
+    tb: i128,
+    tile_space: usize,
+) -> usize {
+    let lived = ta.max(earliest);
+    if tile_space == 0 || lived >= tb {
+        return 0;
+    }
+    let candidate: Vec<bool> = spans
+        .iter()
+        .zip(eligible)
+        .map(|(span, &ok)| ok && span.0 >= ta && span.0 < tb)
+        .collect();
+    let life = (tb - lived) as f64;
+    recollection_walk(
+        spans,
+        costs,
+        &candidate,
+        selected,
+        lived,
+        &|cursor| life * cursor.min(tile_space) as f64 / tile_space as f64,
+        tile_space,
+        cover,
+    )
 }
 
 /// The clock-closed geometric grid.
@@ -98,12 +143,32 @@ pub fn select_grid_recollection_cut(
     let n = latest.div_euclid(unit);
     let first = earliest.div_euclid(unit);
     let mut top = 0u32;
-    while block(n, top + 1) > first {
+    while top < GRID_MAX_LEVEL && block(n, top + 1) > first {
         top += 1;
     }
-    let share = ((1.0 - GRID_OPEN_RESERVE) * budget as f64 / (top as f64 + 1.0)).floor() as usize;
+    let apex = block(n, top + 1) > first;
+    let regions = top as f64 + 1.0 + if apex { 1.0 } else { 0.0 };
+    let share = ((1.0 - GRID_OPEN_RESERVE) * budget as f64 / regions).floor() as usize;
     let mut selected = vec![false; spans.len()];
     let mut carry = 0usize;
+    if apex {
+        let allowance = share.min(budget - out.used);
+        let (ta, tb) = (first * unit, block(n, top + 1) * unit);
+        let spent = walk_tile(
+            spans,
+            costs,
+            eligible,
+            &mut selected,
+            &mut out.cover,
+            earliest,
+            ta,
+            tb,
+            allowance,
+        );
+        out.used += spent;
+        carry = allowance - spent;
+        out.head = out.cover.len();
+    }
     for level in (0..=top).rev() {
         let width = 4i128.pow(level);
         let (lo, hi) = (block(n, level + 1), block(n, level));
@@ -114,25 +179,16 @@ pub fn select_grid_recollection_cut(
             let ta = (lo + t as i128 * width) * unit;
             let tb = ta + width * unit;
             let tile_space = (allowance - spent) / (tiles - t);
-            let lived = ta.max(earliest);
-            if tile_space == 0 || lived >= tb {
-                continue;
-            }
-            let candidate: Vec<bool> = spans
-                .iter()
-                .zip(eligible)
-                .map(|(span, &ok)| ok && span.0 >= ta && span.0 < tb)
-                .collect();
-            let life = (tb - lived) as f64;
-            spent += recollection_walk(
+            spent += walk_tile(
                 spans,
                 costs,
-                &candidate,
+                eligible,
                 &mut selected,
-                lived,
-                &|cursor| life * cursor.min(tile_space) as f64 / tile_space as f64,
-                tile_space,
                 &mut out.cover,
+                earliest,
+                ta,
+                tb,
+                tile_space,
             );
         }
         out.used += spent;
@@ -160,6 +216,21 @@ pub fn select_grid_recollection_cut(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_journal_across_the_grid_origin_terminates_and_keeps_both_sides() {
+        // Signed TAI allows times before the grid's origin; a unit before 0
+        // and one after it never share a block, so only the level cap and
+        // the apex tile end the level search.
+        let u = GRID_UNIT_NS;
+        let spans = vec![(-u, 0, id(1)), (0, u, id(2))];
+        let costs = vec![100, 100];
+        let cut = select_grid_recollection_cut(&spans, &costs, &[true, true], 10_000);
+        let mut picked = cut.cover.clone();
+        picked.sort();
+        assert_eq!(picked, vec![0, 1]);
+        assert!(cut.used <= 10_000);
+    }
     use super::super::*;
     use super::*;
 
