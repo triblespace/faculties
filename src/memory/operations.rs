@@ -346,42 +346,38 @@ impl Memory {
             open_append: None,
             deep_weights: false,
             runs: None,
+            run_geometric: false,
         };
         let _ = (unit, cap);
         let configs = vec![
             (
-                "reference: ratio-2/3/b/uniform, open walk (report 3 primary)".to_owned(),
-                TiledOpts {
-                    closed_fraction: Some(2.0 / 3.0),
-                    ..base.clone()
-                },
-            ),
-            (
-                "clock-closed append-only, reserve 4%, equal closed shares".to_owned(),
-                TiledOpts {
-                    open_append: Some(0.04),
-                    ..base.clone()
-                },
-            ),
-            (
-                "clock-closed append-only, reserve 4%, deep-weighted closed shares".to_owned(),
-                TiledOpts {
-                    open_append: Some(0.04),
-                    deep_weights: true,
-                    ..base.clone()
-                },
-            ),
-            (
-                "full-closed runs, open = 1/3 (JP)".to_owned(),
+                "runs 1/3, uniform interior (report 4)".to_owned(),
                 TiledOpts {
                     runs: Some(1.0 / 3.0),
                     ..base.clone()
                 },
             ),
             (
-                "full-closed runs, open = 1/8".to_owned(),
+                "runs 1/3, geometric interior".to_owned(),
+                TiledOpts {
+                    runs: Some(1.0 / 3.0),
+                    run_geometric: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "runs 1/8, geometric interior".to_owned(),
                 TiledOpts {
                     runs: Some(1.0 / 8.0),
+                    run_geometric: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "runs 1/16, geometric interior".to_owned(),
+                TiledOpts {
+                    runs: Some(1.0 / 16.0),
+                    run_geometric: true,
                     ..base.clone()
                 },
             ),

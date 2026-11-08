@@ -1550,6 +1550,8 @@ pub struct TiledCut {
     pub open_overflow: usize,
     /// Runs: memories that start in a closed run and end past its seam.
     pub crossing: usize,
+    /// Runs: `(rank, lo, hi, space, used)` oldest first.
+    pub run_list: Vec<(u32, i128, i128, usize, usize)>,
     pub used: usize,
 }
 
@@ -1598,6 +1600,9 @@ pub struct TiledOpts {
     /// memories appended to it reach this fraction of the budget, and closed
     /// runs carry base 4 by rank. See [`select_runs_recollection_cut`].
     pub runs: Option<f64>,
+    /// Runs: inside a closed run, today's log-age targets over the run's own
+    /// span (finer toward its young end) instead of uniform targets.
+    pub run_geometric: bool,
 }
 
 /// Range-time order: start ascending, end descending, then intrinsic id.
@@ -1727,6 +1732,7 @@ pub fn select_tiled_recollection_cut(
         open_share: 0,
         open_overflow: 0,
         crossing: 0,
+        run_list: Vec::new(),
         used: 0,
     };
     if let Some(open_frac) = opts.runs {
@@ -1966,6 +1972,7 @@ pub fn select_runs_recollection_cut(
         open_share: 0,
         open_overflow: 0,
         crossing: 0,
+        run_list: Vec::new(),
         used: 0,
     };
     let Some(earliest) = spans.iter().map(|s| s.0).min() else {
@@ -2046,26 +2053,43 @@ pub fn select_runs_recollection_cut(
                 for &i in &members {
                     candidate[i] = true;
                 }
-                let target = Uniform {
-                    life_ns: (hi - lo) as f64,
-                    space,
-                };
-                walk_targets(
-                    spans,
-                    costs,
-                    &candidate,
-                    &mut vec![false; spans.len()],
-                    lo,
-                    &target,
-                    space,
-                )
-                .0
+                if opts.run_geometric {
+                    let gradient = DensityGradient::new((hi - lo).max(1), space);
+                    walk(
+                        spans,
+                        costs,
+                        &candidate,
+                        &mut vec![false; spans.len()],
+                        lo,
+                        &gradient,
+                        space,
+                    )
+                    .0
+                } else {
+                    let target = Uniform {
+                        life_ns: (hi - lo) as f64,
+                        space,
+                    };
+                    walk_targets(
+                        spans,
+                        costs,
+                        &candidate,
+                        &mut vec![false; spans.len()],
+                        lo,
+                        &target,
+                        space,
+                    )
+                    .0
+                }
             };
             range_time_sort(&mut chosen, spans);
+            let mut run_used = 0usize;
             for &i in &chosen {
                 selected[i] = true;
                 spent += costs[i];
+                run_used += costs[i];
             }
+            out.run_list.push((rank, lo, hi, space, run_used));
             out.cover.extend(chosen);
         }
         out.levels.push(TileLevel {
@@ -2329,6 +2353,8 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let mut flow_v = Vec::new();
         let mut open_split_v = Vec::new();
         let mut whole_split_v = Vec::new();
+        let mut age_v: Vec<[usize; 5]> = Vec::new();
+        let mut free_v: Vec<usize> = Vec::new();
         let mut insertions = 0usize;
         let mut overflow_steps = 0usize;
         let mut closed_changed = 0usize;
@@ -2380,6 +2406,8 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 s.latest,
                 cut.open_start,
             ));
+            age_v.push(age_split(&cut.cover, &spans, &costs, s.latest, i128::MAX));
+            free_v.push(budget - cut.used);
             let mut cells = Vec::new();
             let mut resume = 0usize;
             let mut at = vec![0usize; MAX_LEVEL];
@@ -2519,7 +2547,10 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
              closed part (everything before the open slot) changed on {closed_changed} of {} transitions; the open slot rolled over \
              (new open unit or run closed) on {open_rolled}; within one open slot the new open list was NOT an extension of the old \
              (an insertion) on {insertions}; open overflow on {overflow_steps} step(s); memories crossing a closed seam at the last step {crossing_last}; \
-             levels present at the last step {}\n    {}",
+             levels present at the last step {}\n    \
+             whole cover by memory start age only, mean over all steps: <1 d {:.0}k, 1-7 d {:.0}k, 7-30 d {:.0}k, older {:.0}k\n    \
+             elastic room (budget - used, characters free for the live part) over all steps: {}\n    \
+             runs at the last step (rank, span, space -> used): {}\n    {}",
             fills.iter().sum::<f64>() / fills.len().max(1) as f64,
             fills.iter().copied().fold(f64::INFINITY, f64::min),
             used_v.len(),
@@ -2542,6 +2573,35 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 .map(|l| format!("{}:{}:{}", l.level, l.tiles, l.used))
                 .collect::<Vec<_>>()
                 .join(" ")),
+            age_v.iter().map(|x| x[1]).sum::<usize>() as f64 / age_v.len().max(1) as f64 / 1e3,
+            age_v.iter().map(|x| x[2]).sum::<usize>() as f64 / age_v.len().max(1) as f64 / 1e3,
+            age_v.iter().map(|x| x[3]).sum::<usize>() as f64 / age_v.len().max(1) as f64 / 1e3,
+            age_v.iter().map(|x| x[4]).sum::<usize>() as f64 / age_v.len().max(1) as f64 / 1e3,
+            {
+                let mut f = free_v.clone();
+                f.sort_unstable();
+                let q = |p: f64| f.get(((f.len().max(1) - 1) as f64 * p) as usize).copied().unwrap_or(0) / 1000;
+                // An 800k cover standing for 3/4 of a window: 1/4 = budget/3 is
+                // the live quarter, and the live part is that plus the free room.
+                let quarter = budget / 3;
+                let over_half = f.iter().filter(|&&x| quarter + x > 2 * quarter).count();
+                format!(
+                    "mean {:.0}k, min {}k, p10 {}k, p50 {}k, p90 {}k, max {}k; live part = {}k + free, which exceeds half the window ({}k) on {} of {} steps",
+                    mean(&f) / 1e3, q(0.0), q(0.1), q(0.5), q(0.9), q(1.0), quarter / 1000, 2 * quarter / 1000, over_half, f.len()
+                )
+            },
+            out_steps.last().map_or(String::new(), |s| s.cuts[c]
+                .run_list
+                .iter()
+                .map(|&(r, lo, hi, a, u)| format!(
+                    "r{r} {} ({:.1} d) {}k->{}k",
+                    format_time_range(key_to_epoch(lo), key_to_epoch(hi)),
+                    (hi - lo) as f64 / 86_400e9,
+                    a / 1000,
+                    u / 1000
+                ))
+                .collect::<Vec<_>>()
+                .join("; ")),
             lvls.join("\n    "),
         ));
     }
@@ -2671,6 +2731,7 @@ mod tests {
                     open_append: None,
                     deep_weights: false,
                     runs: None,
+                    run_geometric: false,
                 },
                 None,
             );
@@ -2727,6 +2788,7 @@ mod tests {
                 open_append: None,
                 deep_weights: false,
                 runs: None,
+                run_geometric: false,
             },
             None,
         );
@@ -2860,6 +2922,7 @@ mod tests {
                 open_append: None,
                 deep_weights: false,
                 runs: None,
+                run_geometric: false,
             };
             let cut =
                 select_tiled_recollection_cut(&spans, &costs, &observed, 300_000, &opts, None);
@@ -2881,6 +2944,7 @@ mod tests {
             open_append: None,
             deep_weights: false,
             runs: Some(0.1),
+            run_geometric: false,
         };
         let mut previous: Option<TiledCut> = None;
         let mut appends = 0;
