@@ -1565,7 +1565,7 @@ fn author_priority(
         if current.is_empty() {
             let (bottom, snapshot) = compass::priority_snapshot_fragment(lower, [], at);
             fragment += bottom;
-            fragment += entity! { snapshot @ board::by?: by.as_ref() };
+            fragment += entity! { ExclusiveId::force_ref(&snapshot) @ board::by?: by.as_ref() };
             over.insert(snapshot);
         } else {
             over.extend(current);
@@ -1574,7 +1574,7 @@ fn author_priority(
     let (record, snapshot) = compass::priority_snapshot_fragment(goal, over, at);
     fragment += record;
     // Authorship annotates the snapshot; it never changes the identity core.
-    fragment += entity! { snapshot @ board::by?: by.as_ref() };
+    fragment += entity! { ExclusiveId::force_ref(&snapshot) @ board::by?: by.as_ref() };
     (fragment, snapshot)
 }
 
