@@ -68,8 +68,9 @@ enum Command {
     },
     /// Keep the WeMM indexes of Memory, Wiki and Files derived: bind the model
     /// once, derive every commit that has no rows, and again whenever the pile
-    /// grows. Prints one line per index per pass. Exits 0 when a compaction
-    /// replaces the pile file, so its supervisor restarts it on the new one.
+    /// grows. Prints a line for an index only when a pass derived something
+    /// or left something missing. Exits 0 when a compaction replaces the
+    /// pile file, so its supervisor restarts it on the new one.
     /// Needs a GB10, the complete WeMM root in the pile's models collection,
     /// and WEMM_ROOT naming it.
     #[cfg(feature = "wemm")]
@@ -78,8 +79,11 @@ enum Command {
         pile: PathBuf,
         #[arg(long, env = "TRIBLESPACE_KEY")]
         key: Option<PathBuf>,
-        /// How often to look whether the pile has grown.
-        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+        /// How often to look whether the pile has grown. The working pile
+        /// grows every few seconds, and a pass holds a shared pile lock while
+        /// it opens three collections, so this also bounds how often a pass
+        /// can run.
+        #[arg(long, value_name = "SECONDS", default_value_t = 60)]
         poll: u64,
     },
 }
@@ -160,12 +164,16 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
         session.backing(),
         std::time::Duration::from_secs(poll),
         || {
-            let derived = memory.derive_wemm(&session).context("memory")?;
-            eprintln!("maintain: memory {derived}");
-            let derived = wiki.derive_wemm(&session).context("wiki")?;
-            eprintln!("maintain: wiki {derived}");
-            let derived = files.derive_wemm(&session).context("files")?;
-            eprintln!("maintain: files {derived}");
+            // A pass that found everything derived says nothing: the pile
+            // grows all day, and most passes are such passes.
+            let report = |name: &str, derived: faculties::wemm::Derived| {
+                if derived.derived > 0 || derived.missing > 0 {
+                    eprintln!("maintain: {name} {derived}");
+                }
+            };
+            report("memory", memory.derive_wemm(&session).context("memory")?);
+            report("wiki", wiki.derive_wemm(&session).context("wiki")?);
+            report("files", files.derive_wemm(&session).context("files")?);
             Ok(())
         },
     );
