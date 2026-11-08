@@ -83,13 +83,8 @@ static TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Literal query; @ has no host-file meaning."}},"required":["query"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "memory_index",
-        description: "Derive the WeMM index over every memory chunk's prose and image. Requires the wemm build on a GB10, the complete WeMM root in the pile's models collection, and WEMM_ROOT naming it; binds the model (tens of seconds) and may run for hours.",
-        input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#,
-    },
-    Tool {
         name: "memory_similar",
-        description: "Rank memory chunks, prose and images alike, by meaning in the one WeMM space. Requires the wemm build on a GB10 and binds the model per call; run memory_index first.",
+        description: "Rank memory chunks, prose and images alike, by meaning in the one WeMM space. Requires the wemm build on a GB10 and binds the model per call. `faculties maintain` derives the rows in the background; a partial index says so.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1,"description":"Literal query; @ has no host-file meaning."}},"required":["query"],"additionalProperties":false}"#,
     },
     Tool {
@@ -161,7 +156,6 @@ macro_rules! arguments {
         struct $name { $($field: $ty),* }
     };
 }
-arguments!(Empty {});
 arguments!(Selector { selector: String });
 arguments!(Id { id: String });
 arguments!(Query { query: String });
@@ -248,7 +242,7 @@ impl Faculty for Memory {
                     .map_err(invalid_arguments)?;
                 memory.image(&bytes, range)?.emit(out)?;
                 out.line(format!(
-                    "({} image bytes stored; run `memory index` to place it in the WeMM space)",
+                    "({} image bytes stored; `faculties maintain` places it in the WeMM space)",
                     bytes.len()
                 ))
             }
@@ -272,10 +266,6 @@ impl Faculty for Memory {
             "memory_search" => {
                 let args: Query = decode_arguments(arguments)?;
                 memory.search(&args.query, out)
-            }
-            "memory_index" => {
-                let _: Empty = decode_arguments(arguments)?;
-                memory.index(out)
             }
             "memory_similar" => {
                 let args: Query = decode_arguments(arguments)?;

@@ -54,8 +54,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "wiki_tag_list", description: "List known tags and revision counts.", input_schema: EMPTY },
     Tool { name: "wiki_tag_mint", description: "Create or find a content-derived named tag and return its ID.", input_schema: r#"{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}"# },
     Tool { name: "wiki_search", description: "Search current revision titles/content with optional matching-line context.", input_schema: r#"{"type":"object","properties":{"query":{"type":"string"},"context":{"type":"boolean","default":false},"all":{"type":"boolean","default":false}},"required":["query"],"additionalProperties":false}"# },
-    Tool { name: "wiki_index", description: "Derive the WeMM index over every revision's text. Requires the wemm build on a GB10, the complete WeMM root in the pile's models collection, and WEMM_ROOT naming it; binds the model (tens of seconds) and may run for hours.", input_schema: EMPTY },
-    Tool { name: "wiki_similar", description: "Rank current revisions by meaning in the one WeMM space. Requires the wemm build on a GB10 and binds the model per call; run wiki_index first.", input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"# },
+    Tool { name: "wiki_similar", description: "Rank current revisions by meaning in the one WeMM space. Requires the wemm build on a GB10 and binds the model per call. `faculties maintain` derives the rows in the background; a partial index says so.", input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"# },
     Tool { name: "wiki_check", description: "Report live-frontier link integrity without requesting optional whole-corpus Typst compilation.", input_schema: EMPTY },
     Tool { name: "wiki_lint", description: "Report markup/reference normalization; fix publishes successors, check returns an error if changes are needed. Exact revision citations remain pinned.", input_schema: r#"{"type":"object","properties":{"fix":{"type":"boolean","default":false},"check":{"type":"boolean","default":false}},"additionalProperties":false}"# },
     Tool { name: "wiki_fix_truncated", description: "Resolve literal scheme:prefix lines and report expansions/errors. Does not read a local file or stdin and does not edit stored content.", input_schema: r#"{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}"# },
@@ -305,10 +304,6 @@ impl Faculty for Wiki {
             "wiki_search" => {
                 let args: Search = decode_arguments(arguments)?;
                 out.text(wiki.search(&args.query, args.context, args.all)?)
-            }
-            "wiki_index" => {
-                let _: Empty = decode_arguments(arguments)?;
-                wiki.index(out)
             }
             "wiki_similar" => {
                 let args: Query = decode_arguments(arguments)?;

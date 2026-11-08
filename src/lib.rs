@@ -91,6 +91,8 @@ mod organ_client;
 pub mod orient;
 pub mod out;
 pub mod patience;
+#[cfg(any(feature = "wemm", test))]
+pub mod pile_watch;
 pub mod planner;
 pub mod posture;
 pub mod posture_finding;

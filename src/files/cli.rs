@@ -110,7 +110,7 @@ const VERBS: &[Verb] = &[
     },
     Verb {
         name: "similar",
-        about: "Rank stored files by meaning against a file or a --text query, in the one WeMM space for text, images and documents (requires the wemm build and WEMM_ROOT naming the complete root in the models collection)",
+        about: "Rank stored files by meaning against a file or a --text query, in the one WeMM space for text, images and documents (requires the wemm build and WEMM_ROOT naming the complete root in the models collection). `faculties maintain` derives the rows in the background; a partial index says so",
         params: &[
             Param::caller("id", "Entity id/content hash or prefix; omit with --text")
                 .positional()
@@ -122,11 +122,6 @@ const VERBS: &[Verb] = &[
                 .short('n'),
             Param::caller("tag", "Only results carrying all these tags (repeatable)").repeated(),
         ],
-    },
-    Verb {
-        name: "index",
-        about: "Derive the WeMM index over every stored file's content, whoever saved it: images whole, text, HTML text and PDF text layers in windows, one model (requires the wemm build on a GB10 and WEMM_ROOT naming the complete root in the models collection). Resumable; prints the foundations still to derive",
-        params: &[],
     },
     Verb {
         name: "imports",
@@ -273,7 +268,6 @@ fn execute_with_input(
             },
             out,
         ),
-        "index" => files.index(out),
         "imports" => out.text(files.imports()?),
         "tree" => out.text(
             files.tree(
@@ -347,13 +341,15 @@ mod tests {
     use super::*;
     use crate::spec::CliRequest;
 
-    /// The Nomic indexes, the 7b space and the separate WeMM switch are
-    /// gone: one model, one `index`, one `similar`.
+    /// The Nomic indexes, the 7b space, the separate WeMM switch and the
+    /// hand-run `index` are gone: one model, derived by `faculties
+    /// maintain`, and one `similar`.
     #[test]
     fn retired_semantic_verbs_and_flags_are_not_grammar() {
         for arguments in [
             vec!["golden"],
             vec!["embed7b"],
+            vec!["index"],
             vec!["index", "--wemm"],
             vec!["similar", "--text", "query", "--mm7b"],
             vec!["similar", "--text", "query", "--kind", "image"],
@@ -398,11 +394,18 @@ mod tests {
 
     #[cfg(not(feature = "wemm"))]
     #[test]
-    fn index_without_the_wemm_build_opens_no_storage() {
+    fn similar_without_the_wemm_build_opens_no_storage() {
         let dir = tempfile::tempdir().unwrap();
         let pile = dir.path().join("absent.pile");
         let CliRequest::Invoke(invocation) = SPEC
-            .lower_cli_from(["files", "--pile", pile.to_str().unwrap(), "index"])
+            .lower_cli_from([
+                "files",
+                "--pile",
+                pile.to_str().unwrap(),
+                "similar",
+                "--text",
+                "query",
+            ])
             .unwrap()
         else {
             panic!("invoke");

@@ -1,4 +1,6 @@
-//! Native aggregate MCP entrypoint with explicit stdio or HTTP transport.
+//! Native aggregate entrypoint: the MCP server, over stdio or HTTP, and (in
+//! a wemm build) the maintainer of the derived collections only this host can
+//! compute.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -64,6 +66,22 @@ enum Command {
         #[arg(long, value_name = "URL", requires = "http_listen")]
         http_origin: Vec<String>,
     },
+    /// Keep the WeMM indexes of Memory, Wiki and Files derived: bind the model
+    /// once, derive every commit that has no rows, and again whenever the pile
+    /// grows. Prints one line per index per pass. Exits 0 when a compaction
+    /// replaces the pile file, so its supervisor restarts it on the new one.
+    /// Needs a GB10, the complete WeMM root in the pile's models collection,
+    /// and WEMM_ROOT naming it.
+    #[cfg(feature = "wemm")]
+    Maintain {
+        #[arg(long, env = "PILE")]
+        pile: PathBuf,
+        #[arg(long, env = "TRIBLESPACE_KEY")]
+        key: Option<PathBuf>,
+        /// How often to look whether the pile has grown.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+        poll: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -120,7 +138,45 @@ fn main() -> Result<()> {
             };
             catalog.finish(result)
         }
+        #[cfg(feature = "wemm")]
+        Command::Maintain { pile, key, poll } => maintain(pile, key, poll),
     }
+}
+
+/// The derived collections whose mapping only a bound model computes. The
+/// CPU maintenance daemon skips them (`computable_here` is false there), so
+/// this process is what keeps them current; no faculty has an index command.
+#[cfg(feature = "wemm")]
+fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
+    use faculties::{files::Files, memory::Memory, wiki::Wiki};
+
+    let storage = faculties::storage::Storage::shared(pile.clone(), key);
+    let memory = Memory::with_storage(storage.clone());
+    let wiki = Wiki::with_storage(storage.clone());
+    let files = Files::with_storage(storage.clone());
+    let session = faculties::wemm::Session::from_env(&pile)?;
+    let result = faculties::pile_watch::run_until_replaced(
+        &pile,
+        session.backing(),
+        std::time::Duration::from_secs(poll),
+        || {
+            let derived = memory.derive_wemm(&session).context("memory")?;
+            eprintln!("maintain: memory {derived}");
+            let derived = wiki.derive_wemm(&session).context("wiki")?;
+            eprintln!("maintain: wiki {derived}");
+            let derived = files.derive_wemm(&session).context("files")?;
+            eprintln!("maintain: files {derived}");
+            Ok(())
+        },
+    );
+    if result.is_ok() {
+        eprintln!(
+            "maintain: {} was replaced; exiting so a fresh bind maps the new file",
+            pile.display()
+        );
+    }
+    let closed = storage.close();
+    result.and(closed)
 }
 
 /// Take ownership of the process transport before handlers or their children

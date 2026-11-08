@@ -11,6 +11,12 @@
 //! chat template are part of that root ([`mary::ingest::RootParts`]) and are
 //! read from the same facts as the weights; there is no asset directory.
 //!
+//! Nobody runs an index command. Only a process with this runtime bound can
+//! compute the rows (`DeriveMapping::computable_here`), so the CPU
+//! maintenance daemon leaves them alone, and `faculties maintain` binds one
+//! [`Session`] and derives what is missing whenever the pile grows. Queries
+//! score whatever rows exist and say how many foundations have none yet.
+//!
 //! Binding aliases the pile's mapped pages straight into CUDA, so those pages
 //! must not change until the process ends. A dedicated model pile met that by
 //! never being written. The working pile meets it by being append-only: every
@@ -22,7 +28,7 @@
 //! truncate the file any other way, while a WeMM process is bound. The checks
 //! below are diagnostics, not proof of that.
 
-use crate::out::Out;
+use crate::pile_watch::BackingIdentity;
 use crate::storage::{AcquiringReader, FacultyStore};
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
@@ -119,7 +125,7 @@ impl Session {
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
         let model = pile.to_path_buf();
-        let backing = backing(&model)?;
+        let backing = BackingIdentity::of(&model)?;
         let Resolved {
             snapshot,
             root,
@@ -172,6 +178,11 @@ impl Session {
         })
     }
 
+    /// The pile file this session bound, as it observed it.
+    pub fn backing(&self) -> &BackingIdentity {
+        &self.backing
+    }
+
     /// The index over `attributes` of `source`: one descriptor from every
     /// machine, registered idempotently. The descriptor names the model by
     /// its complete root alone, so it carries no blob of its own.
@@ -193,41 +204,40 @@ impl Session {
         Ok((mapping, target))
     }
 
-    /// Derive rows for every foundation of `source` that has none, printing
-    /// the backlog before and after and each derived foundation on stderr. A
-    /// rerun derives only what is still missing; a foundation is published as
-    /// soon as it is done, so stopping loses at most the one in progress.
-    pub fn index(
+    /// Derive rows for every foundation of `source` that has none, naming
+    /// each derived foundation on stderr. A rerun derives only what is still
+    /// missing; a foundation is published as soon as it is done, so stopping
+    /// loses at most the one in progress.
+    pub fn derive(
         &self,
         store: &mut FacultyStore,
         source: Collection<SimpleArchive>,
         attributes: &[Id],
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
-        out: &mut Out<'_>,
-    ) -> Result<()> {
+    ) -> Result<Derived> {
+        let started = std::time::Instant::now();
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let (_, target) = self.register(store, source, attributes, &reader)?;
-        let name = hex::encode(target.handle().raw);
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let backlog = crate::storage::underived(&reader, source, target)?;
-        out.line(format!(
-            "WeMM index {name}: {backlog} foundation(s) to derive"
-        ))?;
         PROGRESS.with(|progress| progress.set((0, backlog)));
         let maintained = with_wemm_runtime(Rc::clone(&self.runtime), || {
             runtime.block_on(store.maintain_with::<Progress>(target, signer))
         })?;
         let after = AcquiringReader::new(store.snapshot()?, runtime.clone());
-        let rows = after
-            .collection_acquiring(target)?
-            .view::<NvFp4CosineIndex<Embedding>>()?
-            .len();
-        let left = crate::storage::underived(&after, source, target)?;
-        out.line(format!(
-            "WeMM index {name}: {rows} row(s), {left} foundation(s) not derived yet"
-        ))?;
-        maintained.map(drop).context("derive the WeMM index")
+        let derived = Derived {
+            index: target.handle(),
+            derived: PROGRESS.with(Cell::get).0,
+            missing: crate::storage::underived(&after, source, target)?,
+            rows: after
+                .collection_acquiring(target)?
+                .view::<NvFp4CosineIndex<Embedding>>()?
+                .len(),
+            elapsed: started.elapsed(),
+        };
+        maintained.with_context(|| format!("derive the WeMM index ({derived})"))?;
+        Ok(derived)
     }
 
     /// Score `query` against the rows of `source`'s index as they stand. It
@@ -239,32 +249,90 @@ impl Session {
         attributes: &[Id],
         runtime: &Arc<tokio::runtime::Runtime>,
         query: Query<'_>,
-    ) -> Result<ReconstructedCosines> {
+    ) -> Result<Scores> {
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let (mapping, target) = self.register(store, source, attributes, &reader)?;
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+        let missing = crate::storage::underived(&reader, source, target)?;
         let index = reader
             .collection_acquiring(target)?
             .view::<NvFp4CosineIndex<Embedding>>()?;
         if index.is_empty() {
-            return Ok(ReconstructedCosines::default());
+            return Ok(Scores {
+                cosines: ReconstructedCosines::default(),
+                missing,
+            });
         }
-        Ok(with_wemm_runtime(
-            Rc::clone(&self.runtime),
-            || match query {
-                Query::Text(text) => mapping.reconstructed_cosines(&index, text),
-                Query::Content(bytes) => mapping.reconstructed_cosines_content(&index, bytes),
-            },
-        )??)
+        let cosines = with_wemm_runtime(Rc::clone(&self.runtime), || match query {
+            Query::Text(text) => mapping.reconstructed_cosines(&index, text),
+            Query::Content(bytes) => mapping.reconstructed_cosines_content(&index, bytes),
+        })??;
+        Ok(Scores { cosines, missing })
+    }
+}
+
+/// What one derive pass over one index did, and what is left.
+#[derive(Clone, Copy, Debug)]
+pub struct Derived {
+    pub index: CollectionHandle,
+    /// Source foundations this pass derived.
+    pub derived: usize,
+    /// Source foundations that still have no row.
+    pub missing: usize,
+    /// Rows the index holds after the pass.
+    pub rows: usize,
+    pub elapsed: std::time::Duration,
+}
+
+impl std::fmt::Display for Derived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "index {}: derived {} foundation(s) in {:.1} s, {} missing, {} row(s)",
+            hex::encode(self.index.raw),
+            self.derived,
+            self.elapsed.as_secs_f64(),
+            self.missing,
+            self.rows
+        )
+    }
+}
+
+/// A query's cosines over the rows that exist, and how many source
+/// foundations have none yet: the answer is partial while that is nonzero.
+pub struct Scores {
+    pub cosines: ReconstructedCosines,
+    pub missing: usize,
+}
+
+impl Scores {
+    /// The line a semantic answer ends with while its index is partial.
+    pub fn partial_note(&self, faculty: &str) -> Option<String> {
+        (self.missing > 0).then(|| {
+            format!(
+                "(partial: {} {faculty} commit(s) have no WeMM rows yet; `faculties maintain` derives them)",
+                self.missing
+            )
+        })
+    }
+
+    /// The refusal for an index with no rows at all.
+    pub fn require_rows(&self, faculty: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.cosines.is_empty(),
+            "the {faculty} WeMM index has no rows yet ({} commit(s) to derive); `faculties maintain` derives them on a GB10",
+            self.missing
+        );
+        Ok(())
     }
 }
 
 thread_local! {
-    /// Foundations derived so far and the backlog an index run started with.
+    /// Foundations derived so far and the backlog a derive pass started with.
     static PROGRESS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
-/// The WeMM mapping, saying on stderr how far a long index run has got. It
+/// The WeMM mapping, saying on stderr how far a long derive pass has got. It
 /// binds from the same descriptor and maps exactly as [`WemmIndex`] does.
 struct Progress(Index);
 
@@ -313,81 +381,9 @@ impl DeriveMapping for Progress {
     }
 }
 
-/// An observed backing file identity: diagnostic evidence, not proof that
-/// another process cannot change mapped pages.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct BackingIdentity {
-    device: u64,
-    inode: u64,
-    bytes: u64,
-}
-
-fn backing(path: &Path) -> Result<BackingIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    anyhow::ensure!(
-        meta.is_file(),
-        "the WeMM model pile must be an ordinary file"
-    );
-    Ok(BackingIdentity {
-        device: meta.dev(),
-        inode: meta.ino(),
-        bytes: meta.len(),
-    })
-}
-
-impl BackingIdentity {
-    /// The pile at `path` is still this file, at least as long as it was:
-    /// appends are expected (the working pile grows), a replaced or shortened
-    /// file is not.
-    fn require_still(&self, path: &Path) -> Result<()> {
-        let now = backing(path)?;
-        anyhow::ensure!(
-            (now.device, now.inode) == (self.device, self.inode),
-            "the WeMM model pile {} was replaced under the bound session; refusing further model use",
-            path.display()
-        );
-        anyhow::ensure!(
-            now.bytes >= self.bytes,
-            "the WeMM model pile {} shrank under the bound session ({} -> {} bytes); refusing further model use",
-            path.display(),
-            self.bytes,
-            now.bytes
-        );
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_grown_pile_is_still_bound_and_a_replaced_or_shortened_one_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let pile = dir.path().join("self.pile");
-        std::fs::write(&pile, b"prefix").unwrap();
-        let bound = backing(&pile).unwrap();
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&pile)
-            .unwrap()
-            .write_all(b" appended")
-            .unwrap();
-        bound.require_still(&pile).unwrap();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&pile)
-            .unwrap()
-            .set_len(3)
-            .unwrap();
-        assert!(bound.require_still(&pile).is_err(), "shortened");
-        let other = dir.path().join("compacted.pile");
-        std::fs::write(&other, b"prefix appended and more").unwrap();
-        std::fs::rename(&other, &pile).unwrap();
-        assert!(bound.require_still(&pile).is_err(), "replaced");
-    }
 
     /// The CPU half of a binding against a real pile: the complete root
     /// resolves from `WEMM_RESOLVE_PILE`'s collection `WEMM_RESOLVE_MODELS`
@@ -454,7 +450,7 @@ mod tests {
     #[ignore = "requires a GB10, a pile holding the complete WeMM root and WEMM_GATE_PNG"]
     fn memory_wiki_and_files_answer_text_queries_on_a_scratch_pile() {
         use crate::memory::operations::parse_time_range;
-        use crate::out::Part;
+        use crate::out::{Out, Part};
 
         let png = std::fs::read(std::env::var("WEMM_GATE_PNG").unwrap()).unwrap();
         let model_pile = std::env::var("WEMM_MODEL_PILE").unwrap();
@@ -539,16 +535,13 @@ mod tests {
         };
         let session = Session::from_env(&pile).unwrap();
         let started = std::time::Instant::now();
-        for report in [
-            run(&mut |out| memory.index_with(&session, out)),
-            run(&mut |out| wiki.index_with(&session, out)),
-            run(&mut |out| files.index_with(&session, out)),
+        for derived in [
+            memory.derive_wemm(&session).unwrap(),
+            wiki.derive_wemm(&session).unwrap(),
+            files.derive_wemm(&session).unwrap(),
         ] {
-            eprintln!("{report}");
-            assert!(
-                report.contains(", 0 foundation(s) not derived yet"),
-                "{report}"
-            );
+            eprintln!("{derived}");
+            assert_eq!(derived.missing, 0, "{derived}");
         }
         eprintln!("indexed in {:.1} s", started.elapsed().as_secs_f64());
 

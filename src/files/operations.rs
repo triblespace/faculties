@@ -604,7 +604,7 @@ fn cmd_add(
     pile.commit(collection, signer, change)
         .context("commit Files import")?;
     // Saving never embeds: on 2026-10-06 one save on a gb10 spent 76 minutes
-    // embedding the whole backlog. Rows come from `files index` only.
+    // embedding the whole backlog. Rows come from `faculties maintain` only.
     ensure_files_after_commit(pile, collection, signer, runtime)?;
 
     if stats.dirs > 0 {
@@ -1459,7 +1459,7 @@ fn cmd_similar<P: TriblePattern>(
         .map(|tag| tag.clone().to_blob().get_handle())
         .collect();
     let attributes = content_attributes();
-    let (cosines, own, label) = match (options.text, options.id) {
+    let (scores, own, label) = match (options.text, options.id) {
         (Some(text), None) => (
             session.cosines(store, collection, &attributes, runtime, Query::Text(text))?,
             None,
@@ -1484,13 +1484,11 @@ fn cmd_similar<P: TriblePattern>(
         }
         _ => bail!("give a file id/hash, or --text \"a query\""),
     };
-    anyhow::ensure!(
-        !cosines.is_empty(),
-        "the Files WeMM index has no rows yet; run `files index`"
-    );
+    scores.require_rows("Files")?;
+    let cosines = &scores.cosines;
     let holders = similar_contents(
         space,
-        &cosines,
+        cosines,
         options.floor.unwrap_or(f64::NEG_INFINITY),
         &tags,
     );
@@ -1506,8 +1504,12 @@ fn cmd_similar<P: TriblePattern>(
         .collect();
     hits.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     hits.truncate(options.limit);
+    let partial = scores.partial_note("Files");
     if hits.is_empty() {
         out.line(format!("no files similar to {label}"))?;
+        if let Some(note) = partial {
+            out.line(note)?;
+        }
         return Ok(());
     }
     out.line(format!(
@@ -1533,6 +1535,9 @@ fn cmd_similar<P: TriblePattern>(
         out.line(format!(
             "  {cos:.3}  {name}  ({mime})  {hash}{tagstr}{others}"
         ))?;
+    }
+    if let Some(note) = partial {
+        out.line(note)?;
     }
     Ok(())
 }
@@ -1782,32 +1787,14 @@ impl Files {
         crate::wemm_unavailable()
     }
 
-    /// Derive the WeMM index over every stored file's content, whoever saved
-    /// it, binding the model the environment names. Saving never embeds.
+    /// Derive the WeMM rows every stored file's content is missing, whoever
+    /// saved it, with a model already bound: what `faculties maintain` runs
+    /// whenever the pile grows. Saving never embeds.
     #[cfg(feature = "wemm")]
-    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
-        self.storage.require_ambient_models("files index")?;
-        self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
-    }
-
-    /// [`Self::index`] with a model already bound.
-    #[cfg(feature = "wemm")]
-    pub fn index_with(&self, session: &crate::wemm::Session, out: &mut Out<'_>) -> Result<()> {
+    pub fn derive_wemm(&self, session: &crate::wemm::Session) -> Result<crate::wemm::Derived> {
         with_files_store(&self.storage, |store, collection, signer, runtime| {
-            session.index(
-                store,
-                collection,
-                &content_attributes(),
-                signer,
-                runtime,
-                out,
-            )
+            session.derive(store, collection, &content_attributes(), signer, runtime)
         })
-    }
-
-    #[cfg(not(feature = "wemm"))]
-    pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
-        crate::wemm_unavailable()
     }
 
     pub fn imports(&self) -> Result<String> {

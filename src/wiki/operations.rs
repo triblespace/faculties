@@ -171,21 +171,12 @@ impl Wiki {
     pub fn search(&self, query: &str, context: bool, all: bool) -> Result<String> {
         cmd_search(self.storage(), query.into(), context, all)
     }
-    /// Derive the WeMM index over every revision's text, binding the model
-    /// the environment names. Explicit only: writing a fragment never embeds.
+    /// Derive the WeMM rows the revisions' text is missing, with a model
+    /// already bound: what `faculties maintain` runs whenever the pile grows.
+    /// Writing a fragment never embeds.
     #[cfg(feature = "wemm")]
-    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
-        self.storage.require_ambient_models("wiki index")?;
-        self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
-    }
-    /// [`Self::index`] with a model already bound.
-    #[cfg(feature = "wemm")]
-    pub fn index_with(&self, session: &crate::wemm::Session, out: &mut Out<'_>) -> Result<()> {
-        cmd_index(self.storage(), session, out)
-    }
-    #[cfg(not(feature = "wemm"))]
-    pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
-        crate::wemm_unavailable()
+    pub fn derive_wemm(&self, session: &crate::wemm::Session) -> Result<crate::wemm::Derived> {
+        derive_wemm(self.storage(), session)
     }
     /// Rank current revisions by meaning, binding the model the environment
     /// names.
@@ -2074,11 +2065,10 @@ fn content_attributes() -> [Id; 1] {
 }
 
 #[cfg(feature = "wemm")]
-fn cmd_index(
+fn derive_wemm(
     storage: WikiStorage<'_>,
     session: &crate::wemm::Session,
-    out: &mut Out<'_>,
-) -> Result<()> {
+) -> Result<crate::wemm::Derived> {
     storage.with_pile(|pile, signer, runtime| {
         let source = storage.storage.open_collection_read(
             pile,
@@ -2086,7 +2076,7 @@ fn cmd_index(
             signer.verifying_key(),
             runtime,
         )?;
-        session.index(pile, source, &content_attributes(), signer, runtime, out)
+        session.derive(pile, source, &content_attributes(), signer, runtime)
     })
 }
 
@@ -2139,20 +2129,23 @@ fn cmd_similar(
             runtime,
         )?;
         let query = crate::wemm::Query::Text(&query);
-        let cosines = session.cosines(pile, source, &content_attributes(), runtime, query)?;
-        anyhow::ensure!(
-            !cosines.is_empty(),
-            "the Wiki WeMM index has no rows yet; run `wiki index`"
-        );
+        let scores = session.cosines(pile, source, &content_attributes(), runtime, query)?;
+        scores.require_rows("Wiki")?;
         views_in(pile, source, signer, &[], runtime, |view, _| {
             let mut report = String::new();
-            for (score, revision) in similar_revisions(view, &cosines).into_iter().take(10) {
+            for (score, revision) in similar_revisions(view, &scores.cosines)
+                .into_iter()
+                .take(10)
+            {
                 let title = wiki_model::revision_records(&view.facts, revision)
                     .first()
                     .map(|row| revision_title(&view.reader, row))
                     .transpose()?
                     .unwrap_or_default();
                 writeln!(report, "{score:6.3}  {revision:x}  {title}").unwrap();
+            }
+            if let Some(note) = scores.partial_note("Wiki") {
+                writeln!(report, "{note}").unwrap();
             }
             Ok(report)
         })

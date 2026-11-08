@@ -181,17 +181,11 @@ impl Memory {
     pub fn similar(&self, _query: &str, _out: &mut Out<'_>) -> Result<()> {
         crate::wemm_unavailable()
     }
-    /// Derive the WeMM index over the journal's prose and images, binding the
-    /// model the environment names. Explicit only: writing a memory never
-    /// embeds.
+    /// Derive the WeMM rows the journal's prose and images are missing, with
+    /// a model already bound: what `faculties maintain` runs whenever the
+    /// pile grows. Writing a memory never embeds.
     #[cfg(feature = "wemm")]
-    pub fn index(&self, out: &mut Out<'_>) -> Result<()> {
-        self.storage.require_ambient_models("memory index")?;
-        self.index_with(&crate::wemm::Session::from_env(self.storage.path())?, out)
-    }
-    /// [`Self::index`] with a model already bound.
-    #[cfg(feature = "wemm")]
-    pub fn index_with(&self, session: &crate::wemm::Session, out: &mut Out<'_>) -> Result<()> {
+    pub fn derive_wemm(&self, session: &crate::wemm::Session) -> Result<crate::wemm::Derived> {
         self.with_operation(|storage| {
             storage.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
                 let source = storage.storage.open_collection_local(
@@ -199,13 +193,9 @@ impl Memory {
                     MEMORY_SCOPE_ID,
                     signer.verifying_key(),
                 )?;
-                session.index(pile, source, &content_attributes(), signer, runtime, out)
+                session.derive(pile, source, &content_attributes(), signer, runtime)
             })
         })
-    }
-    #[cfg(not(feature = "wemm"))]
-    pub fn index(&self, _out: &mut Out<'_>) -> Result<()> {
-        crate::wemm_unavailable()
     }
     pub fn tag(&self, tag: Option<&str>, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| list_tags(storage, tag, out))
@@ -769,7 +759,7 @@ impl MemoryStorage<'_> {
 
     /// Score a text query against the Memory index as it stands.
     #[cfg(feature = "wemm")]
-    fn cosines(&self, session: &crate::wemm::Session, query: &str) -> Result<ReconstructedCosines> {
+    fn cosines(&self, session: &crate::wemm::Session, query: &str) -> Result<crate::wemm::Scores> {
         self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
             let source = self.storage.open_collection_local(
                 pile,
@@ -967,8 +957,8 @@ fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<
 
 // ── semantic index and search (WeMM) ─────────────────────────────────────
 // Where BM25 matches tokens, this matches MEANING: a paraphrase with no shared
-// words still recalls the right memory. `memory index` derives one WeMM row
-// set per journal commit from its chunk prose and wordless images, keyed by
+// words still recalls the right memory. `faculties maintain` derives one WeMM
+// row set per journal commit from its chunk prose and wordless images, keyed by
 // content handle (`crate::wemm`); `memory similar` and `memory context
 // --about/--filter/--remove` score a query against those rows and join them
 // to the journal here, at the point of use. Text and images share the one
@@ -1028,7 +1018,9 @@ fn semantic_scores(
     if session.is_none() {
         *session = Some(crate::wemm::Session::from_env(storage.storage.path())?);
     }
-    let cosines = storage.cosines(session.as_ref().expect("bound above"), query)?;
+    let cosines = storage
+        .cosines(session.as_ref().expect("bound above"), query)?
+        .cosines;
     if cosines.is_empty() {
         return Ok(None);
     }
@@ -1052,20 +1044,22 @@ fn similar(
     if query.is_empty() {
         bail!("memory similar requires a query");
     }
-    let cosines = storage.cosines(session, query)?;
-    anyhow::ensure!(
-        !cosines.is_empty(),
-        "the Memory WeMM index has no rows yet; run `memory index`"
-    );
+    let scores = storage.cosines(session, query)?;
+    scores.require_rows("Memory")?;
+    let cosines = &scores.cosines;
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
-    let mut ranked: Vec<(f64, Id)> = chunk_cosines(space, &cosines)
+    let mut ranked: Vec<(f64, Id)> = chunk_cosines(space, cosines)
         .into_iter()
         .map(|(chunk, cosine)| (cosine, chunk))
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let partial = scores.partial_note("Memory");
     if ranked.is_empty() {
         out.line("no matches.".to_owned())?;
+        if let Some(note) = partial {
+            out.line(note)?;
+        }
         return Ok(());
     }
     for (cos, chunk) in ranked.into_iter().take(10) {
@@ -1075,6 +1069,9 @@ fn similar(
         if let Some(handle) = chunk_image_handle(space, chunk) {
             emit_image(&loaded.memory.reader, handle, out)?;
         }
+    }
+    if let Some(note) = partial {
+        out.line(note)?;
     }
     Ok(())
 }
@@ -1446,8 +1443,8 @@ fn create_chunk(
 /// JUST a chunk (tag KIND_CHUNK_ID) whose content is a picture instead of prose:
 /// no `ctx::summary`, the image bytes live on `ctx::image`. Same time-coordinate
 /// as any chunk — `<when>` is a single `YYYY-MM-DDTHH:MM:SS` point (start==end)
-/// or a `from..to` range. `memory index` places it in the one WeMM space with
-/// text memories, so it ranks in `memory similar` by MEANING beside them.
+/// or a `from..to` range. `faculties maintain` places it in the one WeMM space
+/// with text memories, so it ranks in `memory similar` by MEANING beside them.
 /// Reference it from prose
 /// like any chunk: `[caption](memory:<hex>)`.
 

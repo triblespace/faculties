@@ -274,8 +274,11 @@ fn chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     let body = match chunk_summary_handle(space, id) {
         Some(handle) => {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            Some(if raw_memory { summary.chars().count() }
-                else { summary.trim_end().chars().count() })
+            Some(if raw_memory {
+                summary.chars().count()
+            } else {
+                summary.trim_end().chars().count()
+            })
         }
         None if chunk_image_handle(space, id).is_some() => {
             Some(format!("[image memory @ {range}]").chars().count())
@@ -958,7 +961,7 @@ fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
     let ids: Vec<String> = unscorable.iter().map(|id| format!("{id:x}")).collect();
     Some(format!(
         "memory: {} unindexed chunk(s) not scorable for {label} — kept (fail-open); \
-         run `memory index` to make them filterable: {}",
+         `faculties maintain` makes them filterable: {}",
         unscorable.len(),
         ids.join(", ")
     ))
@@ -1261,8 +1264,11 @@ where
         let summary_handle = chunk_summary_handle(space, id);
         let body = if let Some(handle) = summary_handle {
             let summary: View<str> = reader.get(handle).context("read chunk summary")?;
-            Some(if opts.raw_memory { summary.to_string() }
-                else { summary.trim_end().to_owned() })
+            Some(if opts.raw_memory {
+                summary.to_string()
+            } else {
+                summary.trim_end().to_owned()
+            })
         } else if chunk_image_handle(space, id).is_some() {
             let range = format_time_range(key_to_epoch(s), key_to_epoch(e));
             Some(format!("[image memory @ {range}]"))
@@ -1333,8 +1339,16 @@ mod recollection_tests {
             let epoch = Epoch::from_tai_seconds(seconds);
             (epoch, epoch).try_to_inline().unwrap()
         };
-        for text in ["", "\n\n", " \t", "\nleading\n", "CRLF\r\n",
-            "trailing \t\n", "\u{2003}\u{a0}", "e\u{301} 🐝\n"] {
+        for text in [
+            "",
+            "\n\n",
+            " \t",
+            "\nleading\n",
+            "CRLF\r\n",
+            "trailing \t\n",
+            "\u{2003}\u{a0}",
+            "e\u{301} 🐝\n",
+        ] {
             let fragment = entity! {
                 ExclusiveId::force_ref(&A) @
                 metadata::tag: &KIND_CHUNK_ID,
@@ -1345,21 +1359,29 @@ mod recollection_tests {
             let mut blobs = fragment.blobs().clone();
             let reader = blobs.snapshot().unwrap();
             let spans = collect_chunk_spans(fragment.facts());
-            let ordinary = chunk_cost(&reader, fragment.facts(), &spans,
-                &mut [None], 0, false).unwrap();
-            let raw = chunk_cost(&reader, fragment.facts(), &spans,
-                &mut [None], 0, true).unwrap();
-            assert_eq!(raw - ordinary, text.chars().count() - text.trim_end().chars().count());
+            let ordinary =
+                chunk_cost(&reader, fragment.facts(), &spans, &mut [None], 0, false).unwrap();
+            let raw = chunk_cost(&reader, fragment.facts(), &spans, &mut [None], 0, true).unwrap();
+            assert_eq!(
+                raw - ordinary,
+                text.chars().count() - text.trim_end().chars().count()
+            );
             let mut options = CoverOpts::plain(raw);
             options.raw_memory = true;
-            let report = render_cover_report(fragment.facts(), &reader, &options,
-                &mut |_| panic!("plain raw recall must not score semantically")).unwrap();
+            let report = render_cover_report(fragment.facts(), &reader, &options, &mut |_| {
+                panic!("plain raw recall must not score semantically")
+            })
+            .unwrap();
             assert_eq!(report.entries.len(), 1);
             assert_eq!(report.entries[0].body.as_deref(), Some(text));
             assert_eq!(report.entries[0].recall, format!("memory raw {A:x}"));
             options.budget_chars = raw - 1;
-            assert!(render_cover_report(fragment.facts(), &reader, &options,
-                &mut |_| Ok(None)).unwrap().entries.is_empty());
+            assert!(
+                render_cover_report(fragment.facts(), &reader, &options, &mut |_| Ok(None))
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
         }
     }
 
@@ -1368,7 +1390,8 @@ mod recollection_tests {
         use triblespace::core::repo::SnapshotSource;
         let mut blobs = MemoryBlobStore::new();
         let handle = blobs.insert(Blob::<blobencodings::RawBytes>::new(
-            anybytes::Bytes::from_source(b"synthetic image, never decoded".to_vec())));
+            anybytes::Bytes::from_source(b"synthetic image, never decoded".to_vec()),
+        ));
         let point = |seconds: f64| {
             let epoch = Epoch::from_tai_seconds(seconds);
             (epoch, epoch).try_to_inline().unwrap()
@@ -1382,13 +1405,18 @@ mod recollection_tests {
         };
         let reader = blobs.snapshot().unwrap();
         let mut options = CoverOpts::plain(10_000);
-        let ordinary = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
+        let ordinary =
+            render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
         options.raw_memory = true;
         let raw = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
         assert_eq!(raw.entries, ordinary.entries);
         assert_eq!(raw.entries.len(), 1);
         assert!(!raw.entries[0].recall.starts_with("memory raw "));
-        assert!(raw.entries[0].body.as_ref().unwrap().starts_with("[image memory @ "));
+        assert!(raw.entries[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .starts_with("[image memory @ "));
     }
 
     #[test]
@@ -1397,7 +1425,7 @@ mod recollection_tests {
         for gate in ["--filter", "--remove"] {
             assert_eq!(
                 unscorable_warning(gate, &[B, A]).unwrap(),
-                format!("memory: 2 unindexed chunk(s) not scorable for {gate} — kept (fail-open); run `memory index` to make them filterable: {B:x}, {A:x}")
+                format!("memory: 2 unindexed chunk(s) not scorable for {gate} — kept (fail-open); `faculties maintain` makes them filterable: {B:x}, {A:x}")
             );
         }
     }

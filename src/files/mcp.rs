@@ -32,7 +32,7 @@ const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProper
 const TOOLS: &[Tool] = &[
     Tool {
         name: "files_add",
-        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. Importing never embeds; `files_index` does.",
+        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. Importing never embeds; `faculties maintain` derives the WeMM rows in the background.",
         input_schema: r#"{"type":"object","properties":{"data":{"type":"string","description":"Base64-encoded file bytes"},"name":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["data","name","mime"],"additionalProperties":false}"#,
     },
     Tool {
@@ -52,16 +52,15 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":["id","name"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. Importing never embeds; `files_index` does.",
+        name: "files_fetch", description: "Fetch a URL and import its bytes as a file. Importing never embeds; `faculties maintain` derives the WeMM rows in the background.",
         input_schema: r#"{"type":"object","properties":{"url":{"type":"string"},"mime":{"type":"string"},"name":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"max_bytes":{"type":"integer","minimum":1,"default":8388608}},"required":["url"],"additionalProperties":false}"#,
     },
     Tool {
         name: "files_search", description: "Search stored file names, media types, and tags.",
         input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"#,
     },
-    Tool { name: "files_index", description: "Derive the WeMM index over every stored file's content, whoever saved it: images, text, HTML text and PDF text layers through one model. Requires the wemm build on a GB10, the complete WeMM root in the pile's models collection, and WEMM_ROOT naming it; binds the model (tens of seconds) and may run for hours.", input_schema: EMPTY_SCHEMA },
     Tool {
-        name: "files_similar", description: "Rank stored files by meaning in the one WeMM space for text, images and documents. Supply exactly one of id or text. Scores are reconstructed cosines, not calibrated relevance; floor is an optional cosine in [-1,1]. A content held by several files is one hit. Requires the wemm build on a GB10 and binds the model per call.",
+        name: "files_similar", description: "Rank stored files by meaning in the one WeMM space for text, images and documents. Supply exactly one of id or text. Scores are reconstructed cosines, not calibrated relevance; floor is an optional cosine in [-1,1]. A content held by several files is one hit. Requires the wemm build on a GB10 and binds the model per call. `faculties maintain` derives the rows in the background; a partial index says so.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"floor":{"type":"number","minimum":-1,"maximum":1},"limit":{"type":"integer","minimum":0,"default":10},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"additionalProperties":false}"#,
     },
     Tool { name: "files_imports", description: "List stored imports.", input_schema: EMPTY_SCHEMA },
@@ -246,10 +245,6 @@ impl Faculty for Files {
                     },
                     out,
                 )
-            }
-            "files_index" => {
-                let _: Empty = decode_arguments(arguments)?;
-                files.index(out)
             }
             "files_imports" => {
                 let _: Empty = decode_arguments(arguments)?;

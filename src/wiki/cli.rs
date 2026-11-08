@@ -153,12 +153,9 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Derive the WeMM index over every revision's text (wemm build on a
-    /// GB10; WEMM_ROOT names the complete root in the models collection).
-    /// Resumable; prints the
-    /// commits still to derive.
-    Index,
-    /// Rank current revisions by meaning against the WeMM index.
+    /// Rank current revisions by meaning against the WeMM index, whose rows
+    /// `faculties maintain` derives in the background; a partial index says
+    /// so.
     Similar {
         query: String,
     },
@@ -312,7 +309,6 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             context,
             all,
         } => out.text(wiki.search(&query, context, all)?),
-        Command::Index => wiki.index(out),
         Command::Similar { query } => out.text(wiki.similar(&query)?),
         Command::Batch {
             action: BatchAction::Export { dir },
