@@ -489,7 +489,7 @@ fn failed_predicate_is_diagnostic_and_pause_still_short_circuits_it() {
         .env_remove("DRIVE_ENDPOINT")
         .output()
         .unwrap();
-    assert!(due.status.success());
+    assert!(!due.status.success());
     assert!(String::from_utf8_lossy(&due.stderr).contains("status unavailable"));
     assert!(!String::from_utf8_lossy(&due.stdout).contains("must not be announced as due"));
     operations
