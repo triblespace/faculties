@@ -393,9 +393,8 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
-/// The cover selector of `orient wake --pairs`: `--selector` when given;
-/// otherwise the grid with `--sealed-head` (the selector behind it) and the
-/// walk without.
+/// The cover selector of `orient wake --pairs`: the grid only with
+/// `--selector grid`; otherwise the walk (the default and the rollback).
 fn wake_selector(selector: Option<&str>) -> crate::memory_cover::Selector {
     use crate::memory_cover::Selector;
     match selector {
