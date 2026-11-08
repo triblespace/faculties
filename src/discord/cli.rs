@@ -44,9 +44,13 @@ pub struct Cli {
     /// initialize explicitly with trible pile signing-key init.
     #[arg(long, env = "TRIBLESPACE_KEY", global = true)]
     key: Option<PathBuf>,
-    /// Explicit legacy token override. Without it, resolve the pile's exact
-    /// Secrets reference. Use @path or @- to avoid exposing an override in argv.
-    #[arg(long, env = "DISCORD_TOKEN", hide_env_values = true, global = true)]
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
+    /// Explicit host token override (also with a workspace selected). Otherwise
+    /// use selected Secrets; legacy mode alone also accepts DISCORD_TOKEN.
+    /// Use @path or @- to avoid exposing an override in argv. Workspace selection
+    /// routes collections; it is not a sandbox for this deliberate override.
+    #[arg(long, global = true)]
     token: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -282,10 +286,9 @@ enum ChannelsCommand {
 }
 
 pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let command = cli
-        .command
-        .take()
-        .ok_or_else(|| anyhow!("no Discord command"))?;
+    let Some(command) = cli.command.take() else {
+        return out.line(Cli::command().render_help().to_string());
+    };
     let command = match command {
         Command::Collection(command) => command,
         Command::Live(args) => return run_live(&cli, args),
@@ -306,9 +309,17 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 out,
             )
         }
-        Command::Warm { text, hear } => return warm(cli.pile.as_deref(), &text, hear, out),
+        Command::Warm { text, hear } => {
+            if let Some(storage) = selected_storage(&cli)? {
+                storage.require_ambient_models("discord warm")?;
+            }
+            return warm(cli.pile.as_deref(), &text, hear, out);
+        }
         #[cfg(feature = "discord-hearing")]
         Command::Hear { wav } => {
+            if let Some(storage) = selected_storage(&cli)? {
+                storage.require_ambient_models("discord hear")?;
+            }
             let pile = cli
                 .pile
                 .clone()
@@ -319,15 +330,11 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let token = if matches!(&command, CommandMode::Auth { .. }) {
         None
     } else {
-        cli.token
-            .as_deref()
-            .map(|raw| load_value_or_file_trimmed(raw, "Discord token"))
-            .transpose()?
+        cli_token(&cli)?
     };
-    let pile = cli
-        .pile
-        .ok_or_else(|| anyhow!("missing pile; pass --pile or set PILE"))?;
-    let operations = Discord::new(pile, cli.key);
+    let storage =
+        selected_storage(&cli)?.ok_or_else(|| anyhow!("missing pile; pass --pile or set PILE"))?;
+    let operations = Discord::with_storage(storage);
     let operations = match token {
         Some(token) => operations.with_token(token),
         None => operations,
@@ -399,6 +406,21 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
         } => render::addressed(&operations.channel_addressing()?, out),
     }
 }
+
+/// Resolve once per invocation; all nested faculties inherit this owner.
+fn selected_storage(cli: &Cli) -> Result<Option<crate::storage::Storage>> {
+    match &cli.pile {
+        Some(pile) => cli
+            .workspace
+            .storage(pile.clone(), cli.key.clone())
+            .map(Some),
+        None if cli.workspace.workspace.is_some() => {
+            bail!("workspace selection needs a pile (--pile or PILE)")
+        }
+        None => Ok(None),
+    }
+}
+
 pub fn run() -> Result<()> {
     let mut cli = Cli::parse();
     match cli.command.take() {
@@ -468,6 +490,12 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     if voice.is_none() && !wants_intake {
         bail!(NOTHING_TO_RUN);
     }
+    let storage = selected_storage(cli)?.map(|storage| storage.retained());
+    if voice.is_some() || hear {
+        if let Some(storage) = &storage {
+            storage.require_ambient_models("discord live voice/hearing")?;
+        }
+    }
     let state = StateDir::resolve(state.state_dir)?;
     // What was asked for or begun before now is judged by
     // `crate::discord::say_turn`, never blindly played.
@@ -481,10 +509,9 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     }
     // One store for the life of the process, shared by intake and the voice,
     // rather than one pile open per message.
-    let discord = cli
-        .pile
-        .clone()
-        .map(|pile| Discord::with_storage(crate::storage::Storage::shared(pile, cli.key.clone())));
+    let discord = storage
+        .as_ref()
+        .map(|storage| Discord::with_storage(storage.clone()));
     #[cfg(feature = "discord-voice")]
     if let (Some(_), Some(discord)) = (voice, &discord) {
         discord.preflight_write().context(
@@ -492,7 +519,7 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
              written",
         )?;
     }
-    let token = require_token(cli)?;
+    let token = require_token(cli, discord.as_ref())?;
     // Intake that cannot write is off, loudly, and a voice connection runs
     // either way; without one, nothing is left to run.
     let off = |reason: String| -> Result<Option<Intake>> {
@@ -567,7 +594,10 @@ fn run_live(cli: &Cli, args: LiveArgs) -> Result<()> {
     // Whatever is still running (a download, say) does not hold the process
     // up past its own bounded shutdown.
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-    outcome
+    match storage {
+        Some(storage) => storage.finish(outcome),
+        None => outcome,
+    }
 }
 
 /// `discord hear`: a clip heard as the voice channel is.
@@ -608,12 +638,10 @@ fn say(
     out: &mut Out<'_>,
 ) -> Result<()> {
     options.validate()?;
-    let pile = cli
-        .pile
-        .clone()
+    let storage = selected_storage(cli)?
         .ok_or_else(|| anyhow!("discord say publishes into the pile; pass --pile or set PILE"))?;
     let guild = guild.map(|guild| guild.to_string());
-    let request = Discord::new(pile, cli.key.clone()).request_speech(
+    let request = Discord::with_storage(storage).request_speech(
         guild.as_deref(),
         &channel.to_string(),
         text,
@@ -729,24 +757,33 @@ fn load_attachments(paths: &[PathBuf]) -> Result<Vec<SendAttachment>> {
     Ok(attachments)
 }
 
-fn require_token(cli: &Cli) -> Result<String> {
-    if cli.token.is_none() {
-        let pile = cli.pile.clone().ok_or_else(|| anyhow!(
+fn require_token(cli: &Cli, discord: Option<&Discord>) -> Result<String> {
+    let token = cli_token(cli)?;
+    let Some(token) = token else {
+        let discord = discord.ok_or_else(|| anyhow!(
             "pile-backed Discord authentication needs --pile or PILE; existing callers may explicitly supply --token"
         ))?;
-        return Discord::new(pile, cli.key.clone())
-            .token()
-            .map(|token| token.to_string());
-    }
-    let token = cli
-        .token
-        .as_deref()
-        .ok_or_else(|| anyhow!("missing Discord token; pass --token, DISCORD_TOKEN, @path, or @-"))
-        .and_then(|raw| load_value_or_file_trimmed(raw, "Discord token"))?;
+        return discord.token().map(|token| token.to_string());
+    };
     if token.is_empty() {
         bail!("empty Discord token");
     }
     Ok(token)
+}
+
+fn cli_token(cli: &Cli) -> Result<Option<String>> {
+    // Ambient host credentials are a legacy convenience, never a fallback
+    // from a selected workspace's missing or unreadable Secrets role.
+    let raw = cli.token.clone().or_else(|| {
+        cli.workspace
+            .workspace
+            .is_none()
+            .then(|| std::env::var("DISCORD_TOKEN").ok())
+            .flatten()
+    });
+    raw.as_deref()
+        .map(|raw| load_value_or_file_trimmed(raw, "Discord token"))
+        .transpose()
 }
 
 fn load_value_or_file(raw: &str, label: &str) -> Result<String> {
@@ -770,6 +807,206 @@ fn load_value_or_file_trimmed(raw: &str, label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace::core::collection::CollectionStoreExt;
+    use triblespace::core::metadata;
+    use triblespace::prelude::*;
+
+    #[test]
+    fn workspace_token_precedence_is_process_local() {
+        for case in ["legacy", "selected", "selected-explicit", "legacy-explicit"] {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear()
+                .env("DISCORD_WORKSPACE_TOKEN_TEST", case)
+                .env("DISCORD_TOKEN", "synthetic-ambient-token")
+                .env(
+                    "DISCORD_WORKSPACE_TEST_REVISION",
+                    format!("{:X}", genid().id),
+                )
+                .args([
+                    "--exact",
+                    "discord::cli::tests::workspace_token_precedence_child",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{case}: {} {}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_token_precedence_child() {
+        let Ok(case) = std::env::var("DISCORD_WORKSPACE_TOKEN_TEST") else {
+            return;
+        };
+        let revision = std::env::var("DISCORD_WORKSPACE_TEST_REVISION").unwrap();
+        let mut args = vec!["discord", "auth", "status"];
+        if case.starts_with("selected") {
+            // Exercise FACULTIES_WORKSPACE as well as the explicit flag.
+            std::env::set_var("FACULTIES_WORKSPACE", &revision);
+        }
+        if case.ends_with("-explicit") {
+            args.extend(["--token", "synthetic-explicit-token"]);
+        }
+        let cli = Cli::try_parse_from(args).unwrap();
+        let token = cli_token(&cli).unwrap();
+        let expected = match case.as_str() {
+            "legacy" => Some("synthetic-ambient-token"),
+            "selected" => None,
+            "selected-explicit" | "legacy-explicit" => Some("synthetic-explicit-token"),
+            _ => panic!("unknown fixture case"),
+        };
+        assert_eq!(token.as_deref(), expected);
+    }
+
+    #[test]
+    fn workspace_help_and_exact_selector_do_not_open_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("missing.pile");
+        let key = directory.path().join("missing.key");
+        let revision = format!("{:X}", genid().id);
+        let args = [
+            "discord",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--workspace",
+            &revision,
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let mut help = String::new();
+        execute(
+            cli,
+            &mut Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    help.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(help.contains("--workspace"));
+        assert!(!pile.exists());
+        assert!(!key.exists());
+        assert!(
+            Cli::try_parse_from(["discord", "auth", "status", "--workspace", "label"]).is_err()
+        );
+        let cli =
+            Cli::try_parse_from(["discord", "auth", "status", "--workspace", &revision]).unwrap();
+        assert_eq!(
+            cli.workspace.workspace,
+            Some(crate::cli_workspace::parse_revision(&revision).unwrap())
+        );
+    }
+
+    #[test]
+    fn selected_say_and_live_auth_reuse_routes_and_never_fall_back_to_private_secrets() {
+        use crate::schemas::{config::config, workspace as attrs};
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("node.pile");
+        let key = directory.path().join("node.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let base = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let secret_role = crate::secrets::DEFAULT_SCOPE_ID;
+        let routes = base
+            .with_pile(|store, signer| {
+                let policy = crate::collection_names::private_policy(signer.verifying_key());
+                let discord = store
+                    .collection("workspace discord", policy.clone())?
+                    .handle();
+                let secrets = store.collection("workspace secrets", policy)?.handle();
+                Ok(std::collections::BTreeMap::from([
+                    (crate::schemas::discord::DEFAULT_SCOPE_ID, discord),
+                    (secret_role, secrets),
+                ]))
+            })
+            .unwrap();
+        let routed = base.clone().with_collections(routes.clone());
+        let secret = crate::secrets::Secrets::with_storage(routed.clone())
+            .add("bot", b"synthetic-workspace-token")
+            .unwrap();
+        Discord::with_storage(routed.clone())
+            .auth_set(secret)
+            .unwrap();
+        let legacy_secret = crate::secrets::Secrets::with_storage(base.clone())
+            .add("bot", b"synthetic-private-token")
+            .unwrap();
+        Discord::with_storage(base.clone())
+            .auth_set(legacy_secret)
+            .unwrap();
+        for include_secrets in [true, false] {
+            let revision = genid();
+            let mut route_facts = Fragment::empty();
+            for (role, root) in &routes {
+                if include_secrets || *role != secret_role {
+                    route_facts += entity! { config::anchor: *role, config::selects: *root };
+                }
+            }
+            base.with_pile(|store, signer| {
+                let config = store.collection(
+                    crate::config::COLLECTION_NAME,
+                    crate::collection_names::private_policy(signer.verifying_key()),
+                )?;
+                store.commit(
+                    config,
+                    signer,
+                    entity! { &revision @
+                        metadata::tag: attrs::WORKSPACE, config::anchor: genid().id,
+                        attrs::enrolled: true, metadata::name: "Synthetic",
+                        attrs::workspace_route*: route_facts,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            let revision = format!("{:X}", revision.id);
+            let cli = Cli::try_parse_from([
+                "discord",
+                "--pile",
+                pile.to_str().unwrap(),
+                "--key",
+                key.to_str().unwrap(),
+                "--workspace",
+                &revision,
+                "say",
+                "--voice-channel",
+                "200000000000000201",
+                "selected request",
+            ])
+            .unwrap();
+            let storage = selected_storage(&cli).unwrap().unwrap().retained();
+            let selected = Discord::with_storage(storage.clone());
+            if include_secrets {
+                assert_eq!(
+                    require_token(&cli, Some(&selected)).unwrap(),
+                    "synthetic-workspace-token"
+                );
+                storage.close().unwrap();
+                execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+            } else {
+                let error = require_token(&cli, Some(&selected)).unwrap_err();
+                assert!(format!("{error:#}").contains("unconfigured"), "{error:#}");
+            }
+            storage.close().unwrap();
+        }
+        assert_eq!(
+            Discord::with_storage(routed)
+                .unsettled_speech("200000000000000201")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(Discord::with_storage(base)
+            .unsettled_speech("200000000000000201")
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn send_parses_repeatable_files_and_optional_text() {

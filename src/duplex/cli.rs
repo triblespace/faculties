@@ -21,6 +21,9 @@ use std::sync::{
     about = "A continuously running spoken channel with a transcript to read from and inject into."
 )]
 pub struct Cli {
+    /// Reserved for explicit refusal until the transcript runtime supports routed storage.
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Session directory holding the transcript, cursor, floor and inject
     /// queue. One running loop per directory.
     #[arg(long, env = "DUPLEX_SESSION", global = true)]
@@ -308,6 +311,10 @@ pub fn main() -> Result<()> {
     crate::cli::with_output("duplex", |out| execute(cli, out))
 }
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    anyhow::ensure!(
+        cli.command.is_none() || cli.workspace.workspace.is_none(),
+        "standalone Duplex does not yet support workspace-selected transcripts; session controls and model/device configuration are not workspace-scoped. Omit --workspace and unset FACULTIES_WORKSPACE to use the existing standalone mode"
+    );
     let path = cli.session.unwrap_or_else(default_session);
     let session = Session::new(path.clone());
     match cli.command {
@@ -353,4 +360,44 @@ fn stop_on_signal() -> Result<Arc<AtomicBool>> {
     ctrlc::set_handler(move || requested.store(true, Ordering::Relaxed))
         .context("install Ctrl-C handler")?;
     Ok(stop)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn selected_commands_fail_before_session_or_device_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = directory.path().join("uncreated-session");
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        for command in [
+            vec!["devices"],
+            vec!["status"],
+            vec!["say", "hello"],
+            vec!["ear"],
+        ] {
+            let mut args = vec![
+                "duplex",
+                "--session",
+                session.to_str().unwrap(),
+                "--workspace",
+                &revision,
+            ];
+            args.extend(command);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let error = execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("does not yet support workspace-selected"));
+        }
+        assert!(!session.exists());
+    }
+
+    #[test]
+    fn selected_no_command_remains_help_without_opening_session() {
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        let cli = Cli::try_parse_from(["duplex", "--workspace", &revision]).unwrap();
+        execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+    }
 }

@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
+use triblespace::core::repo::async_store::{AsyncBlobStoreAcquire, AsyncBlobStoreGet};
+use triblespace::core::repo::Store;
 use triblespace::core::trible::Fragment;
 #[derive(Parser)]
 #[command(
@@ -24,6 +26,8 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Enable tracing spans for projection and collection derivation.
     #[arg(long)]
     trace: bool,
@@ -264,20 +268,68 @@ pub(super) fn import_paths(
     writer.close(result)
 }
 
+/// Selected imports borrow the exact routed owner instead of reopening an
+/// unrouted writer. The legacy entry point keeps its existing opening and
+/// admission behavior when no workspace was selected.
+fn import_paths_with_storage(
+    storage: &crate::storage::Storage,
+    paths: &[PathBuf],
+    source: CliImportSource,
+    finished_before: Option<std::time::SystemTime>,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    if storage.collection_routes().is_none() {
+        return import_paths(
+            storage.path(),
+            storage.key_path(),
+            paths,
+            source,
+            finished_before,
+            out,
+        );
+    }
+    storage.with_store(|pile, signer, runtime| {
+        let mut writer =
+            ArchiveImportWriter::from_store_with_storage(pile, signer, runtime.clone(), storage)?;
+        let total = paths.len();
+        for (index, path) in paths.iter().enumerate() {
+            if total > 1 {
+                eprintln!("[{}/{total}] {}", index + 1, path.display());
+            }
+            import_into(
+                &mut writer,
+                storage.path(),
+                path,
+                source,
+                finished_before,
+                out,
+            )
+            .with_context(|| format!("import {}", path.display()))?;
+        }
+        // Each successful path committed its unit. On error the borrowed
+        // writer drops its unfinished staging; Storage closes the owner.
+        Ok(())
+    })
+}
+
 /// Project one source PATH into the open writer and publish its pieces.
 ///
 /// The writer reads nothing back: an unchanged source cuts into the pieces it
 /// cut before, and publishing them again appends nothing to the pile. The
 /// report says how many pieces and COMMITs the path published and how many
 /// bytes the pile file grew by while it did.
-fn import_into(
-    writer: &mut ArchiveImportWriter,
+fn import_into<P>(
+    writer: &mut ArchiveImportWriter<P>,
     pile: &Path,
     path: &Path,
     source: CliImportSource,
     finished_before: Option<std::time::SystemTime>,
     out: &mut Out<'_>,
-) -> Result<()> {
+) -> Result<()>
+where
+    P: Store + AsyncBlobStoreAcquire + Send,
+    P::Snapshot: AsyncBlobStoreGet,
+{
     let before = pile_length(pile)?;
     let stage = |fragment: Fragment, identity: Identity, source_path: &Path| {
         writer
@@ -328,14 +380,22 @@ fn parse_finished_after(raw: &str) -> std::result::Result<std::time::Duration, S
 
 /// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    let storage = if cli.command.is_none() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    };
     execute_in(&storage, cli, out)
 }
 
 /// The process's whole body: one store, closed for process exit.
 fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
-        .scope_to_exit(|storage| execute_in(storage, cli, out))
+    (if cli.command.is_none() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    })
+    .scope_to_exit(|storage| execute_in(storage, cli, out))
 }
 
 fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {
@@ -433,14 +493,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                         .ok_or_else(|| anyhow!("--finished-after reaches before the clock's epoch"))
                 })
                 .transpose()?;
-            import_paths(
-                &cli.pile,
-                cli.key.as_deref(),
-                &path,
-                source,
-                finished_before,
-                out,
-            )
+            import_paths_with_storage(&storage, &path, source, finished_before, out)
         }
         Command::List { limit } => archive.list(limit, reading(false), out),
         Command::Show { id, force } => archive.show(&id, reading(force), out),
@@ -500,4 +553,143 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
     crate::cli::with_output("archive", |out| execute_to_exit(cli, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace::core::metadata;
+    use triblespace::core::repo::SnapshotSource;
+    use triblespace::prelude::*;
+
+    #[test]
+    fn workspace_is_global_and_no_command_does_not_resolve_it() {
+        let revision = genid().id;
+        let id = format!("{revision:X}");
+        for args in [
+            vec![
+                "archive",
+                "--pile",
+                "/absent.pile",
+                "--workspace",
+                &id,
+                "list",
+            ],
+            vec![
+                "archive",
+                "--pile",
+                "/absent.pile",
+                "list",
+                "--workspace",
+                &id,
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().workspace.workspace,
+                Some(revision)
+            );
+        }
+        let cli =
+            Cli::try_parse_from(["archive", "--pile", "/absent.pile", "--workspace", &id]).unwrap();
+        execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+        let help = Cli::try_parse_from(["archive", "--workspace", &id, "--help"])
+            .err()
+            .unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn local_path_import_uses_the_selected_root_and_missing_role_never_falls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("archive.pile");
+        let key = directory.path().join("archive.key");
+        std::fs::File::create(&pile).unwrap();
+        let signer = crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = crate::storage::Storage::new(pile, Some(key));
+        let scope = crate::schemas::blockdag::DEFAULT_SCOPE_ID;
+        let (legacy, selected) = storage
+            .with_store(|store, _, _| {
+                let legacy = crate::collection_names::open(store, scope, signer.verifying_key())?;
+                let selected = store.collection(
+                    crate::collection_names::require_name(scope),
+                    CollectionPolicy::new(
+                        AdmissionPolicy::Open,
+                        AdmissionPolicy::direct(signer.verifying_key()),
+                    ),
+                )?;
+                Ok((legacy, selected))
+            })
+            .unwrap();
+        assert_ne!(legacy.handle(), selected.handle());
+        let source = directory.path().join("source.jsonl");
+        std::fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"selected\",\"uuid\":\"first\",",
+                "\"timestamp\":\"2026-03-01T15:34:01Z\",",
+                "\"message\":{\"role\":\"user\",\"content\":\"selected workspace\"}}\n",
+            ),
+        )
+        .unwrap();
+        let workspace = storage
+            .with_store(|store, signer, _| {
+                use crate::schemas::{config::config, workspace};
+                let config_collection = crate::collection_names::open(
+                    store,
+                    crate::schemas::config::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                let route = entity! { config::anchor: scope, config::selects: selected.handle() };
+                let fragment = entity! {
+                    metadata::tag: workspace::WORKSPACE, config::anchor: genid().id,
+                    workspace::enrolled: true, metadata::name: "Archive fixture",
+                    workspace::workspace_route*: route,
+                };
+                let revision = fragment.root().unwrap();
+                store.commit(config_collection, signer, fragment)?;
+                Ok(revision)
+            })
+            .unwrap();
+        let revision = format!("{workspace:X}");
+        let cli = Cli::try_parse_from([
+            "archive",
+            "--pile",
+            storage.path().to_str().unwrap(),
+            "--key",
+            storage.key_path().unwrap().to_str().unwrap(),
+            "import",
+            source.to_str().unwrap(),
+            "--workspace",
+            &revision,
+        ])
+        .unwrap();
+        execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+        storage
+            .with_store(|store, _, _| {
+                let snapshot = store.snapshot()?;
+                let legacy_facts: TribleSet = legacy.read(&snapshot)?;
+                let selected_facts: TribleSet = selected.read(&snapshot)?;
+                assert!(
+                    legacy_facts.is_empty(),
+                    "workspace import must not write the legacy root"
+                );
+                assert!(!selected_facts.is_empty());
+                Ok(())
+            })
+            .unwrap();
+        let missing = storage.with_collections(BTreeMap::new());
+        let before = std::fs::read(missing.path()).unwrap();
+        let error = import_paths_with_storage(
+            &missing,
+            &[directory.path().join("missing-source")],
+            CliImportSource::ClaudeCode,
+            None,
+            &mut Out::new(&mut |_| Ok(())),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unconfigured"), "{error:#}");
+        assert_eq!(std::fs::read(missing.path()).unwrap(), before);
+    }
 }

@@ -22,6 +22,8 @@ pub struct Cli {
     /// initialize explicitly with `trible pile signing-key init <pile>`.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Reachy daemon base URL (the `shout` Reachy-speaker target).
     #[arg(long, env = "REACHY_DAEMON", default_value = DEFAULT_DAEMON)]
     daemon: String,
@@ -37,6 +39,137 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_help_does_not_open_bootstrap_and_selector_is_global() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("missing.pile");
+        let key = directory.path().join("missing.key");
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        let cli = Cli::try_parse_from([
+            "voice",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--workspace",
+            &revision,
+        ])
+        .unwrap();
+        let mut help = String::new();
+        execute(
+            cli,
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    help.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(help.contains("--workspace"));
+        assert!(!pile.exists());
+        assert!(!key.exists());
+        let cli = Cli::try_parse_from([
+            "voice",
+            "--pile",
+            "unused",
+            "stream",
+            "--workspace",
+            &revision,
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.workspace.workspace,
+            Some(crate::cli_workspace::parse_revision(&revision).unwrap())
+        );
+    }
+
+    #[test]
+    fn workspace_route_set_is_isolated_and_model_commands_fail_before_io() {
+        use crate::schemas::{config::config, workspace as attrs};
+        use triblespace::core::collection::CollectionStoreExt;
+        use triblespace::core::metadata;
+        use triblespace::prelude::*;
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("node.pile");
+        let key = directory.path().join("node.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let base = crate::storage::Storage::new(pile.clone(), Some(key.clone()));
+        let revision = genid();
+        let root = base
+            .with_pile(|store, signer| {
+                let policy = crate::collection_names::private_policy(signer.verifying_key());
+                let root = store.collection("selected voice", policy.clone())?.handle();
+                let config = store.collection(crate::config::COLLECTION_NAME, policy)?;
+                let route = entity! {
+                    config::anchor: crate::schemas::voice::COLLECTION_SCOPE_ID,
+                    config::selects: root,
+                };
+                store.commit(
+                    config,
+                    signer,
+                    entity! { &revision @
+                        metadata::tag: attrs::WORKSPACE, config::anchor: genid().id,
+                        attrs::enrolled: true, metadata::name: "Synthetic voice",
+                        attrs::workspace_route*: route,
+                    },
+                )?;
+                Ok(root)
+            })
+            .unwrap();
+        let revision = format!("{:X}", revision.id);
+        let args = [
+            "voice",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "--workspace",
+            &revision,
+        ];
+        let cli =
+            Cli::try_parse_from(
+                args.into_iter()
+                    .chain(["route-set", "say", "Test headphones"]),
+            )
+            .unwrap();
+        execute(cli, &mut crate::out::Out::new(&mut |_| Ok(()))).unwrap();
+        let selected = base
+            .clone()
+            .with_collections(std::collections::BTreeMap::from([(
+                crate::schemas::voice::COLLECTION_SCOPE_ID,
+                root,
+            )]));
+        assert_eq!(
+            Voice::with_storage(selected).route(Channel::Say).unwrap(),
+            vec!["Test headphones"]
+        );
+        assert!(!Voice::with_storage(base)
+            .route(Channel::Say)
+            .unwrap()
+            .contains(&"Test headphones".to_owned()));
+        for command in ["say", "shout", "synthesize"] {
+            let cli = Cli::try_parse_from(args.into_iter().chain([command, "@missing-text-file"]))
+                .unwrap();
+            let error = execute(cli, &mut crate::out::Out::new(&mut |_| Ok(()))).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("workspace model-asset routing is unconfigured"),
+                "{error:#}"
+            );
+        }
+        let cli = Cli::try_parse_from(args.into_iter().chain(["stream"])).unwrap();
+        let error = execute_stream(cli).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("workspace model-asset routing is unconfigured"),
+            "{error:#}"
+        );
+    }
 
     #[test]
     fn delivery_flags_are_carried_by_each_speech_command() {
@@ -193,6 +326,7 @@ fn execute_stream(cli: Cli) -> Result<()> {
     let Cli {
         pile,
         key,
+        workspace,
         soma,
         command,
         ..
@@ -206,13 +340,14 @@ fn execute_stream(cli: Cli) -> Result<()> {
         anyhow::bail!("Voice framed execution requires the stream command");
     };
     let channel = Channel::parse(&channel)?;
+    let storage = workspace.storage(pile.clone(), key)?.retained();
+    storage.require_ambient_models("voice stream")?;
     let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&pile)));
     synthesizer.validate_options(&options)?;
     let _pause = pause_file.as_deref().map(|path| {
         eprintln!("  [half-duplex] holding {}", path.display());
         crate::turntaking::PauseGuard::hold(path)
     });
-    let storage = crate::storage::Storage::shared(pile, key);
     let voice = Voice::with_storage(storage.clone());
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -230,8 +365,21 @@ fn execute_stream(cli: Cli) -> Result<()> {
 }
 
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
+    if cli.command.is_none() {
+        return out.line(Cli::command().render_help().to_string());
+    }
+    let storage = cli.workspace.storage(cli.pile.clone(), cli.key)?;
+    if matches!(
+        &cli.command,
+        Some(Command::Say { dry_run: false, .. })
+            | Some(Command::Shout { dry_run: false, .. })
+            | Some(Command::Synthesize { .. })
+            | Some(Command::Stream { .. })
+    ) {
+        storage.require_ambient_models("voice synthesis")?;
+    }
     let synthesizer = Synthesizer::new(ModelSources::from_environment(Some(&cli.pile)));
-    let voice = Voice::new(cli.pile, cli.key);
+    let voice = Voice::with_storage(storage);
     let device = Device::new(voice.clone(), cli.daemon, cli.soma, synthesizer.clone());
     match cli.command {
         None => anyhow::bail!("Voice requires an explicit command"),

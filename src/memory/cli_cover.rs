@@ -48,6 +48,24 @@ pub(super) fn cover_session_dir(key: &str) -> Result<PathBuf> {
     Ok(base.join("faculties").join("cover").join(key))
 }
 
+/// Selected caches are local rendering state for one exact source binding.
+/// Keep legacy paths unchanged, and never read them as a selected workspace.
+fn scoped_cover_dir(storage: &crate::storage::Storage, dir: PathBuf) -> Result<PathBuf> {
+    let Some(workspace) = storage.selected_workspace() else {
+        return Ok(dir);
+    };
+    let root = storage
+        .collection_handle(crate::schemas::memory::DEFAULT_SCOPE_ID)?
+        .context("selected workspace has no Memory root")?;
+    storage.with_pile(|_, signer| {
+        Ok(dir
+            .join("workspace")
+            .join(hex::encode(signer.verifying_key().as_bytes()))
+            .join(format!("{:X}", workspace.id))
+            .join(hex::encode(root.raw)))
+    })
+}
+
 /// How many chunks a cover of `total_chars` splits into at `chunk_chars`.
 pub(super) fn cover_chunk_count(total_chars: usize, chunk_chars: usize) -> usize {
     total_chars.div_ceil(chunk_chars)
@@ -199,7 +217,13 @@ pub(super) fn cover_reset_cursor(dir: &Path) -> Result<usize> {
 /// `memory cover start|continue|status|reset` — the cursor state machine a
 /// harness hook drives to force complete ingestion of the context cover:
 /// reset (or start) on session start, block turn-end until `status` exits 0.
-pub(super) fn execute(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<i32> {
+pub(super) fn execute(
+    memory: &Memory,
+    storage: &crate::storage::Storage,
+    args: &[String],
+    literal_from: Option<usize>,
+    out: &mut Out<'_>,
+) -> Result<i32> {
     let usage = "usage: memory cover start [--chars N] [--chunk-chars M] [--session KEY]\n\
                  \x20      memory cover continue [--session KEY]\n\
                  \x20      memory cover status [--session KEY]\n\
@@ -207,21 +231,30 @@ pub(super) fn execute(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Re
     let Some(verb) = args.first().map(String::as_str) else {
         bail!("{usage}");
     };
-    if matches!(verb, "--help" | "-h") {
+    if args
+        .iter()
+        .take(literal_from.unwrap_or(args.len()))
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
         out.line(format!("{usage}"))?;
         return Ok(0);
+    }
+    let option_end = literal_from.unwrap_or(args.len()).max(1);
+    if let Some(literal) = args.get(option_end) {
+        bail!("unexpected literal argument `{literal}` after --\n{usage}");
     }
     let mut budget_chars: usize = COVER_DEFAULT_CHARS;
     let mut chunk_chars: usize = COVER_DEFAULT_CHUNK_CHARS;
     let mut session = "default".to_string();
     {
         let mut i = 1;
-        while i < args.len() {
+        while i < option_end {
             let flag = args[i].as_str();
             match flag {
                 "--chars" | "--chunk-chars" | "--session" => {
                     let raw = args
                         .get(i + 1)
+                        .filter(|_| i + 1 < option_end)
                         .ok_or_else(|| anyhow!("{flag} needs a value\n{usage}"))?;
                     match flag {
                         "--session" => session = raw.clone(),
@@ -245,7 +278,7 @@ pub(super) fn execute(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Re
             }
         }
     }
-    let dir = cover_session_dir(&session)?;
+    let dir = scoped_cover_dir(storage, cover_session_dir(&session)?)?;
 
     match verb {
         "start" => {
@@ -305,5 +338,139 @@ pub(super) fn execute(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Re
             Ok(0)
         }
         other => bail!("unknown cover subcommand `{other}`\n{usage}"),
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use crate::schemas::{config::config, workspace as attrs};
+    use crate::storage::Storage;
+    use triblespace::core::collection::CollectionStoreExt;
+    use triblespace::core::metadata;
+    use triblespace::prelude::*;
+
+    #[test]
+    fn literal_cover_options_cannot_reset_another_session_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let other = directory.path().join("faculties/cover/other");
+        cover_write_state(&other, "abcdefgh", 4, "synthetic".into()).unwrap();
+        cover_advance(&other).unwrap();
+        let before = std::fs::read(other.join(COVER_CURSOR_FILE)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "memory::cli_cover::workspace_tests::literal_cover_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("XDG_CACHE_HOME", directory.path())
+            .env("MEMORY_COVER_LITERAL_TEST", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(other.join(COVER_CURSOR_FILE)).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn literal_cover_child() {
+        if std::env::var_os("MEMORY_COVER_LITERAL_TEST").is_none() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("absent.pile");
+        let cli = super::super::cli::Cli::try_parse_from([
+            "memory",
+            "--pile",
+            pile.to_str().unwrap(),
+            "cover",
+            "reset",
+            "--",
+            "--session",
+            "other",
+        ])
+        .unwrap();
+        let error = super::super::cli::execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected literal argument"),
+            "{error:#}"
+        );
+        assert!(!pile.exists());
+        // A top-level delimiter leaves the verb positional, not an option.
+        let default = cover_session_dir("default").unwrap();
+        cover_write_state(&default, "abcdefgh", 4, "synthetic".into()).unwrap();
+        cover_advance(&default).unwrap();
+        let cli = super::super::cli::Cli::try_parse_from([
+            "memory",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--",
+            "cover",
+            "reset",
+        ])
+        .unwrap();
+        super::super::cli::execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+        assert_eq!(cover_read_state(&default).unwrap().unwrap().1.offset, 0);
+        assert!(!pile.exists());
+    }
+
+    #[test]
+    fn selected_cover_cache_never_reads_another_workspace_or_legacy_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("node.pile");
+        let key = directory.path().join("node.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let base = Storage::new(pile.clone(), Some(key.clone()));
+        let first = genid();
+        let second = genid();
+        let missing = genid();
+        base.with_pile(|pile, signer| {
+            let policy = crate::collection_names::private_policy(signer.verifying_key());
+            let root = pile.collection("scratch Memory", policy.clone())?.handle();
+            let config_root = pile.collection(crate::config::COLLECTION_NAME, policy)?;
+            for revision in [&first, &second, &missing] {
+                let routes = if revision.id == missing.id { Fragment::empty() } else {
+                    entity! { config::anchor: crate::schemas::memory::DEFAULT_SCOPE_ID, config::selects: root }
+                };
+                pile.commit(config_root, signer, entity! { revision @
+                    metadata::tag: attrs::WORKSPACE, config::anchor: genid().id,
+                    attrs::enrolled: true, metadata::name: "Synthetic cache binding",
+                    attrs::workspace_route*: routes,
+                })?;
+            }
+            Ok(())
+        }).unwrap();
+        let select = |revision| {
+            crate::cli_workspace::WorkspaceArgs {
+                workspace: Some(revision),
+            }
+            .storage(pile.clone(), Some(key.clone()))
+            .unwrap()
+        };
+        let cache = directory.path().join("default-session");
+        cover_write_state(&cache, "legacy private text", 100, "synthetic".into()).unwrap();
+        let a = scoped_cover_dir(&select(first.id), cache.clone()).unwrap();
+        cover_write_state(&a, "workspace A text", 100, "synthetic".into()).unwrap();
+        let b = scoped_cover_dir(&select(second.id), cache.clone()).unwrap();
+        assert_ne!(a, b);
+        assert!(cover_read_state(&b).unwrap().is_none());
+        assert!(cover_advance(&b).is_err());
+        assert!(scoped_cover_dir(&select(missing.id), cache.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("unconfigured"));
+        assert_eq!(scoped_cover_dir(&base, cache.clone()).unwrap(), cache);
+        assert!(
+            matches!(cover_advance(&a).unwrap(), CoverStep::Chunk { text, .. } if text == "workspace A text")
+        );
     }
 }

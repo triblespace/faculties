@@ -18,6 +18,9 @@ struct Cli {
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
 
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -37,7 +40,55 @@ pub fn run() -> Result<()> {
     };
 
     crate::cli::with_output("bootstrap", |out| {
-        let report = super::import(&cli.pile, cli.key.as_deref())?;
+        let storage = cli.workspace.storage(cli.pile, cli.key)?;
+        let report = super::import_with_storage(&storage)?;
         super::render_import(&report, out)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_is_global_and_help_requires_no_existing_pile() {
+        let revision = triblespace::prelude::genid().id;
+        let id = format!("{revision:X}");
+        for args in [
+            vec![
+                "bootstrap",
+                "--pile",
+                "/absent.pile",
+                "--workspace",
+                &id,
+                "import",
+            ],
+            vec![
+                "bootstrap",
+                "--pile",
+                "/absent.pile",
+                "import",
+                "--workspace",
+                &id,
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().workspace.workspace,
+                Some(revision)
+            );
+        }
+        let help = Cli::try_parse_from(["bootstrap", "--workspace", &id, "--help"])
+            .err()
+            .unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(Cli::try_parse_from([
+            "bootstrap",
+            "--pile",
+            "/absent.pile",
+            "--workspace",
+            "label",
+            "import",
+        ])
+        .is_err());
+    }
 }

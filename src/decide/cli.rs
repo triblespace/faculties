@@ -13,6 +13,8 @@ use triblespace::prelude::Id;
     about = "A fork-visible TribleSpace deliberation ledger"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -114,7 +116,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.text(Cli::command().render_help().to_string());
     };
-    let decide = Decide::new(cli.pile, cli.key);
+    let decide = Decide::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match command {
         Command::Propose {
             title,

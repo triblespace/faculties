@@ -15,6 +15,8 @@ use triblespace::prelude::Id;
     about = "Authored people, groups, and identity verdicts"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -296,7 +298,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.line(Cli::command().render_help().to_string());
     };
-    let operations = Relations::new(cli.pile, cli.key);
+    let operations = Relations::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match command {
         Command::Add {
             label,

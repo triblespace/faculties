@@ -947,6 +947,7 @@ mod tests {
     use triblespace::core::repo::StoreSnapshot;
     fn cli(pile: &Path, key: &Path, command: Command) -> Cli {
         Cli {
+            workspace: Default::default(),
             pile: pile.to_owned(),
             key: Some(key.to_owned()),
             command: Some(command),

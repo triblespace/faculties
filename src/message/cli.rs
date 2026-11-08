@@ -12,6 +12,8 @@ use std::path::PathBuf;
     about = "Local messaging faculty for the agent"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -79,7 +81,7 @@ pub fn execute(request: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = request.command else {
         return out.text(Cli::command().render_help().to_string());
     };
-    let messages = Message::new(request.pile, request.key);
+    let messages = Message::with_storage(request.workspace.storage(request.pile, request.key)?);
     match command {
         Command::Send { to, text, from } => {
             let Some(from) = from

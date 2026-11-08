@@ -20,6 +20,13 @@ const SHARED: &[Param] = &[
     .ambient()
     .optional()
     .env("TRIBLESPACE_KEY"),
+    Param::caller(
+        "workspace",
+        "Exact workspace revision ID; omit for legacy collection routing",
+    )
+    .ambient()
+    .optional()
+    .env("FACULTIES_WORKSPACE"),
 ];
 
 const VERBS: &[Verb] = &[
@@ -174,10 +181,17 @@ fn execute_with_input(
     out: &mut Out<'_>,
     input: &mut impl std::io::Read,
 ) -> Result<()> {
-    let files = Files::new(
+    let workspace = crate::cli_workspace::WorkspaceArgs {
+        workspace: invocation
+            .get("workspace")
+            .map(crate::cli_workspace::parse_revision)
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
+    };
+    let files = Files::with_storage(workspace.storage(
         invocation.require_path("pile")?.to_owned(),
         invocation.path("key").map(Path::to_owned),
-    );
+    )?);
     match invocation.verb().name {
         "add" => files.add_path(
             invocation.require_path("path")?,
@@ -340,6 +354,58 @@ pub(super) fn emit_resolved(
 mod tests {
     use super::*;
     use crate::spec::CliRequest;
+
+    #[test]
+    fn workspace_is_global_and_help_never_opens_the_pile() {
+        let id = format!("{:X}", triblespace::prelude::genid().id);
+        for args in [
+            vec![
+                "files",
+                "--pile",
+                "/absent.pile",
+                "--workspace",
+                &id,
+                "list",
+            ],
+            vec![
+                "files",
+                "--pile",
+                "/absent.pile",
+                "list",
+                "--workspace",
+                &id,
+            ],
+        ] {
+            let CliRequest::Invoke(invocation) = SPEC.lower_cli_from(args).unwrap() else {
+                panic!("expected invocation");
+            };
+            assert_eq!(invocation.get("workspace"), Some(id.as_str()));
+            crate::cli_workspace::parse_revision(invocation.get("workspace").unwrap()).unwrap();
+        }
+        assert!(matches!(
+            SPEC.lower_cli_from(["files", "--workspace", &id]).unwrap(),
+            CliRequest::Help(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_workspace_fails_before_storage() {
+        let CliRequest::Invoke(invocation) = SPEC
+            .lower_cli_from([
+                "files",
+                "--pile",
+                "/absent.pile",
+                "--workspace",
+                "not-an-id",
+                "list",
+            ])
+            .unwrap()
+        else {
+            panic!("expected invocation");
+        };
+        let error = execute(&invocation, &mut Out::new(&mut |_| panic!("no output"))).unwrap_err();
+        assert!(error.to_string().contains("workspace"), "{error:#}");
+    }
 
     /// The Nomic indexes, the 7b space, the separate WeMM switch and the
     /// hand-run `index` are gone: one model, derived by `faculties

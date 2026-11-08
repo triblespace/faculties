@@ -54,6 +54,7 @@ pub mod body;
 pub mod bootstrap;
 pub mod care;
 pub mod cli;
+pub mod cli_workspace;
 pub mod clock;
 pub mod code;
 pub mod cognition;
@@ -114,6 +115,7 @@ pub mod web;
 pub mod wemm;
 pub mod wiki;
 pub mod wiki_additive;
+pub mod workspace;
 pub mod world;
 
 /// What Files, Memory and Wiki semantic commands answer in a build without

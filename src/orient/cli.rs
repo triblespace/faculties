@@ -38,6 +38,8 @@ pub struct Cli {
     /// Zooid identity and durable signing key. Defaults to the pile-adjacent key.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Maximum age of a current local health report, in seconds (reader policy).
     #[arg(
         long,
@@ -49,14 +51,11 @@ pub struct Cli {
     health_max_age: u64,
     /// Exact admitted metrics descriptor containing native service events.
     /// Optional: no metrics root is created or inferred when absent.
-    #[arg(
-        long,
-        global = true,
-        env = "TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION",
-        value_name = "COLLECTION",
-        value_parser = parse_service_events_collection
-    )]
-    service_events_collection: Option<CollectionHandle>,
+    /// Without workspace selection, falls back to
+    /// TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION. With workspace selection,
+    /// this flag is unsupported and the inherited environment value is ignored.
+    #[arg(long, global = true, value_name = "COLLECTION")]
+    service_events_collection: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -270,6 +269,34 @@ fn parse_service_events_collection(raw: &str) -> Result<CollectionHandle, String
     Ok(triblespace::prelude::Inline::new(bytes))
 }
 
+fn cli_service_events_collection(
+    workspace_selected: bool,
+    explicit: Option<&str>,
+) -> Result<Option<CollectionHandle>> {
+    if workspace_selected {
+        if explicit.is_some() {
+            bail!("--service-events-collection is unsupported with workspace selection: service events are node telemetry, not a workspace role");
+        }
+        return Ok(None);
+    }
+    // Read this manually, after selection is known: Clap must not parse an
+    // inherited node-telemetry handle for a workspace-selected invocation.
+    let raw = match explicit {
+        Some(raw) => Some(raw.to_owned()),
+        None => match std::env::var("TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION") {
+            Ok(raw) => Some(raw),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                bail!("TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION is not valid UTF-8")
+            }
+        },
+    };
+    raw.as_deref()
+        .map(parse_service_events_collection)
+        .transpose()
+        .map_err(anyhow::Error::msg)
+}
+
 pub(super) fn parse_wait_target(target: Option<&WaitTarget>) -> Result<Option<Duration>> {
     let Some(target) = target else {
         return Ok(None);
@@ -380,9 +407,13 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
         out.line(Cli::command().render_help().to_string())?;
         return Ok(());
     };
-    let mut orient =
-        Orient::new(cli.pile, cli.key).with_health_max_age(Duration::from_secs(cli.health_max_age));
-    if let Some(collection) = cli.service_events_collection {
+    let service_events_collection = cli_service_events_collection(
+        cli.workspace.workspace.is_some(),
+        cli.service_events_collection.as_deref(),
+    )?;
+    let mut orient = Orient::with_storage(cli.workspace.storage(cli.pile, cli.key)?)
+        .with_health_max_age(Duration::from_secs(cli.health_max_age));
+    if let Some(collection) = service_events_collection {
         orient = orient.with_service_events_collection(collection);
     }
     match command {
@@ -607,6 +638,194 @@ mod tests {
     use super::*;
 
     #[test]
+    fn service_events_environment_policy_is_process_isolated() {
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        let valid = "01".repeat(32);
+        let mut cases = vec![
+            "absent", "valid", "invalid", "empty", "override", "explicit", "help",
+        ];
+        #[cfg(unix)]
+        cases.push("nonunicode");
+        for selector in ["legacy", "flag", "environment"] {
+            for case in &cases {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "orient::cli::tests::service_events_environment_child",
+                        "--nocapture",
+                    ])
+                    .env("FACULTIES_ORIENT_TELEMETRY_TEST_CASE", case)
+                    .env("FACULTIES_ORIENT_TELEMETRY_TEST_SELECTOR", selector)
+                    .env("FACULTIES_ORIENT_TELEMETRY_TEST_REVISION", &revision);
+                for name in [
+                    "PILE",
+                    "PERSONA",
+                    "TRIBLESPACE_KEY",
+                    "TRIBLESPACE_HEALTH_MAX_AGE_SECS",
+                    "FACULTIES_WORKSPACE",
+                    "TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION",
+                ] {
+                    child.env_remove(name);
+                }
+                if selector == "environment" {
+                    child.env("FACULTIES_WORKSPACE", &revision);
+                }
+                let variable = "TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION";
+                match *case {
+                    "valid" => {
+                        child.env(variable, &valid);
+                    }
+                    "invalid" | "override" | "explicit" | "help" => {
+                        child.env(variable, "invalid");
+                    }
+                    "empty" => {
+                        child.env(variable, "");
+                    }
+                    #[cfg(unix)]
+                    "nonunicode" => {
+                        use std::os::unix::ffi::OsStringExt;
+                        child.env(variable, OsString::from_vec(vec![0xff]));
+                    }
+                    _ => {}
+                }
+                let result = child.output().unwrap();
+                assert!(
+                    result.status.success(),
+                    "{selector}/{case}: {} {}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn service_events_environment_child() {
+        let Ok(case) = std::env::var("FACULTIES_ORIENT_TELEMETRY_TEST_CASE") else {
+            return;
+        };
+        let selector = std::env::var("FACULTIES_ORIENT_TELEMETRY_TEST_SELECTOR").unwrap();
+        let revision = std::env::var("FACULTIES_ORIENT_TELEMETRY_TEST_REVISION").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("absent.pile");
+        let key = directory.path().join("absent.key");
+        let mut base = vec![
+            "orient",
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+        ];
+        if selector == "flag" {
+            base.extend(["--workspace", &revision]);
+        }
+        let selected = selector != "legacy";
+        let valid = "01".repeat(32);
+        if case == "help" {
+            execute(
+                Cli::try_parse_from(base.clone()).unwrap(),
+                &mut crate::out::Out::new(&mut |_| Ok(())),
+            )
+            .unwrap();
+            base.push("--help");
+            let error = Cli::try_parse_from(base).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        } else if case == "explicit" && selected {
+            // Both global placements and even malformed explicit handles get
+            // the policy error before any bootstrap path is opened.
+            for raw in [&valid[..], "malformed"] {
+                for after_command in [false, true] {
+                    let mut args = base.clone();
+                    if !after_command {
+                        args.extend(["--service-events-collection", raw]);
+                    }
+                    args.push("wake");
+                    if after_command {
+                        args.extend(["--service-events-collection", raw]);
+                    }
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    let error =
+                        execute(cli, &mut crate::out::Out::new(&mut |_| Ok(()))).unwrap_err();
+                    let error = error.to_string();
+                    assert!(
+                        error.contains("unsupported with workspace selection"),
+                        "{error}"
+                    );
+                    assert!(error.contains("node telemetry"), "{error}");
+                }
+            }
+        } else {
+            if case == "override" || case == "explicit" {
+                base.extend(["--service-events-collection", &valid]);
+            }
+            base.push("wake");
+            let cli = Cli::try_parse_from(base).unwrap();
+            assert_eq!(cli.workspace.workspace.is_some(), selected);
+            let resolved =
+                cli_service_events_collection(selected, cli.service_events_collection.as_deref());
+            if selected && case == "override" {
+                assert!(resolved
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported with workspace selection"));
+            } else if selected || case == "absent" {
+                assert_eq!(resolved.unwrap(), None);
+            } else if matches!(case.as_str(), "valid" | "override" | "explicit") {
+                assert_eq!(resolved.unwrap(), Some(CollectionHandle::new([1; 32])));
+            } else {
+                let error = resolved.unwrap_err().to_string();
+                assert!(
+                    error.contains(if case == "nonunicode" {
+                        "not valid UTF-8"
+                    } else {
+                        "64-digit hexadecimal"
+                    }),
+                    "{error}"
+                );
+            }
+        }
+        assert!(!pile.exists());
+        assert!(!key.exists());
+    }
+
+    #[test]
+    fn workspace_selector_is_global_and_help_does_not_resolve_it() {
+        let revision = triblespace::prelude::genid().id;
+        let id = format!("{revision:X}");
+        for args in [
+            vec![
+                "orient",
+                "--pile",
+                "/absent.pile",
+                "--workspace",
+                &id,
+                "wake",
+            ],
+            vec![
+                "orient",
+                "--pile",
+                "/absent.pile",
+                "wake",
+                "--workspace",
+                &id,
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap().workspace.workspace,
+                Some(revision)
+            );
+        }
+        let cli =
+            Cli::try_parse_from(["orient", "--pile", "/absent.pile", "--workspace", &id]).unwrap();
+        execute(cli, &mut crate::out::Out::new(&mut |_| Ok(()))).unwrap();
+        let help = Cli::try_parse_from(["orient", "--workspace", &id, "--help"])
+            .err()
+            .unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
     fn daemon_report_discloses_preparation_time_without_refreshing_facts() {
         let report = prepare_daemon_report(
             "frozen health/habit observation\n",
@@ -775,17 +994,37 @@ mod tests {
 
     #[test]
     fn raw_memory_flag_requires_pairs_and_leaves_default_off() {
-        assert!(Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--raw-memory",
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from(["orient", "--pile", "unused.pile", "wake", "--raw-memory",])
+                .is_err()
+        );
         let raw = Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--pairs", "--raw-memory",
-        ]).unwrap();
-        assert!(matches!(raw.command, Some(Command::Wake { pairs: true, raw_memory: true, .. })));
-        let plain = Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--pairs",
-        ]).unwrap();
-        assert!(matches!(plain.command, Some(Command::Wake { pairs: true, raw_memory: false, .. })));
+            "orient",
+            "--pile",
+            "unused.pile",
+            "wake",
+            "--pairs",
+            "--raw-memory",
+        ])
+        .unwrap();
+        assert!(matches!(
+            raw.command,
+            Some(Command::Wake {
+                pairs: true,
+                raw_memory: true,
+                ..
+            })
+        ));
+        let plain =
+            Cli::try_parse_from(["orient", "--pile", "unused.pile", "wake", "--pairs"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Some(Command::Wake {
+                pairs: true,
+                raw_memory: false,
+                ..
+            })
+        ));
     }
 
     #[test]

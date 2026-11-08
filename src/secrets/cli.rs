@@ -21,6 +21,8 @@ use zeroize::Zeroizing;
     about = "Immutable encrypted versions in one capability-governed collection"
 )]
 struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -240,7 +242,14 @@ fn load_value(raw: String) -> Result<Zeroizing<Vec<u8>>> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    let operations = Secrets::new(cli.pile, cli.key);
+    // Import validation is deliberately independent of destination storage,
+    // including when a workspace selector is inherited from the launcher.
+    let storage = if matches!(&cli.command, Command::Import1password { check: true, .. }) {
+        crate::storage::Storage::new(cli.pile, cli.key)
+    } else {
+        cli.workspace.storage(cli.pile, cli.key)?
+    };
+    let operations = Secrets::with_storage(storage);
     match cli.command {
         Command::Import1password {
             path,

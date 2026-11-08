@@ -15,6 +15,8 @@ use triblespace::prelude::Id;
     about = "A fork-visible knowledge wiki over a signed revision-DAG collection"
 )]
 struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -229,10 +231,10 @@ fn tag_change(out: &mut Out<'_>, result: Option<Id>, name: &str, add: bool) -> R
 }
 
 fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let wiki = Wiki::new(cli.pile, cli.key);
     let Some(command) = cli.command else {
         return Ok(());
     };
+    let wiki = Wiki::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match command {
         Command::Create {
             title,

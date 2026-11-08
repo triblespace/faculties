@@ -1,15 +1,15 @@
-//! This pile's own configuration: which exact collection each name resolves to.
+//! The node-private Config root and the older direct role-register helpers.
 //!
-//! See [`crate::schemas::config`] for why the mapping lives in the pile rather
-//! than in the process environment or beside it in a file. The short version is
-//! that a process environment is a copy taken at start which cannot be
-//! invalidated, and a file is a copy a process reads once; a collection is
-//! neither, because opening the pile is the thing every faculty call already
-//! does.
+//! Explicitly selected standalone CLIs use [`crate::workspace`] to
+//! resolve one exact workspace revision from this root. Its role bindings are
+//! exclusive: environment collection overrides cannot supplement or replace
+//! them. The node's pile/key bootstrap is separate from workspace selection.
 //!
-//! The environment still WINS when it is set, because pinning one collection
-//! for one command is ordinary and has to keep working. What changes is that an
-//! environment value which DISAGREES with the pile now says so.
+//! The direct role-register and environment-precedence functions below are
+//! reusable helpers, not the standalone CLI's default resolution pipeline.
+//! Without a workspace selector, CLI callers retain their existing
+//! [`crate::collection_names`] environment/private-root behavior. In particular,
+//! merely having Config facts does not implicitly choose a workspace.
 
 use ed25519_dalek::VerifyingKey;
 

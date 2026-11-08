@@ -309,6 +309,10 @@ fn append_record(path: &Path, record: &serde_json::Value) -> Result<()> {
     writeln!(file, "{record}").with_context(|| format!("append utterance log {}", path.display()))
 }
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    anyhow::ensure!(
+        cli.command.is_none() || std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+        "hear does not support workspace selection; unset FACULTIES_WORKSPACE to use its explicit model and device configuration"
+    );
     match cli.command {
         Some(Command::Listen(args)) => cmd_listen(args, out),
         Some(Command::Once(args)) => cmd_once(args, out),

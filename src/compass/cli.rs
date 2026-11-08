@@ -26,6 +26,8 @@ use crate::out::Out;
         names as tags are only topics, and writing on a goal subscribes nobody to it."
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file to use
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -146,7 +148,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.line(Cli::command().render_help().to_string());
     };
-    let compass = Compass::new(cli.pile, cli.key);
+    let compass = Compass::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     let persona = cli.persona.as_deref();
     match command {
         Command::Add {

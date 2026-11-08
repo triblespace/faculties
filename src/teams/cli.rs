@@ -14,6 +14,8 @@ use triblespace::prelude::Id;
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "teams", about = "Ingest Microsoft Teams messages into TribleSpace")]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -352,7 +354,7 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let delta_url = std::env::var("TEAMS_DELTA_URL")
         .ok()
         .unwrap_or(cli.delta_url);
-    let operations = Teams::new(cli.pile, cli.key)
+    let operations = Teams::with_storage(cli.workspace.storage(cli.pile, cli.key)?)
         .with_tenant(cli.tenant.clone())
         .with_delta_url(delta_url);
     let present_as = cli.present_as.as_deref().unwrap_or("");

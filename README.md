@@ -89,6 +89,62 @@ wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
 
+### Use an existing Erlkonig workspace from the CLI
+
+The ordinary faculty CLIs can read the same pile-backed workspace
+configuration as the Mac and Linux apps. The node's existing pile and signing
+key are bootstrap inputs, separate from choosing a workspace:
+
+```sh
+export PILE=/path/to/existing/self.pile
+export TRIBLESPACE_KEY=/path/to/existing/self.key
+faculties workspace list
+wiki --workspace '<exact-revision-from-the-list>' list
+
+# Optional shell convenience; an explicit --workspace takes precedence.
+export FACULTIES_WORKSPACE='<exact-revision-from-the-list>'
+compass list
+```
+
+Discovery prints current exact revision IDs, labels, role routes, and reasons
+for unavailable revisions. Labels and prefixes are not selectors, and even a
+single configured workspace is not selected implicitly. Discovery itself
+ignores `FACULTIES_WORKSPACE`, so it can recover an obsolete selection. It
+never creates a workspace, identity, collection, or background service.
+
+Selected commands use the resolver extracted from the app workspace configuration. Their collection routes come
+only from that workspace: `TRIBLESPACE_COLLECTION_*` cannot override or fill in
+a missing role, including auxiliary roles such as Secrets. Missing roles fail
+as unconfigured. Config discovery is resident-only; ordinary payload reads
+retain the CLI's existing acquisition behavior. Workspace routing is not a
+filesystem, network, command-execution, or model sandbox.
+
+Each invocation pins the exact binding and node signer. A changed, withdrawn,
+superseded, or conflicted selection is not followed to a replacement. Retained
+observers check at observation boundaries and stop when that binding is no
+longer available; an already-admitted operation can finish on its frozen
+routes. A script launching several commands has several invocation boundaries,
+not an automatic transaction or one frozen binding for the entire script.
+
+Without either selector, existing CLI collection routing remains unchanged.
+To run a legacy launcher deliberately, unset `FACULTIES_WORKSPACE` as well as
+resetting collection variables: clearing only `TRIBLESPACE_*` does not clear
+the selector. Installing a new cohort does not migrate separately pinned
+daemons, launchers, MCP servers, or session-ingest jobs.
+
+Standalone notebook/capture, Duplex, and aggregate `faculties mcp`/`faculties maintain`, and `world` launchers
+currently reject workspace selection rather than silently use legacy roots.
+Unset the selector explicitly to use their legacy launch configuration. CLI
+selection is not a new MCP tool argument; the apps' own workspace-selected
+integration is unchanged. Ambient-model operations remain unavailable where
+the existing workspace API has no explicit model binding.
+
+Selected Orient also ignores the ambient node-telemetry override
+`TRIBLESPACE_ORIENT_SERVICE_EVENTS_COLLECTION`. Its explicit
+`--service-events-collection` flag is unsupported with workspace selection:
+service events do not currently have a workspace role. This prevents an old
+launcher environment from adding another collection to the selected report.
+
 ### Library-first faculties, explicit frontends
 
 All 33 ordinary faculties have callable Rust operations, separate CLI and MCP

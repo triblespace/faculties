@@ -42,6 +42,8 @@ use std::path::{Path, PathBuf};
              Hex id prefixes also accepted as fallback."
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file to use.
     #[arg(long, env = "PILE")]
     pub pile: PathBuf,
@@ -51,6 +53,94 @@ pub struct Cli {
     /// One or more time ranges / id prefixes to show, or `turn <turn-id>`, or `create [<from>..<to>] <summary>`.
     #[arg(value_name = "ID", trailing_var_arg = true, allow_hyphen_values = true)]
     pub ids: Vec<String>,
+    /// Index of the first literal positional token after an explicit `--`.
+    #[arg(skip)]
+    literal_from: Option<usize>,
+}
+
+// Memory deliberately keeps a manual trailing grammar. Move only whole
+// selector arguments ahead of that grammar, never substrings of prose. An
+// explicit `--` ends option recognition. The same path serves run and tests.
+impl Cli {
+    pub fn try_parse_from<I, T>(args: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let (args, literal_tail) = workspace_arguments(args);
+        let mut cli = <Self as Parser>::try_parse_from(args)?;
+        if let Some(tail) = literal_tail {
+            let mut boundary = cli.ids.len().saturating_sub(tail);
+            // Clap retains the delimiter once trailing capture has begun,
+            // but consumes it when it precedes the first positional token.
+            if boundary > 0 && cli.ids[boundary - 1] == "--" {
+                boundary -= 1;
+                cli.ids.remove(boundary);
+            }
+            cli.literal_from = Some(boundary);
+        }
+        Ok(cli)
+    }
+
+    fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    fn information_only(&self) -> bool {
+        self.ids.is_empty()
+            || matches!(
+                self.ids.first().map(String::as_str),
+                Some("create" | "cover")
+            ) && self
+                .ids
+                .iter()
+                .take(self.literal_from.unwrap_or(self.ids.len()))
+                .skip(1)
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    }
+}
+
+fn workspace_arguments<I, T>(args: I) -> (Vec<std::ffi::OsString>, Option<usize>)
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    let mut input = args.into_iter().map(Into::into);
+    let Some(program) = input.next() else {
+        return (Vec::new(), None);
+    };
+    let mut selectors = vec![program];
+    let mut rest = Vec::new();
+    let mut literal_tail = None;
+    while let Some(arg) = input.next() {
+        if arg == "--" {
+            rest.push(arg);
+            let tail: Vec<_> = input.collect();
+            literal_tail = Some(tail.len());
+            rest.extend(tail);
+            break;
+        }
+        if arg == "--workspace" {
+            selectors.push(arg);
+            if let Some(value) = input.next() {
+                selectors.push(value);
+            }
+        } else if arg
+            .to_str()
+            .is_some_and(|arg| arg.starts_with("--workspace="))
+        {
+            selectors.push(arg);
+        } else if matches!(arg.to_str(), Some("--pile" | "--key")) {
+            rest.push(arg);
+            if let Some(value) = input.next() {
+                rest.push(value);
+            }
+        } else {
+            rest.push(arg);
+        }
+    }
+    selectors.extend(rest);
+    (selectors, literal_tail)
 }
 
 pub fn run() -> Result<()> {
@@ -66,14 +156,22 @@ pub fn run() -> Result<()> {
 /// Output routing is finalized before run() applies that process exit code.
 /// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
-    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    let storage = if cli.information_only() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    };
     execute_in(&storage, cli, out)
 }
 
 /// The process's whole body: one store, closed for process exit.
 fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<i32> {
-    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
-        .scope_to_exit(|storage| execute_in(storage, cli, out))
+    (if cli.information_only() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    })
+    .scope_to_exit(|storage| execute_in(storage, cli, out))
 }
 
 fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<i32> {
@@ -84,6 +182,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
     }
     let memory = Memory::with_storage(storage.clone());
     let args = &cli.ids[1..];
+    let literal_from = cli.literal_from.map(|index| index.saturating_sub(1));
     let one = |usage: &str| -> Result<&str> {
         if args.len() != 1 {
             bail!("{usage}");
@@ -103,7 +202,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 .context("memory raw requires one full nonzero 32-hex entity id")?;
             memory.raw(id, out)
         }
-        "create" => cmd_create(&memory, args, out),
+        "create" => cmd_create(&memory, args, literal_from, out),
         "respan" => cmd_respan(&memory, args, out),
         "respan-instants" => {
             memory.respan_instants(dry_run("usage: memory respan-instants [--dry-run]")?, out)
@@ -120,7 +219,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         "search" => memory.search(&literal_or_input(args, "query")?, out),
         "similar" => memory.similar(&literal_or_input(args, "query")?, out),
         "context" => emit_context(memory.context(&context_options(args)?)?, out),
-        "cover" => return super::cli_cover::execute(&memory, args, out),
+        "cover" => return super::cli_cover::execute(&memory, storage, args, literal_from, out),
         "tag" => memory.tag(args.first().map(String::as_str), out),
         "migrate-lens-tags" => {
             memory.migrate_lens_tags(dry_run("usage: memory migrate-lens-tags [--dry-run]")?, out)
@@ -157,11 +256,20 @@ fn literal_or_input(args: &[String], label: &str) -> Result<String> {
     }
 }
 
-fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()> {
+fn cmd_create(
+    memory: &Memory,
+    args: &[String],
+    literal_from: Option<usize>,
+    out: &mut Out<'_>,
+) -> Result<()> {
     // A help flag must never be minted as memory content — print usage and stop
     // before any parsing, so `memory create --help` explains itself instead of
     // storing the literal "--help" as a chunk.
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    if args
+        .iter()
+        .take(literal_from.unwrap_or(args.len()))
+        .any(|a| a == "--help" || a == "-h")
+    {
         out.line(format!(
             "usage: memory create [--tag <tag>]... [<from>..<to>] <summary...>\n\
              \n\
@@ -192,16 +300,21 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
     // Leading `--tag <tag>` options, repeatable. An unknown leading option is
     // refused rather than stored as the first word of the memory.
     let mut tags: Vec<String> = Vec::new();
+    let mut option_tokens = literal_from.unwrap_or(args.len());
     let mut args = args;
     let is_option = |arg: &&String| {
         arg.strip_prefix("--")
             .is_some_and(|name| name.starts_with(|c: char| c.is_ascii_alphabetic()))
     };
-    while let Some(first) = args.first().filter(is_option) {
+    while let Some(first) = args
+        .first()
+        .filter(|arg| option_tokens > 0 && is_option(arg))
+    {
         match (first.as_str(), args.get(1)) {
-            ("--tag", Some(tag)) => {
+            ("--tag", Some(tag)) if option_tokens >= 2 => {
                 tags.push(tag.clone());
                 args = &args[2..];
+                option_tokens -= 2;
             }
             _ => bail!("unknown option {first}: memory create [--tag <tag>]... [<from>..<to>] <summary...>"),
         }
@@ -222,7 +335,7 @@ fn cmd_create(memory: &Memory, args: &[String], out: &mut Out<'_>) -> Result<()>
     let looks_like_range = |t: &str| {
         t.contains("..") && t.len() >= 10 && t.as_bytes()[4] == b'-' && t.as_bytes()[7] == b'-'
     };
-    if looks_like_range(&args[0]) {
+    if option_tokens > 0 && looks_like_range(&args[0]) {
         explicit_range = Some(parse_time_range(&args[0]).with_context(|| {
             format!(
                 "the first argument looks like a time range but does not parse: {}",
@@ -537,4 +650,138 @@ fn comb_persona() -> Result<String> {
              enduring memory stream and are never persona-scoped."
         )
     })
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_selector_is_routing_and_delimited_or_quoted_prose_stays_literal() {
+        let id = format!("{:X}", triblespace::prelude::genid().id);
+        for tail in [
+            vec!["--workspace".to_owned(), id.clone()],
+            vec![format!("--workspace={id}")],
+        ] {
+            let mut args = vec![
+                "memory".to_owned(),
+                "--pile".into(),
+                "/absent.pile".into(),
+                "create".into(),
+                "text".into(),
+            ];
+            args.extend(tail);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(
+                cli.workspace.workspace,
+                Some(crate::cli_workspace::parse_revision(&id).unwrap())
+            );
+            assert_eq!(cli.ids, ["create", "text"]);
+        }
+        let prose = format!("a literal --workspace {id} in one argument");
+        let cli =
+            Cli::try_parse_from(["memory", "--pile", "/absent.pile", "create", &prose]).unwrap();
+        assert!(cli.workspace.workspace.is_none());
+        assert_eq!(cli.ids, ["create", &prose]);
+        let cli = Cli::try_parse_from([
+            "memory",
+            "--pile",
+            "/absent.pile",
+            "create",
+            "text",
+            "--",
+            "--workspace",
+            &id,
+        ])
+        .unwrap();
+        assert!(cli.workspace.workspace.is_none());
+        assert_eq!(cli.ids, ["create", "text", "--workspace", &id]);
+        assert_eq!(cli.literal_from, Some(2));
+    }
+
+    #[test]
+    fn delimited_workspace_and_help_tokens_are_stored_as_exact_literal_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("node.pile");
+        let key = directory.path().join("node.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let memory = Memory::new(pile.clone(), Some(key.clone()));
+        let id = format!("{:X}", triblespace::prelude::genid().id);
+        for (tokens, expected) in [
+            (
+                vec!["create", "text", "--", "--workspace", id.as_str()],
+                format!("text --workspace {id}"),
+            ),
+            (vec!["create", "--", "--help"], "--help".to_owned()),
+            (vec!["--", "create", "--help"], "--help".to_owned()),
+        ] {
+            let mut args = vec![
+                "memory",
+                "--pile",
+                pile.to_str().unwrap(),
+                "--key",
+                key.to_str().unwrap(),
+            ];
+            args.extend(tokens);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(!cli.information_only());
+            let mut receipt = String::new();
+            execute(
+                cli,
+                &mut Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text } = part {
+                        receipt.push_str(&text);
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+            let raw_id = receipt
+                .lines()
+                .find_map(|line| line.strip_prefix("id: "))
+                .unwrap();
+            let id = triblespace::prelude::Id::from_hex(raw_id).unwrap();
+            let mut text = String::new();
+            memory
+                .raw(
+                    id,
+                    &mut Out::new(&mut |part| {
+                        if let crate::out::Part::Text { text: part } = part {
+                            text.push_str(&part);
+                        }
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn manual_help_with_a_selected_revision_never_opens_bootstrap() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("absent.pile");
+        let key = directory.path().join("absent.key");
+        let id = format!("{:X}", triblespace::prelude::genid().id);
+        for command in [
+            vec!["create", "--help"],
+            vec!["cover", "--help"],
+            vec!["cover", "start", "--help"],
+        ] {
+            let mut args = vec![
+                "memory",
+                "--pile",
+                pile.to_str().unwrap(),
+                "--key",
+                key.to_str().unwrap(),
+            ];
+            args.extend(command);
+            args.extend(["--workspace", &id]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+            assert!(!pile.exists());
+            assert!(!key.exists());
+        }
+    }
 }

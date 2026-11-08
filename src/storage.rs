@@ -108,6 +108,10 @@ pub type CollectionRoutes = BTreeMap<Id, CollectionHandle>;
 #[path = "storage_workspace_tests.rs"]
 mod workspace_tests;
 
+#[cfg(test)]
+#[path = "storage_workspace_freshness_tests.rs"]
+mod workspace_freshness_tests;
+
 /// Explicit storage ownership for native faculty operations.
 ///
 /// A one-shot caller uses [`Self::new`]: each operation opens and closes its
@@ -128,6 +132,7 @@ pub struct Storage {
     /// pile-key default: `Some(None)` is no contact at all.
     daemon: Option<Option<VerifyingKey>>,
     collections: Option<Arc<CollectionRoutes>>,
+    workspace: Option<Arc<crate::workspace::Workspace>>,
     expected_signer: Option<VerifyingKey>,
     local_only: bool,
     shared: Option<Arc<Mutex<Option<Session>>>>,
@@ -193,6 +198,10 @@ impl std::fmt::Debug for Storage {
             .field("pile", &self.pile)
             .field("key", &self.key)
             .field("collections", &self.collections)
+            .field(
+                "workspace",
+                &self.workspace.as_ref().map(|workspace| workspace.id),
+            )
             .field("expected_signer", &self.expected_signer)
             .field("local_only", &self.local_only)
             .field("shared", &self.shared.is_some())
@@ -220,6 +229,7 @@ impl Storage {
             key,
             daemon: None,
             collections: None,
+            workspace: None,
             expected_signer: None,
             local_only: false,
             shared: None,
@@ -236,6 +246,7 @@ impl Storage {
             key,
             daemon: None,
             collections: None,
+            workspace: None,
             expected_signer: None,
             local_only: false,
             shared: Some(Arc::new(Mutex::new(None))),
@@ -258,6 +269,7 @@ impl Storage {
             key,
             daemon: Some(daemon),
             collections: None,
+            workspace: None,
             expected_signer: None,
             local_only: false,
             shared: Some(Arc::new(Mutex::new(None))),
@@ -317,7 +329,65 @@ impl Storage {
     /// routing never reads collection environment variables or creates roots.
     pub fn with_collections(mut self, routes: CollectionRoutes) -> Self {
         self.collections = Some(Arc::new(routes));
+        self.workspace = None;
         self
+    }
+
+    /// Pin one resolved workspace and its node identity. Each operation checks
+    /// that exact binding before admission; it never follows a replacement.
+    /// The routes and pin survive clones and retained/shared ownership.
+    pub fn with_workspace(
+        mut self,
+        workspace: crate::workspace::Workspace,
+        signer: VerifyingKey,
+    ) -> Self {
+        self.collections = Some(Arc::new(workspace.routes.clone()));
+        self.workspace = Some(Arc::new(workspace));
+        self.expected_signer = Some(signer);
+        self
+    }
+
+    pub fn selected_workspace(&self) -> Option<&crate::workspace::Workspace> {
+        self.workspace.as_deref()
+    }
+
+    /// Check a new observation boundary against the frozen selection. This
+    /// reads only the supplied snapshot: no acquisition, relocking, or reopen.
+    /// An admitted operation may finish against its frozen routes; retained
+    /// observers call again before admitting their next observation cycle.
+    pub fn validate_workspace_in<S: StoreRead>(
+        &self,
+        snapshot: &S,
+        signer: VerifyingKey,
+    ) -> Result<()> {
+        let Some(selected) = self.workspace.as_deref() else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            self.expected_signer == Some(signer),
+            "workspace node identity changed"
+        );
+        let current = crate::workspace::resolve_in(snapshot, signer, selected.id)
+            .with_context(|| format!("validate selected workspace {:X}", selected.id))?;
+        anyhow::ensure!(
+            current.as_ref() == Some(selected),
+            "selected workspace {:X} changed or is unavailable; choose a current exact revision before continuing",
+            selected.id,
+        );
+        Ok(())
+    }
+
+    /// Freeze a boundary on an already-borrowed store. Legacy/unpinned storage
+    /// does no work, including no extra snapshot. Never enters a Storage lease.
+    pub fn validate_workspace_at<S>(&self, store: &mut S, signer: VerifyingKey) -> Result<()>
+    where
+        S: SnapshotSource,
+        S::Snapshot: StoreRead,
+    {
+        if self.workspace.is_some() {
+            self.validate_workspace_in(&store.snapshot()?, signer)?;
+        }
+        Ok(())
     }
 
     pub fn collection_routes(&self) -> Option<&CollectionRoutes> {
@@ -579,6 +649,10 @@ impl Storage {
         let signer = self.load_signer()?;
         if self.shared.is_some() {
             return self.with_session(signer.verifying_key(), |session| {
+                self.validate_workspace_at(
+                    session.store.as_mut().expect("open store"),
+                    signer.verifying_key(),
+                )?;
                 operation(
                     session.store.as_mut().expect("open store"),
                     &signer,
@@ -588,7 +662,9 @@ impl Storage {
         }
         let runtime = Arc::new(runtime()?);
         let mut store = self.open_owned_store(signer.verifying_key())?;
-        let result = operation(&mut store, &signer, &runtime);
+        let result = self
+            .validate_workspace_at(&mut store, signer.verifying_key())
+            .and_then(|()| operation(&mut store, &signer, &runtime));
         finish_close(result, store.close().context("close faculty store"))
     }
 
@@ -604,7 +680,9 @@ impl Storage {
             &Arc<tokio::runtime::Runtime>,
         ) -> Result<T>,
     ) -> Result<Option<T>> {
-        let shared = self.shared.as_ref()
+        let shared = self
+            .shared
+            .as_ref()
             .ok_or_else(|| anyhow!("observation steps require a retained storage owner"))?;
         let session = match shared.try_lock() {
             Ok(session) => session,
@@ -615,12 +693,17 @@ impl Storage {
         };
         let signer = self.load_signer()?;
         self.with_session_guard(session, signer.verifying_key(), |session| {
+            self.validate_workspace_at(
+                session.store.as_mut().expect("open store"),
+                signer.verifying_key(),
+            )?;
             operation(
                 session.store.as_mut().expect("open store"),
                 &signer,
                 &session.runtime,
             )
-        }).map(Some)
+        })
+        .map(Some)
     }
 
     /// Borrow the same local backend for operations which use resident-only
@@ -637,6 +720,7 @@ impl Storage {
                 let mut pile = session.store.as_ref().expect("open store").store();
                 pile.refresh()
                     .map_err(|error| pile_read_error(&self.pile, error))?;
+                self.validate_workspace_at(&mut *pile, signer.verifying_key())?;
                 let result = catch_unwind(AssertUnwindSafe(|| operation(&mut pile, &signer)));
                 drop(pile);
                 match result {
@@ -646,7 +730,9 @@ impl Storage {
             });
         }
         let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key())?;
-        let result = operation(&mut pile, &signer);
+        let result = self
+            .validate_workspace_at(&mut pile, signer.verifying_key())
+            .and_then(|()| operation(&mut pile, &signer));
         finish_pile(pile, result)
     }
 

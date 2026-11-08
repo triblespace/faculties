@@ -14,6 +14,8 @@ use zeroize::Zeroizing;
     about = "Manage fork-visible Headspace configuration and model profiles."
 )]
 pub struct Cli {
+    #[command(flatten)]
+    pub(super) workspace: crate::cli_workspace::WorkspaceArgs,
     /// Existing pile file. Reads and writes never create it.
     #[arg(long, env = "PILE")]
     pub(super) pile: PathBuf,
@@ -153,14 +155,22 @@ pub fn run() -> Result<()> {
 }
 /// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    let storage = if cli.command.is_none() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    };
     execute_in(&storage, cli, out)
 }
 
 /// The process's whole body: one store, closed for process exit.
 fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
-        .scope_to_exit(|storage| execute_in(storage, cli, out))
+    (if cli.command.is_none() {
+        crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    } else {
+        cli.workspace.storage(cli.pile.clone(), cli.key.clone())?
+    })
+    .scope_to_exit(|storage| execute_in(storage, cli, out))
 }
 
 fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) -> Result<()> {

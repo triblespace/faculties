@@ -12,6 +12,8 @@ use triblespace::prelude::Id;
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "mail", about = "Immutable email evidence, drafts, and delivery receipts")]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Existing durable collection signer. Ordinary commands never create it.
@@ -131,13 +133,14 @@ fn persona() -> Result<String> {
 }
 /// One-shot storage: every operation opens and closes its own store.
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let storage = crate::storage::Storage::new(cli.pile.clone(), cli.key.clone());
+    let storage = cli.workspace.storage(cli.pile.clone(), cli.key.clone())?;
     execute_in(&storage, cli, out)
 }
 
 /// The process's whole body: one store, closed for process exit.
 fn execute_to_exit(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    crate::storage::Storage::new(cli.pile.clone(), cli.key.clone())
+    cli.workspace
+        .storage(cli.pile.clone(), cli.key.clone())?
         .scope_to_exit(|storage| execute_in(storage, cli, out))
 }
 

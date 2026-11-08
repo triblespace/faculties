@@ -14,6 +14,8 @@ use std::path::PathBuf;
     about = "Provider-reported subscription quota, observed per window"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -85,7 +87,7 @@ enum Command {
 }
 
 pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
-    let operations = Quota::new(cli.pile, cli.key);
+    let operations = Quota::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match cli.command {
         Command::Record {
             provider,

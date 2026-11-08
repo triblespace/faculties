@@ -168,6 +168,10 @@ fn main() -> Result<()> {
         println!();
         return Ok(());
     };
+    anyhow::ensure!(
+        std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+        "migrations operates on an explicit whole pile, not a workspace; unset FACULTIES_WORKSPACE before running it"
+    );
     let key = cli.key.as_deref();
 
     match command {

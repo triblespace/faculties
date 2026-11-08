@@ -10,6 +10,8 @@ use std::path::PathBuf;
     about = "Research-quality metrics over Wiki entries and complete DAG frontiers"
 )]
 struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Existing durable signing-key file. Reads never create one.
@@ -51,7 +53,7 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     };
-    let gauge = Gauge::new(cli.pile, cli.key);
+    let gauge = Gauge::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     crate::cli::with_output("gauge", |out| match command {
         Command::Health => presentation::health(&gauge.health()?, out),
         Command::Tags => presentation::tags(&gauge.tags()?, out),

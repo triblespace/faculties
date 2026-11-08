@@ -12,6 +12,8 @@ use triblespace::prelude::*;
     about = "Record explicit reasoning notes linked to the current execution turn"
 )]
 pub(crate) struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -103,7 +105,7 @@ pub fn run() -> Result<()> {
         bail!("reason text is empty");
     }
 
-    let reason = super::Reason::new(cli.pile, cli.key);
+    let reason = super::Reason::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     if cli.command.is_empty() {
         return crate::cli::with_output("reason", |out| {
             let id = reason.record(&text, turn_id, worker_id)?;

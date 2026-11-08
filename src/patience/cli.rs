@@ -13,6 +13,8 @@ use triblespace::prelude::*;
     about = "Extend the active turn timeout and optionally run a command"
 )]
 pub(crate) struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -119,7 +121,7 @@ pub fn run() -> Result<()> {
     )?
     .ok_or_else(|| anyhow!("missing worker id (pass --worker-id or set WORKER_ID)"))?;
 
-    let patience = super::Patience::new(cli.pile, cli.key);
+    let patience = super::Patience::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     crate::cli::with_diagnostic_output("patience", |out| {
         let event = patience.extend(request_id, worker_id, timeout_ms)?;
         out.line(format!("[{event:x}] timeout extended by {timeout_ms} ms"))

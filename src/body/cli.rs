@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
     about = "The Reachy Mini body: perception in, action out, deliberate captures to the pile"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file. Required only by commands that keep or read data.
     #[arg(long, env = "PILE")]
     pile: Option<PathBuf>,
@@ -138,17 +140,28 @@ pub fn main() -> Result<()> {
     }
     crate::cli::with_output("body", |out| execute(cli, out))
 }
-fn storage(pile: Option<PathBuf>, key: Option<PathBuf>) -> Result<Body> {
-    Ok(Body::new(
+fn storage(
+    workspace: &crate::cli_workspace::WorkspaceArgs,
+    pile: Option<PathBuf>,
+    key: Option<PathBuf>,
+) -> Result<Body> {
+    Ok(Body::with_storage(workspace.storage(
         pile.context("this command requires --pile (or PILE); hardware-only commands do not")?,
         key,
-    ))
+    )?))
 }
 fn seconds(value: f64) -> Result<Duration> {
     Duration::try_from_secs_f64(value).context("seconds must be finite and nonnegative")
 }
 
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    if cli.workspace.workspace.is_some() && cli.command.is_some() {
+        anyhow::ensure!(
+            matches!(&cli.command, Some(Command::Intent { .. } | Command::Look { .. }
+                | Command::List | Command::Get { .. } | Command::Feel { keep: true, .. })),
+            "workspace selection applies only to stored Body captures and intents, not hardware-only commands; omit --workspace and unset FACULTIES_WORKSPACE for this command"
+        );
+    }
     let device = Device::new(cli.daemon, cli.python);
     match cli.command {
         None => out.text(Cli::command().render_help().to_string()),
@@ -166,7 +179,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             out.line(name.to_lowercase())
         }
         Some(Command::Intent { text }) => {
-            let body = storage(cli.pile, cli.key)?;
+            let body = storage(&cli.workspace, cli.pile, cli.key)?;
             if let Some(text) = text {
                 presentation::intent_set(&body.set_intent(&text)?, out)
             } else {
@@ -179,12 +192,17 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             }
         }
         Some(Command::Look { note }) => presentation::captured(
-            &device.look(&storage(cli.pile, cli.key)?, note.as_deref())?,
+            &device.look(
+                &storage(&cli.workspace, cli.pile, cli.key)?,
+                note.as_deref(),
+            )?,
             out,
         ),
-        Some(Command::List) => presentation::list(&storage(cli.pile, cli.key)?.list()?, out),
+        Some(Command::List) => {
+            presentation::list(&storage(&cli.workspace, cli.pile, cli.key)?.list()?, out)
+        }
         Some(Command::Get { id, output }) => {
-            let export = storage(cli.pile, cli.key)?.get(&id)?;
+            let export = storage(&cli.workspace, cli.pile, cli.key)?.get(&id)?;
             if output.as_deref() == Some("@-") {
                 let uri = export.uri();
                 out.blob(export.bytes, "application/octet-stream", uri)
@@ -268,7 +286,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             note,
         }) => {
             let body = if keep {
-                Some(storage(cli.pile, cli.key)?)
+                Some(storage(&cli.workspace, cli.pile, cli.key)?)
             } else {
                 None
             };
@@ -370,4 +388,58 @@ fn feel(
         ))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    #[test]
+    fn selected_hardware_only_commands_fail_before_device_or_stdin_access() {
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        for command in [
+            vec!["pose"],
+            vec!["wake"],
+            vec!["sleep"],
+            vec!["gesture", "nod"],
+            vec!["feel"],
+            vec!["observe"],
+            vec!["act", "@-"],
+        ] {
+            let mut args = vec!["body", "--workspace", revision.as_str()];
+            args.extend(command);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let error = execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap_err();
+            assert!(error.to_string().contains("hardware-only commands"));
+        }
+    }
+
+    #[test]
+    fn selected_help_does_not_open_a_destination() {
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        let cli = Cli::try_parse_from(["body", "--workspace", &revision]).unwrap();
+        execute(cli, &mut Out::new(&mut |_| Ok(()))).unwrap();
+    }
+
+    #[test]
+    fn selected_capture_requires_bootstrap_before_device_access() {
+        let revision = format!("{:X}", triblespace::prelude::genid().id);
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("absent.pile");
+        let key = directory.path().join("absent.key");
+        let cli = Cli::try_parse_from([
+            "body",
+            "--workspace",
+            &revision,
+            "--pile",
+            pile.to_str().unwrap(),
+            "--key",
+            key.to_str().unwrap(),
+            "look",
+        ])
+        .unwrap();
+        assert!(execute(cli, &mut Out::new(&mut |_| Ok(()))).is_err());
+        assert!(!pile.exists());
+        assert!(!key.exists());
+    }
 }

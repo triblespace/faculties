@@ -126,6 +126,10 @@ fn target(words: &[String], y: Option<f64>) -> Result<Target> {
 }
 
 fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+        "world does not support workspace selection; unset FACULTIES_WORKSPACE to use its explicit server and session configuration"
+    );
     let session = Session::File(session_file(cli.session_file)?);
     let world = World::new(&cli.url, &session)?;
     match cli.command {

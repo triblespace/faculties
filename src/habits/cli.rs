@@ -10,6 +10,8 @@ use std::path::PathBuf;
     about = "Standing intentions, pulled rather than pushed"
 )]
 pub(crate) struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -107,7 +109,7 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     };
-    let habits = Habits::new(cli.pile, cli.key);
+    let habits = Habits::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match command {
         Command::List | Command::Due => {
             let due = matches!(command, Command::Due);

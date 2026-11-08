@@ -9,6 +9,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "linkedin", about = "LinkedIn → relations import conduit")]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -98,7 +100,7 @@ fn review(value: &ReviewReport, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
-    let operations = LinkedIn::new(cli.pile, cli.key);
+    let operations = LinkedIn::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match cli.command {
         Command::Import { snapshot, dry_run } => {
             let raw = std::fs::read(&snapshot)

@@ -9,6 +9,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "cognition", about = "Validate the fixed shared Cognition collection")]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Existing durable signing-key file; ordinary operations never create it.
@@ -31,7 +33,10 @@ pub fn run() -> Result<()> {
 
 pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     match cli.command {
-        Command::Check => out.line(Cognition::new(cli.pile, cli.key).check()?.summary()),
+        Command::Check => {
+            let cognition = Cognition::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
+            out.line(cognition.check()?.summary())
+        }
     }
 }
 

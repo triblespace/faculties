@@ -20,6 +20,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Discover configured workspaces without selecting one or starting services.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// Serve native faculty tools over stdio, or opt into authenticated HTTP.
     Mcp {
         /// Pile configured by the local launcher, never an MCP tool argument.
@@ -88,9 +93,31 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum WorkspaceCommand {
+    /// List exact current revisions, routes and unavailable entries.
+    List {
+        /// Existing node pile; workspace discovery never creates one.
+        #[arg(long, env = "PILE")]
+        pile: PathBuf,
+        /// Existing durable signing-key path, separate from workspace selection.
+        #[arg(long, env = "TRIBLESPACE_KEY")]
+        key: Option<PathBuf>,
+    },
+}
+
 fn main() -> Result<()> {
     let Cli { command } = Cli::parse();
+    run(command)
+}
+
+fn run(command: Command) -> Result<()> {
     match command {
+        Command::Workspace {
+            command: WorkspaceCommand::List { pile, key },
+        } => faculties::cli::with_output("workspace", |out| {
+            faculties::cli_workspace::list(&pile, key.as_deref(), out)
+        }),
         Command::Mcp {
             pile,
             key,
@@ -106,6 +133,10 @@ fn main() -> Result<()> {
             http_token_file,
             http_origin,
         } => {
+            anyhow::ensure!(
+                std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+                "standalone `faculties mcp` does not support workspace selection; unset FACULTIES_WORKSPACE for legacy mode, or use Erlkonig's explicitly routed integration"
+            );
             let hear = match (hear_model_pile, hear_config_json, hear_tokenizer_json) {
                 (None, None, None) => None,
                 (Some(pile), Some(config_json), Some(tokenizer_json)) => Some(hear::ModelConfig {
@@ -152,6 +183,10 @@ fn main() -> Result<()> {
 /// this process is what keeps them current; no faculty has an index command.
 #[cfg(feature = "wemm")]
 fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
+    anyhow::ensure!(
+        std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+        "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE to use its explicit model bootstrap"
+    );
     use faculties::{files::Files, memory::Memory, wiki::Wiki};
 
     let storage = faculties::storage::Storage::shared(pile.clone(), key);
@@ -247,4 +282,199 @@ fn serve_stdio(registrations: &[&(dyn Faculty + Sync)]) -> Result<()> {
         std::io::stdin().lock(),
         std::io::stdout(),
     )
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn discovery_has_bootstrap_but_no_selection_argument() {
+        let command = Cli::command();
+        let list = command
+            .find_subcommand("workspace")
+            .unwrap()
+            .find_subcommand("list")
+            .unwrap();
+        assert!(list.get_arguments().any(|arg| arg.get_id() == "pile"));
+        assert!(list.get_arguments().any(|arg| arg.get_id() == "key"));
+        assert!(!list.get_arguments().any(|arg| arg.get_id() == "workspace"));
+        let parsed = Cli::try_parse_from([
+            "faculties",
+            "workspace",
+            "list",
+            "--pile",
+            "/unopened/node.pile",
+            "--key",
+            "/unopened/node.key",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::Workspace {
+                command: WorkspaceCommand::List { .. },
+            }
+        ));
+    }
+
+    #[test]
+    fn workspace_help_does_not_require_bootstrap_or_start_mcp() {
+        let error = Cli::try_parse_from(["faculties", "workspace", "list", "--help"])
+            .err()
+            .expect("help exits parsing");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    fn launcher_child(case: &str, selector: &std::ffi::OsStr) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "workspace_tests::launcher_guard_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("FACULTIES_MCP_GUARD_TEST", case)
+            .env("FACULTIES_WORKSPACE", selector)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn inherited_selector_presence_is_refused_before_bootstrap_or_transport() {
+        let selectors = [
+            std::ffi::OsString::from(format!("{:X}", triblespace::prelude::genid().id)),
+            std::ffi::OsString::from("not-a-workspace"),
+            std::ffi::OsString::new(),
+        ];
+        for selector in selectors {
+            let output = launcher_child("mcp", &selector);
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let output = launcher_child("mcp", &std::ffi::OsString::from_vec(vec![0xff]));
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_selector_does_not_affect_help_version_or_workspace_listing() {
+        for case in ["information", "list", "explicit"] {
+            let output = launcher_child(case, std::ffi::OsStr::new("deliberately-invalid"));
+            assert!(
+                output.status.success(),
+                "{case}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if case == "list" {
+                assert!(
+                    String::from_utf8_lossy(&output.stdout).contains("No configured workspaces")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn launcher_guard_child() {
+        let Ok(case) = std::env::var("FACULTIES_MCP_GUARD_TEST") else {
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("node.pile");
+        let key = directory.path().join("node.key");
+        match case.as_str() {
+            "mcp" => {
+                // Missing token prevents binding a listener even if the guard
+                // regresses. No child ever starts an MCP server or network.
+                let token = directory.path().join("missing.token");
+                let cli = Cli::try_parse_from([
+                    "faculties",
+                    "mcp",
+                    "--pile",
+                    pile.to_str().unwrap(),
+                    "--key",
+                    key.to_str().unwrap(),
+                    "--http-listen",
+                    "127.0.0.1:0",
+                    "--http-token-file",
+                    token.to_str().unwrap(),
+                ])
+                .unwrap();
+                let error = run(cli.command).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("standalone `faculties mcp` does not support workspace selection"));
+                assert!(!pile.exists());
+                assert!(!key.exists());
+                assert!(!token.exists());
+            }
+            "information" => {
+                for args in [
+                    vec!["faculties", "--help"],
+                    vec!["faculties", "--version"],
+                    vec!["faculties", "mcp", "--help"],
+                    vec!["faculties", "workspace", "list", "--help"],
+                ] {
+                    let error = Cli::try_parse_from(args)
+                        .err()
+                        .expect("information exits parsing");
+                    assert!(matches!(
+                        error.kind(),
+                        clap::error::ErrorKind::DisplayHelp
+                            | clap::error::ErrorKind::DisplayVersion
+                    ));
+                }
+                assert!(!pile.exists());
+                assert!(!key.exists());
+            }
+            "list" => {
+                std::fs::File::create(&pile).unwrap();
+                faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+                let before = std::fs::read(&pile).unwrap();
+                let cli = Cli::try_parse_from([
+                    "faculties",
+                    "workspace",
+                    "list",
+                    "--pile",
+                    pile.to_str().unwrap(),
+                    "--key",
+                    key.to_str().unwrap(),
+                ])
+                .unwrap();
+                run(cli.command).unwrap();
+                assert_eq!(before, std::fs::read(&pile).unwrap());
+            }
+            "explicit" => {
+                let selector = format!("{:X}", triblespace::prelude::genid().id);
+                let error = Cli::try_parse_from([
+                    "faculties",
+                    "mcp",
+                    "--pile",
+                    pile.to_str().unwrap(),
+                    "--workspace",
+                    &selector,
+                ])
+                .err()
+                .expect("MCP has no selector argument");
+                assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+                assert!(!pile.exists());
+                assert!(!key.exists());
+            }
+            _ => panic!("unknown guard fixture"),
+        }
+    }
 }

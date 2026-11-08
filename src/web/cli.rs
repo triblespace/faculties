@@ -21,6 +21,8 @@ impl From<CliProvider> for Provider {
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "web", about = "Web search/browsing faculty (Tavily/Exa)")]
 pub(crate) struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Existing pile file. Reads and writes never create it.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -83,7 +85,7 @@ pub fn run() -> Result<()> {
             .map(|raw| crate::text_arg(raw, "exa api key").map(|value| value.trim().to_owned()))
             .transpose()?,
     };
-    let web = Web::new(cli.pile, cli.key).with_api_keys(keys);
+    let web = Web::with_storage(cli.workspace.storage(cli.pile, cli.key)?).with_api_keys(keys);
     crate::cli::with_output("web", |out| match command {
         Command::Search {
             query,

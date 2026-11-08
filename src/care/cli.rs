@@ -19,6 +19,8 @@ pub struct Cli {
     /// Existing durable signing-key file. Reads and writes never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -181,7 +183,8 @@ pub fn run() -> Result<()> {
         bail!("no pile: set $PILE or pass --pile");
     };
     crate::cli::with_output("care", |output| {
-        crate::storage::Storage::new(pile.clone(), cli.key.clone())
+        cli.workspace
+            .storage(pile.clone(), cli.key.clone())?
             .scope_to_exit(|storage| execute(Care::with_storage(storage.clone()), command, output))
     })
 }

@@ -8,12 +8,12 @@
 #[path = "health.rs"]
 mod health;
 use health::HealthSources;
+#[path = "next.rs"]
+mod next;
 #[path = "receipt_import.rs"]
 mod receipt_import;
 #[path = "service_events.rs"]
 mod service_events;
-#[path = "next.rs"]
-mod next;
 pub use next::{Next, NextKind, PendingNext, PreparedReport};
 
 #[derive(Clone, Debug)]
@@ -148,12 +148,21 @@ impl Orient {
     }
     /// The same persona-filtered overview without recording Presented. Source
     /// maintenance and explicitly requested Habit evaluation are unchanged.
-    pub fn show_unpresented(&self, persona: Option<&str>, options: &ShowOptions,
-        out: &mut Out<'_>) -> Result<()> {
+    pub fn show_unpresented(
+        &self,
+        persona: Option<&str>,
+        options: &ShowOptions,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         self.show_reporting(persona, options, false, out)
     }
-    fn show_reporting(&self, persona: Option<&str>, options: &ShowOptions,
-        record_presented: bool, out: &mut Out<'_>) -> Result<()> {
+    fn show_reporting(
+        &self,
+        persona: Option<&str>,
+        options: &ShowOptions,
+        record_presented: bool,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             // Quota acquires through the runtime, so it is read before entering it.
             let quota = quota_section(&self.storage, pile, signer, runtime);
@@ -185,12 +194,21 @@ impl Orient {
     }
     /// The same wake selection and output without recording shown Compass
     /// attention. This does not change memory/goal selection or source upkeep.
-    pub fn wake_unpresented(&self, persona: Option<&str>, options: &WakeOptions,
-        out: &mut Out<'_>) -> Result<()> {
+    pub fn wake_unpresented(
+        &self,
+        persona: Option<&str>,
+        options: &WakeOptions,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         self.wake_reporting(persona, options, false, out)
     }
-    fn wake_reporting(&self, persona: Option<&str>, options: &WakeOptions,
-        record_presented: bool, out: &mut Out<'_>) -> Result<()> {
+    fn wake_reporting(
+        &self,
+        persona: Option<&str>,
+        options: &WakeOptions,
+        record_presented: bool,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_wake(
                 &self.storage,
@@ -268,8 +286,17 @@ impl Orient {
     /// No permanent process or competing observer is started by constructing Orient.
     pub fn wait(&self, persona: &str, options: &WaitOptions, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
-            runtime.block_on(cmd_wait(&self.storage, pile, signer, self.storage.path(),
-                Some(persona), options, self.health_max_age, self.service_events_collection, out))
+            runtime.block_on(cmd_wait(
+                &self.storage,
+                pile,
+                signer,
+                self.storage.path(),
+                Some(persona),
+                options,
+                self.health_max_age,
+                self.service_events_collection,
+                out,
+            ))
         })
     }
 
@@ -838,7 +865,11 @@ struct ReceiptSource {
 }
 
 impl ReceiptSource {
-    async fn open(routing: &Storage, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<Self> {
+    async fn open(
+        routing: &Storage,
+        pile: &mut impl FacultyAccess,
+        signer: &SigningKey,
+    ) -> Result<Self> {
         if routing.collection_routes().is_none() {
             return Self::register(pile, signer);
         }
@@ -1242,7 +1273,8 @@ async fn observe_snapshot_acquiring(
     receipts: bool,
 ) -> Result<OrientObservation> {
     start_observation(snapshot, sources, receipts, None)
-        .await.context("join frozen Orient input selection")?
+        .await
+        .context("join frozen Orient input selection")?
 }
 
 fn start_observation(
@@ -1269,11 +1301,15 @@ fn start_observation(
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
-        if let Some(control) = &control { reader = reader.with_control(control.clone()); }
+        if let Some(control) = &control {
+            reader = reader.with_control(control.clone());
+        }
         // The stage lines are the refresh probe's evidence of which targets a
         // refresh attached again; the acquiring reader must keep emitting them.
         let observe = |source: OrientSource| -> Result<OrientFact> {
-            if let Some(control) = &control { control.check()?; }
+            if let Some(control) = &control {
+                control.check()?;
+            }
             let collection = trace_refresh_call(source.label, "attach", || {
                 reader.attached_acquiring(source.rank9)
             })?;
@@ -3411,10 +3447,7 @@ enum AttentionEvent {
 impl AttentionEvent {
     fn id(&self) -> Id {
         match self {
-            Self::Message(id)
-            | Self::Mail(id)
-            | Self::Teams(id)
-            | Self::Discord(id) => *id,
+            Self::Message(id) | Self::Mail(id) | Self::Teams(id) | Self::Discord(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
             Self::GoalMention { goal } => *goal,
@@ -3780,14 +3813,7 @@ async fn cmd_show(
                     }
                     None => Vec::new(),
                 };
-                Ok((
-                    persona_id,
-                    messages,
-                    mail,
-                    habits,
-                    goals,
-                    shown,
-                ))
+                Ok((persona_id, messages, mail, habits, goals, shown))
             })
             .await?;
         let habits = match habits {
@@ -4579,13 +4605,18 @@ async fn load_wait_frame(
     // The observation and polling baseline are the same immutable prefix.
     // Later selected-payload acquisition cannot swallow a concurrent append.
     let selected = selection.get_or_insert_with(|| {
-        let control = pile.read_control().unwrap_or_else(||
-            triblespace::core::repo::async_store::AcquiringReadControl::new(None));
-        WaitSelection { snapshot: snapshot.clone(), task: start_observation(
-            snapshot.clone(), sources, true, Some(control.clone()),
-        ), control }
+        let control = pile.read_control().unwrap_or_else(|| {
+            triblespace::core::repo::async_store::AcquiringReadControl::new(None)
+        });
+        WaitSelection {
+            snapshot: snapshot.clone(),
+            task: start_observation(snapshot.clone(), sources, true, Some(control.clone())),
+            control,
+        }
     });
-    let result = (&mut selected.task).await.context("join frozen Orient wait selection");
+    let result = (&mut selected.task)
+        .await
+        .context("join frozen Orient wait selection");
     let snapshot = selection.take().expect("owned selection").snapshot;
     let observation = match result? {
         Ok(observation) => observation,
@@ -4771,12 +4802,13 @@ async fn load_wait_frame_before_health_deadline(
     next_health_change: Option<Epoch>,
     mut evaluated_at: Epoch,
 ) -> Result<Option<WaitFrameLoad>> {
-    let unchanged = selection.is_none() && pending.as_ref().is_some_and(|pending| {
-        pending.observation.as_ref().map_or_else(
-            || !wait_storage_changed(&snapshot, &pending.watermark),
-            |observation| observation.is_current(&snapshot),
-        )
-    });
+    let unchanged = selection.is_none()
+        && pending.as_ref().is_some_and(|pending| {
+            pending.observation.as_ref().map_or_else(
+                || !wait_storage_changed(&snapshot, &pending.watermark),
+                |observation| observation.is_current(&snapshot),
+            )
+        });
     if unchanged {
         let cached = pending.as_mut().expect("unchanged pending frame exists");
         if cached.observation.is_some() {
@@ -4856,9 +4888,10 @@ async fn prepare_wait_frame_before_health_deadline(
     mut evaluated_at: Epoch,
     output: &mut Out<'_>,
 ) -> Result<Option<WaitFrameLoad>> {
-    if selection.is_none() && maintained_from
-        .as_ref()
-        .is_none_or(|previous| wait_storage_changed(&snapshot, previous))
+    if selection.is_none()
+        && maintained_from
+            .as_ref()
+            .is_none_or(|previous| wait_storage_changed(&snapshot, previous))
     {
         let before = snapshot.clone();
         let result = wait_upkeep_before_deadline(
@@ -4987,9 +5020,19 @@ async fn cmd_observe(
     output: &mut Out<'_>,
 ) -> Result<()> {
     let outcome = observe_wait(
-        routing, pile, signer, pile_path, persona, options, health_max_age,
-        service_events_collection, continuous, deadline, output,
-    ).await?;
+        routing,
+        pile,
+        signer,
+        pile_path,
+        persona,
+        options,
+        health_max_age,
+        service_events_collection,
+        continuous,
+        deadline,
+        output,
+    )
+    .await?;
     if !continuous && !outcome.news_printed {
         output.line(outcome.timeout_text())?;
     }
@@ -5046,6 +5089,7 @@ async fn observe_wait(
         let mut last_pending_sweep = Instant::now();
 
         let sources = loop {
+            routing.validate_workspace_at(pile, signer.verifying_key())?;
             let (fired, deadline) = health
                 .poll_in(pile, signer, persona_input, false, form, output)
                 .await?;
@@ -5070,6 +5114,7 @@ async fn observe_wait(
         // Keep the prefix which selected these target views as the polling
         // watermark, including while their lazy payload reads are pending.
         let initial = loop {
+            routing.validate_workspace_at(pile, signer.verifying_key())?;
             let (fired, deadline) = health
                 .poll_in(pile, signer, persona_input, false, form, output)
                 .await?;
@@ -5383,6 +5428,7 @@ async fn observe_wait(
                 sleep.min(timeout.saturating_sub(start.elapsed()))
             });
             tokio::time::sleep(sleep).await;
+            routing.validate_workspace_at(pile, signer.verifying_key())?;
             let (fired, deadline) = health
                 .poll_in(pile, signer, persona_input, false, form, output)
                 .await?;
@@ -5595,14 +5641,21 @@ async fn observe_wait(
                 });
             }
         }
-    }).catch_unwind().await;
+    })
+    .catch_unwind()
+    .await;
     if let Some(selected) = selection.take() {
         selected.control.cancel();
         // A deadline does not preempt synchronous decoding/query work. This
         // join can therefore outlast the logical deadline, and must remain
         // owned rather than being reported as already settled.
-        let joined = selected.task.await.context("settle frozen Orient selection");
-        if matches!(&result, Ok(Ok(_))) { let _ = joined?; }
+        let joined = selected
+            .task
+            .await
+            .context("settle frozen Orient selection");
+        if matches!(&result, Ok(Ok(_))) {
+            let _ = joined?;
+        }
     }
     let result: Result<WaitOutcome> = match result {
         Ok(result) => result,
@@ -5905,8 +5958,14 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         // placeholder line the cover text shows (as Drive always has).
         pairs.push(WakePair {
             range: Some(format!("{}..{}", entry.start, entry.end)),
-            ..WakePair::new(entry.recall.clone(), if raw { body.to_owned() }
-                else { format!("{body}\n") })
+            ..WakePair::new(
+                entry.recall.clone(),
+                if raw {
+                    body.to_owned()
+                } else {
+                    format!("{body}\n")
+                },
+            )
         });
     }
     let mut shown = BTreeSet::new();
@@ -6049,17 +6108,33 @@ mod tests {
     #[test]
     fn raw_memory_wake_pairs_preserve_one_result_and_image_placeholder() {
         use crate::memory_cover::{CoverEntry, CoverReport};
-        for text in ["", "\n\n", " \t", "\nleading\n", "CRLF\r\n",
-            "trailing \t\n", "\u{2003}\u{a0}", "e\u{301} 🐝\n"] {
+        for text in [
+            "",
+            "\n\n",
+            " \t",
+            "\nleading\n",
+            "CRLF\r\n",
+            "trailing \t\n",
+            "\u{2003}\u{a0}",
+            "e\u{301} 🐝\n",
+        ] {
             let id = *fucid();
             let command = format!("memory raw {id:x}");
             let entry = CoverEntry {
-                start: "2026-01-01T00:00:00".into(), end: "2026-01-01T01:00:00".into(),
-                chunk: id, recall: command.clone(), body: Some(text.into()),
+                start: "2026-01-01T00:00:00".into(),
+                end: "2026-01-01T01:00:00".into(),
+                chunk: id,
+                recall: command.clone(),
+                body: Some(text.into()),
             };
             let selection = WakeSelection {
-                cover: CoverReport { text: String::new(), diagnostics: vec![], entries: vec![entry] },
-                beliefs: wiki_model::CoverBeliefs::default(), goals: "Compass:\n".into(),
+                cover: CoverReport {
+                    text: String::new(),
+                    diagnostics: vec![],
+                    entries: vec![entry],
+                },
+                beliefs: wiki_model::CoverBeliefs::default(),
+                goals: "Compass:\n".into(),
                 presented: None,
             };
             let pairs = wake_pairs(&selection, 5, 5);
@@ -7901,13 +7976,20 @@ mod tests {
             &mut pile,
             crate::schemas::habit::DEFAULT_SCOPE_ID,
             fixture.signer.verifying_key(),
-        ).unwrap();
+        )
+        .unwrap();
         let (definition, habit) = habits::habit_fragment(
-            "unreadable", "when echo 'status unavailable' >&2; exit 2",
-            "must not be due", None, &[], &[],
-        ).unwrap();
+            "unreadable",
+            "when echo 'status unavailable' >&2; exit 2",
+            "must not be due",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
         let facts = archive(definition.facts());
-        pile.commit(collection, &fixture.signer, definition).unwrap();
+        pile.commit(collection, &fixture.signer, definition)
+            .unwrap();
         let snapshot = pile.snapshot().unwrap();
         let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
         let observed = observe_habits(prepared, &fixture.path, 100).unwrap();

@@ -12,6 +12,8 @@ use std::path::PathBuf;
     about = "Doctor-style diagnostics over canonical faculty collections"
 )]
 pub struct Cli {
+    #[command(flatten)]
+    workspace: crate::cli_workspace::WorkspaceArgs,
     /// Path to the pile file to inspect.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -92,7 +94,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return out.line(Cli::command().render_long_help().to_string());
     };
-    let triage = Triage::new(cli.pile, cli.key);
+    let triage = Triage::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
     match command {
         Command::Scan {
             recent,
