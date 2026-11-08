@@ -174,21 +174,6 @@ pub fn pull_header(report: &PullReport, out: &mut Out<'_>) -> Result<()> {
     }
     Ok(())
 }
-/// The pull that freshens a read, whose answer is the history after it. A
-/// channel the pull could not reach is read from what was already resident.
-pub fn read_pull(report: &PullReport, out: &mut Out<'_>) -> Result<()> {
-    pull_header(report, out)?;
-    for channel in &report.channels {
-        match &channel.result {
-            Ok(receipt) => channel_receipt(receipt, out)?,
-            Err(error) => out.note(format!(
-                "{} ({}) not pulled: {error}",
-                channel.channel_id, channel.name
-            ))?,
-        }
-    }
-    Ok(())
-}
 pub fn pull(report: &PullReport, out: &mut Out<'_>) -> Result<()> {
     pull_header(report, out)?;
     for channel in &report.channels {
@@ -267,59 +252,4 @@ pub fn addressed(channels: &[AddressedChannel], out: &mut Out<'_>) -> Result<()>
         ))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::out::Part;
-
-    #[test]
-    fn a_channel_a_read_could_not_pull_is_a_note_beside_the_receipts() {
-        let report = PullReport {
-            all_visible: true,
-            guilds: 1,
-            channels: vec![
-                ChannelPull {
-                    channel_id: "1".into(),
-                    name: "reachable".into(),
-                    result: Ok(ChannelReceipt {
-                        channel_id: "1".into(),
-                        observations: 0,
-                        coverage: None,
-                        commit: None,
-                        more: false,
-                    }),
-                },
-                ChannelPull {
-                    channel_id: "2".into(),
-                    name: "forbidden".into(),
-                    result: Err("synthetic missing access".into()),
-                },
-            ],
-        };
-        let mut parts = Vec::new();
-        read_pull(
-            &report,
-            &mut Out::new(&mut |part| {
-                parts.push(part);
-                Ok(())
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            parts,
-            [
-                Part::Text {
-                    text: "Polling 2 channels across 1 guilds…\n".into()
-                },
-                Part::Text {
-                    text: "  1: no observations\n".into()
-                },
-                Part::Note {
-                    text: "2 (forbidden) not pulled: synthetic missing access".into()
-                },
-            ]
-        );
-    }
 }

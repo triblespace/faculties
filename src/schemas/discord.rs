@@ -48,7 +48,7 @@
 //! addressed to that window's persona, so orient wakes only it for what is
 //! written there.
 //!
-//! Coverage says what is stored, not what was heard: `discord read` brings a
+//! Coverage says what is stored, not what was heard: `discord pull` brings a
 //! channel's history in with the same observations `discord live`'s intake
 //! stores. Where a channel's live intake begins is therefore a fact of its
 //! own ([`discord::kind_intake`]), which is how a reader looking for news

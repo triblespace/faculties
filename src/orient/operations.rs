@@ -2120,8 +2120,8 @@ fn teams_message_detail(query: &OrientQuery<'_>, message: Id) -> Result<(String,
 /// And news is what was heard: a message sent in a channel at or after the
 /// moment `discord live`'s intake hears the channel from, which intake
 /// records in the collection with what it stores. Who stored the message does
-/// not matter: one sent while intake was down is news when `discord read`
-/// brings it in. A channel's history is never news, although `discord read`
+/// not matter: one sent while intake was down is news when `discord pull`
+/// brings it in. A channel's history is never news, although `discord pull`
 /// stores it just as intake stores what it hears, and neither is a channel
 /// intake never heard: reading history wakes no window, then or when a
 /// window first reads Discord.
@@ -11349,7 +11349,7 @@ mod tests {
     /// for the first time, presented the day-old reply as news. It is the
     /// channel's history, which `discord read` stored: never news. What is
     /// sent from where intake begins is news whoever stored it: one sent
-    /// while intake was down that `discord read` brings in, although intake
+    /// while intake was down that `discord pull` brings in, although intake
     /// has stored nothing in the channel yet, and the gateway's next message.
     #[test]
     fn discord_history_read_before_intake_began_is_never_news() {

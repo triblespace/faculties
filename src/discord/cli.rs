@@ -202,20 +202,26 @@ enum CommandMode {
         #[arg(long = "file", value_name = "PATH")]
         files: Vec<PathBuf>,
     },
-    /// Pull one complete forward interval plus a bounded recent window.
+    /// Read the Discord observations already in the pile. No token or
+    /// network; `discord live` keeps them current, and `pull` fetches.
     Read {
-        /// Channel id (global Discord snowflake). If omitted, poll every
-        /// visible text-capable channel.
+        /// Channel id (global Discord snowflake). If omitted, every channel.
         channel_id: Option<String>,
         /// Only display messages at or after this RFC3339 timestamp.
         #[arg(long)]
         since: Option<String>,
-        /// Maximum messages to display after ingestion (0 = no limit).
+        /// Maximum messages to display (0 = no limit).
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Display newest first.
         #[arg(long)]
         descending: bool,
+    },
+    /// Pull one complete forward interval plus a bounded recent window.
+    Pull {
+        /// Channel id (global Discord snowflake). If omitted, poll every
+        /// visible text-capable channel.
+        channel_id: Option<String>,
         /// Maximum messages per forward page (Discord caps this at 100).
         #[arg(long, default_value_t = 100)]
         fetch_limit: u32,
@@ -357,26 +363,28 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
             since,
             limit,
             descending,
-            fetch_limit,
-            reconcile_limit,
         } => {
             let read = ReadOptions {
-                channel_id: channel_id.clone(),
+                channel_id,
                 since,
                 limit,
                 descending,
             };
             read.validate()?;
-            let report = operations.pull(PullOptions {
+            render::history(&operations.read(read)?, out)
+        }
+        CommandMode::Pull {
+            channel_id,
+            fetch_limit,
+            reconcile_limit,
+        } => {
+            let pull = PullOptions {
                 channel_id,
                 fetch_limit: fetch_limit.clamp(1, 100),
                 reconcile_limit: reconcile_limit.clamp(1, 100),
-            })?;
-            render::read_pull(&report, out)?;
-            if report.all_visible && report.channels.is_empty() {
-                return Ok(());
-            }
-            render::history(&operations.read(read)?, out)
+            };
+            pull.validate()?;
+            render::pull(&operations.pull(pull)?, out)
         }
         CommandMode::Channels {
             command: ChannelsCommand::List { guild },
