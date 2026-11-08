@@ -182,6 +182,8 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             let mut dir = ".".to_owned();
             let mut unit_exp = 14u32;
             let mut elastic = false;
+            let mut age_share = 0u8;
+            let mut cut_oldest = false;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -214,10 +216,23 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                         elastic = true;
                         i += 1;
                     }
+                    "--age-share" => {
+                        age_share = args
+                            .get(i + 1)
+                            .ok_or_else(|| anyhow!("--age-share needs a value"))?
+                            .parse()?;
+                        i += 2;
+                    }
+                    "--cut-oldest" => {
+                        cut_oldest = true;
+                        i += 1;
+                    }
                     other => bail!("unknown flag {other}"),
                 }
             }
-            memory.cover_compare(budget, resident, &dir, unit_exp, elastic, out)
+            memory.cover_compare(
+                budget, resident, &dir, unit_exp, elastic, age_share, cut_oldest, out,
+            )
         }
         "runs-diag" => memory.runs_diag(churn_options(args)?.budget_chars, out),
         "churn-calendar" => memory.churn_calendar(&churn_options(args)?, out),

@@ -332,6 +332,8 @@ impl Memory {
         out_dir: &str,
         unit_exp: u32,
         open_elastic: bool,
+        age_share: u8,
+        open_cut_oldest: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
         let mut opts = CoverOpts::plain(budget);
@@ -348,12 +350,20 @@ impl Memory {
                 &opts,
                 (1i128 << unit_exp) * 1_000_000_000,
                 open_elastic,
+                age_share,
+                open_cut_oldest,
             )?;
             std::fs::write(format!("{out_dir}/current-{budget}.txt"), current)?;
             std::fs::write(
                 format!(
-                    "{out_dir}/candidate-grid-u2^{unit_exp}{}-{budget}.txt",
-                    if open_elastic { "-elastic" } else { "" }
+                    "{out_dir}/candidate-grid-u2^{unit_exp}-share{age_share}{}-{budget}.txt",
+                    if open_cut_oldest {
+                        "-cutoldest"
+                    } else if open_elastic {
+                        "-elastic"
+                    } else {
+                        ""
+                    }
                 ),
                 candidate,
             )?;
@@ -409,47 +419,40 @@ impl Memory {
             run_curve: 0,
             unit_ns: None,
             open_elastic: false,
+            age_share: 0,
+            open_cut_oldest: false,
         };
         let _ = (unit, cap);
-        let clock = TiledOpts {
+        let grid = TiledOpts {
             open_append: Some(0.04),
+            unit_ns: Some((1i128 << 16) * 1_000_000_000),
+            open_cut_oldest: true,
             ..base.clone()
         };
-        let u16 = Some(1i128 << 16).map(|x| x * 1_000_000_000);
-        let u17 = Some(1i128 << 17).map(|x| x * 1_000_000_000);
         let configs = vec![
             (
-                "grid unit 2^14 s (report 7 primary)".to_owned(),
-                clock.clone(),
+                "2^16 grid, equal shares (report 8), open from free room, oldest cut".to_owned(),
+                grid.clone(),
             ),
             (
-                "grid unit 2^16 s, open truncated".to_owned(),
+                "2^16 grid, A1 actual-age shares at each level's last change (literal)".to_owned(),
                 TiledOpts {
-                    unit_ns: u16,
-                    ..clock.clone()
+                    age_share: 1,
+                    ..grid.clone()
                 },
             ),
             (
-                "grid unit 2^16 s, open elastic".to_owned(),
+                "2^16 grid, A2 actual-age shares at the level's latest unchanged moment".to_owned(),
                 TiledOpts {
-                    unit_ns: u16,
-                    open_elastic: true,
-                    ..clock.clone()
+                    age_share: 2,
+                    ..grid.clone()
                 },
             ),
             (
-                "grid unit 2^17 s, open truncated".to_owned(),
+                "2^16 grid, A3 equal shares, level 0 absorbs the free room".to_owned(),
                 TiledOpts {
-                    unit_ns: u17,
-                    ..clock.clone()
-                },
-            ),
-            (
-                "grid unit 2^17 s, open elastic".to_owned(),
-                TiledOpts {
-                    unit_ns: u17,
-                    open_elastic: true,
-                    ..clock.clone()
+                    age_share: 3,
+                    ..grid.clone()
                 },
             ),
         ];
