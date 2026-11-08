@@ -19,7 +19,6 @@ open and delivers successive reports to one callback, without per-turn hooks.
   - due Habits and Habit states needing attention
   - Compass goals in `doing`
   - Compass goals in `todo`
-  - current window status
 
 Defaults to ten messages, five doing goals, and five todo goals. The
 `--message-limit`, `--doing-limit`, and `--todo-limit` flags tune those limits.
@@ -66,8 +65,8 @@ and never records presentation; memory diagnostics go to stderr.
 immutable pile snapshot contain news for this persona, rather than reporting
 every raw pile append. Directed news includes unread
 inbox or group messages, Compass goals and notes whose `@label` mentions name
-the persona or any Relations group containing it, newly status-bearing windows,
-and unread Mail. A goal tagged with the persona's own label is assigned to it:
+the persona or any Relations group containing it, and unread Mail. A goal tagged
+with the persona's own label is assigned to it:
 other people's status changes and notes on that goal are news too. Group names
 used as tags are topics and address nobody, and writing on a goal does not
 subscribe the writer to it. The persona's own attributed notes, mentions, status

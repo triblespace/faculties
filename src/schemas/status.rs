@@ -1,4 +1,5 @@
-//! Status schema: per-window "currently doing X" updates.
+//! Historical Status schema: retained to interpret existing collection facts.
+//! No live Status faculty or authored-status observer is registered.
 //!
 //! A status update is an append-only timestamped event keyed to a window
 //! (a relations persona / agent). Latest-per-window = current status; the

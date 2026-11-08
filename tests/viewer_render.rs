@@ -2,35 +2,25 @@
 //! Run only with a reserved graphics host and an outer process deadline.
 #![cfg(feature = "widgets")]
 
-use faculties::relations::{ProfileInput, Relations};
-use faculties::status::Status;
+use faculties::files::operations::Files;
 use faculties::storage::initialize_signer;
 use faculties::viewer::{CaptureOptions, Target, Viewer};
 use std::time::Duration;
 
 #[test]
 #[ignore = "requires an explicitly reserved native graphics runtime"]
-fn resident_capture_renders_a_temporary_status_pile_without_export_files() {
+fn resident_capture_renders_a_temporary_files_pile_without_export_files() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("capture.pile");
     let key = directory.path().join("explicit.key");
     std::fs::File::create(&pile).unwrap();
     initialize_signer(&pile, Some(&key)).unwrap();
-    let relations = Relations::new(pile.clone(), Some(key.clone()));
-    let person = relations
-        .add(
-            ProfileInput {
-                label: "Capture fixture".into(),
-                ..Default::default()
-            },
-            None,
+    Files::new(pile.clone(), Some(key.clone()))
+        .add_bytes(
+            b"Native capture is rendering".to_vec().into(),
+            "capture-fixture.txt",
+            "text/plain",
             &[],
-        )
-        .unwrap();
-    Status::new(pile.clone(), Some(key.clone()))
-        .set(
-            &format!("{:x}", person.person),
-            "Native capture is rendering",
         )
         .unwrap();
     let entries = || {
@@ -50,7 +40,7 @@ fn resident_capture_renders_a_temporary_status_pile_without_export_files() {
     };
     let mut pages = Vec::new();
     let summary = Viewer::new(pile, Some(key))
-        .capture_with(Target::Status, &options, |page| {
+        .capture_with(Target::Files, &options, |page| {
             pages.push(page);
             Ok(())
         })

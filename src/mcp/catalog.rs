@@ -14,7 +14,7 @@ use crate::storage::Storage;
 use crate::{
     archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord, duplex,
     files, gauge, habits, headspace, hear, imagine, linkedin, mail, memory, message, orient,
-    patience, planner, posture, quota, reason, relations, secrets, status, teams, triage, viewer,
+    patience, planner, posture, quota, reason, relations, secrets, teams, triage, viewer,
     voice, web, wiki, world,
 };
 
@@ -125,7 +125,6 @@ impl Catalog {
             Box::new(reason::mcp::Reason::with_storage(storage.clone())),
             Box::new(relations::mcp::Relations::with_storage(storage.clone())),
             Box::new(secrets::mcp::Secrets::with_storage(storage.clone())),
-            Box::new(status::mcp::Status::with_storage(storage.clone())),
             Box::new(teams::mcp::Teams::with_storage(storage.clone())),
             Box::new(triage::mcp::Triage::with_storage(storage.clone())),
             Box::new(viewer::mcp::Viewer::with_storage(storage.clone())),

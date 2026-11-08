@@ -667,7 +667,6 @@ schemas describe exact arguments and effects.
 | `reason` | Reasoning notes and intended-action evidence |
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
 | `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |
-| `status` | Per-persona window status |
 | `teams` | Resident Graph archive, explicit sync/actions and professional context |
 | `triage` | Execution-loop, timeline and context diagnostics |
 | `voice` | Resident speech synthesis and routing policy; host playback separately |
@@ -1028,8 +1027,8 @@ keeps using it until the route itself is changed.
 ## GORBIE viewer
 
 The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile.
-The 11 small capture binaries select shared compositions for Atlas, Discord,
-Files, Gauge, Headspace, Memory, Messages, Planner, Status, Teams and Triage.
+The 10 small capture binaries select shared compositions for Atlas, Discord,
+Files, Gauge, Headspace, Memory, Messages, Planner, Teams and Triage.
 They retain GORBIE's explicit window, headless-file and web-export CLI UX;
 help/version do not start a GPU or open a pile.
 

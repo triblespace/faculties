@@ -329,7 +329,6 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "relations_list",
         "secrets_list",
         "secrets_grant",
-        "status_list",
         "teams_read",
         "triage_scan",
         "viewer_capture",
@@ -339,6 +338,9 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "world_move_to",
     ] {
         assert!(names.contains(name), "missing native tool {name}");
+    }
+    for removed in ["status_set", "status_list", "status_show"] {
+        assert!(!names.contains(removed), "retired tool {removed} is still registered");
     }
     for tool in tools {
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();

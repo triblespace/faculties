@@ -30,7 +30,7 @@ pub struct Cli {
     /// Directed news for a persona: messages and mail to it or its groups;
     /// Compass goals and notes that `@`-mention it or a group it belongs to;
     /// other people's status changes and notes on goals tagged with its own
-    /// label (assignment); newly status-bearing windows; Teams, Discord and
+    /// label (assignment); Teams, Discord and
     /// health news. Group-name tags are topics, and writing on a goal does
     /// not subscribe you to it. Your own actions never wake you.
     #[arg(long, env = "PERSONA")]

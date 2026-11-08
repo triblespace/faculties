@@ -27,20 +27,19 @@ fn tiny_page() -> CapturePage {
 
 #[test]
 fn target_inventory_and_original_dashboard_order_are_explicit() {
-    assert_eq!(Target::ALL.len(), 12);
+    assert_eq!(Target::ALL.len(), 11);
     assert_eq!(
         Target::ALL
             .into_iter()
             .map(Target::name)
             .collect::<BTreeSet<_>>()
             .len(),
-        12
+        11
     );
     assert_eq!(
         Target::Dashboard.card_names(),
         &[
             "storage",
-            "status",
             "headspace",
             "timeline",
             "gauge",
@@ -144,7 +143,7 @@ fn resident_pages_emit_metadata_then_exact_png_not_a_file_resource() {
     let page = tiny_page();
     let mut output = Vec::new();
     page.emit(
-        Target::Status,
+        Target::Files,
         &mut Out::new(&mut |part| {
             output.push(part);
             Ok(())
@@ -156,8 +155,8 @@ fn resident_pages_emit_metadata_then_exact_png_not_a_file_resource() {
         panic!("metadata precedes image")
     };
     let metadata: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(metadata["target"], "status");
-    assert_eq!(metadata["card"], "status");
+    assert_eq!(metadata["target"], "files");
+    assert_eq!(metadata["card"], "files");
     assert_eq!(metadata["card_index"], 1);
     assert_eq!(metadata["page_index"], 0);
     assert_eq!(metadata["page_count"], 1);
@@ -210,18 +209,19 @@ fn mcp_is_strict_finite_and_cannot_supply_host_paths_or_harness_flags() {
     for input in [
         "[]",
         "{}",
-        r#"{"target":"status","target":"files"}"#,
+        r#"{"target":"files","target":"memory"}"#,
+        r#"{"target":"status"}"#,
         r#"{"target":"@/host/path"}"#,
-        r#"{"target":"status","pile":"/host/path"}"#,
-        r#"{"target":"status","key":"/host/key"}"#,
-        r#"{"target":"status","out_dir":"/host/path"}"#,
-        r#"{"target":"status","export":true}"#,
-        r#"{"target":"status","persona":"ambient"}"#,
-        r#"{"target":"status","scale":0}"#,
-        r#"{"target":"status","scale":1e99}"#,
-        r#"{"target":"status","settle_ms":5001}"#,
-        r#"{"target":"status","max_images":0}"#,
-        r#"{"target":"status","max_bytes":0}"#,
+        r#"{"target":"files","pile":"/host/path"}"#,
+        r#"{"target":"files","key":"/host/key"}"#,
+        r#"{"target":"files","out_dir":"/host/path"}"#,
+        r#"{"target":"files","export":true}"#,
+        r#"{"target":"files","persona":"ambient"}"#,
+        r#"{"target":"files","scale":0}"#,
+        r#"{"target":"files","scale":1e99}"#,
+        r#"{"target":"files","settle_ms":5001}"#,
+        r#"{"target":"files","max_images":0}"#,
+        r#"{"target":"files","max_bytes":0}"#,
     ] {
         let error = adapter
             .call(

@@ -125,7 +125,6 @@ impl Fixture {
                 faculties::schemas::teams::DEFAULT_SCOPE_ID,
                 faculties::schemas::compass::DEFAULT_SCOPE_ID,
                 faculties::schemas::relations::DEFAULT_SCOPE_ID,
-                faculties::schemas::status::DEFAULT_SCOPE_ID,
                 faculties::schemas::habit::DEFAULT_SCOPE_ID,
                 faculties::schemas::memory::DEFAULT_SCOPE_ID,
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,
@@ -1242,7 +1241,10 @@ fn a_one_shot_wait_reports_once_and_missing_persona_poll_remains_quiet() {
 fn mcp_is_finite_and_rejects_host_config_waits_and_duplicate_fields() {
     let directory = tempfile::tempdir().unwrap();
     let adapter = mcp::Orient::new(directory.path().join("absent.pile"), None);
-    assert_eq!(adapter.tools().len(), 4);
+    assert_eq!(
+        adapter.tools().iter().map(|tool| tool.name).collect::<Vec<_>>(),
+        ["orient_next", "orient_show", "orient_wake", "orient_poll", "orient_baseline"]
+    );
     Server::new(&[&adapter]).unwrap();
     assert!(!adapter.tools().iter().any(|t| t.name.contains("wait")));
     for (tool, args) in [
@@ -1252,6 +1254,7 @@ fn mcp_is_finite_and_rejects_host_config_waits_and_duplicate_fields() {
             r#"{"evaluate_habits":false,"evaluate_habits":true}"#,
         ),
         ("orient_show", "[]"),
+        // peek=true is valid; this case omits the required persona.
         ("orient_poll", r#"{"peek":true}"#),
         ("orient_poll", r#"{"persona":"p","poll_ms":10}"#),
         ("orient_wake", r#"{"key":"@/host/key"}"#),

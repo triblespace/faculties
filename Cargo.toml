@@ -101,12 +101,6 @@ name = "teams-capture"
 path = "src/bin/teams-capture.rs"
 required-features = ["widgets"]
 
-# Window-status board viewer.
-[[bin]]
-name = "status-capture"
-path = "src/bin/status-capture.rs"
-required-features = ["widgets"]
-
 [features]
 # `local-embed` and `widgets` are default: posture's semantic tier still reads
 # nomic-embed-text, and the GORBIE viewer is part of the normal office surface.

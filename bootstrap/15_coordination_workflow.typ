@@ -99,7 +99,7 @@ Manual `orient poll` and one-shot `orient wait` remain available when needed.
 With a persona set, the watcher wakes for directed news: unread inbox or group
 messages, goals and notes that `@`-mention the persona or one of its Relations
 groups, other people's status changes and notes on goals tagged with the
-persona's own label, and newly status-bearing windows. Group-name tags are
+persona's own label. Group-name tags are
 topics and wake nobody, and writing on a goal subscribes nobody. An agent's own
 status edits stay quiet. Habit sweeps include global intentions and those
 explicitly addressed to this persona. Give a personal clock an explicit

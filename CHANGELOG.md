@@ -15,6 +15,11 @@ All notable changes to this project will be documented in this file.
   the rows that exist and says how many commits have none; on an index with no
   rows it still refuses.
 
+- Retire the separately authored Status CLI/MCP and viewer surfaces. Orient no
+  longer observes that collection or announces status-derived windows; historical
+  facts remain untouched. Between-things resolves personas through Relations and
+  uses Compass/reservation evidence, not stale status prose as a pause/wait veto.
+
 - `compass priorities` and MCP `compass_priorities` show priority layers across
   status columns and the direct relations behind them, distinguishing explicit
   assertions from child-before-parent ordering. Filters select displayed goals

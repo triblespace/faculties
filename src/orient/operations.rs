@@ -361,8 +361,6 @@ use crate::schemas::relations::{
     KIND_GROUP_SNAPSHOT, KIND_IDENTITY_VERDICT, KIND_PERSON_ID, KIND_PERSON_LIFECYCLE,
     KIND_PERSON_PROFILE,
 };
-use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
-use crate::schemas::status::{status as window_status, KIND_STATUS_UPDATE};
 use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::storage::FactView;
@@ -372,7 +370,7 @@ use crate::storage::{open_store, open_store_as, runtime};
 use crate::storage::{read, FactArchive, FacultyAccess, FacultyStore, Storage};
 use crate::{
     clock, compass, discord as discord_model, habits, mail as mail_model, message,
-    orient as orient_model, relations, status, teams as teams_model, wiki as wiki_model,
+    orient as orient_model, relations, teams as teams_model, wiki as wiki_model,
 };
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
@@ -538,11 +536,6 @@ impl RefreshProbe {
                 "Relations",
                 previous.map(|p| &p.facts.relations),
                 &current.facts.relations,
-            ),
-            (
-                "Status",
-                previous.map(|p| &p.facts.status),
-                &current.facts.status,
             ),
         ] {
             self.fact(target, old, new);
@@ -978,7 +971,6 @@ struct OrientSources {
     discord: OrientSource,
     compass: OrientSource,
     relations: OrientSource,
-    status: OrientSource,
     habits: Option<OrientSource>,
     presentations: ReceiptSource,
     compass_status: Collection<LwwRegisterBlob>,
@@ -1003,7 +995,6 @@ impl OrientSources {
             OrientSource::open(routing, pile, signer, COMPASS_SCOPE_ID, "Compass").await?;
         let relations =
             OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
-        let status = OrientSource::open(routing, pile, signer, STATUS_SCOPE_ID, "Status").await?;
         let habits = if include_habits {
             Some(OrientSource::open(routing, pile, signer, HABIT_SCOPE_ID, "Habit").await?)
         } else {
@@ -1018,7 +1009,6 @@ impl OrientSources {
             discord,
             compass,
             relations,
-            status,
             habits,
             presentations,
             compass_status,
@@ -1055,7 +1045,6 @@ struct OrientFacts {
     discord: OrientFact,
     compass: OrientFact,
     relations: OrientFact,
-    status: OrientFact,
     habits: Option<OrientFact>,
     presentations: ReceiptObservation,
 }
@@ -1089,7 +1078,6 @@ impl OrientObservation {
             &self.facts.discord,
             &self.facts.compass,
             &self.facts.relations,
-            &self.facts.status,
         ]
         .into_iter()
         .all(|fact| fact.is_current(snapshot))
@@ -1118,7 +1106,6 @@ impl OrientObservation {
             discord: self.facts.discord.view(),
             compass: self.facts.compass.view(),
             relations: self.facts.relations.view(),
-            status: self.facts.status.view(),
             habits: self.facts.habits.as_ref().map(OrientFact::view),
             presentations: self.facts.presentations.view(),
             compass_status: &self.compass_status,
@@ -1145,7 +1132,6 @@ async fn maintain_inputs(
         Some(&sources.discord),
         Some(&sources.compass),
         Some(&sources.relations),
-        Some(&sources.status),
         sources.habits.as_ref(),
     ]
     .into_iter()
@@ -1182,7 +1168,6 @@ fn observe_sources(
     let discord = sources.discord.observe(&snapshot)?;
     let compass = sources.compass.observe(&snapshot)?;
     let relations = sources.relations.observe(&snapshot)?;
-    let status = sources.status.observe(&snapshot)?;
     let habits = sources
         .habits
         .as_ref()
@@ -1214,7 +1199,6 @@ fn observe_sources(
             discord,
             compass,
             relations,
-            status,
             habits,
             presentations,
         },
@@ -1278,7 +1262,6 @@ fn start_observation(
         sources.discord,
         sources.compass,
         sources.relations,
-        sources.status,
     ];
     let habits = sources.habits;
     let receipts_target = sources.presentations.rank9;
@@ -1302,7 +1285,7 @@ fn start_observation(
                 view,
             })
         };
-        let [messages, mail, teams, discord, compass, relations, status] = fact_sources;
+        let [messages, mail, teams, discord, compass, relations] = fact_sources;
         let presentations = trace_refresh_call("Orient receipts", "attach", || {
             reader.attached(receipts_target)
         })?
@@ -1339,7 +1322,6 @@ fn start_observation(
                 discord: observe(discord)?,
                 compass: observe(compass)?,
                 relations: observe(relations)?,
-                status: observe(status)?,
                 habits: habits.map(observe).transpose()?,
                 presentations: ReceiptObservation {
                     collection: presentations,
@@ -1370,7 +1352,6 @@ struct OrientQuery<'a> {
     discord: &'a FactArchive,
     compass: &'a FactArchive,
     relations: &'a FactArchive,
-    status: &'a FactArchive,
     habits: Option<&'a FactArchive>,
     presentations: &'a FactArchive,
     compass_status: &'a LwwQuery,
@@ -2876,47 +2857,6 @@ fn render_native_compass_goals(
     Ok((out, shown))
 }
 
-fn render_window_status(query: &OrientQuery<'_>) -> Result<(String, BTreeSet<Id>)> {
-    use std::fmt::Write as _;
-
-    let mut latest = BTreeMap::<Id, ((i128, Id), status::TextHandle)>::new();
-    for (event, window, text, at) in find!(
-        (event: Id, window: Id, text: status::TextHandle, at: IntervalValue),
-        pattern!(query.status, [{ ?event @
-            metadata::tag: &KIND_STATUS_UPDATE,
-            window_status::window: ?window,
-            window_status::text: ?text,
-            metadata::created_at: ?at,
-        }])
-    ) {
-        let Some(at) = interval_key(at) else {
-            continue;
-        };
-        let key = (at, event);
-        let entry = latest.entry(window).or_insert((key, text));
-        if key > entry.0 {
-            *entry = (key, text);
-        }
-    }
-    let mut rows = Vec::new();
-    for (person, (_, handle)) in &latest {
-        let text = Some(read_utf8(&query.payloads, *handle, "Status text")?);
-        rows.push((read_native_person_label(query, *person)?, text));
-    }
-    rows.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut out = String::new();
-    let shown = latest.keys().copied().collect();
-    writeln!(out, "Window status:").unwrap();
-    if rows.is_empty() {
-        writeln!(out, "- (none)").unwrap();
-    }
-    for (label, text) in rows {
-        writeln!(out, "- {label}: {}", text.unwrap_or_else(|| "—".to_owned())).unwrap();
-    }
-    Ok((out, shown))
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DueHabit {
     label: String,
@@ -3382,17 +3322,6 @@ fn persona_groups<P: TriblePattern>(facts: &P, persona: Id) -> Result<BTreeSet<I
         .collect())
 }
 
-fn status_roster(query: &OrientQuery<'_>) -> Result<BTreeSet<Id>> {
-    Ok(find!(
-        window: Id,
-        pattern!(query.status, [{ _?event @
-            metadata::tag: &KIND_STATUS_UPDATE,
-            window_status::window: ?window,
-        }])
-    )
-    .collect())
-}
-
 fn insert_note_goal(notes: &mut BTreeMap<Id, (Id, bool)>, note_id: Id, goal_id: Id, mention: bool) {
     notes
         .entry(note_id)
@@ -3462,7 +3391,6 @@ enum AttentionEvent {
     GoalMention {
         goal: Id,
     },
-    StatusWindow(Id),
     Health {
         event: Id,
         detail: String,
@@ -3486,8 +3414,7 @@ impl AttentionEvent {
             Self::Message(id)
             | Self::Mail(id)
             | Self::Teams(id)
-            | Self::Discord(id)
-            | Self::StatusWindow(id) => *id,
+            | Self::Discord(id) => *id,
             Self::Goal { event, .. } => *event,
             Self::Note { note, .. } => *note,
             Self::GoalMention { goal } => *goal,
@@ -3522,9 +3449,6 @@ impl AttentionEvent {
                 if *mention { " mentions you" } else { "" }
             ),
             Self::GoalMention { goal } => format!("goal [{}] mentions you", fmt_id(*goal)),
-            Self::StatusWindow(window) => {
-                format!("new status window [{}]", fmt_id(*window))
-            }
             Self::Health { detail, .. } => format!("swarm health: {detail}"),
             Self::ServiceFailure { detail, .. } => format!("native service failure: {detail}"),
             Self::NewsPath { detail, .. } => detail.clone(),
@@ -3677,12 +3601,6 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
         });
     }
 
-    for window in status_roster(query)? {
-        if !own_identities.contains(&window) {
-            view.insert(AttentionEvent::StatusWindow(window));
-        }
-    }
-
     Ok(view)
 }
 
@@ -3825,7 +3743,7 @@ async fn cmd_show(
         refresh_receipts_before_observation(pile, signer, &sources, output).await?;
         let instant = clock::now()?;
         let observation = observe_current_sources_acquiring(pile, &sources).await?;
-        let (persona_id, messages, mail, habits, goals, window_status, shown) =
+        let (persona_id, messages, mail, habits, goals, shown) =
             read(pile, &observation.snapshot, |reader| {
                 let query = observation.query(reader);
                 let persona_id = persona
@@ -3849,7 +3767,6 @@ async fn cmd_show(
                 // stays strict here.
                 let (goals, goal_events) =
                     render_native_compass_goals(&query, doing_limit, todo_limit, &|_| None)?;
-                let (window_status, status_events) = render_window_status(&query)?;
                 let shown = match persona_id {
                     Some(persona) => {
                         let candidates: BTreeSet<_> =
@@ -3858,7 +3775,6 @@ async fn cmd_show(
                             .into_iter()
                             .chain(mail_events)
                             .chain(goal_events)
-                            .chain(status_events)
                             .filter(|event| candidates.contains(event))
                             .collect::<Vec<_>>()
                     }
@@ -3870,7 +3786,6 @@ async fn cmd_show(
                     mail,
                     habits,
                     goals,
-                    window_status,
                     shown,
                 ))
             })
@@ -3898,7 +3813,6 @@ async fn cmd_show(
         report.push('\n');
         report.push_str(&habits);
         report.push_str(&goals);
-        report.push_str(&window_status);
         report.push_str(quota);
 
         write_complete_report(output, &report, "Orient overview", &mut |_| {}).await?;
@@ -4210,10 +4124,6 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             .unwrap_or_default();
             format!("goal {}{actor} mentions you", news_goal_name(query, goal))
         }
-        AttentionEvent::StatusWindow(window) => match read_native_person_label(query, *window) {
-            Ok(label) => format!("new status window {label}"),
-            Err(_) => event.reason(),
-        },
         AttentionEvent::Discord(_)
         | AttentionEvent::Mail(_)
         | AttentionEvent::Teams(_)
@@ -6444,7 +6354,6 @@ mod tests {
                 DISCORD_SCOPE_ID,
                 COMPASS_SCOPE_ID,
                 RELATIONS_SCOPE_ID,
-                STATUS_SCOPE_ID,
                 HABIT_SCOPE_ID,
                 MEMORY_SCOPE_ID,
                 WIKI_SCOPE_ID,
@@ -6472,7 +6381,6 @@ mod tests {
                 (DISCORD_SCOPE_ID, sources.discord),
                 (COMPASS_SCOPE_ID, sources.compass),
                 (RELATIONS_SCOPE_ID, sources.relations),
-                (STATUS_SCOPE_ID, sources.status),
                 (HABIT_SCOPE_ID, sources.habits.unwrap()),
             ] {
                 assert_eq!(source.source.handle(), routes[&scope]);
@@ -6687,7 +6595,23 @@ mod tests {
 
             let now = clock::point_now().unwrap();
             let mut facts = Fragment::empty();
-            let mut expected = BTreeSet::from([other]);
+            let mut expected = BTreeSet::new();
+            // Historical authored Status facts remain in the pile but are no
+            // longer an Orient input or a source of window announcements.
+            let historical = crate::collection_names::open(
+                &mut pile,
+                crate::schemas::status::DEFAULT_SCOPE_ID,
+                fixture.signer.verifying_key(),
+            )
+            .unwrap();
+            let mut windows = Fragment::empty();
+            for window in [persona, alias, other] {
+                windows += entity! {
+                    metadata::tag: &crate::schemas::status::KIND_STATUS_UPDATE,
+                    crate::schemas::status::status::window: &window,
+                };
+            }
+            pile.commit(historical, &fixture.signer, windows).unwrap();
             // The mixed event puts the external actor first in key order:
             // choosing just one attribution cannot establish "not mine".
             for (label, actor, extra_self, visible) in [
@@ -6731,13 +6655,6 @@ mod tests {
             facts += goal;
             expected.insert(goal_id);
             pile.commit(sources.compass.source, &fixture.signer, facts)
-                .unwrap();
-            let mut windows = Fragment::empty();
-            for window in [persona, alias, other] {
-                windows +=
-                    entity! { metadata::tag: &KIND_STATUS_UPDATE, window_status::window: &window };
-            }
-            pile.commit(sources.status.source, &fixture.signer, windows)
                 .unwrap();
             let mut messages = Fragment::empty();
             for (label, sender, recipient, extra_self, visible) in [
@@ -7435,7 +7352,6 @@ mod tests {
                 &observation.facts.teams,
                 &observation.facts.compass,
                 &observation.facts.relations,
-                &observation.facts.status,
                 observation.facts.habits.as_ref().unwrap(),
             ] {
                 assert!(fact.is_current(&advanced));
