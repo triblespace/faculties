@@ -34,9 +34,12 @@ def arg(name, default):
 persona = arg("--persona", None)
 if not persona:
     print("colony-coverage: --persona is required", file=sys.stderr); sys.exit(2)
-fresh = int(arg("--fresh-mins", "45")) * 60
+try:
+    fresh = int(arg("--fresh-mins", "45")) * 60
+    cache_secs = int(arg("--cache-secs", "600"))
+except ValueError as e:
+    print("colony-coverage: invalid numeric argument: %s" % e, file=sys.stderr); sys.exit(2)
 lock_tag = arg("--lock-tag", None)
-cache_secs = int(arg("--cache-secs", "600"))
 pile = os.environ.get("PILE")
 if not pile:
     print("colony-coverage: predicate PILE is missing", file=sys.stderr); sys.exit(2)
@@ -190,9 +193,11 @@ try:
     try:
         due, why = decide()
         result = "due" if due else "covered"
+        # Include the transition into publication in the timeout handler.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     except (Exception, OutOfTime) as e:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
         result, why = "error", "%s: %s" % (type(e).__name__, str(e)[:4096])
-    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     tmp = "%s.tmp.%d" % (cache, os.getpid())
     try:
         with open(tmp, "w") as f:

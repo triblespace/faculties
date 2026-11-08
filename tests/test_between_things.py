@@ -38,18 +38,18 @@ class PredicateTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 0, self.status, "")
         return subprocess.CompletedProcess(argv, 0, self.listing if argv[1] == "list" else self.show, "")
 
-    def invoke(self, refresh=True, command=None, replace=None, lock=False):
+    def invoke(self, refresh=True, command=None, replace=None, lock=False, mask=None, extra=()):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ, {"PILE": self.pile, "XDG_CACHE_HOME": str(self.root)}))
-            stack.enter_context(patch.object(sys, "argv", [str(SCRIPT), "--persona", "tester"] + (["--refresh"] if refresh else []) + (["--lock-tag", "tester"] if lock else [])))
+            stack.enter_context(patch.object(sys, "argv", [str(SCRIPT), "--persona", "tester"] + (["--refresh"] if refresh else []) + (["--lock-tag", "tester"] if lock else []) + list(extra)))
             stack.enter_context(patch("subprocess.run", side_effect=command or self.command))
             spawned = stack.enter_context(patch("subprocess.Popen"))
             if lock:
                 stack.enter_context(patch("os.access", return_value=True))
             # Never install timers or handlers in the test runner.
             for name in ("alarm", "signal", "pthread_sigmask"):
-                stack.enter_context(patch.object(signal, name))
+                stack.enter_context(patch.object(signal, name, side_effect=mask if name == "pthread_sigmask" else None))
             if replace:
                 stack.enter_context(patch("os.replace", side_effect=replace))
             stack.enter_context(contextlib.redirect_stdout(out))
@@ -95,6 +95,22 @@ class PredicateTests(unittest.TestCase):
             signal.signal.call_args_list[0].args[1]()
         self.assertEqual(self.invoke(command=timed_out)[0], 2)
         self.assertIn("refresh past 480 s", self.stored()["why"])
+
+    def test_timeout_at_publication_transition_is_cached_error(self):
+        calls = 0
+        def mask(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                signal.signal.call_args_list[0].args[1]()
+        self.assertEqual(self.invoke(mask=mask)[0], 2)
+        self.assertIn("refresh past 480 s", self.stored()["why"])
+
+    def test_argument_parse_failure_is_error(self):
+        for flag in ("--fresh-mins", "--cache-secs"):
+            code, _, error, _ = self.invoke(extra=(flag, "invalid"))
+            self.assertEqual(code, 2)
+            self.assertIn("invalid numeric argument", error)
 
     def test_parse_errors_never_become_due_or_covered(self):
         for output in ("", "status for tester (bad)\n", f"status for tester ({PERSON})\nchanged format\n"):
