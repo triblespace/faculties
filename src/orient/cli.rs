@@ -126,9 +126,9 @@ enum Command {
     /// The memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
-    /// With `--sealed-head`, the cover is selected by the grid unless
-    /// `--selector` says otherwise, and the recalls of its sealed head (always
-    /// the leading recalls) also carry `"sealed": true`.
+    /// With `--sealed-head`, the recalls of the cover's sealed head (always the
+    /// leading recalls) also carry `"sealed": true`. Only `--selector grid` has
+    /// a head; the walk (the default and the rollback) seals nothing.
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -396,13 +396,11 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
 /// The cover selector of `orient wake --pairs`: `--selector` when given;
 /// otherwise the grid with `--sealed-head` (the selector behind it) and the
 /// walk without.
-fn wake_selector(selector: Option<&str>, sealed_head: bool) -> crate::memory_cover::Selector {
+fn wake_selector(selector: Option<&str>) -> crate::memory_cover::Selector {
     use crate::memory_cover::Selector;
     match selector {
         Some("grid") => Selector::Grid,
-        Some(_) => Selector::Walk,
-        None if sealed_head => Selector::Grid,
-        None => Selector::Walk,
+        _ => Selector::Walk,
     }
 }
 
@@ -448,7 +446,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     chars,
                     chunk_overhead,
                     raw_memory,
-                    selector: wake_selector(selector.as_deref(), sealed_head),
+                    selector: wake_selector(selector.as_deref()),
                     sealed_head,
                     doing_limit,
                     todo_limit,
@@ -809,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn sealed_head_implies_the_grid_and_the_walk_is_the_default_and_rollback() {
+    fn the_walk_is_the_default_and_rollback_and_grid_is_explicit() {
         use crate::memory_cover::Selector::{Grid, Walk};
         let parse = |args: &[&str]| {
             let mut argv = vec!["orient", "--pile", "unused.pile", "wake"];
@@ -822,7 +820,7 @@ mod tests {
         assert!(parse(&["--pairs", "--sealed-head", "tiled"]).is_err());
         for (args, sealed, selector) in [
             (&["--pairs"][..], false, Walk),
-            (&["--pairs", "--sealed-head"][..], true, Grid),
+            (&["--pairs", "--sealed-head"][..], true, Walk),
             (&["--pairs", "--selector", "grid"][..], false, Grid),
             (
                 &["--pairs", "--sealed-head", "--selector", "walk"][..],
@@ -845,7 +843,7 @@ mod tests {
             };
             assert_eq!(sealed_head, sealed, "{args:?}");
             assert_eq!(
-                wake_selector(chosen.as_deref(), sealed_head),
+                wake_selector(chosen.as_deref()),
                 selector,
                 "{args:?}"
             );
