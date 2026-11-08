@@ -434,6 +434,7 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
         sim_threshold,
         tags,
         without_tags,
+        sealed_head: false,
     })
 }
 

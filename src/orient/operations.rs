@@ -63,6 +63,9 @@ pub struct WakePairsOptions {
     pub chunk_overhead: usize,
     /// Exact selected Memory text; ordinary image placeholders are unchanged.
     pub raw_memory: bool,
+    /// Select the memory cover with the quantized-anchor walk and mark its
+    /// sealed head: each head recall carries `"sealed": true`.
+    pub sealed_head: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
 }
@@ -73,6 +76,7 @@ impl Default for WakePairsOptions {
             chars: wake.chars,
             chunk_overhead: 0,
             raw_memory: false,
+            sealed_head: false,
             doing_limit: wake.doing_limit,
             todo_limit: wake.todo_limit,
         }
@@ -5982,6 +5986,11 @@ struct WakePair {
     /// is the consumer's bookkeeping (where the memory sits in lived time),
     /// never something the reader is shown as output.
     range: Option<String>,
+    /// For a memory recall only: whether its memory is in the cover's sealed
+    /// head ([`crate::memory_cover::CoverEntry::sealed`]). Sealed recalls lead
+    /// the recalls. Bookkeeping for the consumer's saved prompt prefix, never
+    /// output.
+    sealed: bool,
 }
 
 impl WakePair {
@@ -5997,6 +6006,7 @@ impl WakePair {
             command,
             output,
             range: None,
+            sealed: false,
         }
     }
 }
@@ -6027,6 +6037,7 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         // placeholder line the cover text shows (as Drive always has).
         pairs.push(WakePair {
             range: Some(format!("{}..{}", entry.start, entry.end)),
+            sealed: entry.sealed,
             ..WakePair::new(entry.recall.clone(), if raw { body.to_owned() }
                 else { format!("{body}\n") })
         });
@@ -6074,6 +6085,7 @@ async fn cmd_wake_pairs(
     let mut cover_opts = CoverOpts::plain(options.chars);
     cover_opts.chunk_overhead = options.chunk_overhead;
     cover_opts.raw_memory = options.raw_memory;
+    cover_opts.sealed_head = options.sealed_head;
     let selection = wake_selection(
         routing,
         storage,
@@ -6092,6 +6104,9 @@ async fn cmd_wake_pairs(
         });
         if let Some(range) = pair.range {
             object["range"] = serde_json::Value::String(range);
+        }
+        if pair.sealed {
+            object["sealed"] = serde_json::Value::Bool(true);
         }
         lines.push_str(&serde_json::to_string(&object)?);
         lines.push('\n');
@@ -6177,7 +6192,7 @@ mod tests {
             let command = format!("memory raw {id:x}");
             let entry = CoverEntry {
                 start: "2026-01-01T00:00:00".into(), end: "2026-01-01T01:00:00".into(),
-                chunk: id, recall: command.clone(), body: Some(text.into()),
+                chunk: id, recall: command.clone(), body: Some(text.into()), sealed: false,
             };
             let selection = WakeSelection {
                 cover: CoverReport { text: String::new(), diagnostics: vec![], entries: vec![entry] },
@@ -6196,6 +6211,37 @@ mod tests {
             assert_eq!(pairs[0].command, format!("memory {id:x}"));
             assert_eq!(pairs[0].output, "[image memory @ synthetic range]\n");
         }
+    }
+
+    #[test]
+    fn sealed_entries_become_sealed_recalls_and_nothing_else_is_sealed() {
+        use crate::memory_cover::{CoverEntry, CoverReport};
+        let entry = |sealed: bool, body: &str| CoverEntry {
+            start: "2026-01-01T00:00:00".into(),
+            end: "2026-01-01T01:00:00".into(),
+            chunk: *fucid(),
+            recall: "memory 2026-01-01T00:00:00..2026-01-01T01:00:00".into(),
+            body: Some(body.into()),
+            sealed,
+        };
+        let selection = WakeSelection {
+            cover: CoverReport {
+                text: String::new(),
+                diagnostics: vec![],
+                entries: vec![entry(true, "old"), entry(true, ""), entry(false, "young")],
+            },
+            beliefs: wiki_model::CoverBeliefs::default(),
+            goals: "Compass:\n".into(),
+            presented: None,
+        };
+        let pairs = wake_pairs(&selection, 5, 5);
+        // The empty-bodied sealed entry prints no pair; the head stays a prefix.
+        assert_eq!(
+            pairs.iter().map(|pair| pair.sealed).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(pairs[0].output, "old\n");
+        assert_eq!(pairs[1].output, "young\n");
     }
 
     /// Project receipt facts the way the live path does, so tests exercise the

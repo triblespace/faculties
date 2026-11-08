@@ -274,8 +274,11 @@ fn chunk_cost<B: BlobStoreGet, P: TriblePattern>(
     let body = match chunk_summary_handle(space, id) {
         Some(handle) => {
             let summary: View<str> = ws.get(handle).context("read chunk summary")?;
-            Some(if raw_memory { summary.chars().count() }
-                else { summary.trim_end().chars().count() })
+            Some(if raw_memory {
+                summary.chars().count()
+            } else {
+                summary.trim_end().chars().count()
+            })
         }
         None if chunk_image_handle(space, id).is_some() => {
             Some(format!("[image memory @ {range}]").chars().count())
@@ -428,6 +431,10 @@ pub struct CoverOpts {
     pub tags: Vec<String>,
     /// `--without-tag <tag>` (repeatable): drop memories carrying any of these.
     pub without_tags: Vec<String>,
+    /// Select with the quantized-anchor walk ([`select_anchored_recollection_cut`],
+    /// `c = ANCHOR_GRID_BITS`) and mark its leading SEALED HEAD on each
+    /// [`CoverEntry::sealed`]. Off: the plain walk, and no entry is sealed.
+    pub sealed_head: bool,
 }
 
 impl CoverOpts {
@@ -443,6 +450,7 @@ impl CoverOpts {
             sim_threshold: DEFAULT_SIM_THRESHOLD,
             tags: Vec::new(),
             without_tags: Vec::new(),
+            sealed_head: false,
         }
     }
 }
@@ -513,6 +521,67 @@ impl DensityGradient {
 pub struct RecollectionCut {
     pub cover: Vec<usize>,
     pub used: usize,
+    /// How many leading entries of `cover` form the SEALED HEAD: the entries
+    /// chosen against a quantized anchor ([`select_anchored_recollection_cut`]),
+    /// which stay identical from one wake to the next while the anchor holds.
+    /// Zero for the plain walk, which has no such part.
+    pub head: usize,
+}
+
+/// One greedy walk over an explicit gradient origin and cursor cap. Both the
+/// plain walk and the anchored head and tail use this identical scoring, so
+/// the anchored rule changes WHICH targets are walked, never how a target is
+/// matched. `selected` carries picks across walks: a class appears once.
+#[allow(clippy::too_many_arguments)]
+fn recollection_walk(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    selected: &mut [bool],
+    origin: i128,
+    gradient: &DensityGradient,
+    cap: usize,
+    cover: &mut Vec<usize>,
+) -> usize {
+    let mut used = 0usize;
+    while used < cap {
+        let ideal_start = gradient.sample(used).time_ns;
+        let mut best: Option<(f64, Id, usize)> = None;
+        for (i, &(start, end, id)) in spans.iter().enumerate() {
+            let cost = costs[i];
+            if selected[i] || !eligible[i] || cost == 0 {
+                continue;
+            }
+            let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
+            let actual_start = start.saturating_sub(origin) as f64;
+            let actual_end = actual_start + width;
+            let ideal_end = gradient.sample(used.saturating_add(cost)).time_ns;
+            let start_error = actual_start - ideal_start;
+            let end_error = actual_end - ideal_end;
+            let score = start_error.mul_add(start_error, end_error * end_error);
+            let candidate = (score, id, i);
+            if best.as_ref().is_none_or(|current| {
+                candidate
+                    .0
+                    .total_cmp(&current.0)
+                    .then(candidate.1.cmp(&current.1))
+                    .is_lt()
+            }) {
+                best = Some(candidate);
+            }
+        }
+        let Some((_, _, pick)) = best else {
+            break;
+        };
+        let next = used.saturating_add(costs[pick]);
+        if next > cap {
+            break;
+        }
+        selected[pick] = true;
+        cover.push(pick);
+        used = next;
+    }
+    used
 }
 
 /// Greedily approximate the continuous density gradient with the memories the
@@ -540,66 +609,160 @@ pub fn select_recollection_cut(
 ) -> RecollectionCut {
     assert_eq!(spans.len(), costs.len());
     assert_eq!(spans.len(), eligible.len());
+    let empty = RecollectionCut {
+        cover: Vec::new(),
+        used: 0,
+        head: 0,
+    };
     let (Some(earliest), Some(latest)) = (
         spans.iter().map(|span| span.0).min(),
         spans.iter().map(|span| span.1).max(),
     ) else {
-        return RecollectionCut {
-            cover: Vec::new(),
-            used: 0,
-        };
+        return empty;
     };
     if budget == 0 {
-        return RecollectionCut {
-            cover: Vec::new(),
-            used: 0,
-        };
+        return empty;
     }
 
     let gradient = DensityGradient::new(latest.saturating_sub(earliest), budget);
     let mut selected = vec![false; spans.len()];
     let mut cover = Vec::new();
-    let mut used = 0usize;
-
-    while used < budget {
-        let ideal_start = gradient.sample(used).time_ns;
-        let mut best: Option<(f64, Id, usize)> = None;
-        for (i, &(start, end, id)) in spans.iter().enumerate() {
-            let cost = costs[i];
-            if selected[i] || !eligible[i] || cost == 0 {
-                continue;
-            }
-            let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
-            let actual_start = start.saturating_sub(earliest) as f64;
-            let actual_end = actual_start + width;
-            let ideal_end = gradient.sample(used.saturating_add(cost)).time_ns;
-            let start_error = actual_start - ideal_start;
-            let end_error = actual_end - ideal_end;
-            let score = start_error.mul_add(start_error, end_error * end_error);
-            let candidate = (score, id, i);
-            if best.as_ref().is_none_or(|current| {
-                candidate
-                    .0
-                    .total_cmp(&current.0)
-                    .then(candidate.1.cmp(&current.1))
-                    .is_lt()
-            }) {
-                best = Some(candidate);
-            }
-        }
-        let Some((_, _, pick)) = best else {
-            break;
-        };
-        let next = used.saturating_add(costs[pick]);
-        if next > budget {
-            break;
-        }
-        selected[pick] = true;
-        cover.push(pick);
-        used = next;
+    let used = recollection_walk(
+        spans,
+        costs,
+        eligible,
+        &mut selected,
+        earliest,
+        &gradient,
+        budget,
+        &mut cover,
+    );
+    RecollectionCut {
+        cover,
+        used,
+        head: 0,
     }
+}
 
-    RecollectionCut { cover, used }
+/// The anchor grid of the sealed head: `G = max(2^14 s, LIFE_q / 2^c)` with
+/// this `c`. A declared constant. Replayed over four months of the live
+/// journal (640 wakes, 800k characters; faculties cover-sealed-20261108
+/// 487cc5e9, report cc-cover-report-2), `c = 7` kept the head unchanged on
+/// all but 21 of 640 transitions and reused about 218k characters per changed
+/// wake; finer grids lengthen the head but break it far more often.
+pub const ANCHOR_GRID_BITS: u32 = 7;
+
+/// The quantized anchor of [`select_anchored_recollection_cut`]: while it is
+/// unchanged, every target of the sealed head is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecollectionAnchor {
+    /// The life rounded up to `2^k` units of 2^14 s.
+    pub life_q: i128,
+    /// `max(2^14 s, life_q / 2^c)`.
+    pub grid: i128,
+    /// The grid point at or before the newest memory end (absolute TAI key).
+    pub now_q: i128,
+}
+
+impl RecollectionAnchor {
+    pub fn new(earliest: i128, latest: i128, c: u32) -> Self {
+        let unit = REPLAY_QUANTUM_NS;
+        let life = latest.saturating_sub(earliest).max(1);
+        let mut life_q = unit;
+        while life_q < life {
+            life_q = life_q.saturating_mul(2);
+        }
+        let grid = (life_q >> c.min(126)).max(unit);
+        let now_q = latest.div_euclid(grid) * grid;
+        Self {
+            life_q,
+            grid,
+            now_q,
+        }
+    }
+}
+
+/// The walk in use, with its oldest targets taken from a QUANTIZED anchor so
+/// they stay fixed between anchor steps.
+///
+/// `LIFE_q` is the true life rounded UP to `2^k` units of 2^14 s, so it steps
+/// only when the life doubles. The grid is `G = max(unit, LIFE_q / 2^c)`, and
+/// `N_q = floor(L / G) * G` is the grid point at or before the newest memory
+/// end `L`, with the virtual now at `N_q + G`. The HEAD is today's greedy walk
+/// against the gradient of `LIFE_q` ending at that virtual now, over the
+/// cursor positions whose target lies before `N_q`. The young region
+/// `(N_q, L]` then gets the rest of the budget, again with today's walk, its
+/// gradient tracking the true now. Both walks see every eligible memory: there
+/// is no candidate freeze, so a summary written later about an old stretch
+/// competes for the head at once (and may change it once).
+///
+/// Pure in the spans, costs, eligibility and budget, with `c` declared. While
+/// `(LIFE_q, N_q)` holds, the head's targets are identical, so the head
+/// changes only when a new memory wins one of its slots. `head` counts its
+/// entries; they lead `cover`.
+pub fn select_anchored_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    budget: usize,
+    c: u32,
+) -> RecollectionCut {
+    assert_eq!(spans.len(), costs.len());
+    assert_eq!(spans.len(), eligible.len());
+    let empty = RecollectionCut {
+        cover: Vec::new(),
+        used: 0,
+        head: 0,
+    };
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|span| span.0).min(),
+        spans.iter().map(|span| span.1).max(),
+    ) else {
+        return empty;
+    };
+    if budget == 0 {
+        return empty;
+    }
+    let RecollectionAnchor {
+        life_q,
+        grid,
+        now_q,
+    } = RecollectionAnchor::new(earliest, latest, c);
+    let mut selected = vec![false; spans.len()];
+    let mut cover = Vec::new();
+    let gradient = DensityGradient::new(life_q, budget);
+    // Cursor at which the anchored gradient's age reaches G, i.e. its target
+    // reaches N_q: the head never claims the young region's positions.
+    let behind = (grid as f64 / MOMENT_NS as f64).ln_1p() / gradient.rate;
+    let cap = (budget as f64 - behind).floor().max(0.0) as usize;
+    let head_used = recollection_walk(
+        spans,
+        costs,
+        eligible,
+        &mut selected,
+        now_q + grid - life_q,
+        &gradient,
+        cap,
+        &mut cover,
+    );
+    let head = cover.len();
+    let rest = budget - head_used;
+    let young = DensityGradient::new(latest - now_q, rest);
+    let tail_used = recollection_walk(
+        spans,
+        costs,
+        eligible,
+        &mut selected,
+        now_q,
+        &young,
+        rest,
+        &mut cover,
+    );
+    RecollectionCut {
+        cover,
+        used: head_used + tail_used,
+        head,
+    }
 }
 
 /// Gaps longer than one quarter of the currently available life which no
@@ -949,6 +1112,10 @@ pub struct CoverEntry {
     /// whitespace (unchanged bytes in raw mode), or the `[image memory @ <range>]` placeholder. `None` when
     /// the chosen chunk has neither, in which case only the range is printed.
     pub body: Option<String>,
+    /// Whether this entry belongs to the cover's sealed head: the leading
+    /// entries [`select_anchored_recollection_cut`] chose against its quantized
+    /// anchor. Sealed entries always precede every unsealed one.
+    pub sealed: bool,
 }
 
 fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
@@ -1207,8 +1374,19 @@ where
             .saturating_add(chunk_overhead),
         );
     }
-    let cut = select_recollection_cut(&spans, &costs, &class_eligible, budget_chars);
+    let cut = if opts.sealed_head {
+        select_anchored_recollection_cut(
+            &spans,
+            &costs,
+            &class_eligible,
+            budget_chars,
+            ANCHOR_GRID_BITS,
+        )
+    } else {
+        select_recollection_cut(&spans, &costs, &class_eligible, budget_chars)
+    };
     let used = cut.used;
+    let head = cut.head;
     let cover = cut.cover;
 
     // The selected SPACE order is the emitted order. Reordering by lived time
@@ -1239,6 +1417,11 @@ where
         if !without_tags.is_empty() {
             parts.push(format!("without tag {}", quoted(&without_tags, " or ")));
         }
+        if opts.sealed_head {
+            parts.push(format!(
+                "sealed head of {head} entries (quantized anchor, c = {ANCHOR_GRID_BITS})"
+            ));
+        }
         format!("greedy SPACE order; {}", parts.join("; "))
     };
     // The status header goes to STDERR, not into the returned cover buffer: the
@@ -1247,7 +1430,7 @@ where
     // prefix-stable cover on every call. Keep it visible to a human on stderr,
     // out of the stored/ingested cover text.
     let mut entries = Vec::with_capacity(cover.len());
-    for &i in &cover {
+    for (position, &i) in cover.iter().enumerate() {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
         writeln!(out)?;
@@ -1261,8 +1444,11 @@ where
         let summary_handle = chunk_summary_handle(space, id);
         let body = if let Some(handle) = summary_handle {
             let summary: View<str> = reader.get(handle).context("read chunk summary")?;
-            Some(if opts.raw_memory { summary.to_string() }
-                else { summary.trim_end().to_owned() })
+            Some(if opts.raw_memory {
+                summary.to_string()
+            } else {
+                summary.trim_end().to_owned()
+            })
         } else if chunk_image_handle(space, id).is_some() {
             let range = format_time_range(key_to_epoch(s), key_to_epoch(e));
             Some(format!("[image memory @ {range}]"))
@@ -1296,6 +1482,7 @@ where
             start,
             end,
             body,
+            sealed: position < head,
         });
     }
     let fill = if budget_chars == 0 {
@@ -1333,8 +1520,16 @@ mod recollection_tests {
             let epoch = Epoch::from_tai_seconds(seconds);
             (epoch, epoch).try_to_inline().unwrap()
         };
-        for text in ["", "\n\n", " \t", "\nleading\n", "CRLF\r\n",
-            "trailing \t\n", "\u{2003}\u{a0}", "e\u{301} 🐝\n"] {
+        for text in [
+            "",
+            "\n\n",
+            " \t",
+            "\nleading\n",
+            "CRLF\r\n",
+            "trailing \t\n",
+            "\u{2003}\u{a0}",
+            "e\u{301} 🐝\n",
+        ] {
             let fragment = entity! {
                 ExclusiveId::force_ref(&A) @
                 metadata::tag: &KIND_CHUNK_ID,
@@ -1345,21 +1540,29 @@ mod recollection_tests {
             let mut blobs = fragment.blobs().clone();
             let reader = blobs.snapshot().unwrap();
             let spans = collect_chunk_spans(fragment.facts());
-            let ordinary = chunk_cost(&reader, fragment.facts(), &spans,
-                &mut [None], 0, false).unwrap();
-            let raw = chunk_cost(&reader, fragment.facts(), &spans,
-                &mut [None], 0, true).unwrap();
-            assert_eq!(raw - ordinary, text.chars().count() - text.trim_end().chars().count());
+            let ordinary =
+                chunk_cost(&reader, fragment.facts(), &spans, &mut [None], 0, false).unwrap();
+            let raw = chunk_cost(&reader, fragment.facts(), &spans, &mut [None], 0, true).unwrap();
+            assert_eq!(
+                raw - ordinary,
+                text.chars().count() - text.trim_end().chars().count()
+            );
             let mut options = CoverOpts::plain(raw);
             options.raw_memory = true;
-            let report = render_cover_report(fragment.facts(), &reader, &options,
-                &mut |_| panic!("plain raw recall must not score semantically")).unwrap();
+            let report = render_cover_report(fragment.facts(), &reader, &options, &mut |_| {
+                panic!("plain raw recall must not score semantically")
+            })
+            .unwrap();
             assert_eq!(report.entries.len(), 1);
             assert_eq!(report.entries[0].body.as_deref(), Some(text));
             assert_eq!(report.entries[0].recall, format!("memory raw {A:x}"));
             options.budget_chars = raw - 1;
-            assert!(render_cover_report(fragment.facts(), &reader, &options,
-                &mut |_| Ok(None)).unwrap().entries.is_empty());
+            assert!(
+                render_cover_report(fragment.facts(), &reader, &options, &mut |_| Ok(None))
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
         }
     }
 
@@ -1368,7 +1571,8 @@ mod recollection_tests {
         use triblespace::core::repo::SnapshotSource;
         let mut blobs = MemoryBlobStore::new();
         let handle = blobs.insert(Blob::<blobencodings::RawBytes>::new(
-            anybytes::Bytes::from_source(b"synthetic image, never decoded".to_vec())));
+            anybytes::Bytes::from_source(b"synthetic image, never decoded".to_vec()),
+        ));
         let point = |seconds: f64| {
             let epoch = Epoch::from_tai_seconds(seconds);
             (epoch, epoch).try_to_inline().unwrap()
@@ -1382,13 +1586,18 @@ mod recollection_tests {
         };
         let reader = blobs.snapshot().unwrap();
         let mut options = CoverOpts::plain(10_000);
-        let ordinary = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
+        let ordinary =
+            render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
         options.raw_memory = true;
         let raw = render_cover_report(facts.facts(), &reader, &options, &mut |_| Ok(None)).unwrap();
         assert_eq!(raw.entries, ordinary.entries);
         assert_eq!(raw.entries.len(), 1);
         assert!(!raw.entries[0].recall.starts_with("memory raw "));
-        assert!(raw.entries[0].body.as_ref().unwrap().starts_with("[image memory @ "));
+        assert!(raw.entries[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .starts_with("[image memory @ "));
     }
 
     #[test]
@@ -2125,6 +2334,51 @@ mod recall_lookup_tests {
         }
     }
 
+    #[test]
+    fn a_sealed_head_cover_marks_a_leading_head_and_the_plain_cover_marks_none() {
+        // Thirty days of hourly memories, rendered lossily.
+        let memories: Vec<_> = (0..30 * 24)
+            .map(|h| {
+                let start = h as f64 * 3_600.0;
+                (start, start + 3_600.0, format!("hour {h}."), true)
+            })
+            .collect();
+        let (facts, reader) = journal(&memories);
+        let mut options = CoverOpts::plain(4_000);
+        let plain = render_cover_report(&facts, &reader, &options, &mut |_| Ok(None)).unwrap();
+        assert!(plain.entries.iter().all(|entry| !entry.sealed));
+        options.sealed_head = true;
+        let sealed = render_cover_report(&facts, &reader, &options, &mut |_| Ok(None)).unwrap();
+        let head = sealed
+            .entries
+            .iter()
+            .take_while(|entry| entry.sealed)
+            .count();
+        assert!(
+            head > 0 && head < sealed.entries.len(),
+            "{head} of {}",
+            sealed.entries.len()
+        );
+        assert!(
+            sealed.entries[head..].iter().all(|entry| !entry.sealed),
+            "sealed entries lead the cover"
+        );
+        assert!(sealed
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("sealed head of")));
+        // Recall order is the emitted text order: every entry's body appears,
+        // in sequence.
+        let mut at = 0;
+        for entry in &sealed.entries {
+            let body = entry.body.as_deref().unwrap();
+            at += sealed.text[at..]
+                .find(body)
+                .expect("entry rendered in order")
+                + body.len();
+        }
+    }
+
     /// FIXTURE MEASUREMENT, not production: the lookup work only, in a debug
     /// build, on synthetic disjoint one-minute memories. Run with
     /// `--ignored --nocapture`; the numbers are recorded in the commit.
@@ -2173,5 +2427,208 @@ mod recall_lookup_tests {
              shared projection {shared_lookups:?}",
             report.entries.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod anchored_head_tests {
+    use super::*;
+
+    const H: i128 = 3600 * 1_000_000_000;
+    const DAY: i128 = 24 * H;
+    /// Far from zero so absolute grid arithmetic is exercised, and aligned to
+    /// nothing in particular.
+    const BASE: i128 = 1_000 * DAY + 7 * H;
+    const BUDGET: usize = 20_000;
+
+    fn id(k: u128) -> Id {
+        Id::new(u128::to_be_bytes(0x5E000000000000000000000000000000 + k)).expect("nonzero")
+    }
+
+    /// Hourly memories over `[0, hours)` plus one arc per complete day, all
+    /// costing 200 characters. Ids are positional, so a memory keeps its id
+    /// when later ones are appended.
+    fn journal(hours: i128) -> Vec<(i128, i128, Id)> {
+        let mut spans = Vec::new();
+        for h in 0..hours {
+            spans.push((BASE + h * H, BASE + (h + 1) * H, id(h as u128 + 1)));
+        }
+        for d in 0..hours / 24 {
+            spans.push((
+                BASE + d * DAY,
+                BASE + (d + 1) * DAY,
+                id(1_000_000 + d as u128),
+            ));
+        }
+        spans
+    }
+
+    fn cut(spans: &[(i128, i128, Id)]) -> RecollectionCut {
+        select_anchored_recollection_cut(
+            spans,
+            &vec![200; spans.len()],
+            &vec![true; spans.len()],
+            BUDGET,
+            ANCHOR_GRID_BITS,
+        )
+    }
+
+    fn anchor(spans: &[(i128, i128, Id)]) -> RecollectionAnchor {
+        let earliest = spans.iter().map(|s| s.0).min().unwrap();
+        let latest = spans.iter().map(|s| s.1).max().unwrap();
+        RecollectionAnchor::new(earliest, latest, ANCHOR_GRID_BITS)
+    }
+
+    /// The head as memory ids, in emitted order: what a consumer's saved
+    /// prefix holds.
+    fn head(spans: &[(i128, i128, Id)], cut: &RecollectionCut) -> Vec<Id> {
+        cut.cover[..cut.head].iter().map(|&i| spans[i].2).collect()
+    }
+
+    #[test]
+    fn the_plain_walk_is_unchanged_and_has_no_head() {
+        let spans = journal(60 * 24);
+        let plain = select_recollection_cut(
+            &spans,
+            &vec![200; spans.len()],
+            &vec![true; spans.len()],
+            BUDGET,
+        );
+        assert_eq!(plain.head, 0);
+        assert!(plain.used <= BUDGET && !plain.cover.is_empty());
+    }
+
+    #[test]
+    fn the_head_leads_the_cover_and_never_claims_the_young_region() {
+        let spans = journal(60 * 24);
+        let cut = cut(&spans);
+        let anchor = anchor(&spans);
+        assert!(cut.head > 0 && cut.head < cut.cover.len(), "{cut:?}");
+        assert!(cut.used <= BUDGET);
+        let head_used = 200 * cut.head;
+        assert!(head_used < BUDGET, "the young region keeps a share");
+        // Every head memory was matched against a target before N_q; the
+        // young walk then took the memories ending after it.
+        assert!(cut.cover[cut.head..]
+            .iter()
+            .any(|&i| spans[i].1 > anchor.now_q));
+    }
+
+    /// Astra's sequence (1): ordinary young appends. While the anchor holds,
+    /// the head is the same memories in the same order, so one prefix saved at
+    /// its end stays an exact prefix.
+    #[test]
+    fn append_only_keeps_the_head_while_the_anchor_holds() {
+        let mut previous: Option<(RecollectionAnchor, Vec<Id>)> = None;
+        let (mut held, mut stepped) = (0, 0);
+        for hours in (40 * 24..60 * 24).step_by(1) {
+            // Hourly appends only: no arc closes inside this loop's window
+            // except at whole days, and those are appended too, as the
+            // journal does. Both are ordinary young memories.
+            let spans = journal(hours);
+            let cut = cut(&spans);
+            let now = (anchor(&spans), head(&spans, &cut));
+            if let Some((was_anchor, was_head)) = previous.take() {
+                if was_anchor == now.0 {
+                    held += 1;
+                    assert_eq!(
+                        was_head, now.1,
+                        "head changed under an unchanged anchor at hour {hours}"
+                    );
+                } else {
+                    stepped += 1;
+                }
+            }
+            previous = Some(now);
+        }
+        assert!(held > 100, "held {held}");
+        assert!(stepped > 0, "the window crosses at least one anchor step");
+    }
+
+    /// Astra's sequence (2): a summary of an old stretch, written late. It is
+    /// eligible at once, so it may change the head ONCE; after that the head
+    /// holds again under young appends.
+    #[test]
+    fn a_late_summary_inside_the_head_changes_it_once_then_holds() {
+        // Start where the next five appended hours stay under one anchor, so
+        // the "then holds" half is not confounded with an anchor step.
+        let mut hours = 50 * 24 + 5;
+        while anchor(&journal(hours)) != anchor(&journal(hours + 5)) {
+            hours += 1;
+        }
+        let spans = journal(hours);
+        let before = cut(&spans);
+        let head_before = head(&spans, &before);
+        // A summary of an old stretch: the first of a family of candidate
+        // spans (one, two or four days, starting within half a day of a
+        // memory the head holds) that wins a head slot. Whether a given
+        // span wins is the walk's business; the property under test is what
+        // happens once one does.
+        let anchor_now = anchor(&spans).now_q;
+        let summary = before.cover[..before.head]
+            .iter()
+            .map(|&i| spans[i])
+            .flat_map(|s| {
+                (-12..12).flat_map(move |k| {
+                    [1, 2, 4].map(|days| (s.0 + k * H, s.0 + k * H + days * DAY))
+                })
+            })
+            .filter(|&(_, end)| end < anchor_now)
+            .map(|(start, end)| (start, end, id(9_000_000)))
+            .find(|&summary| {
+                let mut spans = spans.clone();
+                spans.push(summary);
+                head(&spans, &cut(&spans)).contains(&summary.2)
+            })
+            .expect("some old-stretch summary wins a head slot");
+        let with = |extra_hours: i128| {
+            let mut spans = journal(hours + extra_hours);
+            spans.push(summary);
+            spans
+        };
+        let spans_after = with(0);
+        assert_eq!(
+            anchor(&spans_after),
+            anchor(&spans),
+            "the summary moves neither end"
+        );
+        let after = cut(&spans_after);
+        let head_after = head(&spans_after, &after);
+        assert_ne!(
+            head_before, head_after,
+            "the late summary competes for the head at once"
+        );
+        assert!(head_after.contains(&summary.2), "and wins a head slot");
+        // Young appends afterwards: the new head holds.
+        for extra in 1..6 {
+            let spans = with(extra);
+            assert_eq!(anchor(&spans), anchor(&spans_after));
+            assert_eq!(
+                head(&spans, &cut(&spans)),
+                head_after,
+                "after {extra} appended hour(s)"
+            );
+        }
+    }
+
+    /// A change confined to the young region (a new arc over the last hours)
+    /// changes only the tail; the head is identical.
+    #[test]
+    fn a_young_region_change_keeps_the_head() {
+        let hours = 50 * 24 + 5;
+        let spans = journal(hours);
+        let anchor_before = anchor(&spans);
+        let before = cut(&spans);
+        let mut changed = spans.clone();
+        let latest = changed.iter().map(|s| s.1).max().unwrap();
+        let young_arc = (latest - 4 * H, latest, id(9_100_000));
+        assert!(
+            young_arc.0 > anchor_before.now_q,
+            "the arc lies in the young region"
+        );
+        changed.push(young_arc);
+        let after = cut(&changed);
+        assert_eq!(anchor(&changed), anchor_before);
+        assert_eq!(head(&changed, &after), head(&spans, &before));
     }
 }

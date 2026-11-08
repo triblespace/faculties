@@ -96,7 +96,10 @@ impl Memory {
             }
             let handle = chunk_summary_handle(&loaded.memory.facts, id)
                 .with_context(|| format!("memory {id:x} has no text summary"))?;
-            let summary: View<str> = loaded.memory.reader.get(handle)
+            let summary: View<str> = loaded
+                .memory
+                .reader
+                .get(handle)
                 .context("read raw Memory summary")?;
             out.text(summary.as_ref())
         })
@@ -381,6 +384,7 @@ fn build_context_cover(
         sim_threshold,
         tags: Vec::new(),
         without_tags: Vec::new(),
+        sealed_head: false,
     };
     Ok(crate::memory_cover::render_cover_report(
         &loaded.memory.facts,
@@ -3352,14 +3356,26 @@ mod tests {
         // Raw answer bytes stay separate from the same frontend-neutral
         // incomplete-view evidence; there is no fabricated terminal newline.
         let mut raw_parts = Vec::new();
-        memory.raw(warm, &mut Out::new(&mut |part| {
-            raw_parts.push(part);
-            Ok(())
-        })).unwrap();
-        assert_eq!(raw_parts, vec![
-            crate::out::Part::Note { text: notes[0].clone() },
-            crate::out::Part::Text { text: "already resident history".into() },
-        ]);
+        memory
+            .raw(
+                warm,
+                &mut Out::new(&mut |part| {
+                    raw_parts.push(part);
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_parts,
+            vec![
+                crate::out::Part::Note {
+                    text: notes[0].clone()
+                },
+                crate::out::Part::Text {
+                    text: "already resident history".into()
+                },
+            ]
+        );
         // A write depends on absence, so it still refuses and names the
         // unread member.
         for summary in [

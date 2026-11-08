@@ -126,6 +126,9 @@ enum Command {
     /// The memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
+    /// With `--sealed-head`, the cover is selected with the quantized-anchor
+    /// walk and the recalls of its sealed head (always the leading recalls)
+    /// also carry `"sealed": true`.
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -151,6 +154,12 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
+        /// Select the memory cover with the quantized-anchor walk and mark the
+        /// recalls of its sealed head with `"sealed": true`, so a harness can
+        /// keep one saved prompt prefix at the head's end across wakes. The
+        /// head leads the recalls. Only with `--pairs`.
+        #[arg(long, requires = "pairs")]
+        sealed_head: bool,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
     /// goals. Never records presentation.
@@ -407,6 +416,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             pairs: true,
             raw_memory,
             chunk_overhead,
+            sealed_head,
         } => {
             // Diagnostics are about the memory selection, not part of any
             // pair, and stdout carries nothing but the pairs.
@@ -415,6 +425,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     chars,
                     chunk_overhead,
                     raw_memory,
+                    sealed_head,
                     doing_limit,
                     todo_limit,
                 },
@@ -775,17 +786,37 @@ mod tests {
 
     #[test]
     fn raw_memory_flag_requires_pairs_and_leaves_default_off() {
-        assert!(Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--raw-memory",
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from(["orient", "--pile", "unused.pile", "wake", "--raw-memory",])
+                .is_err()
+        );
         let raw = Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--pairs", "--raw-memory",
-        ]).unwrap();
-        assert!(matches!(raw.command, Some(Command::Wake { pairs: true, raw_memory: true, .. })));
-        let plain = Cli::try_parse_from([
-            "orient", "--pile", "unused.pile", "wake", "--pairs",
-        ]).unwrap();
-        assert!(matches!(plain.command, Some(Command::Wake { pairs: true, raw_memory: false, .. })));
+            "orient",
+            "--pile",
+            "unused.pile",
+            "wake",
+            "--pairs",
+            "--raw-memory",
+        ])
+        .unwrap();
+        assert!(matches!(
+            raw.command,
+            Some(Command::Wake {
+                pairs: true,
+                raw_memory: true,
+                ..
+            })
+        ));
+        let plain =
+            Cli::try_parse_from(["orient", "--pile", "unused.pile", "wake", "--pairs"]).unwrap();
+        assert!(matches!(
+            plain.command,
+            Some(Command::Wake {
+                pairs: true,
+                raw_memory: false,
+                ..
+            })
+        ));
     }
 
     #[test]
