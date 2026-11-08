@@ -155,16 +155,21 @@ provisioning Secrets and binding its version before upgrading the launcher.
 
 Semantic search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
 GB10 compute 12.1 only) for text, images and documents in one 4096-D space:
-`files index` / `files similar`, `memory index` / `memory similar`, and
-`wiki index` / `wiki similar`, plus `memory context --about/--filter/--remove`,
-which fall back to exact BM25 when no model is configured. Each `index` derives
-NVFP4 rows keyed by content handle from its faculty's source collection: an
-image whole, and text (HTML reduced to its text, a PDF's text layer) in windows
-of at most 248 framed token IDs, the first 16 per content; content the model
-cannot read gets no rows. Indexing is only ever an explicit command, resumable
-per commit, and prints the commits it still has to derive; saving never embeds.
-Scores are reconstructed NVFP4 cosines, not calibrated relevance; `similar`
-ranks top-k unless given an explicit floor.
+`files similar`, `memory similar` and `wiki similar`, plus `memory context
+--about/--filter/--remove`, which fall back to exact BM25 when no model is
+configured. Each faculty declares one derived collection of NVFP4 rows keyed by
+content handle over its source collection: an image whole, and text (HTML
+reduced to its text, a PDF's text layer) in windows of at most 248 framed token
+IDs, the first 16 per content; content the model cannot read gets no rows. No
+faculty has an index command. Only a process with the model bound can compute
+the rows, so the CPU maintenance daemon leaves them alone and `faculties
+maintain`, a long-lived process on the GB10, binds the model once and derives
+every commit that has none, again whenever the pile grows; it exits 0 when a
+compaction replaces the pile file, for its supervisor to restart it on the new
+one. Saving never embeds. `similar` answers from the rows that exist and says
+when the index is partial; with no rows at all it refuses. Scores are
+reconstructed NVFP4 cosines, not calibrated relevance; `similar` ranks top-k
+unless given an explicit floor.
 
 Supply `WEMM_ROOT`; the model is read from the working pile's `models`
 collection (`TRIBLESPACE_COLLECTION_MODELS`), tokenizer, configuration and chat

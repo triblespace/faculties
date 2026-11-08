@@ -123,10 +123,11 @@ web-export = []
 # nomic-embed-text for posture's semantic tier (`posture semantic`), the one
 # reader of the nomic models left. Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
-# Semantic index and search for Files, Memory and Wiki (`files index/similar`,
-# `memory index/similar`, `memory context --about/--filter/--remove`, `wiki
-# index/similar`): one native WeMM model for text, images and documents, on a
-# GB10 only. Without it those commands say so, and context falls back to BM25.
+# Semantic index and search for Files, Memory and Wiki (`faculties maintain`
+# derives the indexes; `files similar`, `memory similar`, `memory context
+# --about/--filter/--remove`, `wiki similar` read them): one native WeMM model
+# for text, images and documents, on a GB10 only. Without it those commands
+# say so, and context falls back to BM25.
 wemm = ["dep:mary", "mary/wemm-input", "triblespace-search/semantic-wemm-cuda"]
 # Text-to-image generation via mary's ported FLUX.2 pipeline (Burn/Metal).
 imagine = ["dep:mary", "mary/flux"]

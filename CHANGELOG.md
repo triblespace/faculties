@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- No faculty has an index command any more: `memory index`, `wiki index` and
+  `files index`, and the MCP tools `memory_index`, `wiki_index` and
+  `files_index`, are gone. `faculties maintain` (wemm build, GB10) binds the
+  WeMM model once and derives every Memory, Wiki and Files commit that has no
+  rows, again whenever the pile grows, printing one line per index per pass:
+  derived, still missing, rows, time. It exits 0 when the pile file is
+  replaced (a compaction), so a supervisor restarts it with a fresh bind, and
+  any derive error ends it non-zero. `similar` on a partial index answers from
+  the rows that exist and says how many commits have none; on an index with no
+  rows it still refuses.
+
 - `compass priorities` and MCP `compass_priorities` show priority layers across
   status columns and the direct relations behind them, distinguishing explicit
   assertions from child-before-parent ordering. Filters select displayed goals
