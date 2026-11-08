@@ -322,6 +322,23 @@ impl Memory {
             Ok(())
         })
     }
+    /// EXPERIMENTAL: diagnose the full-closed run structure over the whole pile.
+    pub fn runs_diag(&self, budget: usize, out: &mut Out<'_>) -> Result<()> {
+        let split = crate::memory_cover::sealed::utc_midnight_key(2026, 7, 10);
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for line in crate::memory_cover::sealed::runs_diagnosis(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                budget,
+                &[1.0 / 3.0, 1.0 / 8.0],
+                split,
+            )? {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
     /// EXPERIMENTAL: replay the greedy walk beside the append-only open slot (clock-closed) and full-closed runs
     /// (shares, arrival policy, in-tile target, deferral cap).
     pub fn churn_tiled(

@@ -892,6 +892,11 @@ fn utc_key(z: i64, hour: u8) -> i128 {
         .total_nanoseconds()
 }
 
+/// TAI key of 00:00 UTC on a calendar date.
+pub fn utc_midnight_key(y: i64, m: i64, d: i64) -> i128 {
+    utc_key(days_from_civil(y, m, d), 0)
+}
+
 /// UTC day number and hour of a TAI key.
 fn utc_day_hour(key: i128) -> (i64, u8) {
     let (y, m, d, h, _, _, _) = key_to_epoch(key).to_gregorian_utc();
@@ -2125,6 +2130,167 @@ pub fn select_runs_recollection_cut(
     out.used += used;
     let _ = opts;
     out
+}
+
+/// Diagnosis of the full-closed run structure over the whole pile (no
+/// replay): for each run, its members' first observations by week, split into
+/// the members that advanced the open run's mass (observed while the run was
+/// open, starting at or after its seam) and those that arrived later with a
+/// start inside it (backfill: comb summaries, re-leafs, imports of old spans).
+pub fn runs_diagnosis<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    budget: usize,
+    open_fracs: &[f64],
+    split_at: i128,
+) -> Result<Vec<String>> {
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed, unobserved) = recollection_class_observations(space, &raw_spans, &classes);
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+            false,
+        )?);
+    }
+    let mut lines = Vec::new();
+    let total: usize = costs.iter().sum();
+    let before: usize = (0..spans.len())
+        .filter(|&i| observed[i] < split_at)
+        .map(|i| costs[i])
+        .sum();
+    let before_n = (0..spans.len()).filter(|&i| observed[i] < split_at).count();
+    lines.push(format!(
+        "{} classes, {} chars in all; observed before {}: {} classes, {} chars ({:.1}%); {} classes use the range-end fallback",
+        spans.len(),
+        total,
+        fmt_key(split_at),
+        before_n,
+        before,
+        100.0 * before as f64 / total.max(1) as f64,
+        unobserved
+    ));
+    let week = |key: i128| -> String {
+        let (z, _) = utc_day_hour(key);
+        let (y, m, d) = civil_from_days(z - weekday(z));
+        format!("{y:04}-{m:02}-{d:02}")
+    };
+    let Some(earliest) = spans.iter().map(|s| s.0).min() else {
+        return Ok(lines);
+    };
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by(|&x, &y| {
+        observed[x]
+            .cmp(&observed[y])
+            .then(spans[x].2.cmp(&spans[y].2))
+    });
+    for &frac in open_fracs {
+        let quantum = ((frac * budget as f64).floor() as usize).max(1);
+        // (rank, lo, hi, first close observation, last close observation)
+        let mut runs: Vec<(u32, i128, i128, i128, i128)> = Vec::new();
+        let mut advanced = vec![false; spans.len()];
+        let mut seam = earliest;
+        let mut mass = 0usize;
+        let mut edge = i128::MIN;
+        let mut opened_at = i128::MIN;
+        for &i in &order {
+            if spans[i].0 < seam {
+                continue;
+            }
+            if mass == 0 {
+                opened_at = observed[i];
+            }
+            advanced[i] = true;
+            mass += costs[i];
+            edge = edge.max(spans[i].1);
+            if mass >= quantum {
+                let hi = edge.max(seam + 1);
+                runs.push((0, seam, hi, opened_at, observed[i]));
+                seam = hi;
+                mass = 0;
+                edge = i128::MIN;
+                while runs.len() >= 4 {
+                    let n = runs.len();
+                    let r = runs[n - 1].0;
+                    if runs[n - 4..].iter().all(|x| x.0 == r) {
+                        let merged = (
+                            r + 1,
+                            runs[n - 4].1,
+                            runs[n - 1].2,
+                            runs[n - 4].3,
+                            runs[n - 1].4,
+                        );
+                        runs.truncate(n - 4);
+                        runs.push(merged);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        lines.push(String::new());
+        lines.push(format!("== open limit {frac:.4} of {budget} = {quantum} chars: {} closed runs, open run from {}", runs.len(), fmt_key(seam)));
+        for &(rank, lo, hi, first, last) in &runs {
+            let members: Vec<usize> = (0..spans.len())
+                .filter(|&i| spans[i].0 >= lo && spans[i].0 < hi)
+                .collect();
+            let adv: Vec<usize> = members.iter().copied().filter(|&i| advanced[i]).collect();
+            let back: Vec<usize> = members.iter().copied().filter(|&i| !advanced[i]).collect();
+            let chars = |v: &[usize]| v.iter().map(|&i| costs[i]).sum::<usize>();
+            let pre = members.iter().filter(|&&i| observed[i] < split_at).count();
+            let pre_chars: usize = members
+                .iter()
+                .filter(|&&i| observed[i] < split_at)
+                .map(|&i| costs[i])
+                .sum();
+            lines.push(format!(
+                "run rank {rank} {} ({:.1} d): {} members, {} chars; advanced the seam {} ({} chars), backfill {} ({} chars); observed before {}: {} members ({} chars); closes observed {} .. {}",
+                format_time_range(key_to_epoch(lo), key_to_epoch(hi)),
+                (hi - lo) as f64 / 86_400e9,
+                members.len(),
+                chars(&members),
+                adv.len(),
+                chars(&adv),
+                back.len(),
+                chars(&back),
+                fmt_key(split_at),
+                pre,
+                pre_chars,
+                fmt_key(first),
+                fmt_key(last),
+            ));
+            if rank >= 1 || runs.len() <= 6 {
+                let mut hist: std::collections::BTreeMap<String, (usize, usize, usize, usize)> =
+                    Default::default();
+                for &i in &members {
+                    let e = hist.entry(week(observed[i])).or_default();
+                    if advanced[i] {
+                        e.0 += 1;
+                        e.1 += costs[i];
+                    } else {
+                        e.2 += 1;
+                        e.3 += costs[i];
+                    }
+                }
+                lines.push(
+                    "    created_at week (Monday): advanced n/chars | backfill n/chars".into(),
+                );
+                for (w, (an, ac, bn, bc)) in hist {
+                    lines.push(format!("    {w}: {an}/{ac} | {bn}/{bc}"));
+                }
+            }
+        }
+    }
+    Ok(lines)
 }
 
 /// Characters of `entries` by where each memory STARTS relative to `latest`:
