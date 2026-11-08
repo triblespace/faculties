@@ -322,31 +322,64 @@ impl Memory {
             Ok(())
         })
     }
-    /// EXPERIMENTAL: replay the greedy walk beside the tiled selector, one
-    /// configuration per gradient anchor (`moment` = 3 s, `unit` = 2^14 s).
+    /// EXPERIMENTAL: replay the greedy walk beside nine tiled configurations
+    /// (shares, arrival policy, in-tile target, deferral cap).
     pub fn churn_tiled(
         &self,
         options: &ChurnOptions,
-        anchors: &[String],
+        _anchors: &[String],
         out: &mut Out<'_>,
     ) -> Result<()> {
+        use crate::memory_cover::sealed::TiledOpts;
         if options.step_units <= 0 {
             bail!("churn step_units must be positive");
         }
-        let anchors = anchors
-            .iter()
-            .map(|a| match a.as_str() {
-                "moment" => Ok((
-                    "moment (3 s)".to_owned(),
-                    (crate::memory::MOMENT_SECONDS * 1e9) as i128,
-                )),
-                "unit" => Ok((
-                    "unit (2^14 s)".to_owned(),
-                    crate::memory_cover::REPLAY_QUANTUM_NS,
-                )),
-                other => Err(anyhow!("unknown anchor {other}; use moment or unit")),
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let moment = (crate::memory::MOMENT_SECONDS * 1e9) as i128;
+        let unit = crate::memory_cover::REPLAY_QUANTUM_NS;
+        let cap = Some(64 * unit); // 12.1 d: levels 4 and up re-read at least this often
+        let cfg = |anchor_ns, frozen, uniform, cap_ns| TiledOpts {
+            anchor_ns,
+            frozen,
+            uniform,
+            cap_ns,
+            closed_fraction: None,
+        };
+        let ratio = |frozen, cap_ns| TiledOpts {
+            anchor_ns: moment,
+            frozen,
+            uniform: true,
+            cap_ns,
+            closed_fraction: Some(2.0 / 3.0),
+        };
+        let configs = vec![
+            (
+                "ratio-2/3/b/uniform (primary)".to_owned(),
+                ratio(false, None),
+            ),
+            ("ratio-2/3/a/uniform/cap-12d".to_owned(), ratio(true, cap)),
+            (
+                "moment/a/log-target (report 2)".to_owned(),
+                cfg(moment, true, false, None),
+            ),
+            ("moment/a/uniform".to_owned(), cfg(moment, true, true, None)),
+            (
+                "moment/a/uniform/cap-12d".to_owned(),
+                cfg(moment, true, true, cap),
+            ),
+            (
+                "moment/b/log-target".to_owned(),
+                cfg(moment, false, false, None),
+            ),
+            (
+                "moment/b/uniform".to_owned(),
+                cfg(moment, false, true, None),
+            ),
+            (
+                "unit/a/uniform/cap-12d".to_owned(),
+                cfg(unit, true, true, cap),
+            ),
+            ("unit/b/uniform".to_owned(), cfg(unit, false, true, None)),
+        ];
         self.with_operation(|storage| {
             let loaded = storage.load()?;
             for line in crate::memory_cover::sealed::replay_tiled(
@@ -355,7 +388,7 @@ impl Memory {
                 options.budget_chars,
                 options.steps,
                 options.step_units,
-                &anchors,
+                &configs,
             )? {
                 out.line(line)?;
             }

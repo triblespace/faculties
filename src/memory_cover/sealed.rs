@@ -1538,8 +1538,14 @@ pub struct TiledCut {
     pub levels: Vec<TileLevel>,
     /// The highest level the counter uses for this life.
     pub top: u32,
+    /// Start of the open unit (absolute key) and the first open-walk entry.
+    pub open_start: i128,
+    pub open_from: usize,
     /// Characters left to the open walk (residual share plus unspent).
     pub open_space: usize,
+    /// The open walk's own share; `open_space - open_share` is what the
+    /// closed levels left unspent.
+    pub open_share: usize,
     pub used: usize,
 }
 
@@ -1552,6 +1558,102 @@ impl TiledCut {
     }
 }
 
+/// The declared constants of one tiled configuration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TiledOpts {
+    /// Anchor of the per-level shares: 3 s (today's shape) or 2^14 s (the
+    /// 2026-09-05 tiled shape).
+    pub anchor_ns: i128,
+    /// Arrival policy a (true): a level's candidates are those observed by its
+    /// latest change. Policy b (false): every memory is a candidate at once.
+    pub frozen: bool,
+    /// Inside a tile, target slots uniformly over the tile (the old design's
+    /// one grain per tile) instead of today's log gradient toward the tile's
+    /// young edge.
+    pub uniform: bool,
+    /// Policy a only: levels whose tiles are wider than this re-read their
+    /// candidates at least once per this much OBSERVATION time (the newest
+    /// created_at in the pile, floored to a multiple of the cap), bounding
+    /// how long a late summary waits.
+    pub cap_ns: Option<i128>,
+    /// A declared closed fraction instead of anchor shares: the closed levels
+    /// together get this fraction of the budget, equally per level (JP,
+    /// 2026-11-08: "2/4 big picture history, 1/4 current context, 1/4 now",
+    /// with "now" the resident's live quarter after the cover, so 2/3 of the
+    /// cover closed and 1/3 open). `anchor_ns` is then unused.
+    pub closed_fraction: Option<f64>,
+}
+
+/// A target map inside one slot.
+trait Target {
+    fn at(&self, cursor: usize) -> f64;
+}
+
+impl Target for DensityGradient {
+    fn at(&self, cursor: usize) -> f64 {
+        self.sample(cursor).time_ns
+    }
+}
+
+/// Uniform targets over `[0, life]` for `space` characters.
+struct Uniform {
+    life_ns: f64,
+    space: usize,
+}
+
+impl Target for Uniform {
+    fn at(&self, cursor: usize) -> f64 {
+        self.life_ns * cursor.min(self.space) as f64 / self.space.max(1) as f64
+    }
+}
+
+/// [`walk`] over any target map.
+fn walk_targets(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    candidate: &[bool],
+    selected: &mut [bool],
+    origin: i128,
+    target: &dyn Target,
+    cap: usize,
+) -> (Vec<usize>, usize) {
+    let mut cover = Vec::new();
+    let mut used = 0usize;
+    while used < cap {
+        let ideal_start = target.at(used);
+        let mut best: Option<(f64, Id, usize)> = None;
+        for (i, &(start, end, id)) in spans.iter().enumerate() {
+            let cost = costs[i];
+            if selected[i] || !candidate[i] || cost == 0 {
+                continue;
+            }
+            let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
+            let actual_start = start.saturating_sub(origin) as f64;
+            let actual_end = actual_start + width;
+            let ideal_end = target.at(used.saturating_add(cost));
+            let start_error = actual_start - ideal_start;
+            let end_error = actual_end - ideal_end;
+            let score = start_error.mul_add(start_error, end_error * end_error);
+            let cand = (score, id, i);
+            if best
+                .as_ref()
+                .is_none_or(|cur| cand.0.total_cmp(&cur.0).then(cand.1.cmp(&cur.1)).is_lt())
+            {
+                best = Some(cand);
+            }
+        }
+        let Some((_, _, pick)) = best else { break };
+        let next = used.saturating_add(costs[pick]);
+        if next > cap {
+            break;
+        }
+        selected[pick] = true;
+        cover.push(pick);
+        used = next;
+    }
+    (cover, used)
+}
+
 /// The tiled selector.
 ///
 /// The tiling is the old tiled cover's (wiki "The memory cover", 2026-09-05):
@@ -1559,37 +1661,31 @@ impl TiledCut {
 /// three complete tiles per level before the current block of the next level.
 /// It is the base-4 counter of `n`, the unit holding the newest memory end:
 /// level `l` spans `[floor(n/4^(l+1))*4^(l+1), floor(n/4^l)*4^l)` units, so its
-/// tile count is the base-4 digit `l` of `n`. A level changes only when its own
-/// digit changes (a tile appended, every `4^l` units) or a deeper level carries
-/// (four tiles merging into one of the next level).
+/// tile count is the base-4 digit `l` of `n`.
 ///
-/// Where the old design gave every tile one grain from a globally fitted
-/// detail `m`, which could step and re-render the whole cover, each level here
-/// gets a fixed share of the budget from the log-age gradient over the
-/// counter's own bands, `ln((A + 4^(l+1)u)/(A + 4^l u)) / ln((A + 4^(top+1)u)/A)`
-/// with anchor `A` (the 3 s journal moment, or one unit). The share depends on
-/// the level and the counter's height only. A level's allowance (share plus
-/// what older levels left unspent) is split evenly among its tiles, oldest
-/// first, unspent passing to the next tile. Inside each tile today's greedy
-/// walk runs over the tile's own span, frozen at its level's strike: only
-/// memories that START in the tile and were observed by the first observation
-/// at which the journal's running maximum end reached the level's newest tile
-/// end. What all
-/// levels leave unspent, plus the residual share of the open unit, goes to
-/// today's walk over the open unit `[n*u, L]`, which may fall back on any
-/// memory not yet taken.
+/// Each level gets a fixed share of the budget from the log-age gradient over
+/// the counter's own bands, `ln((A + 4^(l+1)u)/(A + 4^l u)) / ln((A +
+/// 4^(top+1)u)/A)`, never a globally fitted detail. A level's allowance
+/// (share plus what older levels left unspent) is split evenly among its
+/// tiles, oldest first, unspent passing on. Inside each tile today's greedy
+/// walk chooses among memories that START in the tile, against either today's
+/// log targets toward the tile's young edge or uniform targets
+/// ([`TiledOpts::uniform`]). Arrival: policy a freezes a level's candidates at
+/// its latest change (optionally refreshed every [`TiledOpts::cap_ns`] of
+/// observation time for wide levels); policy b admits every memory at once.
+/// What all levels leave unspent goes to today's walk over the open unit
+/// `[n*u, L]`, which may fall back on any memory not yet taken.
 ///
 /// Pure in the spans, their first observation times, the budget and the
-/// declared anchor. No previous cover, no wall clock, no completeness floor:
-/// a tile with too little support simply passes its allowance on. `late` =
-/// `(level, shift)` moves one level's observation cutoffs earlier, for the
+/// declared options. No previous cover, no wall clock, no completeness floor.
+/// `late` = `(level, shift)` moves one level's cutoff earlier, for the
 /// late-arrival probe; the real selector passes `None`.
 pub fn select_tiled_recollection_cut(
     spans: &[(i128, i128, Id)],
     costs: &[usize],
     observed: &[i128],
     budget: usize,
-    anchor_ns: i128,
+    opts: &TiledOpts,
     late: Option<(u32, i128)>,
 ) -> TiledCut {
     assert_eq!(spans.len(), costs.len());
@@ -1598,7 +1694,10 @@ pub fn select_tiled_recollection_cut(
         cover: Vec::new(),
         levels: Vec::new(),
         top: 0,
+        open_start: 0,
+        open_from: 0,
         open_space: 0,
+        open_share: 0,
         used: 0,
     };
     let (Some(earliest), Some(latest)) = (
@@ -1622,14 +1721,18 @@ pub fn select_tiled_recollection_cut(
         top += 1;
     }
     out.top = top;
-    let a = anchor_ns.max(1) as f64;
+    let a = opts.anchor_ns.max(1) as f64;
     let u = unit as f64;
     let norm = ((a + 4f64.powi(top as i32 + 1) * u) / a).ln();
     let share = |l: u32| -> usize {
+        if let Some(f) = opts.closed_fraction {
+            return (f.clamp(0.0, 1.0) * budget as f64 / (top as f64 + 1.0)).floor() as usize;
+        }
         let hi = a + 4f64.powi(l as i32 + 1) * u;
         let lo = a + 4f64.powi(l as i32) * u;
         ((hi / lo).ln() / norm * budget as f64).floor() as usize
     };
+    out.open_share = budget - (0..=top).map(share).sum::<usize>().min(budget);
 
     let mut order: Vec<usize> = (0..spans.len()).collect();
     order.sort_by(|&x, &y| {
@@ -1637,7 +1740,6 @@ pub fn select_tiled_recollection_cut(
             .cmp(&observed[y])
             .then(spans[x].2.cmp(&spans[y].2))
     });
-    // Running lived edge in observation order, for each tile's strike.
     let mut edges: Vec<(i128, i128)> = Vec::with_capacity(order.len());
     let mut edge = i128::MIN;
     for &i in &order {
@@ -1648,6 +1750,7 @@ pub fn select_tiled_recollection_cut(
         let k = edges.partition_point(|&(e, _)| e < end);
         edges.get(k).map_or(i128::MAX, |&(_, o)| o)
     };
+    let newest_observation = observed.iter().copied().max().unwrap_or(0);
 
     let mut selected = vec![false; spans.len()];
     let mut carry = 0usize;
@@ -1664,12 +1767,19 @@ pub fn select_tiled_recollection_cut(
             Some((level, shift)) if level == l => shift,
             _ => 0,
         };
-        // Every tile of a level shares the cutoff of the level's latest change
-        // (the strike of its newest tile end): the level re-renders whenever
-        // it gains a tile anyway, so this costs no stability, and a summary
-        // written later about an old stretch becomes visible at the next
-        // change of its level instead of never.
-        let cutoff = strike(hi * unit).saturating_sub(shift);
+        // Policy a: the level's latest change (the strike of its newest tile
+        // end), so a late summary enters at the level's next change; with a
+        // cap, wide levels also re-read at least once per cap of observation
+        // time. Policy b: no cutoff.
+        let cutoff = if opts.frozen {
+            let mut c = strike(hi * unit);
+            if let Some(cap) = opts.cap_ns.filter(|&cap| width * unit > cap) {
+                c = c.max(newest_observation.div_euclid(cap) * cap);
+            }
+            c.saturating_sub(shift)
+        } else {
+            i128::MAX
+        };
         let start = out.cover.len();
         let mut spent = 0usize;
         for t in 0..tiles {
@@ -1685,16 +1795,32 @@ pub fn select_tiled_recollection_cut(
                 .zip(observed)
                 .map(|(s, &o)| s.0 >= ta && s.0 < tb && o <= cutoff)
                 .collect();
-            let gradient = DensityGradient::new(tb - ta, tile_space);
-            let (cover, used) = walk(
-                spans,
-                costs,
-                &candidate,
-                &mut selected,
-                ta,
-                &gradient,
-                tile_space,
-            );
+            let (cover, used) = if opts.uniform {
+                let target = Uniform {
+                    life_ns: (tb - ta) as f64,
+                    space: tile_space,
+                };
+                walk_targets(
+                    spans,
+                    costs,
+                    &candidate,
+                    &mut selected,
+                    ta,
+                    &target,
+                    tile_space,
+                )
+            } else {
+                let gradient = DensityGradient::new(tb - ta, tile_space);
+                walk(
+                    spans,
+                    costs,
+                    &candidate,
+                    &mut selected,
+                    ta,
+                    &gradient,
+                    tile_space,
+                )
+            };
             out.cover.extend(cover);
             spent += used;
         }
@@ -1714,6 +1840,8 @@ pub fn select_tiled_recollection_cut(
     let rest = budget - out.used;
     out.open_space = rest;
     let origin = n * unit;
+    out.open_start = origin;
+    out.open_from = out.cover.len();
     let gradient = DensityGradient::new(latest - origin, rest);
     let candidate = vec![true; spans.len()];
     let (open, used) = walk(
@@ -1730,15 +1858,43 @@ pub fn select_tiled_recollection_cut(
     out
 }
 
-/// Replay the walk in use beside the tiled selector, one configuration per
-/// anchor.
+/// Characters of `entries` by where each memory STARTS relative to `latest`:
+/// [inside the open unit, earlier within 1 day, 1 to 7 days, 7 to 30 days, older].
+fn age_split(
+    entries: &[usize],
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    latest: i128,
+    open_start: i128,
+) -> [usize; 5] {
+    const DAY: i128 = 86_400 * 1_000_000_000;
+    let mut out = [0usize; 5];
+    for &i in entries {
+        let s = spans[i].0;
+        let b = if s >= open_start {
+            0
+        } else if s >= latest - DAY {
+            1
+        } else if s >= latest - 7 * DAY {
+            2
+        } else if s >= latest - 30 * DAY {
+            3
+        } else {
+            4
+        };
+        out[b] += costs[i];
+    }
+    out
+}
+
+/// Replay the walk in use beside tiled configurations.
 pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
     space: &P,
     ws: &B,
     budget: usize,
     steps: usize,
     step_units: i128,
-    anchors: &[(String, i128)],
+    configs: &[(String, TiledOpts)],
 ) -> Result<Vec<String>> {
     let raw_spans = collect_chunk_spans(space);
     let (spans, classes) = recollection_classes(&raw_spans);
@@ -1770,15 +1926,15 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
 
     struct Step {
         point: i128,
+        latest: i128,
         base: Vec<usize>,
         base_used: usize,
         cuts: Vec<TiledCut>,
         silent: Vec<bool>,
     }
-    // probes[config][level] = (distinct level states probed, changes per lag)
-    let mut probes = vec![vec![(0usize, [0usize; 3]); MAX_LEVEL]; anchors.len()];
-    let mut seen: Vec<Vec<Vec<(i128, i128, usize, u32)>>> =
-        vec![vec![Vec::new(); MAX_LEVEL]; anchors.len()];
+    let mut probes = vec![vec![(0usize, [0usize; 3]); MAX_LEVEL]; configs.len()];
+    let mut seen: Vec<Vec<Vec<(i128, i128, usize, u32, i128)>>> =
+        vec![vec![Vec::new(); MAX_LEVEL]; configs.len()];
     let mut base_silent = 0usize;
     let mut out_steps: Vec<Step> = Vec::new();
     for k in (0..=steps).rev() {
@@ -1792,39 +1948,47 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let sub: Vec<_> = map.iter().map(|&i| spans[i]).collect();
         let sub_costs: Vec<_> = map.iter().map(|&i| costs[i]).collect();
         let sub_obs: Vec<_> = map.iter().map(|&i| observed_at[i]).collect();
+        let latest = sub.iter().map(|s| s.1).max().unwrap_or(0);
+        let newest_obs = sub_obs.iter().copied().max().unwrap_or(0);
         let base = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget);
         if !silent_life_quarters(&sub, &base.cover).is_empty() {
             base_silent += 1;
         }
         let mut cuts = Vec::new();
         let mut silent = Vec::new();
-        for (c, (_, anchor)) in anchors.iter().enumerate() {
+        for (c, (_, opts)) in configs.iter().enumerate() {
             let mut cut =
-                select_tiled_recollection_cut(&sub, &sub_costs, &sub_obs, budget, *anchor, None);
+                select_tiled_recollection_cut(&sub, &sub_costs, &sub_obs, budget, opts, None);
             silent.push(!silent_life_quarters(&sub, &cut.cover).is_empty());
-            for lv in &cut.levels {
-                let li = lv.level as usize;
-                if li >= MAX_LEVEL {
-                    continue;
-                }
-                let key = (lv.lower, lv.upper, lv.allowance, cut.top);
-                if seen[c][li].contains(&key) {
-                    continue;
-                }
-                seen[c][li].push(key);
-                probes[c][li].0 += 1;
-                for (j, lag_h) in LAGS_H.iter().enumerate() {
-                    let lag = lag_h * 3600 * 1_000_000_000;
-                    let late = select_tiled_recollection_cut(
-                        &sub,
-                        &sub_costs,
-                        &sub_obs,
-                        budget,
-                        *anchor,
-                        Some((lv.level, lag)),
-                    );
-                    if late.level_entries(lv.level) != cut.level_entries(lv.level) {
-                        probes[c][li].1[j] += 1;
+            if opts.frozen {
+                for lv in &cut.levels {
+                    let li = lv.level as usize;
+                    if li >= MAX_LEVEL {
+                        continue;
+                    }
+                    let capped = opts
+                        .cap_ns
+                        .filter(|&cap| 4i128.pow(lv.level) * SEAL_UNIT_NS > cap)
+                        .map_or(0, |cap| newest_obs.div_euclid(cap));
+                    let key = (lv.lower, lv.upper, lv.allowance, cut.top, capped);
+                    if seen[c][li].contains(&key) {
+                        continue;
+                    }
+                    seen[c][li].push(key);
+                    probes[c][li].0 += 1;
+                    for (j, lag_h) in LAGS_H.iter().enumerate() {
+                        let lag = lag_h * 3600 * 1_000_000_000;
+                        let late = select_tiled_recollection_cut(
+                            &sub,
+                            &sub_costs,
+                            &sub_obs,
+                            budget,
+                            opts,
+                            Some((lv.level, lag)),
+                        );
+                        if late.level_entries(lv.level) != cut.level_entries(lv.level) {
+                            probes[c][li].1[j] += 1;
+                        }
                     }
                 }
             }
@@ -1835,6 +1999,7 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         }
         out_steps.push(Step {
             point,
+            latest,
             base: base.cover.iter().map(|&j| map[j]).collect(),
             base_used: base.used,
             cuts,
@@ -1857,32 +2022,57 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         .filter(|&k| out_steps[k].base != out_steps[k - 1].base)
         .collect();
     let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    let mean_split = |v: &[[usize; 5]]| -> String {
+        let n = v.len().max(1) as f64;
+        let m: Vec<String> = (0..5)
+            .map(|b| {
+                format!(
+                    "{:.0}k",
+                    v.iter().map(|x| x[b]).sum::<usize>() as f64 / n / 1e3
+                )
+            })
+            .collect();
+        format!(
+            "open unit {}, <1 d {}, 1-7 d {}, 7-30 d {}, older {}",
+            m[0], m[1], m[2], m[3], m[4]
+        )
+    };
     let base_used: Vec<usize> = changed.iter().map(|&k| out_steps[k].base_used).collect();
     let base_lcp: Vec<usize> = changed
         .iter()
         .map(|&k| lcp_chars(&out_steps[k].base, &out_steps[k - 1].base, &costs))
         .collect();
+    let base_split: Vec<[usize; 5]> = out_steps
+        .iter()
+        .map(|s| {
+            let open = s.latest.div_euclid(SEAL_UNIT_NS) * SEAL_UNIT_NS;
+            age_split(&s.base, &spans, &costs, s.latest, open)
+        })
+        .collect();
     let mut summary = vec![format!(
         "walk in use: {} of {} transitions changed the cover; on those, mean cover {:.0}k chars, reused with today's single saved prefix 0, \
-         mean common entry prefix {:.0}k chars; mean fill {:.1}%; {} step(s) silent > LIFE/4",
+         mean common entry prefix {:.0}k chars; mean fill {:.1}%; {} step(s) silent > LIFE/4\n    \
+         whole cover by memory start, mean over all steps: {}",
         changed.len(),
         out_steps.len().saturating_sub(1),
         mean(&base_used) / 1e3,
         mean(&base_lcp) / 1e3,
         out_steps.iter().map(|s| pct(s.base_used)).sum::<f64>() / out_steps.len().max(1) as f64,
         base_silent,
+        mean_split(&base_split),
     )];
 
-    for (c, (name, _)) in anchors.iter().enumerate() {
+    for (c, (name, _)) in configs.iter().enumerate() {
         lines.push(String::new());
         lines.push(format!(
-            "== tiled, anchor {name}: levels coarsest first as level:tiles:used (* = changed since the previous step); \
+            "== tiled {name}: levels coarsest first as level:tiles:used (* = changed since the previous step); \
              resume = chars reused if the backend could resume at the deepest unchanged level boundary; \
-             at-j = chars reused with ONE prefix saved at the young end of level j"
+             at-j = chars reused with ONE prefix saved at the young end of level j; open split = open-walk chars by memory start \
+             (open unit / <1 d / 1-7 d / 7-30 d / older)"
         ));
         lines.push(format!(
-            "{:<20} {:>8} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}  levels | open",
-            "observed", "used", "fill%", "open", "resume", "at-1", "at-2", "at-3", "lcp"
+            "{:<20} {:>8} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8}  {:<32}  levels",
+            "observed", "used", "fill%", "open", "resume", "at-1", "at-2", "lcp", "open split"
         ));
         let mut fills = Vec::new();
         let mut silent_steps = 0usize;
@@ -1891,9 +2081,13 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let mut lcp_v = Vec::new();
         let mut used_v = Vec::new();
         let mut open_v = Vec::new();
+        let mut flow_v = Vec::new();
+        let mut open_split_v = Vec::new();
+        let mut whole_split_v = Vec::new();
         let mut lvl_used: Vec<Vec<usize>> = vec![Vec::new(); MAX_LEVEL];
         let mut lvl_changed = vec![0usize; MAX_LEVEL];
         let mut lvl_own = vec![0usize; MAX_LEVEL];
+        let mut lvl_content = vec![0usize; MAX_LEVEL];
         let mut max_top = 0u32;
         for (k, s) in out_steps.iter().enumerate() {
             let cut = &s.cuts[c];
@@ -1903,6 +2097,22 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 silent_steps += 1;
             }
             let open_used = cut.used - cut.levels.iter().map(|l| l.used).sum::<usize>();
+            flow_v.push(cut.open_space.saturating_sub(cut.open_share));
+            let open_split = age_split(
+                &cut.cover[cut.open_from..],
+                &spans,
+                &costs,
+                s.latest,
+                cut.open_start,
+            );
+            open_split_v.push(open_split);
+            whole_split_v.push(age_split(
+                &cut.cover,
+                &spans,
+                &costs,
+                s.latest,
+                cut.open_start,
+            ));
             let mut cells = Vec::new();
             let mut resume = 0usize;
             let mut at = vec![0usize; MAX_LEVEL];
@@ -1911,14 +2121,14 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 let prev = &out_steps[k - 1].cuts[c];
                 let same_top = prev.top == cut.top;
                 let mut intact = same_top;
-                // Levels coarsest first; a level absent in both is unchanged.
-                let mut unchanged_through: Vec<(u32, bool, usize)> = Vec::new();
+                let mut through: Vec<(u32, bool, usize)> = Vec::new();
                 for l in (0..=cut.top).rev() {
                     let cur = cut.levels.iter().find(|x| x.level == l);
                     let old = prev.levels.iter().find(|x| x.level == l);
-                    let same = same_top
-                        && cut.level_entries(l) == prev.level_entries(l)
-                        && cur.map(|x| (x.lower, x.upper)) == old.map(|x| (x.lower, x.upper));
+                    let same_span =
+                        cur.map(|x| (x.lower, x.upper)) == old.map(|x| (x.lower, x.upper));
+                    let same =
+                        same_top && same_span && cut.level_entries(l) == prev.level_entries(l);
                     let used = cur.map_or(0, |x| x.used);
                     if same && intact {
                         resume += used;
@@ -1927,12 +2137,15 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                     }
                     if !same {
                         lvl_changed[l as usize] += 1;
-                        let deeper_same = unchanged_through.iter().all(|&(_, s, _)| s);
-                        if deeper_same {
-                            lvl_own[l as usize] += 1;
+                        if through.iter().all(|&(_, s, _)| s) && same_top {
+                            if same_span {
+                                lvl_content[l as usize] += 1;
+                            } else {
+                                lvl_own[l as usize] += 1;
+                            }
                         }
                     }
-                    unchanged_through.push((l, same, used));
+                    through.push((l, same, used));
                     if let Some(x) = cur {
                         cells.push(format!(
                             "{}{}:{}:{}",
@@ -1945,19 +2158,13 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                         cells.push(format!("*{l}:0:0"));
                     }
                 }
-                // ONE prefix saved at the young end of level j: reused when
-                // every level >= j is unchanged.
                 for j in 0..=cut.top as usize {
-                    let ok = unchanged_through
+                    let rows: Vec<_> = through
                         .iter()
                         .filter(|&&(l, _, _)| l as usize >= j)
-                        .all(|&(_, s, _)| s);
-                    if ok {
-                        at[j] = unchanged_through
-                            .iter()
-                            .filter(|&&(l, _, _)| l as usize >= j)
-                            .map(|&(_, _, u)| u)
-                            .sum();
+                        .collect();
+                    if rows.iter().all(|&&(_, s, _)| s) {
+                        at[j] = rows.iter().map(|&&(_, _, u)| u).sum();
                     }
                 }
                 lcp = lcp_chars(&cut.cover, &prev.cover, &costs);
@@ -1978,8 +2185,16 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
             for x in &cut.levels {
                 lvl_used[x.level as usize].push(x.used);
             }
+            let split = format!(
+                "{}/{}/{}/{}/{}",
+                open_split[0] / 1000,
+                open_split[1] / 1000,
+                open_split[2] / 1000,
+                open_split[3] / 1000,
+                open_split[4] / 1000
+            );
             lines.push(format!(
-                "{:<20} {:>8} {:>5.1}% {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}  {} | {}{}",
+                "{:<20} {:>8} {:>5.1}% {:>7} {:>8} {:>8} {:>8} {:>8}  {:<32}  {}{}",
                 fmt_key(s.point),
                 cut.used,
                 pct(cut.used),
@@ -1987,10 +2202,9 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 resume,
                 at[1],
                 at[2],
-                at[3],
                 lcp,
+                split,
                 cells.join(" "),
-                open_used,
                 if s.silent[c] { "  SILENT>LIFE/4" } else { "" }
             ));
         }
@@ -1998,8 +2212,9 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let reread = |v: &[usize]| (total(&used_v) - total(v)) as f64 / 1e6;
         let ats: Vec<String> = (0..=max_top as usize)
             .map(|j| {
+                let zero = at_v[j].iter().filter(|&&x| x == 0).count();
                 format!(
-                    "at-{j} {:.0}k (reread {:.1}M)",
+                    "at-{j} {:.0}k (reread {:.1}M, no reuse on {zero})",
                     mean(&at_v[j]) / 1e3,
                     reread(&at_v[j])
                 )
@@ -2009,27 +2224,37 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
             .rev()
             .map(|l| {
                 let p = &probes[c][l];
+                let probe = if configs[c].1.frozen {
+                    format!(
+                        "; late-arrival probe changes {}/{} level states at 1h, {}/{} at 6h, {}/{} at 24h",
+                        p.1[0], p.0, p.1[1], p.0, p.1[2], p.0
+                    )
+                } else {
+                    String::new()
+                };
                 format!(
-                    "level {l} (tiles {}): mean {:.0}k chars over {} steps present; changed on {} transitions ({} with every coarser level unchanged); \
-                     late-arrival probe changes {}/{} level states at 1h, {}/{} at 6h, {}/{} at 24h",
+                    "level {l} (tiles {}): mean {:.0}k chars over {} steps present; changed on {} transitions \
+                     ({} by its own digit, {} by content alone, rest by a coarser change){probe}",
                     humanize_unit(l as u32),
                     mean(&lvl_used[l]) / 1e3,
                     lvl_used[l].len(),
                     lvl_changed[l],
                     lvl_own[l],
-                    p.1[0], p.0, p.1[1], p.0, p.1[2], p.0
+                    lvl_content[l],
                 )
             })
             .collect();
         summary.push(format!(
-            "tiled, anchor {name}: mean fill {:.1}% (min {:.1}%), {silent_steps} step(s) silent > LIFE/4; on the {} changed transitions \
-             (mean cover {:.0}k chars, open walk mean {:.0}k): reused mean resume-at-deepest-unchanged {:.0}k (reread {:.1}M), {}, \
-             common entry prefix {:.0}k (reread {:.1}M); walk in use for comparison: single prefix reread {:.1}M, common-prefix reread {:.1}M\n    {}",
+            "tiled {name}: mean fill {:.1}% (min {:.1}%), {silent_steps} step(s) silent > LIFE/4; on the {} changed transitions \
+             (mean cover {:.0}k chars, open walk mean {:.0}k; unspent closed-level characters flowing to the open walk, mean over all steps {:.0}k): reused mean resume-at-deepest-unchanged {:.0}k (reread {:.1}M), {}, \
+             common entry prefix {:.0}k (reread {:.1}M); walk in use for comparison: single prefix reread {:.1}M, common-prefix reread {:.1}M\n    \
+             open walk by memory start, mean over all steps: {}\n    whole cover by memory start, mean over all steps: {}\n    {}",
             fills.iter().sum::<f64>() / fills.len().max(1) as f64,
             fills.iter().copied().fold(f64::INFINITY, f64::min),
             used_v.len(),
             mean(&used_v) / 1e3,
             mean(&open_v) / 1e3,
+            mean(&flow_v) / 1e3,
             mean(&resume_v) / 1e3,
             reread(&resume_v),
             ats.join(", "),
@@ -2037,6 +2262,8 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
             reread(&lcp_v),
             total(&base_used) as f64 / 1e6,
             (total(&base_used) - total(&base_lcp)) as f64 / 1e6,
+            mean_split(&open_split_v),
+            mean_split(&whole_split_v),
             lvls.join("\n    "),
         ));
     }
@@ -2152,7 +2379,20 @@ mod tests {
             let s: Vec<_> = vis.iter().map(|&i| spans[i]).collect();
             let c: Vec<_> = vis.iter().map(|&i| costs[i]).collect();
             let o: Vec<_> = vis.iter().map(|&i| observed[i]).collect();
-            let mut cut = select_tiled_recollection_cut(&s, &c, &o, 60_000, MOMENT_NS, None);
+            let mut cut = select_tiled_recollection_cut(
+                &s,
+                &c,
+                &o,
+                60_000,
+                &TiledOpts {
+                    anchor_ns: MOMENT_NS,
+                    frozen: true,
+                    uniform: false,
+                    cap_ns: None,
+                    closed_fraction: None,
+                },
+                None,
+            );
             assert!(cut.used <= 60_000);
             for x in cut.cover.iter_mut() {
                 *x = vis[*x];
@@ -2192,8 +2432,20 @@ mod tests {
     #[test]
     fn tile_levels_are_the_base4_digits_of_the_newest_unit() {
         let (spans, costs, observed) = journal(30);
-        let cut =
-            select_tiled_recollection_cut(&spans, &costs, &observed, 200_000, SEAL_UNIT_NS, None);
+        let cut = select_tiled_recollection_cut(
+            &spans,
+            &costs,
+            &observed,
+            200_000,
+            &TiledOpts {
+                anchor_ns: SEAL_UNIT_NS,
+                frozen: true,
+                uniform: true,
+                cap_ns: None,
+                closed_fraction: None,
+            },
+            None,
+        );
         let n = spans
             .iter()
             .map(|s| s.1)
@@ -2296,5 +2548,37 @@ mod tests {
             }
             previous = Some(cut);
         }
+    }
+
+    #[test]
+    fn immediate_policy_admits_a_late_summary_at_once_and_frozen_defers_it() {
+        let (mut spans, mut costs, mut observed) = journal(60);
+        let latest = spans.iter().map(|s| s.1).max().unwrap();
+        let newest_obs = observed.iter().copied().max().unwrap();
+        // A summary of day 3 (deep in the past), written after everything else.
+        let day3 = (1_000 * 24 + 3 * 24) * H;
+        spans.push((
+            day3,
+            day3 + 24 * H - 1,
+            Id::new(u128::to_be_bytes(0x5F00_0000_0000_0000_0000_0000_0000_0001)).unwrap(),
+        ));
+        costs.push(150);
+        observed.push(newest_obs + H);
+        let _ = latest;
+        let late = spans.len() - 1;
+        let pick = |frozen: bool| {
+            let opts = TiledOpts {
+                anchor_ns: MOMENT_NS,
+                frozen,
+                uniform: true,
+                cap_ns: None,
+                closed_fraction: Some(2.0 / 3.0),
+            };
+            let cut =
+                select_tiled_recollection_cut(&spans, &costs, &observed, 300_000, &opts, None);
+            cut.cover[..cut.open_from].contains(&late)
+        };
+        assert!(pick(false), "policy b renders the late summary in its tile");
+        assert!(!pick(true), "policy a defers it to the level's next change");
     }
 }
