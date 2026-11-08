@@ -638,10 +638,10 @@ fn priority_layers_preserve_hidden_paths_and_distinguish_structural_edges() {
     assert!(!view.text.contains("] hidden (done)"));
     assert!(view
         .text
-        .contains(&format!("[{parent_id}] > [{hidden_id}]* (explicit)")));
+        .contains(&format!("[{parent_id}] first > [{hidden_id}]* (explicit)")));
     assert!(view
         .text
-        .contains(&format!("[{hidden_id}]* > [{last_id}] (explicit)")));
+        .contains(&format!("[{hidden_id}]* > [{last_id}] last (explicit)")));
     assert!(view.text.contains("(explicit + child-before-parent)"));
     assert!(view
         .text

@@ -756,10 +756,8 @@ fn render_priorities<P: TriblePattern>(
     }
 
     let mut text = String::from(
-        "Priority layers use the full board, including filtered goals.\n\
-         Goals within an acyclic layer are incomparable; different layers can also be incomparable.\n\
-         Direct relations below are the ordering evidence. ID order within a layer is display only.\n\
-         Goals on or below a cycle share the final layer; see diagnostics.\n",
+        "Priority layers use the full board, including filtered goals; ID order is display only.\n\
+         Within acyclic layers, goals are incomparable; different layers can also be incomparable.\n",
     );
     // Only ids and graph ranks are sorted; goal payloads are read at rendering.
     let mut ordered: Vec<_> = selected.iter().copied().collect();
@@ -804,8 +802,16 @@ fn render_priorities<P: TriblePattern>(
         writeln!(
             text,
             "- [{higher:x}]{} > [{lower:x}]{} ({kind})",
-            if selected.contains(&higher) { "" } else { "*" },
-            if selected.contains(&lower) { "" } else { "*" }
+            if selected.contains(&higher) {
+                format!(" {}", task_title(reader, space, higher)?)
+            } else {
+                "*".to_owned()
+            },
+            if selected.contains(&lower) {
+                format!(" {}", task_title(reader, space, lower)?)
+            } else {
+                "*".to_owned()
+            }
         )?;
         any = true;
     }
@@ -1905,7 +1911,7 @@ mod tests {
         assert!(output.text.contains("selected child"));
         assert!(!output.text.contains("hidden parent"));
         assert!(output.text.contains(&format!(
-            "[{selected:x}] > [{parent:x}]* (child-before-parent)"
+            "[{selected:x}] selected child > [{parent:x}]* (child-before-parent)"
         )));
         assert_eq!(store.requested, vec![title.transmute()]);
     }
@@ -2747,10 +2753,10 @@ mod tests {
         assert!(priorities.text.contains(&format!("[{b:x}] beta")));
         assert!(priorities
             .text
-            .contains(&format!("[{a:x}] > [{b:x}] (explicit)")));
+            .contains(&format!("[{a:x}] alpha > [{b:x}] beta (explicit)")));
         assert!(priorities
             .text
-            .contains(&format!("[{b:x}] > [{a:x}] (explicit)")));
+            .contains(&format!("[{b:x}] beta > [{a:x}] alpha (explicit)")));
     }
 
     #[test]
