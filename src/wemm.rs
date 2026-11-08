@@ -289,6 +289,15 @@ impl DeriveMapping for Progress {
         source: &Blob<SimpleArchive>,
         reader: &R,
     ) -> Result<Blob<Self::Target>, CollectionOperationError> {
+        // A foundation is one source commit, not one entry: a bulk commit
+        // can hold the whole history and take hours, so name it first.
+        let (started, backlog) = PROGRESS.with(Cell::get);
+        eprintln!(
+            "wemm: deriving {}/{backlog}: {} ({} bytes)",
+            started + 1,
+            hex::encode(source.get_handle().raw),
+            source.bytes.len()
+        );
         let started = std::time::Instant::now();
         let image = self.0.map(source, reader)?;
         let (done, backlog) = PROGRESS.with(|progress| {
