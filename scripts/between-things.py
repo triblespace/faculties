@@ -99,6 +99,9 @@ if not refresh:
     if c is None or now >= c["until"] + cache_secs:
         report("error", "%s for %s (refresh requested)" %
                (problem if c is None else "cached result expired", persona))
+    # Orient compares diagnostic text: age alone must not renew an error.
+    if c["result"] == "error":
+        report("error", c["why"])
     report(c["result"], "%s (checked %ds ago)" % (c["why"], now - c["at"]))
 
 def run(*argv):

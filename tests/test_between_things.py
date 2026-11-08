@@ -83,6 +83,19 @@ class PredicateTests(unittest.TestCase):
         self.assertEqual(self.stored()["result"], "error")
         self.assertIn("PILE required", self.invoke(False)[2])
 
+    def test_cached_error_diagnostic_stays_identical_as_clock_advances(self):
+        self.failure = RuntimeError("status unavailable")
+        self.assertEqual(self.invoke()[0], 2)
+        checked = self.stored()["at"]
+        with patch("time.time", return_value=checked + 1):
+            first = self.invoke(False)
+        with patch("time.time", return_value=checked + 61):
+            second = self.invoke(False)
+        self.assertEqual((first[0], second[0]), (2, 2))
+        self.assertEqual(first[2], second[2])
+        self.assertEqual(first[2].strip(), self.stored()["why"])
+        self.assertEqual((first[3], second[3]), (0, 0))
+
     def test_call_timeout_is_cached_error(self):
         self.failure = subprocess.TimeoutExpired(["status", "show"], 120)
         self.assertEqual(self.invoke()[0], 2)
