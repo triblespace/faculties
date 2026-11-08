@@ -262,6 +262,74 @@ impl Memory {
             Ok(())
         })
     }
+    /// EXPERIMENTAL: replay the greedy walk beside the quantized-anchor walk.
+    pub fn churn_anchor(
+        &self,
+        options: &ChurnOptions,
+        cs: &[u32],
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        if options.step_units <= 0 {
+            bail!("churn step_units must be positive");
+        }
+        if cs.iter().any(|&c| c > 60) {
+            bail!("--c must be at most 60");
+        }
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for line in crate::memory_cover::sealed::replay_anchored(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                options.budget_chars,
+                options.steps,
+                options.step_units,
+                cs,
+            )? {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
+    /// EXPERIMENTAL: replay the greedy walk beside the tiled selector, one
+    /// configuration per gradient anchor (`moment` = 3 s, `unit` = 2^14 s).
+    pub fn churn_tiled(
+        &self,
+        options: &ChurnOptions,
+        anchors: &[String],
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        if options.step_units <= 0 {
+            bail!("churn step_units must be positive");
+        }
+        let anchors = anchors
+            .iter()
+            .map(|a| match a.as_str() {
+                "moment" => Ok((
+                    "moment (3 s)".to_owned(),
+                    (crate::memory::MOMENT_SECONDS * 1e9) as i128,
+                )),
+                "unit" => Ok((
+                    "unit (2^14 s)".to_owned(),
+                    crate::memory_cover::REPLAY_QUANTUM_NS,
+                )),
+                other => Err(anyhow!("unknown anchor {other}; use moment or unit")),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for line in crate::memory_cover::sealed::replay_tiled(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                options.budget_chars,
+                options.steps,
+                options.step_units,
+                &anchors,
+            )? {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
     pub fn respan_instants(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| respan_instants(storage, dry_run, out))
     }

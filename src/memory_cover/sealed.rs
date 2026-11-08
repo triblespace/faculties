@@ -547,6 +547,845 @@ pub fn replay_compare<B: BlobStoreGet, P: TriblePattern>(
     Ok(lines)
 }
 
+// ---------------------------------------------------------------------------
+// quantized anchor: today's sampler with LIFE and "now" stepped on a grid
+// ---------------------------------------------------------------------------
+
+/// Today's walk with its time map computed from a quantized anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnchoredCut {
+    pub cover: Vec<usize>,
+    /// Leading entries chosen against the quantized (anchored) targets.
+    pub anchored: usize,
+    pub anchored_used: usize,
+    pub used: usize,
+    /// The anchor: quantized LIFE and the snapped "now" (absolute key).
+    pub life_q: i128,
+    pub now_q: i128,
+    pub grid: i128,
+}
+
+/// The walk in use, but its targets `T(s)` come from a QUANTIZED anchor:
+/// `LIFE_q` is the true life rounded UP to `2^k` units of 2^14 s (it steps
+/// only when the life doubles), the grid is `G = max(unit, LIFE_q / 2^c)`, and
+/// the virtual now is `N_q + G` with `N_q = floor(L / G) * G`, the grid
+/// boundary at or before the newest memory end. Positions whose target lies
+/// before `N_q` (cursor up to where the anchored age equals `G`) are filled by
+/// the unchanged greedy walk against those fixed targets, over every memory.
+/// The young region `(N_q, L]` then gets the remaining budget, again with
+/// today's walk and a gradient that tracks the true now. Pure in the pile and
+/// budget, with `c` a declared constant; there is no candidate freeze, so a
+/// memory written later about an old stretch is eligible immediately.
+pub fn select_anchored_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    budget: usize,
+    c: u32,
+) -> AnchoredCut {
+    assert_eq!(spans.len(), costs.len());
+    let mut out = AnchoredCut {
+        cover: Vec::new(),
+        anchored: 0,
+        anchored_used: 0,
+        used: 0,
+        life_q: 0,
+        now_q: 0,
+        grid: 0,
+    };
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) else {
+        return out;
+    };
+    if budget == 0 {
+        return out;
+    }
+    let unit = SEAL_UNIT_NS;
+    let life = latest.saturating_sub(earliest).max(1);
+    let mut life_q = unit;
+    while life_q < life {
+        life_q *= 2;
+    }
+    let grid = (life_q >> c).max(unit);
+    let now_q = latest.div_euclid(grid) * grid;
+    out.life_q = life_q;
+    out.now_q = now_q;
+    out.grid = grid;
+    let mut selected = vec![false; spans.len()];
+    let candidate = vec![true; spans.len()];
+    let gradient = DensityGradient::new(life_q, budget);
+    let origin = now_q + grid - life_q;
+    let behind = (grid as f64 / MOMENT_NS as f64).ln_1p() / gradient.rate;
+    let cap = (budget as f64 - behind).floor().max(0.0) as usize;
+    let (head, head_used) = walk(
+        spans,
+        costs,
+        &candidate,
+        &mut selected,
+        origin,
+        &gradient,
+        cap,
+    );
+    out.anchored = head.len();
+    out.anchored_used = head_used;
+    out.cover = head;
+    let rest = budget - head_used;
+    let young = DensityGradient::new(latest - now_q, rest);
+    let (tail, tail_used) = walk(spans, costs, &candidate, &mut selected, now_q, &young, rest);
+    out.cover.extend(tail);
+    out.used = head_used + tail_used;
+    out
+}
+
+/// Replay the walk in use beside the quantized-anchor walk for each `c`.
+pub fn replay_anchored<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    budget: usize,
+    steps: usize,
+    step_units: i128,
+    cs: &[u32],
+) -> Result<Vec<String>> {
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed_at, unobserved) = recollection_class_observations(space, &raw_spans, &classes);
+    let mut lines = Vec::new();
+    let Some(latest_observation) = observed_at.iter().copied().max() else {
+        lines.push("no memory chunks".into());
+        return Ok(lines);
+    };
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+            false,
+        )?);
+    }
+    let step_ns = step_units.max(1) * REPLAY_QUANTUM_NS;
+    let pct = |x: usize| 100.0 * x as f64 / budget.max(1) as f64;
+    struct Step {
+        point: i128,
+        base: Vec<usize>,
+        base_used: usize,
+        base_silent: bool,
+        cuts: Vec<AnchoredCut>,
+        silent: Vec<bool>,
+    }
+    let mut out_steps = Vec::new();
+    for k in (0..=steps).rev() {
+        let point = latest_observation - (k as i128) * step_ns;
+        let map: Vec<usize> = (0..spans.len())
+            .filter(|&i| observed_at[i] <= point)
+            .collect();
+        if map.is_empty() {
+            continue;
+        }
+        let sub: Vec<_> = map.iter().map(|&i| spans[i]).collect();
+        let sub_costs: Vec<_> = map.iter().map(|&i| costs[i]).collect();
+        let base = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget);
+        let base_silent = !silent_life_quarters(&sub, &base.cover).is_empty();
+        let mut cuts = Vec::new();
+        let mut silent = Vec::new();
+        for &c in cs {
+            let mut cut = select_anchored_recollection_cut(&sub, &sub_costs, budget, c);
+            silent.push(!silent_life_quarters(&sub, &cut.cover).is_empty());
+            for x in cut.cover.iter_mut() {
+                *x = map[*x];
+            }
+            cuts.push(cut);
+        }
+        out_steps.push(Step {
+            point,
+            base: base.cover.iter().map(|&j| map[j]).collect(),
+            base_used: base.used,
+            base_silent,
+            cuts,
+            silent,
+        });
+    }
+    lines.push(format!(
+        "frame: budget {budget} CHARACTERS; {} replay points ({} transitions) of {step_units} x 2^14 s, observation (created_at) {} to {}; \
+         {} exact-span classes ({} with range-end fallback); all figures are rendered cover characters compared as entry sequences",
+        out_steps.len(),
+        out_steps.len().saturating_sub(1),
+        fmt_key(out_steps.first().map_or(latest_observation, |s| s.point)),
+        fmt_key(latest_observation),
+        spans.len(),
+        unobserved,
+    ));
+    let changed: Vec<usize> = (1..out_steps.len())
+        .filter(|&k| out_steps[k].base != out_steps[k - 1].base)
+        .collect();
+    let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    let base_used: Vec<usize> = changed.iter().map(|&k| out_steps[k].base_used).collect();
+    let base_lcp: Vec<usize> = changed
+        .iter()
+        .map(|&k| lcp_chars(&out_steps[k].base, &out_steps[k - 1].base, &costs))
+        .collect();
+    let base_full = (1..out_steps.len())
+        .filter(|&k| !out_steps[k].base.starts_with(&out_steps[k - 1].base))
+        .count();
+    let mut summary = vec![format!(
+        "walk in use: {} of {} transitions changed; full rereads with today's whole-cover saved prefix {}; on changed transitions mean cover {:.0}k, \
+         mean common entry prefix {:.0}k (reread from first change mean {:.0}k); mean fill {:.1}%; {} step(s) silent > LIFE/4",
+        changed.len(),
+        out_steps.len().saturating_sub(1),
+        base_full,
+        mean(&base_used) / 1e3,
+        mean(&base_lcp) / 1e3,
+        (mean(&base_used) - mean(&base_lcp)) / 1e3,
+        out_steps.iter().map(|s| pct(s.base_used)).sum::<f64>() / out_steps.len().max(1) as f64,
+        out_steps.iter().filter(|s| s.base_silent).count(),
+    )];
+    for (ci, &c) in cs.iter().enumerate() {
+        lines.push(String::new());
+        lines.push(format!(
+            "== quantized anchor, c = {c} (grid G = LIFE_q / 2^{c}, at least 2^14 s); head = entries against anchored targets; \
+             keep-head = chars reused with ONE prefix saved at the head's end; lcp = common entry prefix chars"
+        ));
+        lines.push(format!(
+            "{:<20} {:>7} {:>9} {:<20} {:>8} {:>8} {:>6} {:>8} {:>8}  note",
+            "observed", "G(d)", "LIFE_q(d)", "now_q", "head", "used", "fill%", "keep-hd", "lcp"
+        ));
+        let mut steps_anchor = 0usize;
+        let mut steps_life = 0usize;
+        let mut head_full = 0usize;
+        let mut whole_full = 0usize;
+        let mut head_changed_same_anchor = 0usize;
+        let (mut keep_v, mut lcp_v, mut used_v, mut head_v) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (k, s) in out_steps.iter().enumerate() {
+            let cut = &s.cuts[ci];
+            let mut note = String::new();
+            let (mut keep, mut lcp) = (0, 0);
+            if k > 0 {
+                let prev = &out_steps[k - 1].cuts[ci];
+                let prev_head = &prev.cover[..prev.anchored];
+                let head = &cut.cover[..cut.anchored];
+                if (prev.life_q, prev.now_q) != (cut.life_q, cut.now_q) {
+                    steps_anchor += 1;
+                    note.push_str("anchor-step ");
+                    if prev.life_q != cut.life_q {
+                        steps_life += 1;
+                        note.push_str("(LIFE_q doubled) ");
+                    }
+                }
+                if cut.cover.starts_with(prev_head) {
+                    keep = prev.anchored_used;
+                } else {
+                    head_full += 1;
+                    if (prev.life_q, prev.now_q) == (cut.life_q, cut.now_q) {
+                        head_changed_same_anchor += 1;
+                        note.push_str("HEAD CHANGED under the same anchor ");
+                    }
+                }
+                if !cut.cover.starts_with(&prev.cover) {
+                    whole_full += 1;
+                }
+                let _ = head;
+                lcp = lcp_chars(&cut.cover, &prev.cover, &costs);
+                if changed.contains(&k) {
+                    keep_v.push(keep);
+                    lcp_v.push(lcp);
+                    used_v.push(cut.used);
+                    head_v.push(cut.anchored_used);
+                }
+            }
+            if s.silent[ci] {
+                note.push_str("SILENT>LIFE/4");
+            }
+            lines.push(format!(
+                "{:<20} {:>7.2} {:>9.1} {:<20} {:>8} {:>8} {:>5.1}% {:>8} {:>8}  {note}",
+                fmt_key(s.point),
+                cut.grid as f64 / 86_400e9,
+                cut.life_q as f64 / 86_400e9,
+                fmt_key(cut.now_q),
+                cut.anchored_used,
+                cut.used,
+                pct(cut.used),
+                keep,
+                lcp,
+            ));
+        }
+        let fills: Vec<f64> = out_steps.iter().map(|s| pct(s.cuts[ci].used)).collect();
+        let total = |v: &[usize]| v.iter().sum::<usize>();
+        summary.push(format!(
+            "anchor c={c}: anchor stepped on {steps_anchor} of {} transitions ({steps_life} of them LIFE_q doubling); mean fill {:.1}% (min {:.1}%); \
+             {} step(s) silent > LIFE/4; full rereads with a whole-cover saved prefix {whole_full}, with a prefix saved at the head's end {head_full} \
+             (of which {head_changed_same_anchor} with the anchor unchanged); on the {} changed transitions: mean head {:.0}k chars, \
+             mean reused at the head's end {:.0}k (reread {:.1}M total), mean common entry prefix {:.0}k (reread from first change mean {:.0}k, {:.1}M total); \
+             walk in use: common-prefix reread {:.1}M total",
+            out_steps.len().saturating_sub(1),
+            fills.iter().sum::<f64>() / fills.len().max(1) as f64,
+            fills.iter().copied().fold(f64::INFINITY, f64::min),
+            out_steps.iter().filter(|s| s.silent[ci]).count(),
+            used_v.len(),
+            mean(&head_v) / 1e3,
+            mean(&keep_v) / 1e3,
+            (total(&used_v) - total(&keep_v)) as f64 / 1e6,
+            mean(&lcp_v) / 1e3,
+            (mean(&used_v) - mean(&lcp_v)) / 1e3,
+            (total(&used_v) - total(&lcp_v)) as f64 / 1e6,
+            (total(&base_used) - total(&base_lcp)) as f64 / 1e6,
+        ));
+    }
+    lines.push(String::new());
+    lines.push("== summary".into());
+    lines.extend(summary);
+    Ok(lines)
+}
+
+// ---------------------------------------------------------------------------
+// tiled recollection: the old LSM's base-4 tile counter, the greedy walk in each tile
+// ---------------------------------------------------------------------------
+
+/// One level of a [`TiledCut`]: its complete tiles, rendered in order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileLevel {
+    /// Tiles at this level are `4^level` units of 2^14 s wide.
+    pub level: u32,
+    /// Complete tiles at this level (the base-4 digit, 1..=3).
+    pub tiles: usize,
+    /// The level's span `[lower, upper)` (absolute TAI keys).
+    pub lower: i128,
+    pub upper: i128,
+    /// Characters the level was allowed (its share plus what older levels
+    /// left unspent).
+    pub allowance: usize,
+    /// Entries `cover[start..start + len]` belong to this level.
+    pub start: usize,
+    pub len: usize,
+    pub used: usize,
+}
+
+/// A recollection rendered as base-4 tile levels, coarsest first, then the
+/// open unit and its fallback walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TiledCut {
+    pub cover: Vec<usize>,
+    pub levels: Vec<TileLevel>,
+    /// The highest level the counter uses for this life.
+    pub top: u32,
+    /// Characters left to the open walk (residual share plus unspent).
+    pub open_space: usize,
+    pub used: usize,
+}
+
+impl TiledCut {
+    pub fn level_entries(&self, level: u32) -> &[usize] {
+        self.levels
+            .iter()
+            .find(|l| l.level == level)
+            .map_or(&[][..], |l| &self.cover[l.start..l.start + l.len])
+    }
+}
+
+/// The tiled selector.
+///
+/// The tiling is the old tiled cover's (wiki "The memory cover", 2026-09-05):
+/// an absolute grid of 2^14 s units, tiles quadrupling backwards, and at most
+/// three complete tiles per level before the current block of the next level.
+/// It is the base-4 counter of `n`, the unit holding the newest memory end:
+/// level `l` spans `[floor(n/4^(l+1))*4^(l+1), floor(n/4^l)*4^l)` units, so its
+/// tile count is the base-4 digit `l` of `n`. A level changes only when its own
+/// digit changes (a tile appended, every `4^l` units) or a deeper level carries
+/// (four tiles merging into one of the next level).
+///
+/// Where the old design gave every tile one grain from a globally fitted
+/// detail `m`, which could step and re-render the whole cover, each level here
+/// gets a fixed share of the budget from the log-age gradient over the
+/// counter's own bands, `ln((A + 4^(l+1)u)/(A + 4^l u)) / ln((A + 4^(top+1)u)/A)`
+/// with anchor `A` (the 3 s journal moment, or one unit). The share depends on
+/// the level and the counter's height only. A level's allowance (share plus
+/// what older levels left unspent) is split evenly among its tiles, oldest
+/// first, unspent passing to the next tile. Inside each tile today's greedy
+/// walk runs over the tile's own span, frozen at the tile's strike: only
+/// memories that START in the tile and were observed by the first observation
+/// at which the journal's running maximum end reached the tile's end. What all
+/// levels leave unspent, plus the residual share of the open unit, goes to
+/// today's walk over the open unit `[n*u, L]`, which may fall back on any
+/// memory not yet taken.
+///
+/// Pure in the spans, their first observation times, the budget and the
+/// declared anchor. No previous cover, no wall clock, no completeness floor:
+/// a tile with too little support simply passes its allowance on. `late` =
+/// `(level, shift)` moves one level's observation cutoffs earlier, for the
+/// late-arrival probe; the real selector passes `None`.
+pub fn select_tiled_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    observed: &[i128],
+    budget: usize,
+    anchor_ns: i128,
+    late: Option<(u32, i128)>,
+) -> TiledCut {
+    assert_eq!(spans.len(), costs.len());
+    assert_eq!(spans.len(), observed.len());
+    let mut out = TiledCut {
+        cover: Vec::new(),
+        levels: Vec::new(),
+        top: 0,
+        open_space: 0,
+        used: 0,
+    };
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) else {
+        return out;
+    };
+    if budget == 0 {
+        return out;
+    }
+    let unit = SEAL_UNIT_NS;
+    let n = latest.div_euclid(unit);
+    let first = earliest.div_euclid(unit);
+    let block = |l: u32| -> i128 {
+        let w = 4i128.pow(l);
+        n.div_euclid(w) * w
+    };
+    let mut top = 0u32;
+    while block(top + 1) > first {
+        top += 1;
+    }
+    out.top = top;
+    let a = anchor_ns.max(1) as f64;
+    let u = unit as f64;
+    let norm = ((a + 4f64.powi(top as i32 + 1) * u) / a).ln();
+    let share = |l: u32| -> usize {
+        let hi = a + 4f64.powi(l as i32 + 1) * u;
+        let lo = a + 4f64.powi(l as i32) * u;
+        ((hi / lo).ln() / norm * budget as f64).floor() as usize
+    };
+
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by(|&x, &y| {
+        observed[x]
+            .cmp(&observed[y])
+            .then(spans[x].2.cmp(&spans[y].2))
+    });
+    // Running lived edge in observation order, for each tile's strike.
+    let mut edges: Vec<(i128, i128)> = Vec::with_capacity(order.len());
+    let mut edge = i128::MIN;
+    for &i in &order {
+        edge = edge.max(spans[i].1);
+        edges.push((edge, observed[i]));
+    }
+    let strike = |end: i128| -> i128 {
+        let k = edges.partition_point(|&(e, _)| e < end);
+        edges.get(k).map_or(i128::MAX, |&(_, o)| o)
+    };
+
+    let mut selected = vec![false; spans.len()];
+    let mut carry = 0usize;
+    for l in (0..=top).rev() {
+        let width = 4i128.pow(l);
+        let (lo, hi) = (block(l + 1), block(l));
+        let tiles = ((hi - lo) / width) as usize;
+        let allowance = share(l).saturating_add(carry).min(budget - out.used);
+        if tiles == 0 {
+            carry = allowance;
+            continue;
+        }
+        let shift = match late {
+            Some((level, shift)) if level == l => shift,
+            _ => 0,
+        };
+        let start = out.cover.len();
+        let mut spent = 0usize;
+        for t in 0..tiles {
+            let ta = (lo + t as i128 * width) * unit;
+            let tb = ta + width * unit;
+            let left = allowance - spent;
+            let tile_space = left / (tiles - t);
+            if tile_space == 0 {
+                continue;
+            }
+            let cutoff = strike(tb).saturating_sub(shift);
+            let candidate: Vec<bool> = spans
+                .iter()
+                .zip(observed)
+                .map(|(s, &o)| s.0 >= ta && s.0 < tb && o <= cutoff)
+                .collect();
+            let gradient = DensityGradient::new(tb - ta, tile_space);
+            let (cover, used) = walk(
+                spans,
+                costs,
+                &candidate,
+                &mut selected,
+                ta,
+                &gradient,
+                tile_space,
+            );
+            out.cover.extend(cover);
+            spent += used;
+        }
+        out.levels.push(TileLevel {
+            level: l,
+            tiles,
+            lower: lo * unit,
+            upper: hi * unit,
+            allowance,
+            start,
+            len: out.cover.len() - start,
+            used: spent,
+        });
+        out.used += spent;
+        carry = allowance - spent;
+    }
+    let rest = budget - out.used;
+    out.open_space = rest;
+    let origin = n * unit;
+    let gradient = DensityGradient::new(latest - origin, rest);
+    let candidate = vec![true; spans.len()];
+    let (open, used) = walk(
+        spans,
+        costs,
+        &candidate,
+        &mut selected,
+        origin,
+        &gradient,
+        rest,
+    );
+    out.cover.extend(open);
+    out.used += used;
+    out
+}
+
+/// Replay the walk in use beside the tiled selector, one configuration per
+/// anchor.
+pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    budget: usize,
+    steps: usize,
+    step_units: i128,
+    anchors: &[(String, i128)],
+) -> Result<Vec<String>> {
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed_at, unobserved) = recollection_class_observations(space, &raw_spans, &classes);
+    let mut lines = Vec::new();
+    let Some(latest_observation) = observed_at.iter().copied().max() else {
+        lines.push("no memory chunks".into());
+        return Ok(lines);
+    };
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+            false,
+        )?);
+    }
+    let step_ns = step_units.max(1) * REPLAY_QUANTUM_NS;
+    let pct = |x: usize| 100.0 * x as f64 / budget.max(1) as f64;
+    const LAGS_H: [i128; 3] = [1, 6, 24];
+    const MAX_LEVEL: usize = 16;
+
+    struct Step {
+        point: i128,
+        base: Vec<usize>,
+        base_used: usize,
+        cuts: Vec<TiledCut>,
+        silent: Vec<bool>,
+    }
+    // probes[config][level] = (distinct level states probed, changes per lag)
+    let mut probes = vec![vec![(0usize, [0usize; 3]); MAX_LEVEL]; anchors.len()];
+    let mut seen: Vec<Vec<Vec<(i128, i128, usize, u32)>>> =
+        vec![vec![Vec::new(); MAX_LEVEL]; anchors.len()];
+    let mut base_silent = 0usize;
+    let mut out_steps: Vec<Step> = Vec::new();
+    for k in (0..=steps).rev() {
+        let point = latest_observation - (k as i128) * step_ns;
+        let map: Vec<usize> = (0..spans.len())
+            .filter(|&i| observed_at[i] <= point)
+            .collect();
+        if map.is_empty() {
+            continue;
+        }
+        let sub: Vec<_> = map.iter().map(|&i| spans[i]).collect();
+        let sub_costs: Vec<_> = map.iter().map(|&i| costs[i]).collect();
+        let sub_obs: Vec<_> = map.iter().map(|&i| observed_at[i]).collect();
+        let base = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget);
+        if !silent_life_quarters(&sub, &base.cover).is_empty() {
+            base_silent += 1;
+        }
+        let mut cuts = Vec::new();
+        let mut silent = Vec::new();
+        for (c, (_, anchor)) in anchors.iter().enumerate() {
+            let mut cut =
+                select_tiled_recollection_cut(&sub, &sub_costs, &sub_obs, budget, *anchor, None);
+            silent.push(!silent_life_quarters(&sub, &cut.cover).is_empty());
+            for lv in &cut.levels {
+                let li = lv.level as usize;
+                if li >= MAX_LEVEL {
+                    continue;
+                }
+                let key = (lv.lower, lv.upper, lv.allowance, cut.top);
+                if seen[c][li].contains(&key) {
+                    continue;
+                }
+                seen[c][li].push(key);
+                probes[c][li].0 += 1;
+                for (j, lag_h) in LAGS_H.iter().enumerate() {
+                    let lag = lag_h * 3600 * 1_000_000_000;
+                    let late = select_tiled_recollection_cut(
+                        &sub,
+                        &sub_costs,
+                        &sub_obs,
+                        budget,
+                        *anchor,
+                        Some((lv.level, lag)),
+                    );
+                    if late.level_entries(lv.level) != cut.level_entries(lv.level) {
+                        probes[c][li].1[j] += 1;
+                    }
+                }
+            }
+            for x in cut.cover.iter_mut() {
+                *x = map[*x];
+            }
+            cuts.push(cut);
+        }
+        out_steps.push(Step {
+            point,
+            base: base.cover.iter().map(|&j| map[j]).collect(),
+            base_used: base.used,
+            cuts,
+            silent,
+        });
+    }
+
+    lines.push(format!(
+        "frame: budget {budget} CHARACTERS; {} replay points ({} transitions) of {step_units} x 2^14 s, observation (created_at) {} to {}; \
+         {} exact-span classes ({} with range-end fallback for missing created_at); all figures are rendered cover characters, \
+         compared as entry sequences; no tokens, no beliefs/goals/live turns",
+        out_steps.len(),
+        out_steps.len().saturating_sub(1),
+        fmt_key(out_steps.first().map_or(latest_observation, |s| s.point)),
+        fmt_key(latest_observation),
+        spans.len(),
+        unobserved,
+    ));
+    let changed: Vec<usize> = (1..out_steps.len())
+        .filter(|&k| out_steps[k].base != out_steps[k - 1].base)
+        .collect();
+    let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    let base_used: Vec<usize> = changed.iter().map(|&k| out_steps[k].base_used).collect();
+    let base_lcp: Vec<usize> = changed
+        .iter()
+        .map(|&k| lcp_chars(&out_steps[k].base, &out_steps[k - 1].base, &costs))
+        .collect();
+    let mut summary = vec![format!(
+        "walk in use: {} of {} transitions changed the cover; on those, mean cover {:.0}k chars, reused with today's single saved prefix 0, \
+         mean common entry prefix {:.0}k chars; mean fill {:.1}%; {} step(s) silent > LIFE/4",
+        changed.len(),
+        out_steps.len().saturating_sub(1),
+        mean(&base_used) / 1e3,
+        mean(&base_lcp) / 1e3,
+        out_steps.iter().map(|s| pct(s.base_used)).sum::<f64>() / out_steps.len().max(1) as f64,
+        base_silent,
+    )];
+
+    for (c, (name, _)) in anchors.iter().enumerate() {
+        lines.push(String::new());
+        lines.push(format!(
+            "== tiled, anchor {name}: levels coarsest first as level:tiles:used (* = changed since the previous step); \
+             resume = chars reused if the backend could resume at the deepest unchanged level boundary; \
+             at-j = chars reused with ONE prefix saved at the young end of level j"
+        ));
+        lines.push(format!(
+            "{:<20} {:>8} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}  levels | open",
+            "observed", "used", "fill%", "open", "resume", "at-1", "at-2", "at-3", "lcp"
+        ));
+        let mut fills = Vec::new();
+        let mut silent_steps = 0usize;
+        let mut resume_v = Vec::new();
+        let mut at_v: Vec<Vec<usize>> = vec![Vec::new(); MAX_LEVEL];
+        let mut lcp_v = Vec::new();
+        let mut used_v = Vec::new();
+        let mut open_v = Vec::new();
+        let mut lvl_used: Vec<Vec<usize>> = vec![Vec::new(); MAX_LEVEL];
+        let mut lvl_changed = vec![0usize; MAX_LEVEL];
+        let mut lvl_own = vec![0usize; MAX_LEVEL];
+        let mut max_top = 0u32;
+        for (k, s) in out_steps.iter().enumerate() {
+            let cut = &s.cuts[c];
+            max_top = max_top.max(cut.top);
+            fills.push(pct(cut.used));
+            if s.silent[c] {
+                silent_steps += 1;
+            }
+            let open_used = cut.used - cut.levels.iter().map(|l| l.used).sum::<usize>();
+            let mut cells = Vec::new();
+            let mut resume = 0usize;
+            let mut at = vec![0usize; MAX_LEVEL];
+            let mut lcp = 0usize;
+            if k > 0 {
+                let prev = &out_steps[k - 1].cuts[c];
+                let same_top = prev.top == cut.top;
+                let mut intact = same_top;
+                // Levels coarsest first; a level absent in both is unchanged.
+                let mut unchanged_through: Vec<(u32, bool, usize)> = Vec::new();
+                for l in (0..=cut.top).rev() {
+                    let cur = cut.levels.iter().find(|x| x.level == l);
+                    let old = prev.levels.iter().find(|x| x.level == l);
+                    let same = same_top
+                        && cut.level_entries(l) == prev.level_entries(l)
+                        && cur.map(|x| (x.lower, x.upper)) == old.map(|x| (x.lower, x.upper));
+                    let used = cur.map_or(0, |x| x.used);
+                    if same && intact {
+                        resume += used;
+                    } else {
+                        intact = false;
+                    }
+                    if !same {
+                        lvl_changed[l as usize] += 1;
+                        let deeper_same = unchanged_through.iter().all(|&(_, s, _)| s);
+                        if deeper_same {
+                            lvl_own[l as usize] += 1;
+                        }
+                    }
+                    unchanged_through.push((l, same, used));
+                    if let Some(x) = cur {
+                        cells.push(format!(
+                            "{}{}:{}:{}",
+                            if same { "" } else { "*" },
+                            l,
+                            x.tiles,
+                            x.used
+                        ));
+                    } else if !same {
+                        cells.push(format!("*{l}:0:0"));
+                    }
+                }
+                // ONE prefix saved at the young end of level j: reused when
+                // every level >= j is unchanged.
+                for j in 0..=cut.top as usize {
+                    let ok = unchanged_through
+                        .iter()
+                        .filter(|&&(l, _, _)| l as usize >= j)
+                        .all(|&(_, s, _)| s);
+                    if ok {
+                        at[j] = unchanged_through
+                            .iter()
+                            .filter(|&&(l, _, _)| l as usize >= j)
+                            .map(|&(_, _, u)| u)
+                            .sum();
+                    }
+                }
+                lcp = lcp_chars(&cut.cover, &prev.cover, &costs);
+                if changed.contains(&k) {
+                    resume_v.push(resume);
+                    for j in 0..MAX_LEVEL {
+                        at_v[j].push(at[j]);
+                    }
+                    lcp_v.push(lcp);
+                    used_v.push(cut.used);
+                    open_v.push(open_used);
+                }
+            } else {
+                for x in &cut.levels {
+                    cells.push(format!("{}:{}:{}", x.level, x.tiles, x.used));
+                }
+            }
+            for x in &cut.levels {
+                lvl_used[x.level as usize].push(x.used);
+            }
+            lines.push(format!(
+                "{:<20} {:>8} {:>5.1}% {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}  {} | {}{}",
+                fmt_key(s.point),
+                cut.used,
+                pct(cut.used),
+                open_used,
+                resume,
+                at[1],
+                at[2],
+                at[3],
+                lcp,
+                cells.join(" "),
+                open_used,
+                if s.silent[c] { "  SILENT>LIFE/4" } else { "" }
+            ));
+        }
+        let total = |v: &[usize]| v.iter().sum::<usize>();
+        let reread = |v: &[usize]| (total(&used_v) - total(v)) as f64 / 1e6;
+        let ats: Vec<String> = (0..=max_top as usize)
+            .map(|j| {
+                format!(
+                    "at-{j} {:.0}k (reread {:.1}M)",
+                    mean(&at_v[j]) / 1e3,
+                    reread(&at_v[j])
+                )
+            })
+            .collect();
+        let lvls: Vec<String> = (0..=max_top as usize)
+            .rev()
+            .map(|l| {
+                let p = &probes[c][l];
+                format!(
+                    "level {l} (tiles {}): mean {:.0}k chars over {} steps present; changed on {} transitions ({} with every coarser level unchanged); \
+                     late-arrival probe changes {}/{} level states at 1h, {}/{} at 6h, {}/{} at 24h",
+                    humanize_unit(l as u32),
+                    mean(&lvl_used[l]) / 1e3,
+                    lvl_used[l].len(),
+                    lvl_changed[l],
+                    lvl_own[l],
+                    p.1[0], p.0, p.1[1], p.0, p.1[2], p.0
+                )
+            })
+            .collect();
+        summary.push(format!(
+            "tiled, anchor {name}: mean fill {:.1}% (min {:.1}%), {silent_steps} step(s) silent > LIFE/4; on the {} changed transitions \
+             (mean cover {:.0}k chars, open walk mean {:.0}k): reused mean resume-at-deepest-unchanged {:.0}k (reread {:.1}M), {}, \
+             common entry prefix {:.0}k (reread {:.1}M); walk in use for comparison: single prefix reread {:.1}M, common-prefix reread {:.1}M\n    {}",
+            fills.iter().sum::<f64>() / fills.len().max(1) as f64,
+            fills.iter().copied().fold(f64::INFINITY, f64::min),
+            used_v.len(),
+            mean(&used_v) / 1e3,
+            mean(&open_v) / 1e3,
+            mean(&resume_v) / 1e3,
+            reread(&resume_v),
+            ats.join(", "),
+            mean(&lcp_v) / 1e3,
+            reread(&lcp_v),
+            total(&base_used) as f64 / 1e6,
+            (total(&base_used) - total(&base_lcp)) as f64 / 1e6,
+            lvls.join("\n    "),
+        ));
+    }
+    lines.push(String::new());
+    lines.push("== summary".into());
+    lines.extend(summary);
+    Ok(lines)
+}
+
+fn humanize_unit(level: u32) -> String {
+    let secs = 4f64.powi(level as i32) * (SEAL_UNIT_NS as f64 / 1e9);
+    if secs < 86_400.0 {
+        format!("{:.1} h", secs / 3600.0)
+    } else {
+        format!("{:.1} d", secs / 86_400.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +1470,95 @@ mod tests {
         assert_eq!(cut.boundary, None);
         let base = select_recollection_cut(spans, costs, &vec![true; spans.len()], 5_000);
         assert_eq!(cut.cover, base.cover);
+    }
+
+    #[test]
+    fn a_tile_level_changes_only_with_its_digit_or_a_coarser_change() {
+        let (spans, costs, observed) = journal(60);
+        let mut previous: Option<TiledCut> = None;
+        let mut deep_kept_while_young_moved = 0;
+        for hours in (40 * 24..60 * 24).step_by(3) {
+            let now = 1_000 * 24 * H + hours * H;
+            let vis: Vec<usize> = (0..spans.len()).filter(|&i| observed[i] <= now).collect();
+            let s: Vec<_> = vis.iter().map(|&i| spans[i]).collect();
+            let c: Vec<_> = vis.iter().map(|&i| costs[i]).collect();
+            let o: Vec<_> = vis.iter().map(|&i| observed[i]).collect();
+            let mut cut = select_tiled_recollection_cut(&s, &c, &o, 60_000, MOMENT_NS, None);
+            assert!(cut.used <= 60_000);
+            for x in cut.cover.iter_mut() {
+                *x = vis[*x];
+            }
+            if let Some(prev) = previous.take() {
+                if prev.top == cut.top {
+                    let mut coarser_same = true;
+                    for l in (0..=cut.top).rev() {
+                        let span = |t: &TiledCut| {
+                            t.levels
+                                .iter()
+                                .find(|x| x.level == l)
+                                .map(|x| (x.lower, x.upper))
+                        };
+                        let same = prev.level_entries(l) == cut.level_entries(l);
+                        if coarser_same && span(&prev) == span(&cut) {
+                            assert!(
+                                same,
+                                "level {l} changed without its digit or a coarser level changing"
+                            );
+                        }
+                        coarser_same &= same && span(&prev) == span(&cut);
+                    }
+                    if cut.top >= 2
+                        && prev.level_entries(cut.top) == cut.level_entries(cut.top)
+                        && prev.level_entries(0) != cut.level_entries(0)
+                    {
+                        deep_kept_while_young_moved += 1;
+                    }
+                }
+            }
+            previous = Some(cut);
+        }
+        assert!(deep_kept_while_young_moved > 0);
+    }
+
+    #[test]
+    fn tile_levels_are_the_base4_digits_of_the_newest_unit() {
+        let (spans, costs, observed) = journal(30);
+        let cut =
+            select_tiled_recollection_cut(&spans, &costs, &observed, 200_000, SEAL_UNIT_NS, None);
+        let n = spans
+            .iter()
+            .map(|s| s.1)
+            .max()
+            .unwrap()
+            .div_euclid(SEAL_UNIT_NS);
+        for lv in &cut.levels {
+            assert_eq!(lv.tiles as i128, n / 4i128.pow(lv.level) % 4);
+        }
+        assert!(cut.used <= 200_000);
+    }
+
+    #[test]
+    fn anchored_head_is_stable_while_the_anchor_holds() {
+        let (spans, costs, observed) = journal(60);
+        let mut previous: Option<AnchoredCut> = None;
+        let mut held = 0;
+        for hours in (40 * 24..60 * 24).step_by(5) {
+            let now = 1_000 * 24 * H + hours * H;
+            let vis: Vec<usize> = (0..spans.len()).filter(|&i| observed[i] <= now).collect();
+            let s: Vec<_> = vis.iter().map(|&i| spans[i]).collect();
+            let c: Vec<_> = vis.iter().map(|&i| costs[i]).collect();
+            let mut cut = select_anchored_recollection_cut(&s, &c, 20_000, 4);
+            assert!(cut.used <= 20_000);
+            for x in cut.cover.iter_mut() {
+                *x = vis[*x];
+            }
+            if let Some(prev) = previous.take() {
+                if (prev.life_q, prev.now_q) == (cut.life_q, cut.now_q) {
+                    held += 1;
+                }
+            }
+            previous = Some(cut);
+        }
+        assert!(held > 0);
     }
 }

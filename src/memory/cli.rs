@@ -153,6 +153,47 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             }
             memory.churn_sealed(&churn_options(&rest)?, &ratios, out)
         }
+        "churn-anchor" => {
+            // EXPERIMENTAL: `--c 7,9,11,13` are the grid exponents (G = LIFE_q / 2^c).
+            let mut rest = Vec::new();
+            let mut cs: Vec<u32> = vec![7, 9, 11, 13];
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--c" {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--c needs a value"))?;
+                    cs = v
+                        .split(',')
+                        .map(|r| r.trim().parse().context("--c expects numbers"))
+                        .collect::<Result<_>>()?;
+                    i += 2;
+                } else {
+                    rest.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            memory.churn_anchor(&churn_options(&rest)?, &cs, out)
+        }
+        "churn-tiled" => {
+            // EXPERIMENTAL: `--anchor moment,unit` names the gradient anchors to compare.
+            let mut rest = Vec::new();
+            let mut anchors = vec!["moment".to_owned(), "unit".to_owned()];
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--anchor" {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--anchor needs a value"))?;
+                    anchors = v.split(',').map(|a| a.trim().to_owned()).collect();
+                    i += 2;
+                } else {
+                    rest.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            memory.churn_tiled(&churn_options(&rest)?, &anchors, out)
+        }
         _ => memory.show_many(&cli.ids, out),
     }?;
     Ok(0)
