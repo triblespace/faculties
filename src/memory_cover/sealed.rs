@@ -908,9 +908,10 @@ impl TiledCut {
 /// the level and the counter's height only. A level's allowance (share plus
 /// what older levels left unspent) is split evenly among its tiles, oldest
 /// first, unspent passing to the next tile. Inside each tile today's greedy
-/// walk runs over the tile's own span, frozen at the tile's strike: only
+/// walk runs over the tile's own span, frozen at its level's strike: only
 /// memories that START in the tile and were observed by the first observation
-/// at which the journal's running maximum end reached the tile's end. What all
+/// at which the journal's running maximum end reached the level's newest tile
+/// end. What all
 /// levels leave unspent, plus the residual share of the open unit, goes to
 /// today's walk over the open unit `[n*u, L]`, which may fall back on any
 /// memory not yet taken.
@@ -1000,6 +1001,12 @@ pub fn select_tiled_recollection_cut(
             Some((level, shift)) if level == l => shift,
             _ => 0,
         };
+        // Every tile of a level shares the cutoff of the level's latest change
+        // (the strike of its newest tile end): the level re-renders whenever
+        // it gains a tile anyway, so this costs no stability, and a summary
+        // written later about an old stretch becomes visible at the next
+        // change of its level instead of never.
+        let cutoff = strike(hi * unit).saturating_sub(shift);
         let start = out.cover.len();
         let mut spent = 0usize;
         for t in 0..tiles {
@@ -1010,7 +1017,6 @@ pub fn select_tiled_recollection_cut(
             if tile_space == 0 {
                 continue;
             }
-            let cutoff = strike(tb).saturating_sub(shift);
             let candidate: Vec<bool> = spans
                 .iter()
                 .zip(observed)
