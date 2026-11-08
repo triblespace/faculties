@@ -126,9 +126,10 @@ enum Command {
     /// The memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
-    /// With `--sealed-head`, the cover is selected with the quantized-anchor
-    /// walk and the recalls of its sealed head (always the leading recalls)
-    /// also carry `"sealed": true`.
+    /// With `--sealed-head [tiled|anchored]`, the cover is selected with a
+    /// rule that has a stable sealed head (default: the base-4 tiled cover),
+    /// and the recalls of that head (always the leading recalls) also carry
+    /// `"sealed": true`.
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -154,12 +155,16 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// Select the memory cover with the quantized-anchor walk and mark the
-        /// recalls of its sealed head with `"sealed": true`, so a harness can
-        /// keep one saved prompt prefix at the head's end across wakes. The
-        /// head leads the recalls. Only with `--pairs`.
-        #[arg(long, requires = "pairs")]
-        sealed_head: bool,
+        /// Select the memory cover with a rule that has a stable SEALED HEAD
+        /// and mark the recalls of that head with `"sealed": true`, so a
+        /// harness can keep one saved prompt prefix at the head's end across
+        /// wakes. The head leads the recalls. `tiled` (the default when the
+        /// flag is given without a value): the base-4 tiled cover, head = tile
+        /// levels from 2 (3-day tiles) up. `anchored`: the c = 7
+        /// quantized-anchor walk. Only with `--pairs`.
+        #[arg(long, requires = "pairs", num_args = 0..=1, default_missing_value = "tiled",
+            value_parser = ["tiled", "anchored"])]
+        sealed_head: Option<String>,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
     /// goals. Never records presentation.
@@ -425,7 +430,10 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     chars,
                     chunk_overhead,
                     raw_memory,
-                    sealed_head,
+                    sealed_head: sealed_head.as_deref().map(|rule| match rule {
+                        "anchored" => crate::memory_cover::SealedHead::Anchored,
+                        _ => crate::memory_cover::SealedHead::Tiled,
+                    }),
                     doing_limit,
                     todo_limit,
                 },
@@ -782,6 +790,30 @@ mod tests {
             missing.kind(),
             clap::error::ErrorKind::MissingRequiredArgument
         );
+    }
+
+    #[test]
+    fn sealed_head_flag_requires_pairs_and_defaults_to_tiled() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["orient", "--pile", "unused.pile", "wake"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+        assert!(parse(&["--sealed-head"]).is_err());
+        assert!(parse(&["--pairs", "--sealed-head", "other"]).is_err());
+        for (args, expected) in [
+            (&["--pairs"][..], None),
+            (&["--pairs", "--sealed-head"][..], Some("tiled")),
+            (
+                &["--pairs", "--sealed-head", "anchored"][..],
+                Some("anchored"),
+            ),
+        ] {
+            let Some(Command::Wake { sealed_head, .. }) = parse(args).unwrap().command else {
+                panic!("wake")
+            };
+            assert_eq!(sealed_head.as_deref(), expected, "{args:?}");
+        }
     }
 
     #[test]

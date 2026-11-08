@@ -431,10 +431,21 @@ pub struct CoverOpts {
     pub tags: Vec<String>,
     /// `--without-tag <tag>` (repeatable): drop memories carrying any of these.
     pub without_tags: Vec<String>,
-    /// Select with the quantized-anchor walk ([`select_anchored_recollection_cut`],
-    /// `c = ANCHOR_GRID_BITS`) and mark its leading SEALED HEAD on each
-    /// [`CoverEntry::sealed`]. Off: the plain walk, and no entry is sealed.
-    pub sealed_head: bool,
+    /// Select with a rule that has a stable SEALED HEAD and mark the head on
+    /// each [`CoverEntry::sealed`]. `None`: the plain walk, and no entry is
+    /// sealed.
+    pub sealed_head: Option<SealedHead>,
+}
+
+/// A cover selection with a leading sealed head ([`CoverOpts::sealed_head`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealedHead {
+    /// [`select_tiled_recollection_cut`]: head = tile levels
+    /// `>= TILED_HEAD_LEVEL`. The chosen rule (report cc-cover-report-3).
+    Tiled,
+    /// [`select_anchored_recollection_cut`] at `c = ANCHOR_GRID_BITS`: head =
+    /// the entries walked against the quantized anchor.
+    Anchored,
 }
 
 impl CoverOpts {
@@ -450,7 +461,7 @@ impl CoverOpts {
             sim_threshold: DEFAULT_SIM_THRESHOLD,
             tags: Vec::new(),
             without_tags: Vec::new(),
-            sealed_head: false,
+            sealed_head: None,
         }
     }
 }
@@ -539,13 +550,13 @@ fn recollection_walk(
     eligible: &[bool],
     selected: &mut [bool],
     origin: i128,
-    gradient: &DensityGradient,
+    target: &dyn Fn(usize) -> f64,
     cap: usize,
     cover: &mut Vec<usize>,
 ) -> usize {
     let mut used = 0usize;
     while used < cap {
-        let ideal_start = gradient.sample(used).time_ns;
+        let ideal_start = target(used);
         let mut best: Option<(f64, Id, usize)> = None;
         for (i, &(start, end, id)) in spans.iter().enumerate() {
             let cost = costs[i];
@@ -555,7 +566,7 @@ fn recollection_walk(
             let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
             let actual_start = start.saturating_sub(origin) as f64;
             let actual_end = actual_start + width;
-            let ideal_end = gradient.sample(used.saturating_add(cost)).time_ns;
+            let ideal_end = target(used.saturating_add(cost));
             let start_error = actual_start - ideal_start;
             let end_error = actual_end - ideal_end;
             let score = start_error.mul_add(start_error, end_error * end_error);
@@ -633,7 +644,7 @@ pub fn select_recollection_cut(
         eligible,
         &mut selected,
         earliest,
-        &gradient,
+        &|cursor| gradient.sample(cursor).time_ns,
         budget,
         &mut cover,
     );
@@ -741,7 +752,7 @@ pub fn select_anchored_recollection_cut(
         eligible,
         &mut selected,
         now_q + grid - life_q,
-        &gradient,
+        &|cursor| gradient.sample(cursor).time_ns,
         cap,
         &mut cover,
     );
@@ -754,7 +765,7 @@ pub fn select_anchored_recollection_cut(
         eligible,
         &mut selected,
         now_q,
-        &young,
+        &|cursor| young.sample(cursor).time_ns,
         rest,
         &mut cover,
     );
@@ -763,6 +774,142 @@ pub fn select_anchored_recollection_cut(
         used: head_used + tail_used,
         head,
     }
+}
+
+/// The closed levels' declared share of a tiled cover's budget, equal per
+/// level (JP, 2026-11-08: "2/4 big picture history, 1/4 current context, 1/4
+/// now", with "now" the resident's live quarter after the cover, so 2/3 of the
+/// cover closed and 1/3 open).
+pub const TILED_CLOSED_FRACTION: f64 = 2.0 / 3.0;
+
+/// Levels at or above this form a tiled cover's SEALED HEAD: tiles of
+/// `4^2 x 2^14 s` (3.0 days) and coarser. Replayed over four months of the live
+/// journal (640 wakes, 800k characters; faculties cover-sealed-20261108
+/// 2005c569, report cc-cover-report-3 section 1), the end of level 2 was the
+/// best single save point in every configuration: 314k characters reused per
+/// changed wake for this rule, against 218k for the c = 7 anchored head.
+pub const TILED_HEAD_LEVEL: u32 = 2;
+
+/// The base-4 tile block of level `level` at or before unit `n`, in units:
+/// `floor(n / 4^level) * 4^level`.
+fn tile_block(n: i128, level: u32) -> i128 {
+    let width = 4i128.pow(level);
+    n.div_euclid(width) * width
+}
+
+/// The geometric base-4 TILED recollection (report cc-cover-report-3, primary:
+/// declared 2/3 closed ratio, arrival policy b, uniform in-tile targets).
+///
+/// The tiling is the old tiled cover's (wiki "The memory cover", 2026-09-05):
+/// an absolute grid of 2^14 s units, tiles quadrupling backwards, at most three
+/// complete tiles per level. It is the base-4 counter of `n`, the unit holding
+/// the newest memory end: level `l` spans units
+/// `[floor(n/4^(l+1))*4^(l+1), floor(n/4^l)*4^l)`, so its tile count is the
+/// base-4 digit `l` of `n`. Tiles only decide where the cover SAMPLES; no
+/// memory is written for a tile.
+///
+/// The closed levels `0..=top` together get [`TILED_CLOSED_FRACTION`] of the
+/// budget, equally per level. A level's allowance (its share plus what older
+/// levels left unspent) is split evenly over its tiles, oldest first, unspent
+/// passing on. Inside each tile today's greedy walk chooses among the eligible
+/// memories that START in the tile, against UNIFORM targets across it. Every
+/// memory is a candidate at once (arrival policy b), so a summary written
+/// late about an old tile changes that tile at the next render. What the
+/// closed levels leave, the open stretch's own third included, goes to
+/// today's walk over the open unit `[n*u, L]`, which may fall back on any
+/// eligible memory not yet taken.
+///
+/// Levels are emitted coarsest first, so levels `>= TILED_HEAD_LEVEL` lead the
+/// cover; `head` counts their entries. They change only when their own or a
+/// coarser base-4 digit of `n` changes, when the life gains a level, or when a
+/// memory starting inside one of their tiles arrives. Pure in the spans,
+/// costs, eligibility and budget; no previous cover, observation time or clock.
+pub fn select_tiled_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    budget: usize,
+) -> RecollectionCut {
+    assert_eq!(spans.len(), costs.len());
+    assert_eq!(spans.len(), eligible.len());
+    let mut out = RecollectionCut {
+        cover: Vec::new(),
+        used: 0,
+        head: 0,
+    };
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|span| span.0).min(),
+        spans.iter().map(|span| span.1).max(),
+    ) else {
+        return out;
+    };
+    if budget == 0 {
+        return out;
+    }
+    let unit = REPLAY_QUANTUM_NS;
+    let n = latest.div_euclid(unit);
+    let first = earliest.div_euclid(unit);
+    let mut top = 0u32;
+    while tile_block(n, top + 1) > first {
+        top += 1;
+    }
+    let share = (TILED_CLOSED_FRACTION * budget as f64 / (top as f64 + 1.0)).floor() as usize;
+    let mut selected = vec![false; spans.len()];
+    let mut carry = 0usize;
+    for level in (0..=top).rev() {
+        let width = 4i128.pow(level);
+        let (lo, hi) = (tile_block(n, level + 1), tile_block(n, level));
+        let tiles = ((hi - lo) / width) as usize;
+        let allowance = share.saturating_add(carry).min(budget - out.used);
+        if tiles == 0 {
+            carry = allowance;
+            continue;
+        }
+        let mut spent = 0usize;
+        for t in 0..tiles {
+            let ta = (lo + t as i128 * width) * unit;
+            let tb = ta + width * unit;
+            let tile_space = (allowance - spent) / (tiles - t);
+            if tile_space == 0 {
+                continue;
+            }
+            let candidate: Vec<bool> = spans
+                .iter()
+                .zip(eligible)
+                .map(|(span, &ok)| ok && span.0 >= ta && span.0 < tb)
+                .collect();
+            let life = (tb - ta) as f64;
+            spent += recollection_walk(
+                spans,
+                costs,
+                &candidate,
+                &mut selected,
+                ta,
+                &|cursor| life * cursor.min(tile_space) as f64 / tile_space as f64,
+                tile_space,
+                &mut out.cover,
+            );
+        }
+        out.used += spent;
+        carry = allowance - spent;
+        if level >= TILED_HEAD_LEVEL {
+            out.head = out.cover.len();
+        }
+    }
+    let rest = budget - out.used;
+    let origin = n * unit;
+    let open = DensityGradient::new(latest - origin, rest);
+    out.used += recollection_walk(
+        spans,
+        costs,
+        eligible,
+        &mut selected,
+        origin,
+        &|cursor| open.sample(cursor).time_ns,
+        rest,
+        &mut out.cover,
+    );
+    out
 }
 
 /// Gaps longer than one quarter of the currently available life which no
@@ -1374,16 +1521,18 @@ where
             .saturating_add(chunk_overhead),
         );
     }
-    let cut = if opts.sealed_head {
-        select_anchored_recollection_cut(
+    let cut = match opts.sealed_head {
+        None => select_recollection_cut(&spans, &costs, &class_eligible, budget_chars),
+        Some(SealedHead::Tiled) => {
+            select_tiled_recollection_cut(&spans, &costs, &class_eligible, budget_chars)
+        }
+        Some(SealedHead::Anchored) => select_anchored_recollection_cut(
             &spans,
             &costs,
             &class_eligible,
             budget_chars,
             ANCHOR_GRID_BITS,
-        )
-    } else {
-        select_recollection_cut(&spans, &costs, &class_eligible, budget_chars)
+        ),
     };
     let used = cut.used;
     let head = cut.head;
@@ -1417,10 +1566,14 @@ where
         if !without_tags.is_empty() {
             parts.push(format!("without tag {}", quoted(&without_tags, " or ")));
         }
-        if opts.sealed_head {
-            parts.push(format!(
+        match opts.sealed_head {
+            None => {}
+            Some(SealedHead::Tiled) => parts.push(format!(
+                "sealed head of {head} entries (base-4 tiles, levels >= {TILED_HEAD_LEVEL})"
+            )),
+            Some(SealedHead::Anchored) => parts.push(format!(
                 "sealed head of {head} entries (quantized anchor, c = {ANCHOR_GRID_BITS})"
-            ));
+            )),
         }
         format!("greedy SPACE order; {}", parts.join("; "))
     };
@@ -2347,35 +2500,37 @@ mod recall_lookup_tests {
         let mut options = CoverOpts::plain(4_000);
         let plain = render_cover_report(&facts, &reader, &options, &mut |_| Ok(None)).unwrap();
         assert!(plain.entries.iter().all(|entry| !entry.sealed));
-        options.sealed_head = true;
-        let sealed = render_cover_report(&facts, &reader, &options, &mut |_| Ok(None)).unwrap();
-        let head = sealed
-            .entries
-            .iter()
-            .take_while(|entry| entry.sealed)
-            .count();
-        assert!(
-            head > 0 && head < sealed.entries.len(),
-            "{head} of {}",
-            sealed.entries.len()
-        );
-        assert!(
-            sealed.entries[head..].iter().all(|entry| !entry.sealed),
-            "sealed entries lead the cover"
-        );
-        assert!(sealed
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("sealed head of")));
-        // Recall order is the emitted text order: every entry's body appears,
-        // in sequence.
-        let mut at = 0;
-        for entry in &sealed.entries {
-            let body = entry.body.as_deref().unwrap();
-            at += sealed.text[at..]
-                .find(body)
-                .expect("entry rendered in order")
-                + body.len();
+        for rule in [SealedHead::Tiled, SealedHead::Anchored] {
+            options.sealed_head = Some(rule);
+            let sealed = render_cover_report(&facts, &reader, &options, &mut |_| Ok(None)).unwrap();
+            let head = sealed
+                .entries
+                .iter()
+                .take_while(|entry| entry.sealed)
+                .count();
+            assert!(
+                head > 0 && head < sealed.entries.len(),
+                "{head} of {}",
+                sealed.entries.len()
+            );
+            assert!(
+                sealed.entries[head..].iter().all(|entry| !entry.sealed),
+                "sealed entries lead the cover"
+            );
+            assert!(sealed
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("sealed head of")));
+            // Recall order is the emitted text order: every entry's body appears,
+            // in sequence.
+            let mut at = 0;
+            for entry in &sealed.entries {
+                let body = entry.body.as_deref().unwrap();
+                at += sealed.text[at..]
+                    .find(body)
+                    .expect("entry rendered in order")
+                    + body.len();
+            }
         }
     }
 
@@ -2630,5 +2785,168 @@ mod anchored_head_tests {
         let after = cut(&changed);
         assert_eq!(anchor(&changed), anchor_before);
         assert_eq!(head(&changed, &after), head(&spans, &before));
+    }
+}
+
+#[cfg(test)]
+mod tiled_head_tests {
+    use super::*;
+
+    const H: i128 = 3600 * 1_000_000_000;
+    const DAY: i128 = 24 * H;
+    const BASE: i128 = 1_000 * DAY + 7 * H;
+    const BUDGET: usize = 20_000;
+
+    fn id(k: u128) -> Id {
+        Id::new(u128::to_be_bytes(0x7E000000000000000000000000000000 + k)).expect("nonzero")
+    }
+
+    /// Hourly memories over `[0, hours)` plus one arc per day for the first
+    /// `arc_days` days, all costing 200 characters, with positional ids.
+    fn journal(hours: i128, arc_days: i128) -> Vec<(i128, i128, Id)> {
+        let mut spans: Vec<_> = (0..hours)
+            .map(|h| (BASE + h * H, BASE + (h + 1) * H, id(h as u128 + 1)))
+            .collect();
+        for d in 0..arc_days {
+            spans.push((
+                BASE + d * DAY,
+                BASE + (d + 1) * DAY,
+                id(1_000_000 + d as u128),
+            ));
+        }
+        spans
+    }
+
+    fn cut(spans: &[(i128, i128, Id)]) -> RecollectionCut {
+        select_tiled_recollection_cut(
+            spans,
+            &vec![200; spans.len()],
+            &vec![true; spans.len()],
+            BUDGET,
+        )
+    }
+
+    /// What the head's targets depend on: the level-2 block of the newest unit
+    /// and the number of levels.
+    fn key(spans: &[(i128, i128, Id)]) -> (i128, u32) {
+        let unit = REPLAY_QUANTUM_NS;
+        let n = spans.iter().map(|s| s.1).max().unwrap().div_euclid(unit);
+        let first = spans.iter().map(|s| s.0).min().unwrap().div_euclid(unit);
+        let mut top = 0;
+        while tile_block(n, top + 1) > first {
+            top += 1;
+        }
+        (tile_block(n, TILED_HEAD_LEVEL), top)
+    }
+
+    fn head(spans: &[(i128, i128, Id)], cut: &RecollectionCut) -> Vec<Id> {
+        cut.cover[..cut.head].iter().map(|&i| spans[i].2).collect()
+    }
+
+    #[test]
+    fn the_head_is_the_levels_from_two_up_and_leads_the_cover() {
+        let spans = journal(60 * 24, 55);
+        let cut = cut(&spans);
+        let (block, _) = key(&spans);
+        assert!(cut.head > 0 && cut.head < cut.cover.len(), "{cut:?}");
+        assert!(cut.used <= BUDGET);
+        // Every head memory starts before the level-2 block ends; the closed
+        // levels below it start at or after it.
+        let edge = block * REPLAY_QUANTUM_NS;
+        assert!(cut.cover[..cut.head].iter().all(|&i| spans[i].0 < edge));
+        assert!(cut.cover[cut.head..].iter().any(|&i| spans[i].0 >= edge));
+    }
+
+    /// (1) Ordinary young appends: while the level-2 block and the level count
+    /// hold, the head is the same memories in the same order.
+    #[test]
+    fn append_only_keeps_the_head_while_its_blocks_hold() {
+        let mut previous: Option<((i128, u32), Vec<Id>)> = None;
+        let (mut held, mut stepped) = (0, 0);
+        for hours in 40 * 24..60 * 24 {
+            let spans = journal(hours, 35);
+            let now = (key(&spans), head(&spans, &cut(&spans)));
+            if let Some((was_key, was_head)) = previous.take() {
+                if was_key == now.0 {
+                    held += 1;
+                    assert_eq!(
+                        was_head, now.1,
+                        "head changed under unchanged blocks at hour {hours}"
+                    );
+                } else {
+                    stepped += 1;
+                }
+            }
+            previous = Some(now);
+        }
+        assert!(held > 200 && stepped > 0, "held {held}, stepped {stepped}");
+    }
+
+    /// (2) A summary written late about an old stretch counts at once (arrival
+    /// policy b): it changes the head once, after which the head holds.
+    #[test]
+    fn a_late_summary_inside_the_head_changes_it_once_then_holds() {
+        let mut hours = 50 * 24 + 5;
+        while key(&journal(hours, 35)) != key(&journal(hours + 5, 35)) {
+            hours += 1;
+        }
+        let spans = journal(hours, 35);
+        let before = cut(&spans);
+        let edge = key(&spans).0 * REPLAY_QUANTUM_NS;
+        let summary = before.cover[..before.head]
+            .iter()
+            .map(|&i| spans[i])
+            .flat_map(|s| {
+                (-12..12).flat_map(move |k| {
+                    [1, 2, 4].map(|days| (s.0 + k * H, s.0 + k * H + days * DAY))
+                })
+            })
+            .filter(|&(start, _)| start < edge)
+            .map(|(start, end)| (start, end, id(9_000_000)))
+            .find(|&summary| {
+                let mut spans = spans.clone();
+                spans.push(summary);
+                head(&spans, &cut(&spans)).contains(&summary.2)
+            })
+            .expect("some old-stretch summary wins a head slot");
+        let with = |extra: i128| {
+            let mut spans = journal(hours + extra, 35);
+            spans.push(summary);
+            spans
+        };
+        let after = with(0);
+        assert_eq!(key(&after), key(&spans));
+        let head_after = head(&after, &cut(&after));
+        assert_ne!(head(&spans, &before), head_after);
+        for extra in 1..6 {
+            let spans = with(extra);
+            assert_eq!(key(&spans), key(&after));
+            assert_eq!(
+                head(&spans, &cut(&spans)),
+                head_after,
+                "after {extra} appended hour(s)"
+            );
+        }
+    }
+
+    /// (3) A change confined to the young levels (an arc over the last hours)
+    /// changes only what follows the head.
+    #[test]
+    fn a_young_region_change_keeps_the_head() {
+        // Start where the last four hours lie past the level-2 block.
+        let mut hours = 50 * 24 + 5;
+        while BASE + (hours - 4) * H < key(&journal(hours, 35)).0 * REPLAY_QUANTUM_NS {
+            hours += 1;
+        }
+        let spans = journal(hours, 35);
+        let before = cut(&spans);
+        let latest = spans.iter().map(|s| s.1).max().unwrap();
+        let young_arc = (latest - 4 * H, latest, id(9_100_000));
+        let mut changed = spans.clone();
+        changed.push(young_arc);
+        let after = cut(&changed);
+        assert_eq!(key(&changed), key(&spans));
+        assert_eq!(head(&changed, &after), head(&spans, &before));
+        assert_ne!(after.cover[after.head..].len(), 0);
     }
 }

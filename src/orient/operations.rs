@@ -63,9 +63,9 @@ pub struct WakePairsOptions {
     pub chunk_overhead: usize,
     /// Exact selected Memory text; ordinary image placeholders are unchanged.
     pub raw_memory: bool,
-    /// Select the memory cover with the quantized-anchor walk and mark its
-    /// sealed head: each head recall carries `"sealed": true`.
-    pub sealed_head: bool,
+    /// Select the memory cover with a sealed-head rule and mark its head:
+    /// each head recall carries `"sealed": true`. `None`: unchanged pairs.
+    pub sealed_head: Option<crate::memory_cover::SealedHead>,
     pub doing_limit: usize,
     pub todo_limit: usize,
 }
@@ -76,7 +76,7 @@ impl Default for WakePairsOptions {
             chars: wake.chars,
             chunk_overhead: 0,
             raw_memory: false,
-            sealed_head: false,
+            sealed_head: None,
             doing_limit: wake.doing_limit,
             todo_limit: wake.todo_limit,
         }

@@ -384,7 +384,7 @@ fn build_context_cover(
         sim_threshold,
         tags: Vec::new(),
         without_tags: Vec::new(),
-        sealed_head: false,
+        sealed_head: None,
     };
     Ok(crate::memory_cover::render_cover_report(
         &loaded.memory.facts,
