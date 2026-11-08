@@ -18,13 +18,12 @@ pub enum Target {
     Memory,
     Messages,
     Planner,
-    Status,
     Teams,
     Triage,
 }
 
 impl Target {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::Dashboard,
         Self::Atlas,
         Self::Discord,
@@ -34,7 +33,6 @@ impl Target {
         Self::Memory,
         Self::Messages,
         Self::Planner,
-        Self::Status,
         Self::Teams,
         Self::Triage,
     ];
@@ -50,7 +48,6 @@ impl Target {
             Self::Memory => "memory",
             Self::Messages => "messages",
             Self::Planner => "planner",
-            Self::Status => "status",
             Self::Teams => "teams",
             Self::Triage => "triage",
         }
@@ -61,7 +58,6 @@ impl Target {
         match self {
             Self::Dashboard => &[
                 "storage",
-                "status",
                 "headspace",
                 "timeline",
                 "gauge",
@@ -87,7 +83,6 @@ impl Target {
             Self::Memory => &["storage", "memory"],
             Self::Messages => &["storage", "messages"],
             Self::Planner => &["storage", "planner"],
-            Self::Status => &["storage", "status"],
             Self::Teams => &["storage", "teams"],
             Self::Triage => &["storage", "triage"],
         }

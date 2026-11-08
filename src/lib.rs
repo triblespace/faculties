@@ -100,7 +100,6 @@ pub mod reason;
 pub mod relations;
 pub mod schemas;
 pub mod spec;
-pub mod status;
 pub mod storage;
 pub mod teams;
 pub mod tokens;
@@ -131,7 +130,7 @@ pub(crate) mod test_support;
 
 /// Resolve a free-text argument that may reference a file or stdin, so every
 /// faculty that takes prose content (`memory create`, `message send`,
-/// `wiki create/edit`, `compass note`, `status set`, …) shares one convention:
+/// `wiki create/edit`, `compass note`, …) shares one convention:
 ///
 /// - `@-`         → read all of stdin
 /// - `@<path>`    → read the file at `<path>`

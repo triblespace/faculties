@@ -125,7 +125,6 @@ impl Fixture {
                 faculties::schemas::teams::DEFAULT_SCOPE_ID,
                 faculties::schemas::compass::DEFAULT_SCOPE_ID,
                 faculties::schemas::relations::DEFAULT_SCOPE_ID,
-                faculties::schemas::status::DEFAULT_SCOPE_ID,
                 faculties::schemas::habit::DEFAULT_SCOPE_ID,
                 faculties::schemas::memory::DEFAULT_SCOPE_ID,
                 faculties::schemas::wiki::DEFAULT_SCOPE_ID,

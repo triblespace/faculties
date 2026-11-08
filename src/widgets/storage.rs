@@ -49,7 +49,6 @@ use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
 use crate::schemas::planner::DEFAULT_SCOPE_ID as PLANNER_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
-use crate::schemas::status::DEFAULT_SCOPE_ID as STATUS_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
@@ -84,7 +83,6 @@ pub enum SourceKey {
     Reason,
     Relations,
     Secrets,
-    Status,
     Teams,
     Triage,
     Wiki,
@@ -92,7 +90,7 @@ pub enum SourceKey {
 
 impl SourceKey {
     /// Every logical input understood by the viewer core.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 17] = [
         Self::Archive,
         Self::Atlas,
         Self::Compass,
@@ -107,7 +105,6 @@ impl SourceKey {
         Self::Reason,
         Self::Relations,
         Self::Secrets,
-        Self::Status,
         Self::Teams,
         Self::Triage,
         Self::Wiki,
@@ -119,7 +116,7 @@ impl SourceKey {
     fn dependencies(self) -> &'static [Self] {
         match self {
             Self::Headspace => &[Self::Secrets],
-            Self::Mail | Self::Messages | Self::Planner | Self::Status => &[Self::Relations],
+            Self::Mail | Self::Messages | Self::Planner => &[Self::Relations],
             Self::Triage => &[
                 Self::Headspace,
                 Self::Secrets,
@@ -412,11 +409,6 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         key: SourceKey::Relations,
         scope: RELATIONS_SCOPE_ID,
         label: "Relations",
-    },
-    CollectionSource {
-        key: SourceKey::Status,
-        scope: STATUS_SCOPE_ID,
-        label: "Status",
     },
     CollectionSource {
         key: SourceKey::Teams,
@@ -1003,12 +995,15 @@ mod tests {
 
     fn publish_malformed_status(path: &Path) {
         let instant = Epoch::from_tai_seconds(3.0);
-        let mut fragment = crate::status::status_fragment(
-            Id::new([0x31; 16]).unwrap(),
-            "malformed",
-            (instant, instant).try_to_inline().unwrap(),
-        )
-        .unwrap();
+        use crate::schemas::status::{status, KIND_STATUS_UPDATE};
+        let at: Inline<inlineencodings::NsTAIInterval> =
+            (instant, instant).try_to_inline().unwrap();
+        let mut fragment = entity! {
+            metadata::tag: &KIND_STATUS_UPDATE,
+            status::window: Id::new([0x31; 16]).unwrap(),
+            status::text: "malformed",
+            metadata::created_at: at,
+        };
         let event = fragment.root().unwrap();
         fragment += entity! {
             ExclusiveId::force_ref(&event) @ metadata::tag: &Id::new([0x32; 16]).unwrap()
@@ -1016,9 +1011,12 @@ mod tests {
 
         let signer = load_signer(path, None).unwrap();
         let mut pile = open_pile_strict(path).unwrap();
-        let collection =
-            crate::collection_names::open(&mut pile, STATUS_SCOPE_ID, signer.verifying_key())
-                .unwrap();
+        let collection = crate::collection_names::open(
+            &mut pile,
+            crate::schemas::status::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+        )
+        .unwrap();
         pile.commit(collection, &signer, fragment).unwrap();
         pile.close().unwrap();
     }
@@ -1167,7 +1165,7 @@ mod tests {
             source_closure([SourceKey::Teams]),
             BTreeSet::from([SourceKey::Teams])
         );
-        for source in [SourceKey::Messages, SourceKey::Planner, SourceKey::Status] {
+        for source in [SourceKey::Messages, SourceKey::Planner] {
             assert_eq!(
                 source_closure([source]),
                 BTreeSet::from([source, SourceKey::Relations])
@@ -1419,13 +1417,11 @@ mod tests {
         let context = narrow.context();
         assert!(context.dataset(SourceKey::Reason).is_some());
         assert!(context.dataset(SourceKey::Triage).is_none());
-        assert!(context.dataset(SourceKey::Status).is_none());
         assert!(narrow.error().is_none());
 
         let mut full = StorageState::new(&path);
         let context = full.context();
         assert!(context.dataset(SourceKey::Reason).is_some());
-        assert!(context.dataset(SourceKey::Status).is_some());
         assert!(full.error().is_none());
     }
 
@@ -1436,11 +1432,12 @@ mod tests {
         create_pile(&path);
         let mut storage = StorageState::new(&path);
 
+        let visible = visible_keys(storage.context());
+        assert!(storage.error().is_none(), "{:?}", storage.error());
         assert_eq!(
-            visible_keys(storage.context()),
+            visible,
             SourceKey::ALL.into_iter().collect()
         );
-        assert!(storage.error().is_none());
     }
 
     #[test]

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Retire the separately authored Status CLI/MCP and viewer surfaces. Orient no
+  longer observes that collection or announces status-derived windows; historical
+  facts remain untouched. Between-things resolves personas through Relations and
+  uses Compass/reservation evidence, not stale status prose as a pause/wait veto.
+
 - `compass priorities` and MCP `compass_priorities` show priority layers across
   status columns and the direct relations behind them, distinguishing explicit
   assertions from child-before-parent ordering. Filters select displayed goals

@@ -6,10 +6,9 @@
 # JP, 2026-11-06: Compass is for persistent goals and autonomy, not a todo list,
 # so this never measures busyness. It only notices the gap after a finished step,
 # and the nudge asks what the zooid wants to pursue next. Covered (not due) when,
-# within the last --fresh-mins, this persona itself did any of:
-#   - moved or noted a goal that is now doing or blocked (shared rows count only
-#     through one's own activity, never through a tag alone);
-#   - set a status that says it is paused or waiting;
+# within the last --fresh-mins, this persona itself moved or noted a goal that
+# is now doing or blocked (shared rows count only through one's own activity,
+# never through a tag alone);
 # or when it holds a Spark reservation (a gb10 lock whose tag starts with
 # --lock-tag). A quiet stretch is a prompt to look, never a verdict of idleness:
 # timestamps cannot see reading, thinking or a long build. Exit 0 means due,
@@ -22,6 +21,8 @@
 # The exclusive flock is never unlinked, and only one refresher owns it.
 # The whole refresh remains bounded by REFRESH_BOUND; publishing the result
 # blocks that signal so a timeout cannot misreport what was published.
+# Operator notification pause remains the owner/callback's boundary. This
+# predicate does not interpret authored status prose as a pause or liveness fact.
 import calendar, fcntl, json, os, re, shutil, signal, subprocess, sys, time
 
 def arg(name, default):
@@ -45,7 +46,7 @@ if not pile:
     print("colony-coverage: predicate PILE is missing", file=sys.stderr); sys.exit(2)
 pile = os.path.abspath(pile)
 os.environ["PILE"] = pile
-context = {"version": 2, "pile": pile, "fresh": fresh, "lock_tag": lock_tag}
+context = {"version": 3, "pile": pile, "fresh": fresh, "lock_tag": lock_tag}
 now = time.time()
 REFRESH_BOUND = 480
 
@@ -119,23 +120,16 @@ def utc_age(stamp):
     return now - calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S"))
 
 def decide():
-    head = run("status", "show", persona).splitlines()
-    m = re.search(r"\(([0-9a-f]{32})\)", head[0] if head else "")
-    if not m:
-        raise ValueError("status show: no persona id for %s" % persona)
-    me = m.group(1)
-    if len(head) < 2:
-        raise ValueError("status show: missing current status")
-    # An explicit pause or wait in the current status, if it is fresh.
-    for line in head[1:2]:
-        cur = re.match(r"\*\s+(.*)\s+\((\d+)([smhd]) ago\)\s*$", line)
-        if not cur and line != "- (no status set)":
-            raise ValueError("status show: unrecognized current status")
-        if cur:
-            text, n, unit = cur.group(1), int(cur.group(2)), cur.group(3)
-            secs = n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-            if secs <= fresh and re.match(r"(paused|waiting)\b", text.strip(), re.I):
-                return False, "covered: fresh status says %s" % text.split()[0].lower()
+    # Exact anchors need no authored status or profile lookup. Labels/aliases
+    # use Relations' existing selector, which reports ambiguity as an error.
+    if re.fullmatch(r"[0-9a-fA-F]{32}", persona) and int(persona, 16) != 0:
+        me = persona.lower()
+    else:
+        head = run("relations", "show", persona).splitlines()
+        match = re.fullmatch(r"person: ([0-9a-f]{32})", head[0] if head else "")
+        if not match or int(match.group(1), 16) == 0:
+            raise ValueError("relations show: no person id for %s" % persona)
+        me = match.group(1)
     if lock_tag:
         lock = os.path.expanduser("~/liora/mary/scripts/gb10-lock.sh")
         if os.access(lock, os.X_OK):
@@ -176,7 +170,7 @@ def decide():
     if newest and newest[0] <= fresh:
         return False, "covered: own activity on doing/blocked goal %s %d min ago" % (newest[1], newest[0] // 60)
     since = "never" if newest is None else "%d min ago (goal %s)" % (newest[0] // 60, newest[1])
-    return True, "between things: no own move or note on a doing/blocked goal within %d min (last %s), no fresh pause, no reservation" % (fresh // 60, since)
+    return True, "between things: no own move or note on a doing/blocked goal within %d min (last %s), no reservation" % (fresh // 60, since)
 
 try:
     held = try_lock(cache + ".lock")

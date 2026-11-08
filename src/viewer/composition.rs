@@ -4,7 +4,7 @@ use super::{Target, Viewer};
 use crate::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, SourceKey, StatusViewer, StorageState, TeamsViewer, TimelineSource,
+    RelationsViewer, SourceKey, StorageState, TeamsViewer, TimelineSource,
     TriageViewer, WikiViewer,
 };
 use GORBIE::prelude::*;
@@ -21,7 +21,6 @@ impl Target {
             Self::Memory => &[SourceKey::Memory],
             Self::Messages => &[SourceKey::Messages],
             Self::Planner => &[SourceKey::Planner],
-            Self::Status => &[SourceKey::Status],
             Self::Teams => &[SourceKey::Teams],
             Self::Triage => &[SourceKey::Triage],
         }
@@ -42,17 +41,6 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
             st.top_bar(ctx);
         },
     );
-
-    if target == Target::Dashboard || target == Target::Status {
-        nb.state("status", StatusViewer::default, move |ctx, panel| {
-            let mut st = storage.read_mut(ctx);
-            let sources = st.context();
-            let Some(view) = sources.dataset(SourceKey::Status) else {
-                return;
-            };
-            panel.render(ctx, view, sources.dataset(SourceKey::Relations));
-        });
-    }
 
     if target == Target::Dashboard || target == Target::Headspace {
         nb.state("headspace", HeadspaceViewer::default, move |ctx, panel| {
@@ -277,7 +265,6 @@ mod tests {
             (Target::Memory, SourceKey::Memory),
             (Target::Messages, SourceKey::Messages),
             (Target::Planner, SourceKey::Planner),
-            (Target::Status, SourceKey::Status),
             (Target::Teams, SourceKey::Teams),
             (Target::Triage, SourceKey::Triage),
         ] {

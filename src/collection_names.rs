@@ -91,6 +91,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (quota::DEFAULT_SCOPE_ID, "quota"),
         (relations::DEFAULT_SCOPE_ID, "relations"),
         (SECRETS_SCOPE_ID, "secrets"),
+        // Historical descriptor name only; no live authored Status faculty.
         (status::DEFAULT_SCOPE_ID, "status"),
         (
             swarm_health::DEFAULT_SCOPE_ID,

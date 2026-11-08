@@ -418,7 +418,6 @@ fn aggregate_native_primary_and_auxiliary_openers_fail_closed_without_routes() {
         ("posture_vocab_list", "{}"),
         ("relations_list", "{}"),
         ("secrets_list", "{}"),
-        ("status_list", "{}"),
         ("teams_auth_status", "{}"),
         ("triage_scan", "{}"),
         ("voice_route", "{}"),

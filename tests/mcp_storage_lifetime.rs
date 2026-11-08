@@ -143,14 +143,6 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         let captures = text(&call(&mut second, "body_list", json!({})));
         assert!(captures.contains("first resident touch"), "{captures}");
         assert!(!captures.contains("second resident touch"), "{captures}");
-        call(
-            &mut second,
-            "status_set",
-            json!({"persona": "alice", "text": "first local-only status"}),
-        );
-        let statuses = text(&call(&mut second, "status_list", json!({})));
-        assert!(statuses.contains("first local-only status"), "{statuses}");
-        assert!(!statuses.contains("second local-only status"), "{statuses}");
         assert!(
             !fixture.pile.exists(),
             "a local-only adapter reopened the pathname"
@@ -190,7 +182,6 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         assert!(wiki.contains("One live store."), "{wiki}");
 
         // The local-only readers must take fresh snapshots on their next calls.
-        // Distinct status windows avoid depending on wall-clock ordering.
         call(
             &mut second,
             "body_capture",
@@ -199,15 +190,6 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         let captures = text(&call(&mut second, "body_list", json!({})));
         assert!(captures.contains("first resident touch"), "{captures}");
         assert!(captures.contains("second resident touch"), "{captures}");
-        call(
-            &mut second,
-            "status_set",
-            json!({"persona": "bob", "text": "second local-only status"}),
-        );
-        let statuses = text(&call(&mut second, "status_list", json!({})));
-        assert!(statuses.contains("first local-only status"), "{statuses}");
-        assert!(statuses.contains("second local-only status"), "{statuses}");
-
         call(
             &mut second,
             "compass_move",
@@ -219,7 +201,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             json!({"evaluate_habits": false}),
         ));
         assert!(overview.contains("shared-pile-record"), "{overview}");
-        assert!(overview.contains("second local-only status"), "{overview}");
+        assert!(!overview.contains("Window status:"), "{overview}");
         assert!(
             !fixture.pile.exists(),
             "an adapter reopened the configured pathname"
