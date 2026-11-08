@@ -1614,6 +1614,13 @@ pub struct TiledOpts {
     /// then id), never by when they were written; see
     /// [`select_lived_runs_recollection_cut`].
     pub lived_order: bool,
+    /// Lived-order runs: closed allowances from the log-age curve instead of
+    /// equal per rank. 0 = equal per rank. 1 = the curve's integral over the
+    /// run's lived span, evaluated and normalised over the closed part at the
+    /// run's LAST CHANGE and frozen until it changes again. 2 = the same
+    /// integral evaluated at the newest closed run end, so every closed
+    /// allowance is recomputed whenever a run closes.
+    pub run_curve: u8,
 }
 
 /// Range-time order: start ascending, end descending, then intrinsic id.
@@ -2192,14 +2199,30 @@ pub fn select_lived_runs_recollection_cut(
             .then(spans[a].0.cmp(&spans[b].0))
             .then(spans[a].2.cmp(&spans[b].2))
     });
-    // (rank, first position, end position) in `order`, oldest first.
-    let mut runs: Vec<(u32, usize, usize)> = Vec::new();
+    let earliest = spans.iter().map(|s| s.0).min().unwrap_or(0);
+    let closed = budget - quantum.min(budget);
+    let moment = MOMENT_NS as f64;
+    // The log-age curve's mass over lived [a, b] seen from `now`, as a
+    // fraction of its mass over [earliest, now].
+    let curve = |a: i128, b: i128, now: i128| -> f64 {
+        let total = (1.0 + (now - earliest).max(0) as f64 / moment).ln();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        let g = ((moment + (now - a).max(0) as f64) / (moment + (now - b).max(0) as f64)).ln();
+        (g / total).clamp(0.0, 1.0)
+    };
+    // (rank, first position, end position, lived start, lived end, frozen
+    // allowance) in `order`, oldest first. A run's lived span starts where the
+    // previous run's ends, so the closed runs tile [earliest, newest close].
+    let mut runs: Vec<(u32, usize, usize, i128, i128, usize)> = Vec::new();
     let mut first = 0usize;
     let mut mass = 0usize;
     for (p, &i) in order.iter().enumerate() {
         mass += costs[i];
         if mass >= quantum {
-            runs.push((0, first, p + 1));
+            let a = runs.last().map_or(earliest, |r| r.4);
+            runs.push((0, first, p + 1, a, spans[i].1, 0));
             out.closes.push(spans[i].2);
             first = p + 1;
             mass = 0;
@@ -2207,35 +2230,83 @@ pub fn select_lived_runs_recollection_cut(
                 let n = runs.len();
                 let r = runs[n - 1].0;
                 if runs[n - 4..].iter().all(|x| x.0 == r) {
-                    let merged = (r + 1, runs[n - 4].1, runs[n - 1].2);
+                    let merged = (
+                        r + 1,
+                        runs[n - 4].1,
+                        runs[n - 1].2,
+                        runs[n - 4].3,
+                        runs[n - 1].4,
+                        0,
+                    );
                     runs.truncate(n - 4);
                     runs.push(merged);
                 } else {
                     break;
                 }
             }
+            if opts.run_curve == 1 {
+                // The run this close produced changes now: evaluate the curve
+                // at its own end (the lived edge at its change) and freeze it.
+                let idx = runs.len() - 1;
+                let (a, b) = (runs[idx].3, runs[idx].4);
+                runs[idx].5 = (closed as f64 * curve(a, b, b)).floor() as usize;
+            }
+        }
+    }
+    // Members whose lived range reaches back across an earlier boundary: in
+    // lived order every member ends inside its own run, so a crossing is a
+    // member (of a later run or the open run) starting before that run's
+    // lived start.
+    for r in &runs {
+        out.crossing += order[r.1..r.2]
+            .iter()
+            .filter(|&&i| spans[i].0 < r.3)
+            .count();
+    }
+    let open_lo = runs.last().map_or(earliest, |r| r.4);
+    out.crossing += order[first..]
+        .iter()
+        .filter(|&&i| spans[i].0 < open_lo)
+        .count();
+    if opts.run_curve == 2 {
+        let now = runs.last().map_or(earliest, |r| r.4);
+        for r in runs.iter_mut() {
+            r.5 = (closed as f64 * curve(r.3, r.4, now)).floor() as usize;
         }
     }
     let top = runs.iter().map(|r| r.0).max().unwrap_or(0);
     out.top = top;
-    let closed = budget - quantum.min(budget);
     let per_rank = closed / (top as usize + 1);
     let mut carry = 0usize;
     for rank in (0..=top).rev() {
-        let mine: Vec<(usize, usize)> = runs
+        let mine: Vec<(usize, usize, usize)> = runs
             .iter()
             .filter(|r| r.0 == rank)
-            .map(|r| (r.1, r.2))
+            .map(|r| (r.1, r.2, r.5))
             .collect();
-        let allowance = per_rank.saturating_add(carry).min(budget - out.used);
+        let allowance = if opts.run_curve > 0 {
+            mine.iter().map(|r| r.2).sum::<usize>()
+        } else {
+            per_rank
+        }
+        .saturating_add(carry)
+        .min(budget - out.used);
         if mine.is_empty() {
             carry = allowance;
             continue;
         }
         let start = out.cover.len();
         let mut spent = 0usize;
-        for (t, &(a, b)) in mine.iter().enumerate() {
-            let space = (allowance - spent) / (mine.len() - t);
+        for (t, &(a, b, frozen)) in mine.iter().enumerate() {
+            let space = if opts.run_curve > 0 {
+                // Its own curve allowance plus what older runs left unspent.
+                let later: usize = mine[t + 1..].iter().map(|r| r.2).sum();
+                (allowance - spent)
+                    .saturating_sub(later)
+                    .max(frozen.min(allowance - spent))
+            } else {
+                (allowance - spent) / (mine.len() - t)
+            };
             let members = &order[a..b];
             let lo = members.iter().map(|&i| spans[i].0).min().unwrap_or(0);
             let hi = members.iter().map(|&i| spans[i].1).max().unwrap_or(lo);
@@ -2317,6 +2388,314 @@ pub fn select_lived_runs_recollection_cut(
     }
     out.used += used;
     out
+}
+
+/// Side-by-side behavioural comparison at the newest state of the pile: the
+/// current cover exactly as `render_cover_report` (memory context / orient
+/// wake) produces it with `opts`, and the lived-order 1/8 candidate charged
+/// the same way. Returns the analysis lines, the current cover's text and the
+/// candidate's text.
+pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    opts: &CoverOpts,
+) -> Result<(Vec<String>, String, String)> {
+    use std::fmt::Write as _;
+    const DAY: i128 = 86_400 * 1_000_000_000;
+    let budget = opts.budget_chars;
+    let current = render_cover_report(space, ws, opts, &mut |_| Ok(None))?;
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed, _) = recollection_class_observations(space, &raw_spans, &classes);
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(
+            recollection_class_cost(
+                ws,
+                space,
+                &raw_spans,
+                &mut raw_costs,
+                &classes,
+                &mut class_costs,
+                i,
+                opts.raw_memory,
+            )?
+            .saturating_add(opts.chunk_overhead),
+        );
+    }
+    let mut class_of: HashMap<Id, usize> = HashMap::new();
+    for (c, members) in classes.iter().enumerate() {
+        for &m in members {
+            class_of.insert(raw_spans[m].2, c);
+        }
+    }
+    // The primary candidate: the clock-closed geometric grid over lived time.
+    let topts = TiledOpts {
+        anchor_ns: MOMENT_NS,
+        frozen: false,
+        uniform: true,
+        cap_ns: None,
+        closed_fraction: None,
+        open_append: Some(0.04),
+        deep_weights: false,
+        runs: None,
+        run_geometric: false,
+        lived_order: false,
+        run_curve: 0,
+    };
+    let observed_for_cut = observed.clone();
+    let cand =
+        select_tiled_recollection_cut(&spans, &costs, &observed_for_cut, budget, &topts, None);
+    // Candidate text, framed as the cover frames an entry.
+    let mut cand_text = String::new();
+    for &c in &cand.cover {
+        let (st, en, id) = spans[c];
+        let range = format_time_range(key_to_epoch(st), key_to_epoch(en));
+        let body = match chunk_summary_handle(space, id) {
+            Some(h) => {
+                let v: View<str> = ws.get(h).context("read chunk summary")?;
+                Some(if opts.raw_memory {
+                    v.to_string()
+                } else {
+                    v.trim_end().to_string()
+                })
+            }
+            None if chunk_image_handle(space, id).is_some() => {
+                Some(format!("[image memory @ {range}]"))
+            }
+            None => None,
+        };
+        let _ = write!(cand_text, "\n{range}\n");
+        if let Some(b) = body {
+            let _ = writeln!(cand_text, "{b}");
+        }
+    }
+    // Current entries as classes.
+    let cur: Vec<usize> = current
+        .entries
+        .iter()
+        .filter_map(|e| class_of.get(&e.chunk).copied())
+        .collect();
+    let cur_used: usize = cur.iter().map(|&c| costs[c]).sum();
+    let latest = spans.iter().map(|s| s.1).max().unwrap_or(0);
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "budget {budget} chars; raw_memory {}; chunk_overhead {}; newest memory end {}; current cover {} entries / {} charged chars ({} text chars); \
+         candidate (clock-closed geometric grid, curve shares, 4% append-only open unit, uniform in-tile targets, policy b) {} entries / {} charged chars ({} text chars), free {}",
+        opts.raw_memory,
+        opts.chunk_overhead,
+        fmt_key(latest),
+        cur.len(),
+        cur_used,
+        current.text.chars().count(),
+        cand.cover.len(),
+        cand.used,
+        cand_text.chars().count(),
+        budget - cand.used.min(budget),
+    ));
+    let cur_set: BTreeSet<usize> = cur.iter().copied().collect();
+    let cand_set: BTreeSet<usize> = cand.cover.iter().copied().collect();
+    let desc = |c: usize| -> String {
+        format!(
+            "{} {}c {:x}",
+            format_time_range(key_to_epoch(spans[c].0), key_to_epoch(spans[c].1)),
+            costs[c],
+            spans[c].2
+        )
+    };
+    // (a) recent experience.
+    for (label, cutoff) in [
+        ("last day", latest - DAY),
+        ("last 7 days", latest - 7 * DAY),
+    ] {
+        let inn = |set: &BTreeSet<usize>| -> Vec<usize> {
+            set.iter()
+                .copied()
+                .filter(|&c| spans[c].1 >= cutoff)
+                .collect()
+        };
+        let a = inn(&cur_set);
+        let b = inn(&cand_set);
+        let all: Vec<usize> = (0..spans.len()).filter(|&c| spans[c].1 >= cutoff).collect();
+        let chars = |v: &[usize]| v.iter().map(|&c| costs[c]).sum::<usize>();
+        let missing: Vec<usize> = a
+            .iter()
+            .copied()
+            .filter(|c| !cand_set.contains(c))
+            .collect();
+        let extra: Vec<usize> = b.iter().copied().filter(|c| !cur_set.contains(c)).collect();
+        lines.push(format!(
+            "(a) {label} (range end within): pile {} memories / {}c; current {} / {}c; candidate {} / {}c; current-only {} / {}c; candidate-only {} / {}c",
+            all.len(), chars(&all), a.len(), chars(&a), b.len(), chars(&b), missing.len(), chars(&missing), extra.len(), chars(&extra)
+        ));
+        for &c in missing.iter().take(40) {
+            lines.push(format!("    missing from candidate: {}", desc(c)));
+        }
+    }
+    // (b) late summaries.
+    let late: Vec<usize> = (0..spans.len())
+        .filter(|&c| observed[c] - spans[c].1 > DAY)
+        .collect();
+    let in_cur_late: Vec<usize> = late
+        .iter()
+        .copied()
+        .filter(|c| cur_set.contains(c))
+        .collect();
+    let in_cand_late: Vec<usize> = late
+        .iter()
+        .copied()
+        .filter(|c| cand_set.contains(c))
+        .collect();
+    lines.push(format!(
+        "(b) late memories (observed more than 1 d after their range end): pile {}; in current {}; in candidate {}; in both {}",
+        late.len(),
+        in_cur_late.len(),
+        in_cand_late.len(),
+        in_cur_late.iter().filter(|c| cand_set.contains(c)).count()
+    ));
+    let cur_pos: HashMap<usize, usize> = cur.iter().enumerate().map(|(k, &c)| (c, k)).collect();
+    let cand_pos: HashMap<usize, usize> = cand
+        .cover
+        .iter()
+        .enumerate()
+        .map(|(k, &c)| (c, k))
+        .collect();
+    let run_of = |k: usize| -> String {
+        if k >= cand.open_from {
+            return "open unit".into();
+        }
+        let mut at = 0usize;
+        for (n, lv) in cand.levels.iter().enumerate() {
+            if k < lv.start + lv.len {
+                let _ = n;
+                return format!("level {}", lv.level);
+            }
+            at += lv.len;
+        }
+        let _ = at;
+        "?".into()
+    };
+    let mut late_listed: Vec<usize> = in_cur_late
+        .iter()
+        .chain(in_cand_late.iter())
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    late_listed.sort_by_key(|&c| std::cmp::Reverse(observed[c] - spans[c].1));
+    for &c in late_listed.iter().take(60) {
+        lines.push(format!(
+            "    {} late by {:.0} d: current {}; candidate {}",
+            desc(c),
+            (observed[c] - spans[c].1) as f64 / DAY as f64,
+            cur_pos
+                .get(&c)
+                .map_or("absent".to_string(), |k| format!("entry {k}")),
+            cand_pos.get(&c).map_or("absent".to_string(), |&k| format!(
+                "entry {k}, {}",
+                run_of(k)
+            )),
+        ));
+    }
+    // (c) the oldest era.
+    let first_fifth = |v: &[usize]| -> Vec<usize> {
+        let total: usize = v.iter().map(|&c| costs[c]).sum();
+        let mut acc = 0usize;
+        let mut out = Vec::new();
+        for &c in v {
+            if acc * 5 >= total {
+                break;
+            }
+            acc += costs[c];
+            out.push(c);
+        }
+        out
+    };
+    let year_of = |c: usize| -> i32 { key_to_epoch(spans[c].0).to_gregorian_utc().0 };
+    for (label, v) in [("current", cur.clone()), ("candidate", cand.cover.clone())] {
+        let f = first_fifth(&v);
+        let mut by_year: std::collections::BTreeMap<i32, (usize, usize)> = Default::default();
+        for &c in &f {
+            let e = by_year.entry(year_of(c)).or_default();
+            e.0 += 1;
+            e.1 += costs[c];
+        }
+        let lo = f.iter().map(|&c| spans[c].0).min().unwrap_or(0);
+        let hi = f.iter().map(|&c| spans[c].1).max().unwrap_or(0);
+        lines.push(format!(
+            "(c) first 20% of the {label} cover: {} entries, spanning {}; by start year {}",
+            f.len(),
+            format_time_range(key_to_epoch(lo), key_to_epoch(hi)),
+            by_year
+                .iter()
+                .map(|(y, (n, ch))| format!("{y}: {n} / {ch}c"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let old = |set: &BTreeSet<usize>| -> Vec<usize> {
+        set.iter()
+            .copied()
+            .filter(|&c| year_of(c) <= 2025)
+            .collect()
+    };
+    let cur_old = old(&cur_set);
+    let cand_old = old(&cand_set);
+    let dropped: Vec<usize> = cur_old
+        .iter()
+        .copied()
+        .filter(|c| !cand_set.contains(c))
+        .collect();
+    let added: Vec<usize> = cand_old
+        .iter()
+        .copied()
+        .filter(|c| !cur_set.contains(c))
+        .collect();
+    let chars = |v: &[usize]| v.iter().map(|&c| costs[c]).sum::<usize>();
+    lines.push(format!(
+        "(c) memories starting in 2024-2025: current {} / {}c; candidate {} / {}c; dropped by the candidate {} / {}c; added by the candidate {} / {}c",
+        cur_old.len(), chars(&cur_old), cand_old.len(), chars(&cand_old), dropped.len(), chars(&dropped), added.len(), chars(&added)
+    ));
+    let mut dropped_sorted = dropped.clone();
+    dropped_sorted.sort_by_key(|&c| std::cmp::Reverse(spans[c].1 - spans[c].0));
+    for &c in dropped_sorted.iter().take(40) {
+        lines.push(format!("    dropped: {}", desc(c)));
+    }
+    let mut runs: Vec<String> = Vec::new();
+    for lv in &cand.levels {
+        for (k, &c) in cand.cover[lv.start..lv.start + lv.len].iter().enumerate() {
+            let _ = (k, c);
+        }
+    }
+    for &(r, lo, hi, sp, u) in &cand.run_list {
+        runs.push(format!(
+            "rank {r}: members' starts..ends {} ({:.1} d), space {}k, used {}k",
+            format_time_range(key_to_epoch(lo), key_to_epoch(hi)),
+            (hi - lo) as f64 / DAY as f64,
+            sp / 1000,
+            u / 1000
+        ));
+    }
+    let _ = runs;
+    // Ends-based span of each candidate level, which is the lived span.
+    for lv in &cand.levels {
+        let ents = &cand.cover[lv.start..lv.start + lv.len];
+        let e_lo = ents.iter().map(|&c| spans[c].1).min().unwrap_or(0);
+        let e_hi = ents.iter().map(|&c| spans[c].1).max().unwrap_or(0);
+        lines.push(format!(
+            "(c) candidate level {} ({} tile(s), tiles span {}): selected entries end {} ({:.1} d of range ends), {} entries, {}c",
+            lv.level,
+            lv.tiles,
+            format_time_range(key_to_epoch(lv.lower), key_to_epoch(lv.upper)),
+            format_time_range(key_to_epoch(e_lo), key_to_epoch(e_hi)),
+            (e_hi - e_lo) as f64 / DAY as f64,
+            ents.len(),
+            lv.used
+        ));
+    }
+    Ok((lines, current.text, cand_text))
 }
 
 /// Diagnosis of the full-closed run structure over the whole pile (no
@@ -2478,6 +2857,24 @@ pub fn runs_diagnosis<B: BlobStoreGet, P: TriblePattern>(
         }
     }
     Ok(lines)
+}
+
+/// Characters of `entries` by the UTC year their memory starts: [2024, 2025, 2026].
+fn year_split(entries: &[usize], spans: &[(i128, i128, Id)], costs: &[usize]) -> [usize; 3] {
+    let y2025 = utc_midnight_key(2025, 1, 1);
+    let y2026 = utc_midnight_key(2026, 1, 1);
+    let mut out = [0usize; 3];
+    for &i in entries {
+        let b = if spans[i].0 < y2025 {
+            0
+        } else if spans[i].0 < y2026 {
+            1
+        } else {
+            2
+        };
+        out[b] += costs[i];
+    }
+    out
 }
 
 /// Characters of `entries` by where each memory STARTS relative to `latest`:
@@ -2674,7 +3071,7 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
     let mut summary = vec![format!(
         "walk in use: {} of {} transitions changed the cover; on those, mean cover {:.0}k chars, reused with today's single saved prefix 0, \
          mean common entry prefix {:.0}k chars; mean fill {:.1}%; {} step(s) silent > LIFE/4\n    \
-         whole cover by memory start, mean over all steps: {}",
+         whole cover by memory start, mean over all steps: {}; by start year, last step: {}",
         changed.len(),
         out_steps.len().saturating_sub(1),
         mean(&base_used) / 1e3,
@@ -2682,6 +3079,13 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         out_steps.iter().map(|s| pct(s.base_used)).sum::<f64>() / out_steps.len().max(1) as f64,
         base_silent,
         mean_split(&base_split),
+        out_steps.last().map_or(String::new(), |s| {
+            let y = year_split(&s.base, &spans, &costs);
+            format!("2024 {}k, 2025 {}k, 2026 {}k; mean over all steps 2024 {:.0}k, 2025 {:.0}k",
+                y[0] / 1000, y[1] / 1000, y[2] / 1000,
+                out_steps.iter().map(|s| year_split(&s.base, &spans, &costs)[0]).sum::<usize>() as f64 / out_steps.len().max(1) as f64 / 1e3,
+                out_steps.iter().map(|s| year_split(&s.base, &spans, &costs)[1]).sum::<usize>() as f64 / out_steps.len().max(1) as f64 / 1e3)
+        }),
     )];
 
     for (c, (name, _)) in configs.iter().enumerate() {
@@ -2707,6 +3111,8 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let mut open_split_v = Vec::new();
         let mut whole_split_v = Vec::new();
         let mut age_v: Vec<[usize; 5]> = Vec::new();
+        let mut year_v: Vec<[usize; 3]> = Vec::new();
+        let mut widths: Vec<Vec<i128>> = vec![Vec::new(); MAX_LEVEL + 1];
         let mut shifts = 0usize;
         let mut shift_lcp: Vec<usize> = Vec::new();
         let mut shift_runs_back: Vec<usize> = Vec::new();
@@ -2791,6 +3197,17 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 cut.open_start,
             ));
             age_v.push(age_split(&cut.cover, &spans, &costs, s.latest, i128::MAX));
+            year_v.push(year_split(&cut.cover, &spans, &costs));
+            for lv in &cut.levels {
+                if (lv.level as usize) < MAX_LEVEL {
+                    for &i in &cut.cover[lv.start..lv.start + lv.len] {
+                        widths[lv.level as usize].push(spans[i].1 - spans[i].0);
+                    }
+                }
+            }
+            for &i in &cut.cover[cut.open_from..] {
+                widths[MAX_LEVEL].push(spans[i].1 - spans[i].0);
+            }
             free_v.push(budget - cut.used);
             let mut cells = Vec::new();
             let mut resume = 0usize;
@@ -2934,7 +3351,9 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
              levels present at the last step {}\n    \
              whole cover by memory start age only, mean over all steps: <1 d {:.0}k, 1-7 d {:.0}k, 7-30 d {:.0}k, older {:.0}k\n    \
              elastic room (budget - used, characters free for the live part) over all steps: {}\n    \
-             runs at the last step (rank, span, space -> used): {}\n    {}{}",
+             runs at the last step (rank, span, space -> used): {}\n    \
+             by memory start year, mean over all steps (last step): 2024 {:.0}k ({}k), 2025 {:.0}k ({}k), 2026 {:.0}k ({}k)\n    \
+             selected memory width (end - start) per level, pooled over all steps: {}\n    {}{}",
             fills.iter().sum::<f64>() / fills.len().max(1) as f64,
             fills.iter().copied().fold(f64::INFINITY, f64::min),
             used_v.len(),
@@ -2986,6 +3405,33 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 ))
                 .collect::<Vec<_>>()
                 .join("; ")),
+            year_v.iter().map(|x| x[0]).sum::<usize>() as f64 / year_v.len().max(1) as f64 / 1e3,
+            year_v.last().map_or(0, |x| x[0] / 1000),
+            year_v.iter().map(|x| x[1]).sum::<usize>() as f64 / year_v.len().max(1) as f64 / 1e3,
+            year_v.last().map_or(0, |x| x[1] / 1000),
+            year_v.iter().map(|x| x[2]).sum::<usize>() as f64 / year_v.len().max(1) as f64 / 1e3,
+            year_v.last().map_or(0, |x| x[2] / 1000),
+            {
+                let human = |ns: i128| -> String {
+                    let s = ns as f64 / 1e9;
+                    if s < 120.0 { format!("{s:.0} s") }
+                    else if s < 7200.0 { format!("{:.0} min", s / 60.0) }
+                    else if s < 172_800.0 { format!("{:.1} h", s / 3600.0) }
+                    else { format!("{:.1} d", s / 86_400.0) }
+                };
+                let mut parts = Vec::new();
+                for l in (0..=MAX_LEVEL).rev() {
+                    let mut w = widths[l].clone();
+                    if w.is_empty() {
+                        continue;
+                    }
+                    w.sort_unstable();
+                    let q = |p: f64| w[((w.len() - 1) as f64 * p) as usize];
+                    let name = if l == MAX_LEVEL { "open".to_string() } else { format!("level {l}") };
+                    parts.push(format!("{name}: median {} (p90 {}, n {})", human(q(0.5)), human(q(0.9)), w.len()));
+                }
+                parts.join("; ")
+            },
             if configs[c].1.lived_order {
                 let mut l = shift_lcp.clone();
                 l.sort_unstable();
@@ -3136,6 +3582,7 @@ mod tests {
                     runs: None,
                     run_geometric: false,
                     lived_order: false,
+                    run_curve: 0,
                 },
                 None,
             );
@@ -3194,6 +3641,7 @@ mod tests {
                 runs: None,
                 run_geometric: false,
                 lived_order: false,
+                run_curve: 0,
             },
             None,
         );
@@ -3329,6 +3777,7 @@ mod tests {
                 runs: None,
                 run_geometric: false,
                 lived_order: false,
+                run_curve: 0,
             };
             let cut =
                 select_tiled_recollection_cut(&spans, &costs, &observed, 300_000, &opts, None);
@@ -3352,6 +3801,7 @@ mod tests {
             runs: Some(0.1),
             run_geometric: false,
             lived_order: false,
+            run_curve: 0,
         };
         let mut previous: Option<TiledCut> = None;
         let mut appends = 0;
@@ -3393,6 +3843,7 @@ mod tests {
             runs: Some(0.1),
             run_geometric: true,
             lived_order: true,
+            run_curve: 0,
         };
         let a = select_tiled_recollection_cut(&spans, &costs, &observed, 60_000, &opts, None);
         let shuffled: Vec<i128> = observed.iter().rev().copied().collect();

@@ -322,6 +322,40 @@ impl Memory {
             Ok(())
         })
     }
+    /// EXPERIMENTAL: render the current cover and the lived-order 1/8 candidate
+    /// side by side at the newest state, write both texts under `out_dir`, and
+    /// print the comparison.
+    pub fn cover_compare(
+        &self,
+        budget: usize,
+        resident: bool,
+        out_dir: &str,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        let mut opts = CoverOpts::plain(budget);
+        if resident {
+            // Drive's read_cover: orient wake --pairs --raw-memory --chunk-overhead 47.
+            opts.raw_memory = true;
+            opts.chunk_overhead = "memory ".len() + 19 + "..".len() + 19;
+        }
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            let (lines, current, candidate) = crate::memory_cover::sealed::cover_compare(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                &opts,
+            )?;
+            std::fs::write(format!("{out_dir}/current-{budget}.txt"), current)?;
+            std::fs::write(
+                format!("{out_dir}/candidate-lived-1of8-{budget}.txt"),
+                candidate,
+            )?;
+            for line in lines {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
     /// EXPERIMENTAL: diagnose the full-closed run structure over the whole pile.
     pub fn runs_diag(&self, budget: usize, out: &mut Out<'_>) -> Result<()> {
         let split = crate::memory_cover::sealed::utc_midnight_key(2026, 7, 10);
@@ -365,34 +399,36 @@ impl Memory {
             runs: None,
             run_geometric: false,
             lived_order: false,
+            run_curve: 0,
         };
         let _ = (unit, cap);
+        let lived = TiledOpts {
+            runs: Some(1.0 / 8.0),
+            run_geometric: true,
+            lived_order: true,
+            ..base.clone()
+        };
+        let clock = TiledOpts {
+            open_append: Some(0.04),
+            ..base.clone()
+        };
         let configs = vec![
             (
-                "runs 1/8, geometric, WRITE order (report 5)".to_owned(),
-                TiledOpts {
-                    runs: Some(1.0 / 8.0),
-                    run_geometric: true,
-                    ..base.clone()
-                },
+                "PRIMARY clock-closed grid, curve shares (ln 4 per level), 4% open, uniform tiles, policy b".to_owned(),
+                clock.clone(),
             ),
             (
-                "runs 1/8, geometric, LIVED order (primary)".to_owned(),
-                TiledOpts {
-                    runs: Some(1.0 / 8.0),
-                    run_geometric: true,
-                    lived_order: true,
-                    ..base.clone()
-                },
+                "clock-closed grid, deep-weighted shares, 4% open, uniform tiles, policy b".to_owned(),
+                TiledOpts { deep_weights: true, ..clock.clone() },
+            ),
+            ("comparison: lived-order runs 1/8, geometric, equal rank shares".to_owned(), lived.clone()),
+            (
+                "comparison: lived-order runs 1/8, curve shares frozen at each run's change".to_owned(),
+                TiledOpts { run_curve: 1, ..lived.clone() },
             ),
             (
-                "runs 1/16, geometric, LIVED order".to_owned(),
-                TiledOpts {
-                    runs: Some(1.0 / 16.0),
-                    run_geometric: true,
-                    lived_order: true,
-                    ..base.clone()
-                },
+                "comparison: lived-order runs 1/8, curve shares recomputed at every close".to_owned(),
+                TiledOpts { run_curve: 2, ..lived.clone() },
             ),
         ];
         self.with_operation(|storage| {

@@ -175,6 +175,37 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             }
             memory.churn_anchor(&churn_options(&rest)?, &cs, out)
         }
+        "cover-compare" => {
+            // EXPERIMENTAL: cover-compare --chars N [--resident] --out-dir DIR
+            let mut budget = 800_000usize;
+            let mut resident = false;
+            let mut dir = ".".to_owned();
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--chars" => {
+                        budget = args
+                            .get(i + 1)
+                            .ok_or_else(|| anyhow!("--chars needs a value"))?
+                            .parse()?;
+                        i += 2;
+                    }
+                    "--out-dir" => {
+                        dir = args
+                            .get(i + 1)
+                            .ok_or_else(|| anyhow!("--out-dir needs a value"))?
+                            .clone();
+                        i += 2;
+                    }
+                    "--resident" => {
+                        resident = true;
+                        i += 1;
+                    }
+                    other => bail!("unknown flag {other}"),
+                }
+            }
+            memory.cover_compare(budget, resident, &dir, out)
+        }
         "runs-diag" => memory.runs_diag(churn_options(args)?.budget_chars, out),
         "churn-calendar" => memory.churn_calendar(&churn_options(args)?, out),
         "churn-tiled" => {
