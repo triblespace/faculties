@@ -1921,9 +1921,16 @@ pub fn select_tiled_recollection_cut(
                 .zip(observed)
                 .map(|(s, &o)| s.0 >= ta && s.0 < tb && o <= cutoff)
                 .collect();
+            // Targets cover lived time only: a tile of the absolute grid can
+            // begin before the first memory, and target characters placed on
+            // that unlived stretch would all snap to the earliest memories.
+            let lived = ta.max(earliest);
+            if lived >= tb {
+                continue;
+            }
             let (cover, used) = if opts.uniform {
                 let target = Uniform {
-                    life_ns: (tb - ta) as f64,
+                    life_ns: (tb - lived) as f64,
                     space: tile_space,
                 };
                 walk_targets(
@@ -1931,18 +1938,18 @@ pub fn select_tiled_recollection_cut(
                     costs,
                     &candidate,
                     &mut selected,
-                    ta,
+                    lived,
                     &target,
                     tile_space,
                 )
             } else {
-                let gradient = DensityGradient::new(tb - ta, tile_space);
+                let gradient = DensityGradient::new(tb - lived, tile_space);
                 walk(
                     spans,
                     costs,
                     &candidate,
                     &mut selected,
-                    ta,
+                    lived,
                     &gradient,
                     tile_space,
                 )
@@ -2507,13 +2514,17 @@ pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
         }
     }
     // The primary candidate: the clock-closed geometric grid over lived time.
+    // Experimental: COVER_OPEN_APPEND overrides the open unit's reserved
+    // fraction (default 0.04) for one-constant replays.
+    let open_fraction = std::env::var("COVER_OPEN_APPEND").ok()
+        .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.04);
     let topts = TiledOpts {
         anchor_ns: MOMENT_NS,
         frozen: false,
         uniform: true,
         cap_ns: None,
         closed_fraction: None,
-        open_append: Some(0.04),
+        open_append: Some(open_fraction),
         deep_weights: false,
         runs: None,
         run_geometric: false,
@@ -2562,7 +2573,7 @@ pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
     let mut lines = Vec::new();
     lines.push(format!(
         "budget {budget} chars; raw_memory {}; chunk_overhead {}; newest memory end {}; current cover {} entries / {} charged chars ({} text chars); \
-         candidate (clock-closed geometric grid, unit {} s, share mode {}, 4% append-only open unit{}, uniform in-tile targets, policy b) {} entries / {} charged chars ({} text chars), free {}, over budget {}, open unit dropped {} memories / {} chars",
+         candidate (clock-closed geometric grid, unit {} s, share mode {}, open fraction {open_fraction} append-only open unit{}, uniform in-tile targets, policy b) {} entries / {} charged chars ({} text chars), free {}, over budget {}, open unit dropped {} memories / {} chars",
         opts.raw_memory,
         opts.chunk_overhead,
         fmt_key(latest),

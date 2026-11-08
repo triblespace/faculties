@@ -423,8 +423,12 @@ impl Memory {
             open_cut_oldest: false,
         };
         let _ = (unit, cap);
+        // Experimental: COVER_OPEN_APPEND overrides the open unit's reserved
+        // fraction (default 0.04) for one-constant replays.
+        let open_append = std::env::var("COVER_OPEN_APPEND").ok()
+            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.04);
         let grid = TiledOpts {
-            open_append: Some(0.04),
+            open_append: Some(open_append),
             unit_ns: Some((1i128 << 16) * 1_000_000_000),
             open_cut_oldest: true,
             ..base.clone()
