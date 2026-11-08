@@ -236,6 +236,32 @@ impl Memory {
             .ok_or_else(|| anyhow!("churn diagnostic time span is too large"))?;
         self.with_operation(|storage| churn(storage, options, out))
     }
+    /// EXPERIMENTAL: replay the greedy walk beside the sealed-segment
+    /// selector for each carry ratio.
+    pub fn churn_sealed(
+        &self,
+        options: &ChurnOptions,
+        ratios: &[i128],
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        if options.step_units <= 0 {
+            bail!("churn step_units must be positive");
+        }
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for line in crate::memory_cover::sealed::replay_compare(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                options.budget_chars,
+                options.steps,
+                options.step_units,
+                ratios,
+            )? {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
     pub fn respan_instants(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| respan_instants(storage, dry_run, out))
     }

@@ -131,6 +131,28 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         "check" => memory.check(one("usage: memory check <grain>")?, out),
         "density" => memory.density(args.first().map(String::as_str), out),
         "churn" => memory.churn(&churn_options(args)?, out),
+        "churn-sealed" => {
+            // EXPERIMENTAL: `--ratio a,b,...` is taken here; the rest are churn's flags.
+            let mut rest = Vec::new();
+            let mut ratios: Vec<i128> = vec![32];
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--ratio" {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--ratio needs a value"))?;
+                    ratios = v
+                        .split(',')
+                        .map(|r| r.trim().parse().context("--ratio expects numbers"))
+                        .collect::<Result<_>>()?;
+                    i += 2;
+                } else {
+                    rest.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            memory.churn_sealed(&churn_options(&rest)?, &ratios, out)
+        }
         _ => memory.show_many(&cli.ids, out),
     }?;
     Ok(0)
