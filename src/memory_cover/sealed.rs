@@ -1557,6 +1557,8 @@ pub struct TiledCut {
     pub crossing: usize,
     /// Runs: `(rank, lo, hi, space, used)` oldest first.
     pub run_list: Vec<(u32, i128, i128, usize, usize)>,
+    /// Lived-order runs: the last member of every rank-0 close, oldest first.
+    pub closes: Vec<Id>,
     pub used: usize,
 }
 
@@ -1608,6 +1610,10 @@ pub struct TiledOpts {
     /// Runs: inside a closed run, today's log-age targets over the run's own
     /// span (finer toward its young end) instead of uniform targets.
     pub run_geometric: bool,
+    /// Runs in LIVED order: memories are walked by range end (then start,
+    /// then id), never by when they were written; see
+    /// [`select_lived_runs_recollection_cut`].
+    pub lived_order: bool,
 }
 
 /// Range-time order: start ascending, end descending, then intrinsic id.
@@ -1738,8 +1744,12 @@ pub fn select_tiled_recollection_cut(
         open_overflow: 0,
         crossing: 0,
         run_list: Vec::new(),
+        closes: Vec::new(),
         used: 0,
     };
+    if let (Some(open_frac), true) = (opts.runs, opts.lived_order) {
+        return select_lived_runs_recollection_cut(spans, costs, budget, open_frac, opts);
+    }
     if let Some(open_frac) = opts.runs {
         return select_runs_recollection_cut(spans, costs, observed, budget, open_frac, opts);
     }
@@ -1978,6 +1988,7 @@ pub fn select_runs_recollection_cut(
         open_overflow: 0,
         crossing: 0,
         run_list: Vec::new(),
+        closes: Vec::new(),
         used: 0,
     };
     let Some(earliest) = spans.iter().map(|s| s.0).min() else {
@@ -2129,6 +2140,182 @@ pub fn select_runs_recollection_cut(
     }
     out.used += used;
     let _ = opts;
+    out
+}
+
+/// Full-closed runs in LIVED order (JP, 2026-11-08: "the day the memories
+/// were written shouldn't affect the cover because it's using the time range
+/// they cover").
+///
+/// Every memory is walked in lived order: range end ascending, then start,
+/// then intrinsic id. The open run takes them in that order and closes when
+/// its characters reach `open_frac` of the budget; closed runs merge four into
+/// one by rank. Run boundaries therefore depend only on lived time and sizes;
+/// `created_at` does not enter. Closed runs share the rest of the budget
+/// equally per rank, evenly over a rank's runs, unspent passing younger.
+/// Inside a run that does not fit, today's walk picks a subset (geometric
+/// targets over the run's span with `run_geometric`, else uniform). Runs and
+/// the open run are emitted in lived order, so a memory ending after
+/// everything else is a pure append. A memory inserted earlier in lived order
+/// (written long after the period it covers) shifts every later boundary.
+pub fn select_lived_runs_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    budget: usize,
+    open_frac: f64,
+    opts: &TiledOpts,
+) -> TiledCut {
+    let mut out = TiledCut {
+        cover: Vec::new(),
+        levels: Vec::new(),
+        top: 0,
+        open_start: 0,
+        open_from: 0,
+        open_space: 0,
+        open_share: 0,
+        open_overflow: 0,
+        crossing: 0,
+        run_list: Vec::new(),
+        closes: Vec::new(),
+        used: 0,
+    };
+    if budget == 0 || spans.is_empty() {
+        return out;
+    }
+    let quantum = ((open_frac.clamp(0.0, 1.0) * budget as f64).floor() as usize).max(1);
+    out.open_share = quantum;
+    let mut order: Vec<usize> = (0..spans.len()).filter(|&i| costs[i] > 0).collect();
+    order.sort_by(|&a, &b| {
+        spans[a]
+            .1
+            .cmp(&spans[b].1)
+            .then(spans[a].0.cmp(&spans[b].0))
+            .then(spans[a].2.cmp(&spans[b].2))
+    });
+    // (rank, first position, end position) in `order`, oldest first.
+    let mut runs: Vec<(u32, usize, usize)> = Vec::new();
+    let mut first = 0usize;
+    let mut mass = 0usize;
+    for (p, &i) in order.iter().enumerate() {
+        mass += costs[i];
+        if mass >= quantum {
+            runs.push((0, first, p + 1));
+            out.closes.push(spans[i].2);
+            first = p + 1;
+            mass = 0;
+            while runs.len() >= 4 {
+                let n = runs.len();
+                let r = runs[n - 1].0;
+                if runs[n - 4..].iter().all(|x| x.0 == r) {
+                    let merged = (r + 1, runs[n - 4].1, runs[n - 1].2);
+                    runs.truncate(n - 4);
+                    runs.push(merged);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    let top = runs.iter().map(|r| r.0).max().unwrap_or(0);
+    out.top = top;
+    let closed = budget - quantum.min(budget);
+    let per_rank = closed / (top as usize + 1);
+    let mut carry = 0usize;
+    for rank in (0..=top).rev() {
+        let mine: Vec<(usize, usize)> = runs
+            .iter()
+            .filter(|r| r.0 == rank)
+            .map(|r| (r.1, r.2))
+            .collect();
+        let allowance = per_rank.saturating_add(carry).min(budget - out.used);
+        if mine.is_empty() {
+            carry = allowance;
+            continue;
+        }
+        let start = out.cover.len();
+        let mut spent = 0usize;
+        for (t, &(a, b)) in mine.iter().enumerate() {
+            let space = (allowance - spent) / (mine.len() - t);
+            let members = &order[a..b];
+            let lo = members.iter().map(|&i| spans[i].0).min().unwrap_or(0);
+            let hi = members.iter().map(|&i| spans[i].1).max().unwrap_or(lo);
+            let mass: usize = members.iter().map(|&i| costs[i]).sum();
+            let mut chosen: Vec<usize> = if mass <= space {
+                members.to_vec()
+            } else {
+                let mut candidate = vec![false; spans.len()];
+                for &i in members {
+                    candidate[i] = true;
+                }
+                if opts.run_geometric {
+                    let gradient = DensityGradient::new((hi - lo).max(1), space);
+                    walk(
+                        spans,
+                        costs,
+                        &candidate,
+                        &mut vec![false; spans.len()],
+                        lo,
+                        &gradient,
+                        space,
+                    )
+                    .0
+                } else {
+                    let target = Uniform {
+                        life_ns: (hi - lo).max(1) as f64,
+                        space,
+                    };
+                    walk_targets(
+                        spans,
+                        costs,
+                        &candidate,
+                        &mut vec![false; spans.len()],
+                        lo,
+                        &target,
+                        space,
+                    )
+                    .0
+                }
+            };
+            // Lived order inside the run too.
+            chosen.sort_by(|&x, &y| {
+                spans[x]
+                    .1
+                    .cmp(&spans[y].1)
+                    .then(spans[x].0.cmp(&spans[y].0))
+                    .then(spans[x].2.cmp(&spans[y].2))
+            });
+            let run_used: usize = chosen.iter().map(|&i| costs[i]).sum();
+            spent += run_used;
+            out.run_list.push((rank, lo, hi, space, run_used));
+            out.cover.extend(chosen);
+        }
+        out.levels.push(TileLevel {
+            level: rank,
+            tiles: mine.len(),
+            lower: spans[order[mine[0].0]].1,
+            upper: spans[order[mine[mine.len() - 1].1 - 1]].1,
+            allowance,
+            start,
+            len: out.cover.len() - start,
+            used: spent,
+        });
+        out.used += spent;
+        carry = allowance - spent;
+    }
+    let rest = budget - out.used;
+    out.open_space = rest;
+    out.open_from = out.cover.len();
+    out.open_start = order.get(first).map_or(i128::MAX, |&i| spans[i].0);
+    let mut used = 0usize;
+    for (k, &i) in order[first..].iter().enumerate() {
+        if used + costs[i] > rest {
+            out.open_overflow = order.len() - first - k;
+            break;
+        }
+        used += costs[i];
+        out.cover.push(i);
+    }
+    out.used += used;
     out
 }
 
@@ -2520,6 +2707,11 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let mut open_split_v = Vec::new();
         let mut whole_split_v = Vec::new();
         let mut age_v: Vec<[usize; 5]> = Vec::new();
+        let mut shifts = 0usize;
+        let mut shift_lcp: Vec<usize> = Vec::new();
+        let mut shift_runs_back: Vec<usize> = Vec::new();
+        let mut late_steps = 0usize;
+        let mut shift_with_late = 0usize;
         let mut free_v: Vec<usize> = Vec::new();
         let mut insertions = 0usize;
         let mut overflow_steps = 0usize;
@@ -2544,6 +2736,32 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 overflow_steps += 1;
             }
             crossing_last = cut.crossing;
+            if k > 0 && configs[c].1.lived_order {
+                let prev = &out_steps[k - 1].cuts[c];
+                const DAY: i128 = 86_400 * 1_000_000_000;
+                let late = (0..spans.len()).any(|i| {
+                    observed_at[i] > out_steps[k - 1].point
+                        && observed_at[i] <= s.point
+                        && observed_at[i] - spans[i].1 > DAY
+                });
+                if late {
+                    late_steps += 1;
+                }
+                if !cut.closes.starts_with(&prev.closes) {
+                    shifts += 1;
+                    if late {
+                        shift_with_late += 1;
+                    }
+                    shift_lcp.push(lcp_chars(&cut.cover, &prev.cover, &costs));
+                    let same = cut
+                        .closes
+                        .iter()
+                        .zip(&prev.closes)
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    shift_runs_back.push(prev.closes.len() - same);
+                }
+            }
             if k > 0 {
                 let prev = &out_steps[k - 1].cuts[c];
                 let closed_same = prev.open_from == cut.open_from
@@ -2716,7 +2934,7 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
              levels present at the last step {}\n    \
              whole cover by memory start age only, mean over all steps: <1 d {:.0}k, 1-7 d {:.0}k, 7-30 d {:.0}k, older {:.0}k\n    \
              elastic room (budget - used, characters free for the live part) over all steps: {}\n    \
-             runs at the last step (rank, span, space -> used): {}\n    {}",
+             runs at the last step (rank, span, space -> used): {}\n    {}{}",
             fills.iter().sum::<f64>() / fills.len().max(1) as f64,
             fills.iter().copied().fold(f64::INFINITY, f64::min),
             used_v.len(),
@@ -2768,6 +2986,25 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 ))
                 .collect::<Vec<_>>()
                 .join("; ")),
+            if configs[c].1.lived_order {
+                let mut l = shift_lcp.clone();
+                l.sort_unstable();
+                let mut rb = shift_runs_back.clone();
+                rb.sort_unstable();
+                format!(
+                    "lived order: steps with a late memory (observed more than 1 d after its range end) {late_steps}; rank-0 close sequence \
+                     NOT a continuation of the previous one (a boundary shift) on {shifts} transitions, {shift_with_late} of them with a late memory; \
+                     on those, first changed entry at mean {:.0}k / median {}k / min {}k characters into the cover, and the first moved close lies a \
+                     median {} (max {}) rank-0 closes back\n    ",
+                    mean(&l) / 1e3,
+                    l.get(l.len() / 2).copied().unwrap_or(0) / 1000,
+                    l.first().copied().unwrap_or(0) / 1000,
+                    rb.get(rb.len() / 2).copied().unwrap_or(0),
+                    rb.last().copied().unwrap_or(0),
+                )
+            } else {
+                String::new()
+            },
             lvls.join("\n    "),
         ));
     }
@@ -2898,6 +3135,7 @@ mod tests {
                     deep_weights: false,
                     runs: None,
                     run_geometric: false,
+                    lived_order: false,
                 },
                 None,
             );
@@ -2955,6 +3193,7 @@ mod tests {
                 deep_weights: false,
                 runs: None,
                 run_geometric: false,
+                lived_order: false,
             },
             None,
         );
@@ -3089,6 +3328,7 @@ mod tests {
                 deep_weights: false,
                 runs: None,
                 run_geometric: false,
+                lived_order: false,
             };
             let cut =
                 select_tiled_recollection_cut(&spans, &costs, &observed, 300_000, &opts, None);
@@ -3111,6 +3351,7 @@ mod tests {
             deep_weights: false,
             runs: Some(0.1),
             run_geometric: false,
+            lived_order: false,
         };
         let mut previous: Option<TiledCut> = None;
         let mut appends = 0;
@@ -3136,5 +3377,27 @@ mod tests {
             previous = Some(cut);
         }
         assert!(appends > 0);
+    }
+
+    #[test]
+    fn lived_order_runs_ignore_when_memories_were_written() {
+        let (spans, costs, observed) = journal(30);
+        let opts = TiledOpts {
+            anchor_ns: MOMENT_NS,
+            frozen: false,
+            uniform: true,
+            cap_ns: None,
+            closed_fraction: None,
+            open_append: None,
+            deep_weights: false,
+            runs: Some(0.1),
+            run_geometric: true,
+            lived_order: true,
+        };
+        let a = select_tiled_recollection_cut(&spans, &costs, &observed, 60_000, &opts, None);
+        let shuffled: Vec<i128> = observed.iter().rev().copied().collect();
+        let b = select_tiled_recollection_cut(&spans, &costs, &shuffled, 60_000, &opts, None);
+        assert_eq!(a.cover, b.cover);
+        assert!(a.used <= 60_000 && !a.closes.is_empty());
     }
 }
