@@ -152,6 +152,31 @@ impl Orient {
         out: &mut Out<'_>) -> Result<()> {
         self.show_reporting(persona, options, false, out)
     }
+    /// Host startup uses the same overview with one call-scoped acquisition
+    /// deadline. Buffering any prefix is not successful completion or delivery.
+    pub(crate) fn show_unpresented_controlled(&self, persona: &str, options: &ShowOptions,
+        control: triblespace::core::repo::async_store::AcquiringReadControl,
+        out: &mut Out<'_>) -> Result<()> {
+        anyhow::ensure!(!options.evaluate_habits, "controlled startup overview requires passive Habits");
+        self.storage.scope(|storage| {
+            let (mut pile, signer, runtime) = crate::storage::BorrowedStore::open(
+                storage.clone(), control.clone(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?;
+            let quota = quota_section(storage, &mut pile, &signer, &runtime);
+            control.check()?;
+            let result = runtime.block_on(cmd_show(
+                storage, &mut pile, &signer, storage.path(), Some(persona),
+                options.message_limit, options.doing_limit, options.todo_limit,
+                false, self.health_max_age, self.service_events_collection,
+                &quota, false, out,
+            ));
+            // Quota and health rendering are best effort. Even if a display
+            // helper absorbed interruption, a partial overview cannot succeed.
+            control.check()?;
+            result
+        })
+    }
     fn show_reporting(&self, persona: Option<&str>, options: &ShowOptions,
         record_presented: bool, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
@@ -333,7 +358,7 @@ impl Orient {
     }
 }
 
-use crate::collection_names::{open_configured, open_exact_in, open_exact_read_in};
+use crate::collection_names::{open_configured, open_exact_in, open_workspace_read_in};
 use crate::memory_cover::{render_cover_report, CoverOpts};
 use crate::out::Out;
 use crate::schemas::archive::archive;
@@ -769,7 +794,9 @@ impl OrientSource {
             let snapshot = pile.snapshot()?;
             read(pile, &snapshot, |reader| {
                 if explicit {
-                    open_exact_read_in(reader, scope, authority, handle)
+                    // Explicit workspace roles select exact named roots, not
+                    // canonical CLI names. Keep the same READ authority check.
+                    open_workspace_read_in(reader, authority, handle)
                 } else {
                     open_exact_in(reader, scope, handle)
                 }
@@ -1356,7 +1383,8 @@ async fn observe_current_sources_acquiring(
     pile: &mut impl FacultyAccess,
     sources: &OrientSources,
 ) -> Result<OrientObservation> {
-    observe_snapshot_acquiring(pile.snapshot()?, sources, true).await
+    start_observation(pile.snapshot()?, sources, true, pile.read_control())
+        .await.context("join frozen Orient input selection")?
 }
 
 /// Borrowed inputs for one declarative Orient query.
@@ -3800,8 +3828,10 @@ async fn cmd_show(
             .await?
             .with_service_events(pile, signer, service_events_collection)
             .await?;
-        let health = health_sources.observe_acquiring(pile, signer).await?;
-        let health_report = health.report_acquiring().await?;
+        let control = pile.read_control();
+        let health = health_sources.observe_acquiring(pile, signer, control).await?;
+        let health_report = health.report_acquiring(pile.read_control()).await?;
+        if let Some(control) = pile.read_control() { control.check()?; }
         write_complete_report(
             output,
             &health_report.text,
@@ -3902,6 +3932,7 @@ async fn cmd_show(
         report.push_str(&window_status);
         report.push_str(quota);
 
+        if let Some(control) = pile.read_control() { control.check()?; }
         write_complete_report(output, &report, "Orient overview", &mut |_| {}).await?;
 
         if record_presented && persona_id.is_some() {
@@ -6437,7 +6468,8 @@ mod tests {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
             let mut routes = crate::storage::CollectionRoutes::new();
-            // The alternate descriptors differ from all signer-private defaults.
+            // Explicit roles may name independent workspace roots, not just
+            // canonical faculty names with a different authority policy.
             for scope in [
                 MESSAGE_SCOPE_ID,
                 MAIL_SCOPE_ID,
@@ -6453,7 +6485,7 @@ mod tests {
             ] {
                 let collection = pile
                     .collection(
-                        crate::collection_names::require_name(scope),
+                        &format!("isolated-workspace-{}", crate::collection_names::require_name(scope)),
                         CollectionPolicy::new(
                             AdmissionPolicy::Open,
                             AdmissionPolicy::direct(fixture.signer.verifying_key()),
@@ -6568,7 +6600,7 @@ mod tests {
             let foreign = SigningKey::from_bytes(&[98; 32]);
             let read_only = pile
                 .collection(
-                    "message",
+                    "isolated-workspace-message",
                     CollectionPolicy::new(
                         AdmissionPolicy::Open,
                         AdmissionPolicy::direct(foreign.verifying_key()),
@@ -6577,7 +6609,7 @@ mod tests {
                 .unwrap();
             let denied = pile
                 .collection(
-                    "relations",
+                    "isolated-workspace-relations",
                     CollectionPolicy::new(
                         AdmissionPolicy::direct(foreign.verifying_key()),
                         AdmissionPolicy::direct(fixture.signer.verifying_key()),
@@ -6586,7 +6618,7 @@ mod tests {
                 .unwrap();
             let read_only_receipts = pile
                 .collection(
-                    "orient-receipts",
+                    "orient-receipts-isolated-zooid",
                     CollectionPolicy::new(
                         AdmissionPolicy::Open,
                         AdmissionPolicy::direct(foreign.verifying_key()),
@@ -6608,6 +6640,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(source.source, read_only, "a read must not require WRITE");
+            // The non-workspace canonical-name contract is unchanged.
+            let snapshot = pile.snapshot().unwrap();
+            let error = open_exact_in(&snapshot, MESSAGE_SCOPE_ID, read_only.handle()).unwrap_err();
+            assert!(format!("{error:#}").contains("not expected faculty collection"));
             let error = OrientSource::open(
                 &routing,
                 &mut pile,

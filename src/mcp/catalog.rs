@@ -183,6 +183,20 @@ impl Catalog {
         self.orient.prepare_next(arguments)
     }
 
+    /// One host startup overview, not a new tool or alternate inbox evaluator.
+    /// Uses the registered Show decoder and ordinary bounded native collector;
+    /// only a complete successful result may be admitted by the host. Partial
+    /// output remains an error, and no Presented receipt is recorded.
+    pub fn invoke_startup_show(&self, arguments: super::Bytes, limits: super::Limits,
+        cancelled: &AtomicBool,
+        control: triblespace::core::repo::async_store::AcquiringReadControl,
+    ) -> Result<super::NativeResult> {
+        anyhow::ensure!(control.deadline().is_some(), "startup overview requires one absolute deadline");
+        super::native_argument_budget(&arguments, limits)?;
+        super::invoke_native(&self.orient.startup_show(control), "orient_show", arguments,
+            limits.response_bytes, cancelled)
+    }
+
     /// Borrow the same adapters for an HTTP listener.
     pub fn registrations(&self) -> Vec<&dyn Faculty> {
         self.faculties

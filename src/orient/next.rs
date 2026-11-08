@@ -209,6 +209,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_receipt_name(crate::schemas::orient::RECEIPT_COLLECTION_NAME)
+        }
+
+        fn with_receipt_name(receipt_name: &str) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let pile = directory.path().join("wait.pile");
             let key = directory.path().join("wait.key");
@@ -219,6 +223,9 @@ mod tests {
                 let mut routes = CollectionRoutes::new(); // Fixture's explicit config, not cached facts.
                 for (scope, name) in crate::collection_names::table() {
                     let authority = AdmissionPolicy::direct(signer.verifying_key());
+                    let name = if scope == crate::schemas::orient::RECEIPTS_SCOPE_ID {
+                        receipt_name
+                    } else { name };
                     routes.insert(scope, store.collection(name,
                         CollectionPolicy::new(authority.clone(), authority))?.handle());
                 }
@@ -268,11 +275,144 @@ mod tests {
         fn drop(&mut self) { self.storage.close().unwrap(); }
     }
 
+    fn startup_arguments(persona: Id) -> anybytes::Bytes {
+        anybytes::Bytes::from(serde_json::to_vec(&serde_json::json!({
+            "persona": fmt_id(persona), "message_limit": 64,
+            "doing_limit": 0, "todo_limit": 0, "evaluate_habits": false,
+        })).unwrap())
+    }
+
+    #[test]
+    fn startup_catalog_whole_overview_is_unpresented_and_message_unread() {
+        use crate::mcp::catalog::{Catalog, Config};
+        let fixture = Fixture::new();
+        fixture.storage.with_store(|store, signer, _| {
+            use crate::schemas::swarm_health::{Component, Condition, Recorder, State};
+            let health = store.collection(crate::schemas::swarm_health::COLLECTION_NAME,
+                crate::collection_names::private_policy(signer.verifying_key()))?;
+            let report = Recorder::new(signer.verifying_key()).record(clock::now()?, [
+                Condition { component: Component::Store, collection: None, peer: None,
+                    state: State::Stalled, alert: true },
+            ])?;
+            store.commit(health, signer, report)?;
+            Ok(())
+        }).unwrap();
+        let catalog = Catalog::with_native_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
+        let result = catalog.invoke_startup_show(startup_arguments(fixture.persona),
+            crate::mcp::Limits::default(), &AtomicBool::new(false),
+            AcquiringReadControl::new(Some(Instant::now() + Duration::from_secs(20)))).unwrap();
+        assert!(!result.is_error);
+        assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("Swarm health (local observations)"))));
+        assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("  serving snapshot: stalled\n"))));
+        assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("complete native report\n    with second line"))));
+        assert!(!fixture.presented());
+        fixture.storage.with_store(|store, signer, runtime| {
+            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+            let facts = store.snapshot()?.collection(sources.messages.source)?.view::<TribleSet>()?;
+            assert!(!exists!(pattern!(&facts, [{
+                crate::schemas::message::local::about_message: fixture.event,
+                crate::schemas::message::local::reader: fixture.persona,
+            }])));
+            let receipts = store.snapshot()?.collection(sources.presentations.source)?.view::<TribleSet>()?;
+            assert!(!exists!(pattern!(&receipts, [{ presentation::event: _?event }])));
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn startup_catalog_health_prefix_then_ordinary_error_is_not_success() {
+        use crate::mcp::catalog::{Catalog, Config};
+        let fixture = Fixture::new();
+        let mut routes = fixture.storage.collection_routes().unwrap().clone();
+        routes.remove(&crate::schemas::message::DEFAULT_SCOPE_ID);
+        let catalog = Catalog::with_native_storage(Config::new(fixture.storage.path()),
+            fixture.storage.clone().with_collections(routes));
+        let result = catalog.invoke_startup_show(startup_arguments(fixture.persona),
+            crate::mcp::Limits::default(), &AtomicBool::new(false),
+            AcquiringReadControl::new(Some(Instant::now() + Duration::from_secs(20)))).unwrap();
+        assert!(result.is_error);
+        assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("Swarm health (local observations)"))));
+        assert!(!result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("complete native report"))));
+        assert!(!fixture.presented());
+    }
+
+    #[test]
+    fn startup_busy_owner_deadline_and_cancel_join_without_entering() {
+        use crate::mcp::catalog::{Catalog, Config};
+        let fixture = Fixture::new();
+        for cancel in [false, true] {
+            let catalog = Arc::new(Catalog::with_native_storage(
+                Config::new(fixture.storage.path()), fixture.storage.clone()));
+            let args = startup_arguments(fixture.persona);
+            let control = AcquiringReadControl::new(Some(Instant::now() + Duration::from_millis(50)));
+            fixture.storage.with_store(|_, _, _| {
+                let worker_control = control.clone();
+                let worker = std::thread::spawn(move || catalog.invoke_startup_show(
+                    args, crate::mcp::Limits::default(), &AtomicBool::new(false), worker_control));
+                if cancel { control.cancel(); }
+                let result = worker.join().unwrap().unwrap();
+                assert!(result.is_error);
+                assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+                    if text.contains(if cancel { "cancelled" } else { "deadline" }))));
+                Ok(())
+            }).unwrap();
+        }
+        assert!(!fixture.presented());
+    }
+
+    #[test]
+    fn startup_interruption_after_health_or_final_output_cannot_complete() {
+        let fixture = Fixture::new();
+        for after_ordinary in [false, true] {
+            let control = AcquiringReadControl::new(Some(Instant::now() + Duration::from_secs(20)));
+            let mut parts = Vec::new();
+            let mut emit = |part: Part| {
+                if matches!(&part, Part::Text { text } if text.contains(
+                    if after_ordinary { "complete native report" } else { "Swarm health (local observations)" })) {
+                    control.cancel();
+                }
+                parts.push(part);
+                Ok(()) // Buffer acceptance must not turn interruption into success.
+            };
+            let error = Orient::with_storage(fixture.storage.clone()).show_unpresented_controlled(
+                &fmt_id(fixture.persona), &ShowOptions { message_limit: 64,
+                    doing_limit: 0, todo_limit: 0, evaluate_habits: false },
+                control.clone(), &mut Out::new(&mut emit)).unwrap_err();
+            assert!(format!("{error:#}").contains("cancelled"));
+            assert!(parts.iter().any(|part| matches!(part, Part::Text { text }
+                if text.contains("Swarm health (local observations)"))));
+            assert!(!fixture.presented());
+        }
+    }
+
+    #[test]
+    fn startup_ordinary_snapshot_reader_honors_cancel_and_absolute_deadline() {
+        let fixture = Fixture::new();
+        fixture.storage.with_store(|store, signer, runtime| {
+            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+            for cancel in [false, true] {
+                let control = AcquiringReadControl::new(Some(Instant::now()));
+                if cancel { control.cancel(); }
+                let result = runtime.block_on(async {
+                    start_observation(store.snapshot()?, &sources, true, Some(control)).await?
+                });
+                let error = result.err().expect("interrupted snapshot must not complete");
+                assert!(format!("{error:#}").contains(if cancel { "cancelled" } else { "deadline" }));
+            }
+            Ok(())
+        }).unwrap();
+    }
+
     #[test]
     fn native_catalog_observations_do_not_present_and_generic_delivery_still_does() {
         use crate::mcp::catalog::{Catalog, Config};
         for name in ["orient_show", "orient_wake", "orient_poll"] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::with_receipt_name("orient-receipts-isolated-zooid");
             let goal = fixture.storage.with_store(|store, signer, runtime| {
                 let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
                 let (fragment, goal) = compass::goal_fragment("native overview goal",
@@ -339,6 +479,49 @@ mod tests {
         next.acknowledge(report).unwrap();
         assert!(next.is_settled());
         assert!(fixture.presented());
+    }
+
+    #[test]
+    fn custom_named_receipt_routes_keep_next_acknowledgment_isolated() {
+        let fixture = Fixture::with_receipt_name("orient-receipts-isolated-zooid");
+        // Another explicitly selected receipt root shares the same sources,
+        // signer and event. Even those identical inputs must not merge receipt
+        // state merely because the two roots serve the same faculty role.
+        let other = fixture.storage.with_store(|store, signer, _| {
+            Ok(store.collection("orient-receipts-another-zooid",
+                crate::collection_names::private_policy(signer.verifying_key()))?)
+        }).unwrap();
+        let mut routes = fixture.storage.collection_routes().unwrap().clone();
+        routes.insert(crate::schemas::orient::RECEIPTS_SCOPE_ID, other.handle());
+        let alternate = fixture.storage.clone().with_collections(routes);
+        let other_presented = || alternate.try_with_store(|store, _, _| {
+            let facts = store.snapshot()?.collection(other)?.view::<TribleSet>()?;
+            Ok(exists!(pattern!(&facts, [{ presentation::event: fixture.event }])))
+        }).unwrap().expect("prepared report must release the shared owner");
+
+        let mut first = fixture.start();
+        let report = first.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(report.kind(), NextKind::Report);
+        assert!(!fixture.presented());
+        assert!(!other_presented());
+        first.acknowledge(report).unwrap();
+        assert!(fixture.presented());
+        assert!(!other_presented(), "acceptance must affect only the selected root");
+
+        let mut second = Orient::with_storage(alternate.clone())
+            .begin_next(&fmt_id(fixture.persona), &WaitOptions {
+                timeout: Some(Duration::from_secs(20)),
+                poll_interval: Duration::from_millis(10), ..Default::default()
+            }).unwrap().start().unwrap();
+        let report = second.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(report.kind(), NextKind::Report);
+        assert!(report.parts().iter().any(|part| matches!(part, Part::Text { text }
+            if text.contains("complete native report\nwith second line"))));
+        assert!(!other_presented(), "first root's receipt must not suppress this report");
+        second.acknowledge(report).unwrap();
+        assert!(second.is_settled());
+        assert!(fixture.presented());
+        assert!(other_presented());
     }
 
     #[test]

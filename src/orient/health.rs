@@ -148,6 +148,7 @@ impl HealthSources {
         &self,
         pile: &mut impl FacultyAccess,
         signer: &SigningKey,
+        control: Option<triblespace::core::repo::async_store::AcquiringReadControl>,
     ) -> Result<HealthObservation> {
         let _receipt_note = self.maintain(pile, signer)?;
         let snapshot = pile.snapshot()?;
@@ -165,7 +166,11 @@ impl HealthSources {
             .transpose()?;
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
-            let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            let mut reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            if let Some(control) = &control {
+                control.check()?;
+                reader = reader.with_control(control.clone());
+            }
             let observe = |source: OrientSource| -> Result<OrientFact> {
                 let collection = reader.attached_acquiring(source.rank9)?;
                 let view = crate::storage::acquire_attached_facts(&collection)?;
@@ -1365,7 +1370,9 @@ impl HealthObservation {
     /// A requested dashboard may wait for its exact selected facts and labels.
     /// Passive health attention deliberately does not: a disconnected observer
     /// must be able to report the outage before ordinary network acquisition.
-    pub(super) async fn report_acquiring(&self) -> Result<HealthReport> {
+    pub(super) async fn report_acquiring(&self,
+        control: Option<triblespace::core::repo::async_store::AcquiringReadControl>,
+    ) -> Result<HealthReport> {
         let facts = self.facts.view.clone();
         let latest = self.latest.clone();
         let snapshot = self.snapshot.clone();
@@ -1378,7 +1385,11 @@ impl HealthObservation {
             .map(|source| source.view.clone());
         let people = self.relations.view.clone();
         tokio::task::spawn_blocking(move || {
-            let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            let mut reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            if let Some(control) = &control {
+                control.check()?;
+                reader = reader.with_control(control.clone());
+            }
             let mut report = render_health(&facts, &latest, &reader, now, max_age, Detail::Full);
             if let Some(facts) = service_events {
                 service_events::append_report(&mut report, &facts, &snapshot, true);
@@ -1392,10 +1403,11 @@ impl HealthObservation {
                 now,
                 Detail::Full,
             );
-            report
+            if let Some(control) = &control { control.check()?; }
+            Ok(report)
         })
         .await
-        .context("join requested health report acquisition")
+        .context("join requested health report acquisition")?
     }
 
     pub(super) async fn persona_acquiring(
@@ -3637,12 +3649,34 @@ mod tests {
         test_block_on(async {
             let observation = f
                 .sources
-                .observe_acquiring(&mut f.store, &f.signer)
+                .observe_acquiring(&mut f.store, &f.signer, None)
                 .await
                 .unwrap();
-            let report = observation.report_acquiring().await.unwrap();
+            let report = observation.report_acquiring(None).await.unwrap();
             assert!(report.text.contains("not observed / not configured"));
             assert!(report.attention.is_empty());
+        });
+    }
+
+    #[test]
+    fn startup_health_selection_and_report_honor_cancel_and_deadline() {
+        use triblespace::core::repo::async_store::AcquiringReadControl;
+        let mut f = Fixture::new();
+        test_block_on(async {
+            let observation = f.sources.observe_acquiring(&mut f.store, &f.signer, None)
+                .await.unwrap();
+            for cancel in [false, true] {
+                let control = AcquiringReadControl::new(Some(Instant::now()));
+                if cancel { control.cancel(); }
+                // The ordinary fixture store has no call control. These two
+                // workers must honor the explicit control on their raw readers.
+                let error = f.sources.observe_acquiring(&mut f.store, &f.signer, Some(control.clone()))
+                    .await.err().expect("interrupted health selection");
+                assert!(format!("{error:#}").contains(if cancel { "cancelled" } else { "deadline" }));
+                let error = observation.report_acquiring(Some(control)).await
+                    .err().expect("interrupted health rendering");
+                assert!(format!("{error:#}").contains(if cancel { "cancelled" } else { "deadline" }));
+            }
         });
     }
 

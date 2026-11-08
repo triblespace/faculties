@@ -10,6 +10,7 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::time::Duration;
+use triblespace::core::repo::async_store::AcquiringReadControl;
 
 pub struct Orient {
     operations: super::Orient,
@@ -67,6 +68,44 @@ impl Orient {
             timeout: Some(Duration::from_secs(a.timeout_secs)),
             ..Default::default()
         })
+    }
+
+    /// Ephemeral host adapter: shares registration/decoding, never retains a
+    /// startup deadline on the ordinary adapter or shared observation caches.
+    pub(crate) fn startup_show(&self, control: AcquiringReadControl) -> impl Faculty + '_ {
+        StartupShow { orient: self, control }
+    }
+
+    fn call_show(&self, arguments: Bytes, control: Option<AcquiringReadControl>,
+        out: &mut Out<'_>) -> Result<()> {
+        let a: Show = decode_arguments(arguments)?;
+        let operations = self.operations.clone().with_health_max_age(Duration::from_secs(
+            a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
+        ));
+        let options = ShowOptions { message_limit: a.message_limit,
+            doing_limit: a.doing_limit, todo_limit: a.todo_limit,
+            evaluate_habits: a.evaluate_habits };
+        if let Some(control) = control {
+            if !self.native || a.evaluate_habits
+                || a.persona.as_deref().is_none_or(|persona| persona.trim().is_empty()) {
+                return Err(crate::mcp::invalid_arguments(
+                    "startup orient_show requires a native adapter, explicit persona and passive Habits"));
+            }
+            operations.show_unpresented_controlled(a.persona.as_deref().unwrap(), &options, control, out)
+        } else if self.native { operations.show_unpresented(a.persona.as_deref(), &options, out) }
+        else { operations.show(a.persona.as_deref(), &options, out) }
+    }
+}
+
+struct StartupShow<'a> {
+    orient: &'a Orient,
+    control: AcquiringReadControl,
+}
+impl Faculty for StartupShow<'_> {
+    fn tools(&self) -> &[Tool] { self.orient.tools() }
+    fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
+        anyhow::ensure!(name == "orient_show", "startup adapter only invokes orient_show");
+        self.orient.call_show(arguments, Some(self.control.clone()), out)
     }
 }
 
@@ -158,17 +197,7 @@ impl Faculty for Orient {
                 }
             }
             "orient_show" => {
-                let a: Show = decode_arguments(arguments)?;
-                let operations = self.operations
-                    .clone()
-                    .with_health_max_age(Duration::from_secs(
-                        a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
-                    ));
-                let options = ShowOptions { message_limit: a.message_limit,
-                    doing_limit: a.doing_limit, todo_limit: a.todo_limit,
-                    evaluate_habits: a.evaluate_habits };
-                if self.native { operations.show_unpresented(a.persona.as_deref(), &options, out) }
-                else { operations.show(a.persona.as_deref(), &options, out) }
+                self.call_show(arguments, None, out)
             }
             "orient_wake" => {
                 let a: Wake = decode_arguments(arguments)?;
