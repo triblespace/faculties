@@ -126,10 +126,9 @@ enum Command {
     /// The memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
-    /// With `--sealed-head [tiled|anchored]`, the cover is selected with a
-    /// rule that has a stable sealed head (default: the base-4 tiled cover),
-    /// and the recalls of that head (always the leading recalls) also carry
-    /// `"sealed": true`.
+    /// With `--sealed-head`, the cover is selected by the grid unless
+    /// `--selector` says otherwise, and the recalls of its sealed head (always
+    /// the leading recalls) also carry `"sealed": true`.
     Wake {
         /// CHARACTER budget for the memory cover — the wake ritual is for
         /// wholeness, so the default is generous (matches the SessionStart hook);
@@ -155,16 +154,21 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// Select the memory cover with a rule that has a stable SEALED HEAD
-        /// and mark the recalls of that head with `"sealed": true`, so a
-        /// harness can keep one saved prompt prefix at the head's end across
-        /// wakes. The head leads the recalls. `tiled` (the default when the
-        /// flag is given without a value): the base-4 tiled cover, head = tile
-        /// levels from 2 (3-day tiles) up. `anchored`: the c = 7
-        /// quantized-anchor walk. Only with `--pairs`.
-        #[arg(long, requires = "pairs", num_args = 0..=1, default_missing_value = "tiled",
-            value_parser = ["tiled", "anchored"])]
-        sealed_head: Option<String>,
+        /// Mark the recalls of the cover's SEALED HEAD with `"sealed": true`,
+        /// so a harness can keep one saved prompt prefix at the head's end
+        /// across wakes. The head leads the recalls: with the grid, every
+        /// level up to the young end of level 1. Implies `--selector grid`
+        /// unless `--selector` is given; with `--selector walk` (the rollback)
+        /// nothing is sealed and the pairs are byte-identical to a wake
+        /// without this flag. Only with `--pairs`.
+        #[arg(long, requires = "pairs")]
+        sealed_head: bool,
+        /// The rule that selects the memory cover: `walk` (today's greedy
+        /// walk; the default without `--sealed-head`, and the rollback) or
+        /// `grid` (the clock-closed geometric grid over lived time). Only with
+        /// `--pairs`.
+        #[arg(long, requires = "pairs", value_parser = ["walk", "grid"])]
+        selector: Option<String>,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
     /// goals. Never records presentation.
@@ -389,6 +393,19 @@ fn chrono_duration_to_std(duration: ChronoDuration) -> Duration {
     }
 }
 
+/// The cover selector of `orient wake --pairs`: `--selector` when given;
+/// otherwise the grid with `--sealed-head` (the selector behind it) and the
+/// walk without.
+fn wake_selector(selector: Option<&str>, sealed_head: bool) -> crate::memory_cover::Selector {
+    use crate::memory_cover::Selector;
+    match selector {
+        Some("grid") => Selector::Grid,
+        Some(_) => Selector::Walk,
+        None if sealed_head => Selector::Grid,
+        None => Selector::Walk,
+    }
+}
+
 pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         out.line(Cli::command().render_help().to_string())?;
@@ -422,6 +439,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             raw_memory,
             chunk_overhead,
             sealed_head,
+            selector,
         } => {
             // Diagnostics are about the memory selection, not part of any
             // pair, and stdout carries nothing but the pairs.
@@ -430,10 +448,8 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     chars,
                     chunk_overhead,
                     raw_memory,
-                    sealed_head: sealed_head.as_deref().map(|rule| match rule {
-                        "anchored" => crate::memory_cover::SealedHead::Anchored,
-                        _ => crate::memory_cover::SealedHead::Tiled,
-                    }),
+                    selector: wake_selector(selector.as_deref(), sealed_head),
+                    sealed_head,
                     doing_limit,
                     todo_limit,
                 },
@@ -793,26 +809,46 @@ mod tests {
     }
 
     #[test]
-    fn sealed_head_flag_requires_pairs_and_defaults_to_tiled() {
+    fn sealed_head_implies_the_grid_and_the_walk_is_the_default_and_rollback() {
+        use crate::memory_cover::Selector::{Grid, Walk};
         let parse = |args: &[&str]| {
             let mut argv = vec!["orient", "--pile", "unused.pile", "wake"];
             argv.extend_from_slice(args);
             Cli::try_parse_from(argv)
         };
         assert!(parse(&["--sealed-head"]).is_err());
-        assert!(parse(&["--pairs", "--sealed-head", "other"]).is_err());
-        for (args, expected) in [
-            (&["--pairs"][..], None),
-            (&["--pairs", "--sealed-head"][..], Some("tiled")),
+        assert!(parse(&["--selector", "grid"]).is_err());
+        assert!(parse(&["--pairs", "--selector", "tiled"]).is_err());
+        assert!(parse(&["--pairs", "--sealed-head", "tiled"]).is_err());
+        for (args, sealed, selector) in [
+            (&["--pairs"][..], false, Walk),
+            (&["--pairs", "--sealed-head"][..], true, Grid),
+            (&["--pairs", "--selector", "grid"][..], false, Grid),
             (
-                &["--pairs", "--sealed-head", "anchored"][..],
-                Some("anchored"),
+                &["--pairs", "--sealed-head", "--selector", "walk"][..],
+                true,
+                Walk,
+            ),
+            (
+                &["--pairs", "--selector", "grid", "--sealed-head"][..],
+                true,
+                Grid,
             ),
         ] {
-            let Some(Command::Wake { sealed_head, .. }) = parse(args).unwrap().command else {
+            let Some(Command::Wake {
+                sealed_head,
+                selector: chosen,
+                ..
+            }) = parse(args).unwrap().command
+            else {
                 panic!("wake")
             };
-            assert_eq!(sealed_head.as_deref(), expected, "{args:?}");
+            assert_eq!(sealed_head, sealed, "{args:?}");
+            assert_eq!(
+                wake_selector(chosen.as_deref(), sealed_head),
+                selector,
+                "{args:?}"
+            );
         }
     }
 

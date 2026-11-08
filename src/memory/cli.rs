@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
              memory <from>..<to>              — show best summary covering a time range\n  \
              memory raw <full-id>             — selected text bytes, without trimming or added newline\n  \
              memory meta <from>..<to>         — show structural metadata for a time range\n  \
-             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] [--tag <tag>]... [--without-tag <tag>]... — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). --tag <tag> (repeatable) is the crisp counterpart of --filter: keeps ONLY memories carrying every given tag (AND); --without-tag <tag> (repeatable) drops memories carrying any of them; names are trimmed and lowercased as `create --tag` writes them, and no score or threshold is involved. They all compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning.\n  \
+             memory context [<budget>] [--chars N] [--chunk-overhead N] [--about <query>] [--filter <query>] [--remove <query>] [--sim-threshold <f>] [--tag <tag>]... [--without-tag <tag>]... [--selector walk|grid] — density-shaped, deliberately lossy recollection over journaled time in greedy SPACE order, fit to a CHARACTER budget (bare <budget>, --chars N, or the --tokens N alias all count CHARACTERS — there is no token estimate). A continuous logarithmic-age gradient maps each candidate length to an ideal temporal slot and chooses the actual range whose endpoints match best; wide old arcs emerge from that shape rather than a special coverage rule, so gaps, overlap, wobbling temporal centres, and unsampled detail are valid while the pile remains lossless. --chunk-overhead charges N additional character-equivalents per selected chunk for consumer framing/tokenization without changing stored summaries or rendered text; --about chooses the recollection most relevant to <query> by MEANING only when multiple memories have exactly the same temporal coverage (semantic through the WeMM index when WEMM_PILE names the model and `memory index` has rows; otherwise exact lexical BM25 is rebuilt automatically) and never changes the temporal sampler; --filter <query> keeps ONLY chunks whose positive similarity to <query> exceeds --sim-threshold (default 0.55); --remove <query> is the anti-filter — drops chunks whose similarity EXCEEDS the threshold (negate in the retrieval, NOT the query text; do not phrase a negation). --tag <tag> (repeatable) is the crisp counterpart of --filter: keeps ONLY memories carrying every given tag (AND); --without-tag <tag> (repeatable) drops memories carrying any of them; names are trimmed and lowercased as `create --tag` writes them, and no score or threshold is involved. They all compose. NOTE: gating is chunk-level — a surviving COARSE memory's pre-written summary may still mention removed material. Unindexed wordless images are kept (fail-open) with a stderr warning. --selector grid selects with the clock-closed geometric grid over lived time instead (base-4 tiles of 2^16 s on an absolute grid, equal shares per level, uniform targets in each tile, then the append-only open unit); the walk is the default and the rollback.\n  \
              memory cover start [--chars N] [--chunk-chars M] [--session KEY] — generate the context cover (exactly `memory context --chars N`; N=400000) and store it for cursor-chunked reading in ~M-char chunks (M=20000); state lives in `${XDG_CACHE_HOME:-~/.cache}/faculties/cover/<KEY>/`, NOT the pile\n  \
              memory cover continue [--session KEY] — print the next stored chunk and advance the cursor; the final chunk ends with `COVER COMPLETE K/K`\n  \
              memory cover status [--session KEY]  — one line: complete=<true|false> loaded=<i>/<K> chars=<X>/<Y>; exit 0 when complete, 1 when not (hook-friendly)\n  \
@@ -331,6 +331,9 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
     // when present either wins over the bare positional (a backward-compatible
     // fallback — it also means characters).
     let mut chars_explicit = false;
+    // `--selector walk|grid`: the rule that selects the cover. The walk is the
+    // default and the rollback.
+    let mut selector = crate::memory_cover::Selector::Walk;
     {
         // A value flag consumes the following args up to the NEXT recognized flag
         // (or end), so multi-word queries stay unquoted AND `--about`/`--filter`/
@@ -347,6 +350,7 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
                     | "--sim-threshold"
                     | "--tag"
                     | "--without-tag"
+                    | "--selector"
             )
         };
         let mut i = 0;
@@ -376,6 +380,18 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
                 } else {
                     without_tags.push(tag.clone());
                 }
+                i += 2;
+                continue;
+            }
+            if args[i] == "--selector" {
+                selector = match args.get(i + 1).map(String::as_str) {
+                    Some("walk") => crate::memory_cover::Selector::Walk,
+                    Some("grid") => crate::memory_cover::Selector::Grid,
+                    other => bail!(
+                        "--selector expects `walk` or `grid`, got {}",
+                        other.map_or("nothing".to_owned(), |v| format!("`{v}`"))
+                    ),
+                };
                 i += 2;
                 continue;
             }
@@ -434,7 +450,8 @@ fn context_options(args: &[String]) -> Result<CoverOpts> {
         sim_threshold,
         tags,
         without_tags,
-        sealed_head: None,
+        selector,
+        sealed_head: false,
     })
 }
 
@@ -540,4 +557,30 @@ fn comb_persona() -> Result<String> {
              enduring memory stream and are never persona-scoped."
         )
     })
+}
+
+#[cfg(test)]
+mod context_option_tests {
+    use super::context_options;
+    use crate::memory_cover::Selector;
+
+    fn parse(args: &[&str]) -> anyhow::Result<crate::memory_cover::CoverOpts> {
+        context_options(&args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_walk_is_the_default_and_grid_is_named() {
+        assert_eq!(parse(&["--chars", "900"]).unwrap().selector, Selector::Walk);
+        assert_eq!(
+            parse(&["--selector", "walk"]).unwrap().selector,
+            Selector::Walk
+        );
+        let grid = parse(&["--about", "lamps", "--selector", "grid", "--chars", "900"]).unwrap();
+        assert_eq!(grid.selector, Selector::Grid);
+        assert_eq!(grid.about.as_deref(), Some("lamps"));
+        assert_eq!(grid.budget_chars, 900);
+        assert!(!grid.sealed_head);
+        assert!(parse(&["--selector"]).is_err());
+        assert!(parse(&["--selector", "tiled"]).is_err());
+    }
 }

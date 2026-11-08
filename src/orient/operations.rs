@@ -63,9 +63,11 @@ pub struct WakePairsOptions {
     pub chunk_overhead: usize,
     /// Exact selected Memory text; ordinary image placeholders are unchanged.
     pub raw_memory: bool,
-    /// Select the memory cover with a sealed-head rule and mark its head:
-    /// each head recall carries `"sealed": true`. `None`: unchanged pairs.
-    pub sealed_head: Option<crate::memory_cover::SealedHead>,
+    /// The rule that selects the memory cover; the walk by default.
+    pub selector: crate::memory_cover::Selector,
+    /// Mark the selector's sealed head: each head recall carries
+    /// `"sealed": true`. The walk has none, so with it the pairs are unchanged.
+    pub sealed_head: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
 }
@@ -76,7 +78,8 @@ impl Default for WakePairsOptions {
             chars: wake.chars,
             chunk_overhead: 0,
             raw_memory: false,
-            sealed_head: None,
+            selector: crate::memory_cover::Selector::Walk,
+            sealed_head: false,
             doing_limit: wake.doing_limit,
             todo_limit: wake.todo_limit,
         }
@@ -6085,6 +6088,7 @@ async fn cmd_wake_pairs(
     let mut cover_opts = CoverOpts::plain(options.chars);
     cover_opts.chunk_overhead = options.chunk_overhead;
     cover_opts.raw_memory = options.raw_memory;
+    cover_opts.selector = options.selector;
     cover_opts.sealed_head = options.sealed_head;
     let selection = wake_selection(
         routing,
