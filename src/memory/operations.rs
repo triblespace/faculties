@@ -290,6 +290,38 @@ impl Memory {
             Ok(())
         })
     }
+    /// EXPERIMENTAL: replay the greedy walk beside the calendar-unit grid in
+    /// eight configurations: moment or unit shares, Thursday weeks or none,
+    /// arrival policy a (frozen) or b (immediate).
+    pub fn churn_calendar(&self, options: &ChurnOptions, out: &mut Out<'_>) -> Result<()> {
+        if options.step_units <= 0 {
+            bail!("churn step_units must be positive");
+        }
+        let moment = (crate::memory::MOMENT_SECONDS * 1e9) as i128;
+        let unit = crate::memory_cover::REPLAY_QUANTUM_NS;
+        let mut configs = Vec::new();
+        for (aname, anchor) in [("moment", moment), ("unit", unit)] {
+            for (wname, weeks) in [("thursday-weeks", true), ("no-weeks", false)] {
+                for (pname, frozen) in [("a-frozen", true), ("b-immediate", false)] {
+                    configs.push((format!("{aname}/{wname}/{pname}"), anchor, weeks, frozen));
+                }
+            }
+        }
+        self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            for line in crate::memory_cover::sealed::replay_calendar(
+                &loaded.memory.facts,
+                &loaded.memory.reader,
+                options.budget_chars,
+                options.steps,
+                options.step_units,
+                &configs,
+            )? {
+                out.line(line)?;
+            }
+            Ok(())
+        })
+    }
     /// EXPERIMENTAL: replay the greedy walk beside the tiled selector, one
     /// configuration per gradient anchor (`moment` = 3 s, `unit` = 2^14 s).
     pub fn churn_tiled(

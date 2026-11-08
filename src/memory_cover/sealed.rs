@@ -845,6 +845,669 @@ pub fn replay_anchored<B: BlobStoreGet, P: TriblePattern>(
 }
 
 // ---------------------------------------------------------------------------
+// calendar-unit grid: years, months, (weeks,) days, hours of today, in UTC
+// ---------------------------------------------------------------------------
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if m <= 2 {
+            yoe + era * 400 + 1
+        } else {
+            yoe + era * 400
+        },
+        m,
+        d,
+    )
+}
+
+/// Monday = 0 (1970-01-01 was a Thursday).
+fn weekday(z: i64) -> i64 {
+    (z + 3).rem_euclid(7)
+}
+
+/// TAI key of `hour`:00 UTC on day `z`.
+fn utc_key(z: i64, hour: u8) -> i128 {
+    let (y, m, d) = civil_from_days(z);
+    Epoch::from_gregorian_utc_hms(y as i32, m as u8, d as u8, hour, 0, 0)
+        .to_tai_duration()
+        .total_nanoseconds()
+}
+
+/// UTC day number and hour of a TAI key.
+fn utc_day_hour(key: i128) -> (i64, u8) {
+    let (y, m, d, h, _, _, _) = key_to_epoch(key).to_gregorian_utc();
+    (days_from_civil(y as i64, m as i64, d as i64), h)
+}
+
+pub const CAL_HOUR: u32 = 0;
+pub const CAL_DAY: u32 = 1;
+pub const CAL_WEEK: u32 = 2;
+pub const CAL_MONTH: u32 = 3;
+pub const CAL_YEAR: u32 = 4;
+
+pub fn cal_level_name(level: u32) -> &'static str {
+    ["hour", "day", "week", "month", "year"][level as usize]
+}
+
+/// The sampling slots for a newest memory end `latest`, coarsest first, as
+/// `(level, start, end)` TAI keys, plus the start of the open hour.
+///
+/// Complete years before the current one, complete months of the current year
+/// before the current month, [complete weeks of the current month before the
+/// current week,] complete days before today, complete hours of today before
+/// the current hour. With `weeks`, a week belongs to the month (and year) of
+/// its Thursday, so months and years begin on the Monday of the week holding
+/// their 4th of the month (ISO 8601's rule for years) and everything nests.
+/// Without weeks, months and years are the calendar's own.
+pub fn calendar_slots(earliest: i128, latest: i128, weeks: bool) -> (Vec<(u32, i128, i128)>, i128) {
+    let (z_now, h_now) = utc_day_hour(latest);
+    let (z_first, _) = utc_day_hour(earliest);
+    let mut slots = Vec::new();
+    let monday = |z: i64| z - weekday(z);
+    if weeks {
+        let w0 = monday(z_now);
+        let (y0, m0, _) = civil_from_days(w0 + 3);
+        let month_start = |y: i64, m: i64| monday(days_from_civil(y, m, 4));
+        let (wy_first, _, _) = civil_from_days(monday(z_first) + 3);
+        for y in wy_first..y0 {
+            slots.push((
+                CAL_YEAR,
+                utc_key(month_start(y, 1), 0),
+                utc_key(month_start(y + 1, 1), 0),
+            ));
+        }
+        for m in 1..m0 {
+            slots.push((
+                CAL_MONTH,
+                utc_key(month_start(y0, m), 0),
+                utc_key(month_start(y0, m + 1), 0),
+            ));
+        }
+        let mut w = month_start(y0, m0);
+        while w < w0 {
+            slots.push((CAL_WEEK, utc_key(w, 0), utc_key(w + 7, 0)));
+            w += 7;
+        }
+        for z in w0..z_now {
+            slots.push((CAL_DAY, utc_key(z, 0), utc_key(z + 1, 0)));
+        }
+    } else {
+        let (y0, m0, d0) = civil_from_days(z_now);
+        let (y_first, _, _) = civil_from_days(z_first);
+        for y in y_first..y0 {
+            slots.push((
+                CAL_YEAR,
+                utc_key(days_from_civil(y, 1, 1), 0),
+                utc_key(days_from_civil(y + 1, 1, 1), 0),
+            ));
+        }
+        for m in 1..m0 {
+            slots.push((
+                CAL_MONTH,
+                utc_key(days_from_civil(y0, m, 1), 0),
+                utc_key(days_from_civil(y0, m + 1, 1), 0),
+            ));
+        }
+        for d in 1..d0 {
+            let z = days_from_civil(y0, m0, d);
+            slots.push((CAL_DAY, utc_key(z, 0), utc_key(z + 1, 0)));
+        }
+    }
+    for h in 0..h_now {
+        slots.push((CAL_HOUR, utc_key(z_now, h), utc_key(z_now, h + 1)));
+    }
+    (slots, utc_key(z_now, h_now))
+}
+
+/// One slot of a [`CalendarCut`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalSlot {
+    pub start: i128,
+    pub end: i128,
+    pub allowance: usize,
+    pub entries: usize,
+    pub used: usize,
+}
+
+/// One calendar level of a [`CalendarCut`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalLevel {
+    pub level: u32,
+    pub slots: Vec<CalSlot>,
+    pub allowance: usize,
+    /// Entries `cover[start..start + len]` belong to this level.
+    pub start: usize,
+    pub len: usize,
+    pub used: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalendarCut {
+    pub cover: Vec<usize>,
+    pub levels: Vec<CalLevel>,
+    pub years: usize,
+    pub open_start: i128,
+    pub open_space: usize,
+    pub used: usize,
+}
+
+impl CalendarCut {
+    pub fn level_entries(&self, level: u32) -> &[usize] {
+        self.levels
+            .iter()
+            .find(|l| l.level == level)
+            .map_or(&[][..], |l| &self.cover[l.start..l.start + l.len])
+    }
+    pub fn level_span(&self, level: u32) -> Option<(i128, i128, usize)> {
+        self.levels.iter().find(|l| l.level == level).map(|l| {
+            (
+                l.slots.first().map_or(0, |s| s.start),
+                l.slots.last().map_or(0, |s| s.end),
+                l.slots.len(),
+            )
+        })
+    }
+}
+
+/// The calendar-unit selector. Slots come from [`calendar_slots`]. Each
+/// level's share of the budget is the log-age gradient's mass over that
+/// level's nominal band (hour 1 h..1 d, day 1 d..1 w or 1 mo, week 1 w..1 mo,
+/// month 1 mo..1 y, year 1 y..(years+1) y), normalised over 0..(years+1) y,
+/// with anchor `A` (3 s = today's shape, 2^14 s = the 2026-09-05 tiled
+/// shape). A level's allowance (share plus what older levels left) is split
+/// evenly over its slots, unspent passing on; inside each slot today's greedy
+/// walk chooses among memories that START in the slot. With `frozen`, a
+/// level's candidates are only those observed by the first observation at
+/// which the journal's lived edge reached the end of the level's newest slot
+/// (policy a); otherwise every memory is a candidate at once (policy b). The
+/// open hour, with whatever is left, is today's walk over everything not yet
+/// taken. Pure in the pile, the budget and the declared constants.
+pub fn select_calendar_recollection_cut(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    observed: &[i128],
+    budget: usize,
+    anchor_ns: i128,
+    weeks: bool,
+    frozen: bool,
+) -> CalendarCut {
+    let mut out = CalendarCut {
+        cover: Vec::new(),
+        levels: Vec::new(),
+        years: 0,
+        open_start: 0,
+        open_space: 0,
+        used: 0,
+    };
+    let (Some(earliest), Some(latest)) = (
+        spans.iter().map(|s| s.0).min(),
+        spans.iter().map(|s| s.1).max(),
+    ) else {
+        return out;
+    };
+    if budget == 0 {
+        return out;
+    }
+    let (slots, open_start) = calendar_slots(earliest, latest, weeks);
+    out.open_start = open_start;
+    let years = slots.iter().filter(|s| s.0 == CAL_YEAR).count();
+    out.years = years;
+    const HOUR: f64 = 3600.0;
+    const DAY: f64 = 86_400.0;
+    const WEEK: f64 = 604_800.0;
+    const MONTH: f64 = 2_629_746.0;
+    const YEAR: f64 = 31_556_952.0;
+    let a = anchor_ns.max(1) as f64 / 1e9;
+    let norm = ((a + (years as f64 + 1.0) * YEAR) / a).ln();
+    let band = |lo: f64, hi: f64| ((a + hi) / (a + lo)).ln() / norm * budget as f64;
+    let share = |level: u32| -> usize {
+        (match level {
+            CAL_HOUR => band(HOUR, DAY),
+            CAL_DAY => band(DAY, if weeks { WEEK } else { MONTH }),
+            CAL_WEEK => band(WEEK, MONTH),
+            CAL_MONTH => band(MONTH, YEAR),
+            _ => band(YEAR, (years as f64 + 1.0) * YEAR),
+        })
+        .floor() as usize
+    };
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by(|&x, &y| {
+        observed[x]
+            .cmp(&observed[y])
+            .then(spans[x].2.cmp(&spans[y].2))
+    });
+    let mut edges: Vec<(i128, i128)> = Vec::with_capacity(order.len());
+    let mut edge = i128::MIN;
+    for &i in &order {
+        edge = edge.max(spans[i].1);
+        edges.push((edge, observed[i]));
+    }
+    let strike = |end: i128| -> i128 {
+        let k = edges.partition_point(|&(e, _)| e < end);
+        edges.get(k).map_or(i128::MAX, |&(_, o)| o)
+    };
+    let mut selected = vec![false; spans.len()];
+    let mut carry = 0usize;
+    let levels: &[u32] = if weeks {
+        &[CAL_YEAR, CAL_MONTH, CAL_WEEK, CAL_DAY, CAL_HOUR]
+    } else {
+        &[CAL_YEAR, CAL_MONTH, CAL_DAY, CAL_HOUR]
+    };
+    for &level in levels {
+        let mine: Vec<(i128, i128)> = slots
+            .iter()
+            .filter(|s| s.0 == level)
+            .map(|s| (s.1, s.2))
+            .collect();
+        let allowance = share(level).saturating_add(carry).min(budget - out.used);
+        if mine.is_empty() {
+            carry = allowance;
+            continue;
+        }
+        let cutoff = if frozen {
+            strike(mine.last().expect("non-empty").1)
+        } else {
+            i128::MAX
+        };
+        let start = out.cover.len();
+        let mut spent = 0usize;
+        let mut cal_slots = Vec::new();
+        for (t, &(sa, sb)) in mine.iter().enumerate() {
+            let left = allowance - spent;
+            let space = left / (mine.len() - t);
+            let mut slot = CalSlot {
+                start: sa,
+                end: sb,
+                allowance: space,
+                entries: 0,
+                used: 0,
+            };
+            if space > 0 {
+                let candidate: Vec<bool> = spans
+                    .iter()
+                    .zip(observed)
+                    .map(|(s, &o)| s.0 >= sa && s.0 < sb && o <= cutoff)
+                    .collect();
+                let gradient = DensityGradient::new(sb - sa, space);
+                let (cover, used) = walk(
+                    spans,
+                    costs,
+                    &candidate,
+                    &mut selected,
+                    sa,
+                    &gradient,
+                    space,
+                );
+                slot.entries = cover.len();
+                slot.used = used;
+                out.cover.extend(cover);
+                spent += used;
+            }
+            cal_slots.push(slot);
+        }
+        out.levels.push(CalLevel {
+            level,
+            slots: cal_slots,
+            allowance,
+            start,
+            len: out.cover.len() - start,
+            used: spent,
+        });
+        out.used += spent;
+        carry = allowance - spent;
+    }
+    let rest = budget - out.used;
+    out.open_space = rest;
+    let gradient = DensityGradient::new((latest - open_start).max(1), rest);
+    let candidate = vec![true; spans.len()];
+    let (open, used) = walk(
+        spans,
+        costs,
+        &candidate,
+        &mut selected,
+        open_start,
+        &gradient,
+        rest,
+    );
+    out.cover.extend(open);
+    out.used += used;
+    out
+}
+
+/// Replay the walk in use beside calendar-grid configurations
+/// `(name, anchor, weeks, frozen)`.
+pub fn replay_calendar<B: BlobStoreGet, P: TriblePattern>(
+    space: &P,
+    ws: &B,
+    budget: usize,
+    steps: usize,
+    step_units: i128,
+    configs: &[(String, i128, bool, bool)],
+) -> Result<Vec<String>> {
+    let raw_spans = collect_chunk_spans(space);
+    let (spans, classes) = recollection_classes(&raw_spans);
+    let (observed_at, unobserved) = recollection_class_observations(space, &raw_spans, &classes);
+    let mut lines = Vec::new();
+    let Some(latest_observation) = observed_at.iter().copied().max() else {
+        lines.push("no memory chunks".into());
+        return Ok(lines);
+    };
+    let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
+    let mut class_costs: Vec<Option<usize>> = vec![None; spans.len()];
+    let mut costs = Vec::with_capacity(spans.len());
+    for i in 0..spans.len() {
+        costs.push(recollection_class_cost(
+            ws,
+            space,
+            &raw_spans,
+            &mut raw_costs,
+            &classes,
+            &mut class_costs,
+            i,
+            false,
+        )?);
+    }
+    let step_ns = step_units.max(1) * REPLAY_QUANTUM_NS;
+    let pct = |x: usize| 100.0 * x as f64 / budget.max(1) as f64;
+    struct Step {
+        point: i128,
+        base: Vec<usize>,
+        base_used: usize,
+        cuts: Vec<CalendarCut>,
+        silent: Vec<bool>,
+    }
+    let mut base_silent = 0usize;
+    let mut out_steps: Vec<Step> = Vec::new();
+    for k in (0..=steps).rev() {
+        let point = latest_observation - (k as i128) * step_ns;
+        let map: Vec<usize> = (0..spans.len())
+            .filter(|&i| observed_at[i] <= point)
+            .collect();
+        if map.is_empty() {
+            continue;
+        }
+        let sub: Vec<_> = map.iter().map(|&i| spans[i]).collect();
+        let sub_costs: Vec<_> = map.iter().map(|&i| costs[i]).collect();
+        let sub_obs: Vec<_> = map.iter().map(|&i| observed_at[i]).collect();
+        let base = select_recollection_cut(&sub, &sub_costs, &vec![true; sub.len()], budget);
+        if !silent_life_quarters(&sub, &base.cover).is_empty() {
+            base_silent += 1;
+        }
+        let mut cuts = Vec::new();
+        let mut silent = Vec::new();
+        for (_, anchor, weeks, frozen) in configs {
+            let mut cut = select_calendar_recollection_cut(
+                &sub, &sub_costs, &sub_obs, budget, *anchor, *weeks, *frozen,
+            );
+            silent.push(!silent_life_quarters(&sub, &cut.cover).is_empty());
+            for x in cut.cover.iter_mut() {
+                *x = map[*x];
+            }
+            cuts.push(cut);
+        }
+        out_steps.push(Step {
+            point,
+            base: base.cover.iter().map(|&j| map[j]).collect(),
+            base_used: base.used,
+            cuts,
+            silent,
+        });
+    }
+    lines.push(format!(
+        "frame: budget {budget} CHARACTERS; {} replay points ({} transitions) of {step_units} x 2^14 s, observation (created_at) {} to {}; \
+         {} exact-span classes ({} with range-end fallback); figures are rendered cover characters compared as entry sequences; \
+         calendar in UTC (hifitime, leap seconds included), keys TAI",
+        out_steps.len(),
+        out_steps.len().saturating_sub(1),
+        fmt_key(out_steps.first().map_or(latest_observation, |s| s.point)),
+        fmt_key(latest_observation),
+        spans.len(),
+        unobserved,
+    ));
+    let changed: Vec<usize> = (1..out_steps.len())
+        .filter(|&k| out_steps[k].base != out_steps[k - 1].base)
+        .collect();
+    let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+    let base_used: Vec<usize> = changed.iter().map(|&k| out_steps[k].base_used).collect();
+    let base_lcp: Vec<usize> = changed
+        .iter()
+        .map(|&k| lcp_chars(&out_steps[k].base, &out_steps[k - 1].base, &costs))
+        .collect();
+    let mut summary = vec![format!(
+        "walk in use: {} of {} transitions changed the cover; on those mean cover {:.0}k, reused with today's single saved prefix 0, \
+         common entry prefix {:.0}k; mean fill {:.1}%; {} step(s) silent > LIFE/4",
+        changed.len(),
+        out_steps.len().saturating_sub(1),
+        mean(&base_used) / 1e3,
+        mean(&base_lcp) / 1e3,
+        out_steps.iter().map(|s| pct(s.base_used)).sum::<f64>() / out_steps.len().max(1) as f64,
+        base_silent,
+    )];
+    for (c, (name, _, weeks, _)) in configs.iter().enumerate() {
+        let order: Vec<u32> = if *weeks {
+            vec![CAL_YEAR, CAL_MONTH, CAL_WEEK, CAL_DAY, CAL_HOUR]
+        } else {
+            vec![CAL_YEAR, CAL_MONTH, CAL_DAY, CAL_HOUR]
+        };
+        lines.push(String::new());
+        lines.push(format!(
+            "== calendar {name}: levels coarsest first as name:slots:used (* = changed); resume = reused if the backend could resume at the \
+             deepest unchanged level; at-<level> = reused with ONE prefix saved at the end of that level"
+        ));
+        lines.push(format!(
+            "{:<20} {:>8} {:>6} {:>7} {:>8} {:>8} {:>8} {:>8}  levels | open",
+            "observed", "used", "fill%", "open", "resume", "at-month", "at-week", "lcp"
+        ));
+        let mut fills = Vec::new();
+        let mut silent_steps = 0usize;
+        let (mut resume_v, mut lcp_v, mut used_v, mut open_v) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut at_v: Vec<Vec<usize>> = vec![Vec::new(); 5];
+        let mut lvl_used: Vec<Vec<usize>> = vec![Vec::new(); 5];
+        let (mut own, mut cascade, mut other) = (vec![0usize; 5], vec![0usize; 5], vec![0usize; 5]);
+        for (k, s) in out_steps.iter().enumerate() {
+            let cut = &s.cuts[c];
+            fills.push(pct(cut.used));
+            if s.silent[c] {
+                silent_steps += 1;
+            }
+            let open_used = cut.used - cut.levels.iter().map(|l| l.used).sum::<usize>();
+            for l in &cut.levels {
+                lvl_used[l.level as usize].push(l.used);
+            }
+            let mut cells = Vec::new();
+            let (mut resume, mut lcp) = (0usize, 0usize);
+            let mut at = vec![0usize; 5];
+            if k > 0 {
+                let prev = &out_steps[k - 1].cuts[c];
+                let mut intact = prev.years == cut.years;
+                let mut coarser_changed = !intact;
+                let mut through: Vec<(u32, bool, usize)> = Vec::new();
+                for &l in &order {
+                    let same_span = cut.level_span(l) == prev.level_span(l);
+                    let same = prev.years == cut.years
+                        && same_span
+                        && cut.level_entries(l) == prev.level_entries(l);
+                    let used = cut
+                        .levels
+                        .iter()
+                        .find(|x| x.level == l)
+                        .map_or(0, |x| x.used);
+                    if same && intact {
+                        resume += used;
+                    } else {
+                        intact = false;
+                    }
+                    if !same {
+                        if coarser_changed {
+                            cascade[l as usize] += 1;
+                        } else if !same_span {
+                            own[l as usize] += 1;
+                        } else {
+                            other[l as usize] += 1;
+                        }
+                        coarser_changed = true;
+                    }
+                    through.push((l, same, used));
+                    if let Some(x) = cut.levels.iter().find(|x| x.level == l) {
+                        cells.push(format!(
+                            "{}{}:{}:{}",
+                            if same { "" } else { "*" },
+                            cal_level_name(l),
+                            x.slots.len(),
+                            x.used
+                        ));
+                    }
+                }
+                for (j, &(l, _, _)) in through.iter().enumerate() {
+                    if through[..=j].iter().all(|&(_, s, _)| s) {
+                        at[l as usize] = through[..=j].iter().map(|&(_, _, u)| u).sum();
+                    }
+                }
+                lcp = lcp_chars(&cut.cover, &prev.cover, &costs);
+                if changed.contains(&k) {
+                    resume_v.push(resume);
+                    for l in 0..5 {
+                        at_v[l].push(at[l]);
+                    }
+                    lcp_v.push(lcp);
+                    used_v.push(cut.used);
+                    open_v.push(open_used);
+                }
+            } else {
+                for x in &cut.levels {
+                    cells.push(format!(
+                        "{}:{}:{}",
+                        cal_level_name(x.level),
+                        x.slots.len(),
+                        x.used
+                    ));
+                }
+            }
+            lines.push(format!(
+                "{:<20} {:>8} {:>5.1}% {:>7} {:>8} {:>8} {:>8} {:>8}  {} | {}{}",
+                fmt_key(s.point),
+                cut.used,
+                pct(cut.used),
+                open_used,
+                resume,
+                at[CAL_MONTH as usize],
+                if *weeks { at[CAL_WEEK as usize] } else { 0 },
+                lcp,
+                cells.join(" "),
+                open_used,
+                if s.silent[c] { "  SILENT>LIFE/4" } else { "" }
+            ));
+        }
+        let total = |v: &[usize]| v.iter().sum::<usize>();
+        let reread = |v: &[usize]| (total(&used_v) - total(v)) as f64 / 1e6;
+        let ats: Vec<String> = order
+            .iter()
+            .map(|&l| {
+                let v = &at_v[l as usize];
+                let zero = v.iter().filter(|&&x| x == 0).count();
+                format!(
+                    "at-{} {:.0}k (reread {:.1}M, zero reuse on {zero})",
+                    cal_level_name(l),
+                    mean(v) / 1e3,
+                    reread(v)
+                )
+            })
+            .collect();
+        let lv: Vec<String> = order
+            .iter()
+            .map(|&l| {
+                let i = l as usize;
+                format!(
+                    "{}: mean {:.0}k chars over {} steps present; changed on {} transitions: {} by its own slot set, {} by a coarser change, {} by content alone",
+                    cal_level_name(l),
+                    mean(&lvl_used[i]) / 1e3,
+                    lvl_used[i].len(),
+                    own[i] + cascade[i] + other[i],
+                    own[i],
+                    cascade[i],
+                    other[i]
+                )
+            })
+            .collect();
+        summary.push(format!(
+            "calendar {name}: mean fill {:.1}% (min {:.1}%), {silent_steps} step(s) silent > LIFE/4; on the {} changed transitions (mean cover {:.0}k, \
+             open hour mean {:.0}k): reused mean resume-at-deepest-unchanged {:.0}k (reread {:.1}M), {}, common entry prefix {:.0}k (reread {:.1}M); \
+             walk in use: single prefix reread {:.1}M, common-prefix reread {:.1}M\n    {}",
+            fills.iter().sum::<f64>() / fills.len().max(1) as f64,
+            fills.iter().copied().fold(f64::INFINITY, f64::min),
+            used_v.len(),
+            mean(&used_v) / 1e3,
+            mean(&open_v) / 1e3,
+            mean(&resume_v) / 1e3,
+            reread(&resume_v),
+            ats.join(", "),
+            mean(&lcp_v) / 1e3,
+            reread(&lcp_v),
+            total(&base_used) as f64 / 1e6,
+            (total(&base_used) - total(&base_lcp)) as f64 / 1e6,
+            lv.join("\n    "),
+        ));
+    }
+    // The slot structure at the last step, for the policy-(b) configurations.
+    if let Some(last) = out_steps.last() {
+        for (c, (name, _, _, frozen)) in configs.iter().enumerate() {
+            if *frozen || !name.contains("moment") {
+                continue;
+            }
+            let cut = &last.cuts[c];
+            lines.push(String::new());
+            lines.push(format!(
+                "== slot structure at {} for calendar {name}",
+                fmt_key(last.point)
+            ));
+            for l in &cut.levels {
+                for s in &l.slots {
+                    lines.push(format!(
+                        "  {:<5} {}  allowance {:>7}  used {:>7}  entries {:>4}",
+                        cal_level_name(l.level),
+                        format_time_range(key_to_epoch(s.start), key_to_epoch(s.end)),
+                        s.allowance,
+                        s.used,
+                        s.entries
+                    ));
+                }
+            }
+            let open_used = cut.used - cut.levels.iter().map(|l| l.used).sum::<usize>();
+            lines.push(format!(
+                "  open  from {}  space {:>7}  used {:>7}  (today's walk; may fall back on any memory not yet taken)",
+                fmt_key(cut.open_start),
+                cut.open_space,
+                open_used
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push("== summary".into());
+    lines.extend(summary);
+    Ok(lines)
+}
+
+// ---------------------------------------------------------------------------
 // tiled recollection: the old LSM's base-4 tile counter, the greedy walk in each tile
 // ---------------------------------------------------------------------------
 
@@ -1566,5 +2229,72 @@ mod tests {
             previous = Some(cut);
         }
         assert!(held > 0);
+    }
+
+    #[test]
+    fn civil_day_arithmetic_round_trips_and_knows_mondays() {
+        for z in [-800_000i64, -1, 0, 1, 19_000, 20_000, 20_765, 400_000] {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z);
+        }
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        // 2026-11-09 is a Monday; 2026-11-08 a Sunday.
+        assert_eq!(weekday(days_from_civil(2026, 11, 9)), 0);
+        assert_eq!(weekday(days_from_civil(2026, 11, 8)), 6);
+    }
+
+    #[test]
+    fn calendar_slots_nest_without_gaps() {
+        let latest = utc_key(days_from_civil(2026, 11, 8), 12) + 1_234_000_000_000;
+        let earliest = utc_key(days_from_civil(2024, 8, 26), 0);
+        for weeks in [true, false] {
+            let (slots, open) = calendar_slots(earliest, latest, weeks);
+            assert!(slots.first().unwrap().1 <= earliest);
+            for w in slots.windows(2) {
+                assert_eq!(w[0].2, w[1].1, "slots must tile time ({weeks})");
+                assert!(w[0].0 >= w[1].0, "coarser first ({weeks})");
+            }
+            assert_eq!(slots.last().unwrap().2, open);
+            assert_eq!(open, utc_key(days_from_civil(2026, 11, 8), 12));
+            assert_eq!(slots.iter().filter(|s| s.0 == CAL_HOUR).count(), 12);
+        }
+        // With weeks: Sunday 8 Nov 2026 is in the week of Monday 2 Nov, whose
+        // Thursday (5 Nov) is in November, which starts on Monday 2 Nov.
+        let (slots, _) = calendar_slots(earliest, latest, true);
+        assert_eq!(slots.iter().filter(|s| s.0 == CAL_WEEK).count(), 0);
+        assert_eq!(slots.iter().filter(|s| s.0 == CAL_DAY).count(), 6);
+    }
+
+    #[test]
+    fn frozen_calendar_level_changes_only_with_its_slots_or_a_coarser_change() {
+        let (spans, costs, observed) = journal(60);
+        let mut previous: Option<CalendarCut> = None;
+        for hours in (40 * 24..60 * 24).step_by(5) {
+            let now = 1_000 * 24 * H + hours * H;
+            let vis: Vec<usize> = (0..spans.len()).filter(|&i| observed[i] <= now).collect();
+            let s: Vec<_> = vis.iter().map(|&i| spans[i]).collect();
+            let c: Vec<_> = vis.iter().map(|&i| costs[i]).collect();
+            let o: Vec<_> = vis.iter().map(|&i| observed[i]).collect();
+            let mut cut =
+                select_calendar_recollection_cut(&s, &c, &o, 60_000, MOMENT_NS, true, true);
+            assert!(cut.used <= 60_000);
+            for x in cut.cover.iter_mut() {
+                *x = vis[*x];
+            }
+            if let Some(prev) = previous.take() {
+                if prev.years == cut.years {
+                    let mut coarser_same = true;
+                    for l in [CAL_YEAR, CAL_MONTH, CAL_WEEK, CAL_DAY, CAL_HOUR] {
+                        let span_same = prev.level_span(l) == cut.level_span(l);
+                        let same = prev.level_entries(l) == cut.level_entries(l);
+                        if coarser_same && span_same {
+                            assert!(same, "level {l} changed by content alone under policy a");
+                        }
+                        coarser_same &= same && span_same;
+                    }
+                }
+            }
+            previous = Some(cut);
+        }
     }
 }

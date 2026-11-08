@@ -175,6 +175,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             }
             memory.churn_anchor(&churn_options(&rest)?, &cs, out)
         }
+        "churn-calendar" => memory.churn_calendar(&churn_options(args)?, out),
         "churn-tiled" => {
             // EXPERIMENTAL: `--anchor moment,unit` names the gradient anchors to compare.
             let mut rest = Vec::new();
