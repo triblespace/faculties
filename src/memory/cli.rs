@@ -180,6 +180,8 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             let mut budget = 800_000usize;
             let mut resident = false;
             let mut dir = ".".to_owned();
+            let mut unit_exp = 14u32;
+            let mut elastic = false;
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -201,10 +203,21 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                         resident = true;
                         i += 1;
                     }
+                    "--unit-exp" => {
+                        unit_exp = args
+                            .get(i + 1)
+                            .ok_or_else(|| anyhow!("--unit-exp needs a value"))?
+                            .parse()?;
+                        i += 2;
+                    }
+                    "--open-elastic" => {
+                        elastic = true;
+                        i += 1;
+                    }
                     other => bail!("unknown flag {other}"),
                 }
             }
-            memory.cover_compare(budget, resident, &dir, out)
+            memory.cover_compare(budget, resident, &dir, unit_exp, elastic, out)
         }
         "runs-diag" => memory.runs_diag(churn_options(args)?.budget_chars, out),
         "churn-calendar" => memory.churn_calendar(&churn_options(args)?, out),

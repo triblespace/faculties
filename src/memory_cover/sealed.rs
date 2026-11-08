@@ -1559,6 +1559,8 @@ pub struct TiledCut {
     pub run_list: Vec<(u32, i128, i128, usize, usize)>,
     /// Lived-order runs: the last member of every rank-0 close, oldest first.
     pub closes: Vec<Id>,
+    /// Append-only open unit: characters of memories that did not fit.
+    pub open_dropped: usize,
     pub used: usize,
 }
 
@@ -1621,6 +1623,11 @@ pub struct TiledOpts {
     /// integral evaluated at the newest closed run end, so every closed
     /// allowance is recomputed whenever a run closes.
     pub run_curve: u8,
+    /// The grid unit (default 2^14 s). Tiles are `4^l` units wide.
+    pub unit_ns: Option<i128>,
+    /// Append-only open unit: hold ALL its memories even past the budget,
+    /// taking the excess from the live room, instead of truncating.
+    pub open_elastic: bool,
 }
 
 /// Range-time order: start ascending, end descending, then intrinsic id.
@@ -1752,6 +1759,7 @@ pub fn select_tiled_recollection_cut(
         crossing: 0,
         run_list: Vec::new(),
         closes: Vec::new(),
+        open_dropped: 0,
         used: 0,
     };
     if let (Some(open_frac), true) = (opts.runs, opts.lived_order) {
@@ -1769,7 +1777,7 @@ pub fn select_tiled_recollection_cut(
     if budget == 0 {
         return out;
     }
-    let unit = SEAL_UNIT_NS;
+    let unit = opts.unit_ns.unwrap_or(SEAL_UNIT_NS);
     let n = latest.div_euclid(unit);
     let first = earliest.div_euclid(unit);
     let block = |l: u32| -> i128 {
@@ -1921,8 +1929,9 @@ pub fn select_tiled_recollection_cut(
         range_time_sort(&mut members, spans);
         let mut used = 0usize;
         for (k, &i) in members.iter().enumerate() {
-            if used + costs[i] > rest {
+            if !opts.open_elastic && used + costs[i] > rest {
                 out.open_overflow = members.len() - k;
+                out.open_dropped = members[k..].iter().map(|&m| costs[m]).sum();
                 break;
             }
             used += costs[i];
@@ -1996,6 +2005,7 @@ pub fn select_runs_recollection_cut(
         crossing: 0,
         run_list: Vec::new(),
         closes: Vec::new(),
+        open_dropped: 0,
         used: 0,
     };
     let Some(earliest) = spans.iter().map(|s| s.0).min() else {
@@ -2184,6 +2194,7 @@ pub fn select_lived_runs_recollection_cut(
         crossing: 0,
         run_list: Vec::new(),
         closes: Vec::new(),
+        open_dropped: 0,
         used: 0,
     };
     if budget == 0 || spans.is_empty() {
@@ -2399,6 +2410,8 @@ pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
     space: &P,
     ws: &B,
     opts: &CoverOpts,
+    unit_ns: i128,
+    open_elastic: bool,
 ) -> Result<(Vec<String>, String, String)> {
     use std::fmt::Write as _;
     const DAY: i128 = 86_400 * 1_000_000_000;
@@ -2444,6 +2457,8 @@ pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
         run_geometric: false,
         lived_order: false,
         run_curve: 0,
+        unit_ns: Some(unit_ns),
+        open_elastic,
     };
     let observed_for_cut = observed.clone();
     let cand =
@@ -2483,17 +2498,22 @@ pub fn cover_compare<B: BlobStoreGet, P: TriblePattern>(
     let mut lines = Vec::new();
     lines.push(format!(
         "budget {budget} chars; raw_memory {}; chunk_overhead {}; newest memory end {}; current cover {} entries / {} charged chars ({} text chars); \
-         candidate (clock-closed geometric grid, curve shares, 4% append-only open unit, uniform in-tile targets, policy b) {} entries / {} charged chars ({} text chars), free {}",
+         candidate (clock-closed geometric grid, unit {} s, curve shares, 4% append-only open unit{}, uniform in-tile targets, policy b) {} entries / {} charged chars ({} text chars), free {}, over budget {}, open unit dropped {} memories / {} chars",
         opts.raw_memory,
         opts.chunk_overhead,
         fmt_key(latest),
         cur.len(),
         cur_used,
         current.text.chars().count(),
+        unit_ns / 1_000_000_000,
+        if open_elastic { " (elastic: never truncated)" } else { "" },
         cand.cover.len(),
         cand.used,
         cand_text.chars().count(),
         budget - cand.used.min(budget),
+        cand.used.saturating_sub(budget),
+        cand.open_overflow,
+        cand.open_dropped,
     ));
     let cur_set: BTreeSet<usize> = cur.iter().copied().collect();
     let cand_set: BTreeSet<usize> = cand.cover.iter().copied().collect();
@@ -3119,6 +3139,8 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
         let mut late_steps = 0usize;
         let mut shift_with_late = 0usize;
         let mut free_v: Vec<usize> = Vec::new();
+        let mut over_v: Vec<usize> = Vec::new();
+        let mut dropped_v: Vec<usize> = Vec::new();
         let mut insertions = 0usize;
         let mut overflow_steps = 0usize;
         let mut closed_changed = 0usize;
@@ -3208,7 +3230,9 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
             for &i in &cut.cover[cut.open_from..] {
                 widths[MAX_LEVEL].push(spans[i].1 - spans[i].0);
             }
-            free_v.push(budget - cut.used);
+            free_v.push(budget.saturating_sub(cut.used));
+            over_v.push(cut.used.saturating_sub(budget));
+            dropped_v.push(cut.open_dropped);
             let mut cells = Vec::new();
             let mut resume = 0usize;
             let mut at = vec![0usize; MAX_LEVEL];
@@ -3331,7 +3355,10 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                 format!(
                     "level {l} (tiles {}): mean {:.0}k chars over {} steps present; changed on {} transitions \
                      ({} by its own digit, {} by content alone, rest by a coarser change){probe}",
-                    humanize_unit(l as u32),
+                    {
+                        let secs = 4f64.powi(l as i32) * (configs[c].1.unit_ns.unwrap_or(SEAL_UNIT_NS) as f64 / 1e9);
+                        if secs < 86_400.0 { format!("{:.1} h", secs / 3600.0) } else { format!("{:.1} d", secs / 86_400.0) }
+                    },
                     mean(&lvl_used[l]) / 1e3,
                     lvl_used[l].len(),
                     lvl_changed[l],
@@ -3351,6 +3378,7 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
              levels present at the last step {}\n    \
              whole cover by memory start age only, mean over all steps: <1 d {:.0}k, 1-7 d {:.0}k, 7-30 d {:.0}k, older {:.0}k\n    \
              elastic room (budget - used, characters free for the live part) over all steps: {}\n    \
+             open unit: truncated on {} step(s), dropped characters mean {:.0}k / max {}k; over budget on {} step(s), excess mean {:.0}k / max {}k (taken from the live room)\n    \
              runs at the last step (rank, span, space -> used): {}\n    \
              by memory start year, mean over all steps (last step): 2024 {:.0}k ({}k), 2025 {:.0}k ({}k), 2026 {:.0}k ({}k)\n    \
              selected memory width (end - start) per level, pooled over all steps: {}\n    {}{}",
@@ -3393,6 +3421,12 @@ pub fn replay_tiled<B: BlobStoreGet, P: TriblePattern>(
                     mean(&f) / 1e3, q(0.0), q(0.1), q(0.5), q(0.9), q(1.0), quarter / 1000, 2 * quarter / 1000, over_half, f.len()
                 )
             },
+            dropped_v.iter().filter(|&&x| x > 0).count(),
+            mean(&dropped_v) / 1e3,
+            dropped_v.iter().max().copied().unwrap_or(0) / 1000,
+            over_v.iter().filter(|&&x| x > 0).count(),
+            mean(&over_v) / 1e3,
+            over_v.iter().max().copied().unwrap_or(0) / 1000,
             out_steps.last().map_or(String::new(), |s| s.cuts[c]
                 .run_list
                 .iter()
@@ -3583,6 +3617,8 @@ mod tests {
                     run_geometric: false,
                     lived_order: false,
                     run_curve: 0,
+                    unit_ns: None,
+                    open_elastic: false,
                 },
                 None,
             );
@@ -3642,6 +3678,8 @@ mod tests {
                 run_geometric: false,
                 lived_order: false,
                 run_curve: 0,
+                unit_ns: None,
+                open_elastic: false,
             },
             None,
         );
@@ -3778,6 +3816,8 @@ mod tests {
                 run_geometric: false,
                 lived_order: false,
                 run_curve: 0,
+                unit_ns: None,
+                open_elastic: false,
             };
             let cut =
                 select_tiled_recollection_cut(&spans, &costs, &observed, 300_000, &opts, None);
@@ -3802,6 +3842,8 @@ mod tests {
             run_geometric: false,
             lived_order: false,
             run_curve: 0,
+            unit_ns: None,
+            open_elastic: false,
         };
         let mut previous: Option<TiledCut> = None;
         let mut appends = 0;
@@ -3844,6 +3886,8 @@ mod tests {
             run_geometric: true,
             lived_order: true,
             run_curve: 0,
+            unit_ns: None,
+            open_elastic: false,
         };
         let a = select_tiled_recollection_cut(&spans, &costs, &observed, 60_000, &opts, None);
         let shuffled: Vec<i128> = observed.iter().rev().copied().collect();

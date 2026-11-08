@@ -330,6 +330,8 @@ impl Memory {
         budget: usize,
         resident: bool,
         out_dir: &str,
+        unit_exp: u32,
+        open_elastic: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
         let mut opts = CoverOpts::plain(budget);
@@ -344,10 +346,15 @@ impl Memory {
                 &loaded.memory.facts,
                 &loaded.memory.reader,
                 &opts,
+                (1i128 << unit_exp) * 1_000_000_000,
+                open_elastic,
             )?;
             std::fs::write(format!("{out_dir}/current-{budget}.txt"), current)?;
             std::fs::write(
-                format!("{out_dir}/candidate-lived-1of8-{budget}.txt"),
+                format!(
+                    "{out_dir}/candidate-grid-u2^{unit_exp}{}-{budget}.txt",
+                    if open_elastic { "-elastic" } else { "" }
+                ),
                 candidate,
             )?;
             for line in lines {
@@ -400,35 +407,50 @@ impl Memory {
             run_geometric: false,
             lived_order: false,
             run_curve: 0,
+            unit_ns: None,
+            open_elastic: false,
         };
         let _ = (unit, cap);
-        let lived = TiledOpts {
-            runs: Some(1.0 / 8.0),
-            run_geometric: true,
-            lived_order: true,
-            ..base.clone()
-        };
         let clock = TiledOpts {
             open_append: Some(0.04),
             ..base.clone()
         };
+        let u16 = Some(1i128 << 16).map(|x| x * 1_000_000_000);
+        let u17 = Some(1i128 << 17).map(|x| x * 1_000_000_000);
         let configs = vec![
             (
-                "PRIMARY clock-closed grid, curve shares (ln 4 per level), 4% open, uniform tiles, policy b".to_owned(),
+                "grid unit 2^14 s (report 7 primary)".to_owned(),
                 clock.clone(),
             ),
             (
-                "clock-closed grid, deep-weighted shares, 4% open, uniform tiles, policy b".to_owned(),
-                TiledOpts { deep_weights: true, ..clock.clone() },
-            ),
-            ("comparison: lived-order runs 1/8, geometric, equal rank shares".to_owned(), lived.clone()),
-            (
-                "comparison: lived-order runs 1/8, curve shares frozen at each run's change".to_owned(),
-                TiledOpts { run_curve: 1, ..lived.clone() },
+                "grid unit 2^16 s, open truncated".to_owned(),
+                TiledOpts {
+                    unit_ns: u16,
+                    ..clock.clone()
+                },
             ),
             (
-                "comparison: lived-order runs 1/8, curve shares recomputed at every close".to_owned(),
-                TiledOpts { run_curve: 2, ..lived.clone() },
+                "grid unit 2^16 s, open elastic".to_owned(),
+                TiledOpts {
+                    unit_ns: u16,
+                    open_elastic: true,
+                    ..clock.clone()
+                },
+            ),
+            (
+                "grid unit 2^17 s, open truncated".to_owned(),
+                TiledOpts {
+                    unit_ns: u17,
+                    ..clock.clone()
+                },
+            ),
+            (
+                "grid unit 2^17 s, open elastic".to_owned(),
+                TiledOpts {
+                    unit_ns: u17,
+                    open_elastic: true,
+                    ..clock.clone()
+                },
             ),
         ];
         self.with_operation(|storage| {
