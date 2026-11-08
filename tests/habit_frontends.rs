@@ -44,6 +44,7 @@ fn cli(pile: &Path, key: &Path, args: &[&str]) -> String {
         .arg(key)
         .args(args)
         .env("PERSONA", "ambient-not-a-target")
+        .env_remove("PILE")
         .env_remove("DRIVE_ENDPOINT")
         .env_remove("DRIVE_KEY")
         .output()
@@ -435,4 +436,67 @@ fn check_reads_a_completion_that_arrives_before_its_definition() {
     let listed = Habits::new(pile, Some(key)).list(false).unwrap();
     assert_eq!(listed.entries.len(), 1);
     assert_eq!(listed.entries[0].row.completed_at.len(), 1);
+}
+
+#[test]
+fn explicit_cli_pile_reaches_predicate_without_ambient_pile() {
+    let (_directory, pile, key) = fixture();
+    let operations = Habits::new(pile.clone(), Some(key.clone()));
+    let quoted = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    operations
+        .add(
+            "pile-context",
+            &format!(
+                "when test \"$PILE\" = {} && test \"$PWD\" = {}",
+                quoted(&pile),
+                quoted(pile.parent().unwrap())
+            ),
+            "context reached predicate",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let due = cli(&pile, &key, &["due"]);
+    assert!(due.contains("context reached predicate"), "{due}");
+}
+
+#[test]
+fn failed_predicate_is_diagnostic_and_pause_still_short_circuits_it() {
+    let (_directory, pile, key) = fixture();
+    let operations = Habits::new(pile.clone(), Some(key.clone()));
+    operations
+        .add(
+            "unreadable",
+            "when echo 'status unavailable' >&2; exit 2",
+            "must not be announced as due",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(
+        operations.list(true).unwrap().entries[0].state.as_ref(),
+        Some(habits::State::Failed(error)) if error.contains("status unavailable")
+    ));
+    let due = Command::new(env!("CARGO_BIN_EXE_habit"))
+        .arg("--pile")
+        .arg(&pile)
+        .arg("--key")
+        .arg(&key)
+        .arg("due")
+        .env_remove("PILE")
+        .env_remove("DRIVE_ENDPOINT")
+        .output()
+        .unwrap();
+    assert!(due.status.success());
+    assert!(String::from_utf8_lossy(&due.stderr).contains("status unavailable"));
+    assert!(!String::from_utf8_lossy(&due.stdout).contains("must not be announced as due"));
+    operations
+        .set_state("unreadable", DeclaredState::Paused)
+        .unwrap();
+    assert_eq!(
+        operations.list(true).unwrap().entries[0].state,
+        Some(habits::State::Paused)
+    );
 }

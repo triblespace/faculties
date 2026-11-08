@@ -220,12 +220,11 @@ impl Habits {
             Ok((rows, ids.intersection(&superseded).count()))
         })?;
         let observed_seconds = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
-        let at = habits::evaluation_dir(self.storage.path());
         let entries = rows
             .into_iter()
             .map(|row| {
-                let state =
-                    evaluate_conditions.then(|| habits::evaluate(&row, observed_seconds, &at));
+                let state = evaluate_conditions
+                    .then(|| habits::evaluate(&row, observed_seconds, self.storage.path()));
                 EvaluatedHabit { row, state }
             })
             .collect();

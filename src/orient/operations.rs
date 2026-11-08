@@ -2988,9 +2988,8 @@ fn observe_habits(
     pile: &Path,
     now_secs: i64,
 ) -> Result<HabitObservation> {
-    let at = habits::evaluation_dir(pile);
     for row in rows {
-        let state = habits::evaluate(&row, now_secs, &at);
+        let state = habits::evaluate(&row, now_secs, pile);
         match &state {
             habits::State::Due => {
                 let since = row
@@ -7978,6 +7977,31 @@ mod tests {
         pile.close().unwrap();
     }
 
+    #[test]
+    fn orient_keeps_predicate_errors_in_existing_habit_attention() {
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let collection = open_configured(
+            &mut pile,
+            crate::schemas::habit::DEFAULT_SCOPE_ID,
+            fixture.signer.verifying_key(),
+        ).unwrap();
+        let (definition, habit) = habits::habit_fragment(
+            "unreadable", "when echo 'status unavailable' >&2; exit 2",
+            "must not be due", None, &[], &[],
+        ).unwrap();
+        let facts = archive(definition.facts());
+        pile.commit(collection, &fixture.signer, definition).unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let prepared = prepare_habits(&snapshot, &facts, None).unwrap();
+        let observed = observe_habits(prepared, &fixture.path, 100).unwrap();
+        assert!(observed.due.is_empty());
+        let diagnostic = observed.attention.get(&habit).unwrap();
+        assert!(diagnostic.contains("condition command exited 2: status unavailable"));
+        assert!(diagnostic.contains("unreadable"));
+        pile.close().unwrap();
+    }
+
     /// Only a complete, understood state assertion supersedes another. A
     /// tagged entity carrying an edge but no state or time is not an
     /// assertion, so it cannot unpause what `habit list` shows paused.
@@ -8098,10 +8122,9 @@ mod tests {
         pile.commit(collection, &fixture.signer, fragment).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let listed = habits::rows(&snapshot, &facts).unwrap();
-        let at = habits::evaluation_dir(&fixture.path);
         let announced = listed
             .iter()
-            .find(|row| habits::evaluate(row, 100, &at).is_due())
+            .find(|row| habits::evaluate(row, 100, &fixture.path).is_due())
             .unwrap();
         assert_eq!(announced.nudge, early);
         let prepared = prepare_habits(&snapshot, &facts, None).unwrap();

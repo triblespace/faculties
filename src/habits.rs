@@ -1342,29 +1342,36 @@ pub fn resolve_command(
     Ok(format!("{}{suffix}", shell_word(&path)))
 }
 
-/// Run the predicate from the fixed directory supplied by the caller.
-pub fn condition_holds(command: &str, at: &Path) -> std::result::Result<bool, String> {
-    // A timer-driven predicate must not stream arbitrary output into whoever
-    // happens to be reading Orient. Capture it, and retain stderr only for the
-    // one shell outcome which means the predicate itself is broken.
+/// Run from the pile's directory with its resolved path as child `PILE`.
+/// Exit 0 means true, 1 means false; every other status is an evaluation error.
+/// Resolve before changing directory so a relative CLI override stays meaningful.
+pub fn condition_holds(command: &str, pile: &Path) -> std::result::Result<bool, String> {
+    let pile = std::path::absolute(pile)
+        .map_err(|error| format!("resolve predicate pile {}: {error}", pile.display()))?;
+    // Capture output; errors retain a bounded diagnostic for Habit and Orient.
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(command)
-        .current_dir(at)
+        .current_dir(evaluation_dir(&pile))
+        .env("PILE", &pile)
         .output()
         .map_err(|error| format!("running {command:?}: {error}"))?;
     match output.status.code() {
         Some(0) => Ok(true),
-        Some(code @ (126 | 127)) => {
+        Some(1) => Ok(false),
+        Some(code) => {
             let detail = String::from_utf8_lossy(&output.stderr);
-            let detail = detail.trim();
+            let mut chars = detail.trim().chars();
+            let mut detail = chars.by_ref().take(2048).collect::<String>();
+            if chars.next().is_some() {
+                detail.push_str(" …");
+            }
             Err(if detail.is_empty() {
                 format!("condition command exited {code}")
             } else {
                 format!("condition command exited {code}: {detail}")
             })
         }
-        Some(_) => Ok(false),
         None => Err(format!(
             "condition command terminated by signal: {command:?}"
         )),
@@ -1372,7 +1379,7 @@ pub fn condition_holds(command: &str, at: &Path) -> std::result::Result<bool, St
 }
 
 /// Evaluate one standing intention against a wall-clock second.
-pub fn evaluate(row: &HabitRow, now_secs: i64, at: &Path) -> State {
+pub fn evaluate(row: &HabitRow, now_secs: i64, pile: &Path) -> State {
     match &row.activation {
         Activation::Paused(_) => return State::Paused,
         Activation::Forked(heads) => {
@@ -1396,7 +1403,7 @@ pub fn evaluate(row: &HabitRow, now_secs: i64, at: &Path) -> State {
         Ok(command) => command,
         Err(error) => return State::Failed(error),
     };
-    match condition_holds(&command, at) {
+    match condition_holds(&command, pile) {
         Ok(true) => State::Due,
         Ok(false) => State::Waiting,
         Err(error) => State::Failed(error),
@@ -1580,12 +1587,16 @@ mod tests {
             evaluate(
                 &row("every 1h", &[], active.clone()),
                 10_000,
-                Path::new(".")
+                Path::new("./self.pile")
             ),
             State::Due
         );
         assert_eq!(
-            evaluate(&row("when exit 1", &[], active), 10_000, Path::new(".")),
+            evaluate(
+                &row("when exit 1", &[], active),
+                10_000,
+                Path::new("./self.pile")
+            ),
             State::Waiting
         );
     }
@@ -1594,9 +1605,12 @@ mod tests {
     fn cooldown_is_measured_from_completion_not_observation() {
         let row = row("every 1h", &[1_000, 9_000], Activation::Active(Vec::new()));
         for _ in 0..3 {
-            assert_eq!(evaluate(&row, 10_000, Path::new(".")), State::Cooling);
+            assert_eq!(
+                evaluate(&row, 10_000, Path::new("./self.pile")),
+                State::Cooling
+            );
         }
-        assert_eq!(evaluate(&row, 12_600, Path::new(".")), State::Due);
+        assert_eq!(evaluate(&row, 12_600, Path::new("./self.pile")), State::Due);
         assert_eq!(row.next_cooldown_at().unwrap(), Some(12_600));
     }
 
@@ -1935,7 +1949,7 @@ mod tests {
         assert_eq!(rows[0].last_done(), Some(tai(2_000.0)));
         assert_eq!(rows[0].next_cooldown_at().unwrap(), Some(tai(5_600.0)));
         assert_eq!(
-            evaluate(&rows[0], tai(3_000.0), Path::new(".")),
+            evaluate(&rows[0], tai(3_000.0), Path::new("./self.pile")),
             State::Cooling
         );
     }
@@ -2014,7 +2028,7 @@ mod tests {
         assert_eq!(before[0].id, b_id);
         assert!(before[0].completed_at.is_empty());
         assert_eq!(
-            evaluate(&before[0], tai(4_000.0), Path::new(".")),
+            evaluate(&before[0], tai(4_000.0), Path::new("./self.pile")),
             State::Due
         );
 
@@ -2022,7 +2036,7 @@ mod tests {
         assert_eq!(after[0].id, b_id);
         assert_eq!(after[0].completed_at, [tai(3_500.0)]);
         assert_eq!(
-            evaluate(&after[0], tai(4_000.0), Path::new(".")),
+            evaluate(&after[0], tai(4_000.0), Path::new("./self.pile")),
             State::Cooling
         );
     }
@@ -2199,7 +2213,7 @@ mod tests {
         let due = script("#!/bin/sh\nexit 0\n");
         let mut row = row("when @script --due", &[], Activation::Active(Vec::new()));
         row.script = Some(due.clone());
-        assert_eq!(evaluate(&row, 10_000, Path::new(".")), State::Due);
+        assert_eq!(evaluate(&row, 10_000, Path::new("./self.pile")), State::Due);
 
         let path = materialize_script(&due).unwrap();
         assert_eq!(path.parent().unwrap(), shared_cache());
@@ -2208,7 +2222,10 @@ mod tests {
 
         let mut waiting = row.clone();
         waiting.script = Some(script("#!/bin/sh\nexit 1\n"));
-        assert_eq!(evaluate(&waiting, 10_000, Path::new(".")), State::Waiting);
+        assert_eq!(
+            evaluate(&waiting, 10_000, Path::new("./self.pile")),
+            State::Waiting
+        );
     }
 
     /// Editing a script changes its hash, so it lands beside the old copy
@@ -2280,7 +2297,7 @@ mod tests {
         let path = awkward.join("body");
         std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         let command = format!("test -f {} && exit 0", shell_word(&path));
-        assert!(condition_holds(&command, Path::new(".")).unwrap());
+        assert!(condition_holds(&command, Path::new("./self.pile")).unwrap());
     }
 
     #[test]
@@ -2295,10 +2312,33 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_shell_commands_are_errors_not_false_predicates() {
-        assert!(condition_holds("exit 126", Path::new(".")).is_err());
-        assert!(condition_holds("exit 127", Path::new(".")).is_err());
-        assert_eq!(condition_holds("exit 1", Path::new(".")).unwrap(), false);
+    fn predicate_exit_status_preserves_true_false_and_errors() {
+        let pile = Path::new("./self.pile");
+        for code in [2, 3, 124, 126, 127] {
+            let error =
+                condition_holds(&format!("echo unavailable >&2; exit {code}"), pile).unwrap_err();
+            assert_eq!(
+                error,
+                format!("condition command exited {code}: unavailable")
+            );
+        }
+        assert!(condition_holds("exit 0", pile).unwrap());
+        assert!(!condition_holds("echo covered >&2; exit 1", pile).unwrap());
+        assert!(condition_holds("kill -TERM $$", pile).is_err());
+        let error = condition_holds("printf '%3000s' x | tr ' ' x >&2; exit 2", pile).unwrap_err();
+        assert!(error.len() < 2200);
+    }
+
+    #[test]
+    fn relative_pile_is_absolute_in_predicate_and_defines_its_directory() {
+        let pile = Path::new("./self.pile");
+        let resolved = std::path::absolute(pile).unwrap();
+        let command = format!(
+            "test \"$PILE\" = {} && test \"$PWD\" = {}",
+            shell_word(&resolved),
+            shell_word(&evaluation_dir(&resolved)),
+        );
+        assert!(condition_holds(&command, pile).unwrap());
     }
 
     /// Round-trip: publish a definition carrying its script, read it back from
@@ -2369,7 +2409,7 @@ mod tests {
         );
         let read = rows(&reader, &facts).unwrap();
         assert!(matches!(
-            evaluate(&read[0], 10_000, Path::new(".")),
+            evaluate(&read[0], 10_000, Path::new("./self.pile")),
             State::Failed(ref error) if error.contains("carries no script")
         ));
     }
