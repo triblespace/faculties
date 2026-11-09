@@ -8,12 +8,12 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 pub struct Memory {
     operations: super::Memory,
+    files: crate::files::operations::Files,
 }
 impl Memory {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -21,7 +21,8 @@ impl Memory {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Memory::with_storage(storage),
+            operations: super::Memory::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
@@ -59,8 +60,8 @@ static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "memory_image",
-        description: "Store exact base64-encoded image bytes as a wordless memory; when is a TAI point or from..to. Display validates/derives media separately.",
-        input_schema: r#"{"type":"object","properties":{"when":{"type":"string"},"data":{"type":"string","minLength":1,"description":"Base64-encoded resident image bytes, not a path."}},"required":["when","data"],"additionalProperties":false}"#,
+        description: "Store one image's exact bytes as a wordless memory, from a Files file_id or an absolute path on the host the MCP server runs on (read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none); when is a TAI point or from..to. Display validates/derives media separately.",
+        input_schema: r#"{"type":"object","properties":{"when":{"type":"string"},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the image."},"path":{"type":"string","description":"Absolute path of the image on the MCP server's host."}},"required":["when"],"oneOf":[{"required":["file_id"]},{"required":["path"]}],"additionalProperties":false}"#,
     },
     Tool {
         name: "memory_respan",
@@ -162,7 +163,8 @@ arguments!(Query { query: String });
 arguments!(Create { summary: String, range: Option<String>, tags: Option<Vec<String>> });
 arguments!(Image {
     when: String,
-    data: String
+    file_id: Option<String>,
+    path: Option<String>
 });
 arguments!(Respan {
     id: String,
@@ -237,9 +239,12 @@ impl Faculty for Memory {
                     parse_tai_timestamp(&args.when).map(|when| (when, when))
                 }
                 .map_err(invalid_arguments)?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(args.data)
-                    .map_err(invalid_arguments)?;
+                let bytes = crate::mcp::input::read_reference(
+                    &self.files,
+                    args.file_id.as_deref(),
+                    args.path.as_deref(),
+                    crate::mcp::input::MAX_HOST_FILE_BYTES,
+                )?;
                 memory.image(&bytes, range)?.emit(out)?;
                 out.line(format!(
                     "({} image bytes stored; `faculties maintain` places it in the WeMM space)",

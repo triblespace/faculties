@@ -43,8 +43,8 @@ fn cases() -> Vec<Case> {
             tool: "mail_draft",
             prefix: r#"{"account":"unopened","to":["to@example.test"],"subject":"subject","body":"@-","attachments":["#,
             suffix: "]}",
-            record: r#"{"name":"@-","mime":"text/plain","data":"YQ=="}"#,
-            positional: r#"["@-","text/plain","YQ=="]"#,
+            record: r#"{"name":"@-","mime":"text/plain","path":"/no/such/attachment"}"#,
+            positional: r#"["@-","text/plain","/no/such/attachment"]"#,
             duplicate: r#""name":"second""#,
         },
         Case {
@@ -52,8 +52,8 @@ fn cases() -> Vec<Case> {
             tool: "archive_import",
             prefix: r#"{"source":"chatgpt","source_name":"resident.json","content":"[]","attachments":["#,
             suffix: "]}",
-            record: r#"{"name":"@-","data":"YQ=="}"#,
-            positional: r#"["@-","YQ=="]"#,
+            record: r#"{"name":"@-","path":"/no/such/attachment"}"#,
+            positional: r#"["@-","/no/such/attachment"]"#,
             duplicate: r#""name":"second""#,
         },
         Case {
@@ -70,8 +70,8 @@ fn cases() -> Vec<Case> {
             tool: "posture_scan",
             prefix: r#"{"label":"resident","dry_run":true,"documents":["#,
             suffix: "]}",
-            record: r#"{"name":"@-","data_base64":"YQ=="}"#,
-            positional: r#"["@-","YQ=="]"#,
+            record: r#"{"name":"@-","path":"/no/such/document"}"#,
+            positional: r#"["@-","/no/such/document"]"#,
             duplicate: r#""name":"second""#,
         },
         Case {

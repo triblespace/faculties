@@ -6,12 +6,12 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 pub struct Body {
     operations: Operations,
+    files: crate::files::operations::Files,
 }
 impl Body {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -19,15 +19,16 @@ impl Body {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: Operations::with_storage(storage),
+            operations: Operations::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
 const TOOLS: &[Tool] = &[
     Tool {
         name: "body_capture",
-        description: "Keep an already acquired resident signal and literal pose/note in one immutable capture. No camera, microphone or robot is contacted. Vision needs bytes, an image MIME and positive width/height; audio needs bytes and an audio MIME without image dimensions; touch has only pose/note. Bytes and declared metadata are stored exactly, not decoded or normalized; use body_view for bounded perception.",
-        input_schema: r#"{"type":"object","properties":{"modality":{"type":"string","enum":["vision","audio","touch"]},"data_base64":{"type":"string"},"mime":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pose":{"type":"string"},"note":{"type":"string"}},"required":["modality","pose"],"additionalProperties":false}"#,
+        description: "Keep an already acquired signal and literal pose/note in one immutable capture. No camera, microphone or robot is contacted. Vision and audio take their bytes from exactly one of a Files file_id or an absolute path on the host the MCP server runs on (read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none). Vision needs an image MIME and positive width/height; audio needs an audio MIME without image dimensions; touch has only pose/note. Bytes and declared metadata are stored exactly, not decoded or normalized; use body_view for bounded perception.",
+        input_schema: r#"{"type":"object","properties":{"modality":{"type":"string","enum":["vision","audio","touch"]},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the signal."},"path":{"type":"string","description":"Absolute path of the signal on the MCP server's host."},"mime":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pose":{"type":"string"},"note":{"type":"string"}},"required":["modality","pose"],"additionalProperties":false}"#,
     },
     Tool {
         name: "body_list",
@@ -79,7 +80,8 @@ enum Modality {
 #[serde(deny_unknown_fields)]
 struct Capture {
     modality: Modality,
-    data_base64: Option<String>,
+    file_id: Option<String>,
+    path: Option<String>,
     mime: Option<String>,
     width: Option<u64>,
     height: Option<u64>,
@@ -99,20 +101,19 @@ fn default_max_bytes() -> usize {
     ViewOptions::default().max_bytes
 }
 impl Capture {
-    fn input(self) -> Result<CaptureInput> {
+    fn input(self, files: &crate::files::operations::Files) -> Result<CaptureInput> {
         let media = || -> Result<(Bytes, String)> {
-            let data = self
-                .data_base64
-                .as_ref()
-                .ok_or_else(|| invalid_arguments("media capture requires data_base64"))?;
             let mime = self
                 .mime
                 .clone()
                 .ok_or_else(|| invalid_arguments("media capture requires mime"))?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .map_err(invalid_arguments)?;
-            Ok((bytes.into(), mime))
+            let bytes = crate::mcp::input::read_reference(
+                files,
+                self.file_id.as_deref(),
+                self.path.as_deref(),
+                crate::mcp::input::MAX_HOST_FILE_BYTES,
+            )?;
+            Ok((bytes, mime))
         };
         let signal = match self.modality {
             Modality::Vision => {
@@ -140,7 +141,8 @@ impl Capture {
                 Signal::Audio { bytes, mime }
             }
             Modality::Touch => {
-                if self.data_base64.is_some()
+                if self.file_id.is_some()
+                    || self.path.is_some()
                     || self.mime.is_some()
                     || self.width.is_some()
                     || self.height.is_some()
@@ -169,7 +171,7 @@ impl Faculty for Body {
         match name {
             "body_capture" => {
                 let args: Capture = decode_arguments(arguments)?;
-                presentation::captured(&self.operations.capture(&args.input()?)?, out)
+                presentation::captured(&self.operations.capture(&args.input(&self.files)?)?, out)
             }
             "body_list" => {
                 let _: Empty = decode_arguments(arguments)?;

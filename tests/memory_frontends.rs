@@ -626,7 +626,15 @@ fn mcp_has_only_explicit_resident_tools_and_rejects_argv_paths_and_duplicates() 
         ),
         (
             "memory_image",
-            r#"{"when":"2026-09-01T00:00:00","path":"/host/image"}"#,
+            r#"{"when":"2026-09-01T00:00:00","path":"/no/such/image"}"#,
+        ),
+        (
+            "memory_image",
+            r#"{"when":"2026-09-01T00:00:00","data":"AA=="}"#,
+        ),
+        (
+            "memory_image",
+            r#"{"when":"2026-09-01T00:00:00","path":"/a","file_id":"0123456789abcdef0123456789abcdef"}"#,
         ),
         ("memory_context", r#"{"argv":["--remove","secret"]}"#),
         ("memory_context", r#"{"budget_chars":-1}"#),

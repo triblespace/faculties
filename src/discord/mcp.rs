@@ -3,8 +3,7 @@ use super::{operations::*, render};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
-use anyhow::{bail, Result};
-use base64::Engine;
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -18,7 +17,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "discord_pull", description: "Pull a complete forward interval and bounded recent edits into the archive using the workspace's Secrets-backed bot credential. Omit channel_id to visit all visible text-capable channels; partial channel failures are reported explicitly.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"fetch_limit":{"type":"integer","minimum":1,"maximum":100,"default":100},"reconcile_limit":{"type":"integer","minimum":1,"maximum":100,"default":50}},"additionalProperties":false}"# },
     Tool { name: "discord_send", description: "Send literal text and/or attachments as the workspace's Secrets-backed Discord bot after collection WRITE admission, then store the returned observation and attachment bytes. At most 10 files and 20 MiB decoded bytes total; transport request limits may be smaller. An uncertain send or post-send retention failure must not be retried automatically.",
-        input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"text":{"type":"string","maxLength":2000,"description":"Optional literal message body. @file and @- never expand to host input."},"attachments":{"type":"array","maxItems":10,"items":{"type":"object","properties":{"filename":{"type":"string","minLength":1,"maxLength":255,"description":"Leaf filename, without path separators or control characters."},"media_type":{"type":"string","maxLength":255,"description":"MIME type, e.g. image/png or application/pdf."},"data_base64":{"type":"string","description":"Standard padded base64 of the file bytes (not a data URL); for small files only, subject to transport request limits."},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID in this workspace, resolved as files_get. Use the Entity or Import ID from files_show or files_add, not a content Hash or host path. Prefer for retained or larger files."}},"required":["filename","media_type"],"oneOf":[{"required":["data_base64"],"not":{"required":["file_id"]}},{"required":["file_id"],"not":{"required":["data_base64"]}}],"additionalProperties":false}}},"required":["channel_id"],"additionalProperties":false}"# },
+        input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"text":{"type":"string","maxLength":2000,"description":"Optional literal message body. @file and @- never expand to host input."},"attachments":{"type":"array","maxItems":10,"items":{"type":"object","properties":{"filename":{"type":"string","minLength":1,"maxLength":255,"description":"Leaf filename, without path separators or control characters."},"media_type":{"type":"string","maxLength":255,"description":"MIME type, e.g. image/png or application/pdf."},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID in this workspace, resolved as files_get. Use the Entity or Import ID from files_show or files_add, not a content Hash. A folder import is refused."},"path":{"type":"string","description":"Absolute path of the file on the MCP server's host, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none."}},"required":["filename","media_type"],"oneOf":[{"required":["file_id"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["file_id"]}}],"additionalProperties":false}}},"required":["channel_id"],"additionalProperties":false}"# },
     Tool { name: "discord_channels_list", description: "List the guilds and channels visible to the workspace's Secrets-backed Discord bot through a finite REST query.",
         input_schema: r#"{"type":"object","properties":{"guild":{"type":"string","description":"Optional exact canonical Discord guild snowflake."}},"additionalProperties":false}"# },
 ];
@@ -64,8 +63,8 @@ struct Send {
 struct Attachment {
     filename: String,
     media_type: String,
-    data_base64: Option<String>,
     file_id: Option<String>,
+    path: Option<String>,
 }
 impl Send {
     fn decode_attachments(
@@ -87,44 +86,37 @@ impl Send {
         validate_send(&self.channel_id, &self.text, &attachments)?;
         // Check the whole input before reading any selected content.
         for source in &self.attachments {
-            match (&source.data_base64, &source.file_id) {
-                (Some(_), None) => {}
-                (None, Some(id))
+            match (&source.file_id, &source.path) {
+                (Some(id), None)
                     if id.len() == 32 && triblespace::prelude::Id::from_hex(id).is_some() => {}
-                (None, Some(_)) => {
+                (Some(_), None) => {
                     bail!("file_id must be an exact 32-character Files entity or single-file import id")
                 }
-                _ => bail!("each attachment requires exactly one of data_base64 or file_id"),
+                (None, Some(path)) => {
+                    crate::mcp::input::absolute(path)?;
+                }
+                _ => bail!("each attachment requires exactly one of file_id or path"),
             }
         }
         let mut remaining = MAX_SEND_ATTACHMENT_BYTES;
         for (source, attachment) in self.attachments.iter().zip(&mut attachments) {
-            attachment.bytes = if let Some(data) = &source.data_base64 {
-                // Bound the decode allocation before accepting caller-supplied bytes.
-                if data.len() > remaining.div_ceil(3) * 4 {
-                    bail!("attachments exceed the 20 MiB total upload limit");
-                }
-                base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "attachment data_base64 is not valid standard padded base64"
-                        )
-                    })?
+            let bytes = if let Some(path) = &source.path {
+                // A file past the remaining budget fails before it is read whole.
+                crate::mcp::input::read_host_file(path, remaining as u64)
+                    .context("attachments are limited to 20 MiB in total")?
             } else {
                 // Exact entity ids take Files' scoped entity path. Hashes are
                 // deliberately excluded: files_get may read unnamed resident
                 // blobs, which need not belong to this workspace's Files view.
-                let export =
-                    files.get(source.file_id.as_deref().expect("validated file source"))?;
-                if export.bytes.len() > remaining {
-                    bail!("attachments exceed the 20 MiB total upload limit");
-                }
-                export.bytes.as_ref().to_vec()
+                crate::mcp::input::read_file_id(
+                    files,
+                    source.file_id.as_deref().expect("validated file source"),
+                )?
             };
-            if attachment.bytes.len() > remaining {
+            if bytes.len() > remaining {
                 bail!("attachments exceed the 20 MiB total upload limit");
             }
+            attachment.bytes = bytes.as_ref().to_vec();
             remaining -= attachment.bytes.len();
         }
         Ok(attachments)
@@ -238,13 +230,15 @@ mod tests {
     use triblespace::prelude::*;
 
     #[test]
-    fn send_decodes_literal_text_or_bounded_base64_attachments() {
+    fn send_reads_literal_text_and_host_path_attachments() {
         let files = crate::files::operations::Files::new(PathBuf::from("/not-opened"), None);
         let args: Send = serde_json::from_value(json!({"channel_id": "1", "text": "@-"})).unwrap();
         assert!(args.decode_attachments(&files).unwrap().is_empty());
         assert_eq!(args.text, "@-");
-        let attachment =
-            json!({"filename": "image.png", "media_type": "image/png", "data_base64": "AP8K"});
+        let host = tempfile::tempdir().unwrap();
+        let image = host.path().join("image.png");
+        std::fs::write(&image, [0, 255, 10]).unwrap();
+        let attachment = json!({"filename": "image.png", "media_type": "image/png", "path": image});
         let args: Send =
             serde_json::from_value(json!({"channel_id": "1", "attachments": [attachment.clone()]}))
                 .unwrap();
@@ -253,14 +247,20 @@ mod tests {
             args.decode_attachments(&files).unwrap()[0].bytes,
             [0, 255, 10]
         );
-        for invalid in ["%%%", "data:image/png;base64,AP8K", "YQ"] {
+        for invalid in ["relative.png", "/no/such/image.png"] {
             let mut attachment = attachment.clone();
-            attachment["data_base64"] = json!(invalid);
+            attachment["path"] = json!(invalid);
             let args: Send =
                 serde_json::from_value(json!({"channel_id": "1", "attachments": [attachment]}))
                     .unwrap();
             assert!(args.decode_attachments(&files).is_err());
         }
+        let mut retired = attachment.clone();
+        retired["data_base64"] = json!("AP8K");
+        assert!(serde_json::from_value::<Send>(
+            json!({"channel_id": "1", "attachments": [retired]})
+        )
+        .is_err());
         let args: Send = serde_json::from_value(json!({"channel_id": "1"})).unwrap();
         assert!(args.decode_attachments(&files).is_err());
     }
@@ -307,7 +307,7 @@ mod tests {
         let args: Send = serde_json::from_value(via_import).unwrap();
         assert_eq!(args.decode_attachments(&files).unwrap()[0].bytes, bytes);
         let mut invalid = raw.clone();
-        invalid["attachments"][0]["data_base64"] = json!("YQ==");
+        invalid["attachments"][0]["path"] = json!("/no/such/scan.pdf");
         let args: Send = serde_json::from_value(invalid).unwrap();
         assert!(args
             .decode_attachments(&files)

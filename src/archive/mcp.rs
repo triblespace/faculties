@@ -4,13 +4,13 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub struct Archive {
     operations: super::Archive,
+    files: crate::files::operations::Files,
 }
 impl Archive {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -18,12 +18,13 @@ impl Archive {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::Archive::with_storage(storage),
+            operations: super::Archive::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
 const TOOLS:&[Tool]=&[
-    Tool { name: "archive_import", description: "Import one immutable resident source in any of seven formats, publishing only after complete projection. Exactly one literal content string or base64 data field. source_name is provenance only, never a file to open. ChatGPT attachment keys are logical export filenames, Gemini keys exact pointer strings; other formats use embedded assets. Missing external references stay unresolved; never accesses host files or networks.", input_schema:r#"{"type":"object","properties":{"source":{"type":"string","enum":["agy","chatgpt","claude-code","claude-web","codex","copilot","gemini"],"default":"claude-code"},"source_name":{"type":"string"},"content":{"type":"string"},"data":{"type":"string","contentEncoding":"base64"},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"data":{"type":"string","contentEncoding":"base64"}},"required":["name","data"],"additionalProperties":false}}},"required":["source_name"],"additionalProperties":false}"# },
+    Tool { name: "archive_import", description: "Import one immutable source in any of seven formats, publishing only after complete projection. The source is exactly one of a Files file_id, an absolute path on the host the MCP server runs on (read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none), or a literal content string. source_name is provenance only, never a file to open. Attachments take a file_id or path each; ChatGPT attachment keys are logical export filenames, Gemini keys exact pointer strings; other formats use embedded assets. Missing external references stay unresolved; never follows references inside the source to host files or networks.", input_schema:r#"{"type":"object","properties":{"source":{"type":"string","enum":["agy","chatgpt","claude-code","claude-web","codex","copilot","gemini"],"default":"claude-code"},"source_name":{"type":"string"},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the export."},"path":{"type":"string","description":"Absolute path of the export on the MCP server's host."},"content":{"type":"string","description":"Literal export text, for small sources."},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"path":{"type":"string"}},"required":["name"],"oneOf":[{"required":["file_id"]},{"required":["path"]}],"additionalProperties":false}}},"required":["source_name"],"additionalProperties":false}"# },
     Tool { name: "archive_list", description: "List selected recent source projection summaries from one frozen Archive view. Snippets of content a recorded safety-classifier stop followed are withheld as in archive_show; reader_provider declares the reading model's provider (anthropic, google or openai; advisory).", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"limit":{"type":"integer","minimum":0,"default":50}},"additionalProperties":false}"# },
     Tool { name: "archive_show", description: "Inspect one exact projection's text, provenance and held-fact metadata, by projection (receipt) id prefix, or one node by the id a search hit leads with. Media rows identify resident blobs or unresolved external pointers; this diagnostic does not claim to render media. Content a recorded safety-classifier stop followed is withheld and named in its place, for a reader of the stopped provider or one that declares none; reader_provider (anthropic, google or openai; any other value counts as none) is the caller's own advisory declaration, and another provider's reader gets the content after a note; force prints it.", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"id":{"type":"string"},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
     Tool { name: "archive_thread", description: "Inspect the full canonical ancestor DAG of one projection (receipt) id prefix, or of one node by the id a search hit leads with; exceeding limit is an error so no fork is hidden. tail shows only the newest N ancestors (fewest steps back, ties by id), in reading order, and says whether older ones exist; limit does not apply to it. Content a recorded safety-classifier stop followed is withheld and named in its place, for a reader of the stopped provider or one that declares none; reader_provider (anthropic, google or openai; any other value counts as none) is the caller's own advisory declaration, and another provider's reader gets the content after a note; force prints it.", input_schema:r#"{"type":"object","properties":{"reader_provider":{"type":"string"},"id":{"type":"string"},"limit":{"type":"integer","minimum":1,"default":100},"tail":{"type":"integer","minimum":1},"force":{"type":"boolean","default":false}},"required":["id"],"additionalProperties":false}"# },
@@ -72,7 +73,8 @@ impl From<Source> for ImportSource {
 #[serde(deny_unknown_fields)]
 struct Attachment {
     name: String,
-    data: String,
+    file_id: Option<String>,
+    path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,8 +82,9 @@ struct Import {
     #[serde(default)]
     source: Source,
     source_name: String,
+    file_id: Option<String>,
+    path: Option<String>,
     content: Option<String>,
-    data: Option<String>,
     #[serde(default, deserialize_with = "crate::mcp::object::vec")]
     attachments: Vec<Attachment>,
 }
@@ -151,12 +154,6 @@ struct Replay {
     #[serde(default)]
     reader_provider: Option<String>,
 }
-fn decode_base64(data: &str) -> Result<Bytes> {
-    base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map(Bytes::from)
-        .map_err(invalid_arguments)
-}
 /// A read as the request states it; nothing comes from the environment.
 fn reading(force: bool, provider: &Option<String>) -> super::Reading<'_> {
     super::Reading {
@@ -183,14 +180,15 @@ impl Faculty for Archive {
                         "source_name must be nonempty and contain no NUL",
                     ));
                 }
-                let bytes = match (a.content, a.data) {
-                    (Some(content), None) => Bytes::from(content),
-                    (None, Some(data)) => decode_base64(&data)?,
-                    _ => {
-                        return Err(invalid_arguments(
-                            "provide exactly one content or data field",
-                        ))
-                    }
+                let limit = crate::mcp::input::MAX_HOST_FILE_BYTES;
+                let bytes = match crate::mcp::input::exactly_one([
+                    ("file_id", a.file_id.as_deref()),
+                    ("path", a.path.as_deref()),
+                    ("content", a.content.as_deref()),
+                ])? {
+                    ("file_id", id) => crate::mcp::input::read_file_id(&self.files, id)?,
+                    ("path", path) => crate::mcp::input::read_host_file(path, limit)?,
+                    (_, content) => Bytes::from(content.to_owned()),
                 };
                 let source: ImportSource = a.source.into();
                 if !a.attachments.is_empty()
@@ -205,10 +203,13 @@ impl Faculty for Archive {
                             "attachment name must be nonempty and contain no NUL",
                         ));
                     }
-                    if attachments
-                        .insert(a.name, decode_base64(&a.data)?)
-                        .is_some()
-                    {
+                    let bytes = crate::mcp::input::read_reference(
+                        &self.files,
+                        a.file_id.as_deref(),
+                        a.path.as_deref(),
+                        limit,
+                    )?;
+                    if attachments.insert(a.name, bytes).is_some() {
                         return Err(invalid_arguments("duplicate attachment name"));
                     }
                 }

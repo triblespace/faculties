@@ -1,7 +1,6 @@
 //! Mail native/CLI/MCP contracts on temporary resident piles; no POP or SMTP network calls.
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use faculties::mail::{self, AccountOptions, DraftAttachment, DraftRequest, Mail};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
@@ -276,9 +275,36 @@ fn draft_supports_exact_files_and_resident_attachments_without_cli_paths() {
         file,
     )
     .unwrap();
+    // A single-file import id is a file id too.
+    let host = tempfile::tempdir().unwrap();
+    let imported = host.path().join("imported.txt");
+    std::fs::write(&imported, b"imported file").unwrap();
+    let mut report = String::new();
+    faculties::files::Files::new(fixture.pile.clone(), Some(fixture.key.clone()))
+        .add_path(
+            &imported,
+            None,
+            &[],
+            false,
+            &mut faculties::out::Out::new(&mut |part| {
+                if let faculties::out::Part::Text { text } = part {
+                    report.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let import_id = report
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let resident = host.path().join("resident.bin");
+    std::fs::write(&resident, [0, 1, 255]).unwrap();
     let output=call(&fixture.mcp(),"mail_draft",json!({
         "account":format!("{:x}",fixture.account),"to":["recipient@example.test"],"subject":"@- literal subject","body":"@/not-a-host-file",
-        "file_ids":[format!("{file_id:x}")],"attachments":[{"name":"resident.bin","mime":"application/octet-stream","data":base64::engine::general_purpose::STANDARD.encode([0,1,255])}],
+        "file_ids":[format!("{file_id:x}"), import_id],"attachments":[{"name":"resident.bin","mime":"application/octet-stream","path":resident}],
     })).unwrap();
     let outbox = fixture.operations().outbox().unwrap();
     assert_eq!(outbox.len(), 1);
@@ -287,7 +313,11 @@ fn draft_supports_exact_files_and_resident_attachments_without_cli_paths() {
     assert!(output.contains(&format!("Decision {:x}", mail::draft_decision_id(draft.id))));
     assert_eq!(draft.subject, "@- literal subject");
     assert_eq!(draft.body, "@/not-a-host-file");
-    assert_eq!(draft.attachments.len(), 2);
+    assert_eq!(draft.attachments.len(), 3);
+    assert!(draft
+        .attachments
+        .iter()
+        .any(|file| file.filename == "imported.txt" && file.bytes == b"imported file"));
     assert!(draft
         .attachments
         .iter()
@@ -459,15 +489,19 @@ fn independent_decoders_reject_nested_input_errors_and_credentials_without_stora
         ),
         (
             "mail_draft",
-            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","mime":"text/plain","data":"not-base64!"}]}"#,
+            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","mime":"text/plain","data":"YQ=="}]}"#,
         ),
         (
             "mail_draft",
-            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","mime":"text/plain","data":"YQ==","path":"/host"}]}"#,
+            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","mime":"text/plain","path":"relative.txt"}]}"#,
         ),
         (
             "mail_draft",
-            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","name":"y","mime":"text/plain","data":"YQ=="}]}"#,
+            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","mime":"text/plain","path":"/no/such/attachment"}]}"#,
+        ),
+        (
+            "mail_draft",
+            r#"{"account":"a","to":["r"],"subject":"s","body":"b","attachments":[{"name":"x","name":"y","mime":"text/plain","path":"/a"}]}"#,
         ),
         (
             "mail_reply",

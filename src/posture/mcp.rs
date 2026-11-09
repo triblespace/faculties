@@ -6,13 +6,13 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use serde::Deserialize;
 use std::path::PathBuf;
 use triblespace::prelude::Id;
 
 pub struct Posture {
     operations: Operations,
+    files: crate::files::operations::Files,
 }
 impl Posture {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -20,7 +20,8 @@ impl Posture {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: Operations::with_storage(storage),
+            operations: Operations::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
@@ -28,8 +29,8 @@ impl Posture {
 const TOOLS: &[Tool] = &[
     Tool {
         name: "posture_scan",
-        description: "Inspect resident document bytes for deterministic disclosure candidates and record one complete scan, unless dry_run. Names are literal evidence/type hints, not host paths. No model is loaded. Unsupported content and parse failures remain explicit; no clean-bill-of-health claim.",
-        input_schema: r#"{"type":"object","properties":{"label":{"type":"string","minLength":1},"documents":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"data_base64":{"type":"string"}},"required":["name","data_base64"],"additionalProperties":false}},"dry_run":{"type":"boolean","default":false}},"required":["label","documents"],"additionalProperties":false}"#,
+        description: "Inspect document bytes for deterministic disclosure candidates and record one complete scan, unless dry_run. Each document's bytes come from exactly one of a Files file_id or an absolute path on the host the MCP server runs on (read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none). Names are literal evidence/type hints, never opened. No model is loaded. Unsupported content and parse failures remain explicit; no clean-bill-of-health claim.",
+        input_schema: r#"{"type":"object","properties":{"label":{"type":"string","minLength":1},"documents":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID."},"path":{"type":"string","description":"Absolute path on the MCP server's host."}},"required":["name"],"oneOf":[{"required":["file_id"]},{"required":["path"]}],"additionalProperties":false}},"dry_run":{"type":"boolean","default":false}},"required":["label","documents"],"additionalProperties":false}"#,
     },
     Tool {
         name: "posture_list",
@@ -77,7 +78,8 @@ const TOOLS: &[Tool] = &[
 #[serde(deny_unknown_fields)]
 struct Document {
     name: String,
-    data_base64: String,
+    file_id: Option<String>,
+    path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,19 +169,20 @@ impl Faculty for Posture {
                     args.documents.iter().map(|document| document.name.as_str()),
                 )
                 .map_err(invalid_arguments)?;
-                // Decode the entire resident batch before any scan publication.
+                // Read the entire batch before any scan publication.
                 let bytes = args
                     .documents
                     .iter()
                     .map(|document| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(&document.data_base64)
-                            .map_err(|error| {
-                                invalid_arguments(format!(
-                                    "document {:?}: invalid base64: {error}",
-                                    document.name
-                                ))
-                            })
+                        crate::mcp::input::read_reference(
+                            &self.files,
+                            document.file_id.as_deref(),
+                            document.path.as_deref(),
+                            crate::mcp::input::MAX_HOST_FILE_BYTES,
+                        )
+                        .map_err(|error| {
+                            invalid_arguments(format!("document {:?}: {error:#}", document.name))
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let documents = args

@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use anybytes::Bytes;
 use anyhow::{anyhow, Result};
-use base64::Engine as _;
 use clap::Parser;
 use faculties::collection_names::open_configured;
 use faculties::mcp::{Faculty, InvalidArguments};
@@ -200,6 +199,8 @@ fn native_mcp_names_are_literal_and_read_frontends_agree() {
     let adapter = fixture.adapter();
     let sentinel = fixture._directory.path().join("untouched.bin");
     fs::write(&sentinel, b"sentinel is not a document input").unwrap();
+    let document = fixture._directory.path().join("document.docx");
+    fs::write(&document, office()).unwrap();
     let output = collect(|out| {
         adapter.call(
             "posture_scan",
@@ -207,7 +208,7 @@ fn native_mcp_names_are_literal_and_read_frontends_agree() {
                 "label": "@-",
                 "documents": [{
                     "name": sentinel.to_str().unwrap(),
-                    "data_base64": base64::engine::general_purpose::STANDARD.encode(office()),
+                    "path": document,
                 }],
             })),
             out,
@@ -299,22 +300,33 @@ fn mcp_rejects_bad_arguments_before_any_store_access_or_partial_batch() {
     let directory = tempfile::tempdir().unwrap();
     let missing = directory.path().join("missing.pile");
     let adapter = mcp::Posture::new(missing.clone(), None);
+    let ok = directory.path().join("ok.txt");
+    fs::write(&ok, b"fine").unwrap();
+    let partial = format!(
+        r#"{{"label":"x","documents":[{{"name":"ok","path":{:?}}},{{"name":"bad","path":"relative.txt"}}]}}"#,
+        ok.to_str().unwrap()
+    );
     let requests = [
         (
             "posture_scan",
-            r#"{"label":"x","documents":[{"name":"x","data_base64":"","path":"/host"}]}"#,
+            r#"{"label":"x","documents":[{"name":"x","data_base64":"AA=="}]}"#,
         ),
         (
             "posture_scan",
-            r#"{"label":"x","documents":[{"name":"ok","data_base64":""},{"name":"bad","data_base64":"%%%"}]}"#,
+            r#"{"label":"x","documents":[{"name":"x","file_id":"0123456789abcdef0123456789abcdef","path":"/host"}]}"#,
         ),
+        (
+            "posture_scan",
+            r#"{"label":"x","documents":[{"name":"x"}]}"#,
+        ),
+        ("posture_scan", partial.as_str()),
         (
             "posture_scan",
             r#"{"label":"x","label":"duplicate","documents":[]}"#,
         ),
         (
             "posture_scan",
-            r#"{"label":"x","documents":[{"name":"same","data_base64":""},{"name":"same","data_base64":""}]}"#,
+            r#"{"label":"x","documents":[{"name":"same","path":"/no/such/a"},{"name":"same","path":"/no/such/b"}]}"#,
         ),
         (
             "posture_semantic",
@@ -351,14 +363,23 @@ fn mcp_rejects_bad_arguments_before_any_store_access_or_partial_batch() {
 #[test]
 fn output_failure_does_not_retry_a_scan_publication() {
     let fixture = Fixture::new();
+    let document = fixture._directory.path().join("opaque.bin");
+    fs::write(&document, office()).unwrap();
     let mut emissions = 0;
-    let error = fixture.adapter().call("posture_scan", json(serde_json::json!({
-        "label":"one publication",
-        "documents":[{"name":"opaque.bin","data_base64":base64::engine::general_purpose::STANDARD.encode(office())}],
-    })), &mut Out::new(&mut |_| {
-        emissions += 1;
-        Err(anyhow!("emitter closed"))
-    })).unwrap_err();
+    let error = fixture
+        .adapter()
+        .call(
+            "posture_scan",
+            json(serde_json::json!({
+                "label":"one publication",
+                "documents":[{"name":"opaque.bin","path":document}],
+            })),
+            &mut Out::new(&mut |_| {
+                emissions += 1;
+                Err(anyhow!("emitter closed"))
+            }),
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("emitter closed"));
     assert_eq!(emissions, 1);
     assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);

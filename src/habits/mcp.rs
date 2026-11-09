@@ -1,18 +1,17 @@
 //! Standing intentions with resident inputs and explicit predicate evaluation.
 
 use super::{render, DeclaredState, Habits as Operations};
-use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
+use crate::mcp::{decode_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use serde::Deserialize;
 use std::path::PathBuf;
 
 const EMPTY: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 const SELECTOR: &str = r#"{"type":"object","properties":{"habit":{"type":"string"}},"required":["habit"],"additionalProperties":false}"#;
 const TOOLS: &[Tool] = &[
-    Tool { name: "habit_add", description: "Store an immutable standing intention from literal text and an optional base64 carried script. This does not execute the predicate or script. Optional personas are literal labels or exact IDs; omitted or empty personas notify everyone. A label is not unique; replacements require explicit supersedes IDs.", input_schema: r#"{"type":"object","properties":{"label":{"type":"string"},"when":{"type":"string"},"nudge":{"type":"string"},"script_base64":{"type":"string"},"supersedes":{"type":"array","items":{"type":"string"},"default":[]},"personas":{"type":"array","items":{"type":"string"},"default":[]}},"required":["label","when","nudge"],"additionalProperties":false}"# },
+    Tool { name: "habit_add", description: "Store an immutable standing intention from literal text and an optional carried script, given as at most one of literal script text, a Files script_file_id, or an absolute script_path on the host the MCP server runs on (read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none). This does not execute the predicate or script. Optional personas are literal labels or exact IDs; omitted or empty personas notify everyone. A label is not unique; replacements require explicit supersedes IDs.", input_schema: r#"{"type":"object","properties":{"label":{"type":"string"},"when":{"type":"string"},"nudge":{"type":"string"},"script":{"type":"string","description":"Literal script text."},"script_file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the script."},"script_path":{"type":"string","description":"Absolute path of the script on the MCP server's host."},"supersedes":{"type":"array","items":{"type":"string"},"default":[]},"personas":{"type":"array","items":{"type":"string"},"default":[]}},"required":["label","when","nudge"],"additionalProperties":false}"# },
     Tool { name: "habit_list", description: "Inspect current definitions and activation without evaluating stored predicates by default. Explicit evaluate_conditions=true executes stored shell predicates on the server, as the CLI list command does.", input_schema: r#"{"type":"object","properties":{"evaluate_conditions":{"type":"boolean","default":false}},"additionalProperties":false}"# },
     Tool { name: "habit_show", description: "Inspect an exact definition or unambiguous label, including historical superseded definitions. Does not evaluate predicates.", input_schema: SELECTOR },
     Tool { name: "habit_due", description: "Explicitly evaluate stored standing-intention predicates on the server and return those due. Predicates can execute carried scripts or shell commands; failed evaluations are reported, not silently treated as not due.", input_schema: EMPTY },
@@ -28,7 +27,9 @@ struct Add {
     label: String,
     when: String,
     nudge: String,
-    script_base64: Option<String>,
+    script: Option<String>,
+    script_file_id: Option<String>,
+    script_path: Option<String>,
     #[serde(default)]
     supersedes: Vec<String>,
     #[serde(default)]
@@ -51,6 +52,7 @@ struct Empty {}
 
 pub struct Habits {
     operations: Operations,
+    files: crate::files::operations::Files,
 }
 impl Habits {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -58,7 +60,8 @@ impl Habits {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: Operations::with_storage(storage),
+            operations: Operations::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
@@ -70,17 +73,25 @@ impl Faculty for Habits {
         match name {
             "habit_add" => {
                 let args: Add = decode_arguments(arguments)?;
-                let script = args
-                    .script_base64
-                    .as_deref()
-                    .map(|value| {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(value)
-                            .map_err(|error| {
-                                invalid_arguments(format!("invalid script_base64: {error}"))
-                            })
-                    })
-                    .transpose()?;
+                let script = match (&args.script, &args.script_file_id, &args.script_path) {
+                    (None, None, None) => None,
+                    _ => Some(
+                        match crate::mcp::input::exactly_one([
+                            ("script", args.script.as_deref()),
+                            ("script_file_id", args.script_file_id.as_deref()),
+                            ("script_path", args.script_path.as_deref()),
+                        ])? {
+                            ("script", text) => Bytes::from(text.to_owned()),
+                            ("script_file_id", id) => {
+                                crate::mcp::input::read_file_id(&self.files, id)?
+                            }
+                            (_, path) => crate::mcp::input::read_host_file(
+                                path,
+                                crate::mcp::input::MAX_HOST_FILE_BYTES,
+                            )?,
+                        },
+                    ),
+                };
                 render::added(
                     &self.operations.add(
                         &args.label,

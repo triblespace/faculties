@@ -1,7 +1,6 @@
 //! Resident contracts only: no robot, camera shim, microphone or HTTP call.
 use anybytes::Bytes;
 use anyhow::{anyhow, Result};
-use base64::Engine;
 use clap::Parser;
 use faculties::body::{self, Body, CaptureInput, Signal};
 use faculties::files::presentation::ViewOptions;
@@ -105,7 +104,9 @@ fn resident_mcp_capture_export_and_bounded_view_are_distinct() {
     let fixture = Fixture::new();
     let adapter = fixture.mcp();
     let image = png();
-    let output = parts(|out| adapter.call("body_capture",json(serde_json::json!({"modality":"vision","data_base64":base64::engine::general_purpose::STANDARD.encode(&image),"mime":"image/png","width":2,"height":1,"pose":"@/not-a-file","note":"@-"})),out)).unwrap();
+    let host = fixture.directory.path().join("frame.png");
+    fs::write(&host, &image).unwrap();
+    let output = parts(|out| adapter.call("body_capture",json(serde_json::json!({"modality":"vision","path":host,"mime":"image/png","width":2,"height":1,"pose":"@/not-a-file","note":"@-"})),out)).unwrap();
     assert!(output.iter().all(|p| matches!(p, Part::Text { .. })));
     let id = format!("{:x}", fixture.body().list().unwrap()[0].id);
     let output =
@@ -127,6 +128,71 @@ fn resident_mcp_capture_export_and_bounded_view_are_distinct() {
     assert_eq!(mime_type, "image/png");
     assert_eq!(image::load_from_memory(bytes.as_ref()).unwrap().width(), 1);
     assert_eq!(fixture.body().get(&id).unwrap().bytes, image);
+}
+
+#[test]
+fn a_capture_by_file_id_stores_the_same_frame_as_by_path_and_by_bytes() {
+    let fixture = Fixture::new();
+    let adapter = fixture.mcp();
+    let image = png();
+    let host = fixture.directory.path().join("frame.png");
+    fs::write(&host, &image).unwrap();
+    // The Import id files_add reports for one file is the file_id.
+    let files = faculties::files::mcp::Files::new(fixture.pile.clone(), Some(fixture.key.clone()));
+    let report =
+        parts(|out| files.call("files_add", json(serde_json::json!({"path": host})), out)).unwrap();
+    let report: String = report
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.as_str(),
+            _ => "",
+        })
+        .collect();
+    let file_id = report
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let capture = |source: serde_json::Value| {
+        let mut args = serde_json::json!({"modality":"vision","mime":"image/png","width":2,"height":1,"pose":"p"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(source.as_object().unwrap().clone());
+        let line = args.to_string();
+        parts(|out| adapter.call("body_capture", Bytes::from(line.into_bytes()), out)).unwrap();
+    };
+    capture(serde_json::json!({"file_id": file_id}));
+    capture(serde_json::json!({"path": host}));
+    fixture.body().capture(&vision(image.clone())).unwrap();
+    let captures = fixture.body().list().unwrap();
+    assert_eq!(captures.len(), 3);
+    for capture in captures {
+        let id = format!("{:x}", capture.id);
+        assert_eq!(fixture.body().get(&id).unwrap().bytes, image, "{id}");
+    }
+
+    // A folder import is one tree, not a frame: it is refused by name.
+    let folder = fixture.directory.path().join("frames");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("frame.png"), &image).unwrap();
+    let report =
+        parts(|out| files.call("files_add", json(serde_json::json!({"path": folder})), out))
+            .unwrap();
+    let Part::Text { text } = report.last().unwrap() else {
+        panic!("report")
+    };
+    let folder_id = text.trim().strip_prefix("Import: ").unwrap().to_owned();
+    let error = parts(|out| {
+        adapter.call(
+            "body_capture",
+            json(serde_json::json!({"modality":"vision","mime":"image/png","width":2,"height":1,"pose":"p","file_id":folder_id})),
+            out,
+        )
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("folder import"), "{error:#}");
+    assert_eq!(fixture.body().list().unwrap().len(), 3);
 }
 
 #[test]
@@ -198,15 +264,23 @@ fn invalid_mcp_arguments_fail_before_storage_or_hardware() {
     for (name, args) in [
         (
             "body_capture",
-            serde_json::json!({"modality":"touch","pose":"{}","data_base64":"AA=="}),
+            serde_json::json!({"modality":"touch","pose":"{}","path":"/no/such/frame"}),
         ),
         (
             "body_capture",
-            serde_json::json!({"modality":"vision","pose":"{}","data_base64":"AA==","mime":"image/png","width":0,"height":1}),
+            serde_json::json!({"modality":"vision","pose":"{}","path":"/no/such/frame","mime":"image/png","width":0,"height":1}),
         ),
         (
             "body_capture",
-            serde_json::json!({"modality":"audio","pose":"{}","data_base64":"!","mime":"audio/wav"}),
+            serde_json::json!({"modality":"audio","pose":"{}","path":"relative.wav","mime":"audio/wav"}),
+        ),
+        (
+            "body_capture",
+            serde_json::json!({"modality":"audio","pose":"{}","data_base64":"AA==","mime":"audio/wav"}),
+        ),
+        (
+            "body_capture",
+            serde_json::json!({"modality":"audio","pose":"{}","path":"/a","file_id":"0123456789abcdef0123456789abcdef","mime":"audio/wav"}),
         ),
         ("body_get", serde_json::json!({"id":"@-"})),
         (

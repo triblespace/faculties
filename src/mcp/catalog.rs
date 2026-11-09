@@ -111,7 +111,7 @@ impl Catalog {
             Box::new(gauge::mcp::Gauge::with_storage(storage.clone())),
             Box::new(habits::mcp::Habits::with_storage(storage.clone())),
             Box::new(headspace::mcp::Headspace::with_storage(storage.clone())),
-            Box::new(hear::mcp::Hear::new(hear_config)),
+            Box::new(hear::mcp::Hear::with_storage(storage.clone(), hear_config)),
             Box::new(home::mcp::Home::with_storage(storage.clone())),
             Box::new(imagine::mcp::Imagine::with_storage(storage.clone())),
             Box::new(linkedin),

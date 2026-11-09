@@ -4,7 +4,6 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use serde::Deserialize;
 use std::path::PathBuf;
 use triblespace::prelude::Id;
@@ -13,7 +12,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "mail_account_set", description: "Publish a full-state mail-account configuration, or reconcile every current fork. Accept only exact existing encrypted Secrets versions; omit credential_version only to inherit one settled current credential. No password or host-path input.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"address":{"type":"string"},"display_name":{"type":"string"},"pop_endpoint":{"type":"string","description":"Implicit-TLS POP endpoint as host:port."},"smtp_endpoint":{"type":"string","description":"Implicit-TLS SMTP endpoint as host:port."},"username":{"type":"string"},"credential_version":{"type":"string"},"disabled":{"type":"boolean","default":false}},"required":["address","display_name","pop_endpoint","smtp_endpoint"],"additionalProperties":false}"# },
     Tool { name: "mail_account_list", description: "List resident account identities, configuration heads and disabled/forked state without opening credential plaintext.", input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"# },
     Tool { name: "mail_fetch", description: "Drain every enabled account through UIDL-safe POP. This is an explicit network/remote-deletion action: persist Files and Mail evidence before DELE, then QUIT. A failed QUIT can leave remote deletion uncertain.", input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"# },
-    Tool { name: "mail_draft", description: "Create one immutable draft and its deterministic Decide authorization proposal. Text is literal. Attach existing exact Files IDs and/or resident raw attachments; no host paths. Does not send mail.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"default":[]},"cc":{"type":"array","items":{"type":"string"},"default":[]},"bcc":{"type":"array","items":{"type":"string"},"default":[]},"subject":{"type":"string"},"body":{"type":"string"},"file_ids":{"type":"array","items":{"type":"string"},"default":[],"description":"Exact existing Files value IDs."},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"mime":{"type":"string"},"data":{"type":"string","description":"Raw attachment bytes encoded as base64."}},"required":["name","mime","data"],"additionalProperties":false},"default":[]}},"required":["account","subject","body"],"additionalProperties":false,"anyOf":[{"required":["to"],"properties":{"to":{"minItems":1}}},{"required":["cc"],"properties":{"cc":{"minItems":1}}},{"required":["bcc"],"properties":{"bcc":{"minItems":1}}}]}"# },
+    Tool { name: "mail_draft", description: "Create one immutable draft and its deterministic Decide authorization proposal. Text is literal. Attach stored files by exact Files entity or single-file import ID (file_ids), and/or host files by absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none (attachments). A folder import is refused. Does not send mail.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"default":[]},"cc":{"type":"array","items":{"type":"string"},"default":[]},"bcc":{"type":"array","items":{"type":"string"},"default":[]},"subject":{"type":"string"},"body":{"type":"string"},"file_ids":{"type":"array","items":{"type":"string"},"default":[],"description":"Exact 32-hex Files entity IDs or single-file import IDs."},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"mime":{"type":"string"},"path":{"type":"string","description":"Absolute path of the attachment on the MCP server's host."}},"required":["name","mime","path"],"additionalProperties":false},"default":[]}},"required":["account","subject","body"],"additionalProperties":false,"anyOf":[{"required":["to"],"properties":{"to":{"minItems":1}}},{"required":["cc"],"properties":{"cc":{"minItems":1}}},{"required":["bcc"],"properties":{"bcc":{"minItems":1}}}]}"# },
     Tool { name: "mail_reply", description: "Create a reply draft using one unambiguous existing wire message and explicit sending account. Body is literal, including @-; does not send mail.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"message":{"type":"string"},"body":{"type":"string"}},"required":["account","message","body"],"additionalProperties":false}"# },
     Tool { name: "mail_send", description: "Submit one Decide-authorized immutable draft under host-serialized per-account execution. Persist its send attempt before SMTP and acceptance afterward. Never automatically retry an uncertain attempt; host must serialize other processes/replicas too.", input_schema: r#"{"type":"object","properties":{"draft":{"type":"string"}},"required":["draft"],"additionalProperties":false}"# },
     Tool { name: "mail_outbox", description: "List resident draft intents and their pending, accepted, or uncertain delivery state.", input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"# },
@@ -40,10 +39,10 @@ struct AccountSet {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResidentAttachment {
+struct HostAttachment {
     name: String,
     mime: String,
-    data: String,
+    path: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +59,7 @@ struct Draft {
     #[serde(default)]
     file_ids: Vec<String>,
     #[serde(default, deserialize_with = "crate::mcp::object::vec")]
-    attachments: Vec<ResidentAttachment>,
+    attachments: Vec<HostAttachment>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +125,7 @@ fn exact_id(value: &str) -> Result<Id> {
 #[derive(Clone, Debug)]
 pub struct Mail {
     operations: super::operations::Mail,
+    files: crate::files::operations::Files,
 }
 impl Mail {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -133,7 +133,8 @@ impl Mail {
     }
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
-            operations: super::operations::Mail::with_storage(storage),
+            operations: super::operations::Mail::with_storage(storage.clone()),
+            files: crate::files::operations::Files::with_storage(storage),
         }
     }
 }
@@ -206,15 +207,20 @@ impl Faculty for Mail {
                 let mut attachments = args
                     .file_ids
                     .iter()
-                    .map(|id| exact_id(id).map(DraftAttachment::File))
+                    .map(|id| {
+                        exact_id(id)?;
+                        Ok(DraftAttachment::File(self.files.file_entity(id)?))
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 for value in args.attachments {
                     text(&value.name, "attachment name")?;
                     let media_type = crate::files::normalize_media_type(&value.mime)
                         .map_err(invalid_arguments)?;
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&value.data)
-                        .map_err(invalid_arguments)?;
+                    let bytes = crate::mcp::input::read_host_file(
+                        &value.path,
+                        crate::mcp::input::MAX_HOST_FILE_BYTES,
+                    )?
+                    .to_vec();
                     attachments.push(DraftAttachment::Resident(super::AttachmentData {
                         filename: value.name,
                         media_type,

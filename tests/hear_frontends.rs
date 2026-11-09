@@ -233,30 +233,39 @@ fn malformed_samples_and_embedding_shapes_fail_before_emission() {
     assert_eq!(emitted, 0);
 }
 #[test]
-fn mcp_discovery_never_loads_models_and_caller_cannot_choose_devices_or_paths() {
+fn mcp_discovery_never_loads_models_and_caller_cannot_choose_devices() {
     let adapter = mcp::Hear::new(None);
     assert_eq!(adapter.tools().len(), 1);
     assert_eq!(adapter.tools()[0].name, "hear_once");
     Server::new(&[&adapter]).unwrap();
+    let host = tempfile::tempdir().unwrap();
+    let clip = host.path().join("clip.wav");
+    std::fs::write(&clip, [1_u8]).unwrap();
+    let empty = host.path().join("empty.wav");
+    std::fs::write(&empty, []).unwrap();
+    let with = |extra: &str| format!(r#"{{"path":{:?}{extra}}}"#, clip.to_str().unwrap());
     for args in [
-        r#"{"data":"AQ==","path":"/host/audio.wav"}"#,
-        r#"{"data":"AQ==","pile":"/host/model.pile"}"#,
-        r#"{"data":"AQ==","model":"other"}"#,
-        r#"{"data":"AQ==","soma":"http://localhost:8000"}"#,
-        r#"{"data":"AQ==","out":"/host/log"}"#,
-        r#"{"data":"AQ==","emb_dir":"/host/embeddings"}"#,
-        r#"{"data":"AQ==","data":"Ag=="}"#,
-        r#"{"data":"AQ==","tokens":0}"#,
-        r#"{"data":"AQ==","min_dur_s":-1}"#,
-        r#"{"data":"AQ==","mime_type":"image/png"}"#,
-        r#"{"data":""}"#,
-        r#"{"data":"!invalid!"}"#,
-        "[]",
+        with(r#","pile":"/host/model.pile""#),
+        with(r#","model":"other""#),
+        with(r#","soma":"http://localhost:8000""#),
+        with(r#","out":"/host/log""#),
+        with(r#","emb_dir":"/host/embeddings""#),
+        with(r#","file_id":"0123456789abcdef0123456789abcdef""#),
+        with(r#","tokens":0"#),
+        with(r#","min_dur_s":-1"#),
+        with(r#","mime_type":"image/png""#),
+        format!(r#"{{"path":{:?}}}"#, empty.to_str().unwrap()),
+        r#"{"path":"relative.wav"}"#.to_owned(),
+        r#"{"path":"/no/such/clip.wav"}"#.to_owned(),
+        r#"{"data":"AQ=="}"#.to_owned(),
+        r#"{"file_id":"0123456789abcdef0123456789abcdef"}"#.to_owned(),
+        "{}".to_owned(),
+        "[]".to_owned(),
     ] {
         let error = adapter
             .call(
                 "hear_once",
-                Bytes::from(args),
+                Bytes::from(args.clone()),
                 &mut Out::new(&mut |_| anyhow::bail!("unexpected emission")),
             )
             .unwrap_err();
@@ -268,7 +277,7 @@ fn mcp_discovery_never_loads_models_and_caller_cannot_choose_devices_or_paths() 
     let error = adapter
         .call(
             "hear_once",
-            Bytes::from(r#"{"data":"AQ==","prompt":"@literal","source":"@literal"}"#),
+            Bytes::from(with(r#","prompt":"@literal","source":"@literal""#)),
             &mut Out::new(&mut |_| anyhow::bail!("unexpected emission")),
         )
         .unwrap_err();

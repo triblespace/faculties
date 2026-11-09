@@ -1,5 +1,4 @@
 use anybytes::Bytes;
-use base64::Engine as _;
 use clap::Parser;
 use faculties::archive::{cli, mcp, Archive, ImportSource, Reading};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
@@ -408,15 +407,49 @@ fn malformed_import_is_not_published_and_output_failure_is_not_retried() {
 fn codex_resident_import_retains_trailing_bytes_and_mcp_binary_content() {
     let fixture = Fixture::new();
     let content = format!("{CODEX}{{\"incomplete\":");
-    let data = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
+    let host = fixture.directory.path().join("rollout.jsonl");
+    fs::write(&host, content.as_bytes()).unwrap();
     let result = fixture.call(
         "archive_import",
-        json!({"source":"codex","source_name":"rollout.jsonl","data":data}),
+        json!({"source":"codex","source_name":"rollout.jsonl","path":host}),
     );
     assert!(
         text(&result).contains("trailing_bytes_ignored=14"),
         "{}",
         text(&result)
+    );
+    assert_eq!(fixture.projections().len(), 1);
+
+    // The same bytes by Files file_id are the same immutable source: the
+    // import is idempotent, so no second projection appears.
+    let files = faculties::files::mcp::Files::new(fixture.pile.clone(), Some(fixture.key.clone()));
+    let mut report = String::new();
+    files
+        .call(
+            "files_add",
+            serde_json::to_vec(&json!({"path": host})).unwrap().into(),
+            &mut Out::new(&mut |part| {
+                if let Part::Text { text } = part {
+                    report.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let file_id = report
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let again = fixture.call(
+        "archive_import",
+        json!({"source":"codex","source_name":"rollout.jsonl","file_id":file_id}),
+    );
+    assert!(
+        text(&again).contains("trailing_bytes_ignored=14"),
+        "{}",
+        text(&again)
     );
     assert_eq!(fixture.projections().len(), 1);
 }
@@ -428,13 +461,14 @@ fn finite_schemas_reject_config_duplicates_invalid_shapes_and_dates_before_stora
     assert_eq!(adapter.tools().len(), 9);
     Server::new(&[&adapter]).unwrap();
     for (tool, args) in [
+        ("archive_import", r#"{"source_name":"x","data":"eA=="}"#),
         (
             "archive_import",
-            r#"{"source_name":"x","content":"x","data":"eA=="}"#,
+            r#"{"source_name":"x","path":"relative/file"}"#,
         ),
         (
             "archive_import",
-            r#"{"source_name":"x","data":"!invalid!"}"#,
+            r#"{"source_name":"x","path":"/no/such/export"}"#,
         ),
         (
             "archive_import",
@@ -442,11 +476,16 @@ fn finite_schemas_reject_config_duplicates_invalid_shapes_and_dates_before_stora
         ),
         (
             "archive_import",
+            r#"{"source_name":"x","file_id":"f00d","content":"x"}"#,
+        ),
+        ("archive_import", r#"{"source_name":"x"}"#),
+        (
+            "archive_import",
             r#"{"source_name":"x","source_name":"y","content":"x"}"#,
         ),
         (
             "archive_import",
-            r#"{"source":"gemini","source_name":"x","content":"x","attachments":[{"name":"x","data":""},{"name":"x","data":""}]}"#,
+            r#"{"source":"gemini","source_name":"x","content":"x","attachments":[{"name":"x","path":"/no/such/a"},{"name":"x","file_id":"0123456789abcdef0123456789abcdef","path":"/b"}]}"#,
         ),
         ("archive_list", r#"{"pile":"/host/pile"}"#),
         ("archive_index", "[]"),

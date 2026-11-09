@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use base64::Engine as _;
 use faculties::habits::{self, DeclaredState, Habits};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
@@ -236,17 +235,52 @@ fn literal_prose_and_resident_script_bytes_are_preserved_without_execution() {
     let (_directory, pile, key) = fixture();
     let script = b"#!/bin/sh\nprintf 'should not run'\n";
     let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
-    call(
-        &mcp,
-        "habit_add",
-        json!({"label":"literal", "when":"when @script", "nudge":"@/not-a-file", "script_base64":base64::engine::general_purpose::STANDARD.encode(script)}),
-    );
+    let host = _directory.path().join("check.sh");
+    std::fs::write(&host, script).unwrap();
+    let files = faculties::files::Files::new(pile.clone(), Some(key.clone()));
+    let mut report = String::new();
+    files
+        .add_path(
+            &host,
+            None,
+            &[],
+            false,
+            &mut faculties::out::Out::new(&mut |part| {
+                if let Part::Text { text } = part {
+                    report.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+    let file_id = report
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned();
+    for (label, source) in [
+        ("literal", json!({"script_path": host})),
+        ("by-file", json!({"script_file_id": file_id})),
+        (
+            "by-text",
+            json!({"script": std::str::from_utf8(script).unwrap()}),
+        ),
+    ] {
+        let mut args = json!({"label":label, "when":"when @script", "nudge":"@/not-a-file"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(source.as_object().unwrap().clone());
+        call(&mcp, "habit_add", args);
+    }
     let operations = Habits::new(pile, Some(key));
-    let observed = operations.show("literal").unwrap();
-    assert_eq!(observed.definition.nudge, "@/not-a-file");
-    assert_eq!(observed.definition.condition, "when @script");
-    assert_eq!(observed.definition.script.unwrap().bytes, script);
-    assert!(call(&mcp, "habit_check", json!({})).contains("1 definitions"));
+    for label in ["literal", "by-file", "by-text"] {
+        let observed = operations.show(label).unwrap();
+        assert_eq!(observed.definition.nudge, "@/not-a-file");
+        assert_eq!(observed.definition.condition, "when @script");
+        assert_eq!(observed.definition.script.unwrap().bytes, script, "{label}");
+    }
+    assert!(call(&mcp, "habit_check", json!({})).contains("3 definitions"));
 }
 
 #[test]
@@ -328,11 +362,19 @@ fn invalid_transport_arguments_do_not_touch_absent_storage() {
         ),
         (
             "habit_add",
-            r#"{"label":"x","when":"every 1h","nudge":"n","script_base64":"???"}"#,
+            r#"{"label":"x","when":"every 1h","nudge":"n","script_base64":"Yg=="}"#,
         ),
         (
             "habit_add",
-            r#"{"label":"x","when":"every 1h","nudge":"n","script_path":"/host/path"}"#,
+            r#"{"label":"x","when":"every 1h","nudge":"n","script_path":"/no/such/script"}"#,
+        ),
+        (
+            "habit_add",
+            r#"{"label":"x","when":"every 1h","nudge":"n","script_path":"relative.sh"}"#,
+        ),
+        (
+            "habit_add",
+            r#"{"label":"x","when":"every 1h","nudge":"n","script":"true","script_path":"/a"}"#,
         ),
         (
             "habit_add",
