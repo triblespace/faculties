@@ -305,7 +305,8 @@ impl WikiLive {
         let path = tmp_dir.join(&name);
         std::fs::write(&path, &*blob.bytes)
             .map_err(|_| "Cannot write the file preview.".to_owned())?;
-        std::process::Command::new("open")
+        let opener = if cfg!(target_os = "linux") { "xdg-open" } else { "open" };
+        std::process::Command::new(opener)
             .arg(&path)
             .spawn()
             .map_err(|_| "Cannot open this file with the system viewer.".to_owned())?;
