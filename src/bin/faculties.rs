@@ -77,7 +77,11 @@ enum Command {
     /// or left something missing. Exits 0 when a compaction replaces the
     /// pile file, so its supervisor restarts it on the new one.
     /// Needs a GB10, the complete WeMM root in the pile's models collection,
-    /// and WEMM_ROOT naming it.
+    /// and WEMM_ROOT naming it. WEMM_COPY_WEIGHTS=1 copies the weights into
+    /// device memory instead of reading them from the pile in place, and
+    /// WEMM_PROBE_DIR=<dir> turns on a probe self-check that logs agreement
+    /// or disagreement of a fixed batch (faculties::wemm::probe). Both are
+    /// read once at startup and are off when unset.
     #[cfg(feature = "wemm")]
     Maintain {
         #[arg(long, env = "PILE")]
@@ -194,6 +198,8 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
     let wiki = Wiki::with_storage(storage.clone());
     let files = Files::with_storage(storage.clone());
     let session = faculties::wemm::Session::from_env(&pile)?;
+    // Off unless WEMM_PROBE_DIR names a directory (faculties::wemm::probe).
+    session.start_probe_from_env()?;
     let result = faculties::pile_watch::run_until_replaced(
         &pile,
         session.backing(),

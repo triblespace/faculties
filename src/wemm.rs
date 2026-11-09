@@ -27,6 +27,13 @@
 //! which lies after any prefix a snapshot could observe. Nobody may run it, or
 //! truncate the file any other way, while a WeMM process is bound. The checks
 //! below are diagnostics, not proof of that.
+//!
+//! [`COPY_WEIGHTS_ENV`]` = 1` instead copies every weight into device memory
+//! at bind, so forwards never read the mapped pile pages. It costs device
+//! memory and bind time, and is off unless chosen. [`probe`] is an optional
+//! self-check for the maintenance daemon.
+
+pub mod probe;
 
 use crate::pile_watch::BackingIdentity;
 use crate::storage::{AcquiringReader, FacultyStore};
@@ -34,7 +41,7 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use mary::models::qwen3_5::input_codec::InputCodec;
 use mary::models::qwen3_5::native::{device_identity, Assets, NativeWemm};
-use mary::nn::cuda_bf16_alias::CudaBf16Aliases;
+use mary::nn::cuda_bf16_alias::{CudaBf16Aliases, WeightResidence};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -62,6 +69,54 @@ type Target = Collection<NvFp4CosineSet<Embedding>>;
 /// WeMM-Embedding-9B's BF16 tensors, one alias registration each.
 const ROLES: usize = 759;
 
+/// `1` copies the model's weights into device memory at bind; unset or `0`
+/// leaves them read in place from the pile's mapped pages (the default).
+/// Read once, when a [`Session`] binds.
+pub const COPY_WEIGHTS_ENV: &str = "WEMM_COPY_WEIGHTS";
+
+/// The weight residence [`COPY_WEIGHTS_ENV`]'s value chooses. Any value
+/// other than unset, `0` or `1` is refused, so a typo never silently selects
+/// the default.
+pub fn residence_from_env_value(value: Option<&std::ffi::OsStr>) -> Result<WeightResidence> {
+    match value.map(|v| v.to_str()) {
+        None => Ok(WeightResidence::PileAliased),
+        Some(Some("0")) => Ok(WeightResidence::PileAliased),
+        Some(Some("1")) => Ok(WeightResidence::DeviceCopy),
+        Some(other) => anyhow::bail!(
+            "{COPY_WEIGHTS_ENV} must be 1 (copy weights to device memory), 0 or unset (read them zero-copy from the pile); got {other:?}"
+        ),
+    }
+}
+
+/// The short name of a residence in logs and probe provenance.
+pub fn residence_name(residence: WeightResidence) -> &'static str {
+    match residence {
+        WeightResidence::PileAliased => "pile-aliased",
+        WeightResidence::DeviceCopy => "device-copy",
+    }
+}
+
+/// The line a bind ends with.
+pub fn bind_note(
+    roles: usize,
+    pile: &Path,
+    seconds: f64,
+    residence: WeightResidence,
+    copied_bytes: u64,
+) -> String {
+    let weights = match residence {
+        WeightResidence::DeviceCopy => format!(
+            "weights copied to device memory ({:.2} GiB, {COPY_WEIGHTS_ENV}=1)",
+            copied_bytes as f64 / (1u64 << 30) as f64
+        ),
+        WeightResidence::PileAliased => "weights read zero-copy from the pile".to_owned(),
+    };
+    format!(
+        "wemm: bound {roles} tensors from {} in {seconds:.1} s; {weights}",
+        pile.display()
+    )
+}
+
 /// What a query asks about: text, or content bytes read the way the index
 /// reads them (an image whole, the text of text, HTML or a PDF).
 pub enum Query<'a> {
@@ -75,6 +130,8 @@ pub enum Query<'a> {
 pub struct Session {
     runtime: Rc<RefCell<WemmRuntime>>,
     identity: WemmIdentity,
+    residence: WeightResidence,
+    tokenizer: Option<Id>,
     model: PathBuf,
     backing: BackingIdentity,
     _source: mary::model_collection::ModelPileSnapshot,
@@ -124,6 +181,7 @@ impl Session {
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
+        let residence = residence_from_env_value(std::env::var_os(COPY_WEIGHTS_ENV).as_deref())?;
         let model = pile.to_path_buf();
         let backing = BackingIdentity::of(&model)?;
         let Resolved {
@@ -133,13 +191,18 @@ impl Session {
             ..
         } = resolve(&model, crate::model_storage::models_handle()?, root)?;
         let codec: InputCodec = assets.codec().clone();
+        let tokenizer = mary::selection::model_root_parts(snapshot.facts(), root)
+            .ok()
+            .and_then(|parts| parts.tokenizer);
         let device = Default::default();
         let observed = device_identity(&device).map_err(anyhow::Error::msg)?;
         anyhow::ensure!(
             observed == ("NVIDIA GB10".into(), 12, 1),
             "WeMM runs on an NVIDIA GB10 (compute 12.1); this is {observed:?}"
         );
-        let mut aliases = CudaBf16Aliases::new(device, ROLES).map_err(anyhow::Error::msg)?;
+        let mut aliases = CudaBf16Aliases::new(device, ROLES)
+            .map_err(anyhow::Error::msg)?
+            .with_residence(residence);
         let started = std::time::Instant::now();
         let mut roles = 0usize;
         // SAFETY: the pile is append-only and is neither truncated nor
@@ -165,13 +228,20 @@ impl Session {
         };
         let runtime = WemmRuntime::from_native(identity, native, codec)?;
         eprintln!(
-            "wemm: bound {roles} tensors from {} in {:.1} s",
-            model.display(),
-            started.elapsed().as_secs_f64()
+            "{}",
+            bind_note(
+                roles,
+                &model,
+                started.elapsed().as_secs_f64(),
+                residence,
+                aliases.stats().copied_bytes
+            )
         );
         Ok(Self {
             runtime: Rc::new(RefCell::new(runtime)),
             identity,
+            residence,
+            tokenizer,
             model,
             backing,
             _source: snapshot,
@@ -181,6 +251,72 @@ impl Session {
     /// The pile file this session bound, as it observed it.
     pub fn backing(&self) -> &BackingIdentity {
         &self.backing
+    }
+
+    /// Where this session's weights live.
+    pub fn residence(&self) -> WeightResidence {
+        self.residence
+    }
+
+    /// Start the [`probe`] self-check if [`probe::PROBE_DIR_ENV`] names a
+    /// directory: probe once now, then after every
+    /// [`probe::PROBE_EVERY_FOUNDATIONS`] foundations this thread derives.
+    /// Returns whether it is on. Only the setup can fail; a later probe that
+    /// cannot run is logged and skipped, never an error of the derive.
+    pub fn start_probe_from_env(&self) -> Result<bool> {
+        let Some(dir) =
+            probe::dir_from_env_value(std::env::var_os(probe::PROBE_DIR_ENV).as_deref())
+        else {
+            return Ok(false);
+        };
+        let output = self
+            .runtime
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("WeMM runtime is busy"))?
+            .probe_texts(&probe::PROBE_TEXTS)?;
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .map(|h| h.trim().to_owned())
+            .unwrap_or_else(|_| "unknown".into());
+        let identity = probe::Provenance::default()
+            .with("model_root", format!("{:X}", self.identity.model_root))
+            .with(
+                "tokenizer_part",
+                self.tokenizer
+                    .map_or("unknown".into(), |id| format!("{id:X}")),
+            )
+            .with(
+                "probe_texts_sha256",
+                probe::texts_sha256(&probe::PROBE_TEXTS),
+            )
+            .with("probe_ids_sha256", probe::ids_sha256(&output.ids))
+            .with("batch", probe::PROBE_TEXTS.len())
+            .with("order", "as listed in faculties::wemm::probe::PROBE_TEXTS")
+            .with("weights", residence_name(self.residence))
+            .with(
+                "executable",
+                std::env::current_exe().map_or("unknown".into(), |p| p.display().to_string()),
+            )
+            .with("executable_sha256", probe::executable_sha256()?)
+            .with("faculties_version", crate::GIT_VERSION)
+            .with("host", host)
+            .with("pid", std::process::id());
+        let mut checker = probe::Checker::new(&dir, identity, probe::PROBE_TEXTS.len())?;
+        eprintln!(
+            "wemm probe: on, every {} derived foundations, results are agreement or disagreement with two baselines (this process's first probe and the reference), neither an oracle; identity {}: {}",
+            probe::PROBE_EVERY_FOUNDATIONS,
+            checker.identity().digest(),
+            checker.identity().line()
+        );
+        for line in checker.observe(output.forward, output.raw, &now())? {
+            eprintln!("{line}");
+        }
+        PROBE.with(|slot| {
+            *slot.borrow_mut() = Some(Probe {
+                checker,
+                runtime: Rc::clone(&self.runtime),
+            })
+        });
+        Ok(true)
     }
 
     /// The index over `attributes` of `source`: one descriptor from every
@@ -330,6 +466,45 @@ impl Scores {
 thread_local! {
     /// Foundations derived so far and the backlog a derive pass started with.
     static PROGRESS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// The running self-check, when [`Session::start_probe_from_env`] started one.
+    static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
+}
+
+struct Probe {
+    checker: probe::Checker,
+    runtime: Rc<RefCell<WemmRuntime>>,
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Count one derived foundation and probe when one is due. Never fails: a
+/// probe that cannot run is logged and skipped.
+fn probe_after_foundation() {
+    PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(probe) = slot.as_mut() else {
+            return;
+        };
+        if !probe.checker.foundation_derived() {
+            return;
+        }
+        let output = match probe.runtime.try_borrow_mut() {
+            Ok(mut runtime) => runtime.probe_texts(&probe::PROBE_TEXTS),
+            Err(_) => {
+                eprintln!("wemm probe: skipped, the runtime is in use");
+                return;
+            }
+        };
+        match output {
+            Ok(output) => match probe.checker.observe(output.forward, output.raw, &now()) {
+                Ok(lines) => lines.iter().for_each(|line| eprintln!("{line}")),
+                Err(e) => eprintln!("wemm probe: skipped: {e:#}"),
+            },
+            Err(e) => eprintln!("wemm probe: skipped: {e}"),
+        }
+    });
 }
 
 /// The WeMM mapping, saying on stderr how far a long derive pass has got. It
@@ -377,6 +552,7 @@ impl DeriveMapping for Progress {
             "wemm: derived {done}/{backlog} in {:.1} s",
             started.elapsed().as_secs_f64()
         );
+        probe_after_foundation();
         Ok(image)
     }
 }
@@ -384,6 +560,41 @@ impl DeriveMapping for Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weights_stay_in_the_pile_unless_copying_is_chosen() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            residence_from_env_value(None).unwrap(),
+            WeightResidence::PileAliased
+        );
+        assert_eq!(WeightResidence::default(), WeightResidence::PileAliased);
+        assert_eq!(
+            residence_from_env_value(Some(OsStr::new("0"))).unwrap(),
+            WeightResidence::PileAliased
+        );
+        assert_eq!(
+            residence_from_env_value(Some(OsStr::new("1"))).unwrap(),
+            WeightResidence::DeviceCopy
+        );
+        for typo in ["", "yes", "true", " 1", "2"] {
+            let error = residence_from_env_value(Some(OsStr::new(typo))).unwrap_err();
+            assert!(error.to_string().contains(COPY_WEIGHTS_ENV), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_bind_line_says_where_the_weights_are() {
+        let pile = Path::new("/p.pile");
+        assert_eq!(
+            bind_note(759, pile, 43.04, WeightResidence::DeviceCopy, 18_000_000_000),
+            "wemm: bound 759 tensors from /p.pile in 43.0 s; weights copied to device memory (16.76 GiB, WEMM_COPY_WEIGHTS=1)"
+        );
+        assert_eq!(
+            bind_note(759, pile, 16.0, WeightResidence::PileAliased, 0),
+            "wemm: bound 759 tensors from /p.pile in 16.0 s; weights read zero-copy from the pile"
+        );
+    }
 
     /// The CPU half of a binding against a real pile: the complete root
     /// resolves from `WEMM_RESOLVE_PILE`'s collection `WEMM_RESOLVE_MODELS`
