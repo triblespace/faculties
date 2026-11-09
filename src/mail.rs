@@ -27,7 +27,7 @@ use lettre::Message;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::BlobStoreGet;
+use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
 use crate::decide::{self, Resolution};
@@ -119,6 +119,51 @@ pub struct AttachmentData {
     pub media_type: String,
     pub bytes: Vec<u8>,
 }
+
+/// The most attachment bytes one materialization of a draft copies, summed
+/// over every attachment it names. Sending materializes a draft twice, once
+/// to render it and once to check the frozen attempt against it. The send
+/// path materializes before it reads the send resolution, so a draft over
+/// this budget is refused before its attachments are copied, before it is
+/// rendered and before Decide is consulted.
+///
+/// This bounds the attachment copies, not the process's memory: rendering
+/// base64-encodes the copies, and [`materialize_draft`] says when a blob is
+/// fetched before it can be charged.
+///
+/// It is the input budget of one MCP call,
+/// [`crate::mcp::input::MAX_CALL_INPUT_BYTES`]. Mail has no message size
+/// limit of its own; a provider's limit is the provider's to enforce at
+/// submission.
+pub const MAX_DRAFT_ATTACHMENT_BYTES: u64 = crate::mcp::input::MAX_CALL_INPUT_BYTES;
+
+/// A draft whose attachments exceed the attachment budget of one
+/// materialization. `total` sums every attachment whose length was known
+/// when the draft was refused; `complete` says whether that was all of them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DraftOverBudget {
+    pub draft: Id,
+    pub attachments: usize,
+    pub total: u64,
+    pub complete: bool,
+    pub limit: u64,
+}
+
+impl std::fmt::Display for DraftOverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "draft {:x}: its {} attachments total {}{} bytes, over the {}-byte attachment budget of one draft; it was not rendered or sent",
+            self.draft,
+            self.attachments,
+            if self.complete { "" } else { "at least " },
+            self.total,
+            self.limit,
+        )
+    }
+}
+
+impl std::error::Error for DraftOverBudget {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WireIdentity {
@@ -1439,13 +1484,6 @@ pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<Strin
     Ok(value.to_string())
 }
 
-pub fn read_bytes(reader: &impl BlobStoreGet, handle: BytesHandle) -> Result<Vec<u8>> {
-    let value: anybytes::Bytes = reader
-        .get(handle)
-        .with_context(|| format!("read Mail byte blob {}", hex::encode(handle.raw)))?;
-    Ok(value.as_ref().to_vec())
-}
-
 fn text_union<Overlay: BlobStoreGet>(
     reader: &impl BlobStoreGet,
     overlay: Option<&Overlay>,
@@ -1552,12 +1590,19 @@ fn file_attachment_union<Overlay: BlobStoreGet>(
     })
 }
 
-/// Decode one attachment for an ordinary typed read.
+/// The blobs of one attachment, selected by an ordinary typed read.
+struct AttachmentHandles {
+    content: BytesHandle,
+    name: TextHandle,
+    media_type: TextHandle,
+}
+
+/// Select one attachment's blobs without reading any of them.
 ///
 /// The query itself selects the Files vocabulary this consumer understands.
 /// Unlike import validation, this path neither reconstructs the intrinsic id
 /// nor rejects additive facts that another version may understand.
-fn file_attachment<P>(reader: &impl BlobStoreGet, facts: &P, file: Id) -> Result<AttachmentData>
+fn file_attachment_handles<P>(facts: &P, file: Id) -> Result<AttachmentHandles>
 where
     P: TriblePattern,
 {
@@ -1577,7 +1622,7 @@ where
         .collect(),
         "file name",
     )?;
-    let media_name = required(
+    let media_type = required(
         find!(value: TextHandle, pattern!(facts, [
             { file @
                 metadata::tag: &KIND_FILE,
@@ -1591,10 +1636,10 @@ where
         .collect(),
         "media type name",
     )?;
-    Ok(AttachmentData {
-        filename: read_text(reader, name)?,
-        media_type: read_text(reader, media_name)?,
-        bytes: read_bytes(reader, content)?,
+    Ok(AttachmentHandles {
+        content,
+        name,
+        media_type,
     })
 }
 
@@ -2974,13 +3019,31 @@ where
     }
 }
 
-pub fn materialize_draft<M, F>(
-    reader: &impl BlobStoreGet,
+/// Read one draft and every attachment it names, refusing with
+/// [`DraftOverBudget`] when the attachments together exceed
+/// `attachment_limit` bytes.
+///
+/// The draft names each attachment once: its attachments are a set of Files
+/// entities. Two entities with the same content are two attachments and are
+/// charged twice, because each is copied into the draft.
+///
+/// The budget is checked against the lengths the reader's metadata reports,
+/// before any attachment blob is read with `get` or copied. (A pile answers
+/// metadata from its mapped record, which it may hash to validate; that
+/// copies nothing.) The metadata answers only for blobs the snapshot holds
+/// locally. A blob it does not hold has no length to read beforehand (an
+/// acquiring reader fetches it from a peer on `get`), so that blob is
+/// charged after it is fetched and before it is copied: its fetch is not
+/// bounded by this budget, only its copy.
+pub fn materialize_draft<R, M, F>(
+    reader: &R,
     mail_facts: &M,
     files_facts: &F,
     id: Id,
+    attachment_limit: u64,
 ) -> Result<MaterializedDraft>
 where
+    R: BlobStoreGet + BlobStoreMeta,
     M: TriblePattern,
     F: TriblePattern,
 {
@@ -2991,11 +3054,60 @@ where
             .map(|&handle| read_text(reader, handle))
             .collect()
     };
-    let attachments = record
+    let handles = record
         .attachments
         .iter()
-        .map(|&file| file_attachment(reader, files_facts, file))
-        .collect::<Result<_>>()?;
+        .map(|&file| file_attachment_handles(files_facts, file))
+        .collect::<Result<Vec<_>>>()?;
+    let mut over = DraftOverBudget {
+        draft: id,
+        attachments: handles.len(),
+        total: 0,
+        complete: true,
+        limit: attachment_limit,
+    };
+    let mut counted = Vec::with_capacity(handles.len());
+    let mut uncounted = 0usize;
+    for handle in &handles {
+        let length = reader
+            .metadata(handle.content)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!(
+                    "read the length of Mail attachment blob {}",
+                    hex::encode(handle.content.raw)
+                )
+            })?
+            .map(|metadata| metadata.length);
+        match length {
+            Some(length) => over.total = over.total.saturating_add(length),
+            None => uncounted += 1,
+        }
+        counted.push(length.is_some());
+    }
+    over.complete = uncounted == 0;
+    if over.total > attachment_limit {
+        return Err(over.into());
+    }
+    let mut attachments = Vec::with_capacity(handles.len());
+    for (handle, counted) in handles.iter().zip(counted) {
+        let bytes: anybytes::Bytes = reader
+            .get(handle.content)
+            .with_context(|| format!("read Mail byte blob {}", hex::encode(handle.content.raw)))?;
+        if !counted {
+            uncounted -= 1;
+            over.total = over.total.saturating_add(bytes.len() as u64);
+            over.complete = uncounted == 0;
+            if over.total > attachment_limit {
+                return Err(over.into());
+            }
+        }
+        attachments.push(AttachmentData {
+            filename: read_text(reader, handle.name)?,
+            media_type: read_text(reader, handle.media_type)?,
+            bytes: bytes.as_ref().to_vec(),
+        });
+    }
     let wires = ids_of_kind(mail_facts, KIND_WIRE_MESSAGE);
     let resolve_wire = |wire: Id, field: &str| -> Result<String> {
         if !wires.contains(&wire) {
@@ -3089,8 +3201,9 @@ fn materialize_draft_union<Overlay: BlobStoreGet>(
 }
 
 /// Format a draft once. The returned bytes and envelope are what a caller must
-/// freeze into SendAttempt before invoking SMTP.
-pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<RenderedMail> {
+/// freeze into SendAttempt before invoking SMTP. The draft is consumed so its
+/// attachment bytes move into the message instead of being copied.
+pub fn render_draft(draft: MaterializedDraft, account: &OpenAccount) -> Result<RenderedMail> {
     if draft.account != account.anchor {
         bail!("draft and account do not share an anchor");
     }
@@ -3166,12 +3279,12 @@ pub fn render_draft(draft: &MaterializedDraft, account: &OpenAccount) -> Result<
                 .header(header::ContentType::TEXT_PLAIN)
                 .body(draft.body.clone()),
         );
-        for attachment in &draft.attachments {
+        for attachment in draft.attachments {
             let content_type = header::ContentType::parse(&attachment.media_type)
                 .unwrap_or(header::ContentType::parse(files::DEFAULT_MEDIA_TYPE).unwrap());
             multipart = multipart.singlepart(
-                lettre::message::Attachment::new(attachment.filename.clone())
-                    .body(attachment.bytes.clone(), content_type),
+                lettre::message::Attachment::new(attachment.filename)
+                    .body(attachment.bytes, content_type),
             );
         }
         builder
@@ -3312,15 +3425,17 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// cannot prove that this local snapshot was globally fresh or complete: SMTP
 /// execution is therefore an affine authority which deployments must
 /// serialize per account rather than running concurrently on replicas.
-pub fn prepare_send<M, F, D>(
-    mail_reader: &impl BlobStoreGet,
+pub fn prepare_send<R, M, F, D>(
+    mail_reader: &R,
     decide_reader: &impl BlobStoreGet,
     mail_facts: &M,
     files_facts: &F,
     decide_facts: &D,
     input: SendAttemptInput,
+    attachment_limit: u64,
 ) -> Result<PreparedSend>
 where
+    R: BlobStoreGet + BlobStoreMeta,
     M: TriblePattern,
     F: TriblePattern,
     D: TriblePattern,
@@ -3349,9 +3464,15 @@ where
 
     let envelope = smtp_envelope_for_attempt(&input)?;
     let config = account_config(mail_facts, input.config)?;
-    let materialized = materialize_draft(mail_reader, mail_facts, files_facts, input.draft)?;
+    let materialized = materialize_draft(
+        mail_reader,
+        mail_facts,
+        files_facts,
+        input.draft,
+        attachment_limit,
+    )?;
     let expected = render_draft(
-        &materialized,
+        materialized,
         &OpenAccount {
             anchor: config.account,
             config: config.id,
@@ -3382,6 +3503,7 @@ where
             "send attempt bytes or envelope do not equal the authorized DraftIntent rendering: SMTP envelope differs"
         );
     }
+    drop(expected);
     let raw = input.raw.clone();
     let (attempt, attempt_id) = send_attempt_fragment(input)?;
     let outgoing = outgoing_publication(attempt_id, &raw)?;
@@ -3664,7 +3786,14 @@ mod tests {
         staged_mail += draft.mail;
         let mail_facts = staged_mail.facts().clone();
         let files_facts = file.facts().clone();
-        assert!(materialize_draft(&reader, &mail_facts, &files_facts, draft.draft).is_err());
+        assert!(materialize_draft(
+            &reader,
+            &mail_facts,
+            &files_facts,
+            draft.draft,
+            MAX_DRAFT_ATTACHMENT_BYTES
+        )
+        .is_err());
 
         let mut staged = staged_mail;
         staged += file;
@@ -3832,6 +3961,238 @@ mod tests {
         assert!(format!("{error:#}").contains("UIDL \"stable-uidl\" names different raw messages"));
     }
 
+    /// One fixed draft with two attachments, its Mail and Files facts and
+    /// blobs in one fragment, and the account it renders for.
+    fn golden_draft_parts() -> (Fragment, Id, OpenAccount) {
+        let binary: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let first = files::stage(binary, "data.bin", "application/octet-stream").unwrap();
+        let second = files::stage(
+            b"plain attachment text\r\nsecond line\n".to_vec(),
+            "notes.txt",
+            "text/plain",
+        )
+        .unwrap();
+        let draft = draft_publication(DraftInput {
+            nonce: id(93),
+            account: id(94),
+            envelope_from: "sender@example.test".into(),
+            to: vec!["Receiver <receiver@example.test>".into()],
+            cc: vec!["cc@example.test".into()],
+            bcc: vec!["hidden@example.test".into()],
+            subject: "Golden rendering".into(),
+            body: "Body text for the golden rendering.".into(),
+            attachments: vec![first.root().unwrap(), second.root().unwrap()],
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            created_at: at(5),
+        })
+        .unwrap();
+        let mut staged = draft.mail;
+        staged += first;
+        staged += second;
+        let account = OpenAccount {
+            anchor: id(94),
+            config: id(95),
+            address: "sender@example.test".into(),
+            display_name: "Sender".into(),
+            pop_endpoint: "pop.example.test:995".into(),
+            smtp_endpoint: "smtp.example.test:465".into(),
+            username: "sender@example.test".into(),
+            password: "unused".into(),
+            enabled: true,
+        };
+        (staged, draft.draft, account)
+    }
+
+    /// The rendering of [`golden_draft_parts`] at faculties fe66c43e, before
+    /// the attachment budget: its blake3 hash and length.
+    const GOLDEN_RENDER_BLAKE3: &str =
+        "823a0486504d114b83d7920129d08c8115d6b8313fdce90d3545fca837d8a099";
+    const GOLDEN_RENDER_LEN: usize = 6550;
+
+    #[test]
+    fn a_draft_within_the_attachment_budget_renders_as_before() {
+        let (mut staged, draft, account) = golden_draft_parts();
+        let facts = staged.facts().clone();
+        let reader = staged.blobs_mut().snapshot().unwrap();
+        let attachment_bytes = 4096 + 35;
+        let materialized =
+            materialize_draft(&reader, &facts, &facts, draft, attachment_bytes).unwrap();
+        let rendered = render_draft(materialized, &account).unwrap();
+        if let Some(path) = std::env::var_os("MAIL_GOLDEN_RENDER_OUT") {
+            std::fs::write(path, &rendered.raw).unwrap();
+        }
+        assert_eq!(rendered.raw.len(), GOLDEN_RENDER_LEN);
+        assert_eq!(
+            blake3::hash(&rendered.raw).to_hex().as_str(),
+            GOLDEN_RENDER_BLAKE3
+        );
+    }
+
+    /// A reader that counts its `get` calls and can hide blob lengths, as a
+    /// reader does for a blob it would have to fetch from a peer.
+    struct Counting<'a, R> {
+        inner: &'a R,
+        lengths: bool,
+        gets: std::cell::Cell<usize>,
+    }
+
+    impl<'a, R> Counting<'a, R> {
+        fn new(inner: &'a R, lengths: bool) -> Self {
+            Self {
+                inner,
+                lengths,
+                gets: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl<R: BlobStoreGet> BlobStoreGet for Counting<'_, R> {
+        type GetError<E: std::error::Error + Send + Sync + 'static> = R::GetError<E>;
+
+        fn get<T, S>(
+            &self,
+            handle: triblespace::core::inline::Inline<
+                triblespace::core::inline::encodings::hash::Handle<S>,
+            >,
+        ) -> Result<T, Self::GetError<<T as triblespace::core::blob::TryFromBlob<S>>::Error>>
+        where
+            S: triblespace::core::blob::BlobEncoding + 'static,
+            T: triblespace::core::blob::TryFromBlob<S>,
+            triblespace::core::inline::encodings::hash::Handle<S>:
+                triblespace::core::inline::InlineEncoding,
+        {
+            self.gets.set(self.gets.get() + 1);
+            self.inner.get(handle)
+        }
+    }
+
+    impl<R: BlobStoreMeta> BlobStoreMeta for Counting<'_, R> {
+        type MetaError = R::MetaError;
+
+        fn metadata<S>(
+            &self,
+            handle: triblespace::core::inline::Inline<
+                triblespace::core::inline::encodings::hash::Handle<S>,
+            >,
+        ) -> Result<Option<triblespace::core::repo::BlobMetadata>, Self::MetaError>
+        where
+            S: triblespace::core::blob::BlobEncoding + 'static,
+            triblespace::core::inline::encodings::hash::Handle<S>:
+                triblespace::core::inline::InlineEncoding,
+        {
+            if self.lengths {
+                self.inner.metadata(handle)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn over_budget(error: &anyhow::Error) -> DraftOverBudget {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<DraftOverBudget>())
+            .unwrap_or_else(|| panic!("not an attachment budget refusal: {error:#}"))
+            .clone()
+    }
+
+    #[test]
+    fn the_attachment_budget_sums_every_attachment_before_reading_any() {
+        let (mut staged, draft, _) = golden_draft_parts();
+        let facts = staged.facts().clone();
+        let store = staged.blobs_mut().snapshot().unwrap();
+        let total = 4096 + 35;
+
+        let reader = Counting::new(&store, true);
+        materialize_draft(&reader, &facts, &facts, draft, total).unwrap();
+
+        // One byte under the sum of both attachments refuses the draft, and
+        // with their lengths known it does so before reading any blob.
+        let reader = Counting::new(&store, true);
+        let error = materialize_draft(&reader, &facts, &facts, draft, total - 1).unwrap_err();
+        assert_eq!(
+            over_budget(&error),
+            DraftOverBudget {
+                draft,
+                attachments: 2,
+                total,
+                complete: true,
+                limit: total - 1,
+            }
+        );
+        assert_eq!(reader.gets.get(), 0);
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("draft {draft:x}")), "{message}");
+        assert!(
+            message.contains(&format!("total {total} bytes")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_attachment_without_a_known_length_is_charged_before_it_is_copied() {
+        let (mut staged, draft, _) = golden_draft_parts();
+        let facts = staged.facts().clone();
+        let store = staged.blobs_mut().snapshot().unwrap();
+
+        let reader = Counting::new(&store, false);
+        materialize_draft(&reader, &facts, &facts, draft, 4096 + 35).unwrap();
+
+        // Without lengths, the first attachment fetched already exceeds the
+        // budget, and nothing after it is read.
+        let reader = Counting::new(&store, false);
+        let error = materialize_draft(&reader, &facts, &facts, draft, 10).unwrap_err();
+        let refused = over_budget(&error);
+        assert_eq!(refused.attachments, 2);
+        assert!(!refused.complete);
+        assert!(refused.total == 4096 || refused.total == 35, "{refused:?}");
+        assert_eq!(reader.gets.get(), 1);
+        assert!(format!("{error:#}").contains("at least"));
+    }
+
+    #[test]
+    fn a_file_named_twice_is_one_attachment_and_equal_content_is_charged_per_file() {
+        let content = vec![7u8; 100];
+        let first = files::stage(content.clone(), "a.bin", "application/octet-stream").unwrap();
+        let second = files::stage(content, "b.bin", "application/octet-stream").unwrap();
+        let draft_with = |nonce: u8, attachments: Vec<Id>| {
+            draft_publication(DraftInput {
+                nonce: id(nonce),
+                account: id(94),
+                envelope_from: "sender@example.test".into(),
+                to: vec!["receiver@example.test".into()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Attachments".into(),
+                body: "Body".into(),
+                attachments,
+                in_reply_to: Vec::new(),
+                references: Vec::new(),
+                created_at: at(6),
+            })
+            .unwrap()
+        };
+        let twice = draft_with(96, vec![first.root().unwrap(), first.root().unwrap()]);
+        let pair = draft_with(97, vec![first.root().unwrap(), second.root().unwrap()]);
+        let (twice_id, pair_id) = (twice.draft, pair.draft);
+        let mut staged = twice.mail;
+        staged += pair.mail;
+        staged += first;
+        staged += second;
+        let facts = staged.facts().clone();
+        let reader = staged.blobs_mut().snapshot().unwrap();
+
+        let materialized = materialize_draft(&reader, &facts, &facts, twice_id, 100).unwrap();
+        assert_eq!(materialized.attachments.len(), 1);
+
+        let error = materialize_draft(&reader, &facts, &facts, pair_id, 199).unwrap_err();
+        let refused = over_budget(&error);
+        assert_eq!((refused.attachments, refused.total), (2, 200));
+        let materialized = materialize_draft(&reader, &facts, &facts, pair_id, 200).unwrap();
+        assert_eq!(materialized.attachments.len(), 2);
+    }
+
     #[test]
     fn multipart_draft_rendering_is_byte_deterministic() {
         let draft = MaterializedDraft {
@@ -3864,8 +4225,8 @@ mod tests {
             enabled: true,
         };
 
-        let first = render_draft(&draft, &account).unwrap();
-        let second = render_draft(&draft, &account).unwrap();
+        let first = render_draft(draft.clone(), &account).unwrap();
+        let second = render_draft(draft.clone(), &account).unwrap();
         assert_eq!(first, second);
         let boundary = format!("boundary=\"=_triblespace_{:x}\"", draft.id);
         assert!(first
@@ -4270,9 +4631,10 @@ mod tests {
             &views.mail.facts,
             &views.files.facts,
             draft.draft,
+            MAX_DRAFT_ATTACHMENT_BYTES,
         )
         .unwrap();
-        let rendered = render_draft(&materialized, &account).unwrap();
+        let rendered = render_draft(materialized.clone(), &account).unwrap();
         let (decision, heads) =
             authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap();
         assert_eq!(heads, vec![resolution_id]);
@@ -4348,6 +4710,7 @@ mod tests {
                 raw: corrupt,
                 ..base_attempt.clone()
             },
+            MAX_DRAFT_ATTACHMENT_BYTES,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("bytes or envelope"));
@@ -4359,6 +4722,7 @@ mod tests {
             &views.files.facts,
             &views.decide.facts,
             base_attempt,
+            MAX_DRAFT_ATTACHMENT_BYTES,
         )
         .unwrap();
         let attempt_id = prepared.attempt_id();
@@ -4511,9 +4875,10 @@ mod tests {
             &views.mail.facts,
             &views.files.facts,
             draft.draft,
+            MAX_DRAFT_ATTACHMENT_BYTES,
         )
         .unwrap();
-        let rendered = render_draft(&materialized, &account).unwrap();
+        let rendered = render_draft(materialized.clone(), &account).unwrap();
         let (decision, heads) =
             authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap();
         assert_eq!(heads, vec![send_id]);
@@ -4534,6 +4899,7 @@ mod tests {
                 cc: materialized.cc,
                 bcc: materialized.bcc,
             },
+            MAX_DRAFT_ATTACHMENT_BYTES,
         )
         .unwrap();
         fixture.publish(

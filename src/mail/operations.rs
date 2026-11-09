@@ -918,6 +918,33 @@ fn endpoint<'a>(value: &'a str, label: &str) -> Result<(&'a str, u16)> {
 }
 
 fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
+    cmd_send_with(
+        storage,
+        selector,
+        mail::MAX_DRAFT_ATTACHMENT_BYTES,
+        |account| {
+            let (host, port) = endpoint(&account.smtp_endpoint, "SMTP")?;
+            let creds = Credentials::new(account.username.clone(), account.password.clone());
+            let transport = SmtpTransport::relay(host)
+                .with_context(|| format!("configure SMTP relay {host}"))?
+                .port(port)
+                .credentials(creds)
+                .build();
+            Ok(LettreSubmit { transport })
+        },
+    )
+}
+
+/// [`cmd_send`] with its attachment budget and its SMTP connection supplied.
+/// `connect` is called only once the attempt is prepared and its Files
+/// evidence published, immediately before the attempt is published and
+/// submitted.
+fn cmd_send_with<S: mail::SmtpSubmit>(
+    storage: &Storage,
+    selector: &str,
+    attachment_limit: u64,
+    connect: impl FnOnce(&mail::OpenAccount) -> Result<S>,
+) -> Result<SendReceipt> {
     let views = storage.views()?;
     let draft_id = resolve_draft(&views.mail.facts, selector)?;
     let existing = mail::attempts_for_draft(&views.mail.facts, draft_id);
@@ -943,6 +970,15 @@ fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
     if !current_config.enabled {
         bail!("draft account {} is disabled", fmt_id(record.account));
     }
+    // An over-budget draft is refused here: before its credential is opened,
+    // before it is rendered and before Decide is consulted.
+    let draft = mail::materialize_draft(
+        &views.mail.reader,
+        &views.mail.facts,
+        &views.files.facts,
+        draft_id,
+        attachment_limit,
+    )?;
     let account = mail::open_account(
         &views.mail.reader,
         &views.mail.facts,
@@ -950,13 +986,9 @@ fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
         record.account,
         &storage.signer,
     )?;
-    let draft = mail::materialize_draft(
-        &views.mail.reader,
-        &views.mail.facts,
-        &views.files.facts,
-        draft_id,
-    )?;
-    let rendered = mail::render_draft(&draft, &account)?;
+    let envelope_from = draft.envelope_from.clone();
+    let (to, cc, bcc) = (draft.to.clone(), draft.cc.clone(), draft.bcc.clone());
+    let rendered = mail::render_draft(draft, &account)?;
     let (decision, heads) =
         mail::authorized_send(&views.decide.reader, &views.decide.facts, draft_id)?;
     let prepared = mail::prepare_send(
@@ -970,12 +1002,13 @@ fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
             config: account.config,
             decision,
             decision_heads: heads,
-            raw: rendered.raw.clone(),
-            envelope_from: draft.envelope_from.clone(),
-            to: draft.to.clone(),
-            cc: draft.cc.clone(),
-            bcc: draft.bcc.clone(),
+            raw: rendered.raw,
+            envelope_from,
+            to,
+            cc,
+            bcc,
         },
+        attachment_limit,
     )?;
     let attempt_id = prepared.attempt_id();
     // Any Files evidence needed by the post-effect outgoing projection is
@@ -987,15 +1020,7 @@ fn cmd_send(storage: &Storage, selector: &str) -> Result<SendReceipt> {
             "mail: outgoing attachment evidence",
         )?;
     }
-    let smtp_endpoint = account.smtp_endpoint.clone();
-    let (host, port) = endpoint(&smtp_endpoint, "SMTP")?;
-    let creds = Credentials::new(account.username.clone(), account.password.clone());
-    let transport = SmtpTransport::relay(host)
-        .with_context(|| format!("configure SMTP relay {host}"))?
-        .port(port)
-        .credentials(creds)
-        .build();
-    let mut submitter = LettreSubmit { transport };
+    let mut submitter = connect(&account)?;
     let response = mail::submit_once(
         &mut submitter,
         &prepared,
@@ -1030,12 +1055,9 @@ fn cmd_outbox(storage: &Storage) -> Result<Vec<DraftStatus>> {
     .collect();
     let mut result = Vec::new();
     for id in drafts {
-        let draft = mail::materialize_draft(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            id,
-        )?;
+        // The outbox shows each draft's subject, so it reads the subject
+        // alone and none of the draft's attachments.
+        let draft = mail::draft_value(&views.mail.facts, id)?;
         let attempts = mail::attempts_for_draft(&views.mail.facts, id);
         let state = match attempts.as_slice() {
             [] => DraftDelivery::Pending,
@@ -1047,7 +1069,7 @@ fn cmd_outbox(storage: &Storage) -> Result<Vec<DraftStatus>> {
         };
         result.push(DraftStatus {
             draft: id,
-            subject: draft.subject,
+            subject: mail::read_text(&views.mail.reader, draft.subject)?,
             delivery: state,
         });
     }
@@ -1710,6 +1732,166 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("disabled"), "{message}");
         assert!(!message.contains("open secret"), "{message}");
+    }
+
+    /// A test transport that records what it is given and accepts it. It
+    /// never opens a connection.
+    struct RecordingSmtp {
+        submitted: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl mail::SmtpSubmit for RecordingSmtp {
+        fn submit(
+            &mut self,
+            _envelope: &mail::SmtpEnvelope,
+            raw: &[u8],
+        ) -> Result<mail::AcceptedReply> {
+            self.submitted.borrow_mut().push(raw.to_vec());
+            Ok(mail::AcceptedReply {
+                code: 250,
+                message: "accepted by the test transport".into(),
+            })
+        }
+    }
+
+    fn never_connect(_: &mail::OpenAccount) -> Result<RecordingSmtp> {
+        panic!("an over-budget draft must not reach the SMTP transport")
+    }
+
+    fn draft_with_attachment(storage: &Storage, fixture: &Fixture, bytes: usize) -> Id {
+        cmd_draft(
+            storage,
+            DraftRequest {
+                account: format!("{:x}", fixture.account),
+                to: vec!["recipient@example.test".into()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Large attachment".into(),
+                body: "attached".into(),
+                attachments: vec![DraftAttachment::Resident(mail::AttachmentData {
+                    filename: "payload.bin".into(),
+                    media_type: "application/octet-stream".into(),
+                    bytes: vec![42; bytes],
+                })],
+            },
+        )
+        .unwrap()
+        .draft
+    }
+
+    fn pile_len(fixture: &Fixture) -> u64 {
+        std::fs::metadata(&fixture.pile).unwrap().len()
+    }
+
+    fn assert_over_budget(error: &anyhow::Error, draft: Id, total: u64, limit: u64) {
+        let refused = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<mail::DraftOverBudget>())
+            .unwrap_or_else(|| panic!("not an attachment budget refusal: {error:#}"));
+        assert_eq!(
+            refused,
+            &mail::DraftOverBudget {
+                draft,
+                attachments: 1,
+                total,
+                complete: true,
+                limit,
+            }
+        );
+    }
+
+    #[test]
+    fn an_over_budget_draft_is_refused_before_decide_rendering_and_transport() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let draft = draft_with_attachment(&storage, &fixture, 1000);
+        let selector = format!("{draft:x}");
+
+        // No send resolution exists yet, so consulting Decide would fail
+        // with "has no resolution": the budget refusal comes before it.
+        storage.views().unwrap();
+        let before = pile_len(&fixture);
+        let error = cmd_send_with(&storage, &selector, 999, never_connect).unwrap_err();
+        assert_over_budget(&error, draft, 1000, 999);
+        assert!(!format!("{error:#}").contains("resolution"));
+        assert_eq!(pile_len(&fixture), before, "a refused send published");
+
+        // Authorized, the draft is still refused over budget: nothing is
+        // published and the transport is never created.
+        let (resolution, _) = crate::decide::resolution_fragment(
+            mail::draft_decision_id(draft),
+            "send",
+            None,
+            true,
+            &[],
+            &[],
+            point_now().unwrap(),
+        )
+        .unwrap();
+        storage
+            .publish(storage.scopes.decide, resolution, "test: authorize send")
+            .unwrap();
+        storage.views().unwrap();
+        let before = pile_len(&fixture);
+        let error = cmd_send_with(&storage, &selector, 999, never_connect).unwrap_err();
+        assert_over_budget(&error, draft, 1000, 999);
+        assert_eq!(pile_len(&fixture), before, "a refused send published");
+        let views = storage.views().unwrap();
+        assert!(mail::attempts_for_draft(&views.mail.facts, draft).is_empty());
+        drop(views);
+
+        // Within the budget the same draft reaches the test transport once.
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let receipt = cmd_send_with(&storage, &selector, 1000, |_| {
+            Ok(RecordingSmtp {
+                submitted: submitted.clone(),
+            })
+        })
+        .unwrap();
+        assert!(matches!(receipt.status, SendStatus::Accepted(_)));
+        assert_eq!(submitted.borrow().len(), 1);
+        let views = storage.views().unwrap();
+        assert_eq!(
+            mail::attempts_for_draft(&views.mail.facts, draft),
+            vec![receipt.attempt]
+        );
+    }
+
+    #[test]
+    fn the_outbox_reads_no_attachment_bytes() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        // A Files record whose blobs this pile does not hold: the outbox
+        // can list a draft naming it only if it reads none of its bytes.
+        let file = files::stage(vec![9; 64], "absent.bin", "application/octet-stream").unwrap();
+        let file_id = file.root().unwrap();
+        storage
+            .publish(
+                storage.scopes.files,
+                Fragment::new(file.exports(), file.facts().clone()),
+                "test: a file without its blobs",
+            )
+            .unwrap();
+        let draft = cmd_draft(
+            &storage,
+            DraftRequest {
+                account: format!("{:x}", fixture.account),
+                to: vec!["recipient@example.test".into()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "Absent attachment".into(),
+                body: "attached".into(),
+                attachments: vec![DraftAttachment::File(file_id)],
+            },
+        )
+        .unwrap()
+        .draft;
+
+        let outbox = cmd_outbox(&storage).unwrap();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].draft, draft);
+        assert_eq!(outbox[0].subject, "Absent attachment");
+        assert!(matches!(outbox[0].delivery, DraftDelivery::Pending));
     }
 
     #[derive(Default)]
