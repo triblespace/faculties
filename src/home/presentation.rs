@@ -138,8 +138,8 @@ pub fn discovered(bridges: &[Discovered], out: &mut Out<'_>) -> Result<()> {
 
 pub fn binding(binding: &Binding, out: &mut Out<'_>) -> Result<()> {
     out.line(format!(
-        "[{:x}] bridge {} at {}, username in Secrets version {:x}",
-        binding.revision, binding.bridge_id, binding.address, binding.secret
+        "[{:x}] bridge {}, username in Secrets version {:x}",
+        binding.revision, binding.bridge_id, binding.secret
     ))?;
     out.line(match binding.pin {
         Some(pin) => format!("certificate SHA-256 {pin}"),
@@ -175,9 +175,6 @@ pub fn status(status: &BindingStatus, out: &mut Out<'_>) -> Result<()> {
             }
             for id in &status.bridge_ids {
                 out.line(format!("bridge {id}"))?;
-            }
-            for address in &status.addresses {
-                out.line(format!("address {address}"))?;
             }
             for secret in &status.secrets {
                 out.line(format!("username secret {secret:x}"))?;

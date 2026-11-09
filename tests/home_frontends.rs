@@ -1,7 +1,9 @@
 //! Home talks to a loopback fake bridge here, never to a real one: no request
 //! in this file can reach a light. The fake bridge speaks TLS with a
 //! self-signed Ed25519 certificate made in the test, so every path below runs
-//! through the same certificate pinning a real bridge gets.
+//! through the same certificate pinning a real bridge gets. mDNS is faked
+//! too: every Home that could search is handed a scripted discovery, so no
+//! query leaves the machine.
 use faculties::home::{self, Fingerprint, Home, Request};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
@@ -12,6 +14,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::UTF8String;
@@ -294,6 +297,70 @@ fn fake_bridge_with(
     }
 }
 
+/// The bridge at an `https://127.0.0.1:PORT` base, as mDNS would announce it.
+fn announced(base: &str) -> home::Discovered {
+    let (address, port) = base
+        .strip_prefix("https://")
+        .and_then(|rest| rest.rsplit_once(':'))
+        .unwrap();
+    home::Discovered {
+        bridge_id: Some("001788fffe000001".into()),
+        address: address.into(),
+        port: Some(port.parse().unwrap()),
+        model: Some("BSB002".into()),
+        instance: None,
+        via: "mdns",
+    }
+}
+
+/// A scripted mDNS, and the record of what each search offered.
+#[derive(Clone, Default)]
+struct Searches(Arc<Mutex<Vec<Vec<String>>>>);
+
+impl Searches {
+    /// Answers with `bases` in this order, then stays silent until the
+    /// window closes, as a network with no further bridge would.
+    fn announcing(
+        &self,
+        bases: &[&str],
+    ) -> impl Fn(Duration, &mut dyn FnMut(&home::Discovered) -> bool) -> anyhow::Result<()>
+           + Send
+           + Sync
+           + 'static {
+        let log = self.0.clone();
+        let offers: Vec<_> = bases.iter().map(|base| announced(base)).collect();
+        move |wait, accept| {
+            let started = Instant::now();
+            let mut offered = Vec::new();
+            for bridge in &offers {
+                offered.push(format!("{}:{}", bridge.address, bridge.port.unwrap()));
+                if accept(bridge) {
+                    log.lock().unwrap().push(offered);
+                    return Ok(());
+                }
+            }
+            log.lock().unwrap().push(offered);
+            std::thread::sleep(wait.saturating_sub(started.elapsed()));
+            Ok(())
+        }
+    }
+
+    fn log(&self) -> Vec<Vec<String>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// `host:port` of a base URL, as `Searches` logs it.
+fn host(base: &str) -> String {
+    base.trim_start_matches("https://").to_owned()
+}
+
+/// An address nothing listens on.
+fn dead_base() -> String {
+    let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("https://{}", closed.local_addr().unwrap())
+}
+
 fn call(adapter: &dyn Faculty, tool: &str, arguments: Value) -> anyhow::Result<String> {
     let mut text = String::new();
     adapter.call(
@@ -365,8 +432,10 @@ fn binding_through_secrets_then_changes_are_sent_and_recorded() {
     let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
         .add("hue-bridge-fixture-username", USER.as_bytes())
         .unwrap();
-    let operations = Home::new(pile.clone(), Some(key.clone()));
-    let binding = operations.bridge_set(&bridge.base, secret).unwrap();
+    let searches = Searches::default();
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(searches.announcing(&[&bridge.base]));
+    let binding = operations.bridge_set(Some(&bridge.base), secret).unwrap();
     assert_eq!(binding.bridge_id, "001788fffe000001");
     assert_eq!(binding.secret, secret);
     assert_eq!(
@@ -375,18 +444,19 @@ fn binding_through_secrets_then_changes_are_sent_and_recorded() {
         "binding records the certificate"
     );
     assert_eq!(
-        operations.bridge_set(&bridge.base, secret).unwrap(),
+        operations.bridge_set(Some(&bridge.base), secret).unwrap(),
         binding
+    );
+    assert!(
+        searches.log().is_empty(),
+        "binding at an address searches nothing"
     );
     assert!(
         bridge.puts().is_empty(),
         "binding proves the username with GETs only"
     );
 
-    let adapter = home::mcp::Home::with_storage(faculties::storage::Storage::new(
-        pile.clone(),
-        Some(key.clone()),
-    ));
+    let adapter = home::mcp::Home::from_operations(operations.clone());
     let mut output = String::new();
     output += &call(
         &adapter,
@@ -659,15 +729,19 @@ fn the_binding_pin_follows_the_bridge_and_a_changed_certificate_needs_naming() {
     let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
         .add("hue-bridge-fixture-username", USER.as_bytes())
         .unwrap();
-    let operations = Home::new(pile.clone(), Some(key.clone()));
-    let binding = operations.bridge_set(&first.base, secret).unwrap();
+    // Both bridges answer mDNS; only the bound certificate is taken.
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(Searches::default().announcing(&[&first.base, &second.base]));
+    let binding = operations.bridge_set(Some(&first.base), secret).unwrap();
     assert_eq!(binding.pin, Some(first.pin));
 
     // The same bridge id behind another certificate: refused, both named,
     // before the username is opened or sent.
     let error = format!(
         "{:#}",
-        operations.bridge_set(&second.base, secret).unwrap_err()
+        operations
+            .bridge_set(Some(&second.base), secret)
+            .unwrap_err()
     );
     assert!(error.contains(&first.pin.to_string()), "{error}");
     assert!(error.contains(&second.pin.to_string()), "{error}");
@@ -683,7 +757,7 @@ fn the_binding_pin_follows_the_bridge_and_a_changed_certificate_needs_naming() {
         operations
             .clone()
             .with_pin(Fingerprint([0x5a; 32]))
-            .bridge_set(&second.base, secret)
+            .bridge_set(Some(&second.base), secret)
             .unwrap_err()
     );
     assert!(error.contains("refusing"), "{error}");
@@ -692,7 +766,7 @@ fn the_binding_pin_follows_the_bridge_and_a_changed_certificate_needs_naming() {
     let rebound = operations
         .clone()
         .with_pin(second.pin)
-        .bridge_set(&second.base, secret)
+        .bridge_set(Some(&second.base), secret)
         .unwrap();
     assert_eq!(rebound.pin, Some(second.pin));
     assert_eq!(
@@ -732,4 +806,169 @@ fn a_tls12_bridge_is_pinned_the_same_way() {
     let error = format!("{:#}", home(Fingerprint([0x5a; 32])).rooms().unwrap_err());
     assert!(error.contains("refusing"), "{error}");
     assert_eq!(Home::probe(&bridge.base).unwrap().certificate, bridge.pin);
+}
+
+#[test]
+fn every_connection_finds_the_bound_bridge_by_its_certificate_and_stops_there() {
+    let right = fake_bridge_with_key(1);
+    let wrong = fake_bridge_with_key(2);
+    let later = fake_bridge_with_key(3);
+    let dead = dead_base();
+    let (_directory, pile, key) = fresh_pile();
+    let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
+        .add("hue-bridge-fixture-username", USER.as_bytes())
+        .unwrap();
+    let searches = Searches::default();
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(searches.announcing(&[&dead, &wrong.base, &right.base, &later.base]));
+
+    // A pin alone binds the bridge mDNS finds presenting it.
+    let binding = operations
+        .clone()
+        .with_pin(right.pin)
+        .bridge_set(None, secret)
+        .unwrap();
+    assert_eq!(binding.pin, Some(right.pin));
+    assert_eq!(binding.bridge_id, "001788fffe000001");
+
+    let started = Instant::now();
+    assert_eq!(operations.rooms().unwrap().rooms.len(), 4);
+    assert!(
+        started.elapsed() < home::DISCOVERY_WAIT,
+        "the first match ends the search: {:?}",
+        started.elapsed()
+    );
+    let offered = vec![host(&dead), host(&wrong.base), host(&right.base)];
+    assert_eq!(searches.log(), [offered.clone(), offered]);
+    assert!(
+        wrong.seen().is_empty() && later.seen().is_empty(),
+        "a passed-over bridge completed no handshake and saw no request"
+    );
+    assert!(right
+        .seen()
+        .iter()
+        .any(|seen| seen.path == format!("/api/{USER}/groups")));
+    assert_eq!(
+        operations.bridge_status().unwrap().selected().unwrap(),
+        binding
+    );
+}
+
+#[test]
+fn a_bridge_presenting_another_certificate_is_never_taken() {
+    let bound = fake_bridge_with_key(1);
+    let impostor = fake_bridge_with_key(2);
+    let other = fake_bridge_with_key(3);
+    let (_directory, pile, key) = fresh_pile();
+    let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
+        .add("hue-bridge-fixture-username", USER.as_bytes())
+        .unwrap();
+    let searches = Searches::default();
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(searches.announcing(&[&impostor.base, &other.base]));
+    let binding = operations.bridge_set(Some(&bound.base), secret).unwrap();
+    drop(bound);
+
+    let started = Instant::now();
+    let error = format!("{:#}", operations.rooms().unwrap_err());
+    assert!(started.elapsed() >= home::DISCOVERY_WAIT);
+    assert!(error.contains(&binding.pin.unwrap().to_string()), "{error}");
+    assert!(error.contains(&impostor.pin.to_string()), "{error}");
+    assert!(error.contains(&other.pin.to_string()), "{error}");
+    assert!(error.contains("--bridge ADDRESS"), "{error}");
+    assert!(!error.contains(USER), "{error}");
+
+    // Binding by pin alone takes neither, and nothing is written.
+    let error = format!(
+        "{:#}",
+        operations
+            .clone()
+            .with_pin(binding.pin.unwrap())
+            .bridge_set(None, secret)
+            .unwrap_err()
+    );
+    assert!(error.contains("through mDNS"), "{error}");
+    assert_eq!(searches.log().len(), 2);
+    assert!(impostor.seen().is_empty() && other.seen().is_empty());
+    let status = operations.bridge_status().unwrap();
+    assert_eq!(status.heads.len(), 1);
+    assert_eq!(status.selected().unwrap(), binding);
+
+    // Without a pin and without an address there is nothing to search for.
+    let error = format!("{:#}", operations.bridge_set(None, secret).unwrap_err());
+    assert!(error.contains("--pin"), "{error}");
+    assert_eq!(searches.log().len(), 2);
+}
+
+#[test]
+fn an_explicit_address_never_searches() {
+    let bound = fake_bridge_with_key(1);
+    let wrong = fake_bridge_with_key(2);
+    let (_directory, pile, key) = fresh_pile();
+    let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
+        .add("hue-bridge-fixture-username", USER.as_bytes())
+        .unwrap();
+    let searches = Searches::default();
+    // A search would find the bound bridge; none may run.
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(searches.announcing(&[&bound.base]));
+    operations.bridge_set(Some(&bound.base), secret).unwrap();
+
+    // The wrong certificate at an explicit address is a hard refusal.
+    let error = format!(
+        "{:#}",
+        operations
+            .clone()
+            .with_address(wrong.base.clone())
+            .rooms()
+            .unwrap_err()
+    );
+    assert!(error.contains("refusing"), "{error}");
+    assert!(wrong.seen().is_empty());
+
+    // A dead explicit address fails where it is.
+    let error = format!(
+        "{:#}",
+        operations
+            .clone()
+            .with_address(dead_base())
+            .rooms()
+            .unwrap_err()
+    );
+    assert!(error.contains("GET groups"), "{error}");
+    assert!(!error.contains(USER), "{error}");
+
+    let reached = operations.clone().with_address(bound.base.clone());
+    assert_eq!(reached.rooms().unwrap().rooms.len(), 4);
+    assert!(searches.log().is_empty());
+}
+
+#[test]
+fn a_candidate_that_never_speaks_cannot_hold_the_search() {
+    let right = fake_bridge();
+    // The kernel completes the TCP handshake into the backlog; nothing ever
+    // answers the TLS ClientHello.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let silent_base = format!("https://{}", silent.local_addr().unwrap());
+    let (_directory, pile, key) = fresh_pile();
+    let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
+        .add("hue-bridge-fixture-username", USER.as_bytes())
+        .unwrap();
+    let searches = Searches::default();
+    let operations = Home::new(pile.clone(), Some(key.clone()))
+        .with_discovery(searches.announcing(&[&silent_base, &right.base]));
+    operations.bridge_set(Some(&right.base), secret).unwrap();
+
+    let started = Instant::now();
+    assert_eq!(operations.rooms().unwrap().rooms.len(), 4);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= home::CANDIDATE_TIMEOUT && elapsed < Duration::from_secs(3),
+        "the silent candidate is given up after its own timeout: {elapsed:?}"
+    );
+    assert_eq!(
+        searches.log(),
+        [vec![host(&silent_base), host(&right.base)]]
+    );
+    drop(silent);
 }

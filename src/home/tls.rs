@@ -141,6 +141,11 @@ pub(crate) struct Transport {
 
 impl Transport {
     pub(crate) fn new(trust: Trust) -> Result<Self> {
+        Self::with_timeout(trust, std::time::Duration::from_secs(10))
+    }
+
+    /// `timeout` bounds each request whole: connect, handshake and answer.
+    pub(crate) fn with_timeout(trust: Trust, timeout: std::time::Duration) -> Result<Self> {
         let provider = rustls::crypto::ring::default_provider();
         let presented = Arc::new(Mutex::new(None));
         let pin = match trust {
@@ -160,7 +165,7 @@ impl Transport {
             .with_no_client_auth();
         let http = Client::builder()
             .user_agent("faculties-home/0")
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(timeout)
             // Plain HTTP would carry no certificate to check.
             .https_only(true)
             .use_preconfigured_tls(config)
@@ -199,7 +204,7 @@ impl Transport {
                     "the bridge presented a certificate with SHA-256 {presented}, \
                      but Home is pinned to {pin}; refusing to talk to it (if the \
                      bridge really changed its certificate, rebind it with \
-                     `home bridge set ADDRESS SECRET --pin {presented}`)"
+                     `home bridge set SECRET --pin {presented}`)"
                 ),
                 _ => anyhow!(error.without_url()),
             })

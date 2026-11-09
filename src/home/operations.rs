@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::SigningKey;
@@ -27,9 +28,23 @@ use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultyStore, 
 type TextHandle = Inline<Handle<UTF8String>>;
 type CertificateHash = Inline<inlineencodings::Hash<Sha256>>;
 
-/// Configured Home operations. The bridge comes from the pile's binding
-/// unless a trusted caller overrides its address, username source or
-/// certificate pin.
+/// How Home finds bridges: each one is offered to the callback as it
+/// answers, until the callback takes one or the wait runs out.
+pub type Discovery =
+    Arc<dyn Fn(Duration, &mut dyn FnMut(&Discovered) -> bool) -> Result<()> + Send + Sync>;
+
+/// The longest a connection searches for its bridge. The search ends at the
+/// first bridge presenting the pinned certificate, normally well within it.
+pub const DISCOVERY_WAIT: Duration = Duration::from_secs(2);
+
+/// The longest one candidate may take to connect, finish its handshake and
+/// answer while searching, so a peer that accepts and never speaks cannot
+/// hold the search. Requests to the chosen bridge keep the normal timeout.
+pub const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Configured Home operations. The bridge is the one the pile's binding pins,
+/// found through mDNS, unless a trusted caller overrides its address,
+/// username source or certificate pin.
 #[derive(Clone)]
 pub struct Home {
     storage: Storage,
@@ -38,6 +53,7 @@ pub struct Home {
     username: Option<Zeroizing<String>>,
     pin: Option<Fingerprint>,
     insecure_tls: bool,
+    discovery: Discovery,
 }
 
 impl std::fmt::Debug for Home {
@@ -57,7 +73,6 @@ impl std::fmt::Debug for Home {
 pub struct BindingStatus {
     pub heads: BTreeSet<Id>,
     pub bridge_ids: BTreeSet<String>,
-    pub addresses: BTreeSet<String>,
     pub secrets: BTreeSet<Id>,
     /// Certificate pins. A binding made before Home pinned certificates has
     /// none; it still names its bridge, but no connection trusts it.
@@ -68,11 +83,10 @@ impl BindingStatus {
     /// A settled binding, never an arbitrary winner among concurrent ones.
     pub fn selected(&self) -> Result<Binding> {
         if self.heads.is_empty() {
-            bail!("no Hue bridge is bound; run `home discover`, then `home bridge set ADDRESS SECRET`");
+            bail!("no Hue bridge is bound; run `home discover`, then `home bridge set SECRET ADDRESS`");
         }
         if self.heads.len() != 1
             || self.bridge_ids.len() != 1
-            || self.addresses.len() != 1
             || self.secrets.len() != 1
             || self.pins.len() > 1
         {
@@ -81,7 +95,6 @@ impl BindingStatus {
         Ok(Binding {
             revision: *self.heads.first().expect("one head"),
             bridge_id: self.bridge_ids.first().expect("one id").clone(),
-            address: self.addresses.first().expect("one address").clone(),
             secret: *self.secrets.first().expect("one secret"),
             pin: self.pins.first().copied(),
         })
@@ -92,7 +105,6 @@ impl BindingStatus {
 pub struct Binding {
     pub revision: Id,
     pub bridge_id: String,
-    pub address: String,
     pub secret: Id,
     /// The bridge's certificate; `None` only for a binding made before Home
     /// pinned certificates.
@@ -183,10 +195,11 @@ impl Home {
             username: None,
             pin: None,
             insecure_tls: false,
+            discovery: Arc::new(bridge::discover_mdns_until),
         }
     }
 
-    /// Reach the bridge at this address instead of the bound one.
+    /// Reach the bridge at this address instead of finding it through mDNS.
     pub fn with_address(mut self, address: impl Into<String>) -> Self {
         self.address = Some(address.into());
         self
@@ -218,13 +231,25 @@ impl Home {
         self
     }
 
+    /// Trusted Rust injection of how bridges are found (tests).
+    pub fn with_discovery(
+        mut self,
+        discovery: impl Fn(Duration, &mut dyn FnMut(&Discovered) -> bool) -> Result<()>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.discovery = Arc::new(discovery);
+        self
+    }
+
     pub fn storage(&self) -> &Storage {
         &self.storage
     }
 
     /// Bridges answering mDNS on the local network, or, with `cloud`, those
     /// Signify's discovery service knows for this network.
-    pub fn discover(cloud: bool, wait: std::time::Duration) -> Result<Vec<Discovered>> {
+    pub fn discover(cloud: bool, wait: Duration) -> Result<Vec<Discovered>> {
         if cloud {
             bridge::discover_cloud(bridge::CLOUD_DISCOVERY)
         } else {
@@ -247,21 +272,35 @@ impl Home {
         })
     }
 
-    /// Bind the bridge at `address` with the username in Secrets version
-    /// `secret`, pinned to the certificate it presents. The bridge's id comes
-    /// from its own public configuration, and the username is proven with one
-    /// authenticated read, over a connection pinned to that certificate,
-    /// before anything is written. Only GET requests reach the bridge.
+    /// Bind a bridge with the username in Secrets version `secret`: the one
+    /// at `address`, pinned to the certificate it presents (or to
+    /// [`Home::with_pin`]), or, with a pin and no address, the one mDNS finds
+    /// presenting that certificate. The binding records no address; every
+    /// connection finds the bridge again by its certificate. The bridge's id
+    /// comes from its own public configuration, and the username is proven
+    /// with one authenticated read, over a connection pinned to that
+    /// certificate, before anything is written. Only GET requests reach the
+    /// bridge.
     ///
-    /// Without [`Home::with_pin`], the first certificate seen is trusted, but a
-    /// bridge already bound under the same id that now presents a different
+    /// Without a pin, the first certificate seen is trusted, but a bridge
+    /// already bound under the same id that now presents a different
     /// certificate is refused before its username is opened: a changed
     /// certificate is accepted only when named explicitly.
-    pub fn bridge_set(&self, address: &str, secret: Id) -> Result<Binding> {
-        let address = address.trim();
-        let base = tls::base_url(address)?;
-        let trust = self.pin.map_or(Trust::Observe, Trust::Pin);
-        let config = bridge::public_config(&Transport::new(trust)?, &base)?;
+    pub fn bridge_set(&self, address: Option<&str>, secret: Id) -> Result<Binding> {
+        let (base, config) = match (address, self.pin) {
+            (Some(address), pin) => {
+                let base = tls::base_url(address)?;
+                let trust = pin.map_or(Trust::Observe, Trust::Pin);
+                let config = bridge::public_config(&Transport::new(trust)?, &base)?;
+                (base, config)
+            }
+            (None, Some(pin)) => self.find(pin)?,
+            (None, None) => bail!(
+                "binding a bridge without its ADDRESS needs its certificate: pass --pin SHA256 \
+                 (`home discover` lists bridges, `home bridge probe ADDRESS` shows a \
+                 certificate), or give the ADDRESS to trust the certificate presented there"
+            ),
+        };
         let certificate = config.certificate;
         self.storage.scope(|storage| {
             let earlier = storage.with_store(|pile, signer, runtime| {
@@ -276,7 +315,7 @@ impl Home {
                 bail!(
                     "bridge {} now presents a certificate with SHA-256 {certificate}, but it \
                      was bound with {}; if its certificate really changed, rebind with \
-                     `home bridge set ADDRESS SECRET --pin {certificate}`",
+                     `home bridge set SECRET --pin {certificate}`",
                     config.bridge_id,
                     earlier
                         .pins
@@ -295,30 +334,64 @@ impl Home {
                 let status = binding_status(&facts, &reader)?;
                 if let Ok(current) = status.selected() {
                     if current.bridge_id == config.bridge_id
-                        && current.address == address
                         && current.secret == secret
                         && current.pin == Some(certificate)
                     {
                         return Ok(current);
                     }
                 }
-                let fragment = binding_fragment(
-                    &config.bridge_id,
-                    address,
-                    secret,
-                    certificate,
-                    status.heads,
-                );
+                let fragment =
+                    binding_fragment(&config.bridge_id, secret, certificate, status.heads);
                 let revision = fragment.root().expect("binding has one intrinsic root");
                 commit(storage, pile, signer, runtime, fragment)?;
                 Ok(Binding {
                     revision,
                     bridge_id: config.bridge_id.clone(),
-                    address: address.to_owned(),
                     secret,
                     pin: Some(certificate),
                 })
             })
+        })
+    }
+
+    /// The first bridge discovery offers that presents `pin`, with its
+    /// public configuration. A bridge presenting any other certificate, or
+    /// not answering, is passed over; no username is sent while searching.
+    fn find(&self, pin: Fingerprint) -> Result<(String, BridgeConfig)> {
+        let mut found = None;
+        let mut passed = Vec::new();
+        (self.discovery)(DISCOVERY_WAIT, &mut |candidate| {
+            let address = match candidate.port {
+                Some(port) => format!("{}:{port}", candidate.address),
+                None => candidate.address.clone(),
+            };
+            let reached = tls::base_url(&address).and_then(|base| {
+                let transport = Transport::with_timeout(Trust::Pin(pin), CANDIDATE_TIMEOUT)?;
+                let config = bridge::public_config(&transport, &base)?;
+                Ok((base, config))
+            });
+            match reached {
+                Ok(reached) => {
+                    found = Some(reached);
+                    true
+                }
+                Err(error) => {
+                    passed.push(format!("{address}: {error:#}"));
+                    false
+                }
+            }
+        })
+        .context("discover Hue bridges over mDNS")?;
+        found.ok_or_else(|| {
+            let seen = if passed.is_empty() {
+                "no Hue bridge answered".to_owned()
+            } else {
+                format!("passed over {}", passed.join("; "))
+            };
+            anyhow!(
+                "no Hue bridge found through mDNS within {DISCOVERY_WAIT:?} presents the \
+                 certificate {pin} ({seen}); pass --bridge ADDRESS to reach it directly"
+            )
         })
     }
 
@@ -332,7 +405,7 @@ impl Home {
                 base,
             });
         }
-        self.storage.scope(|storage| {
+        let (binding, trust, username) = self.storage.scope(|storage| {
             let binding =
                 if self.address.is_some() && (self.secret.is_some() || self.username.is_some()) {
                     None
@@ -342,29 +415,35 @@ impl Home {
                         binding_status(&facts, &reader)?.selected()
                     })?)
                 };
-            let address = self
-                .address
-                .clone()
-                .or_else(|| binding.as_ref().map(|b| b.address.clone()))
-                .expect("an address is configured");
             // Decided before the username is opened, and so before it can
             // travel anywhere.
             let trust = trust(self.pin, binding.as_ref(), self.insecure_tls)?;
-            let base = tls::base_url(&address)?;
+            if self.address.is_none() && trust == Trust::Observe {
+                bail!(
+                    "an unpinned binding cannot be found through mDNS, which would trust any \
+                     bridge: pass --bridge ADDRESS, or rebind with `home bridge set SECRET ADDRESS`"
+                );
+            }
             let username = match (&self.username, self.secret, &binding) {
                 (Some(username), _, _) => username.clone(),
                 (None, Some(secret), _) => open_username(storage, secret)?,
                 (None, None, Some(binding)) => open_username(storage, binding.secret)?,
                 (None, None, None) => unreachable!("a binding was read"),
             };
-            Ok(Connection {
-                bridge: Bridge::new(base.clone(), username, trust)?,
-                // The bound id names the bound bridge, not an overridden one.
-                bridge_id: binding
-                    .filter(|_| self.address.is_none())
-                    .map(|binding| binding.bridge_id),
-                base,
-            })
+            Ok((binding, trust, username))
+        })?;
+        let base = match (&self.address, trust) {
+            (Some(address), _) => tls::base_url(address)?,
+            (None, Trust::Pin(pin)) => self.find(pin)?.0,
+            (None, Trust::Observe) => unreachable!("refused above"),
+        };
+        Ok(Connection {
+            bridge: Bridge::new(base.clone(), username, trust)?,
+            // The bound id names the bound bridge, not an overridden one.
+            bridge_id: binding
+                .filter(|_| self.address.is_none())
+                .map(|binding| binding.bridge_id),
+            base,
         })
     }
 
@@ -596,7 +675,7 @@ fn trust(pin: Option<Fingerprint>, binding: Option<&Binding>, insecure: bool) ->
     match binding {
         Some(_) => bail!(
             "the Hue bridge binding has no certificate pin (it was bound before Home pinned \
-             certificates); run `home bridge set ADDRESS SECRET` again to record one"
+             certificates); run `home bridge set SECRET ADDRESS` again to record one"
         ),
         None => bail!(
             "a bridge override without a binding needs the bridge's certificate: pass \
@@ -618,19 +697,16 @@ fn open_username(storage: &Storage, secret: Id) -> Result<Zeroizing<String>> {
 
 pub fn binding_fragment(
     bridge_id: &str,
-    address: &str,
     secret: Id,
     certificate: Fingerprint,
     predecessors: impl IntoIterator<Item = Id>,
 ) -> Fragment {
     let mut fragment = Fragment::empty();
     let bridge_id: TextHandle = fragment.put(bridge_id.to_owned());
-    let address: TextHandle = fragment.put(address.to_owned());
     let certificate: CertificateHash = Inline::new(certificate.0);
     fragment += entity! { _ @
         metadata::tag: KIND_BRIDGE,
         home::bridge_id: bridge_id,
-        home::address: address,
         home::username_secret: secret,
         home::certificate_sha256: certificate,
         metadata::supersedes*: predecessors,
@@ -692,11 +768,6 @@ where
             status
                 .bridge_ids
                 .insert(read_text(reader, handle, "bridge id")?);
-        }
-        for handle in find!(h: TextHandle, pattern!(facts, [{ head @ home::address: ?h }])) {
-            status
-                .addresses
-                .insert(read_text(reader, handle, "bridge address")?);
         }
         status
             .secrets
@@ -850,20 +921,27 @@ mod tests {
     #[test]
     fn binding_status_follows_supersession_and_refuses_a_fork() {
         let secret = Id::new([7; 16]).unwrap();
+        let rotated = Id::new([8; 16]).unwrap();
         let pin = Fingerprint([1; 32]);
-        let first = binding_fragment("0017", "192.0.2.1", secret, pin, []);
+        let first = binding_fragment("0017", secret, pin, []);
         let first_id = first.root().unwrap();
-        let second = binding_fragment("0017", "192.0.2.2", secret, pin, [first_id]);
+        let second = binding_fragment("0017", rotated, pin, [first_id]);
         let second_id = second.root().unwrap();
         let mut union = first.clone();
         union += second;
         let reader = union.blobs_mut().snapshot().unwrap();
         let status = binding_status(union.facts(), &reader).unwrap();
         assert_eq!(status.heads, [second_id].into());
-        assert_eq!(status.selected().unwrap().address, "192.0.2.2");
+        assert_eq!(status.selected().unwrap().secret, rotated);
+        assert!(
+            find!(h: TextHandle, pattern!(union.facts(), [{ second_id @ home::address: ?h }]))
+                .next()
+                .is_none(),
+            "a binding records no address"
+        );
         assert_eq!(status.selected().unwrap().pin, Some(pin));
 
-        union += binding_fragment("0017", "192.0.2.3", secret, pin, [first_id]);
+        union += binding_fragment("0017", Id::new([9; 16]).unwrap(), pin, [first_id]);
         let reader = union.blobs_mut().snapshot().unwrap();
         let status = binding_status(union.facts(), &reader).unwrap();
         assert_eq!(status.heads.len(), 2);
@@ -873,7 +951,7 @@ mod tests {
     #[test]
     fn two_pins_on_one_head_are_unsettled() {
         let secret = Id::new([7; 16]).unwrap();
-        let mut union = binding_fragment("0017", "192.0.2.1", secret, Fingerprint([1; 32]), []);
+        let mut union = binding_fragment("0017", secret, Fingerprint([1; 32]), []);
         let head = union.root().unwrap();
         let other: CertificateHash = Inline::new([2; 32]);
         union += entity! { ExclusiveId::force_ref(&head) @ home::certificate_sha256: other };
@@ -885,6 +963,8 @@ mod tests {
 
     #[test]
     fn a_binding_from_before_pinning_reads_but_is_not_trusted() {
+        // Such a binding also names the address it was bound at, which Home
+        // no longer reads: the fact is ignored, not refused.
         let secret = Id::new([7; 16]).unwrap();
         let mut fragment = Fragment::empty();
         let bridge_id: TextHandle = fragment.put("0017".to_owned());
@@ -914,7 +994,6 @@ mod tests {
         let binding = Binding {
             revision: Id::new([3; 16]).unwrap(),
             bridge_id: "0017".into(),
-            address: "192.0.2.1".into(),
             secret: Id::new([7; 16]).unwrap(),
             pin: Some(bound),
         };

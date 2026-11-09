@@ -20,7 +20,8 @@ pub(crate) struct Cli {
     /// Existing durable collection signer. Ordinary commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
-    /// Reach the bridge at this address instead of the bound one.
+    /// Reach the bridge at this address instead of finding the bound one
+    /// through mDNS.
     #[arg(long, value_name = "ADDRESS")]
     bridge: Option<String>,
     /// Open this exact Secrets version for the bridge username instead of the
@@ -85,10 +86,16 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BridgeAction {
-    /// Bind the bridge at ADDRESS, its username held in Secrets version
-    /// SECRET, pinned to the certificate it presents (or to --pin). Reads the
-    /// bridge's id and proves the username with GETs only.
-    Set { address: String, secret: String },
+    /// Bind a bridge, its username held in Secrets version SECRET: the one
+    /// at ADDRESS, pinned to the certificate it presents (or to --pin), or
+    /// with --pin alone the one mDNS finds presenting that certificate. No
+    /// address is recorded; every connection finds the bridge by its
+    /// certificate. Reads the bridge's id and proves the username with GETs
+    /// only.
+    Set {
+        secret: String,
+        address: Option<String>,
+    },
     /// Show the bridge at ADDRESS and the SHA-256 of its certificate, without
     /// verifying it, opening a secret or touching the pile.
     Probe { address: String },
@@ -188,10 +195,10 @@ pub fn run() -> Result<()> {
             }
             Command::Bridge { action: None } => presentation::status(&home.bridge_status()?, out),
             Command::Bridge {
-                action: Some(BridgeAction::Set { address, secret }),
+                action: Some(BridgeAction::Set { secret, address }),
             } => {
                 let secret = parse_id(&secret, "SECRET")?;
-                presentation::binding(&home.bridge_set(&address, secret)?, out)
+                presentation::binding(&home.bridge_set(address.as_deref(), secret)?, out)
             }
             Command::Discover { .. }
             | Command::Bridge {
@@ -240,15 +247,7 @@ mod tests {
         ]);
         assert!(parsed.is_err());
         let parsed = Cli::try_parse_from([
-            "home",
-            "--pile",
-            "x.pile",
-            "bridge",
-            "set",
-            "192.0.2.1",
-            "00",
-            "--pin",
-            &pin,
+            "home", "--pile", "x.pile", "bridge", "set", "00", "--pin", &pin,
         ])
         .unwrap();
         assert_eq!(parsed.pin.as_deref(), Some(pin.as_str()));

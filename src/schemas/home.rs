@@ -6,10 +6,10 @@
 //! collection:
 //!
 //! - A bridge binding ([`KIND_BRIDGE`]) names the bridge (its own `bridgeid`),
-//!   where to reach it, and the exact Secrets version holding the bridge
-//!   username, and the SHA-256 fingerprint of the certificate the bridge
-//!   presented when it was bound. Every later connection is pinned to that
-//!   fingerprint. Rebinding supersedes the earlier binding through
+//!   the exact Secrets version holding the bridge username, and the SHA-256
+//!   fingerprint of the certificate the bridge presented when it was bound.
+//!   Every later connection finds the bridge through mDNS and is pinned to
+//!   that fingerprint. Rebinding supersedes the earlier binding through
 //!   `metadata::supersedes`, as Discord's authentication revisions do.
 //! - An action ([`KIND_ACTION`]) is one state change Home sent: the bridge
 //!   resource it addressed, the target's Hue name at the time, the JSON body,
@@ -78,7 +78,9 @@ pub mod home {
     attributes! {
         /// The bridge's own `bridgeid`, lowercase hex (`001788fffe000001`).
         "0BDD674F2E955CCF6FDCD0D508962081" as bridge_id: Handle<UTF8String>;
-        /// Host name or IP address the bridge answers HTTPS on.
+        /// Host name or IP address the bridge answered HTTPS on when it was
+        /// bound. Bindings made before Home found bridges through mDNS carry
+        /// it; Home now neither writes nor reads it.
         "EEAD0B51D6A16A234411E55F70B30366" as address: Handle<UTF8String>;
         /// Exact Secrets version holding the bridge username (API key).
         "F8A234DC62CAA271EF2C2247D9CD40B3" as username_secret: GenId;

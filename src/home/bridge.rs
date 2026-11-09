@@ -346,14 +346,36 @@ pub struct Discovered {
 
 const MDNS_SERVICE: &str = "_hue._tcp.local";
 
-/// Ask the local network for `_hue._tcp` and collect answers for `wait`.
-///
+/// Ask the local network for `_hue._tcp` and collect every answer for `wait`.
+pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
+    let mut found = Vec::new();
+    discover_mdns_until(wait, &mut |bridge| {
+        found.push(bridge.clone());
+        false
+    })?;
+    Ok(found)
+}
+
+/// Ask the local network for `_hue._tcp` and offer each bridge to `accept`
+/// as soon as its address is known, until `accept` takes one or `wait` runs
+/// out. A bridge answers within a few hundred milliseconds, so a search that
+/// is looking for one bridge ends long before the wait does.
+pub fn discover_mdns_until(
+    wait: std::time::Duration,
+    accept: &mut dyn FnMut(&Discovered) -> bool,
+) -> Result<()> {
+    let group = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(224, 0, 0, 251), 5353);
+    mdns_until(group, wait, accept)
+}
+
 /// The query is sent from an ephemeral port with the unicast-response bit, so
 /// responders answer this socket directly (RFC 6762 §5.4, §6.7).
-pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
-    use simple_dns::rdata::RData;
+fn mdns_until(
+    to: std::net::SocketAddrV4,
+    wait: std::time::Duration,
+    accept: &mut dyn FnMut(&Discovered) -> bool,
+) -> Result<()> {
     use simple_dns::{Name, Packet, Question, CLASS, QTYPE, TYPE};
-    use std::collections::BTreeMap;
     use std::net::{Ipv4Addr, UdpSocket};
 
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("bind mDNS query socket")?;
@@ -365,15 +387,11 @@ pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
         true,
     ));
     let bytes = query.build_bytes_vec().context("build mDNS query")?;
-    socket
-        .send_to(&bytes, (Ipv4Addr::new(224, 0, 0, 251), 5353))
-        .context("send mDNS query")?;
+    socket.send_to(&bytes, to).context("send mDNS query")?;
 
     let deadline = std::time::Instant::now() + wait;
-    let mut instances = Vec::<String>::new();
-    let mut services = BTreeMap::<String, (String, u16)>::new();
-    let mut texts = BTreeMap::<String, BTreeMap<String, String>>::new();
-    let mut hosts = BTreeMap::<String, Ipv4Addr>::new();
+    let mut answers = Answers::default();
+    let mut offered = std::collections::BTreeSet::<String>::new();
     let mut buffer = [0u8; 9000];
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -398,23 +416,67 @@ pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
         let Ok(packet) = Packet::parse(&buffer[..length]) else {
             continue;
         };
+        answers.absorb(&packet);
+        for instance in answers.instances.clone() {
+            if offered.contains(&instance) {
+                continue;
+            }
+            if let Some(bridge) = answers.bridge(&instance, false) {
+                offered.insert(instance);
+                if accept(&bridge) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    // A bridge whose host never resolved is still offered, by host name.
+    for instance in &answers.instances {
+        if offered.contains(instance) {
+            continue;
+        }
+        if let Some(bridge) = answers.bridge(instance, true) {
+            if accept(&bridge) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What mDNS answers have said so far, keyed by lowercase owner name.
+#[derive(Default)]
+struct Answers {
+    /// Service instances, in the order they were first announced.
+    instances: Vec<String>,
+    services: std::collections::BTreeMap<String, (String, u16)>,
+    texts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    hosts: std::collections::BTreeMap<String, std::net::Ipv4Addr>,
+}
+
+impl Answers {
+    fn absorb(&mut self, packet: &simple_dns::Packet<'_>) {
+        use simple_dns::rdata::RData;
         for record in packet.answers.iter().chain(&packet.additional_records) {
             let owner = record.name.to_string().to_ascii_lowercase();
             match &record.rdata {
                 RData::PTR(target) if owner == MDNS_SERVICE => {
                     let instance = target.0.to_string();
-                    if !instances.contains(&instance) {
-                        instances.push(instance);
+                    if !self
+                        .instances
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(&instance))
+                    {
+                        self.instances.push(instance);
                     }
                 }
                 RData::SRV(srv) => {
-                    services.insert(
+                    self.services.insert(
                         owner,
                         (srv.target.to_string().to_ascii_lowercase(), srv.port),
                     );
                 }
                 RData::TXT(txt) => {
-                    let entry = texts.entry(owner).or_default();
+                    let entry = self.texts.entry(owner).or_default();
                     for (key, value) in txt.attributes() {
                         if let Some(value) = value {
                             entry.insert(key.to_ascii_lowercase(), value);
@@ -422,31 +484,36 @@ pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
                     }
                 }
                 RData::A(a) => {
-                    hosts.insert(owner, Ipv4Addr::from(a.address));
+                    self.hosts
+                        .insert(owner, std::net::Ipv4Addr::from(a.address));
                 }
                 _ => {}
             }
         }
     }
-    Ok(instances
-        .into_iter()
-        .filter_map(|instance| {
-            let key = instance.to_ascii_lowercase();
-            let (host, port) = services.get(&key).cloned()?;
-            let address = hosts.get(&host).map_or(host.clone(), |ip| ip.to_string());
-            let txt = texts.get(&key);
-            Some(Discovered {
-                bridge_id: txt
-                    .and_then(|t| t.get("bridgeid"))
-                    .map(|id| id.to_ascii_lowercase()),
-                address,
-                port: Some(port),
-                model: txt.and_then(|t| t.get("modelid")).cloned(),
-                instance: Some(instance),
-                via: "mdns",
-            })
+
+    /// The bridge behind `instance` once its service and, unless `by_name`,
+    /// its host address are known.
+    fn bridge(&self, instance: &str, by_name: bool) -> Option<Discovered> {
+        let key = instance.to_ascii_lowercase();
+        let (host, port) = self.services.get(&key)?;
+        let address = match self.hosts.get(host) {
+            Some(ip) => ip.to_string(),
+            None if by_name => host.clone(),
+            None => return None,
+        };
+        let txt = self.texts.get(&key);
+        Some(Discovered {
+            bridge_id: txt
+                .and_then(|t| t.get("bridgeid"))
+                .map(|id| id.to_ascii_lowercase()),
+            address,
+            port: Some(*port),
+            model: txt.and_then(|t| t.get("modelid")).cloned(),
+            instance: Some(instance.to_owned()),
+            via: "mdns",
         })
-        .collect())
+    }
 }
 
 /// Signify's cloud discovery endpoint: bridges that reported in from this
@@ -527,6 +594,92 @@ mod tests {
         assert!(scene(None, &["1"]).belongs_to(&room));
         assert!(!scene(None, &["1", "9"]).belongs_to(&room));
         assert!(!scene(None, &[]).belongs_to(&room));
+    }
+
+    /// A loopback stand-in for a bridge's mDNS responder: it answers the
+    /// first query with two bridges, the second one's host unresolved.
+    fn responder() -> (std::net::SocketAddrV4, std::thread::JoinHandle<()>) {
+        use simple_dns::rdata::{RData, A, PTR, SRV, TXT};
+        use simple_dns::{Name, Packet, ResourceRecord, CLASS};
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(at) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let thread = std::thread::spawn(move || {
+            let mut buffer = [0u8; 1500];
+            let (_, from) = socket.recv_from(&mut buffer).unwrap();
+            let record = |owner, rdata| {
+                ResourceRecord::new(Name::new_unchecked(owner), CLASS::IN, 120, rdata)
+            };
+            let mut reply = Packet::new_reply(0);
+            for (instance, host) in [
+                ("fake-one._hue._tcp.local", "fake-one.local"),
+                ("fake-two._hue._tcp.local", "fake-two.local"),
+            ] {
+                reply.answers.push(record(
+                    MDNS_SERVICE,
+                    RData::PTR(PTR(Name::new_unchecked(instance))),
+                ));
+                reply.additional_records.push(record(
+                    instance,
+                    RData::SRV(SRV {
+                        priority: 0,
+                        weight: 0,
+                        port: 443,
+                        target: Name::new_unchecked(host),
+                    }),
+                ));
+            }
+            reply.additional_records.push(record(
+                "fake-one._hue._tcp.local",
+                RData::TXT(TXT::new().with_string("bridgeid=001788FFFE000001").unwrap()),
+            ));
+            reply.additional_records.push(record(
+                "fake-one.local",
+                RData::A(A::from(std::net::Ipv4Addr::new(192, 0, 2, 7))),
+            ));
+            socket
+                .send_to(&reply.build_bytes_vec().unwrap(), from)
+                .unwrap();
+        });
+        (at, thread)
+    }
+
+    #[test]
+    fn mdns_offers_bridges_as_they_answer_and_stops_at_the_first_taken() {
+        use std::time::{Duration, Instant};
+        let (at, thread) = responder();
+        let started = Instant::now();
+        let mut offered = Vec::new();
+        mdns_until(at, Duration::from_secs(5), &mut |bridge| {
+            offered.push(bridge.clone());
+            true
+        })
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        thread.join().unwrap();
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].address, "192.0.2.7");
+        assert_eq!(offered[0].port, Some(443));
+        assert_eq!(offered[0].bridge_id.as_deref(), Some("001788fffe000001"));
+
+        // Declining every offer waits out the window; an unresolved host is
+        // offered last, by name.
+        let (at, thread) = responder();
+        let started = Instant::now();
+        let mut offered = Vec::new();
+        mdns_until(at, Duration::from_millis(300), &mut |bridge| {
+            offered.push(bridge.address.clone());
+            false
+        })
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        thread.join().unwrap();
+        assert_eq!(offered, ["192.0.2.7", "fake-two.local"]);
     }
 
     #[test]
