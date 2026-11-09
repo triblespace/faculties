@@ -28,11 +28,14 @@
 # The generic cache-directory signature alone is not enough: Hugging Face and
 # Python virtual environments write the same first line. Dot-entries directly
 # under $HOME are not searched, nor any directory holding a file named
-# `.leftovers-skip`: put one in archived snapshots, whose contents are history
+# `.leftovers-skip` or `.keep`: put one in archived snapshots, whose contents are history
 # even when they look like build output. Top-level entries
 # alone miss it, because a work folder that is touched daily can hold hundreds
 # of gigabytes of stale targets (2026-10-17: 595 GB inside one such folder).
-# Build output can always be rebuilt; its lines say "clean", not "decide".
+# Unkept build output is labelled "clean", not "decide"; this is only a report.
+# Row sizes count each inode once within that entry. Summary sizes count each
+# inode once per section; rows and sections can overlap. These are allocated
+# bytes, not reclaimable bytes (hard links may also exist outside the report).
 #
 # The walk is Python (os.walk over lstat, one filesystem, no symlinks
 # followed), so it behaves the same on Linux and macOS. An entry that cannot be
@@ -62,38 +65,52 @@ cutoff = time.time() - age_days * 86400
 lanes, scratch = os.path.join(home, "lanes"), os.path.join(home, "scratch")
 
 MARKERS = {".keep", ".leftovers-skip"}
-# Every (device, inode) is counted once across the whole report: hard links
-# would otherwise make the sum of the rows larger than what deleting them all
-# frees (found on 2026-10-17: 776 GB of rows for 692 GB allocated).
-counted = set()
 
-def scan(entry):
+def regular_file(path):
+    """Open only a regular file, without following a link or waiting on a FIFO."""
+    try:
+        mode = os.lstat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(mode):
+        return None
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"marker changed type: {path}")
+    return os.fdopen(fd, "rb")
+
+def scan(entry, honor_holds=False):
     """Allocated bytes and newest mtime under entry, on one filesystem, symlinks
-    not followed. Raises OSError if any part cannot be read."""
+    not followed. Raises OSError if any part cannot be read. When honoring
+    holds, a marker anywhere below entry returns an unmeasured size (None)."""
     st = os.lstat(entry)
     dev = st.st_dev
-    total, newest = st.st_blocks * 512, 0.0
-    if os.path.islink(entry) or not os.path.isdir(entry):
-        return total, newest
+    allocated = {(dev, st.st_ino): st.st_blocks * 512}
+    if not stat.S_ISDIR(st.st_mode):
+        return sum(allocated.values()), st.st_mtime, allocated
+    newest = 0.0
     def fail(error):
         raise error
     for path, dirs, files in os.walk(entry, onerror=fail):
+        if honor_holds and MARKERS.intersection(dirs + files):
+            # A whole-target recommendation must respect every descendant hold.
+            # Discard partial accounting and do not enter the protected subtree.
+            return None, 0.0, {}
         keep = []
         for name in dirs + files:
             s = os.lstat(os.path.join(path, name))
             if s.st_dev != dev:
                 continue
-            if (s.st_dev, s.st_ino) not in counted:
-                counted.add((s.st_dev, s.st_ino))
-                total += s.st_blocks * 512
+            allocated[(s.st_dev, s.st_ino)] = s.st_blocks * 512
             # Writing a marker is a decision about the entry, not use of it,
             # so it must not make a kept entry look recently changed.
             if name not in MARKERS:
                 newest = max(newest, s.st_mtime)
-            if name in dirs:
+            if name in dirs and stat.S_ISDIR(s.st_mode):
                 keep.append(name)
         dirs[:] = keep
-    return total, newest
+    return sum(allocated.values()), newest, allocated
 
 def git(repo, *args):
     r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
@@ -118,7 +135,7 @@ def git_state(entry):
             f"{unpublished} with HEAD on no remote branch")
 
 examined = found = kept = errors = 0
-total_bytes = 0
+decision_inodes = {}
 lines = []
 for parent in (home, lanes, scratch):
     if not os.path.isdir(parent):
@@ -137,7 +154,7 @@ for parent in (home, lanes, scratch):
             continue
         examined += 1
         try:
-            size, newest = scan(entry)
+            size, newest, allocated = scan(entry)
         except OSError as error:
             errors += 1
             lines.append(f"error   {entry}  (could not read all of it: {error})")
@@ -147,21 +164,21 @@ for parent in (home, lanes, scratch):
         if newest >= cutoff:
             continue
         stamp = time.strftime("%Y-%m-%d", time.localtime(newest))
-        keep = os.path.join(entry, ".keep")
         try:
-            keep_is_file = stat.S_ISREG(os.lstat(keep).st_mode)
-        except OSError:
-            keep_is_file = False
-        if keep_is_file:
-            # A regular file only, opened without following links, like the walk.
+            marker = regular_file(os.path.join(entry, ".keep"))
+            if marker is not None:
+                with marker:
+                    reason = marker.readline().decode(errors="replace").strip()
+        except OSError as error:
+            errors += 1
+            lines.append(f"error   {entry}  (could not read keep marker: {error})")
+            continue
+        if marker is not None:
             kept += 1
-            fd = os.open(keep, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            with os.fdopen(fd, errors="replace") as f:
-                reason = f.readline().strip()
             lines.append(f"kept    {size / 1e9:.1f} GB  last change {stamp}  {entry}  ({reason})")
             continue
         found += 1
-        total_bytes += size
+        decision_inodes.update(allocated)
         lines.append(f"decide  {size / 1e9:.1f} GB  last change {stamp}  {entry}{git_state(entry)}")
 # Cargo build output at any depth, found by its CACHEDIR.TAG signature.
 CARGO_TAG = b"Signature: 8a477f597d28d172789f06886806bc55"
@@ -172,47 +189,64 @@ def note(error):
     errors += 1
     lines.append(f"error   {getattr(error, 'filename', '?')}  (could not search it: {error})")
 for path, dirs, files in os.walk(home, onerror=note):
+    # Apply holds before target detection, including a marker on the target.
+    if MARKERS.intersection(dirs + files):
+        dirs[:] = []
+        continue
     if "CACHEDIR.TAG" in files and ".rustc_info.json" in files:
         try:
-            with open(os.path.join(path, "CACHEDIR.TAG"), "rb") as f:
-                head = f.read(256)
-            if head.startswith(CARGO_TAG) and b"created by cargo" in head:
+            marker = regular_file(os.path.join(path, "CACHEDIR.TAG"))
+            head = b""
+            if marker is not None:
+                with marker:
+                    head = marker.read(256)
+            rustc_mode = os.lstat(os.path.join(path, ".rustc_info.json")).st_mode
+            if (stat.S_ISREG(rustc_mode) and head.startswith(CARGO_TAG)
+                    and b"created by cargo" in head):
                 targets.append(path)
                 dirs[:] = []
                 continue
-        except OSError:
-            pass
+        except OSError as error:
+            note(error)
     keep = []
     for d in dirs:
         if path == home and d.startswith("."):
             continue
-        if os.path.exists(os.path.join(path, d, ".leftovers-skip")):
-            continue
         full = os.path.join(path, d)
         try:
             s = os.lstat(full)
-        except OSError:
+        except OSError as error:
+            note(error)
             continue
         if d != ".git" and stat.S_ISDIR(s.st_mode) and s.st_dev == home_dev:
             keep.append(d)
     dirs[:] = keep
-to_clean = clean_bytes = 0
+to_clean = 0
+build_inodes = {}
 for target in targets:
     try:
-        size, newest = scan(target)
+        size, newest, allocated = scan(target, honor_holds=True)
     except OSError as error:
         errors += 1
         lines.append(f"error   {target}  (could not read all of it: {error})")
         continue
+    if size is None:
+        kept += 1
+        lines.append(f"kept    size not measured  {target}  (contains .keep or .leftovers-skip)")
+        continue
     if size < 0.1e9 or newest >= cutoff:
         continue
     to_clean += 1
-    clean_bytes += size
+    build_inodes.update(allocated)
     stamp = time.strftime("%Y-%m-%d", time.localtime(newest))
     lines.append(f"clean   {size / 1e9:.1f} GB  last change {stamp}  {target}  (cargo build output)")
 
 for line in lines:
     print(line)
+total_bytes = sum(decision_inodes.values())
+clean_bytes = sum(build_inodes.values())
+print("leftovers: allocated sizes, not reclaimable; rows and sections overlap; "
+      "summary sizes deduplicate inodes within each section")
 print(f"leftovers: {to_clean} build outputs to clean ({clean_bytes / 1e9:.1f} GB) of {len(targets)} found")
 print(f"leftovers: {found} to decide ({total_bytes / 1e9:.1f} GB), {kept} kept, {errors} unreadable, "
       f"{examined} entries examined (lanes of any size, other entries of at least {size_gb:g} GB; "
