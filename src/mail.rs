@@ -122,10 +122,14 @@ pub struct AttachmentData {
 
 /// The most attachment bytes one materialization of a draft copies, summed
 /// over every attachment it names. Sending materializes a draft twice, once
-/// to render it and once to check the frozen attempt against it. The send
-/// path materializes before it reads the send resolution, so a draft over
-/// this budget is refused before its attachments are copied, before it is
-/// rendered and before Decide is consulted.
+/// to render it and once to check the frozen attempt against it. `cmd_send`
+/// materializes before it reads the send resolution. So when every
+/// attachment's length is known locally, a draft over this budget is refused
+/// there before any attachment is copied, before it is rendered and before
+/// Decide is consulted. When a length is only known after fetching, earlier
+/// in-budget attachments may already have been copied, and a peer fetch may
+/// already have cached verified bytes, before the refusal. A direct call of
+/// `prepare_send` consults Decide before its own budget check.
 ///
 /// This bounds the attachment copies, not the process's memory: rendering
 /// base64-encodes the copies, and [`materialize_draft`] says when a blob is
