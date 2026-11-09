@@ -165,11 +165,9 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         ));
         assert!(inbox.contains("one resident peer"), "{inbox}");
 
-        call(
-            &mut second,
-            "files_add",
-            json!({"data": "c2hhcmVkIHN0b3Jl", "name": "resident.txt", "mime": "text/plain"}),
-        );
+        let upload = fixture._directory.path().join("resident.txt");
+        std::fs::write(&upload, "shared store").unwrap();
+        call(&mut second, "files_add", json!({"path": upload}));
         let files = text(&call(&mut second, "files_list", json!({})));
         assert!(files.contains("resident.txt"), "{files}");
 

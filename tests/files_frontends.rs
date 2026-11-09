@@ -601,13 +601,21 @@ fn mcp_has_independent_schemas_and_rejects_host_conventions_before_storage() {
         .iter()
         .find(|tool| tool["name"] == "files_add")
         .unwrap();
-    assert!(add["inputSchema"]["properties"].get("path").is_none());
-    assert!(add["inputSchema"]["properties"].get("data").is_some());
+    // A model hands the server a host path, never the bytes themselves.
+    assert!(add["inputSchema"]["properties"].get("path").is_some());
+    assert!(add["inputSchema"]["properties"].get("data").is_none());
+    assert_eq!(add["inputSchema"]["required"], serde_json::json!(["path"]));
     for (name, arguments) in [
         ("files_get", r#"{"id":"unused","output":"/dev/stdout"}"#),
         ("files_get", r#"{"id":"unused","pile":"foreign.pile"}"#),
         ("files_get", r#"{"id":"unused","id":"second"}"#),
-        ("files_add", r#"{"path":"/etc/passwd"}"#),
+        ("files_add", r#"{"path":"relative/notes.txt"}"#),
+        ("files_add", r#"{"path":"/no/such/host/path"}"#),
+        (
+            "files_add",
+            r#"{"data":"YQ==","name":"a.txt","mime":"text/plain"}"#,
+        ),
+        ("files_add", r#"{"path":"/no/such","data":"YQ=="}"#),
         ("files_resolve", r#"{"input":"@/dev/stdin"}"#),
         ("files_tree", r#"{"id":"unused","depth":"10"}"#),
         ("files_view", r#"{"id":"unused","max_bytes":-1}"#),
@@ -625,31 +633,263 @@ fn mcp_has_independent_schemas_and_rejects_host_conventions_before_storage() {
     }
 }
 
+/// One tools/call through the real JSON-RPC handler: the request line as
+/// sent, and the response's text parts joined, with its isError flag.
+fn call_tool(
+    server: &mut Server<'_>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> (String, String, bool) {
+    let line = serde_json::json!({
+        "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments}
+    })
+    .to_string();
+    let response = request(server, &line).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&response).unwrap();
+    let result = &json["result"];
+    assert!(result.is_object(), "{response}");
+    let text = result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("");
+    (line, text, result["isError"].as_bool().unwrap())
+}
+
+fn import_id(report: &str) -> String {
+    report
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap_or_else(|| panic!("no Import line in {report:?}"))
+        .trim()
+        .to_owned()
+}
+
+/// What an import is, apart from when it happened: its root, its source
+/// and the stored tree under it.
+fn import_shape(files: &Files, import: &str) -> (Vec<String>, String) {
+    let show = files.show(import).unwrap();
+    let mut lines: Vec<String> = show
+        .lines()
+        .filter(|line| line.starts_with("Root:") || line.starts_with("Source:"))
+        .map(str::to_owned)
+        .collect();
+    lines.sort();
+    (lines, files.tree(import, None).unwrap())
+}
+
+fn fresh_files(directory: &std::path::Path) -> Files {
+    let pile = directory.join("cli.pile");
+    let key = directory.join("cli.key");
+    fs::File::create(&pile).unwrap();
+    initialize_signer(&pile, Some(&key)).unwrap();
+    Files::new(pile, Some(key))
+}
+
+/// A tree with nested directories, an empty directory, a hidden file and a
+/// file larger than the stdio transport's 1 MiB frame.
+fn sample_tree(base: &std::path::Path) -> (PathBuf, Vec<u8>) {
+    let root = base.join("project");
+    fs::create_dir_all(root.join("sub/deeper")).unwrap();
+    fs::create_dir_all(root.join("empty")).unwrap();
+    fs::write(root.join("top.txt"), TEXT).unwrap();
+    let big: Vec<u8> = (0..1_500_000_u32).map(|i| (i % 251) as u8).collect();
+    fs::write(root.join("sub/big.bin"), &big).unwrap();
+    fs::write(root.join("sub/deeper/leaf.txt"), b"leaf").unwrap();
+    fs::write(root.join(".hidden"), b"never imported").unwrap();
+    (root, big)
+}
+
 #[test]
-fn mcp_add_accepts_bytes_without_a_host_path_and_get_returns_them() {
+fn mcp_add_by_path_is_the_cli_importer_for_a_file_and_a_tree() {
     let fixture = Fixture::new();
     let files = fixture.mcp();
-    let mut parts = Vec::new();
-    let args = serde_json::json!({
-        "data": base64::engine::general_purpose::STANDARD.encode(TEXT),
-        "name": "uploaded.txt", "mime": "text/plain", "tags": ["upload"]
-    });
-    files
-        .call(
+    let mut server = Server::new(&[&files]).unwrap();
+    initialize(&mut server);
+    let host = tempfile::tempdir().unwrap();
+    let (root, _) = sample_tree(host.path());
+    let cli_side = tempfile::tempdir().unwrap();
+    let cli = fresh_files(cli_side.path());
+
+    for path in [root.join("sub/big.bin"), root.clone()] {
+        let (line, report, failed) = call_tool(
+            &mut server,
             "files_add",
-            serde_json::to_vec(&args).unwrap().into(),
+            serde_json::json!({"path": path, "tags": ["upload"]}),
+        );
+        assert!(!failed, "{report}");
+        // The request names the file; its 1.5 MB never travel in the frame.
+        assert!(line.len() < 512, "request is {} bytes", line.len());
+        println!(
+            "files_add request {} bytes for {} ({} bytes on disk)",
+            line.len(),
+            path.display(),
+            fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0)
+        );
+
+        let mut emitted = Vec::new();
+        cli.add_path(
+            &path,
+            None,
+            &["upload".to_owned()],
+            false,
             &mut Out::new(&mut |part| {
-                parts.push(part);
+                emitted.push(part);
                 Ok(())
             }),
         )
         .unwrap();
-    let Part::Text { text } = &parts[0] else {
-        panic!("file reference");
-    };
-    let reference = text.trim();
-    let returned = fixture.files().get(reference).unwrap();
-    assert_eq!(returned.bytes.as_ref(), TEXT);
+        let cli_report: String = emitted
+            .iter()
+            .map(|part| match part {
+                Part::Text { text } => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        let without_import = |report: &str| {
+            report
+                .lines()
+                .filter(|line| !line.starts_with("Import: "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(without_import(&report), without_import(&cli_report));
+        assert_eq!(
+            import_shape(&fixture.files(), &import_id(&report)),
+            import_shape(&cli, &import_id(&cli_report)),
+            "the same root, source and stored tree as the CLI importer"
+        );
+    }
+
+    let tree = fixture
+        .files()
+        .tree(
+            &import_id(&call_tool(&mut server, "files_add", serde_json::json!({"path": root})).1),
+            None,
+        )
+        .unwrap();
+    for entry in [
+        "project/", "empty/", "sub/", "deeper/", "big.bin", "leaf.txt", "top.txt",
+    ] {
+        assert!(tree.contains(entry), "{entry} missing from\n{tree}");
+    }
+    assert!(!tree.contains(".hidden"), "{tree}");
+}
+
+#[test]
+fn a_single_file_import_id_is_a_file_id_and_a_folder_import_id_is_refused() {
+    let fixture = Fixture::new();
+    let files = fixture.mcp();
+    let mut server = Server::new(&[&files]).unwrap();
+    initialize(&mut server);
+    let host = tempfile::tempdir().unwrap();
+    let (root, big) = sample_tree(host.path());
+
+    let (_, report, _) = call_tool(
+        &mut server,
+        "files_add",
+        serde_json::json!({"path": root.join("sub/big.bin")}),
+    );
+    let file = import_id(&report);
+    let bytes = faculties::mcp::input::read_file_id(&fixture.files(), &file).unwrap();
+    assert_eq!(bytes.as_ref(), big.as_slice());
+
+    let (_, report, _) = call_tool(&mut server, "files_add", serde_json::json!({"path": root}));
+    let folder = import_id(&report);
+    let error = faculties::mcp::input::read_file_id(&fixture.files(), &folder).unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<faculties::files::operations::NotAFile>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("folder import"), "{error:#}");
+    // The folder's id names the tree for the tools that read trees.
+    let (_, tree, failed) = call_tool(&mut server, "files_tree", serde_json::json!({"id": folder}));
+    assert!(!failed && tree.contains("leaf.txt"), "{tree}");
+}
+
+#[test]
+fn path_imports_follow_symlinks_only_inside_the_tree() {
+    let fixture = Fixture::new();
+    let files = fixture.mcp();
+    let mut server = Server::new(&[&files]).unwrap();
+    initialize(&mut server);
+    let host = tempfile::tempdir().unwrap();
+    let (root, _) = sample_tree(host.path());
+    let outside = host.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("private.txt"), b"not in the tree").unwrap();
+    std::os::unix::fs::symlink(&root, root.join("sub/loop")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+    std::os::unix::fs::symlink(outside.join("private.txt"), root.join("escape.txt")).unwrap();
+    std::os::unix::fs::symlink(root.join("missing"), root.join("dangling")).unwrap();
+    std::os::unix::fs::symlink(root.join("sub/deeper/leaf.txt"), root.join("alias.txt")).unwrap();
+
+    let (_, report, failed) =
+        call_tool(&mut server, "files_add", serde_json::json!({"path": root}));
+    assert!(!failed, "{report}");
+    assert!(report.contains("Skipped 4 symlink(s)"), "{report}");
+    for skipped in [
+        "sub/loop (would close a cycle)",
+        "escape (points outside the tree)",
+        "escape.txt (points outside the tree)",
+        "dangling (dangling)",
+    ] {
+        assert!(report.contains(skipped), "{skipped} not in {report}");
+    }
+    let tree = fixture.files().tree(&import_id(&report), None).unwrap();
+    assert!(
+        tree.contains("alias.txt"),
+        "an in-tree link is followed\n{tree}"
+    );
+    assert!(
+        !tree.contains("private.txt") && !tree.contains("loop"),
+        "{tree}"
+    );
+}
+
+#[test]
+fn bounded_path_imports_fail_before_publishing() {
+    use faculties::files::operations::ImportLimits;
+    let fixture = Fixture::new();
+    let host = tempfile::tempdir().unwrap();
+    let (root, _) = sample_tree(host.path());
+    let files = fixture.files();
+    let before = files.imports().unwrap();
+    for (limits, expected) in [
+        (
+            ImportLimits {
+                max_entries: 3,
+                max_bytes: u64::MAX,
+            },
+            "3-entry limit",
+        ),
+        (
+            ImportLimits {
+                max_entries: usize::MAX,
+                max_bytes: 1_000_000,
+            },
+            "1000000-byte limit",
+        ),
+    ] {
+        let error = files
+            .add_path_within(
+                &root,
+                None,
+                &[],
+                false,
+                limits,
+                &mut Out::new(&mut |_| Ok(())),
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+    assert_eq!(files.imports().unwrap(), before, "nothing was published");
 }
 
 #[test]

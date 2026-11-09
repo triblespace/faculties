@@ -434,85 +434,110 @@ fn files_view_in<T>(
 
 // ── tree builder ─────────────────────────────────────────────────────────
 
-struct TreeStats {
+/// Bounds on one path import, checked before anything is committed. The
+/// whole tree is held in memory until its one commit, so a bounded caller
+/// fails with a clear error instead of exhausting the host.
+#[derive(Clone, Copy, Debug)]
+pub struct ImportLimits {
+    /// Files and directories visited, the root included.
+    pub max_entries: usize,
+    /// File bytes read.
+    pub max_bytes: u64,
+}
+
+impl ImportLimits {
+    /// The CLI's behaviour: the person at the shell chose the tree.
+    pub const UNBOUNDED: Self = Self {
+        max_entries: usize::MAX,
+        max_bytes: u64::MAX,
+    };
+    /// A tool caller's import: 100 000 entries and 4 GiB of file bytes.
+    pub const TOOL: Self = Self {
+        max_entries: 100_000,
+        max_bytes: 4 << 30,
+    };
+}
+
+/// One walk of a host tree: what it counted, which symlinks it declined,
+/// and the canonical directories on the current branch.
+///
+/// A symlink below the root is followed only when its canonical target is
+/// inside the canonical root and is not a directory on the current branch.
+/// A link that leaves the tree, closes a cycle or dangles is skipped and
+/// listed, never followed. The root itself is canonicalized, so naming a
+/// symlink as the import path imports its target.
+///
+/// These are canonical-prefix checks made at traversal time, without
+/// fd-relative traversal. They keep an ordinary tree contained and acyclic;
+/// they are not a snapshot of the filesystem and not a security boundary
+/// against a concurrent writer replacing paths during the walk.
+struct Walk {
+    root: PathBuf,
+    branch: Vec<PathBuf>,
+    limits: ImportLimits,
+    entries: usize,
     files: usize,
     dirs: usize,
     bytes: u64,
+    skipped: Vec<String>,
 }
 
-/// Build a Merkle tree from a filesystem path, bottom-up.
-/// Returns a Fragment whose root is the top-level entity and whose
-/// facts contain the entire tree.
-fn print_fs_tree(
-    path: &Path,
-    prefix: &str,
-    child_prefix: &str,
-    stats: &mut TreeStats,
-    out: &mut Out<'_>,
-) -> Result<()> {
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
-
-    if meta.is_file() {
-        let size = meta.len();
-        stats.bytes += size;
-        stats.files += 1;
-        let mime = file_capability::infer_media_type(path);
-        out.line(format!("{prefix}{name}  ({mime}, {})", human_size(size)))?;
-    } else if meta.is_dir() {
-        stats.dirs += 1;
-        let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-        let mut files: Vec<(String, PathBuf)> = Vec::new();
-        for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
-            let entry = entry?;
-            let ename = entry.file_name().to_string_lossy().to_string();
-            if ename.starts_with('.') {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                dirs.push((ename, entry.path()));
-            } else {
-                files.push((ename, entry.path()));
-            }
-        }
-        dirs.sort_by(|a, b| a.0.cmp(&b.0));
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        out.line(format!("{prefix}{name}/"))?;
-        let all: Vec<_> = dirs.into_iter().chain(files).collect();
-        for (i, (_, child_path)) in all.iter().enumerate() {
-            let last = i == all.len() - 1;
-            let connector = if last { "└── " } else { "├── " };
-            let continuation = if last { "    " } else { "│   " };
-            print_fs_tree(
-                child_path,
-                &format!("{child_prefix}{connector}"),
-                &format!("{child_prefix}{continuation}"),
-                stats,
-                out,
-            )?;
+impl Walk {
+    fn new(root: PathBuf, limits: ImportLimits) -> Self {
+        Self {
+            root,
+            branch: Vec::new(),
+            limits,
+            entries: 0,
+            files: 0,
+            dirs: 0,
+            bytes: 0,
+            skipped: Vec::new(),
         }
     }
-    Ok(())
-}
 
-fn build_tree(path: &Path, mime_override: Option<&str>, stats: &mut TreeStats) -> Result<Fragment> {
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    fn relative<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, str> {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+    }
 
-    if meta.is_file() {
-        let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-        stats.bytes += bytes.len() as u64;
-        let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(path));
-        let name_str = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unnamed");
+    /// The path to read for one directory entry and its metadata, or `None`
+    /// for a symlink this walk declines (recorded in `skipped`).
+    fn resolve(&mut self, entry: &Path) -> Result<Option<(PathBuf, fs::Metadata)>> {
+        let meta =
+            fs::symlink_metadata(entry).with_context(|| format!("stat {}", entry.display()))?;
+        if !meta.file_type().is_symlink() {
+            return Ok(Some((entry.to_owned(), meta)));
+        }
+        let reason = match fs::canonicalize(entry) {
+            Err(_) => "dangling",
+            Ok(target) if !target.starts_with(&self.root) => "points outside the tree",
+            Ok(target) if self.branch.contains(&target) => "would close a cycle",
+            Ok(target) => {
+                let meta =
+                    fs::metadata(&target).with_context(|| format!("stat {}", target.display()))?;
+                return Ok(Some((target, meta)));
+            }
+        };
+        let link = self.relative(entry).into_owned();
+        self.skipped.push(format!("{link} ({reason})"));
+        Ok(None)
+    }
 
-        stats.files += 1;
-        let frag = file_capability::stage(bytes, name_str, mime)?;
-        Ok(frag)
-    } else if meta.is_dir() {
-        // Collect children sorted by name for deterministic ordering.
+    fn enter(&mut self) -> Result<()> {
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            bail!(
+                "import exceeds the {}-entry limit; nothing was imported",
+                self.limits.max_entries
+            );
+        }
+        Ok(())
+    }
+
+    /// The children of one directory sorted by name, hidden ones skipped.
+    fn children(&mut self, path: &Path) -> Result<Vec<(PathBuf, PathBuf, fs::Metadata)>> {
         let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
         for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
             let entry = entry?;
@@ -523,18 +548,137 @@ fn build_tree(path: &Path, mime_override: Option<&str>, stats: &mut TreeStats) -
             }
             entries.insert(name, entry.path());
         }
-
-        let mut children = Fragment::default();
-
-        for (_name, child_path) in &entries {
-            let child_frag = build_tree(child_path, None, stats)?;
-            children += child_frag;
+        let mut children = Vec::new();
+        for link in entries.into_values() {
+            if let Some((target, meta)) = self.resolve(&link)? {
+                children.push((link, target, meta));
+            }
         }
+        Ok(children)
+    }
 
-        let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+    /// Read one regular file within the remaining byte budget. A FIFO named
+    /// as a file is refused by its metadata before this opens anything.
+    fn read(&mut self, path: &Path, meta: &fs::Metadata) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+        let remaining = self.limits.max_bytes - self.bytes;
+        let too_large = || {
+            anyhow::anyhow!(
+                "import exceeds the {}-byte limit at {}; nothing was imported",
+                self.limits.max_bytes,
+                path.display()
+            )
+        };
+        if meta.len() > remaining {
+            return Err(too_large());
+        }
+        let file = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(remaining.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {}", path.display()))?;
+        if bytes.len() as u64 > remaining {
+            return Err(too_large());
+        }
+        self.bytes += bytes.len() as u64;
+        Ok(bytes)
+    }
+
+    fn report_skipped(&self, out: &mut Out<'_>) -> Result<()> {
+        if !self.skipped.is_empty() {
+            out.line(format!(
+                "Skipped {} symlink(s), not followed:",
+                self.skipped.len()
+            ))?;
+            for link in &self.skipped {
+                out.line(format!("  {link}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn print_fs_tree(
+    link: &Path,
+    path: &Path,
+    meta: &fs::Metadata,
+    prefix: &str,
+    child_prefix: &str,
+    walk: &mut Walk,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let name = link.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+    walk.enter()?;
+    if meta.is_file() {
+        let size = meta.len();
+        walk.bytes += size;
+        walk.files += 1;
+        let mime = file_capability::infer_media_type(link);
+        out.line(format!("{prefix}{name}  ({mime}, {})", human_size(size)))?;
+    } else if meta.is_dir() {
+        walk.dirs += 1;
+        walk.branch.push(path.to_owned());
+        let (dirs, files): (Vec<_>, Vec<_>) = walk
+            .children(path)?
+            .into_iter()
+            .partition(|(_, _, meta)| meta.is_dir());
+        out.line(format!("{prefix}{name}/"))?;
+        let all: Vec<_> = dirs.into_iter().chain(files).collect();
+        for (i, (child_link, child_path, child_meta)) in all.iter().enumerate() {
+            let last = i == all.len() - 1;
+            let connector = if last { "└── " } else { "├── " };
+            let continuation = if last { "    " } else { "│   " };
+            print_fs_tree(
+                child_link,
+                child_path,
+                child_meta,
+                &format!("{child_prefix}{connector}"),
+                &format!("{child_prefix}{continuation}"),
+                walk,
+                out,
+            )?;
+        }
+        walk.branch.pop();
+    }
+    Ok(())
+}
+
+/// Build a Merkle tree from a filesystem path, bottom-up.
+/// Returns a Fragment whose root is the top-level entity and whose
+/// facts contain the entire tree. `link` names the entry; `path` is what
+/// it resolves to.
+fn build_tree(
+    link: &Path,
+    path: &Path,
+    meta: &fs::Metadata,
+    mime_override: Option<&str>,
+    walk: &mut Walk,
+) -> Result<Fragment> {
+    walk.enter()?;
+    if meta.is_file() {
+        let bytes = walk.read(path, meta)?;
+        let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(link));
+        let name_str = link
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed");
+
+        walk.files += 1;
+        let frag = file_capability::stage(bytes, name_str, mime)?;
+        Ok(frag)
+    } else if meta.is_dir() {
+        // Children sorted by name for deterministic ordering.
+        let mut children = Fragment::default();
+        walk.branch.push(path.to_owned());
+        for (child_link, child_path, child_meta) in walk.children(path)? {
+            children += build_tree(&child_link, &child_path, &child_meta, None, walk)?;
+        }
+        walk.branch.pop();
+
+        let dir_name = link.file_name().and_then(|n| n.to_str()).unwrap_or(".");
         let mut directory = Fragment::empty();
         let name_h: TextHandle = directory.put(dir_name.to_string());
-        stats.dirs += 1;
+        walk.dirs += 1;
         directory += entity! {
             metadata::tag: &KIND_DIRECTORY,
             file::name: name_h,
@@ -546,24 +690,33 @@ fn build_tree(path: &Path, mime_override: Option<&str>, stats: &mut TreeStats) -
     }
 }
 
-// ── commands ─────────────────────────────────────────────────────────────
-
-fn cmd_add_dry_run(path: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
+/// The canonical import root and its metadata.
+fn import_root(path: &Path) -> Result<(PathBuf, fs::Metadata)> {
     let abs_path =
         fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
-    let mut stats = TreeStats {
-        files: 0,
-        dirs: 0,
-        bytes: 0,
-    };
-    print_fs_tree(&abs_path, "", "", &mut stats, out)?;
+    let meta = fs::metadata(&abs_path).with_context(|| format!("stat {}", abs_path.display()))?;
+    Ok((abs_path, meta))
+}
+
+// ── commands ─────────────────────────────────────────────────────────────
+
+fn cmd_add_dry_run(
+    path: &Path,
+    tags: &[String],
+    limits: ImportLimits,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let (abs_path, meta) = import_root(path)?;
+    let mut walk = Walk::new(abs_path.clone(), limits);
+    print_fs_tree(&abs_path, &abs_path, &meta, "", "", &mut walk, out)?;
     out.line("")?;
     out.line(format!(
         "Would import: {} files, {} dirs, {}",
-        stats.files,
-        stats.dirs,
-        human_size(stats.bytes),
+        walk.files,
+        walk.dirs,
+        human_size(walk.bytes),
     ))?;
+    walk.report_skipped(out)?;
     if !tags.is_empty() {
         out.line(format!("Tags: {}", tags.join(", ")))?;
     }
@@ -578,19 +731,15 @@ fn cmd_add(
     path: &Path,
     mime_override: Option<&str>,
     tags: &[String],
+    limits: ImportLimits,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let abs_path =
-        fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let (abs_path, meta) = import_root(path)?;
 
     let source = abs_path.to_string_lossy().to_string();
 
-    let mut stats = TreeStats {
-        files: 0,
-        dirs: 0,
-        bytes: 0,
-    };
-    let tree = build_tree(&abs_path, mime_override, &mut stats)?;
+    let mut walk = Walk::new(abs_path.clone(), limits);
+    let tree = build_tree(&abs_path, &abs_path, &meta, mime_override, &mut walk)?;
     let root_id = tree.root().expect("tree has a root");
     let root_content = contents_of(tree.facts(), root_id).first().copied();
 
@@ -619,13 +768,13 @@ fn cmd_add(
     // embedding the whole backlog. Rows come from `faculties maintain` only.
     ensure_files_after_commit(pile, collection, signer, runtime)?;
 
-    if stats.dirs > 0 {
+    if walk.dirs > 0 {
         out.line(format!(
             "Imported {} ({} files, {} dirs, {})",
             abs_path.display(),
-            stats.files,
-            stats.dirs,
-            human_size(stats.bytes),
+            walk.files,
+            walk.dirs,
+            human_size(walk.bytes),
         ))?;
     } else {
         // Single file — show the content hash.
@@ -635,11 +784,12 @@ fn cmd_add(
         let mime = file_capability::normalize_media_type(
             mime_override.unwrap_or_else(|| file_capability::infer_media_type(&abs_path)),
         )?;
-        out.line(format!("{}  {}  ({})", hash, name, human_size(stats.bytes)))?;
+        out.line(format!("{}  {}  ({})", hash, name, human_size(walk.bytes)))?;
         if mime.starts_with("image/") {
             out.line(format!("![{name}](files:{hash})"))?;
         }
     }
+    walk.report_skipped(out)?;
     out.line(format!("Import: {}", fmt_id(import_id)))?;
     Ok(())
 }
@@ -1707,11 +1857,26 @@ impl Files {
         dry_run: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
+        self.add_path_within(path, mime, tags, dry_run, ImportLimits::UNBOUNDED, out)
+    }
+
+    /// [`Self::add_path`] within explicit bounds, checked before the commit.
+    pub fn add_path_within(
+        &self,
+        path: &Path,
+        mime: Option<&str>,
+        tags: &[String],
+        dry_run: bool,
+        limits: ImportLimits,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
         if dry_run {
-            return cmd_add_dry_run(path, tags, out);
+            return cmd_add_dry_run(path, tags, limits, out);
         }
         with_files_write_store(&self.storage, |store, collection, signer, runtime| {
-            cmd_add(store, collection, signer, runtime, path, mime, tags, out)
+            cmd_add(
+                store, collection, signer, runtime, path, mime, tags, limits, out,
+            )
         })
     }
 
@@ -1866,6 +2031,20 @@ impl Files {
 
     /// Resolve a batch in one view. Individual misses remain individual results;
     /// no selector is interpreted as an instruction to read a host file or stdin.
+    /// The file entity an entity or import id names, resolved exactly as
+    /// [`Self::get`] resolves it. A directory, or an import whose root is
+    /// one, is refused by name rather than flattened, because a caller that
+    /// wants one file's bytes cannot use a tree.
+    pub fn file_entity(&self, id: &str) -> Result<Id> {
+        with_files_view(&self.storage, |_, _, _, facts, _, _| {
+            let target = selected_target(facts, id)?;
+            if !is_file(facts, target) {
+                return Err(not_a_file(id).into());
+            }
+            Ok(target)
+        })
+    }
+
     pub fn resolve(
         &self,
         selectors: &[String],
@@ -1890,6 +2069,29 @@ impl Files {
 /// The node a selector names, following an import to its root. An import
 /// observed with several roots names each of them; the answer is the
 /// candidates, each of which selects one.
+/// A one-file reader was given a directory or a folder import. It is
+/// refused by name rather than flattened or narrowed to one of its files.
+#[derive(Debug)]
+pub struct NotAFile {
+    pub id: String,
+}
+
+impl std::fmt::Display for NotAFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is a directory or folder import, not one file; give a single file's id (files_tree lists them), or use CLI extraction for the tree",
+            self.id
+        )
+    }
+}
+
+impl std::error::Error for NotAFile {}
+
+fn not_a_file(id: &str) -> NotAFile {
+    NotAFile { id: id.to_owned() }
+}
+
 fn selected_target<P: TriblePattern>(space: &P, id: &str) -> Result<Id> {
     let eid = file_capability::resolve_selector(space, id)?;
     if !is_import(space, eid) {
@@ -1927,10 +2129,9 @@ where
         file_capability::FileReference::Content(content) => content,
         file_capability::FileReference::Entity(_) => {
             let target = selected_target(space, id)?;
-            anyhow::ensure!(
-                is_file(space, target),
-                "get requires a file; use CLI extraction for directories"
-            );
+            if !is_file(space, target) {
+                return Err(not_a_file(id).into());
+            }
             one_content(space, target)?
         }
     };

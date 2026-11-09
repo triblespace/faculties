@@ -412,13 +412,11 @@ fn real_workers_preserve_media_isolation_revocation_and_reconnects() {
         );
     }
 
+    let upload_0 = root.join("written-through-gateway.txt");
+    std::fs::write(&upload_0, "gateway write").unwrap();
     let added = tool_body(
         request(&client, address, ALICE, Some(&alice_session), Method::POST)
-            .body(call(
-                "files_add",
-                json!({"name":"written-through-gateway.txt", "mime":"text/plain",
-            "data":base64::engine::general_purpose::STANDARD.encode("gateway write")}),
-            ))
+            .body(call("files_add", json!({"path": upload_0})))
             .send()
             .unwrap(),
     );
@@ -489,6 +487,8 @@ fn real_workers_preserve_media_isolation_revocation_and_reconnects() {
     drop(alice_worker);
     alice_worker = alice.start();
     // A stale session must not be silently recreated to replay this mutation.
+    let upload_1 = root.join("must-not-replay.txt");
+    std::fs::write(&upload_1, "x").unwrap();
     assert_eq!(
         request(
             &client,
@@ -497,10 +497,7 @@ fn real_workers_preserve_media_isolation_revocation_and_reconnects() {
             Some(&renewed_session),
             Method::POST
         )
-        .body(call(
-            "files_add",
-            json!({"name":"must-not-replay.txt", "mime":"text/plain", "data":"eA=="})
-        ))
+        .body(call("files_add", json!({"path": upload_1})))
         .send()
         .unwrap()
         .status(),

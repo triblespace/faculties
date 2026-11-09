@@ -20,6 +20,7 @@
 
 pub mod catalog;
 pub mod http;
+pub mod input;
 pub mod object;
 
 use std::collections::{BTreeMap, BTreeSet};

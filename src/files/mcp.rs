@@ -1,13 +1,13 @@
-//! Purpose-built Files MCP tools. No shell paths, stdin markers, or ambient
-//! configuration are accepted as tool arguments.
+//! Purpose-built Files MCP tools. files_add takes an absolute path on the
+//! server's host; no shell expansion, stdin markers, or ambient configuration
+//! are accepted as tool arguments.
 
-use super::operations::{FetchOptions, Files as Operations, SimilarityOptions};
+use super::operations::{FetchOptions, Files as Operations, ImportLimits, SimilarityOptions};
 use super::presentation::ViewOptions;
 use crate::mcp::{decode_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
-use anyhow::{bail, Context, Result};
-use base64::Engine as _;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -32,8 +32,8 @@ const EMPTY_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProper
 const TOOLS: &[Tool] = &[
     Tool {
         name: "files_add",
-        description: "Import a file from base64-encoded original bytes. Name is a leaf filename, never a server path. Importing never embeds; `faculties maintain` derives the WeMM rows in the background.",
-        input_schema: r#"{"type":"object","properties":{"data":{"type":"string","description":"Base64-encoded file bytes"},"name":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["data","name","mime"],"additionalProperties":false}"#,
+        description: "Import a file or a whole directory tree from an absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none; the bytes never travel in the call. Runs the same importer as the CLI `files add <path>`: a directory keeps its tree, hidden entries are skipped, symlinks are followed only inside the tree (others are listed as skipped), and tags go on the import. At most 100000 entries and 4 GiB per call. Returns the CLI's report, ending in the Import id; a single file's Import id is a file_id for other tools, a folder's names the tree. Importing never embeds; `faculties maintain` derives the WeMM rows in the background.",
+        input_schema: r#"{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of a file or directory on the MCP server's host."},"mime":{"type":"string","description":"MIME override for a single file; inferred from the name when omitted."},"tags":{"type":"array","items":{"type":"string"},"default":[]}},"required":["path"],"additionalProperties":false}"#,
     },
     Tool {
         name: "files_list",
@@ -89,9 +89,8 @@ struct Id {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Add {
-    data: String,
-    name: String,
-    mime: String,
+    path: String,
+    mime: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
 }
@@ -182,11 +181,27 @@ impl Faculty for Files {
         match name {
             "files_add" => {
                 let args: Add = decode_arguments(arguments)?;
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(args.data)
-                    .context("file data must be base64")?;
-                let id = files.add_bytes(bytes.into(), &args.name, &args.mime, &args.tags)?;
-                out.line(format!("files:{id:x}"))
+                let path = std::path::Path::new(&args.path);
+                if !path.is_absolute() {
+                    return Err(crate::mcp::invalid_arguments(format!(
+                        "path {} must be absolute on the MCP server's host",
+                        args.path
+                    )));
+                }
+                if let Err(error) = std::fs::metadata(path) {
+                    return Err(crate::mcp::invalid_arguments(format!(
+                        "cannot read {}: {error}",
+                        args.path
+                    )));
+                }
+                files.add_path_within(
+                    path,
+                    args.mime.as_deref(),
+                    &args.tags,
+                    false,
+                    ImportLimits::TOOL,
+                    out,
+                )
             }
             "files_list" => {
                 let args: List = decode_arguments(arguments)?;
