@@ -192,6 +192,15 @@ fn fake_bridge() -> FakeBridge {
 /// A fake bridge whose certificate is made from `seed`: two seeds, two
 /// certificates, one `bridgeid`.
 fn fake_bridge_with_key(seed: u8) -> FakeBridge {
+    fake_bridge_with(seed, &[&rustls::version::TLS13, &rustls::version::TLS12])
+}
+
+/// A real bridge negotiates TLS 1.2, whose handshake signature takes a
+/// different verifier path from TLS 1.3.
+fn fake_bridge_with(
+    seed: u8,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+) -> FakeBridge {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let (certificate, key) = self_signed(seed);
     let pin = Fingerprint::of(&certificate);
@@ -199,7 +208,7 @@ fn fake_bridge_with_key(seed: u8) -> FakeBridge {
         rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(
@@ -706,4 +715,21 @@ fn the_binding_pin_follows_the_bridge_and_a_changed_certificate_needs_naming() {
     assert!(error.contains("refusing"), "{error}");
     assert_eq!(first.seen().len(), before);
     assert!(first.puts().is_empty() && second.puts().is_empty());
+}
+
+#[test]
+fn a_tls12_bridge_is_pinned_the_same_way() {
+    let bridge = fake_bridge_with(3, &[&rustls::version::TLS12]);
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let home = |pin| {
+        Home::new(pile.clone(), None)
+            .with_address(bridge.base.clone())
+            .with_username(USER)
+            .with_pin(pin)
+    };
+    assert_eq!(home(bridge.pin).rooms().unwrap().rooms.len(), 4);
+    let error = format!("{:#}", home(Fingerprint([0x5a; 32])).rooms().unwrap_err());
+    assert!(error.contains("refusing"), "{error}");
+    assert_eq!(Home::probe(&bridge.base).unwrap().certificate, bridge.pin);
 }
