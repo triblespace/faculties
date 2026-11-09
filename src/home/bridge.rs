@@ -3,12 +3,14 @@
 //! Everything here is a live answer from the bridge. Rows are parsed for
 //! presentation and resolution within one command and then dropped; nothing
 //! is cached. The username travels in the request path, so every transport
-//! error is stripped of its URL before it can reach output or a log.
+//! error is stripped of its URL before it can reach output or a log. Every
+//! connection to a bridge is pinned to its certificate (module `tls`).
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::blocking::Client;
 use serde_json::{json, Map, Value};
 use zeroize::Zeroizing;
+
+use super::tls::{Fingerprint, Transport, Trust};
 
 /// Hue brightness is 1..=254; a percentage maps onto that range.
 pub const MAX_BRI: u8 = 254;
@@ -17,7 +19,7 @@ pub const MAX_BRI: u8 = 254;
 pub(crate) struct Bridge {
     base: String,
     username: Zeroizing<String>,
-    http: Client,
+    http: Transport,
 }
 
 impl std::fmt::Debug for Bridge {
@@ -28,52 +30,24 @@ impl std::fmt::Debug for Bridge {
     }
 }
 
-/// A transport error with its URL removed: the URL carries the username.
-fn scrub(error: reqwest::Error) -> anyhow::Error {
-    anyhow!(error.without_url())
-}
-
-/// The bridge presents a certificate signed by the Hue root CA for its
-/// `bridgeid`, with no subjectAltName, which webpki cannot verify. Until Home
-/// pins that chain itself, it accepts the bridge's certificate unverified; the
-/// bridge is only ever reached on the local network.
-pub(crate) fn http_client() -> Result<Client> {
-    Client::builder()
-        .user_agent("faculties-home/0")
-        .timeout(std::time::Duration::from_secs(10))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .context("build Hue bridge HTTP client")
-}
-
-/// `https://<address>` unless the address already names a scheme (tests use a
-/// loopback `http://` stub).
-pub(crate) fn base_url(address: &str) -> String {
-    let address = address.trim().trim_end_matches('/');
-    if address.starts_with("http://") || address.starts_with("https://") {
-        address.to_owned()
-    } else {
-        format!("https://{address}")
-    }
-}
-
-/// The bridge's unauthenticated `/api/config`: its `bridgeid` and model.
+/// The bridge's unauthenticated `/api/config`: its `bridgeid` and model,
+/// and the certificate it presented while answering.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BridgeConfig {
     pub bridge_id: String,
     pub name: Option<String>,
     pub model: Option<String>,
     pub api_version: Option<String>,
+    pub certificate: Fingerprint,
 }
 
-pub(crate) fn public_config(http: &Client, base: &str) -> Result<BridgeConfig> {
-    let value: Value = http
-        .get(format!("{base}/api/config"))
-        .send()
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.json())
-        .map_err(scrub)
+pub(crate) fn public_config(http: &Transport, base: &str) -> Result<BridgeConfig> {
+    let value = http
+        .json(http.get(format!("{base}/api/config")))
         .context("read the bridge's public configuration")?;
+    let certificate = http
+        .presented()
+        .ok_or_else(|| anyhow!("the bridge answered without presenting a certificate"))?;
     let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
     let bridge_id = text("bridgeid")
         .ok_or_else(|| anyhow!("bridge configuration carries no bridgeid"))?
@@ -83,11 +57,12 @@ pub(crate) fn public_config(http: &Client, base: &str) -> Result<BridgeConfig> {
         name: text("name"),
         model: text("modelid"),
         api_version: text("apiversion"),
+        certificate,
     })
 }
 
 impl Bridge {
-    pub(crate) fn new(base: String, username: Zeroizing<String>) -> Result<Self> {
+    pub(crate) fn new(base: String, username: Zeroizing<String>, trust: Trust) -> Result<Self> {
         if username.is_empty()
             || !username
                 .bytes()
@@ -98,8 +73,12 @@ impl Bridge {
         Ok(Self {
             base,
             username,
-            http: http_client()?,
+            http: Transport::new(trust)?,
         })
+    }
+
+    pub(crate) fn transport(&self) -> &Transport {
+        &self.http
     }
 
     fn url(&self, path: &str) -> String {
@@ -107,13 +86,9 @@ impl Bridge {
     }
 
     pub(crate) fn get(&self, path: &str) -> Result<Value> {
-        let value: Value = self
+        let value = self
             .http
-            .get(self.url(path))
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json())
-            .map_err(scrub)
+            .json(self.http.get(self.url(path)))
             .with_context(|| format!("GET {path} from the bridge"))?;
         refused(&value).with_context(|| format!("GET {path}"))?;
         Ok(value)
@@ -123,12 +98,7 @@ impl Bridge {
     /// `success` and `error` entries, one per attribute.
     pub(crate) fn put(&self, path: &str, body: &Value) -> Result<Value> {
         self.http
-            .put(self.url(path))
-            .json(body)
-            .send()
-            .and_then(|response| response.error_for_status())
-            .and_then(|response| response.json())
-            .map_err(scrub)
+            .json(self.http.put(self.url(path)).json(body))
             .with_context(|| format!("PUT {path} on the bridge"))
     }
 
@@ -481,13 +451,18 @@ pub fn discover_mdns(wait: std::time::Duration) -> Result<Vec<Discovered>> {
 
 /// Signify's cloud discovery endpoint: bridges that reported in from this
 /// network's public address. It is rate-limited, so it is asked only on request.
+/// It is an ordinary public HTTPS service, verified against the WebPKI roots.
 pub fn discover_cloud(url: &str) -> Result<Vec<Discovered>> {
-    let value: Value = http_client()?
+    let value: Value = reqwest::blocking::Client::builder()
+        .user_agent("faculties-home/0")
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build Hue discovery HTTP client")?
         .get(url)
         .send()
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json())
-        .map_err(scrub)
+        .map_err(|error| anyhow!(error.without_url()))
         .context("ask Hue cloud discovery")?;
     Ok(value
         .as_array()
@@ -563,11 +538,5 @@ mod tests {
             "bridge refused: unauthorized user (type 1)"
         );
         assert!(refused(&json!({"1":{"name":"a"}})).is_ok());
-    }
-
-    #[test]
-    fn base_url_defaults_to_https_and_keeps_an_explicit_scheme() {
-        assert_eq!(base_url("192.0.2.10"), "https://192.0.2.10");
-        assert_eq!(base_url("http://127.0.0.1:9/"), "http://127.0.0.1:9");
     }
 }

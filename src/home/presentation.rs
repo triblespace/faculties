@@ -1,5 +1,5 @@
 //! Present already fetched bridge answers without asking the bridge again.
-use super::bridge::{bri_to_percent, Discovered, Group};
+use super::bridge::{bri_to_percent, BridgeConfig, Discovered, Group};
 use super::{ActionReport, Binding, BindingStatus, LightsView, RoomsView, ScenesView};
 use crate::out::Out;
 use anyhow::Result;
@@ -140,6 +140,28 @@ pub fn binding(binding: &Binding, out: &mut Out<'_>) -> Result<()> {
     out.line(format!(
         "[{:x}] bridge {} at {}, username in Secrets version {:x}",
         binding.revision, binding.bridge_id, binding.address, binding.secret
+    ))?;
+    out.line(match binding.pin {
+        Some(pin) => format!("certificate SHA-256 {pin}"),
+        None => "no certificate pin: bound before Home pinned certificates; rebind with `home bridge set`".to_owned(),
+    })
+}
+
+pub fn probe(config: &BridgeConfig, out: &mut Out<'_>) -> Result<()> {
+    let mut line = format!("bridge {}", config.bridge_id);
+    if let Some(name) = &config.name {
+        line.push_str(&format!(" {name:?}"));
+    }
+    if let Some(model) = &config.model {
+        line.push_str(&format!(" model {model}"));
+    }
+    if let Some(version) = &config.api_version {
+        line.push_str(&format!(" api {version}"));
+    }
+    out.line(line)?;
+    out.line(format!(
+        "certificate SHA-256 {} (not verified)",
+        config.certificate
     ))
 }
 
@@ -159,6 +181,9 @@ pub fn status(status: &BindingStatus, out: &mut Out<'_>) -> Result<()> {
             }
             for secret in &status.secrets {
                 out.line(format!("username secret {secret:x}"))?;
+            }
+            for pin in &status.pins {
+                out.line(format!("certificate SHA-256 {pin}"))?;
             }
             Ok(())
         }

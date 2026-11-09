@@ -1,5 +1,5 @@
 //! Explicit shell grammar for Home.
-use super::{presentation, Home, Request};
+use super::{presentation, Fingerprint, Home, Request};
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
@@ -27,6 +27,15 @@ pub(crate) struct Cli {
     /// bound one.
     #[arg(long, value_name = "VERSION")]
     username_secret: Option<String>,
+    /// Accept only the bridge certificate with this SHA-256 fingerprint (64
+    /// hex digits, colons allowed), in place of the bound pin. With
+    /// `bridge set`, refuse a bridge presenting any other.
+    #[arg(long, value_name = "SHA256", global = true)]
+    pin: Option<String>,
+    /// Talk to an unpinned bridge without checking its certificate. Only for
+    /// a --bridge override with no pin; a pin, given or bound, still wins.
+    #[arg(long, conflicts_with = "pin")]
+    insecure_tls: bool,
     /// Do not record a light change in the pile; only send it.
     #[arg(long)]
     no_store: bool,
@@ -77,8 +86,12 @@ enum Command {
 #[derive(Subcommand)]
 enum BridgeAction {
     /// Bind the bridge at ADDRESS, its username held in Secrets version
-    /// SECRET. Reads the bridge's id and proves the username with GETs only.
+    /// SECRET, pinned to the certificate it presents (or to --pin). Reads the
+    /// bridge's id and proves the username with GETs only.
     Set { address: String, secret: String },
+    /// Show the bridge at ADDRESS and the SHA-256 of its certificate, without
+    /// verifying it, opening a secret or touching the pile.
+    Probe { address: String },
 }
 
 fn parse_id(raw: &str, what: &str) -> Result<Id> {
@@ -99,6 +112,14 @@ pub fn run() -> Result<()> {
         let found = Home::discover(cloud, std::time::Duration::from_millis(wait_ms))?;
         return crate::cli::with_output("home", |out| presentation::discovered(&found, out));
     }
+    if let Command::Bridge {
+        action: Some(BridgeAction::Probe { address }),
+    } = &command
+    {
+        let config = Home::probe(address)?;
+        return crate::cli::with_output("home", |out| presentation::probe(&config, out));
+    }
+    let pin = cli.pin.as_deref().map(Fingerprint::parse).transpose()?;
     let request = match &command {
         Command::On { bri, percent, .. } => Some(Request::On {
             bri: match (bri, percent) {
@@ -134,6 +155,17 @@ pub fn run() -> Result<()> {
         if let Some(secret) = username_secret {
             home = home.with_secret(secret);
         }
+        if let Some(pin) = pin {
+            home = home.with_pin(pin);
+        }
+        if cli.insecure_tls {
+            eprintln!(
+                "home: warning: --insecure-tls: unless a pin is given or bound, the bridge's \
+                 certificate is not checked, and whatever answers at this address receives \
+                 the bridge username"
+            );
+            home = home.with_insecure_tls();
+        }
         crate::cli::with_output("home", |out| match command {
             Command::Rooms => presentation::rooms(&home.rooms()?, out),
             Command::Lights { room } => presentation::lights(&home.lights(room.as_deref())?, out),
@@ -161,7 +193,10 @@ pub fn run() -> Result<()> {
                 let secret = parse_id(&secret, "SECRET")?;
                 presentation::binding(&home.bridge_set(&address, secret)?, out)
             }
-            Command::Discover { .. } => unreachable!("handled before the pile"),
+            Command::Discover { .. }
+            | Command::Bridge {
+                action: Some(BridgeAction::Probe { .. }),
+            } => unreachable!("handled before the pile"),
         })
     })
 }
@@ -189,5 +224,33 @@ mod tests {
             "4",
         ]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn pin_and_insecure_tls_conflict_and_pin_reaches_bridge_set() {
+        let pin = "AB".repeat(32);
+        let parsed = Cli::try_parse_from([
+            "home",
+            "--pin",
+            &pin,
+            "--insecure-tls",
+            "--pile",
+            "x.pile",
+            "rooms",
+        ]);
+        assert!(parsed.is_err());
+        let parsed = Cli::try_parse_from([
+            "home",
+            "--pile",
+            "x.pile",
+            "bridge",
+            "set",
+            "192.0.2.1",
+            "00",
+            "--pin",
+            &pin,
+        ])
+        .unwrap();
+        assert_eq!(parsed.pin.as_deref(), Some(pin.as_str()));
     }
 }

@@ -7,7 +7,9 @@
 //!
 //! - A bridge binding ([`KIND_BRIDGE`]) names the bridge (its own `bridgeid`),
 //!   where to reach it, and the exact Secrets version holding the bridge
-//!   username. Rebinding supersedes the earlier binding through
+//!   username, and the SHA-256 fingerprint of the certificate the bridge
+//!   presented when it was bound. Every later connection is pinned to that
+//!   fingerprint. Rebinding supersedes the earlier binding through
 //!   `metadata::supersedes`, as Discord's authentication revisions do.
 //! - An action ([`KIND_ACTION`]) is one state change Home sent: the bridge
 //!   resource it addressed, the target's Hue name at the time, the JSON body,
@@ -17,10 +19,40 @@
 //! Every id below was minted with `trible genid` on 2026-11-09. Attributes use
 //! the explicit-anchor form, so each value encoding participates in identity.
 
+use triblespace::core::id::ExclusiveId;
+use triblespace::core::inline::encodings::hash::HashProtocol;
+use triblespace::core::inline::RawInline;
+use triblespace::core::metadata::{self, MetaDescribe};
 use triblespace::macros::id_hex;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{GenId, Handle};
+use triblespace::prelude::inlineencodings::{GenId, Handle, Hash};
 use triblespace::prelude::*;
+
+/// SHA-256, as the hash protocol of a foreign 256-bit fingerprint: the
+/// digest a TLS certificate is pinned by, which no triblespace store
+/// computes. `Hash<Sha256>` keeps it distinct from Blake3 digests by type.
+pub struct Sha256;
+
+impl HashProtocol for Sha256 {
+    const NAME: &'static str = "sha256";
+
+    fn digest(bytes: &[u8]) -> RawInline {
+        use sha2::Digest;
+        sha2::Sha256::digest(bytes).into()
+    }
+}
+
+impl MetaDescribe for Sha256 {
+    fn describe() -> Fragment {
+        // Minted with `trible genid` on 2026-11-09.
+        let id = id_hex!("498BD453DFF7831CE1334F033CF05394");
+        entity! { ExclusiveId::force_ref(&id) @
+            metadata::name: "sha256",
+            metadata::description: "SHA-256 256-bit digest of raw bytes, as computed by systems outside triblespace (TLS certificate fingerprints). The value stores the digest bytes.",
+            metadata::tag: metadata::KIND_INLINE_ENCODING,
+        }
+    }
+}
 
 /// Stable extrinsic scope of the Home collection, named `home`.
 ///
@@ -44,12 +76,16 @@ pub mod home {
     use super::*;
 
     attributes! {
-        /// The bridge's own `bridgeid`, lowercase hex (`ecb5fafffe1bf21b`).
+        /// The bridge's own `bridgeid`, lowercase hex (`001788fffe000001`).
         "0BDD674F2E955CCF6FDCD0D508962081" as bridge_id: Handle<UTF8String>;
         /// Host name or IP address the bridge answers HTTPS on.
         "EEAD0B51D6A16A234411E55F70B30366" as address: Handle<UTF8String>;
         /// Exact Secrets version holding the bridge username (API key).
         "F8A234DC62CAA271EF2C2247D9CD40B3" as username_secret: GenId;
+        /// SHA-256 of the DER leaf certificate the bridge presented when it
+        /// was bound; every connection is refused unless it presents the
+        /// same one. Minted with `trible genid` on 2026-11-09.
+        "FD25F831F60221FCDFB5783B5BF9497F" as certificate_sha256: Hash<Sha256>;
         /// The bridge resource an action addressed, e.g. `groups/3/action`.
         "B09BF469E0A8B236426999E86B9AB735" as target: Handle<UTF8String>;
         /// The target's Hue name when the action was sent.

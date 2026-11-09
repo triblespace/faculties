@@ -1,6 +1,8 @@
 //! Home talks to a loopback fake bridge here, never to a real one: no request
-//! in this file can reach a light.
-use faculties::home::{self, Home, Request};
+//! in this file can reach a light. The fake bridge speaks TLS with a
+//! self-signed Ed25519 certificate made in the test, so every path below runs
+//! through the same certificate pinning a real bridge gets.
+use faculties::home::{self, Fingerprint, Home, Request};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::schemas::home::{home as attrs, DEFAULT_SCOPE_ID, KIND_ACTION};
@@ -27,6 +29,8 @@ struct Seen {
 
 struct FakeBridge {
     base: String,
+    /// SHA-256 of the certificate this bridge presents.
+    pin: Fingerprint,
     seen: Arc<Mutex<Vec<Seen>>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -95,7 +99,7 @@ fn route(method: &str, path: &str, body: Option<&Value>) -> Value {
     let unauthorized =
         json!([{"error": {"type": 1, "address": "/", "description": "unauthorized user"}}]);
     if method == "GET" && path == "/api/config" {
-        return json!({"name": "Fake Bridge", "bridgeid": "ECB5FAFFFE000001",
+        return json!({"name": "Fake Bridge", "bridgeid": "001788FFFE000001",
                       "modelid": "BSB002", "apiversion": "1.78.0"});
     }
     let Some(rest) = path.strip_prefix(&format!("/api/{USER}/")) else {
@@ -125,9 +129,87 @@ fn route(method: &str, path: &str, body: Option<&Value>) -> Value {
     }
 }
 
+/// One DER element: tag, definite length, content.
+fn der(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let length = content.len();
+    if length < 0x80 {
+        out.push(length as u8);
+    } else {
+        let bytes: Vec<u8> = length
+            .to_be_bytes()
+            .into_iter()
+            .skip_while(|byte| *byte == 0)
+            .collect();
+        out.push(0x80 | bytes.len() as u8);
+        out.extend(bytes);
+    }
+    out.extend_from_slice(content);
+    out
+}
+
+fn sequence(parts: &[&[u8]]) -> Vec<u8> {
+    der(0x30, &parts.concat())
+}
+
+/// A self-signed X.509 v3 certificate for an Ed25519 key, and the key as
+/// PKCS#8 v1. Built by hand so the test needs no certificate generator; the
+/// fake bridge, like a real one, carries no subjectAltName.
+fn self_signed(seed: u8) -> (Vec<u8>, Vec<u8>) {
+    use ed25519_dalek::Signer;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+    let ed25519 = sequence(&[&der(0x06, &[0x2b, 0x65, 0x70])]);
+    let name = sequence(&[&der(
+        0x31,
+        &sequence(&[&der(0x06, &[0x55, 0x04, 0x03]), &der(0x0c, b"fake bridge")]),
+    )]);
+    let mut public_key = vec![0];
+    public_key.extend_from_slice(key.verifying_key().as_bytes());
+    let tbs = sequence(&[
+        &der(0xa0, &der(0x02, &[2])),
+        &der(0x02, &[seed]),
+        &ed25519,
+        &name,
+        &sequence(&[&der(0x17, b"250101000000Z"), &der(0x18, b"20991231235959Z")]),
+        &name,
+        &sequence(&[&ed25519, &der(0x03, &public_key)]),
+    ]);
+    let mut signature = vec![0];
+    signature.extend_from_slice(&key.sign(&tbs).to_bytes());
+    let certificate = sequence(&[&tbs, &ed25519, &der(0x03, &signature)]);
+    let pkcs8 = sequence(&[
+        &der(0x02, &[0]),
+        &ed25519,
+        &der(0x04, &der(0x04, key.as_bytes())),
+    ]);
+    (certificate, pkcs8)
+}
+
 fn fake_bridge() -> FakeBridge {
+    fake_bridge_with_key(1)
+}
+
+/// A fake bridge whose certificate is made from `seed`: two seeds, two
+/// certificates, one `bridgeid`.
+fn fake_bridge_with_key(seed: u8) -> FakeBridge {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let (certificate, key) = self_signed(seed);
+    let pin = Fingerprint::of(&certificate);
+    let tls = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certificate)],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+        )
+        .unwrap(),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!("http://{}", listener.local_addr().unwrap());
+    let base = format!("https://{}", listener.local_addr().unwrap());
     listener.set_nonblocking(true).unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -135,7 +217,7 @@ fn fake_bridge() -> FakeBridge {
         let (seen, stop) = (seen.clone(), stop.clone());
         std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let mut stream = match listener.accept() {
+                let stream = match listener.accept() {
                     Ok((stream, _)) => stream,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -147,8 +229,14 @@ fn fake_bridge() -> FakeBridge {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut stream = rustls::StreamOwned::new(
+                    rustls::ServerConnection::new(tls.clone()).unwrap(),
+                    stream,
+                );
+                let mut reader = BufReader::new(&mut stream);
                 let mut request_line = String::new();
+                // A client that refuses the certificate ends the handshake
+                // here, before any request is read.
                 if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
                     continue;
                 }
@@ -173,6 +261,7 @@ fn fake_bridge() -> FakeBridge {
                     reader.read_exact(&mut bytes).unwrap();
                     serde_json::from_slice::<Value>(&bytes).unwrap()
                 });
+                drop(reader);
                 let response = serde_json::to_vec(&route(&method, &path, body.as_ref())).unwrap();
                 seen.lock().unwrap().push(Seen { method, path, body });
                 write!(
@@ -182,11 +271,14 @@ fn fake_bridge() -> FakeBridge {
                 )
                 .unwrap();
                 stream.write_all(&response).unwrap();
+                stream.conn.send_close_notify();
+                let _ = stream.flush();
             }
         })
     };
     FakeBridge {
         base,
+        pin,
         seen,
         stop,
         thread: Some(thread),
@@ -225,7 +317,8 @@ fn reads_are_live_gets_and_never_touch_storage() {
     let pile = directory.path().join("absent.pile");
     let operations = Home::new(pile.clone(), None)
         .with_address(bridge.base.clone())
-        .with_username(USER);
+        .with_username(USER)
+        .with_pin(bridge.pin);
     let adapter = home::mcp::Home::from_operations(operations);
 
     let rooms = call(&adapter, "home_rooms", json!({})).unwrap();
@@ -265,8 +358,13 @@ fn binding_through_secrets_then_changes_are_sent_and_recorded() {
         .unwrap();
     let operations = Home::new(pile.clone(), Some(key.clone()));
     let binding = operations.bridge_set(&bridge.base, secret).unwrap();
-    assert_eq!(binding.bridge_id, "ecb5fafffe000001");
+    assert_eq!(binding.bridge_id, "001788fffe000001");
     assert_eq!(binding.secret, secret);
+    assert_eq!(
+        binding.pin,
+        Some(bridge.pin),
+        "binding records the certificate"
+    );
     assert_eq!(
         operations.bridge_set(&bridge.base, secret).unwrap(),
         binding
@@ -346,7 +444,7 @@ fn binding_through_secrets_then_changes_are_sent_and_recorded() {
 #[test]
 fn action_record_names_the_target_body_and_answer() {
     let report = home::ActionReport {
-        bridge_id: Some("ecb5fafffe000001".into()),
+        bridge_id: Some("001788fffe000001".into()),
         target: "groups/3/action".into(),
         group: home::Group {
             id: "3".into(),
@@ -432,17 +530,19 @@ fn refusals_and_transport_errors_never_carry_the_username() {
     let pile = directory.path().join("absent.pile");
     let wrong = Home::new(pile.clone(), None)
         .with_address(bridge.base.clone())
-        .with_username("someOtherUser42");
+        .with_username("someOtherUser42")
+        .with_pin(bridge.pin);
     let error = format!("{:#}", wrong.rooms().unwrap_err());
     assert!(error.contains("unauthorized user (type 1)"), "{error}");
     assert!(!error.contains("someOtherUser42"), "{error}");
 
     let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = format!("http://{}", closed.local_addr().unwrap());
+    let address = format!("https://{}", closed.local_addr().unwrap());
     drop(closed);
     let unreachable = Home::new(pile.clone(), None)
         .with_address(address)
-        .with_username(USER);
+        .with_username(USER)
+        .with_pin(bridge.pin);
     let error = format!("{:#}", unreachable.change("2", &Request::Off).unwrap_err());
     assert!(!error.contains(USER), "{error}");
     assert!(error.contains("GET groups"), "{error}");
@@ -450,4 +550,160 @@ fn refusals_and_transport_errors_never_carry_the_username() {
     let debug = format!("{unreachable:?}");
     assert!(!debug.contains(USER), "{debug}");
     assert!(!pile.exists());
+}
+
+#[test]
+fn a_wrong_pin_is_refused_in_the_handshake_naming_both_fingerprints() {
+    let bridge = fake_bridge();
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let wrong = Fingerprint([0x5a; 32]);
+    let home = Home::new(pile.clone(), None)
+        .with_address(bridge.base.clone())
+        .with_username(USER)
+        .with_pin(wrong);
+    let error = format!("{:#}", home.rooms().unwrap_err());
+    assert!(error.contains(&bridge.pin.to_string()), "{error}");
+    assert!(error.contains(&wrong.to_string()), "{error}");
+    assert!(error.contains("refusing"), "{error}");
+    assert!(!error.contains(USER), "{error}");
+    let error = format!("{:#}", home.change("2", &Request::Off).unwrap_err());
+    assert!(error.contains("refusing"), "{error}");
+    assert!(
+        bridge.seen().is_empty(),
+        "no request, and so no username, crossed a refused handshake"
+    );
+
+    let right = Home::new(pile.clone(), None)
+        .with_address(bridge.base.clone())
+        .with_username(USER)
+        .with_pin(bridge.pin);
+    assert_eq!(right.rooms().unwrap().rooms.len(), 4);
+    assert!(!pile.exists());
+}
+
+#[test]
+fn an_override_without_a_pin_refuses_unless_insecure_tls_is_explicit() {
+    let bridge = fake_bridge();
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let unpinned = Home::new(pile.clone(), None)
+        .with_address(bridge.base.clone())
+        .with_username(USER);
+    let error = format!("{:#}", unpinned.rooms().unwrap_err());
+    assert!(
+        error.contains("--pin") && error.contains("--insecure-tls"),
+        "{error}"
+    );
+    assert!(bridge.seen().is_empty(), "refused before the network");
+
+    let insecure = unpinned.clone().with_insecure_tls();
+    assert_eq!(insecure.rooms().unwrap().rooms.len(), 4);
+    assert!(bridge.puts().is_empty());
+
+    // An explicit pin still wins over --insecure-tls.
+    let error = format!(
+        "{:#}",
+        insecure
+            .with_pin(Fingerprint([0x5a; 32]))
+            .rooms()
+            .unwrap_err()
+    );
+    assert!(error.contains("refusing"), "{error}");
+
+    // Plain HTTP carries no certificate and is refused, pin or not.
+    let http = bridge.base.replace("https://", "http://");
+    for home in [
+        Home::new(pile.clone(), None)
+            .with_address(http.clone())
+            .with_username(USER)
+            .with_pin(bridge.pin),
+        Home::new(pile.clone(), None)
+            .with_address(http.clone())
+            .with_username(USER)
+            .with_insecure_tls(),
+    ] {
+        let error = format!("{:#}", home.rooms().unwrap_err());
+        assert!(error.contains("HTTPS only"), "{error}");
+    }
+    assert!(!pile.exists());
+}
+
+#[test]
+fn probe_reports_the_presented_certificate() {
+    let bridge = fake_bridge();
+    let config = Home::probe(&bridge.base).unwrap();
+    assert_eq!(config.bridge_id, "001788fffe000001");
+    assert_eq!(config.certificate, bridge.pin);
+    assert!(bridge
+        .seen()
+        .iter()
+        .all(|seen| seen.method == "GET" && seen.path == "/api/config"));
+}
+
+#[test]
+fn the_binding_pin_follows_the_bridge_and_a_changed_certificate_needs_naming() {
+    let first = fake_bridge_with_key(1);
+    let second = fake_bridge_with_key(2);
+    assert_ne!(first.pin, second.pin);
+    let (_directory, pile, key) = fresh_pile();
+    let secret = faculties::secrets::Secrets::new(pile.clone(), Some(key.clone()))
+        .add("hue-bridge-fixture-username", USER.as_bytes())
+        .unwrap();
+    let operations = Home::new(pile.clone(), Some(key.clone()));
+    let binding = operations.bridge_set(&first.base, secret).unwrap();
+    assert_eq!(binding.pin, Some(first.pin));
+
+    // The same bridge id behind another certificate: refused, both named,
+    // before the username is opened or sent.
+    let error = format!(
+        "{:#}",
+        operations.bridge_set(&second.base, secret).unwrap_err()
+    );
+    assert!(error.contains(&first.pin.to_string()), "{error}");
+    assert!(error.contains(&second.pin.to_string()), "{error}");
+    assert!(error.contains("--pin"), "{error}");
+    assert!(
+        second.seen().iter().all(|seen| seen.path == "/api/config"),
+        "only the unauthenticated config was read"
+    );
+
+    // A pin that matches neither is refused in the handshake.
+    let error = format!(
+        "{:#}",
+        operations
+            .clone()
+            .with_pin(Fingerprint([0x5a; 32]))
+            .bridge_set(&second.base, secret)
+            .unwrap_err()
+    );
+    assert!(error.contains("refusing"), "{error}");
+
+    // Naming the new certificate rebinds.
+    let rebound = operations
+        .clone()
+        .with_pin(second.pin)
+        .bridge_set(&second.base, secret)
+        .unwrap();
+    assert_eq!(rebound.pin, Some(second.pin));
+    assert_eq!(
+        operations.bridge_status().unwrap().selected().unwrap(),
+        rebound
+    );
+    assert_eq!(operations.rooms().unwrap().rooms.len(), 4);
+
+    // The bound username goes only to the bound certificate, whatever
+    // address the bridge is reached at.
+    let before = first.seen().len();
+    let error = format!(
+        "{:#}",
+        operations
+            .clone()
+            .with_address(first.base.clone())
+            .rooms()
+            .unwrap_err()
+    );
+    assert!(error.contains("refusing"), "{error}");
+    assert_eq!(first.seen().len(), before);
+    assert!(first.puts().is_empty() && second.puts().is_empty());
 }
