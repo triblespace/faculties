@@ -523,7 +523,18 @@ impl StorageState {
     /// stamp and reload after an external append. A failed live reload retains
     /// the last coherent snapshot and surfaces the error until explicit OPEN.
     pub fn context(&mut self) -> WidgetContext<'_> {
+        self.refresh();
+        self.loaded_context()
+    }
+
+    /// Refresh on a host-owned worker. This may perform storage I/O.
+    pub fn refresh(&mut self) {
         self.ensure_loaded();
+    }
+
+    /// Borrow the already-loaded immutable observation without refresh or I/O.
+    /// Hosts must visibly handle `error()` and schedule `refresh()` themselves.
+    pub fn loaded_context(&self) -> WidgetContext<'_> {
         WidgetContext {
             datasets: self.datasets.as_ref(),
             secrets: self.secrets.as_ref(),
@@ -1434,10 +1445,7 @@ mod tests {
 
         let visible = visible_keys(storage.context());
         assert!(storage.error().is_none(), "{:?}", storage.error());
-        assert_eq!(
-            visible,
-            SourceKey::ALL.into_iter().collect()
-        );
+        assert_eq!(visible, SourceKey::ALL.into_iter().collect());
     }
 
     #[test]

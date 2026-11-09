@@ -463,3 +463,23 @@ fn aggregate_native_primary_and_auxiliary_openers_fail_closed_without_routes() {
     drop(registrations);
     catalog.close().unwrap();
 }
+
+#[test]
+fn worker_close_retires_session_while_ui_clones_keep_frozen_bytes() {
+    let fixture = Fixture::new();
+    let handle = fixture.private(crate::schemas::wiki::DEFAULT_SCOPE_ID);
+    let frozen = fixture
+        .storage
+        .with_store(|store, _, _| Ok(store.snapshot()?))
+        .unwrap();
+    let ui_clone = fixture.storage.clone();
+    let worker_owner = fixture.storage.clone();
+    std::thread::spawn(move || worker_owner.close())
+        .join()
+        .unwrap()
+        .unwrap();
+    assert!(ui_clone.shared.as_ref().unwrap().lock().unwrap().is_none());
+    assert!(frozen.contains_blob(handle).unwrap());
+    drop(ui_clone); // No Session remains for this thread to close.
+    assert!(frozen.contains_blob(handle).unwrap());
+}

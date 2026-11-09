@@ -25,13 +25,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use super::storage::WidgetReader as PileSnapshot;
 use triblespace::core::blob::Blob;
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::Inline;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use super::storage::WidgetReader as PileSnapshot;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use GORBIE::graph::{self, GraphViewport, KeyedLayout, LayoutParams};
@@ -102,7 +102,9 @@ impl WikiLive {
     }
 
     fn text(reader: &PileSnapshot, h: TextHandle) -> String {
-        crate::wiki::read_text(reader, h).unwrap_or_default()
+        crate::wiki::read_text(reader, h).unwrap_or_else(|_| {
+            "This page is not available on this device yet. Wait for sync, then Refresh.".to_owned()
+        })
     }
 
     // ── maintained revision/entry projection ─────────────────────────
@@ -272,47 +274,42 @@ impl WikiLive {
     /// archive. Ambiguity is local to this explicit open action and never
     /// invalidates unrelated file rows.
     fn resolve_file(files: DatasetView<'_>, hex: &str) -> Result<(FileHandle, String), String> {
-        let resolved = crate::files::resolve_file(files.facts, files.reader, hex)
-            .map_err(|error| format!("resolve files:{hex}: {error:#}"))?;
+        let resolved =
+            crate::files::resolve_file(files.facts, files.reader, hex).map_err(|error| {
+                eprintln!("[files] resolve files:{hex}: {error:#}");
+                "This file link is unavailable or ambiguous in this workspace.".to_owned()
+            })?;
         let name = resolved_file_name(&resolved);
         Ok((resolved.content, name))
     }
 
-    /// Resolve `files:<selector>`, write the blob to `$TMPDIR/faculties-files/<name>`,
-    /// and fire `open` on it. Logs errors to stderr rather than surfacing
-    /// them through the UI (this is a best-effort side channel).
-    fn open_file(files: Option<DatasetView<'_>>, hex: &str) {
-        let Some(files) = files else {
-            eprintln!("[files] no files dataset available");
-            return;
-        };
-        let (handle, name) = match Self::resolve_file(files, hex) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                eprintln!("[files] {error}");
-                return;
-            }
-        };
-
-        let result = (|| -> Result<std::path::PathBuf, String> {
-            let blob: Blob<RawBytes> = files
-                .reader
-                .get(handle)
-                .map_err(|e| format!("get blob: {e:?}"))?;
-            let tmp_dir = std::env::temp_dir().join("faculties-files");
-            std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("mkdir: {e}"))?;
-            let path = tmp_dir.join(&name);
-            std::fs::write(&path, &*blob.bytes).map_err(|e| format!("write: {e}"))?;
-            Ok(path)
-        })();
-
-        match result {
-            Ok(path) => {
-                eprintln!("[files] opening: {}", path.display());
-                let _ = std::process::Command::new("open").arg(&path).spawn();
-            }
-            Err(e) => eprintln!("[files] error: {e}"),
-        }
+    /// Open only the exact blob resolved against the supplied Files observation.
+    fn open_file(
+        files: Option<DatasetView<'_>>,
+        hex: &str,
+        mut before_export: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let files = files.ok_or_else(|| "This workspace has no Files view.".to_owned())?;
+        let (handle, name) = Self::resolve_file(files, hex)?;
+        let blob: Blob<RawBytes> = files.reader.get(handle).map_err(|_| {
+            "This file is not available on this device yet. Wait for sync, then Refresh.".to_owned()
+        })?;
+        // Admit the side effect only after reading the clicked observation's
+        // exact bytes. Same leaf names with different content cannot collide.
+        before_export()?;
+        let tmp_dir = std::env::temp_dir()
+            .join("faculties-files")
+            .join(crate::files::content_hash_hex(handle));
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
+        let path = tmp_dir.join(&name);
+        std::fs::write(&path, &*blob.bytes)
+            .map_err(|_| "Cannot write the file preview.".to_owned())?;
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|_| "Cannot open this file with the system viewer.".to_owned())?;
+        Ok(())
     }
 }
 
@@ -760,6 +757,7 @@ fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
 /// ```
 #[derive(Default)]
 pub struct WikiViewer {
+    file_error: Option<String>,
     search_query: String,
     /// Last search miss (for the "no match" chip). Cleared whenever
     /// the query text is edited.
@@ -791,8 +789,36 @@ impl WikiViewer {
         wiki_view: DatasetView<'_>,
         files_view: Option<DatasetView<'_>>,
     ) {
+        self.render_with_file_action(ctx, wiki_view, files_view, |selector| {
+            WikiLive::open_file(files_view, selector, || Ok(()))
+        });
+    }
+
+    /// Resolve/export from the supplied immutable clicked observation. Call on
+    /// a host worker when I/O must not block its UI; `before_export` is the
+    /// admission point after payload acquisition and before filesystem/open.
+    pub fn open_file_with(
+        files: DatasetView<'_>,
+        selector: &str,
+        before_export: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        WikiLive::open_file(Some(files), selector, before_export)
+    }
+
+    /// Hosts may queue file actions on their own worker. The action receives
+    /// the clicked selector; the host must retain this exact Files observation.
+    pub fn render_with_file_action(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        wiki_view: DatasetView<'_>,
+        files_view: Option<DatasetView<'_>>,
+        mut open_file: impl FnMut(&str) -> Result<(), String>,
+    ) {
         let wiki_reader = wiki_view.reader;
         ctx.section("Wiki", |ctx| {
+        if let Some(error) = self.file_error.as_ref() {
+            render_diagnostic(ctx.ui_mut(), error);
+        }
         // Refresh cached spaces if either revision changed since the last frame.
         let wiki_revision = wiki_view.revision;
         let files_revision = files_view.map(|view| view.revision);
@@ -1229,7 +1255,7 @@ impl WikiViewer {
             }
         }
         for hex in to_open_file {
-            WikiLive::open_file(files_view, &hex);
+            self.file_error = open_file(&hex).err();
         }
         });
     }
