@@ -239,11 +239,10 @@ impl Faculty for Memory {
                     parse_tai_timestamp(&args.when).map(|when| (when, when))
                 }
                 .map_err(invalid_arguments)?;
-                let bytes = crate::mcp::input::read_reference(
+                let bytes = crate::mcp::input::InputBudget::per_call().reference(
                     &self.files,
                     args.file_id.as_deref(),
                     args.path.as_deref(),
-                    crate::mcp::input::MAX_HOST_FILE_BYTES,
                 )?;
                 memory.image(&bytes, range)?.emit(out)?;
                 out.line(format!(

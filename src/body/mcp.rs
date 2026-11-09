@@ -107,11 +107,10 @@ impl Capture {
                 .mime
                 .clone()
                 .ok_or_else(|| invalid_arguments("media capture requires mime"))?;
-            let bytes = crate::mcp::input::read_reference(
+            let bytes = crate::mcp::input::InputBudget::per_call().reference(
                 files,
                 self.file_id.as_deref(),
                 self.path.as_deref(),
-                crate::mcp::input::MAX_HOST_FILE_BYTES,
             )?;
             Ok((bytes, mime))
         };

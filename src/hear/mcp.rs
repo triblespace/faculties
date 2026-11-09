@@ -37,11 +37,9 @@ impl Hear {
                 let files = self.files.as_ref().ok_or_else(|| {
                     invalid_arguments("file_id needs a launcher-configured pile; use path")
                 })?;
-                crate::mcp::input::read_file_id(files, id)
+                crate::mcp::input::InputBudget::per_call().file_id(files, id)
             }
-            (_, path) => {
-                crate::mcp::input::read_host_file(path, crate::mcp::input::MAX_HOST_FILE_BYTES)
-            }
+            (_, path) => crate::mcp::input::InputBudget::per_call().host_file(path),
         }
     }
 }

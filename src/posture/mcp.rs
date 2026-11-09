@@ -169,20 +169,25 @@ impl Faculty for Posture {
                     args.documents.iter().map(|document| document.name.as_str()),
                 )
                 .map_err(invalid_arguments)?;
-                // Read the entire batch before any scan publication.
+                // Read the entire batch, within one budget for the whole
+                // call, before any scan publication.
+                let mut budget = crate::mcp::input::InputBudget::per_call();
                 let bytes = args
                     .documents
                     .iter()
                     .map(|document| {
-                        crate::mcp::input::read_reference(
-                            &self.files,
-                            document.file_id.as_deref(),
-                            document.path.as_deref(),
-                            crate::mcp::input::MAX_HOST_FILE_BYTES,
-                        )
-                        .map_err(|error| {
-                            invalid_arguments(format!("document {:?}: {error:#}", document.name))
-                        })
+                        budget
+                            .reference(
+                                &self.files,
+                                document.file_id.as_deref(),
+                                document.path.as_deref(),
+                            )
+                            .map_err(|error| {
+                                invalid_arguments(format!(
+                                    "document {:?}: {error:#}",
+                                    document.name
+                                ))
+                            })
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let documents = args

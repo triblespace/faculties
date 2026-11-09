@@ -212,15 +212,13 @@ impl Faculty for Mail {
                         Ok(DraftAttachment::File(self.files.file_entity(id)?))
                     })
                     .collect::<Result<Vec<_>>>()?;
+                // Path attachments share one budget for the whole call.
+                let mut budget = crate::mcp::input::InputBudget::per_call();
                 for value in args.attachments {
                     text(&value.name, "attachment name")?;
                     let media_type = crate::files::normalize_media_type(&value.mime)
                         .map_err(invalid_arguments)?;
-                    let bytes = crate::mcp::input::read_host_file(
-                        &value.path,
-                        crate::mcp::input::MAX_HOST_FILE_BYTES,
-                    )?
-                    .to_vec();
+                    let bytes = budget.host_file(&value.path)?.to_vec();
                     attachments.push(DraftAttachment::Resident(super::AttachmentData {
                         filename: value.name,
                         media_type,

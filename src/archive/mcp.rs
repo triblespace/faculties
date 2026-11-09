@@ -180,14 +180,15 @@ impl Faculty for Archive {
                         "source_name must be nonempty and contain no NUL",
                     ));
                 }
-                let limit = crate::mcp::input::MAX_HOST_FILE_BYTES;
+                // The export and its attachments share one budget.
+                let mut budget = crate::mcp::input::InputBudget::per_call();
                 let bytes = match crate::mcp::input::exactly_one([
                     ("file_id", a.file_id.as_deref()),
                     ("path", a.path.as_deref()),
                     ("content", a.content.as_deref()),
                 ])? {
-                    ("file_id", id) => crate::mcp::input::read_file_id(&self.files, id)?,
-                    ("path", path) => crate::mcp::input::read_host_file(path, limit)?,
+                    ("file_id", id) => budget.file_id(&self.files, id)?,
+                    ("path", path) => budget.host_file(path)?,
                     (_, content) => Bytes::from(content.to_owned()),
                 };
                 let source: ImportSource = a.source.into();
@@ -203,12 +204,8 @@ impl Faculty for Archive {
                             "attachment name must be nonempty and contain no NUL",
                         ));
                     }
-                    let bytes = crate::mcp::input::read_reference(
-                        &self.files,
-                        a.file_id.as_deref(),
-                        a.path.as_deref(),
-                        limit,
-                    )?;
+                    let bytes =
+                        budget.reference(&self.files, a.file_id.as_deref(), a.path.as_deref())?;
                     if attachments.insert(a.name, bytes).is_some() {
                         return Err(invalid_arguments("duplicate attachment name"));
                     }

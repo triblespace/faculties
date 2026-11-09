@@ -618,3 +618,45 @@ fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
     assert_eq!(emitted, 0);
     assert_eq!(by_id.commits(DEFAULT_SCAN_SCOPE_ID), 1, "nothing recorded");
 }
+
+#[test]
+fn one_call_reads_its_documents_within_one_budget() {
+    use faculties::mcp::input::MAX_CALL_INPUT_BYTES;
+    let fixture = Fixture::new();
+    // A sparse file just over half the budget: each document alone fits,
+    // the same file named twice does not, and the second is refused by
+    // its size before it is read.
+    let host = tempfile::tempdir().unwrap();
+    let half = host.path().join("half.bin");
+    fs::File::create(&half)
+        .unwrap()
+        .set_len(MAX_CALL_INPUT_BYTES / 2 + 1)
+        .unwrap();
+    let mut emitted = 0;
+    let error = fixture
+        .adapter()
+        .call(
+            "posture_scan",
+            json(serde_json::json!({
+                "label": "budget",
+                "documents": [
+                    {"name": "one.bin", "path": half},
+                    {"name": "two.bin", "path": half},
+                ],
+            })),
+            &mut Out::new(&mut |_| {
+                emitted += 1;
+                Ok(())
+            }),
+        )
+        .unwrap_err();
+    assert!(error.downcast_ref::<InvalidArguments>().is_some());
+    let message = format!("{error:#}");
+    assert!(message.contains("\"two.bin\""), "{message}");
+    assert!(
+        message.contains(&format!("{MAX_CALL_INPUT_BYTES}-byte input budget")),
+        "{message}"
+    );
+    assert_eq!(emitted, 0);
+    assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 0);
+}

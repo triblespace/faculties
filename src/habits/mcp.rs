@@ -82,13 +82,11 @@ impl Faculty for Habits {
                             ("script_path", args.script_path.as_deref()),
                         ])? {
                             ("script", text) => Bytes::from(text.to_owned()),
-                            ("script_file_id", id) => {
-                                crate::mcp::input::read_file_id(&self.files, id)?
+                            ("script_file_id", id) => crate::mcp::input::InputBudget::per_call()
+                                .file_id(&self.files, id)?,
+                            (_, path) => {
+                                crate::mcp::input::InputBudget::per_call().host_file(path)?
                             }
-                            (_, path) => crate::mcp::input::read_host_file(
-                                path,
-                                crate::mcp::input::MAX_HOST_FILE_BYTES,
-                            )?,
                         },
                     ),
                 };
