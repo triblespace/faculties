@@ -48,6 +48,7 @@ pile = os.path.abspath(pile)
 os.environ["PILE"] = pile
 context = {"version": 3, "pile": pile, "fresh": fresh, "lock_tag": lock_tag}
 now = time.time()
+refresh_clock = time.monotonic()
 REFRESH_BOUND = 480
 
 cache_dir = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "colony-coverage")
@@ -105,12 +106,57 @@ if not refresh:
         report("error", c["why"])
     report(c["result"], "%s (checked %ds ago)" % (c["why"], now - c["at"]))
 
+phase = "decide"
+call_index = 0
+call = None
+
+def clipped(value, limit):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "replace")
+    # One bounded line, including for binary/multiline timeout stderr.
+    value = " ".join(str(value or "").split())
+    return value.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+def observed_call(label, argv, timeout, **kwargs):
+    global phase, call_index, call
+    call_index += 1
+    call = {"label": label, "start": time.monotonic(), "elapsed": None, "stderr": ""}
+    phase = "wait"
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        call["stderr"] = clipped(e.stderr, 768)
+        raise
+    finally:
+        call["elapsed"] = time.monotonic() - call["start"]
+    phase = "read-result"
+    if out.returncode:
+        call["stderr"] = clipped(out.stderr, 768)
+    return out
+
+def diagnostic(error):
+    ended = time.time()
+    elapsed = time.monotonic() - refresh_clock
+    current = "none" if call is None else call["label"]
+    duration = 0 if call is None else (
+        call["elapsed"] if call["elapsed"] is not None else time.monotonic() - call["start"])
+    # Do not stringify TimeoutExpired: its argv may contain a private selector
+    # or executable path. Command labels below contain only fixed words/IDs.
+    detail = ("call exceeded %s s" % error.timeout if isinstance(error, subprocess.TimeoutExpired)
+              else clipped(error, 384))
+    detail = "%s: %s; phase=%s call=%d [%s] call_elapsed=%.3fs; refresh_start=%.3f refresh_end=%.3f refresh_elapsed=%.3fs" % (
+        type(error).__name__, detail, phase, call_index, current, duration, now, ended, elapsed)
+    if call is not None and call["stderr"]:
+        detail += "; stderr=" + call["stderr"]
+    # Leave room for the Habit evaluator's exit-status prefix within 2048 bytes.
+    return clipped(detail, 1800)
+
 def run(*argv):
     exe = shutil.which(argv[0]) or os.path.expanduser("~/.local/bin/" + argv[0])
-    out = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=120,
-                         stdin=subprocess.DEVNULL)
+    label = "relations show <persona>" if argv[0] == "relations" else " ".join(argv)
+    out = observed_call(label, [exe, *argv[1:]], 120, stdin=subprocess.DEVNULL)
     if out.returncode != 0:
-        raise RuntimeError("%s exited %d: %s" % (" ".join(argv), out.returncode, out.stderr.strip()[:2048] or "no stderr"))
+        raise RuntimeError("%s exited %d" % (label, out.returncode))
     return out.stdout
 
 STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)? TAI")
@@ -134,12 +180,10 @@ def decide():
         lock = os.path.expanduser("~/liora/mary/scripts/gb10-lock.sh")
         if os.access(lock, os.X_OK):
             for box in ("sky", "stars"):
-                checked = subprocess.run([lock, "check", box], capture_output=True, text=True,
-                                         timeout=30)
+                checked = observed_call("reservation check " + box, [lock, "check", box], 30)
                 held = checked.stdout
                 if checked.returncode not in (0, 3):
-                    raise RuntimeError("reservation check %s exited %d: %s" %
-                                       (box, checked.returncode, (checked.stderr or held).strip()[:2048]))
+                    raise RuntimeError("reservation check %s exited %d" % (box, checked.returncode))
                 if not ((checked.returncode == 0 and held.strip() == "FREE")
                         or (checked.returncode == 3 and "tag=" in held)):
                     raise ValueError("reservation check %s: unrecognized result" % box)
@@ -190,11 +234,13 @@ try:
     try:
         due, why = decide()
         result = "due" if due else "covered"
+        phase = "publish"
         # Include the transition into publication in the timeout handler.
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     except (Exception, OutOfTime) as e:
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-        result, why = "error", "%s: %s" % (type(e).__name__, str(e)[:4096])
+        result, why = "error", diagnostic(e)
+    phase = "publish"
     tmp = "%s.tmp.%d" % (cache, os.getpid())
     try:
         with open(tmp, "w") as f:
@@ -202,7 +248,7 @@ try:
                        "until": now + cache_secs, "context": context}, f)
         os.replace(tmp, cache)
     except Exception as e:
-        result, why = "error", "cache publication failed: %s" % e
+        result, why = "error", diagnostic(RuntimeError("cache publication failed: %s" % e))
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

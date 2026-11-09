@@ -97,7 +97,8 @@ class PredicateTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, 2, "", "PILE required")
         code, _, error, _ = self.invoke(command=failed)
         self.assertEqual(code, 2)
-        self.assertIn("relations show tester exited 2: PILE required", error)
+        self.assertIn("relations show <persona> exited 2", error)
+        self.assertIn("stderr=PILE required", error)
         self.assertEqual(self.stored()["result"], "error")
         self.assertIn("PILE required", self.invoke(False)[2])
 
@@ -120,6 +121,57 @@ class PredicateTests(unittest.TestCase):
         self.assertIn("TimeoutExpired", self.stored()["why"])
         self.assertEqual(self.invoke(False)[0], 2)
 
+    def test_call_timeout_preserves_bounded_stderr_but_not_stdout_or_argv(self):
+        self.failure = subprocess.TimeoutExpired(
+            ["private-path", "private-selector"], 120,
+            output=b"raw-goal-body", stderr="waiting for reader lock\n".encode() + b"\xff" + "é".encode() * 3000)
+        code, out, error, _ = self.invoke()
+        self.assertEqual((code, out), (2, ""))
+        why = self.stored()["why"]
+        self.assertEqual(error.strip(), why)
+        for expected in ("TimeoutExpired", "call exceeded 120 s", "phase=wait", "call=1 [relations show <persona>]",
+                         "call_elapsed=", "refresh_start=", "refresh_end=", "refresh_elapsed=", "stderr=waiting for reader lock"):
+            self.assertIn(expected, why)
+        for private in ("raw-goal-body", "private-path", "private-selector"):
+            self.assertNotIn(private, why)
+        self.assertLessEqual(len(why.encode()), 1800)
+
+    def test_later_whole_alarm_identifies_active_call_and_elapsed_time(self):
+        clock = [100.0]
+        self.listing = f"== DOING (1) ==\n- [{GOAL}] goal\n"
+        def waiting(argv, **kwargs):
+            self.assertEqual(kwargs["timeout"], 120)
+            if argv[1:] == ["show", GOAL]:
+                clock[0] = 580.0
+                signal.signal.call_args_list[0].args[1]()
+            clock[0] += 3
+            return self.command(argv, **kwargs)
+        with patch("time.monotonic", side_effect=lambda: clock[0]), patch("time.time", return_value=1000):
+            self.assertEqual(self.invoke(command=waiting)[0], 2)
+        cached = self.stored()
+        why = cached["why"]
+        self.assertIn(f"phase=wait call=3 [compass show {GOAL}] call_elapsed=474.000s", why)
+        self.assertIn("refresh_start=1000.000 refresh_end=1000.000 refresh_elapsed=480.000s", why)
+        self.assertEqual((cached["at"], cached["until"], cached["context"]["version"]), (1000, 1600, 3))
+        with patch("time.time", return_value=1100):
+            code, _, error, spawns = self.invoke(False)
+        self.assertEqual((code, error.strip(), spawns), (2, why, 0))
+
+    def test_nonzero_later_call_retains_only_error_stderr(self):
+        clock = [100.0]
+        def failed(argv, **kwargs):
+            clock[0] += 7
+            if argv[1] == "list":
+                return subprocess.CompletedProcess(argv, 2, "private-goal-body", "collection unavailable")
+            return self.command(argv, **kwargs)
+        with patch("time.monotonic", side_effect=lambda: clock[0]):
+            self.assertEqual(self.invoke(command=failed)[0], 2)
+        why = self.stored()["why"]
+        self.assertIn("phase=read-result call=2 [compass list doing blocked] call_elapsed=7.000s", why)
+        self.assertIn("refresh_elapsed=14.000s", why)
+        self.assertIn("stderr=collection unavailable", why)
+        self.assertNotIn("private-goal-body", why)
+
     def test_whole_refresh_timeout_is_cached_error(self):
         def timed_out(argv, **kwargs):
             # Invoke the exact handler installed by the script.
@@ -136,6 +188,7 @@ class PredicateTests(unittest.TestCase):
                 signal.signal.call_args_list[0].args[1]()
         self.assertEqual(self.invoke(mask=mask)[0], 2)
         self.assertIn("refresh past 480 s", self.stored()["why"])
+        self.assertIn("phase=publish", self.stored()["why"])
 
     def test_argument_parse_failure_is_error(self):
         for flag in ("--fresh-mins", "--cache-secs"):
@@ -160,6 +213,18 @@ class PredicateTests(unittest.TestCase):
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         self.show += f"Status history:\n- {stamp} TAI doing by {PERSON}\n"
         self.assertEqual(self.invoke()[0], 1)
+        cached = self.stored()
+        self.assertEqual(set(cached), {"result", "why", "at", "until", "context"})
+        self.assertNotIn("refresh_elapsed", cached["why"])
+        self.assertEqual(self.invoke(False)[0], 1)
+
+    def test_current_cache_grace_and_expiry_are_unchanged(self):
+        self.assertEqual(self.invoke()[0], 0)
+        until = self.stored()["until"]
+        for offset, expected_code, expected_spawns in ((-1, 0, 0), (0, 0, 1), (599, 0, 1), (600, 2, 1)):
+            with self.subTest(offset=offset), patch("time.time", return_value=until + offset):
+                code, _, _, spawns = self.invoke(False)
+            self.assertEqual((code, spawns), (expected_code, expected_spawns))
 
     def test_unavailable_or_unidentified_reservation_is_error(self):
         for code, text in ((4, "UNREACHABLE stars"), (3, ""), (0, "unexpected")):
