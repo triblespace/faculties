@@ -13,9 +13,9 @@ use super::Faculty;
 use crate::storage::Storage;
 use crate::{
     archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord, duplex,
-    files, gauge, habits, headspace, hear, imagine, linkedin, mail, memory, message, orient,
-    patience, planner, posture, quota, reason, relations, secrets, teams, triage, viewer,
-    voice, web, wiki, world,
+    files, gauge, habits, headspace, hear, home, imagine, linkedin, mail, memory, message, orient,
+    patience, planner, posture, quota, reason, relations, secrets, teams, triage, viewer, voice,
+    web, wiki, world,
 };
 
 /// Trusted launcher configuration, never supplied as MCP tool arguments.
@@ -112,6 +112,7 @@ impl Catalog {
             Box::new(habits::mcp::Habits::with_storage(storage.clone())),
             Box::new(headspace::mcp::Headspace::with_storage(storage.clone())),
             Box::new(hear::mcp::Hear::new(hear_config)),
+            Box::new(home::mcp::Home::with_storage(storage.clone())),
             Box::new(imagine::mcp::Imagine::with_storage(storage.clone())),
             Box::new(linkedin),
             Box::new(mail::mcp::Mail::with_storage(storage.clone())),
@@ -133,7 +134,11 @@ impl Catalog {
             Box::new(wiki::mcp::Wiki::with_storage(storage.clone())),
             Box::new(world::mcp::WorldTools::new(world_url, world_session)),
         ];
-        Self { faculties, storage, orient }
+        Self {
+            faculties,
+            storage,
+            orient,
+        }
     }
 
     /// Flush and close the application-owned store after transport shutdown.
@@ -151,7 +156,10 @@ impl Catalog {
     /// No second registration table or transport initialization is needed.
     pub fn tools(&self) -> impl Iterator<Item = (&super::Tool, &str)> {
         self.faculties.iter().flat_map(|faculty| {
-            faculty.tools().iter().map(move |tool| (tool, faculty.input_schema(tool)))
+            faculty
+                .tools()
+                .iter()
+                .map(move |tool| (tool, faculty.input_schema(tool)))
         })
     }
 
@@ -168,10 +176,18 @@ impl Catalog {
             bail!("native orient_next requires prepare_next and acknowledgment after publication");
         }
         super::native_argument_budget(&arguments, limits)?;
-        let faculty = self.faculties.iter()
+        let faculty = self
+            .faculties
+            .iter()
             .find(|faculty| faculty.tools().iter().any(|tool| tool.name == name))
             .ok_or_else(|| anyhow::anyhow!("unknown registered faculty tool {name:?}"))?;
-        super::invoke_native(faculty.as_ref(), name, arguments, limits.response_bytes, cancelled)
+        super::invoke_native(
+            faculty.as_ref(),
+            name,
+            arguments,
+            limits.response_bytes,
+            cancelled,
+        )
     }
 
     /// The registered Orient adapter, with deferred native acceptance. Its

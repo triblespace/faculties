@@ -239,6 +239,7 @@ rrule = "0.14"              # planner
 chrono-tz = "0.10"          # quota (Europe/Berlin reset times; already in the graph via rrule)
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
 serde_json = "1"            # discord, teams, triage, web
+simple-dns = "0.11.3"       # home (mDNS bridge discovery); already locked through iroh-dns
 toml = "0.8"                # self.toml, the one external plaintext configuration
 tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive

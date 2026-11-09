@@ -16,6 +16,7 @@ pub mod embeddings;
 pub mod files;
 pub mod habit;
 pub mod headspace;
+pub mod home;
 pub mod linkedin;
 pub mod mail;
 pub mod memory;

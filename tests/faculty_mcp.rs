@@ -315,6 +315,9 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "habit_list",
         "headspace_list",
         "hear_once",
+        "home_rooms",
+        "home_on",
+        "home_scene",
         "imagine_generate",
         "linkedin_import",
         "mail_list",
@@ -340,7 +343,10 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         assert!(names.contains(name), "missing native tool {name}");
     }
     for removed in ["status_set", "status_list", "status_show"] {
-        assert!(!names.contains(removed), "retired tool {removed} is still registered");
+        assert!(
+            !names.contains(removed),
+            "retired tool {removed} is still registered"
+        );
     }
     for tool in tools {
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();

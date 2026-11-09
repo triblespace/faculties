@@ -409,6 +409,7 @@ fn aggregate_native_primary_and_auxiliary_openers_fail_closed_without_routes() {
         ("gauge_health", "{}"),
         ("habit_list", "{}"),
         ("headspace_list", "{}"),
+        ("home_rooms", "{}"),
         ("linkedin_review", "{}"),
         ("mail_account_list", "{}"),
         ("memory_list", "{}"),

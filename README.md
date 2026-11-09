@@ -710,6 +710,7 @@ schemas describe exact arguments and effects.
 | `habit` | Standing intentions, activation and explicitly evaluated predicates |
 | `headspace` | Fork-visible model/profile configuration and credential references |
 | `hear` | Resident-clip hearing/embeddings; separate continuous listener |
+| `home` | Hue lights, live from the bridge: rooms, lights, scenes, on/off/dim, with each change recorded |
 | `imagine` | Local image generation and optional memory publication |
 | `linkedin` | Conservative connection imports and Relations identity review |
 | `mail` | Account state, POP evidence, drafts, authorization and delivery receipts |

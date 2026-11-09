@@ -70,6 +70,7 @@ pub mod gauge;
 pub mod habits;
 pub mod headspace;
 pub mod hear;
+pub mod home;
 pub mod imagine;
 pub mod linkedin;
 pub mod mail;
