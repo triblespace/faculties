@@ -1,4 +1,3 @@
-use base64::Engine as _;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::secrets::{self, Secrets};
@@ -59,10 +58,18 @@ fn explicit_exports_preserve_binary_plaintext_and_ignore_drive_on_cli() {
     let plaintext = b"raw\0\xff\r\n";
     let operations = Secrets::new(pile.clone(), Some(key.clone()));
     let adapter = secrets::mcp::Secrets::new(pile.clone(), Some(key.clone()));
+    // A path is read straight into encryption; nothing reaches Files.
+    let host = _directory.path().join("binary.secret");
+    std::fs::write(&host, plaintext).unwrap();
     call(
         &adapter,
         "secrets_add",
-        json!({"name":"binary", "data_base64":base64::engine::general_purpose::STANDARD.encode(plaintext)}),
+        json!({"name":"binary", "path":host}),
+    );
+    assert!(
+        faculties::files::Files::new(pile.clone(), Some(key.clone()))
+            .list(&[], None)
+            .map_or(true, |listing| !listing.contains("binary"))
     );
     let id = operations.list().unwrap()[0].id;
     let parts = call(&adapter, "secrets_get", json!({"secret":format!("{id:x}")}));
@@ -105,9 +112,11 @@ fn malformed_requests_do_not_open_or_initialize_storage() {
         ("secrets_add", r#"{"name":"x"}"#),
         (
             "secrets_add",
-            r#"{"name":"x","value":"a","data_base64":"Yg=="}"#,
+            r#"{"name":"x","value":"a","path":"/no/such"}"#,
         ),
-        ("secrets_add", r#"{"name":"x","data_base64":"???"}"#),
+        ("secrets_add", r#"{"name":"x","data_base64":"Yg=="}"#),
+        ("secrets_add", r#"{"name":"x","path":"relative.secret"}"#),
+        ("secrets_add", r#"{"name":"x","path":"/no/such/secret"}"#),
         ("secrets_add", r#"{"name":"x","value":"a","value":"b"}"#),
         ("secrets_get", r#"{"secret":"not-a-version"}"#),
         (

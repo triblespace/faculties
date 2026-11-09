@@ -348,14 +348,46 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
             "retired tool {removed} is still registered"
         );
     }
+    // Byte inputs name a file on the server's host instead of carrying it.
+    // Only these tools take a path, and each says whose host it is on.
+    let byte_inputs = [
+        "archive_import",
+        "body_capture",
+        "files_add",
+        "hear_once",
+        "memory_image",
+        "secrets_add",
+    ];
     for tool in tools {
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
         assert_eq!(tool["inputSchema"]["additionalProperties"], false);
-        for ambient in ["pile", "key", "path", "dir", "scope", "branch"] {
+        for ambient in ["pile", "key", "dir", "scope", "branch"] {
             assert!(
                 !properties.contains_key(ambient),
                 "{} exposes {ambient}",
                 tool["name"]
+            );
+        }
+        let name = tool["name"].as_str().unwrap();
+        match properties.get("path") {
+            Some(path) => {
+                assert!(byte_inputs.contains(&name), "{name} exposes path");
+                let described = path["description"].as_str().unwrap_or_default();
+                assert!(
+                    described.contains("MCP server's host"),
+                    "{name}: {described}"
+                );
+            }
+            None => assert!(!byte_inputs.contains(&name), "{name} lost its path"),
+        }
+        let retired = ["data_base64", "script_base64"];
+        for field in retired
+            .iter()
+            .chain(byte_inputs.contains(&name).then_some(&"data"))
+        {
+            assert!(
+                !properties.contains_key(*field),
+                "{name} still takes raw base64 {field}"
             );
         }
     }

@@ -4,13 +4,41 @@ use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
-use base64::Engine as _;
 use faculties_secrets::encrypted::Encrypted;
 use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use serde::Deserialize;
 use std::path::PathBuf;
 use triblespace::prelude::{blobencodings, inlineencodings, Blob, Id, Inline, IntoBlob};
 use zeroize::Zeroizing;
+
+/// The largest secret file `secrets_add` reads through `path`.
+const MAX_SECRET_FILE_BYTES: u64 = 16 << 20;
+
+/// Read a host file straight into a zeroizing buffer sized from its
+/// metadata, so the plaintext is not left behind in a reallocated copy.
+fn read_secret_file(path: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read as _;
+    let path = crate::mcp::input::absolute(path)?;
+    let file = crate::mcp::input::open_regular(path)?;
+    let too_large = || {
+        invalid_arguments(format!(
+            "{} is larger than the {MAX_SECRET_FILE_BYTES}-byte secret limit",
+            path.display()
+        ))
+    };
+    let len = file.metadata()?.len();
+    if len > MAX_SECRET_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut plaintext = Zeroizing::new(Vec::with_capacity(len as usize + 1));
+    file.take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_end(&mut plaintext)
+        .map_err(|error| invalid_arguments(format!("read {}: {error}", path.display())))?;
+    if plaintext.len() as u64 > MAX_SECRET_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(plaintext)
+}
 
 const EMPTY: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
 const TOOLS: &[Tool] = &[
@@ -19,7 +47,7 @@ const TOOLS: &[Tool] = &[
     Tool {name:"secrets_items", description:"List structured encrypted item version IDs and explicit public labels only. Never decrypts values, private labels or filenames.", input_schema:EMPTY},
     Tool {name:"secrets_item_open", description:"Explicitly open a structured item. Without body, disclose body alternatives (advertised ciphertext metadata without unlocking for user-protected versions; decryptable alternatives for ordinary versions). With exact body, export that private native SimpleArchive as a binary resource; its child values remain encrypted handles. User-protected opening requires one local Erlkonig unlock; never supply a password in arguments. Does not read server files.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"}},"required":["secret"],"additionalProperties":false}"#},
     Tool {name:"secrets_item_export", description:"Explicitly decrypt one selected item child as a binary resource. Requires exact version, body and child ciphertext handles and encoding text or bytes. Reveals plaintext to the caller, not perception. No server files or stdin.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"},"child":{"type":"string"},"encoding":{"type":"string","enum":["text","bytes"]}},"required":["secret","body","child","encoding"],"additionalProperties":false}"#},
-    Tool {name:"secrets_add", description:"Encrypt one immutable version from literal value text or base64 bytes. Supply exactly one. Returns its ID, never echoes plaintext, and never reads a server file or stdin. Repeating an add creates a new version.", input_schema:r#"{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"data_base64":{"type":"string"}},"required":["name"],"oneOf":[{"required":["value"]},{"required":["data_base64"]}],"additionalProperties":false}"#},
+    Tool {name:"secrets_add", description:"Encrypt one immutable version from literal value text or the bytes of a file at an absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none straight into encryption (never through Files). Supply exactly one. Returns its ID, never echoes plaintext, and never reads stdin. Repeating an add creates a new version.", input_schema:r#"{"type":"object","properties":{"name":{"type":"string"},"value":{"type":"string"},"path":{"type":"string","description":"Absolute path of a regular file of at most 16 MiB on the MCP server's host."}},"required":["name"],"oneOf":[{"required":["value"]},{"required":["path"]}],"additionalProperties":false}"#},
     Tool {name:"secrets_get", description:"Explicitly decrypt one exact immutable version and return its original plaintext bytes as an embedded binary resource. This reveals the selected secret to the caller; it is not a metadata query or image/audio perception. A user-protected version requires one local Erlkonig unlock; never supply a password in arguments, and do not automatically retry a denied or expired request.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string","description":"Exact nonzero 32-digit version ID"}},"required":["secret"],"additionalProperties":false}"#},
     Tool {name:"secrets_list", description:"List immutable secret version IDs and names in the configured collection. Does not decrypt secret values.", input_schema:EMPTY},
     Tool {name:"secrets_grant", description:"Grant future DEK delivery for one exact secret or resource. Does not grant collection READ/WRITE or reveal plaintext. Optional delivery deadlines do not expire already-delivered envelopes; delegate permits onward grants.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"resource":{"type":"string"},"recipient":{"type":"string"},"not_before":{"type":"string","format":"date-time"},"expires_at":{"type":"string","format":"date-time"},"delegate":{"type":"boolean","default":false}},"required":["recipient"],"oneOf":[{"required":["secret"]},{"required":["resource"]}],"additionalProperties":false}"#},
@@ -30,7 +58,7 @@ const TOOLS: &[Tool] = &[
 struct Add {
     name: String,
     value: Option<String>,
-    data_base64: Option<String>,
+    path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,21 +263,10 @@ impl Faculty for Secrets {
             }
             "secrets_add" => {
                 let args: Add = decode_arguments(arguments)?;
-                let plaintext = match (args.value, args.data_base64) {
+                let plaintext = match (args.value, args.path) {
                     (Some(value), None) => Zeroizing::new(value.into_bytes()),
-                    (None, Some(encoded)) => {
-                        let encoded = Zeroizing::new(encoded);
-                        Zeroizing::new(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(encoded.as_bytes())
-                                .map_err(|_| invalid_arguments("invalid data_base64"))?,
-                        )
-                    }
-                    _ => {
-                        return Err(invalid_arguments(
-                            "supply exactly one of value or data_base64",
-                        ))
-                    }
+                    (None, Some(path)) => read_secret_file(&path)?,
+                    _ => return Err(invalid_arguments("supply exactly one of value or path")),
                 };
                 let id = self.operations.add(&args.name, &plaintext)?;
                 out.line(format!("secret {id:x}  {}", args.name))
