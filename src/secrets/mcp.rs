@@ -14,10 +14,11 @@ use zeroize::Zeroizing;
 /// The largest secret file `secrets_add` reads through `path`.
 const MAX_SECRET_FILE_BYTES: u64 = 16 << 20;
 
-/// Read a host file straight into a zeroizing buffer sized from its
-/// metadata, so the plaintext is not left behind in a reallocated copy.
+/// Read a host file straight into one zeroizing buffer allocated at the
+/// full limit up front. The read fills that buffer in place, so it is never
+/// reallocated and no partial copy of the plaintext is freed unwiped, even
+/// when the file grows between its stat and its read.
 fn read_secret_file(path: &str) -> Result<Zeroizing<Vec<u8>>> {
-    use std::io::Read as _;
     let path = crate::mcp::input::absolute(path)?;
     let file = crate::mcp::input::open_regular(path)?;
     let too_large = || {
@@ -26,18 +27,38 @@ fn read_secret_file(path: &str) -> Result<Zeroizing<Vec<u8>>> {
             path.display()
         ))
     };
-    let len = file.metadata()?.len();
-    if len > MAX_SECRET_FILE_BYTES {
+    // A quick refusal only; the bound that holds is the read's own.
+    if file.metadata()?.len() > MAX_SECRET_FILE_BYTES {
         return Err(too_large());
     }
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(len as usize + 1));
-    file.take(MAX_SECRET_FILE_BYTES + 1)
-        .read_to_end(&mut plaintext)
-        .map_err(|error| invalid_arguments(format!("read {}: {error}", path.display())))?;
-    if plaintext.len() as u64 > MAX_SECRET_FILE_BYTES {
-        return Err(too_large());
+    read_capped(file, MAX_SECRET_FILE_BYTES as usize)
+        .map_err(|error| invalid_arguments(format!("read {}: {error}", path.display())))?
+        .ok_or_else(too_large)
+}
+
+/// Read `reader` to its end into a zeroizing buffer of exactly `cap + 1`
+/// bytes, allocated once and filled in place; `None` (the buffer wiped)
+/// when the reader holds more than `cap` bytes.
+fn read_capped(
+    mut reader: impl std::io::Read,
+    cap: usize,
+) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
+    let mut buffer = Zeroizing::new(vec![0_u8; cap + 1]);
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
     }
-    Ok(plaintext)
+    if filled > cap {
+        return Ok(None);
+    }
+    // Truncation keeps the allocation, which Zeroizing wipes whole on drop.
+    buffer.truncate(filled);
+    Ok(Some(buffer))
 }
 
 const EMPTY: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
@@ -619,5 +640,55 @@ mod tests {
             "body":body,"child":hex::encode(child.raw),"encoding":"bytes"})
         )
         .is_err());
+    }
+
+    /// A reader that keeps producing in small pieces, as a file growing
+    /// after its stat would.
+    struct Trickle {
+        left: usize,
+    }
+    impl std::io::Read for Trickle {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let n = buffer.len().min(self.left).min(7);
+            buffer[..n].fill(0xA5);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_secret_read_fills_one_allocation_and_refuses_past_the_cap() {
+        let read = read_capped(Trickle { left: 100 }, 100).unwrap().unwrap();
+        assert_eq!(read.as_slice(), [0xA5; 100].as_slice());
+        // The one up-front allocation came back: nothing was reallocated.
+        assert_eq!(read.capacity(), 101);
+        let read = read_capped(Trickle { left: 3 }, 100).unwrap().unwrap();
+        assert_eq!((read.len(), read.capacity()), (3, 101));
+        // A reader that keeps growing past the cap is refused, not followed.
+        assert!(read_capped(Trickle { left: 101 }, 100).unwrap().is_none());
+        assert!(read_capped(Trickle { left: usize::MAX }, 100)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            read_capped(std::io::empty(), 100).unwrap().unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_secret_file_is_read_whole_within_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("secret.bin");
+        std::fs::write(&file, [0_u8, 1, 2, 255]).unwrap();
+        let read = read_secret_file(file.to_str().unwrap()).unwrap();
+        assert_eq!(read.as_slice(), [0_u8, 1, 2, 255].as_slice());
+        assert_eq!(read.capacity(), MAX_SECRET_FILE_BYTES as usize + 1);
+        let large = directory.path().join("large.bin");
+        std::fs::File::create(&large)
+            .unwrap()
+            .set_len(MAX_SECRET_FILE_BYTES + 1)
+            .unwrap();
+        let error = read_secret_file(large.to_str().unwrap()).unwrap_err();
+        assert!(format!("{error}").contains("secret limit"), "{error}");
     }
 }
