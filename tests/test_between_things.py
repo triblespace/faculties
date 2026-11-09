@@ -26,11 +26,12 @@ class PredicateTests(unittest.TestCase):
         self.cache = self.root / "colony-coverage" / "tester.json"
         self.pile = str(self.root / "self.pile")
         self.person = f"person: {PERSON}\nlabel: tester\n"
-        self.listing = "No goals yet.\n"
-        self.show = f"Goal {GOAL}\nTitle: goal\n"
+        self.activity = "false\n"
+        self.commands = []
         self.failure = None
 
     def command(self, argv, **kwargs):
+        self.commands.append(argv)
         self.assertEqual(os.environ["PILE"], self.pile)
         if self.failure:
             raise self.failure
@@ -38,7 +39,11 @@ class PredicateTests(unittest.TestCase):
         if Path(argv[0]).name == "relations":
             self.assertEqual(argv[1:], ["show", "tester"])
             return subprocess.CompletedProcess(argv, 0, self.person, "")
-        return subprocess.CompletedProcess(argv, 0, self.listing if argv[1] == "list" else self.show, "")
+        self.assertEqual(Path(argv[0]).name, "compass")
+        self.assertEqual(argv[1:4], ["has-activity", "--actor", PERSON])
+        self.assertEqual(argv[4], "--since")
+        self.assertEqual(argv[6:], ["--status", "doing", "--status", "blocked"])
+        return subprocess.CompletedProcess(argv, 0, self.activity, "")
 
     def invoke(self, refresh=True, command=None, replace=None, lock=False, mask=None, extra=(), persona="tester"):
         out, err = io.StringIO(), io.StringIO()
@@ -141,10 +146,9 @@ class PredicateTests(unittest.TestCase):
 
     def test_later_whole_alarm_identifies_active_call_and_elapsed_time(self):
         clock = [100.0]
-        self.listing = f"== DOING (1) ==\n- [{GOAL}] goal\n"
         def waiting(argv, **kwargs):
             self.assertEqual(kwargs["timeout"], 120)
-            if argv[1:] == ["show", GOAL]:
+            if argv[1] == "has-activity":
                 clock[0] = 580.0
                 signal.signal.call_args_list[0].args[1]()
             clock[0] += 3
@@ -153,10 +157,10 @@ class PredicateTests(unittest.TestCase):
             self.assertEqual(self.invoke(command=waiting)[0], 2)
         cached = self.stored()
         why = cached["why"]
-        self.assertIn(f"phase=wait call=3 [compass show {GOAL}]", why)
+        self.assertIn("phase=wait call=2 [compass has-activity <actor> <since> doing blocked]", why)
         self.assertEqual(cached["diagnostic"], {
             "refresh_start": 1000, "refresh_end": 1000, "refresh_elapsed": 480,
-            "phase": "wait", "call": {"index": 3, "command": f"compass show {GOAL}", "elapsed": 474}})
+            "phase": "wait", "call": {"index": 2, "command": "compass has-activity <actor> <since> doing blocked", "elapsed": 477}})
         self.assertEqual((cached["at"], cached["until"], cached["context"]["version"]), (1000, 1600, 3))
         with patch("time.time", return_value=1100):
             code, _, error, spawns = self.invoke(False)
@@ -166,13 +170,13 @@ class PredicateTests(unittest.TestCase):
         clock = [100.0]
         def failed(argv, **kwargs):
             clock[0] += 7
-            if argv[1] == "list":
+            if argv[1] == "has-activity":
                 return subprocess.CompletedProcess(argv, 2, "private-goal-body", "collection unavailable")
             return self.command(argv, **kwargs)
         with patch("time.monotonic", side_effect=lambda: clock[0]):
             self.assertEqual(self.invoke(command=failed)[0], 2)
         why = self.stored()["why"]
-        self.assertIn("phase=read-result call=2 [compass list doing blocked]", why)
+        self.assertIn("phase=read-result call=2 [compass has-activity <actor> <since> doing blocked]", why)
         self.assertEqual(self.stored()["diagnostic"]["call"]["elapsed"], 7)
         self.assertEqual(self.stored()["diagnostic"]["refresh_elapsed"], 14)
         self.assertIn("stderr=collection unavailable", why)
@@ -241,21 +245,52 @@ class PredicateTests(unittest.TestCase):
                 self.person = output
                 self.assertEqual(self.invoke()[0], 2)
         self.person = f"person: {PERSON}\nlabel: tester\n"
-        self.listing = "new or truncated board format"
-        self.assertEqual(self.invoke()[0], 2)
-        self.listing = f"== DOING (1) ==\n- [{GOAL}] goal\n"
-        self.show = "unrecognized goal"
-        self.assertEqual(self.invoke()[0], 2)
+        for output in ("", "new format", "{}", "[]", "null", "1", '"true"', "true false"):
+            with self.subTest(output=output):
+                self.activity = output
+                self.assertEqual(self.invoke()[0], 2)
 
-    def test_nested_goal_activity_still_covers(self):
-        self.listing = f"== DOING (1) ==\n  - [{GOAL}] goal\n"
-        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-        self.show += f"Status history:\n- {stamp} TAI doing by {PERSON}\n"
+    def test_native_activity_covers_without_rendering_goal_history(self):
+        self.activity = "true\n"
         self.assertEqual(self.invoke()[0], 1)
         cached = self.stored()
         self.assertEqual(set(cached), {"result", "why", "at", "until", "context"})
         self.assertNotIn("refresh_elapsed", cached["why"])
         self.assertEqual(self.invoke(False)[0], 1)
+
+    def test_one_native_query_independent_of_history_size(self):
+        # The process boundary carries a boolean, never a board/history whose
+        # size or nesting could cause additional child calls.
+        for result, code in (("true", 1), ("false", 0)):
+            with self.subTest(result=result):
+                self.commands.clear()
+                self.activity = result
+                self.assertEqual(self.invoke(persona=PERSON)[0], code)
+                self.assertEqual(len(self.commands), 1)
+                self.assertEqual(self.commands[0][1], "has-activity")
+
+    def test_native_cutoff_preserves_whole_tai_calendar_second_boundary(self):
+        for now, expected in ((4000.0, "1970-01-01T00:21:40 TAI"),
+                              (4000.25, "1970-01-01T00:21:41 TAI")):
+            with self.subTest(now=now), patch("time.time", return_value=now):
+                self.commands.clear()
+                self.assertEqual(self.invoke(persona=PERSON)[0], 0)
+                self.assertEqual(self.commands[0][5], expected)
+
+    def test_changing_native_cutoff_does_not_change_failure_identity(self):
+        self.cache = self.cache.with_name(PERSON + ".json")
+        errors = []
+        cutoffs = []
+        def failed(argv, **kwargs):
+            cutoffs.append(argv[5])
+            return subprocess.CompletedProcess(argv, 2, "private-body", "collection unavailable")
+        for now in (4000.0, 5000.0):
+            with patch("time.time", return_value=now):
+                self.assertEqual(self.invoke(command=failed, persona=PERSON)[0], 2)
+                errors.append(self.stored()["why"])
+        self.assertNotEqual(*cutoffs)
+        self.assertEqual(*errors)
+        self.assertNotIn("private-body", errors[0])
 
     def test_current_cache_grace_and_expiry_are_unchanged(self):
         self.assertEqual(self.invoke()[0], 0)

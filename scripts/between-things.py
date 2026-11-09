@@ -23,7 +23,7 @@
 # blocks that signal so a timeout cannot misreport what was published.
 # Operator notification pause remains the owner/callback's boundary. This
 # predicate does not interpret authored status prose as a pause or liveness fact.
-import calendar, fcntl, json, os, re, shutil, signal, subprocess, sys, time
+import fcntl, json, math, os, re, shutil, signal, subprocess, sys, time
 
 def arg(name, default):
     if name in sys.argv:
@@ -158,17 +158,14 @@ def diagnostic(error):
 
 def run(*argv):
     exe = shutil.which(argv[0]) or os.path.expanduser("~/.local/bin/" + argv[0])
-    label = "relations show <persona>" if argv[0] == "relations" else " ".join(argv)
+    # A moving cutoff is call input, never attention identity.
+    label = ("relations show <persona>" if argv[0] == "relations" else
+             "compass has-activity <actor> <since> doing blocked" if argv[:2] == ("compass", "has-activity") else
+             " ".join(argv))
     out = observed_call(label, [exe, *argv[1:]], 120, stdin=subprocess.DEVNULL)
     if out.returncode != 0:
         raise RuntimeError("%s exited %d" % (label, out.returncode))
     return out.stdout
-
-STAMP = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)? TAI")
-
-def utc_age(stamp):
-    # TAI runs 37 s ahead of UTC; irrelevant at minute granularity.
-    return now - calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%S"))
 
 def decide():
     # Exact anchors need no authored status or profile lookup. Labels/aliases
@@ -194,32 +191,17 @@ def decide():
                     raise ValueError("reservation check %s: unrecognized result" % box)
                 if re.search(r"tag=%s" % re.escape(lock_tag), held):
                     return False, "covered: holds the %s reservation" % box
-    listing = run("compass", "list", "doing", "blocked")
-    ids = re.findall(r"^\s*- \[([0-9a-f]{32})\]", listing, re.M)
-    counts = re.findall(r"^== (?:DOING|BLOCKED) \((\d+)\) ==$", listing, re.M)
-    if listing.strip() != "No goals yet." and (not counts or sum(map(int, counts)) != len(ids)):
-        raise ValueError("compass list: unrecognized or incomplete board")
-    newest = None
-    for gid in ids:
-        show = run("compass", "show", gid)
-        if not show.startswith("Goal %s\n" % gid):
-            raise ValueError("compass show %s: missing goal header" % gid)
-        for line in show.splitlines():
-            if ("by " + me) not in line:
-                continue
-            s = STAMP.search(line)
-            if not s and line.startswith("- "):
-                raise ValueError("compass show %s: unrecognized activity timestamp" % gid)
-            if s:
-                a = utc_age(s.group(1))
-                if a <= fresh:
-                    return False, "covered: own activity on doing/blocked goal %s %d min ago" % (gid[:8], a // 60)
-                if newest is None or a < newest[0]:
-                    newest = (a, gid[:8])
-    if newest and newest[0] <= fresh:
-        return False, "covered: own activity on doing/blocked goal %s %d min ago" % (newest[1], newest[0] // 60)
-    since = "never" if newest is None else "%d min ago (goal %s)" % (newest[0] // 60, newest[1])
-    return True, "between things: no own move or note on a doing/blocked goal within %d min (last %s), no reservation" % (fresh // 60, since)
+    # Preserve the previous predicate's boundary: it read whole TAI calendar
+    # seconds as Unix/UTC seconds, discarding fractional seconds. A whole-second
+    # TAI cutoff at ceil(now-fresh) is equivalent; this is not a leap-second fix.
+    since = time.strftime("%Y-%m-%dT%H:%M:%S TAI", time.gmtime(math.ceil(now - fresh)))
+    result = json.loads(run("compass", "has-activity", "--actor", me,
+                            "--since", since, "--status", "doing", "--status", "blocked"))
+    if type(result) is not bool:
+        raise ValueError("compass has-activity: expected a JSON boolean")
+    if result:
+        return False, "covered: own activity on a doing/blocked goal within %d min" % (fresh // 60)
+    return True, "between things: no own move or note on a doing/blocked goal within %d min, no reservation" % (fresh // 60)
 
 try:
     held = try_lock(cache + ".lock")

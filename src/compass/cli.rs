@@ -2,8 +2,10 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use hifitime::Epoch;
+use triblespace::prelude::Id;
 
 use super::{render, AddOptions, Compass, ListOptions, NoteOptions};
 use crate::out::Out;
@@ -75,6 +77,21 @@ enum Command {
         #[arg(long)]
         tag: Vec<String>,
         #[arg(value_name = "STATUS")]
+        status: Vec<String>,
+    },
+    /// Print a JSON boolean: attributed move/note since a cutoff on a goal
+    /// with a selected explicit current status. Missing status does not match.
+    /// Does not fetch titles or note bodies.
+    HasActivity {
+        /// Exact nonzero 32-hex actor id (no Relations lookup)
+        #[arg(long)]
+        actor: String,
+        /// Inclusive activity lower bound, with an explicit time scale, e.g.
+        /// "2026-11-09T12:00:00 TAI"
+        #[arg(long)]
+        since: Epoch,
+        /// Current goal status to include (repeatable)
+        #[arg(long, required = true)]
         status: Vec<String>,
     },
     /// Show priority layers and explicit/child-before-parent relations
@@ -183,6 +200,16 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             })?,
             output,
         ),
+        Command::HasActivity {
+            actor,
+            since,
+            status,
+        } => {
+            let actor = Id::from_hex(&actor).context("actor must be an exact nonzero 32-hex id")?;
+            output.line(serde_json::to_string(
+                &compass.has_activity(actor, since, &status)?,
+            )?)
+        }
         Command::Priorities { status, tag, all } => render::board(
             &compass.priorities(ListOptions {
                 statuses: &status,

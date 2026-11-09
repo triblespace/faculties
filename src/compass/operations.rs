@@ -24,6 +24,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
 use triblespace::core::metadata;
+use triblespace::core::query::rangeconstraint::value_range;
 #[cfg(test)]
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::*;
@@ -165,6 +166,67 @@ impl Compass {
             options.tags.to_vec(),
             options.all,
         )
+    }
+
+    /// Whether an actor has a status event or note at/after `since` on a goal
+    /// with an explicit maintained current status in `statuses`. A missing
+    /// status does not match, including `todo`. Intervals use their lower bound;
+    /// future activity also qualifies. No title, note body or status text is fetched.
+    /// Repeated authors are membership, not a single selected author.
+    pub fn has_activity(&self, actor: Id, since: Epoch, statuses: &[String]) -> Result<bool> {
+        if statuses.is_empty() {
+            bail!("at least one current status is required");
+        }
+        let statuses: HashSet<TextHandle> = statuses
+            .iter()
+            .map(|status| {
+                let status = normalize_status(status.clone());
+                validate_label("status", &status)?;
+                Ok(crate::schemas::compass::text_handle(&status))
+            })
+            .collect::<Result<_>>()?;
+        let min = clock::point(since)?;
+        // Inclusive lower-bound range. The all-max sentinel includes every
+        // upper bound; typed interval decoding below skips inverted intervals.
+        let max = IntervalValue::new([255; 32]);
+        self.storage().with_view(|space, _reader, status_register| {
+            Ok(find!(
+                (goal: Id, at: (Epoch, Epoch)),
+                temp!((event, payload, current, current_status), and!(
+                    pattern!(space, [
+                        { ?goal @ metadata::tag: &KIND_GOAL_ID },
+                        { ?event @ board::by: &actor, metadata::created_at: ?at },
+                        { ?current @
+                            metadata::tag: &KIND_STATUS_ID,
+                            board::status_of: ?goal,
+                            board::status: ?current_status,
+                            metadata::created_at: _?current_at,
+                        },
+                    ]),
+                    or!(
+                        pattern!(space, [{ ?event @
+                            metadata::tag: &KIND_STATUS_ID,
+                            board::status_of: ?goal,
+                            board::status: ?payload,
+                        }]),
+                        pattern!(space, [{ ?event @
+                            metadata::tag: &KIND_NOTE_ID,
+                            board::task: ?goal,
+                            board::note: ?payload,
+                        }]),
+                    ),
+                    status_register.has(current),
+                    statuses.has(current_status),
+                    value_range(at, min, max),
+                ))
+            )
+            .any(|(goal, _)| {
+                // The joined winner can carry several words/times. Preserve
+                // the board's canonical reading rather than accepting any word.
+                latest_status_event(space, status_register, goal)
+                    .is_some_and(|(_, status, _)| statuses.contains(&status))
+            }))
+        })
     }
 
     /// Show priority layers and direct relations across status columns.
@@ -2294,6 +2356,313 @@ mod tests {
         let (goal, id) = compass::goal_fragment(title, vec![], None, point(seconds)).unwrap();
         *fragment += goal;
         id
+    }
+
+    #[test]
+    fn has_activity_joins_actor_current_status_and_exact_cutoff() {
+        let actor = genid().id;
+        let other = genid().id;
+        let absent = genid().id;
+        let mut fragment = Fragment::empty();
+        let doing = plain_goal(&mut fragment, "doing", 1.0);
+        let done = plain_goal(&mut fragment, "done", 1.0);
+        let blocked = plain_goal(&mut fragment, "blocked", 1.0);
+        for (goal, status) in [(doing, "doing"), (done, "done"), (blocked, "blocked")] {
+            fragment += compass::status_fragment(goal, status, None, point(2.0)).unwrap();
+        }
+        fragment += compass::status_fragment(doing, "doing", Some(actor), point(50.0)).unwrap();
+        for (goal, by, at) in [
+            (doing, Some(actor), 100.25),
+            (doing, None, 400.0),
+            (done, Some(actor), 200.0),
+            (blocked, Some(other), 300.0),
+        ] {
+            fragment += compass::note_fragment(goal, "body", vec![], vec![], vec![], by, point(at))
+                .unwrap()
+                .0;
+        }
+        // Many recent self-authored events on a now-done goal stay excluded.
+        for second in 1_000..1_256 {
+            fragment += compass::note_fragment(
+                done,
+                "done history",
+                vec![],
+                vec![],
+                vec![],
+                Some(actor),
+                point(second as f64),
+            )
+            .unwrap()
+            .0;
+        }
+        let missing_status = plain_goal(&mut fragment, "no status", 1.0);
+        fragment += compass::note_fragment(
+            missing_status,
+            "no current status",
+            vec![],
+            vec![],
+            vec![],
+            Some(actor),
+            point(600.0),
+        )
+        .unwrap()
+        .0;
+        let mover = genid().id;
+        fragment +=
+            compass::status_fragment(blocked, "blocked", Some(mover), point(310.0)).unwrap();
+        // Tags and priority events do not become attributed notes or moves.
+        fragment += entity! { ExclusiveId::force_ref(&blocked) @
+            board::tag: format!("{actor:x}"),
+        };
+        fragment += entity! {
+            metadata::tag: &crate::schemas::compass::KIND_PRIORITY_ID,
+            board::task: &doing,
+            board::by: &actor,
+            metadata::created_at: point(500.0),
+        };
+        let (_directory, storage) = raw_pile(fragment);
+        let compass = Compass::with_storage(storage);
+        let active = vec!["doing".to_owned(), "blocked".to_owned()];
+        let at = |seconds| Epoch::from_unix_seconds(seconds);
+        assert!(compass.has_activity(actor, at(100.25), &active).unwrap());
+        assert!(!compass
+            .has_activity(actor, at(100.250001), &active)
+            .unwrap());
+        assert!(!compass.has_activity(absent, at(0.0), &active).unwrap());
+        assert!(compass.has_activity(other, at(300.0), &active).unwrap());
+        assert!(compass.has_activity(mover, at(310.0), &active).unwrap());
+        assert!(!compass
+            .has_activity(mover, at(310.000001), &active)
+            .unwrap());
+        assert!(!compass
+            .has_activity(actor, at(0.0), &["todo".into()])
+            .unwrap());
+        assert!(compass
+            .has_activity(actor, at(200.0), &["done".into()])
+            .unwrap());
+        assert!(compass
+            .has_activity(actor, at(50.0), &[" DOING ".into()])
+            .unwrap());
+        assert!(compass.has_activity(actor, at(0.0), &[]).is_err());
+    }
+
+    #[test]
+    fn has_activity_reads_all_authors_without_text_payloads() {
+        let mut authors = [genid().id, genid().id];
+        authors.sort();
+        let goal = genid().id;
+        let note = genid().id;
+        let parent = genid().id;
+        let mut fragment = entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+            board::parent: &parent,
+        };
+        fragment += compass::status_fragment(goal, "blocked", None, point(1.0)).unwrap();
+        fragment += entity! { ExclusiveId::force_ref(&note) @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note*: ["first body", "second body"],
+            board::by*: authors.iter(),
+            metadata::created_at*: [point(2.0), point(3.0)],
+            metadata::name: "unmodeled annotation",
+        };
+        // Keep only facts: status words, note bodies and annotations are absent.
+        // The query needs their handles, never their payloads or a goal title.
+        fragment.blobs_mut().keep([]);
+        let (directory, storage) = raw_pile(fragment);
+        let compass = Compass::with_storage(storage);
+        for actor in authors {
+            assert!(compass
+                .has_activity(actor, Epoch::from_unix_seconds(3.0), &["blocked".into()],)
+                .unwrap());
+        }
+        // The thin CLI delivers an actual JSON boolean with no prose wrapper.
+        use clap::Parser;
+        let cli = crate::compass::cli::Cli::try_parse_from([
+            "compass".to_owned(),
+            "--pile".into(),
+            directory
+                .path()
+                .join("open-compass.pile")
+                .display()
+                .to_string(),
+            "--key".into(),
+            directory
+                .path()
+                .join("open-compass.key")
+                .display()
+                .to_string(),
+            "has-activity".into(),
+            "--actor".into(),
+            format!("{:x}", authors[1]),
+            "--since".into(),
+            "1970-01-01T00:00:00 TAI".into(),
+            "--status".into(),
+            "blocked".into(),
+        ])
+        .unwrap();
+        let mut text = String::new();
+        let mut emit = |part| {
+            if let crate::out::Part::Text { text: value } = part {
+                text.push_str(&value);
+            }
+            Ok(())
+        };
+        crate::compass::cli::execute(cli, &mut crate::out::Out::new(&mut emit)).unwrap();
+        assert_eq!(text, "true\n");
+    }
+
+    #[test]
+    fn has_activity_preserves_latest_status_word_and_event_ties() {
+        for repeated_words in [false, true] {
+            let actor = genid().id;
+            let goal = genid().id;
+            let first = genid().id;
+            let second = if repeated_words { first } else { genid().id };
+            let mut fragment = entity! { ExclusiveId::force_ref(&goal) @
+                metadata::tag: &KIND_GOAL_ID,
+            };
+            for (event, status) in [(first, "doing"), (second, "done")] {
+                fragment += entity! { ExclusiveId::force_ref(&event) @
+                    metadata::tag: &KIND_STATUS_ID,
+                    board::status_of: &goal,
+                    board::status: status,
+                    metadata::created_at: point(2.0),
+                };
+            }
+            fragment += compass::note_fragment(
+                goal,
+                "recent",
+                vec![],
+                vec![],
+                vec![],
+                Some(actor),
+                point(3.0),
+            )
+            .unwrap()
+            .0;
+            let doing_wins = if repeated_words {
+                crate::schemas::compass::text_handle("doing").raw
+                    > crate::schemas::compass::text_handle("done").raw
+            } else {
+                first > second
+            };
+            let (_directory, storage) = raw_pile(fragment);
+            let compass = Compass::with_storage(storage);
+            assert_eq!(
+                compass
+                    .has_activity(actor, Epoch::from_unix_seconds(3.0), &["doing".into()],)
+                    .unwrap(),
+                doing_wins
+            );
+            assert_eq!(
+                compass
+                    .has_activity(actor, Epoch::from_unix_seconds(3.0), &["done".into()],)
+                    .unwrap(),
+                !doing_wins
+            );
+        }
+    }
+
+    #[test]
+    fn has_activity_propagates_existing_status_order_conflict() {
+        use triblespace::core::collection::lww_register::LwwRegisterError;
+
+        let actor = genid().id;
+        let goal = genid().id;
+        let event = genid().id;
+        let mut fragment = entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+        };
+        fragment += entity! { ExclusiveId::force_ref(&event) @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &goal,
+            board::status: "doing",
+            board::by: &actor,
+            metadata::created_at*: [point(2.0), point(2.5)],
+        };
+        let (_directory, storage) = raw_pile(fragment);
+        let compass = Compass::with_storage(storage);
+        // The shared view's LWW query rejects distinct order values on a
+        // complete state before either the board or activity reader runs.
+        let expected = LwwRegisterError::ConflictingOrder(event.raw());
+        let board_error = compass.board(ListOptions::default()).unwrap_err();
+        assert_eq!(
+            board_error.downcast_ref::<LwwRegisterError>(),
+            Some(&expected)
+        );
+        let activity_error = compass
+            .has_activity(actor, Epoch::from_unix_seconds(1.0), &["doing".into()])
+            .unwrap_err();
+        assert_eq!(
+            activity_error.downcast_ref::<LwwRegisterError>(),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn has_activity_skips_incomplete_and_inverted_readings() {
+        let actor = genid().id;
+        let goal = genid().id;
+        let mut invalid = point(4.0).raw;
+        invalid[16..].copy_from_slice(&point(3.0).raw[16..]);
+        let mut fragment = entity! { ExclusiveId::force_ref(&goal) @
+            metadata::tag: &KIND_GOAL_ID,
+        };
+        fragment += compass::status_fragment(goal, "doing", None, point(1.0)).unwrap();
+        fragment += entity! {
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: "invalid interval",
+            board::by: &actor,
+            metadata::created_at: IntervalValue::new(invalid),
+        };
+        fragment += entity! {
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::by: &actor,
+            metadata::created_at: point(5.0),
+        };
+        // A timestamp and author alone do not make an activity event.
+        fragment += entity! {
+            board::task: &goal,
+            board::note: "no note kind",
+            board::by: &actor,
+            metadata::created_at: point(6.0),
+        };
+        let wide_actor = genid().id;
+        let wide: IntervalValue = (
+            Epoch::from_unix_seconds(2.0),
+            Epoch::from_unix_seconds(10.0),
+        )
+            .try_to_inline()
+            .unwrap();
+        fragment += compass::note_fragment(
+            goal,
+            "wide interval",
+            vec![],
+            vec![],
+            vec![],
+            Some(wide_actor),
+            wide,
+        )
+        .unwrap()
+        .0;
+        let (_directory, storage) = raw_pile(fragment);
+        let compass = Compass::with_storage(storage);
+        assert!(!compass
+            .has_activity(actor, Epoch::from_unix_seconds(2.0), &["doing".into()],)
+            .unwrap());
+        assert!(compass
+            .has_activity(wide_actor, Epoch::from_unix_seconds(2.0), &["doing".into()],)
+            .unwrap());
+        assert!(!compass
+            .has_activity(
+                wide_actor,
+                Epoch::from_unix_seconds(2.000001),
+                &["doing".into()],
+            )
+            .unwrap());
     }
 
     /// The schema cannot express cardinality, so a goal with two titles and
