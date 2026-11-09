@@ -130,8 +130,11 @@ class PredicateTests(unittest.TestCase):
         why = self.stored()["why"]
         self.assertEqual(error.strip(), why)
         for expected in ("TimeoutExpired", "call exceeded 120 s", "phase=wait", "call=1 [relations show <persona>]",
-                         "call_elapsed=", "refresh_start=", "refresh_end=", "refresh_elapsed=", "stderr=waiting for reader lock"):
+                         "stderr=waiting for reader lock"):
             self.assertIn(expected, why)
+        for timing in ("call_elapsed", "refresh_start", "refresh_end", "refresh_elapsed"):
+            self.assertNotIn(timing, why)
+        self.assertIn("refresh_elapsed", self.stored()["diagnostic"])
         for private in ("raw-goal-body", "private-path", "private-selector"):
             self.assertNotIn(private, why)
         self.assertLessEqual(len(why.encode()), 1800)
@@ -150,8 +153,10 @@ class PredicateTests(unittest.TestCase):
             self.assertEqual(self.invoke(command=waiting)[0], 2)
         cached = self.stored()
         why = cached["why"]
-        self.assertIn(f"phase=wait call=3 [compass show {GOAL}] call_elapsed=474.000s", why)
-        self.assertIn("refresh_start=1000.000 refresh_end=1000.000 refresh_elapsed=480.000s", why)
+        self.assertIn(f"phase=wait call=3 [compass show {GOAL}]", why)
+        self.assertEqual(cached["diagnostic"], {
+            "refresh_start": 1000, "refresh_end": 1000, "refresh_elapsed": 480,
+            "phase": "wait", "call": {"index": 3, "command": f"compass show {GOAL}", "elapsed": 474}})
         self.assertEqual((cached["at"], cached["until"], cached["context"]["version"]), (1000, 1600, 3))
         with patch("time.time", return_value=1100):
             code, _, error, spawns = self.invoke(False)
@@ -167,10 +172,44 @@ class PredicateTests(unittest.TestCase):
         with patch("time.monotonic", side_effect=lambda: clock[0]):
             self.assertEqual(self.invoke(command=failed)[0], 2)
         why = self.stored()["why"]
-        self.assertIn("phase=read-result call=2 [compass list doing blocked] call_elapsed=7.000s", why)
-        self.assertIn("refresh_elapsed=14.000s", why)
+        self.assertIn("phase=read-result call=2 [compass list doing blocked]", why)
+        self.assertEqual(self.stored()["diagnostic"]["call"]["elapsed"], 7)
+        self.assertEqual(self.stored()["diagnostic"]["refresh_elapsed"], 14)
         self.assertIn("stderr=collection unavailable", why)
         self.assertNotIn("private-goal-body", why)
+
+    def test_equivalent_failed_refreshes_keep_attention_identity_with_new_timings(self):
+        results = []
+        for start, duration in ((1000.0, 7.0), (2000.0, 11.0)):
+            wall, clock = [start], [100.0]
+            def failed(argv, **kwargs):
+                wall[0] += duration
+                clock[0] += duration
+                return subprocess.CompletedProcess(argv, 2, "private-body", "collection unavailable")
+            with patch("time.time", side_effect=lambda: wall[0]), patch("time.monotonic", side_effect=lambda: clock[0]):
+                code, _, refresh_error, _ = self.invoke(command=failed)
+                cached = self.stored()
+                foreground = self.invoke(False)
+            self.assertEqual((code, foreground[0], foreground[3]), (2, 2, 0))
+            self.assertEqual(refresh_error, foreground[2])
+            self.assertEqual(refresh_error.strip(), cached["why"])
+            self.assertEqual(cached["diagnostic"]["refresh_start"], start)
+            self.assertEqual(cached["diagnostic"]["refresh_end"], start + duration)
+            self.assertEqual(cached["diagnostic"]["refresh_elapsed"], duration)
+            self.assertEqual(cached["diagnostic"]["call"]["elapsed"], duration)
+            results.append((cached, foreground[2]))
+        self.assertEqual(results[0][0]["why"], results[1][0]["why"])
+        self.assertEqual(results[0][1], results[1][1])
+        self.assertNotEqual(results[0][0]["diagnostic"], results[1][0]["diagnostic"])
+
+    def test_old_error_cache_without_diagnostic_remains_readable(self):
+        self.failure = RuntimeError("relations unavailable")
+        self.assertEqual(self.invoke()[0], 2)
+        cached = self.stored()
+        cached.pop("diagnostic")
+        self.cache.write_text(json.dumps(cached))
+        code, _, error, spawns = self.invoke(False)
+        self.assertEqual((code, error.strip(), spawns), (2, cached["why"], 0))
 
     def test_whole_refresh_timeout_is_cached_error(self):
         def timed_out(argv, **kwargs):

@@ -144,12 +144,17 @@ def diagnostic(error):
     # or executable path. Command labels below contain only fixed words/IDs.
     detail = ("call exceeded %s s" % error.timeout if isinstance(error, subprocess.TimeoutExpired)
               else clipped(error, 384))
-    detail = "%s: %s; phase=%s call=%d [%s] call_elapsed=%.3fs; refresh_start=%.3f refresh_end=%.3f refresh_elapsed=%.3fs" % (
-        type(error).__name__, detail, phase, call_index, current, duration, now, ended, elapsed)
+    detail = "%s: %s; phase=%s call=%d [%s]" % (
+        type(error).__name__, detail, phase, call_index, current)
     if call is not None and call["stderr"]:
         detail += "; stderr=" + call["stderr"]
+    # Orient uses the full warning as its attention identity. Keep changing
+    # timings in this cache's optional diagnostic field, never in `why`.
+    timing = {"refresh_start": now, "refresh_end": ended, "refresh_elapsed": elapsed,
+              "phase": phase, "call": None if call is None else {
+                  "index": call_index, "command": current, "elapsed": duration}}
     # Leave room for the Habit evaluator's exit-status prefix within 2048 bytes.
-    return clipped(detail, 1800)
+    return clipped(detail, 1800), timing
 
 def run(*argv):
     exe = shutil.which(argv[0]) or os.path.expanduser("~/.local/bin/" + argv[0])
@@ -230,6 +235,7 @@ def out_of_time(*_):
     raise OutOfTime("refresh past %d s" % REFRESH_BOUND)
 signal.signal(signal.SIGALRM, out_of_time)
 signal.alarm(REFRESH_BOUND)
+details = None
 try:
     try:
         due, why = decide()
@@ -239,16 +245,21 @@ try:
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
     except (Exception, OutOfTime) as e:
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
-        result, why = "error", diagnostic(e)
+        result = "error"
+        why, details = diagnostic(e)
     phase = "publish"
     tmp = "%s.tmp.%d" % (cache, os.getpid())
     try:
         with open(tmp, "w") as f:
-            json.dump({"result": result, "why": why, "at": now,
-                       "until": now + cache_secs, "context": context}, f)
+            cached = {"result": result, "why": why, "at": now,
+                      "until": now + cache_secs, "context": context}
+            if details is not None:
+                cached["diagnostic"] = details
+            json.dump(cached, f)
         os.replace(tmp, cache)
     except Exception as e:
-        result, why = "error", diagnostic(RuntimeError("cache publication failed: %s" % e))
+        result = "error"
+        why, details = diagnostic(RuntimeError("cache publication failed: %s" % e))
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
