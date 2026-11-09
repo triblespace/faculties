@@ -439,7 +439,9 @@ fn files_view_in<T>(
 /// fails with a clear error instead of exhausting the host.
 #[derive(Clone, Copy, Debug)]
 pub struct ImportLimits {
-    /// Files and directories visited, the root included.
+    /// Directory entries read, the root included. Hidden entries and
+    /// skipped symlinks count too, and the count is checked as each entry
+    /// is read, so an oversized directory is refused while being listed.
     pub max_entries: usize,
     /// File bytes read.
     pub max_bytes: u64,
@@ -479,8 +481,14 @@ struct Walk {
     files: usize,
     dirs: usize,
     bytes: u64,
+    /// The first [`MAX_LISTED_SKIPS`] declined symlinks, for the report.
     skipped: Vec<String>,
+    /// Every declined symlink, listed or not.
+    skips: usize,
 }
+
+/// How many declined symlinks an import report names; the rest are counted.
+pub const MAX_LISTED_SKIPS: usize = 100;
 
 impl Walk {
     fn new(root: PathBuf, limits: ImportLimits) -> Self {
@@ -493,6 +501,7 @@ impl Walk {
             dirs: 0,
             bytes: 0,
             skipped: Vec::new(),
+            skips: 0,
         }
     }
 
@@ -511,21 +520,25 @@ impl Walk {
             return Ok(Some((entry.to_owned(), meta)));
         }
         let reason = match fs::canonicalize(entry) {
-            Err(_) => "dangling",
-            Ok(target) if !target.starts_with(&self.root) => "points outside the tree",
-            Ok(target) if self.branch.contains(&target) => "would close a cycle",
+            Err(error) => skip_reason(&error),
+            Ok(target) if !target.starts_with(&self.root) => "points outside the tree".into(),
+            Ok(target) if self.branch.contains(&target) => "would close a cycle".into(),
             Ok(target) => {
                 let meta =
                     fs::metadata(&target).with_context(|| format!("stat {}", target.display()))?;
                 return Ok(Some((target, meta)));
             }
         };
-        let link = self.relative(entry).into_owned();
-        self.skipped.push(format!("{link} ({reason})"));
+        self.skips += 1;
+        if self.skipped.len() < MAX_LISTED_SKIPS {
+            let link = self.relative(entry).into_owned();
+            self.skipped.push(format!("{link} ({reason})"));
+        }
         Ok(None)
     }
 
-    fn enter(&mut self) -> Result<()> {
+    /// Count one directory entry, the root included, against the limit.
+    fn count(&mut self) -> Result<()> {
         self.entries += 1;
         if self.entries > self.limits.max_entries {
             bail!(
@@ -541,6 +554,7 @@ impl Walk {
         let mut entries: BTreeMap<String, PathBuf> = BTreeMap::new();
         for entry in fs::read_dir(path).with_context(|| format!("read dir {}", path.display()))? {
             let entry = entry?;
+            self.count()?;
             let name = entry.file_name().to_string_lossy().to_string();
             // Skip hidden files and common noise.
             if name.starts_with('.') {
@@ -585,16 +599,28 @@ impl Walk {
     }
 
     fn report_skipped(&self, out: &mut Out<'_>) -> Result<()> {
-        if !self.skipped.is_empty() {
-            out.line(format!(
-                "Skipped {} symlink(s), not followed:",
-                self.skipped.len()
-            ))?;
+        if self.skips != 0 {
+            out.line(format!("Skipped {} symlink(s), not followed:", self.skips))?;
             for link in &self.skipped {
                 out.line(format!("  {link}"))?;
             }
+            if self.skips > self.skipped.len() {
+                out.line(format!(
+                    "  ... and {} more, not listed",
+                    self.skips - self.skipped.len()
+                ))?;
+            }
         }
         Ok(())
+    }
+}
+
+/// Why a symlink whose target cannot be resolved is skipped: a missing
+/// target is dangling; any other failure is named, never called missing.
+fn skip_reason(error: &std::io::Error) -> std::borrow::Cow<'static, str> {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "dangling".into(),
+        kind => format!("unreadable ({kind})").into(),
     }
 }
 
@@ -608,7 +634,6 @@ fn print_fs_tree(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let name = link.file_name().and_then(|n| n.to_str()).unwrap_or(".");
-    walk.enter()?;
     if meta.is_file() {
         let size = meta.len();
         walk.bytes += size;
@@ -654,7 +679,6 @@ fn build_tree(
     mime_override: Option<&str>,
     walk: &mut Walk,
 ) -> Result<Fragment> {
-    walk.enter()?;
     if meta.is_file() {
         let bytes = walk.read(path, meta)?;
         let mime = mime_override.unwrap_or_else(|| file_capability::infer_media_type(link));
@@ -708,6 +732,7 @@ fn cmd_add_dry_run(
 ) -> Result<()> {
     let (abs_path, meta) = import_root(path)?;
     let mut walk = Walk::new(abs_path.clone(), limits);
+    walk.count()?;
     print_fs_tree(&abs_path, &abs_path, &meta, "", "", &mut walk, out)?;
     out.line("")?;
     out.line(format!(
@@ -739,6 +764,7 @@ fn cmd_add(
     let source = abs_path.to_string_lossy().to_string();
 
     let mut walk = Walk::new(abs_path.clone(), limits);
+    walk.count()?;
     let tree = build_tree(&abs_path, &abs_path, &meta, mime_override, &mut walk)?;
     let root_id = tree.root().expect("tree has a root");
     let root_content = contents_of(tree.facts(), root_id).first().copied();
@@ -2273,6 +2299,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_link_target_is_called_dangling() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(skip_reason(&Error::from(ErrorKind::NotFound)), "dangling");
+        assert_eq!(
+            skip_reason(&Error::from(ErrorKind::PermissionDenied)),
+            "unreadable (permission denied)"
+        );
+        assert!(skip_reason(&Error::other("disk")).starts_with("unreadable ("));
+    }
     use crate::storage::{initialize_signer, load_signer, runtime};
     #[cfg(feature = "local-embed")]
     use ed25519_dalek::SigningKey;

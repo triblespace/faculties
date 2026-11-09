@@ -1184,3 +1184,128 @@ fn a_hash_with_neither_file_entity_nor_resident_blob_says_so() {
         );
     }
 }
+
+/// Import `root` within `limits` on this fixture, returning the report or
+/// the error text.
+fn add_within(
+    fixture: &Fixture,
+    root: &std::path::Path,
+    limits: faculties::files::operations::ImportLimits,
+) -> Result<String, String> {
+    let mut report = String::new();
+    fixture
+        .files()
+        .add_path_within(
+            root,
+            None,
+            &[],
+            false,
+            limits,
+            &mut Out::new(&mut |part| {
+                if let Part::Text { text } = part {
+                    report.push_str(&text);
+                    report.push('\n');
+                }
+                Ok(())
+            }),
+        )
+        .map(|()| report)
+        .map_err(|error| format!("{error:#}"))
+}
+
+#[test]
+fn every_directory_entry_read_counts_toward_the_entry_limit() {
+    use faculties::files::operations::ImportLimits;
+    let fixture = Fixture::new();
+    let host = tempfile::tempdir().unwrap();
+    let limits = ImportLimits {
+        max_entries: 4,
+        max_bytes: u64::MAX,
+    };
+    // Hidden entries are never imported, yet reading them is work: they count.
+    let hidden = host.path().join("hidden");
+    fs::create_dir_all(&hidden).unwrap();
+    for name in [".a", ".b", ".c", ".d"] {
+        fs::write(hidden.join(name), b"x").unwrap();
+    }
+    // Declined symlinks count as well.
+    let links = host.path().join("links");
+    fs::create_dir_all(&links).unwrap();
+    for name in ["a", "b", "c", "d"] {
+        std::os::unix::fs::symlink(host.path().join("missing"), links.join(name)).unwrap();
+    }
+    let before = fixture.files().imports().unwrap();
+    for root in [&hidden, &links] {
+        let error = add_within(&fixture, root, limits).unwrap_err();
+        assert!(error.contains("4-entry limit"), "{error}");
+    }
+    assert_eq!(fixture.files().imports().unwrap(), before);
+    // Root plus three entries fits exactly.
+    fs::remove_file(hidden.join(".d")).unwrap();
+    add_within(&fixture, &hidden, limits).unwrap();
+}
+
+#[test]
+fn skip_reports_name_a_bounded_number_of_links_and_count_the_rest() {
+    use faculties::files::operations::{ImportLimits, MAX_LISTED_SKIPS};
+    let fixture = Fixture::new();
+    let host = tempfile::tempdir().unwrap();
+    let root = host.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("kept.txt"), b"kept").unwrap();
+    let extra = 7;
+    for i in 0..MAX_LISTED_SKIPS + extra {
+        std::os::unix::fs::symlink(
+            host.path().join("missing"),
+            root.join(format!("link{i:04}")),
+        )
+        .unwrap();
+    }
+    let report = add_within(&fixture, &root, ImportLimits::UNBOUNDED).unwrap();
+    assert!(
+        report.contains(&format!(
+            "Skipped {} symlink(s), not followed:",
+            MAX_LISTED_SKIPS + extra
+        )),
+        "{report}"
+    );
+    assert_eq!(report.matches("(dangling)").count(), MAX_LISTED_SKIPS);
+    assert!(
+        report.contains(&format!("  ... and {extra} more, not listed")),
+        "{report}"
+    );
+    assert!(report
+        .trim_end()
+        .lines()
+        .last()
+        .unwrap()
+        .starts_with("Import: "));
+}
+
+#[test]
+fn a_link_whose_target_cannot_be_read_is_not_called_dangling() {
+    use faculties::files::operations::ImportLimits;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root reads through mode 000");
+        return;
+    }
+    let fixture = Fixture::new();
+    let host = tempfile::tempdir().unwrap();
+    let root = host.path().join("tree");
+    fs::create_dir_all(&root).unwrap();
+    let locked = host.path().join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    fs::write(locked.join("target.txt"), b"present").unwrap();
+    std::os::unix::fs::symlink(locked.join("target.txt"), root.join("hidden-by-mode")).unwrap();
+    std::os::unix::fs::symlink(host.path().join("missing"), root.join("gone")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let report = add_within(&fixture, &root, ImportLimits::UNBOUNDED);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    let report = report.unwrap();
+    assert!(
+        report.contains("hidden-by-mode (unreadable (permission denied))"),
+        "{report}"
+    );
+    assert!(report.contains("gone (dangling)"), "{report}");
+}
