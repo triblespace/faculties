@@ -433,3 +433,188 @@ fn semantic_unavailability_is_explicit_without_opening_a_model_or_store() {
     assert!(error.to_string().contains("semantic tier is unavailable"));
     assert!(!missing.exists());
 }
+
+/// files_add a host path through its MCP tool and return the Import id.
+fn files_add(fixture: &Fixture, path: &std::path::Path) -> String {
+    let files = faculties::files::mcp::Files::new(fixture.pile.clone(), Some(fixture.key.clone()));
+    collect(|out| files.call("files_add", json(serde_json::json!({ "path": path })), out))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn scans_by_file_id_and_by_path_report_what_the_byte_route_reports() {
+    let host = tempfile::tempdir().unwrap();
+    let docx = host.path().join("report.docx");
+    fs::write(&docx, office()).unwrap();
+    let notes = host.path().join("notes.txt");
+    fs::write(&notes, b"plain unsupported text").unwrap();
+    let docx_bytes = fs::read(&docx).unwrap();
+    let notes_bytes = fs::read(&notes).unwrap();
+    let byte_documents = [
+        DocumentInput {
+            name: "report.docx",
+            bytes: &docx_bytes,
+        },
+        DocumentInput {
+            name: "notes.txt",
+            bytes: &notes_bytes,
+        },
+    ];
+    let by_id = Fixture::new();
+    let docx_id = files_add(&by_id, &docx);
+    let notes_id = files_add(&by_id, &notes);
+    let id_documents = serde_json::json!([
+        {"name": "report.docx", "file_id": docx_id},
+        {"name": "notes.txt", "file_id": notes_id},
+    ]);
+    let path_documents = serde_json::json!([
+        {"name": "report.docx", "path": docx},
+        {"name": "notes.txt", "path": notes},
+    ]);
+    let scan = |fixture: &Fixture, documents: &serde_json::Value, dry_run: bool| {
+        collect(|out| {
+            fixture.adapter().call(
+                "posture_scan",
+                json(serde_json::json!({"label": "batch", "documents": documents, "dry_run": dry_run})),
+                out,
+            )
+        })
+        .unwrap()
+    };
+
+    // Dry run: no scan id, so the three reports must be byte-identical.
+    let by_path = Fixture::new();
+    let by_bytes = Fixture::new();
+    let expected = collect(|out| {
+        posture::presentation::scan(
+            &by_bytes
+                .operations()
+                .scan("batch", &byte_documents, true)
+                .unwrap(),
+            out,
+        )
+    })
+    .unwrap();
+    assert!(expected.contains("Fixture Author"), "{expected}");
+    assert_eq!(scan(&by_id, &id_documents, true), expected, "file_id route");
+    assert_eq!(
+        scan(&by_path, &path_documents, true),
+        expected,
+        "path route"
+    );
+    assert_eq!(by_id.commits(DEFAULT_SCAN_SCOPE_ID), 0);
+
+    // Published: one scan per pile; everything but the scan's own id agrees,
+    // including the content-located finding ids.
+    let published_bytes = by_bytes
+        .operations()
+        .scan("batch", &byte_documents, false)
+        .unwrap();
+    let byte_text = collect(|out| posture::presentation::scan(&published_bytes, out)).unwrap();
+    let id_text = scan(&by_id, &id_documents, false);
+    let path_text = scan(&by_path, &path_documents, false);
+    let normalized = |fixture: &Fixture, text: &str| {
+        let scan = fixture.operations().scans().unwrap().remove(0).id;
+        text.replace(&format!("{scan:x}"), "<scan>")
+    };
+    let byte_text = normalized(&by_bytes, &byte_text);
+    assert!(byte_text.contains("<scan>"), "{byte_text}");
+    assert_eq!(normalized(&by_id, &id_text), byte_text, "file_id route");
+    assert_eq!(normalized(&by_path, &path_text), byte_text, "path route");
+    for fixture in [&by_id, &by_path] {
+        assert_eq!(fixture.commits(DEFAULT_SCAN_SCOPE_ID), 1);
+        let scan = fixture.operations().scans().unwrap().remove(0).id;
+        let scan = format!("{scan:x}");
+        let mcp_text = collect(|out| {
+            fixture.adapter().call(
+                "posture_coverage",
+                json(serde_json::json!({ "scan": scan })),
+                out,
+            )
+        })
+        .unwrap();
+        let byte_scan = by_bytes.operations().scans().unwrap().remove(0).id;
+        let byte_coverage = collect(|out| {
+            by_bytes.adapter().call(
+                "posture_coverage",
+                json(serde_json::json!({ "scan": format!("{byte_scan:x}") })),
+                out,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            normalized(fixture, &mcp_text),
+            normalized(&by_bytes, &byte_coverage)
+        );
+        let list = |fixture: &Fixture, scan: String| {
+            normalized(
+                fixture,
+                &collect(|out| {
+                    fixture.adapter().call(
+                        "posture_list",
+                        json(serde_json::json!({ "scan": scan, "examples": 5 })),
+                        out,
+                    )
+                })
+                .unwrap(),
+            )
+        };
+        let listed = list(fixture, scan.clone());
+        assert!(listed.contains("Fixture Author"), "{listed}");
+        assert_eq!(listed, list(&by_bytes, format!("{byte_scan:x}")));
+        // The report the MCP route printed is the byte route's report.
+        let mcp_report = {
+            let report = fixture
+                .operations()
+                .coverage(Some(Id::from_hex(&scan).unwrap()))
+                .unwrap()
+                .unwrap();
+            report.outcomes
+        };
+        assert_eq!(
+            mcp_report,
+            by_bytes
+                .operations()
+                .coverage(published_bytes.scan_id)
+                .unwrap()
+                .unwrap()
+                .outcomes
+        );
+    }
+
+    // A folder import id is a tree, not a document: refused, nothing recorded.
+    let folder = host.path().join("docs");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("report.docx"), office()).unwrap();
+    let folder_id = files_add(&by_id, &folder);
+    let mut emitted = 0;
+    let error = by_id
+        .adapter()
+        .call(
+            "posture_scan",
+            json(serde_json::json!({
+                "label": "folder",
+                "documents": [
+                    {"name": "report.docx", "file_id": docx_id},
+                    {"name": "docs", "file_id": folder_id},
+                ],
+            })),
+            &mut Out::new(&mut |_| {
+                emitted += 1;
+                Ok(())
+            }),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("is a directory or folder import"),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<InvalidArguments>().is_some());
+    assert_eq!(emitted, 0);
+    assert_eq!(by_id.commits(DEFAULT_SCAN_SCOPE_ID), 1, "nothing recorded");
+}

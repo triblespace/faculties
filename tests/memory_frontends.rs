@@ -690,3 +690,109 @@ fn malformed_calendar_grain_and_threshold_inputs_are_fallible_not_panics() {
         .to_string()
         .contains("sim_threshold"));
 }
+
+/// files_add a host path through its MCP tool on this fixture's pile and
+/// return the Import id it reports.
+fn files_add(fixture: &Fixture, path: &std::path::Path) -> String {
+    let files = faculties::files::mcp::Files::new(fixture.pile.clone(), Some(fixture.key.clone()));
+    let mut report = String::new();
+    files
+        .call(
+            "files_add",
+            serde_json::to_vec(&json!({ "path": path })).unwrap().into(),
+            &mut Out::new(&mut |part| {
+                if let Part::Text { text } = part {
+                    report.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+    report
+        .lines()
+        .find_map(|line| line.strip_prefix("Import: "))
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn image_by_file_id_and_by_path_store_what_the_byte_api_stores() {
+    let mut encoded = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        3,
+        2,
+        image::Rgba([200, 10, 70, 255]),
+    ))
+    .write_to(&mut encoded, image::ImageFormat::Png)
+    .unwrap();
+    let bytes = encoded.into_inner();
+    let host = tempfile::tempdir().unwrap();
+    let image_path = host.path().join("frame.png");
+    fs::write(&image_path, &bytes).unwrap();
+
+    // Three scratch piles, one per route, so no route can see another's write.
+    let by_id = Fixture::new();
+    let file_id = files_add(&by_id, &image_path);
+    let created = by_id.call("memory_image", json!({"when": RANGE, "file_id": file_id}));
+    let by_path = Fixture::new();
+    let created_by_path = by_path.call("memory_image", json!({"when": RANGE, "path": image_path}));
+    let by_bytes = Fixture::new();
+    let direct = by_bytes
+        .memory()
+        .image(&bytes, parse_time_range(RANGE).unwrap())
+        .unwrap();
+    let id = format!("{:x}", direct.id);
+    assert_eq!(receipt_id(&created), id, "file_id route");
+    assert_eq!(receipt_id(&created_by_path), id, "path route");
+    let shown = by_bytes.call("memory_show", json!({"selector": id}));
+    assert!(
+        matches!(&shown[1], Part::Image { bytes: actual, mime_type } if actual.as_ref() == bytes.as_slice() && mime_type == "image/png")
+    );
+    assert_eq!(by_id.call("memory_show", json!({"selector": id})), shown);
+    assert_eq!(by_path.call("memory_show", json!({"selector": id})), shown);
+    assert_eq!(
+        by_id.call("memory_meta", json!({"selector": id})),
+        by_bytes.call("memory_meta", json!({"selector": id}))
+    );
+    // On one pile, the second route stores the same memory, not a new one.
+    let again = by_id.call("memory_image", json!({"when": RANGE, "path": image_path}));
+    assert_eq!(receipt_id(&again), id);
+
+    // A folder import id names a tree, not an image: refused, nothing stored.
+    let folder = host.path().join("frames");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(folder.join("frame.png"), &bytes).unwrap();
+    let folder_id = files_add(&by_id, &folder);
+    let listed = by_id.call("memory_list", json!({}));
+    let context = by_id
+        .memory()
+        .context(&CoverOpts::plain(2000))
+        .unwrap()
+        .text;
+    let error = by_id
+        .adapter()
+        .call(
+            "memory_image",
+            serde_json::to_vec(&json!({"when": "2026-09-03T00:00:00", "file_id": folder_id}))
+                .unwrap()
+                .into(),
+            &mut Out::new(&mut |_| panic!("a refused image emits nothing")),
+        )
+        .unwrap_err();
+    assert!(
+        error.chain().any(|cause| cause
+            .downcast_ref::<faculties::mcp::input::NotAFile>()
+            .is_some()),
+        "{error:#}"
+    );
+    assert_eq!(by_id.call("memory_list", json!({})), listed);
+    assert_eq!(
+        by_id
+            .memory()
+            .context(&CoverOpts::plain(2000))
+            .unwrap()
+            .text,
+        context
+    );
+}

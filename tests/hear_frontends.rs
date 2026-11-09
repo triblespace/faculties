@@ -284,3 +284,73 @@ fn mcp_discovery_never_loads_models_and_caller_cannot_choose_devices() {
     assert!(format!("{error:#}").contains("no launcher-configured"));
     assert!(error.downcast_ref::<InvalidArguments>().is_none());
 }
+
+/// The aggregate catalogue registers Hear with its storage, so a Files
+/// file_id reaches the same point a host path does: past resolution, at the
+/// launcher's model configuration, which this test deliberately leaves unset.
+/// That is where this check stops; running the model needs the GPU.
+#[test]
+fn catalog_hear_resolves_file_ids_against_its_storage_and_stops_at_the_model() {
+    use faculties::mcp::catalog::{Catalog, Config};
+    use std::sync::atomic::AtomicBool;
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("hear.pile");
+    let key = directory.path().join("hear.key");
+    std::fs::File::create(&pile).unwrap();
+    faculties::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    let clip = directory.path().join("clip.wav");
+    std::fs::write(&clip, [1_u8, 2, 3]).unwrap();
+    let folder = directory.path().join("clips");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("clip.wav"), [1_u8, 2, 3]).unwrap();
+    let mut config = Config::new(pile.clone());
+    config.key = Some(key.clone());
+    let catalog = Catalog::new(config);
+    let cancelled = AtomicBool::new(false);
+    // (failed, text): native failures arrive as an error result, argument
+    // errors as Err; either way the text says where the call stopped.
+    let invoke = |name: &str, args: serde_json::Value| -> (bool, String) {
+        match catalog.invoke(
+            name,
+            Bytes::from(serde_json::to_vec(&args).unwrap()),
+            faculties::mcp::Limits::default(),
+            &cancelled,
+        ) {
+            Ok(result) => (
+                result.is_error,
+                result
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        Part::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Err(error) => (true, format!("{error:#}")),
+        }
+    };
+    let import = |path: &std::path::Path| {
+        let (failed, text) = invoke("files_add", serde_json::json!({ "path": path }));
+        assert!(!failed, "{text}");
+        let start = text.find("Import: ").unwrap() + "Import: ".len();
+        text[start..start + 32].to_owned()
+    };
+    let file_id = import(&clip);
+    let folder_id = import(&folder);
+    for source in [
+        serde_json::json!({ "file_id": file_id }),
+        serde_json::json!({ "path": clip }),
+    ] {
+        let (failed, text) = invoke("hear_once", source.clone());
+        assert!(failed);
+        assert!(
+            text.contains("no launcher-configured local model"),
+            "{source}: {text}"
+        );
+    }
+    let (failed, text) = invoke("hear_once", serde_json::json!({ "file_id": folder_id }));
+    assert!(failed);
+    assert!(text.contains("is a directory or folder import"), "{text}");
+    catalog.close().unwrap();
+}

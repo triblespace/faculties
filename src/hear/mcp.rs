@@ -28,6 +28,23 @@ impl Hear {
         }
     }
 }
+impl Hear {
+    /// The clip's bytes, exactly as `hear_once` hands them to Hear's input
+    /// stage: one of a Files `file_id` (only with storage) or a host `path`.
+    fn clip(&self, file_id: Option<&str>, path: Option<&str>) -> Result<Bytes> {
+        match crate::mcp::input::exactly_one([("file_id", file_id), ("path", path)])? {
+            ("file_id", id) => {
+                let files = self.files.as_ref().ok_or_else(|| {
+                    invalid_arguments("file_id needs a launcher-configured pile; use path")
+                })?;
+                crate::mcp::input::read_file_id(files, id)
+            }
+            (_, path) => {
+                crate::mcp::input::read_host_file(path, crate::mcp::input::MAX_HOST_FILE_BYTES)
+            }
+        }
+    }
+}
 const TOOLS:&[Tool]=&[Tool{
     name:"hear_once",
     description:"Run one encoded audio clip through the shared VAD, speech filters and launcher-configured Gemma hearing stack. The clip is a Files file_id or an absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none. Returns ordered metadata and exact raw f32le row-major embedding resources, not audio playback; optional text is diagnostic. Requires the hear build feature and explicit local model/config/tokenizer configuration. No microphone, Soma listener, download, log path or model selection can be requested.",
@@ -97,20 +114,7 @@ impl Faculty for Hear {
             },
         };
         options.validate().map_err(invalid_arguments)?;
-        let bytes = match crate::mcp::input::exactly_one([
-            ("file_id", a.file_id.as_deref()),
-            ("path", a.path.as_deref()),
-        ])? {
-            ("file_id", id) => {
-                let files = self.files.as_ref().ok_or_else(|| {
-                    invalid_arguments("file_id needs a launcher-configured pile; use path")
-                })?;
-                crate::mcp::input::read_file_id(files, id)?
-            }
-            (_, path) => {
-                crate::mcp::input::read_host_file(path, crate::mcp::input::MAX_HOST_FILE_BYTES)?
-            }
-        };
+        let bytes = self.clip(a.file_id.as_deref(), a.path.as_deref())?;
         if bytes.is_empty() {
             return Err(invalid_arguments("recorded audio contains no bytes"));
         }
@@ -138,5 +142,74 @@ mod tests {
         assert_eq!(args.source, "@-");
         assert_eq!(args.mime_type, "audio/wav");
         assert!(!args.transcribe);
+    }
+
+    /// file_id and path hand Hear's input stage the same bytes; no model runs.
+    #[test]
+    fn file_id_and_path_hand_the_input_stage_the_same_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("hear.pile");
+        let key = directory.path().join("hear.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let clip: Vec<u8> = (0..=255u8).cycle().take(4099).collect();
+        let host = directory.path().join("clip.wav");
+        std::fs::write(&host, &clip).unwrap();
+        let folder = directory.path().join("clips");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("clip.wav"), &clip).unwrap();
+        let files = crate::files::mcp::Files::new(pile.clone(), Some(key.clone()));
+        let import = |path: &std::path::Path| {
+            let mut report = String::new();
+            files
+                .call(
+                    "files_add",
+                    Bytes::from(serde_json::to_vec(&serde_json::json!({ "path": path })).unwrap()),
+                    &mut Out::new(&mut |part| {
+                        if let crate::out::Part::Text { text } = part {
+                            report.push_str(&text);
+                        }
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+            report
+                .lines()
+                .find_map(|line| line.strip_prefix("Import: "))
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        let file_id = import(&host);
+        let folder_id = import(&folder);
+        let hear = Hear::with_storage(crate::storage::Storage::new(pile, Some(key)), None);
+        let path = host.to_str().unwrap();
+        assert_eq!(
+            hear.clip(Some(&file_id), None).unwrap().as_ref(),
+            clip.as_slice()
+        );
+        assert_eq!(
+            hear.clip(None, Some(path)).unwrap().as_ref(),
+            clip.as_slice()
+        );
+        let error = hear.clip(Some(&folder_id), None).unwrap_err();
+        assert!(
+            error.chain().any(|cause| cause
+                .downcast_ref::<crate::mcp::input::NotAFile>()
+                .is_some()),
+            "{error:#}"
+        );
+        assert!(hear.clip(Some(&file_id), Some(path)).is_err());
+        // Without storage only a path can name the clip.
+        let bare = Hear::new(None);
+        assert_eq!(
+            bare.clip(None, Some(path)).unwrap().as_ref(),
+            clip.as_slice()
+        );
+        let error = bare.clip(Some(&file_id), None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("launcher-configured pile"),
+            "{error:#}"
+        );
     }
 }
