@@ -14,8 +14,8 @@ use crate::storage::Storage;
 use crate::{
     archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord, duplex,
     files, gauge, habits, headspace, hear, home, imagine, linkedin, mail, memory, message, orient,
-    patience, planner, posture, quota, reason, relations, secrets, teams, triage, viewer, voice,
-    web, wiki, world,
+    patience, planner, posture, quota, reason, relations, search, secrets, teams, triage, viewer,
+    voice, web, wiki, world,
 };
 
 /// Trusted launcher configuration, never supplied as MCP tool arguments.
@@ -125,6 +125,7 @@ impl Catalog {
             Box::new(quota::mcp::Quota::with_storage(storage.clone())),
             Box::new(reason::mcp::Reason::with_storage(storage.clone())),
             Box::new(relations::mcp::Relations::with_storage(storage.clone())),
+            Box::new(search::mcp::Search::with_storage(storage.clone())),
             Box::new(secrets::mcp::Secrets::with_storage(storage.clone())),
             Box::new(teams::mcp::Teams::with_storage(storage.clone())),
             Box::new(triage::mcp::Triage::with_storage(storage.clone())),

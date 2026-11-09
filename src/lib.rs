@@ -103,6 +103,7 @@ pub mod quota;
 pub mod reason;
 pub mod relations;
 pub mod schemas;
+pub mod search;
 pub mod spec;
 pub mod storage;
 pub mod teams;

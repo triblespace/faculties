@@ -147,10 +147,10 @@ launcher environment from adding another collection to the selected report.
 
 ### Library-first faculties, explicit frontends
 
-All 33 ordinary faculties have callable Rust operations, separate CLI and MCP
+Ordinary faculties have callable Rust operations, separate CLI and MCP
 adapters, and thin individual binaries. Viewer and the 11 capture binaries share
 one notebook-composition/capture API. The single `faculties` binary registers
-all adapters together: 218 tools, including `viewer_capture`. See the
+all adapters together, including `viewer_capture` and `search`. See the
 [complete inventory](#the-faculties) below.
 
 Shared operations own domain logic, resident inputs, observations and write
@@ -164,14 +164,15 @@ still link separately.
 ```sh
 atlas --pile ./self.pile list
 files --pile ./self.pile view <file-id> --accept image/png --max-dimension 1024
+search --pile ./self.pile --workspace <exact-revision> query "notification owner"
 faculties mcp --pile ./self.pile
 ```
 
 #### MCP server and launcher configuration
 
 `faculties mcp` implements MCP 2025-06-18 over stdio by default, or native
-Streamable HTTP with `--http-listen`. Both transports use the same 34 adapters,
-230 tools, argument decoding, and native image/audio/resource output. The
+Streamable HTTP with `--http-listen`. Both transports use the same adapters,
+tools, argument decoding, and native image/audio/resource output. The
 library's `mcp::catalog::{Config, Catalog}` constructs the aggregate independently
 of either transport, without opening storage, keys, devices, or models.
 This server is trusted software, not a filesystem, network, or model-runtime
@@ -723,6 +724,7 @@ schemas describe exact arguments and effects.
 | `quota` | Provider-reported subscription quota per window: record readings, show latest, pace and staleness |
 | `reason` | Reasoning notes and intended-action evidence |
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
+| `search` | One grouped lexical query: current Wiki text, selected Memory summaries and Files metadata; exact source identities and unavailable-source diagnostics |
 | `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |
 | `teams` | Resident Graph archive, explicit sync/actions and professional context |
 | `triage` | Execution-loop, timeline and context diagnostics |

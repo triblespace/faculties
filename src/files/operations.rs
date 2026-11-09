@@ -41,6 +41,18 @@ use triblespace_search::nvfp4::ReconstructedCosines;
 type FileHandle = Inline<inlineencodings::Handle<blobencodings::RawBytes>>;
 type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 
+/// One matching metadata reading. Equal bytes held by different entities
+/// retain different holders; no file body is searched or fetched here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SearchHit {
+    pub holder: String,
+    pub content: String,
+    pub name: String,
+    pub media_type: String,
+    pub tags: Vec<String>,
+    pub open: crate::search::OpenTarget,
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn now_tai() -> Result<Inline<inlineencodings::NsTAIInterval>> {
@@ -975,46 +987,76 @@ fn cmd_tag<P: TriblePattern>(
 
 /// The readings of [`cmd_list`] whose name, media type or tags contain the
 /// query.
-fn cmd_search<P: TriblePattern>(space: &P, reader: &PileSnapshot, query: &str) -> Result<String> {
+fn search_hits<P: TriblePattern>(
+    space: &P,
+    reader: &PileSnapshot,
+    query: &str,
+) -> Result<Vec<SearchHit>> {
     let needle = query.to_lowercase();
-    let mut hits: Vec<(String, String, String, Vec<String>)> = Vec::new();
-
+    let mut hits = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for (eid, h) in find!(
         (eid: Id, h: FileHandle),
         pattern!(space, [{ ?eid @ metadata::tag: &KIND_FILE, file::content: ?h }])
     ) {
         let names = or_absent(names_of(space, reader, eid)?, "?");
         let mimes = or_absent(media_types_of(space, reader, eid)?, "?");
-        let tags = tags_of(space, reader, eid, &[]);
-
+        let tags = texts(
+            reader,
+            find!(tag: TextHandle, pattern!(space, [{ eid @ file::tag: ?tag }])),
+            "read file search tag",
+        )?;
         let tag_match = tags.iter().any(|t| t.to_lowercase().contains(&needle));
         for mime in &mimes {
-            for fname in &names {
-                let fname_match = fname.to_lowercase().contains(&needle);
-                let mime_match = mime.to_lowercase().contains(&needle);
-                if fname_match || tag_match || mime_match {
-                    hits.push((handle_hex(h), fname.clone(), mime.clone(), tags.clone()));
+            for name in &names {
+                if (name.to_lowercase().contains(&needle)
+                    || mime.to_lowercase().contains(&needle)
+                    || tag_match)
+                    && seen.insert((eid, h, name.clone(), mime.clone(), tags.clone()))
+                {
+                    let content = handle_hex(h);
+                    hits.push(SearchHit {
+                        holder: fmt_id(eid),
+                        open: crate::search::OpenTarget::Files {
+                            id: content.clone(),
+                        },
+                        content,
+                        name: name.clone(),
+                        media_type: mime.clone(),
+                        tags: tags.clone(),
+                    });
                 }
             }
         }
     }
+    hits.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.holder.cmp(&b.holder))
+            .then(a.content.cmp(&b.content))
+            .then(a.media_type.cmp(&b.media_type))
+            .then(a.tags.cmp(&b.tags))
+    });
+    Ok(hits)
+}
 
-    hits.sort_by(|a, b| a.1.cmp(&b.1));
-
+fn render_search(query: &str, hits: &[SearchHit]) -> Result<String> {
     if hits.is_empty() {
         return Ok(format!("No files matching '{query}'\n"));
     }
-
     let mut output = String::new();
-    for (hash, fname, mime, tags) in &hits {
-        let tag_str = if tags.is_empty() {
+    for hit in hits {
+        let tag_str = if hit.tags.is_empty() {
             String::new()
         } else {
-            format!("  [{}]", tags.join(", "))
+            format!("  [{}]", hit.tags.join(", "))
         };
-        writeln!(output, "{}  {}  {}{}", hash, fname, mime, tag_str)?;
+        writeln!(
+            output,
+            "{}  {}  {}{}",
+            hit.content, hit.name, hit.media_type, tag_str
+        )?;
     }
-
     Ok(output)
 }
 
@@ -1742,11 +1784,22 @@ impl Files {
     }
 
     pub fn search(&self, query: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
-            rt.block_on(read(store, snapshot, |reader| {
-                cmd_search(facts, reader, query)
-            }))
-        })
+        render_search(query, &self.search_hits(query)?.hits)
+    }
+
+    pub fn search_hits(&self, query: &str) -> Result<crate::search::SourceRead<SearchHit>> {
+        with_files_view(
+            &self.storage,
+            |store, collection, _, facts, snapshot, rt| {
+                let hits = rt.block_on(read(store, snapshot, |reader| {
+                    search_hits(facts, reader, query)
+                }))?;
+                Ok(crate::search::SourceRead {
+                    collection: collection.handle(),
+                    hits,
+                })
+            },
+        )
     }
 
     /// Rank stored files by meaning (see [`cmd_similar`]), binding the WeMM

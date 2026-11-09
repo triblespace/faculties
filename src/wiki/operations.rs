@@ -80,6 +80,20 @@ pub struct ImportDocument {
     pub content: String,
 }
 
+/// One matching current revision reading, retaining its exact title/body.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SearchHit {
+    pub revision: String,
+    pub title: String,
+    pub title_handle: String,
+    pub content: String,
+    /// None means context was not requested, not that no body lines matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matching_lines: Option<Vec<String>>,
+    pub fork: bool,
+    pub open: crate::search::OpenTarget,
+}
+
 impl Wiki {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self::with_storage(Storage::new(pile, key))
@@ -171,6 +185,14 @@ impl Wiki {
     pub fn search(&self, query: &str, context: bool, all: bool) -> Result<String> {
         cmd_search(self.storage(), query.into(), context, all)
     }
+    pub fn search_hits(
+        &self,
+        query: &str,
+        context: bool,
+        all: bool,
+    ) -> Result<crate::search::SourceRead<SearchHit>> {
+        search_hits(self.storage(), query, context, all)
+    }
     /// Derive the WeMM rows the revisions' text is missing, with a model
     /// already bound: what `faculties maintain` runs whenever the pile grows.
     /// Writing a fragment never embeds.
@@ -221,6 +243,7 @@ struct WikiStorage<'a> {
 
 #[derive(Clone)]
 struct WikiView {
+    source: triblespace::core::collection::CollectionHandle,
     facts: FactArchive,
     reader: FacultySnapshot,
     latest: LatestIndex,
@@ -382,6 +405,7 @@ fn views_in<T>(
         );
     }
     let mut view = WikiView {
+        source: wiki_source.handle(),
         facts,
         reader,
         latest,
@@ -1748,50 +1772,83 @@ fn cmd_import(
     Ok(ids)
 }
 
-fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool) -> Result<String> {
+fn search_hits(
+    storage: WikiStorage<'_>,
+    query: &str,
+    context: bool,
+    all: bool,
+) -> Result<crate::search::SourceRead<SearchHit>> {
     let needle = query.to_ascii_lowercase();
-    let report = storage.view(|view| {
-        let mut entries = wiki_model::entries(&view.facts, &view.latest);
-        if !all {
-            entries.retain(|entry| {
-                !entry
+    storage.view(|view| {
+        let mut hits = Vec::new();
+        let mut seen = BTreeSet::new();
+        for entry in wiki_model::entries(&view.facts, &view.latest) {
+            if !all
+                && entry
                     .frontier
                     .iter()
                     .all(|revision| revision.tags.contains(&schema::TAG_ARCHIVED_ID))
-            });
-        }
-        let mut report = String::new();
-        for entry in entries {
+            {
+                continue;
+            }
             for head in &entry.frontier {
                 let title = revision_title(&view.reader, head)?;
                 let content_text = revision_content(&view.reader, head)?;
-                if title.to_ascii_lowercase().contains(&needle)
-                    || content_text.to_ascii_lowercase().contains(&needle)
+                if !(title.to_ascii_lowercase().contains(&needle)
+                    || content_text.to_ascii_lowercase().contains(&needle))
                 {
-                    writeln!(
-                        report,
-                        "{:x}  {title}{}",
-                        head.id,
-                        if entry.frontier.len() > 1 {
-                            "  [fork]"
-                        } else {
-                            ""
-                        }
-                    )
-                    .unwrap();
-                    if context {
-                        for line in content_text
+                    continue;
+                }
+                // Several authorship witnesses do not turn the same reading
+                // into several hits. Distinct titles/bodies remain distinct.
+                if !seen.insert((head.id, head.title, head.content)) {
+                    continue;
+                }
+                let revision = format!("{:x}", head.id);
+                hits.push(SearchHit {
+                    open: crate::search::OpenTarget::Wiki {
+                        id: revision.clone(),
+                        exact: true,
+                    },
+                    revision,
+                    title,
+                    title_handle: hex::encode(head.title.raw),
+                    content: hex::encode(head.content.raw),
+                    matching_lines: context.then(|| {
+                        content_text
                             .lines()
                             .filter(|line| line.to_ascii_lowercase().contains(&needle))
-                        {
-                            writeln!(report, "    {}", line.trim()).unwrap();
-                        }
-                    }
-                }
+                            .map(|line| line.trim().to_owned())
+                            .collect()
+                    }),
+                    fork: entry.frontier.len() > 1,
+                });
             }
         }
-        Ok(report)
-    })?;
+        Ok(crate::search::SourceRead {
+            collection: view.source,
+            hits,
+        })
+    })
+}
+
+fn cmd_search(storage: WikiStorage<'_>, query: String, context: bool, all: bool) -> Result<String> {
+    let mut report = String::new();
+    for hit in search_hits(storage, &query, context, all)?.hits {
+        writeln!(
+            report,
+            "{}  {}{}",
+            hit.revision,
+            hit.title,
+            if hit.fork { "  [fork]" } else { "" }
+        )
+        .unwrap();
+        if let Some(lines) = hit.matching_lines {
+            for line in lines {
+                writeln!(report, "    {line}").unwrap();
+            }
+        }
+    }
     Ok(report)
 }
 

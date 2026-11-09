@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `search query` and MCP `search` answer one lexical request across the selected
+  Wiki, Memory and Files roots. Results preserve exact selectors and content
+  identities, report unavailable sources separately from empty answers, and
+  limit deduplicated readings per source. Wiki searches current titles/bodies,
+  Memory retains BM25 over each chunk's least summary handle (and exposes its
+  alternative handles), and Files searches metadata only. The existing search
+  commands render the same typed projections; ties are deterministic and
+  identical query witnesses collapse. No model or manual index step is needed;
+  source observations are separately frozen, not an atomic cross-source read.
+  Missing Files tag payloads now fail search instead of silently disappearing;
+  undecodable text readings remain skipped. Other Files readers are unchanged.
+  Grouped Wiki results omit body-line context; ordinary Wiki search collects
+  matching lines only when context is explicitly requested.
+
 - No faculty has an index command any more: `memory index`, `wiki index` and
   `files index`, and the MCP tools `memory_index`, `wiki_index` and
   `files_index`, are gone. `faculties maintain` (wemm build, GB10) binds the

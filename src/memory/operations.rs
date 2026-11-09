@@ -14,6 +14,18 @@ pub struct Memory {
     storage: crate::storage::Storage,
 }
 
+/// BM25 still scores the least summary handle, as ordinary Memory recall
+/// does. Alternatives are identities, not additional scored documents.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct SearchHit {
+    pub chunk: String,
+    pub score: f32,
+    pub summary: String,
+    pub scored_summary: String,
+    pub summary_handles: Vec<String>,
+    pub open: crate::search::OpenTarget,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CreatedMemory {
     pub id: Id,
@@ -152,6 +164,9 @@ impl Memory {
     }
     pub fn search(&self, query: &str, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| search(storage, query, out))
+    }
+    pub fn search_hits(&self, query: &str) -> Result<crate::search::SourceRead<SearchHit>> {
+        self.with_operation(|storage| search_hits(storage, query))
     }
     /// Rank chunks by meaning (see [`similar`]), binding the WeMM model the
     /// environment names.
@@ -543,6 +558,7 @@ impl MemoryStorage<'_> {
     /// reads this; one whose answer depends on absence calls [`Self::load`].
     fn load_read(&self) -> Result<(LoadedMemory, usize)> {
         self.load_with(Self::attach_collection_read)
+            .map(|(loaded, unread, _)| (loaded, unread))
     }
 
     /// Freeze maintained Memory alone for ordinary commands.
@@ -550,7 +566,7 @@ impl MemoryStorage<'_> {
         self.load_with(|collection, snapshot, label| {
             Self::attach_collection(collection, snapshot, label).map(|view| (view, ()))
         })
-        .map(|(loaded, ())| loaded)
+        .map(|(loaded, (), _)| loaded)
     }
 
     fn load_with<U>(
@@ -560,9 +576,13 @@ impl MemoryStorage<'_> {
             &PileSnapshot,
             &str,
         ) -> Result<(CollectionView, U)>,
-    ) -> Result<(LoadedMemory, U)> {
+    ) -> Result<(
+        LoadedMemory,
+        U,
+        triblespace::core::collection::CollectionHandle,
+    )> {
         self.with_store(&[MEMORY_SCOPE_ID], |pile, signer, runtime| {
-            let collection = runtime.block_on(async {
+            let (source, collection) = runtime.block_on(async {
                 let source = self.storage.open_collection_local(
                     pile,
                     MEMORY_SCOPE_ID,
@@ -581,7 +601,7 @@ impl MemoryStorage<'_> {
                     .context("maintain Succinct Memory collection")?;
                 crate::storage::tolerate_own_lag(pile.maintain_attached(collection, signer).await)
                     .context("maintain Rank9 Memory collection")?;
-                Ok::<_, anyhow::Error>(collection)
+                Ok::<_, anyhow::Error>((source, collection))
             })?;
             let store_snapshot = AcquiringReader::new(
                 pile.snapshot()
@@ -589,7 +609,7 @@ impl MemoryStorage<'_> {
                 runtime.clone(),
             );
             let (memory, extra) = attach(collection, &store_snapshot, "Memory")?;
-            Ok((LoadedMemory { memory }, extra))
+            Ok((LoadedMemory { memory }, extra, source.handle()))
         })
     }
 
@@ -930,27 +950,62 @@ pub fn find_chunk_in_spans(
 
 // ── exact BM25 search over the frozen Memory collection ───────────────
 
-fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<()> {
+fn search_hits(
+    storage: MemoryStorage<'_>,
+    query: &str,
+) -> Result<crate::search::SourceRead<SearchHit>> {
     if query.is_empty() {
         bail!("memory search requires a query");
     }
-    let loaded = storage.load()?;
+    let (loaded, (), collection) = storage.load_with(|collection, snapshot, label| {
+        MemoryStorage::attach_collection(collection, snapshot, label).map(|view| (view, ()))
+    })?;
     let mut rows: Vec<(Id, f32)> = crate::memory_cover::lexical_relevance_scores(
         &loaded.memory.facts,
         &loaded.memory.reader,
-        &query,
+        query,
     )?
     .into_iter()
     .collect();
-    rows.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    if rows.is_empty() {
-        out.line(format!("no matches."))?;
-        return Ok(());
+    rows.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut hits = Vec::new();
+    for (chunk, score) in rows {
+        // This is the exact reading BM25 just scored, not whichever body
+        // happens to be resident when the frontend renders the result.
+        let handle = chunk_summary_handle(&loaded.memory.facts, chunk)
+            .context("a scored Memory chunk has no summary")?;
+        let text: View<str> = loaded
+            .memory
+            .reader
+            .get(handle)
+            .context("read scored Memory summary")?;
+        let summaries: BTreeSet<_> = find!(
+            handle: Inline<Handle<UTF8String>>,
+            pattern!(&loaded.memory.facts, [{ chunk @ ctx::summary: ?handle }])
+        )
+        .collect();
+        let chunk = format!("{chunk:x}");
+        hits.push(SearchHit {
+            open: crate::search::OpenTarget::Memory {
+                selector: chunk.clone(),
+            },
+            chunk,
+            score,
+            summary: text.as_ref().lines().next().unwrap_or("").to_owned(),
+            scored_summary: hex::encode(handle.raw),
+            summary_handles: summaries.into_iter().map(|h| hex::encode(h.raw)).collect(),
+        });
     }
-    for (chunk, score) in rows.into_iter().take(10) {
-        let summary = chunk_oneline(&loaded.memory.reader, &loaded.memory.facts, chunk);
-        out.line(format!("{score:6.2}  {chunk:x}  {summary}"))?;
+    Ok(crate::search::SourceRead { collection, hits })
+}
+
+fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<()> {
+    let hits = search_hits(storage, query)?.hits;
+    if hits.is_empty() {
+        return out.line("no matches.");
+    }
+    for hit in hits.into_iter().take(10) {
+        out.line(format!("{:6.2}  {}  {}", hit.score, hit.chunk, hit.summary))?;
     }
     Ok(())
 }
