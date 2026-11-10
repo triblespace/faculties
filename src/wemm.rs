@@ -1,5 +1,5 @@
 //! The one model the faculties search with: WeMM-Embedding-9B, native CUDA
-//! BF16 on a GB10, which places text, images and documents in one
+//! on a GB10, which places text, images and documents in one
 //! 4096-dimensional space. Files, Memory and Wiki each derive a collection of
 //! NVFP4 rows from their own source collection through
 //! [`triblespace_search::semantic_wemm`], keyed by content handle, and join it
@@ -39,6 +39,17 @@
 //! Two device-copy binds on one host take turns ([`copy_lock_path`]): each
 //! reads `MemAvailable` only after the one before it has finished copying.
 //! [`probe`] is an optional self-check for the maintenance daemon.
+//!
+//! [`PROFILE_ENV`] chooses the kernel profile, and with it which index a
+//! process derives and searches: `bf16` (the default) runs every projection
+//! in BF16 from a BF16 root, `w4a4` runs the decoder's 248 projections as
+//! NVFP4 W4A4 from a root that stores them as NVFP4 (`models_import wemm`).
+//! The root and the profile are both the index's identity, so each
+//! configuration has its own indexes, and a process only ever computes and
+//! scores rows of the one it actually bound: a query never reads another
+//! profile's index, and an index of this profile without rows is refused,
+//! not answered from another. The daemon and every query read the same two
+//! variables, so they agree exactly when they are configured alike.
 
 pub mod probe;
 
@@ -67,8 +78,7 @@ use triblespace::prelude::*;
 use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
 use triblespace_search::schemas::Embedding;
 use triblespace_search::semantic_wemm::{
-    with_wemm_runtime, WemmIdentity, WemmIndex, WemmRuntime, DEFAULT_WINDOW_CAP,
-    GB10_NATIVE_BF16_PROFILE,
+    with_wemm_runtime, WemmIdentity, WemmIndex, WemmProfile, WemmRuntime, DEFAULT_WINDOW_CAP,
 };
 
 type Index = WemmIndex<Embedding>;
@@ -76,6 +86,54 @@ type Target = Collection<NvFp4CosineSet<Embedding>>;
 
 /// WeMM-Embedding-9B's BF16 tensors, one alias registration each.
 const ROLES: usize = 759;
+
+/// The kernel profile: `bf16` or unset for every projection in BF16 (the
+/// default), `w4a4` for the decoder's projections as NVFP4 W4A4 from a root
+/// that stores them as NVFP4. Read once, when a [`Session`] binds; `WEMM_ROOT`
+/// must name a root of the matching kind, or the bind is refused.
+pub const PROFILE_ENV: &str = "WEMM_PROFILE";
+
+/// The kernel profile [`PROFILE_ENV`]'s value chooses. Any value other than
+/// unset, `bf16` or `w4a4` is refused, so a typo never silently selects the
+/// default (and with it another index).
+pub fn profile_from_env_value(value: Option<&std::ffi::OsStr>) -> Result<WemmProfile> {
+    let Some(value) = value else {
+        return Ok(WemmProfile::Bf16);
+    };
+    value.to_str().and_then(WemmProfile::parse).with_context(|| {
+        format!(
+            "{PROFILE_ENV} must be bf16 (every projection in BF16, the default), w4a4 (the decoder's projections as NVFP4 W4A4, from a root that stores them so) or unset; got {value:?}"
+        )
+    })
+}
+
+/// Whether `root` states decoder weights as stored NVFP4 leaves: what
+/// decides the one profile it can be bound with.
+fn stores_nvfp4_projections(facts: &TribleSet, root: Id) -> bool {
+    use mary::format::attrs;
+    use mary::leaf::leaf;
+    use triblespace::core::blob::encodings::tensor::elements::NVFP4;
+    exists!(pattern!(facts, [
+        { root @ attrs::member: _?member },
+        { _?member @ attrs::weight: _?weight },
+        { _?weight @ leaf::<NVFP4, 2>(): _?leaf }
+    ]))
+}
+
+/// Refuse a root `profile` cannot run, before any device work: a BF16 root
+/// under `w4a4` (the W4A4 profile never quantizes at load, so the root names
+/// the exact weights its kernels read) and an NVFP4 root under `bf16`.
+fn require_root_fits(profile: WemmProfile, root: Id, stores_nvfp4: bool) -> Result<()> {
+    match (profile, stores_nvfp4) {
+        (WemmProfile::Bf16, false) | (WemmProfile::W4a4, true) => Ok(()),
+        (WemmProfile::W4a4, false) => anyhow::bail!(
+            "WEMM_ROOT {root:X} stores its decoder projections in BF16, and {PROFILE_ENV}=w4a4 binds only a root that stores them as NVFP4 (made by `models_import wemm`); name that root, or unset {PROFILE_ENV} for this one"
+        ),
+        (WemmProfile::Bf16, true) => anyhow::bail!(
+            "WEMM_ROOT {root:X} stores its decoder projections as NVFP4, which the BF16 profile cannot run; set {PROFILE_ENV}=w4a4, or name the BF16 root"
+        ),
+    }
+}
 
 /// `1` copies the model's weights into device memory at bind; unset or `0`
 /// leaves them read in place from the pile's mapped pages (the default).
@@ -225,6 +283,7 @@ pub enum Query<'a> {
 pub struct Session {
     runtime: Rc<RefCell<WemmRuntime>>,
     identity: WemmIdentity,
+    profile: WemmProfile,
     residence: WeightResidence,
     tokenizer: Option<Id>,
     model: PathBuf,
@@ -269,10 +328,11 @@ pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolv
     })
 }
 
-/// What a bind is asked for: the model root, where its weights go, and for
-/// a device copy the margin [`COPY_MIN_FREE_ENV`] chose.
+/// What a bind is asked for: the model root, the kernel profile, where its
+/// weights go, and for a device copy the margin [`COPY_MIN_FREE_ENV`] chose.
 struct BindRequest {
     root: Id,
+    profile: WemmProfile,
     residence: WeightResidence,
     copy_min_free: u64,
 }
@@ -282,6 +342,7 @@ impl BindRequest {
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
+        let profile = profile_from_env_value(std::env::var_os(PROFILE_ENV).as_deref())?;
         let residence = residence_from_env_value(std::env::var_os(COPY_WEIGHTS_ENV).as_deref())?;
         // Read only when copying, so a malformed margin never stops a
         // zero-copy bind.
@@ -293,6 +354,7 @@ impl BindRequest {
         };
         Ok(Self {
             root,
+            profile,
             residence,
             copy_min_free,
         })
@@ -448,6 +510,7 @@ impl Session {
     fn bind(pile: &Path, request: BindRequest, host: &CopyHost) -> Result<Self> {
         let BindRequest {
             root,
+            profile,
             residence,
             copy_min_free,
         } = request;
@@ -469,6 +532,11 @@ impl Session {
             assets,
             ..
         } = resolve(&model, crate::model_storage::models_handle()?, root)?;
+        require_root_fits(
+            profile,
+            root,
+            stores_nvfp4_projections(snapshot.facts(), root),
+        )?;
         let codec: InputCodec = assets.codec().clone();
         let tokenizer = mary::selection::model_root_parts(snapshot.facts(), root)
             .ok()
@@ -488,7 +556,7 @@ impl Session {
         // rewritten in place while this process runs (module docs); every
         // aliased leaf lies in the prefix `snapshot` observed.
         let native = unsafe {
-            NativeWemm::from_frozen(
+            NativeWemm::from_frozen_with(
                 snapshot.facts(),
                 snapshot.store(),
                 root,
@@ -496,6 +564,8 @@ impl Session {
                 &mut aliases,
                 |_, _, _, payload| {
                     roles += 1;
+                    // A stored NVFP4 leaf's payload is its packed planes,
+                    // which is what goes to device memory.
                     if let Some(admission) = admission.as_mut() {
                         admission.select(payload.len() as u64).map_err(|e| {
                             format!("after selecting {roles} of {ROLES} tensors: {e}")
@@ -503,6 +573,7 @@ impl Session {
                     }
                     Ok(())
                 },
+                profile.precision(),
             )
         }?;
         if let Some(admission) = &admission {
@@ -520,11 +591,17 @@ impl Session {
             );
         }
         backing.require_still(&model)?;
-        let identity = WemmIdentity {
-            model_root: native.model_root(),
-            kernel_profile: GB10_NATIVE_BF16_PROFILE,
-        };
-        let runtime = WemmRuntime::from_native(identity, native, codec)?;
+        // The identity is read from what was bound, and must be what was
+        // asked for: never a label put on a model that runs otherwise.
+        let runtime = WemmRuntime::from_native(native, codec)?;
+        let identity = runtime.identity();
+        anyhow::ensure!(
+            identity.kernel_profile == profile.id() && identity.model_root == root,
+            "WEMM_ROOT {root:X} under {PROFILE_ENV}={} bound as root {:X}, profile {:X}",
+            profile.label(),
+            identity.model_root,
+            identity.kernel_profile
+        );
         eprintln!(
             "{}",
             bind_note(
@@ -535,13 +612,20 @@ impl Session {
                 aliases.stats().copied_bytes
             )
         );
+        eprintln!(
+            "wemm: kernel profile {} ({:X}), model root {:X}",
+            profile.label(),
+            identity.kernel_profile,
+            identity.model_root
+        );
         // The copy, and the two flushes after each tensor that free its host
-        // staging, completed inside from_frozen, so the next bind's
+        // staging, completed inside from_frozen_with, so the next bind's
         // MemAvailable reading already sees them: only now may it read.
         drop(admission);
         Ok(Self {
             runtime: Rc::new(RefCell::new(runtime)),
             identity,
+            profile,
             residence,
             tokenizer,
             model,
@@ -558,6 +642,17 @@ impl Session {
     /// Where this session's weights live.
     pub fn residence(&self) -> WeightResidence {
         self.residence
+    }
+
+    /// The model root and kernel profile this session actually bound: the
+    /// identity of every index it derives or searches.
+    pub fn identity(&self) -> WemmIdentity {
+        self.identity
+    }
+
+    /// The kernel profile this session bound.
+    pub fn profile(&self) -> WemmProfile {
+        self.profile
     }
 
     /// Start the [`probe`] self-check if [`probe::PROBE_DIR_ENV`] names a
@@ -586,6 +681,14 @@ impl Session {
             .unwrap_or_else(|_| "unknown".into());
         let identity = probe::Provenance::default()
             .with("model_root", format!("{:X}", self.identity.model_root))
+            .with(
+                "kernel_profile",
+                format!(
+                    "{} {:X}",
+                    self.profile.label(),
+                    self.identity.kernel_profile
+                ),
+            )
             .with(
                 "tokenizer_part",
                 self.tokenizer
@@ -700,13 +803,18 @@ impl Session {
             return Ok(Scores {
                 cosines: ReconstructedCosines::default(),
                 missing,
+                profile: self.profile,
             });
         }
         let cosines = with_wemm_runtime(Rc::clone(&self.runtime), || match query {
             Query::Text(text) => mapping.reconstructed_cosines(&index, text),
             Query::Content(bytes) => mapping.reconstructed_cosines_content(&index, bytes),
         })??;
-        Ok(Scores { cosines, missing })
+        Ok(Scores {
+            cosines,
+            missing,
+            profile: self.profile,
+        })
     }
 }
 
@@ -750,6 +858,8 @@ impl std::fmt::Display for Derived {
 pub struct Scores {
     pub cosines: ReconstructedCosines,
     pub missing: usize,
+    /// The profile of the index these rows are from, the session's own.
+    pub profile: WemmProfile,
 }
 
 impl Scores {
@@ -763,11 +873,13 @@ impl Scores {
         })
     }
 
-    /// The refusal for an index with no rows at all.
+    /// The refusal for an index with no rows at all. It names the profile:
+    /// an index of another profile is never searched in its place.
     pub fn require_rows(&self, faculty: &str) -> Result<()> {
         anyhow::ensure!(
             !self.cosines.is_empty(),
-            "the {faculty} WeMM index has no rows yet ({} commit(s) to derive); `faculties maintain` derives them on a GB10",
+            "the {faculty} WeMM index of the {} profile ({PROFILE_ENV}) has no rows yet ({} commit(s) to derive); `faculties maintain` configured alike derives them on a GB10",
+            self.profile.label(),
             self.missing
         );
         Ok(())
@@ -962,6 +1074,97 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_is_bf16_unless_w4a4_is_chosen_exactly() {
+        use std::ffi::OsStr;
+        use triblespace_search::semantic_wemm::{
+            GB10_NATIVE_BF16_PROFILE, GB10_NATIVE_W4A4_PROFILE,
+        };
+        // Unset is the BF16 profile, whose id every live index was derived
+        // under: an unconfigured process finds exactly the indexes it found.
+        let unset = profile_from_env_value(None).unwrap();
+        assert_eq!(unset, WemmProfile::Bf16);
+        assert_eq!(
+            unset.id(),
+            Id::from_hex("56AA6AA44ECDFF68B91CA45E39BC9EB6").unwrap()
+        );
+        assert_eq!(
+            profile_from_env_value(Some(OsStr::new("bf16"))).unwrap(),
+            WemmProfile::Bf16
+        );
+        let w4a4 = profile_from_env_value(Some(OsStr::new("w4a4"))).unwrap();
+        assert_eq!(w4a4, WemmProfile::W4a4);
+        assert_eq!(w4a4.id(), GB10_NATIVE_W4A4_PROFILE);
+        assert_ne!(GB10_NATIVE_W4A4_PROFILE, GB10_NATIVE_BF16_PROFILE);
+        for typo in ["", "W4A4", "fp4", " w4a4", "w4a16", "nvfp4", "BF16", "0"] {
+            let error = profile_from_env_value(Some(OsStr::new(typo))).unwrap_err();
+            assert!(error.to_string().contains(PROFILE_ENV), "{error}");
+        }
+    }
+
+    /// The root decides the profile it can be bound with: a BF16 root only
+    /// under bf16, a root storing NVFP4 projections only under w4a4.
+    #[test]
+    fn a_root_binds_only_under_the_profile_of_what_it_stores() {
+        use mary::format::attrs;
+        use mary::leaf::leaf;
+        use triblespace::core::blob::encodings::tensor::elements::{BF16, NVFP4};
+        use triblespace::core::inline::encodings::hash::Handle;
+        use triblespace::core::trible::Trible;
+        let root = Id::new([1; 16]).unwrap();
+        let (member, weight) = (Id::new([2; 16]).unwrap(), Id::new([3; 16]).unwrap());
+        let gen = |id: Id| -> Inline<triblespace::core::inline::encodings::genid::GenId> {
+            id.to_inline()
+        };
+        let mut bf16 = TribleSet::new();
+        bf16.insert(&Trible::force(&root, &attrs::member.id(), &gen(member)));
+        bf16.insert(&Trible::force(&member, &attrs::weight.id(), &gen(weight)));
+        let mut nvfp4 = bf16.clone();
+        bf16.insert(&Trible::force(
+            &weight,
+            &leaf::<BF16, 2>().id(),
+            &Inline::<Handle<triblespace::core::blob::encodings::tensor::Tensor<BF16, 2>>>::new(
+                [7; 32],
+            ),
+        ));
+        nvfp4.insert(&Trible::force(
+            &weight,
+            &leaf::<NVFP4, 2>().id(),
+            &Inline::<Handle<triblespace::core::blob::encodings::tensor::Tensor<NVFP4, 2>>>::new(
+                [8; 32],
+            ),
+        ));
+        assert!(!stores_nvfp4_projections(&bf16, root));
+        assert!(stores_nvfp4_projections(&nvfp4, root));
+        // Another root's NVFP4 leaves say nothing about this one.
+        assert!(!stores_nvfp4_projections(&nvfp4, Id::new([9; 16]).unwrap()));
+
+        assert!(require_root_fits(WemmProfile::Bf16, root, false).is_ok());
+        assert!(require_root_fits(WemmProfile::W4a4, root, true).is_ok());
+        let error = require_root_fits(WemmProfile::W4a4, root, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stores its decoder projections in BF16"),
+            "{error}"
+        );
+        let error = require_root_fits(WemmProfile::Bf16, root, true).unwrap_err();
+        assert!(error.to_string().contains("as NVFP4"), "{error}");
+        assert!(error.to_string().contains(PROFILE_ENV), "{error}");
+    }
+
+    #[test]
+    fn an_empty_index_is_refused_naming_its_profile() {
+        let scores = Scores {
+            cosines: ReconstructedCosines::default(),
+            missing: 3,
+            profile: WemmProfile::W4a4,
+        };
+        let error = scores.require_rows("Memory").unwrap_err().to_string();
+        assert!(error.contains("w4a4 profile"), "{error}");
+        assert!(error.contains(PROFILE_ENV), "{error}");
+    }
+
+    #[test]
     fn weights_stay_in_the_pile_unless_copying_is_chosen() {
         use std::ffi::OsStr;
         assert_eq!(
@@ -1097,6 +1300,7 @@ mod tests {
     fn request(residence: WeightResidence, copy_min_free: u64) -> BindRequest {
         BindRequest {
             root: Id::from_hex("85B6ACD39E6CB93EE8BA31FDEF6C4F4F").unwrap(),
+            profile: WemmProfile::Bf16,
             residence,
             copy_min_free,
         }
@@ -1480,6 +1684,193 @@ mod tests {
             .nth(1)
             .unwrap_or_default()
             .contains("crab.png"));
+        storage.close().unwrap();
+    }
+    /// The W4A4 profile on the real stored NVFP4 root. Needs a GB10 under the
+    /// gb10 lock, `WEMM_W4A4_PILE` (a WRITABLE copy of a pile whose `models`
+    /// collection `WEMM_GATE_MODELS` (64 hex digits; set as
+    /// `TRIBLESPACE_COLLECTION_MODELS` after the ambient routes are cleared)
+    /// holds the NVFP4 root
+    /// `WEMM_ROOT`, alone in its directory: the test initializes a signing
+    /// key beside it and writes Memory entries and their index into it), and
+    /// optionally `WEMM_GATE_PNG` (a PNG to journal as a wordless image).
+    ///
+    /// Checks, in order: the BF16 profile refuses the NVFP4 root before any
+    /// device work; a W4A4 bind's identity is the root and the W4A4 profile;
+    /// a row is the same alone and in a batch; Memory derives completely
+    /// under the W4A4 descriptor, which binds back to that identity and is
+    /// not the BF16 descriptor; a query finds what it should; and a mapping
+    /// of the BF16 profile neither computes here nor is scored by this
+    /// runtime.
+    #[test]
+    #[ignore = "requires a GB10, a writable pile holding the stored NVFP4 WeMM root"]
+    fn a_w4a4_bind_on_the_stored_root_derives_rows_under_its_own_descriptor() {
+        use crate::memory::operations::parse_time_range;
+        use crate::out::{Out, Part};
+        use triblespace::core::blob::encodings::rawbytes::RawBytes;
+        use triblespace::core::blob::{IntoBlob, TryFromBlob};
+        use triblespace::core::inline::encodings::hash::Handle;
+        use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+        use triblespace::core::trible::Trible;
+        use triblespace_search::semantic_wemm::GB10_NATIVE_W4A4_PROFILE;
+
+        let pile = PathBuf::from(std::env::var("WEMM_W4A4_PILE").unwrap());
+        let models = std::env::var("WEMM_GATE_MODELS").unwrap();
+        let root = Id::from_hex(&std::env::var("WEMM_ROOT").unwrap()).unwrap();
+        let png = std::env::var_os("WEMM_GATE_PNG").map(|p| std::fs::read(p).unwrap());
+        crate::test_support::clear_ambient_environment();
+        std::env::set_var("TRIBLESPACE_COLLECTION_MODELS", models);
+        crate::storage::initialize_signer(&pile, None).unwrap();
+        let host = CopyHost::this_host();
+        let bind = |profile| {
+            Session::bind(
+                &pile,
+                BindRequest {
+                    root,
+                    profile,
+                    residence: WeightResidence::PileAliased,
+                    copy_min_free: 0,
+                },
+                &host,
+            )
+        };
+
+        let Err(refused) = bind(WemmProfile::Bf16) else {
+            panic!("the BF16 profile bound a root that stores NVFP4 projections");
+        };
+        let refused = format!("{refused:#}");
+        eprintln!("refused bf16 on the NVFP4 root: {refused}");
+        assert!(refused.contains("as NVFP4"), "{refused}");
+
+        let started = Instant::now();
+        let session = bind(WemmProfile::W4a4).unwrap();
+        eprintln!("wemm w4a4 bind {:.1} s", started.elapsed().as_secs_f64());
+        assert_eq!(
+            session.identity(),
+            WemmIdentity {
+                model_root: root,
+                kernel_profile: GB10_NATIVE_W4A4_PROFILE,
+            }
+        );
+
+        // Every row is computed independently: a text's row alone and in a
+        // batch of four are the same bytes (after the early forwards).
+        {
+            let mut runtime = session.runtime.borrow_mut();
+            for _ in 0..probe::EARLY_FORWARDS {
+                runtime.probe_texts(&probe::PROBE_TEXTS).unwrap();
+            }
+            let batch = runtime.probe_texts(&probe::PROBE_TEXTS).unwrap().raw;
+            for (at, text) in probe::PROBE_TEXTS.iter().enumerate() {
+                let alone = runtime.probe_texts(&[text]).unwrap().raw;
+                assert_eq!(
+                    alone,
+                    batch[at * 8192..(at + 1) * 8192],
+                    "text {at}: its row alone differs from its row in the batch"
+                );
+            }
+            eprintln!(
+                "identity batch-invariant rows: {} texts alone == in their batch",
+                probe::PROBE_TEXTS.len()
+            );
+        }
+
+        let storage = crate::storage::Storage::shared(pile.clone(), None);
+        let memory = crate::memory::Memory::with_storage(storage.clone());
+        let day = |n: u32| {
+            parse_time_range(&format!("2026-01-0{n}T08:00:00..2026-01-0{n}T09:00:00")).unwrap()
+        };
+        let texts = [
+            "We repaired the bicycle chain in the garage and oiled the rusty gears.",
+            "The sourdough starter finally rose, and we baked two loaves of rye bread.",
+            "A thunderstorm knocked out the power, so we read by candlelight all evening.",
+            "We tuned the guitar and practised the chord progression for the new song.",
+        ];
+        let chunks: Vec<Id> = texts
+            .iter()
+            .zip(1..)
+            .map(|(text, n)| memory.create(text, Some(day(n)), &[]).unwrap().id)
+            .collect();
+        let crab = png
+            .as_ref()
+            .map(|png| memory.image(png, day(5)).unwrap().id);
+
+        let started = Instant::now();
+        let derived = memory.derive_wemm(&session).unwrap();
+        eprintln!(
+            "derived {derived} ({:.1} s)",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(derived.missing, 0, "{derived}");
+        assert!(
+            derived.rows >= texts.len() + usize::from(crab.is_some()),
+            "{derived}"
+        );
+
+        // The index derived into is the W4A4 descriptor: it binds back to the
+        // session's identity, and the BF16 descriptor of the same root and
+        // content is another descriptor.
+        let snapshot = mary::persist::read_model_pile_snapshot_read_only(&pile).unwrap();
+        let blob: triblespace::core::blob::Blob<SimpleArchive> =
+            snapshot.get(derived.index).unwrap();
+        let described = Fragment::from(TribleSet::try_from_blob(blob).unwrap());
+        let mapping = Index::bind(&Fragment::empty(), &described).unwrap();
+        assert_eq!(mapping.identity(), session.identity());
+        eprintln!(
+            "index {} descriptor binds to root {:X} profile {:X}",
+            hex::encode(derived.index.raw),
+            mapping.identity().model_root,
+            mapping.identity().kernel_profile
+        );
+        let bf16 = Index::new(
+            mapping.content_attributes(),
+            WemmIdentity {
+                model_root: root,
+                kernel_profile: WemmProfile::Bf16.id(),
+            },
+            DEFAULT_WINDOW_CAP,
+        )
+        .unwrap();
+        assert_ne!(bf16.fragment().root(), mapping.fragment().root());
+
+        let mut report = String::new();
+        let mut emit = |part: Part| {
+            if let Part::Text { text } = part {
+                report.push_str(&text);
+            }
+            Ok(())
+        };
+        memory
+            .similar_with(&session, "baking bread at home", &mut Out::new(&mut emit))
+            .unwrap();
+        eprintln!("query: {report}");
+        assert!(report
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(&format!("{:x}", chunks[1])));
+
+        // A mapping of another profile is neither computable here nor
+        // computed: this runtime refuses it rather than embed under W4A4.
+        let mut facts = TribleSet::new();
+        let content = mapping.content_attributes().next().unwrap();
+        facts.insert(&Trible::force(
+            &Id::new([1; 16]).unwrap(),
+            &content,
+            &Inline::<Handle<RawBytes>>::new([5; 32]),
+        ));
+        let mut repo = triblespace::core::repo::memoryrepo::MemoryRepo::default();
+        let reader = repo.snapshot().unwrap();
+        let (computable, refusal) = with_wemm_runtime(Rc::clone(&session.runtime), || {
+            (
+                (bf16.computable_here(), mapping.computable_here()),
+                bf16.map(&facts.to_blob(), &reader).unwrap_err().to_string(),
+            )
+        })
+        .unwrap();
+        eprintln!("refused bf16 mapping under the w4a4 runtime: {refusal}");
+        assert_eq!(computable, (false, true));
+        assert!(refusal.contains("does not match"), "{refusal}");
         storage.close().unwrap();
     }
 }
