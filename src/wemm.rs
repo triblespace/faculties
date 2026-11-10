@@ -181,6 +181,14 @@ pub fn admit_copy(
     if needed.is_some_and(|needed| available >= needed) {
         return Ok(());
     }
+    if copy_bytes == 0 {
+        // The check made before any tensor is selected: only the margin.
+        return Err(format!(
+            "{COPY_WEIGHTS_ENV}=1 refused before copying: {COPY_MIN_FREE_ENV} alone, {min_free} bytes ({:.2} GiB) to keep free beyond the weights, exceeds host MemAvailable {available} bytes ({:.2} GiB), before any weight is counted; unset {COPY_WEIGHTS_ENV} to read the weights zero-copy from the pile",
+            gib(min_free),
+            gib(available)
+        ));
+    }
     let needed = needed.map_or_else(|| "more than 2^64".to_owned(), |n| n.to_string());
     Err(format!(
         "{COPY_WEIGHTS_ENV}=1 refused before copying: the weights need {copy_bytes} bytes ({:.2} GiB) of device memory, which on this box is host RAM, and {COPY_MIN_FREE_ENV} keeps {min_free} bytes ({:.2} GiB) free beyond them, {needed} bytes in all, but host MemAvailable is {available} bytes ({:.2} GiB); unset {COPY_WEIGHTS_ENV} to read the weights zero-copy from the pile",
@@ -806,8 +814,25 @@ mod tests {
         assert!(admit_copy(Some(8 << 30), WEMM_PAYLOAD, margin).is_err());
         // The margin alone can refuse, before any tensor is selected.
         assert!(admit_copy(Some(margin - 1), 0, margin).is_err());
+        // One byte over the weights is still a weights refusal.
+        let error = admit_copy(Some(margin), 1, margin).unwrap_err();
+        assert!(error.contains("the weights need 1 bytes"), "{error}");
         // A sum past 2^64 is refused, not wrapped into a small number.
         assert!(admit_copy(Some(u64::MAX), u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn the_margin_alone_refusal_says_what_was_compared() {
+        let margin = DEFAULT_COPY_MIN_FREE_BYTES;
+        let error = admit_copy(Some(margin - 1), 0, margin).unwrap_err();
+        // No weights were counted yet, so none are named.
+        assert!(!error.contains("need 0 bytes"), "{error}");
+        assert!(
+            error.contains(&format!("{COPY_MIN_FREE_ENV} alone")),
+            "{error}"
+        );
+        assert!(error.contains(&margin.to_string()), "{error}");
+        assert!(error.contains(&(margin - 1).to_string()), "{error}");
     }
 
     #[test]
