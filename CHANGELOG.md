@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- WeMM indexes name the model collection: an index's identity is the
+  collection `TRIBLESPACE_COLLECTION_MODELS` names, the root `WEMM_ROOT`
+  names, and the profile `WEMM_PROFILE` chooses. `Session::bind` resolves the
+  root in that collection only, never in another, records the collection it
+  actually bound from, and refuses a runtime whose identity is not exactly the
+  one asked for. A query searches only the index of the exact (collection,
+  root, profile) it bound; there is no fallback. This changes every WeMM index
+  identity, so all Memory, Wiki and Files WeMM indexes are derived again once
+  by `faculties maintain`; until then `similar` refuses with "no rows yet" and
+  `memory context --about` falls back to BM25. Moving the model to another
+  collection gives new indexes the same way. The probe's provenance names
+  the collection.
+
 - `search query` and MCP `search` answer one lexical request across the selected
   Wiki, Memory and Files roots. Results preserve exact selectors and content
   identities, report unavailable sources separately from empty answers, and

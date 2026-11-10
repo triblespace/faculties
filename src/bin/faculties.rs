@@ -76,13 +76,15 @@ enum Command {
     /// grows. Prints a line for an index only when a pass derived something
     /// or left something missing. Exits 0 when a compaction replaces the
     /// pile file, so its supervisor restarts it on the new one.
-    /// Needs a GB10, the complete WeMM root in the pile's models collection,
-    /// and WEMM_ROOT naming it. WEMM_PROFILE chooses the kernel profile:
-    /// bf16 (unset, the default) from a BF16 root, or w4a4 (the decoder's
-    /// projections as NVFP4 W4A4) from a root that stores them as NVFP4. A
-    /// process derives only the indexes of the root and profile it binds,
-    /// so two daemons configured differently keep two sets of indexes, and
-    /// a query reads the indexes of its own configuration. WEMM_COPY_WEIGHTS=1 copies the weights into
+    /// Needs a GB10, the complete WeMM root in the models collection
+    /// TRIBLESPACE_COLLECTION_MODELS names (the root is looked for there and
+    /// nowhere else), and WEMM_ROOT naming it. WEMM_PROFILE chooses the
+    /// kernel profile: bf16 (unset, the default) from a BF16 root, or w4a4
+    /// (the decoder's projections as NVFP4 W4A4) from a root that stores
+    /// them as NVFP4. An index's identity is the collection, the root and
+    /// the profile, so a process derives only the indexes of the three it
+    /// binds, two daemons configured differently keep two sets of indexes,
+    /// and a query reads the indexes of its own configuration. WEMM_COPY_WEIGHTS=1 copies the weights into
     /// device memory instead of reading them from the pile in place; it is
     /// refused unless host MemAvailable covers the weights plus
     /// WEMM_COPY_MIN_FREE_BYTES (default 16 GiB), a margin that must also

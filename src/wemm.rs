@@ -44,12 +44,18 @@
 //! process derives and searches: `bf16` (the default) runs every projection
 //! in BF16 from a BF16 root, `w4a4` runs the decoder's 248 projections as
 //! NVFP4 W4A4 from a root that stores them as NVFP4 (`models_import wemm`).
-//! The root and the profile are both the index's identity, so each
-//! configuration has its own indexes, and a process only ever computes and
-//! scores rows of the one it actually bound: a query never reads another
-//! profile's index, and an index of this profile without rows is refused,
-//! not answered from another. The daemon and every query read the same two
-//! variables, so they agree exactly when they are configured alike.
+//! The model collection, the root and the profile are all the index's
+//! identity (JP, 2026-11-10: an index describes fully where its model lives),
+//! so each configuration has its own indexes, and a process only ever
+//! computes and scores rows of the one it actually bound: a query never reads
+//! another collection's or profile's index, and an index of this
+//! configuration without rows is refused, not answered from another. The
+//! root is resolved only within the collection `TRIBLESPACE_COLLECTION_MODELS`
+//! names, never searched for in another, and the collection recorded is the
+//! one the bind read it from. Moving the model to another collection
+//! therefore gives new indexes, derived again. The daemon and every query
+//! read the same three variables, so they agree exactly when they are
+//! configured alike.
 
 pub mod probe;
 
@@ -78,7 +84,8 @@ use triblespace::prelude::*;
 use triblespace_search::nvfp4::{NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
 use triblespace_search::schemas::Embedding;
 use triblespace_search::semantic_wemm::{
-    with_wemm_runtime, WemmIdentity, WemmIndex, WemmProfile, WemmRuntime, DEFAULT_WINDOW_CAP,
+    collection_hex, with_wemm_runtime, WemmIdentity, WemmIndex, WemmProfile, WemmRuntime,
+    DEFAULT_WINDOW_CAP,
 };
 
 type Index = WemmIndex<Embedding>;
@@ -133,6 +140,27 @@ fn require_root_fits(profile: WemmProfile, root: Id, stores_nvfp4: bool) -> Resu
             "WEMM_ROOT {root:X} stores its decoder projections as NVFP4, which the BF16 profile cannot run; set {PROFILE_ENV}=w4a4, or name the BF16 root"
         ),
     }
+}
+
+/// Refuse a runtime whose identity, read from what was bound, is not the one
+/// asked for: another collection, root or profile would put rows under an
+/// index the configuration does not name. There is no fallback.
+fn require_bound_as_asked(
+    bound: WemmIdentity,
+    asked: WemmIdentity,
+    profile: WemmProfile,
+) -> Result<()> {
+    anyhow::ensure!(
+        bound == asked,
+        "TRIBLESPACE_COLLECTION_MODELS {} / WEMM_ROOT {:X} under {PROFILE_ENV}={} bound as collection {}, root {:X}, profile {:X}",
+        collection_hex(asked.model_collection),
+        asked.model_root,
+        profile.label(),
+        collection_hex(bound.model_collection),
+        bound.model_root,
+        bound.kernel_profile
+    );
+    Ok(())
 }
 
 /// `1` copies the model's weights into device memory at bind; unset or `0`
@@ -315,7 +343,8 @@ pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolv
         )
         .next()
         .is_some(),
-        "WEMM_ROOT {root:X} is not stated by the model collection of {}",
+        "WEMM_ROOT {root:X} is not stated by the model collection {} (TRIBLESPACE_COLLECTION_MODELS) of {}; a root is resolved only in the collection named, never looked for in another",
+        collection_hex(handle),
         pile.display()
     );
     let assets = Assets::from_model_root(snapshot.facts(), snapshot.store(), root)
@@ -328,9 +357,11 @@ pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolv
     })
 }
 
-/// What a bind is asked for: the model root, the kernel profile, where its
-/// weights go, and for a device copy the margin [`COPY_MIN_FREE_ENV`] chose.
+/// What a bind is asked for: the model collection and the root in it, the
+/// kernel profile, where its weights go, and for a device copy the margin
+/// [`COPY_MIN_FREE_ENV`] chose.
 struct BindRequest {
+    collection: CollectionHandle,
     root: Id,
     profile: WemmProfile,
     residence: WeightResidence,
@@ -339,6 +370,9 @@ struct BindRequest {
 
 impl BindRequest {
     fn from_env() -> Result<Self> {
+        // The exact descriptor TRIBLESPACE_COLLECTION_MODELS names, as for
+        // every model: the root is resolved in it and nowhere else.
+        let collection = crate::model_storage::models_handle()?;
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
@@ -353,6 +387,7 @@ impl BindRequest {
             WeightResidence::PileAliased => 0,
         };
         Ok(Self {
+            collection,
             root,
             profile,
             residence,
@@ -501,14 +536,16 @@ impl CopyAdmission {
 }
 
 impl Session {
-    /// Bind the model `WEMM_ROOT` names from the `models` collection of the
-    /// pile at `pile`, the pile its indexes are written to as well.
+    /// Bind the model `WEMM_ROOT` names from the `models` collection
+    /// `TRIBLESPACE_COLLECTION_MODELS` names in the pile at `pile`, the pile
+    /// its indexes are written to as well.
     pub fn from_env(pile: &Path) -> Result<Self> {
         Self::bind(pile, BindRequest::from_env()?, &CopyHost::this_host())
     }
 
     fn bind(pile: &Path, request: BindRequest, host: &CopyHost) -> Result<Self> {
         let BindRequest {
+            collection,
             root,
             profile,
             residence,
@@ -531,7 +568,7 @@ impl Session {
             root,
             assets,
             ..
-        } = resolve(&model, crate::model_storage::models_handle()?, root)?;
+        } = resolve(&model, collection, root)?;
         require_root_fits(
             profile,
             root,
@@ -591,17 +628,20 @@ impl Session {
             );
         }
         backing.require_still(&model)?;
-        // The identity is read from what was bound, and must be what was
-        // asked for: never a label put on a model that runs otherwise.
-        let runtime = WemmRuntime::from_native(native, codec)?;
+        // The identity is read from what was bound (the collection from the
+        // snapshot the model was bound from), and must be what was asked
+        // for: never a label put on a model that runs otherwise.
+        let runtime = WemmRuntime::from_native(native, codec, &snapshot)?;
         let identity = runtime.identity();
-        anyhow::ensure!(
-            identity.kernel_profile == profile.id() && identity.model_root == root,
-            "WEMM_ROOT {root:X} under {PROFILE_ENV}={} bound as root {:X}, profile {:X}",
-            profile.label(),
-            identity.model_root,
-            identity.kernel_profile
-        );
+        require_bound_as_asked(
+            identity,
+            WemmIdentity {
+                model_collection: collection,
+                model_root: root,
+                kernel_profile: profile.id(),
+            },
+            profile,
+        )?;
         eprintln!(
             "{}",
             bind_note(
@@ -613,10 +653,11 @@ impl Session {
             )
         );
         eprintln!(
-            "wemm: kernel profile {} ({:X}), model root {:X}",
+            "wemm: kernel profile {} ({:X}), model root {:X}, model collection {}",
             profile.label(),
             identity.kernel_profile,
-            identity.model_root
+            identity.model_root,
+            collection_hex(identity.model_collection)
         );
         // The copy, and the two flushes after each tensor that free its host
         // staging, completed inside from_frozen_with, so the next bind's
@@ -644,8 +685,8 @@ impl Session {
         self.residence
     }
 
-    /// The model root and kernel profile this session actually bound: the
-    /// identity of every index it derives or searches.
+    /// The model collection, model root and kernel profile this session
+    /// actually bound: the identity of every index it derives or searches.
     pub fn identity(&self) -> WemmIdentity {
         self.identity
     }
@@ -681,6 +722,10 @@ impl Session {
             .unwrap_or_else(|_| "unknown".into());
         let identity = probe::Provenance::default()
             .with("model_root", format!("{:X}", self.identity.model_root))
+            .with(
+                "model_collection",
+                collection_hex(self.identity.model_collection),
+            )
             .with(
                 "kernel_profile",
                 format!(
@@ -727,7 +772,8 @@ impl Session {
 
     /// The index over `attributes` of `source`: one descriptor from every
     /// machine, registered idempotently. The descriptor names the model by
-    /// its complete root alone, so it carries no blob of its own.
+    /// its collection's descriptor handle and its complete root, so it
+    /// carries no blob of its own.
     fn register(
         &self,
         store: &mut FacultyStore,
@@ -1152,6 +1198,81 @@ mod tests {
         assert!(error.to_string().contains(PROFILE_ENV), "{error}");
     }
 
+    /// A bind whose runtime reads back another collection, root or profile
+    /// than was asked for is refused, naming both; only the exact identity
+    /// asked for passes.
+    #[test]
+    fn a_bound_identity_other_than_the_one_asked_for_is_refused() {
+        let asked = WemmIdentity {
+            model_collection: triblespace::core::inline::Inline::new([0xa0; 32]),
+            model_root: Id::new([1; 16]).unwrap(),
+            kernel_profile: WemmProfile::W4a4.id(),
+        };
+        assert!(require_bound_as_asked(asked, asked, WemmProfile::W4a4).is_ok());
+        let mut others = [asked; 3];
+        others[0].model_collection = triblespace::core::inline::Inline::new([0xb0; 32]);
+        others[1].model_root = Id::new([2; 16]).unwrap();
+        others[2].kernel_profile = WemmProfile::Bf16.id();
+        for bound in others {
+            let error = require_bound_as_asked(bound, asked, WemmProfile::W4a4)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&collection_hex(asked.model_collection))
+                    && error.contains(&collection_hex(bound.model_collection)),
+                "{error}"
+            );
+        }
+    }
+
+    /// The root is resolved only in the collection named: a pile with the
+    /// root in one `models` collection refuses it from another, and names
+    /// the collection; the collection that states it gets past that check
+    /// (and then fails on the stand-in root's missing parts, which shows
+    /// it was read there). No device is touched.
+    #[test]
+    fn a_root_is_resolved_only_in_the_collection_named() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::pile::Pile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models.pile");
+        std::fs::File::create(&path).unwrap();
+        let root = Id::new([0x51; 16]).unwrap();
+        let other = Id::new([0x52; 16]).unwrap();
+        let member = Id::new([0x53; 16]).unwrap();
+        let mut pile = Pile::open(&path).unwrap();
+        let mut models = Vec::new();
+        for (seed, subject) in [(0x61u8, root), (0x62, other)] {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            let policy = CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            );
+            let collection = pile.collection("models", policy).unwrap();
+            let facts = entity! { ExclusiveId::force_ref(&subject) @
+                mary::format::attrs::member: member,
+            };
+            pile.commit(collection, &key, facts).unwrap();
+            models.push(collection.handle());
+        }
+        pile.close().unwrap();
+        assert_ne!(models[0], models[1], "two collections");
+        let error = match resolve(&path, models[1], root) {
+            Ok(_) => panic!("resolved a root its collection does not state"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains("is not stated by the model collection")
+                && error.contains(&collection_hex(models[1])),
+            "{error}"
+        );
+        let error = match resolve(&path, models[0], root) {
+            Ok(_) => panic!("a stand-in root resolved as a complete model"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(!error.contains("is not stated"), "{error}");
+    }
+
     #[test]
     fn an_empty_index_is_refused_naming_its_profile() {
         let scores = Scores {
@@ -1299,6 +1420,10 @@ mod tests {
 
     fn request(residence: WeightResidence, copy_min_free: u64) -> BindRequest {
         BindRequest {
+            collection: mary::model_collection::parse_collection_handle(
+                "a03d075c3cc31e5644b80dda054d0d59ec5b6c898cae1305143de055b0fb75e7",
+            )
+            .unwrap(),
             root: Id::from_hex("85B6ACD39E6CB93EE8BA31FDEF6C4F4F").unwrap(),
             profile: WemmProfile::Bf16,
             residence,
@@ -1696,11 +1821,15 @@ mod tests {
     /// optionally `WEMM_GATE_PNG` (a PNG to journal as a wordless image).
     ///
     /// Checks, in order: the BF16 profile refuses the NVFP4 root before any
-    /// device work; a W4A4 bind's identity is the root and the W4A4 profile;
-    /// a row is the same alone and in a batch; Memory derives completely
-    /// under the W4A4 descriptor, which binds back to that identity and is
-    /// not the BF16 descriptor; a query finds what it should; and a mapping
-    /// of the BF16 profile neither computes here nor is scored by this
+    /// device work; a bind naming another `models` collection of the same
+    /// pile, which does not state the root, is refused (the root is never
+    /// looked for elsewhere); a W4A4 bind's identity is the collection, the
+    /// root and the W4A4 profile; a row is the same alone and in a batch;
+    /// Memory derives completely under the W4A4 descriptor, which binds back
+    /// to that identity, names the collection, and is neither the BF16
+    /// descriptor nor the descriptor of the same root in another collection;
+    /// a query finds what it should; and mappings of the BF16 profile or of
+    /// another collection neither compute here nor are computed by this
     /// runtime.
     #[test]
     #[ignore = "requires a GB10, a writable pile holding the stored NVFP4 WeMM root"]
@@ -1716,16 +1845,18 @@ mod tests {
 
         let pile = PathBuf::from(std::env::var("WEMM_W4A4_PILE").unwrap());
         let models = std::env::var("WEMM_GATE_MODELS").unwrap();
+        let collection = mary::model_collection::parse_collection_handle(&models).unwrap();
         let root = Id::from_hex(&std::env::var("WEMM_ROOT").unwrap()).unwrap();
         let png = std::env::var_os("WEMM_GATE_PNG").map(|p| std::fs::read(p).unwrap());
         crate::test_support::clear_ambient_environment();
         std::env::set_var("TRIBLESPACE_COLLECTION_MODELS", models);
         crate::storage::initialize_signer(&pile, None).unwrap();
         let host = CopyHost::this_host();
-        let bind = |profile| {
+        let bind_in = |collection, profile| {
             Session::bind(
                 &pile,
                 BindRequest {
+                    collection,
                     root,
                     profile,
                     residence: WeightResidence::PileAliased,
@@ -1734,6 +1865,7 @@ mod tests {
                 &host,
             )
         };
+        let bind = |profile| bind_in(collection, profile);
 
         let Err(refused) = bind(WemmProfile::Bf16) else {
             panic!("the BF16 profile bound a root that stores NVFP4 projections");
@@ -1742,15 +1874,57 @@ mod tests {
         eprintln!("refused bf16 on the NVFP4 root: {refused}");
         assert!(refused.contains("as NVFP4"), "{refused}");
 
+        // Another `models` collection in the same pile, which states
+        // something but not the root: asked for, it is refused, although
+        // the pile's other collection holds the root.
+        let elsewhere = {
+            use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+            let key = SigningKey::from_bytes(&[0x5e; 32]);
+            let policy = CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            );
+            let mut store = triblespace::core::repo::pile::Pile::open(&pile).unwrap();
+            let elsewhere = store.collection("models", policy).unwrap();
+            let subject = Id::new([0x5e; 16]).unwrap();
+            let facts = entity! { ExclusiveId::force_ref(&subject) @
+                mary::format::attrs::member: Id::new([0x5f; 16]).unwrap(),
+            };
+            store.commit(elsewhere, &key, facts).unwrap();
+            store.close().unwrap();
+            elsewhere.handle()
+        };
+        assert_ne!(elsewhere, collection);
+        let Err(refused) = bind_in(elsewhere, WemmProfile::W4a4) else {
+            panic!("bound the root from a collection that does not state it");
+        };
+        let refused = format!("{refused:#}");
+        eprintln!(
+            "refused the root from collection {}: {refused}",
+            collection_hex(elsewhere)
+        );
+        assert!(
+            refused.contains("is not stated by the model collection")
+                && refused.contains(&collection_hex(elsewhere)),
+            "{refused}"
+        );
+
         let started = Instant::now();
         let session = bind(WemmProfile::W4a4).unwrap();
         eprintln!("wemm w4a4 bind {:.1} s", started.elapsed().as_secs_f64());
         assert_eq!(
             session.identity(),
             WemmIdentity {
+                model_collection: collection,
                 model_root: root,
                 kernel_profile: GB10_NATIVE_W4A4_PROFILE,
             }
+        );
+        eprintln!(
+            "identity collection {} root {:X} profile {:X}",
+            collection_hex(session.identity().model_collection),
+            session.identity().model_root,
+            session.identity().kernel_profile
         );
 
         // Every row is computed independently: a text's row alone and in a
@@ -1808,30 +1982,44 @@ mod tests {
         );
 
         // The index derived into is the W4A4 descriptor: it binds back to the
-        // session's identity, and the BF16 descriptor of the same root and
-        // content is another descriptor.
+        // session's identity, collection included, and the BF16 descriptor
+        // of the same root and content, and the descriptor of the same root
+        // and profile in another collection, are other descriptors.
         let snapshot = mary::persist::read_model_pile_snapshot_read_only(&pile).unwrap();
         let blob: triblespace::core::blob::Blob<SimpleArchive> =
             snapshot.get(derived.index).unwrap();
         let described = Fragment::from(TribleSet::try_from_blob(blob).unwrap());
         let mapping = Index::bind(&Fragment::empty(), &described).unwrap();
         assert_eq!(mapping.identity(), session.identity());
+        assert_eq!(mapping.identity().model_collection, collection);
         eprintln!(
-            "index {} descriptor binds to root {:X} profile {:X}",
+            "index {} mapping {:X} descriptor binds to collection {} root {:X} profile {:X}",
             hex::encode(derived.index.raw),
+            mapping.fragment().root().unwrap(),
+            collection_hex(mapping.identity().model_collection),
             mapping.identity().model_root,
             mapping.identity().kernel_profile
         );
         let bf16 = Index::new(
             mapping.content_attributes(),
             WemmIdentity {
-                model_root: root,
                 kernel_profile: WemmProfile::Bf16.id(),
+                ..session.identity()
             },
             DEFAULT_WINDOW_CAP,
         )
         .unwrap();
         assert_ne!(bf16.fragment().root(), mapping.fragment().root());
+        let moved = Index::new(
+            mapping.content_attributes(),
+            WemmIdentity {
+                model_collection: elsewhere,
+                ..session.identity()
+            },
+            DEFAULT_WINDOW_CAP,
+        )
+        .unwrap();
+        assert_ne!(moved.fragment().root(), mapping.fragment().root());
 
         let mut report = String::new();
         let mut emit = |part: Part| {
@@ -1850,8 +2038,9 @@ mod tests {
             .unwrap_or_default()
             .contains(&format!("{:x}", chunks[1])));
 
-        // A mapping of another profile is neither computable here nor
-        // computed: this runtime refuses it rather than embed under W4A4.
+        // A mapping of another profile or another collection is neither
+        // computable here nor computed: this runtime refuses it rather than
+        // put rows under an index it did not bind.
         let mut facts = TribleSet::new();
         let content = mapping.content_attributes().next().unwrap();
         facts.insert(&Trible::force(
@@ -1861,16 +2050,39 @@ mod tests {
         ));
         let mut repo = triblespace::core::repo::memoryrepo::MemoryRepo::default();
         let reader = repo.snapshot().unwrap();
-        let (computable, refusal) = with_wemm_runtime(Rc::clone(&session.runtime), || {
+        let (computable, refusals) = with_wemm_runtime(Rc::clone(&session.runtime), || {
             (
-                (bf16.computable_here(), mapping.computable_here()),
-                bf16.map(&facts.to_blob(), &reader).unwrap_err().to_string(),
+                (
+                    bf16.computable_here(),
+                    moved.computable_here(),
+                    mapping.computable_here(),
+                ),
+                [
+                    bf16.map(&facts.clone().to_blob(), &reader)
+                        .unwrap_err()
+                        .to_string(),
+                    moved
+                        .map(&facts.to_blob(), &reader)
+                        .unwrap_err()
+                        .to_string(),
+                ],
             )
         })
         .unwrap();
-        eprintln!("refused bf16 mapping under the w4a4 runtime: {refusal}");
-        assert_eq!(computable, (false, true));
-        assert!(refusal.contains("does not match"), "{refusal}");
+        eprintln!(
+            "refused bf16 mapping under the w4a4 runtime: {}",
+            refusals[0]
+        );
+        eprintln!(
+            "refused the mapping of collection {} under the runtime bound from {}: {}",
+            collection_hex(elsewhere),
+            collection_hex(collection),
+            refusals[1]
+        );
+        assert_eq!(computable, (false, false, true));
+        for refusal in &refusals {
+            assert!(refusal.contains("does not match"), "{refusal}");
+        }
         storage.close().unwrap();
     }
 }
