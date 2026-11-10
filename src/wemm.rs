@@ -33,6 +33,9 @@
 //! memory and bind time, and is off unless chosen. On a GB10 that device
 //! memory is host RAM no cgroup limit sees, so the bind refuses unless host
 //! `MemAvailable` covers the weights plus [`COPY_MIN_FREE_ENV`]'s margin.
+//! Only the payload is counted; the margin must also cover what the copy
+//! costs beyond it (CubeCL's pooling and the copy-time host staging, about
+//! 4.7 GiB for WeMM-9B), so a margin of 0 can overshoot `MemAvailable`.
 //! [`probe`] is an optional self-check for the maintenance daemon.
 
 pub mod probe;
@@ -123,6 +126,14 @@ pub fn bind_note(
 /// [`COPY_WEIGHTS_ENV`]` = 1` may copy them; unset means
 /// [`DEFAULT_COPY_MIN_FREE_BYTES`]. A decimal byte count; anything else is
 /// refused rather than read as the default.
+///
+/// It is not only headroom. The admission counts the weights' payload bytes
+/// and nothing else, while the copy costs more than that at its peak:
+/// CubeCL's pool reserves device memory beyond the payload (0.91 GiB for
+/// WeMM-9B), and the copy stages transient host buffers (up to 3.79 GiB
+/// measured for WeMM-9B on sky, 2026-11-10). This margin must cover both, so
+/// a margin below about 4.7 GiB, 0 among them, can admit a bind whose peak
+/// overshoots `MemAvailable`.
 pub const COPY_MIN_FREE_ENV: &str = "WEMM_COPY_MIN_FREE_BYTES";
 
 /// 16 GiB. On a GB10 a device copy is host RAM that neither `MemoryMax` nor

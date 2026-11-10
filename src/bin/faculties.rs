@@ -78,10 +78,14 @@ enum Command {
     /// pile file, so its supervisor restarts it on the new one.
     /// Needs a GB10, the complete WeMM root in the pile's models collection,
     /// and WEMM_ROOT naming it. WEMM_COPY_WEIGHTS=1 copies the weights into
-    /// device memory instead of reading them from the pile in place, and
+    /// device memory instead of reading them from the pile in place; it is
+    /// refused unless host MemAvailable covers the weights plus
+    /// WEMM_COPY_MIN_FREE_BYTES (default 16 GiB), a margin that must also
+    /// cover CubeCL's pooling and the copy's transient host staging (about
+    /// 4.7 GiB for WeMM-9B), so 0 can overshoot MemAvailable.
     /// WEMM_PROBE_DIR=<dir> turns on a probe self-check that logs agreement
-    /// or disagreement of a fixed batch (faculties::wemm::probe). Both are
-    /// read once at startup and are off when unset.
+    /// or disagreement of a fixed batch (faculties::wemm::probe). Copying and
+    /// the probe are read once at startup and are off when unset.
     #[cfg(feature = "wemm")]
     Maintain {
         #[arg(long, env = "PILE")]
