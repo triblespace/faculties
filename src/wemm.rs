@@ -319,9 +319,14 @@ pub const COPY_LOCK_WAIT: Duration = Duration::from_secs(300);
 /// removed: removing a held lock file would let the next bind lock a new
 /// file beside it. One fixed rule with no fallback, so every process finds
 /// the same file; it covers the processes of one user, which is every WeMM
-/// process on sky. Zero-copy binds take no lock.
+/// process on sky. Zero-copy binds take no lock. A `HOME` that is empty or
+/// relative names no fixed file (each working directory would get its own),
+/// so it counts as unset.
 pub fn copy_lock_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/wemm-device-copy.lock"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".cache/wemm-device-copy.lock"))
 }
 
 /// An exclusive advisory lock (`flock`) on a file that is never removed,
@@ -1188,20 +1193,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wemm-device-copy.lock");
         let (held, is_held) = std::sync::mpsc::channel();
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder = {
             let path = path.clone();
+            let released = released.clone();
             std::thread::spawn(move || {
                 let lock = CopyLock::acquire(&path, Duration::ZERO).unwrap();
                 held.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(400));
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
                 drop(lock);
             })
         };
         is_held.recv().unwrap();
-        let started = Instant::now();
         let _lock = CopyLock::acquire(&path, Duration::from_secs(30)).unwrap();
+        // Ordering, not wall time: the waiter holds the lock only after the
+        // first copy has let it go.
         assert!(
-            started.elapsed() >= Duration::from_millis(300),
+            released.load(std::sync::atomic::Ordering::SeqCst),
             "it did not wait for the first copy"
         );
         holder.join().unwrap();
