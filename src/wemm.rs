@@ -36,6 +36,8 @@
 //! Only the payload is counted; the margin must also cover what the copy
 //! costs beyond it (CubeCL's pooling and the copy-time host staging, about
 //! 4.7 GiB for WeMM-9B), so a margin of 0 can overshoot `MemAvailable`.
+//! Two device-copy binds on one host take turns ([`copy_lock_path`]): each
+//! reads `MemAvailable` only after the one before it has finished copying.
 //! [`probe`] is an optional self-check for the maintenance daemon.
 
 pub mod probe;
@@ -51,6 +53,7 @@ use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
@@ -296,32 +299,118 @@ impl BindRequest {
     }
 }
 
-/// Where a device-copy bind reads the host's memory: `/proc/meminfo`, or a
-/// test's stand-in.
+/// How long a device-copy bind waits for another one on this host to finish
+/// copying before it is refused. A bind takes 30 to 110 s, so this is a
+/// few binds; the wait never hangs on a holder that is stuck.
+pub const COPY_LOCK_WAIT: Duration = Duration::from_secs(300);
+
+/// The file every device-copy bind of this user locks:
+/// `$HOME/.cache/wemm-device-copy.lock`, or `None` without `HOME`.
+///
+/// `MemAvailable` is read once per bind, so two binds that read it at the
+/// same moment (a `faculties maintain` restart overlapping a Memory, Wiki or
+/// Files command) would each be admitted against memory only one of them
+/// can have, and together take twice the copy. So a bind takes an exclusive
+/// `flock` on this file before it reads `MemAvailable` and keeps it until
+/// its copy and the flushes after each tensor have completed, when the copy
+/// is already in device memory and so in the next reader's `MemAvailable`.
+/// A second bind waits up to [`COPY_LOCK_WAIT`], then is refused. A process
+/// that dies releases its lock with its file descriptors. The file is never
+/// removed: removing a held lock file would let the next bind lock a new
+/// file beside it. One fixed rule with no fallback, so every process finds
+/// the same file; it covers the processes of one user, which is every WeMM
+/// process on sky. Zero-copy binds take no lock.
+pub fn copy_lock_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/wemm-device-copy.lock"))
+}
+
+/// An exclusive advisory lock (`flock`) on a file that is never removed,
+/// released when it is dropped.
+struct CopyLock {
+    _file: std::fs::File,
+}
+
+impl CopyLock {
+    /// Lock `path`, creating it and its directory if need be, waiting at
+    /// most `wait` while another holder has it.
+    fn acquire(path: &Path, wait: Duration) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open the WeMM device-copy lock {}", path.display()))?;
+        let started = Instant::now();
+        let mut waiting = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("lock {}", path.display()))
+                }
+            }
+            let waited = started.elapsed();
+            if waited >= wait {
+                anyhow::bail!(
+                    "{COPY_WEIGHTS_ENV}=1 refused: another device copy on this host still holds {} after {:.1} s; each copy waits for the one before it, so that it reads MemAvailable after that copy is in device memory, and gives up after {} s; retry once that one has bound, or unset {COPY_WEIGHTS_ENV} to read the weights zero-copy from the pile",
+                    path.display(),
+                    waited.as_secs_f64(),
+                    wait.as_secs_f64()
+                );
+            }
+            if !waiting {
+                eprintln!(
+                    "wemm: waiting for another device copy on this host to finish ({} is held)",
+                    path.display()
+                );
+                waiting = true;
+            }
+            std::thread::sleep((wait - waited).min(Duration::from_millis(100)));
+        }
+    }
+}
+
+/// Where a device-copy bind reads the host's memory and whom it takes turns
+/// with: `/proc/meminfo` and [`copy_lock_path`], or a test's stand-ins.
 struct CopyHost {
     meminfo: PathBuf,
+    lock: Option<PathBuf>,
+    wait: Duration,
 }
 
 impl CopyHost {
     fn this_host() -> Self {
         Self {
             meminfo: PathBuf::from("/proc/meminfo"),
+            lock: copy_lock_path(),
+            wait: COPY_LOCK_WAIT,
         }
     }
 }
 
 /// A device copy admitted against one `MemAvailable` reading: the margin
-/// alone when it begins, then the weights as each tensor is selected.
+/// alone when it begins, then the weights as each tensor is selected. It
+/// holds the host's copy lock from before the reading until it is dropped.
 struct CopyAdmission {
     available: u64,
     min_free: u64,
     selected: u64,
+    _lock: CopyLock,
 }
 
 impl CopyAdmission {
-    /// Read `MemAvailable` and admit the margin alone; an unreadable
-    /// `MemAvailable` is refused.
+    /// Take the host's copy lock, then read `MemAvailable` and admit the
+    /// margin alone; an unreadable `MemAvailable` is refused.
     fn begin(host: &CopyHost, min_free: u64) -> Result<Self> {
+        let path = host.lock.as_deref().with_context(|| {
+            format!("{COPY_WEIGHTS_ENV}=1 refused: HOME is not set, so the device-copy lock $HOME/.cache/wemm-device-copy.lock cannot be found")
+        })?;
+        let lock = CopyLock::acquire(path, host.wait)?;
         let available = std::fs::read_to_string(&host.meminfo)
             .ok()
             .and_then(|text| mem_available_bytes(&text));
@@ -332,6 +421,7 @@ impl CopyAdmission {
             available: available.unwrap_or(0),
             min_free,
             selected: 0,
+            _lock: lock,
         })
     }
 
@@ -440,6 +530,10 @@ impl Session {
                 aliases.stats().copied_bytes
             )
         );
+        // The copy, and the two flushes after each tensor that free its host
+        // staging, completed inside from_frozen, so the next bind's
+        // MemAvailable reading already sees them: only now may it read.
+        drop(admission);
         Ok(Self {
             runtime: Rc::new(RefCell::new(runtime)),
             identity,
@@ -988,7 +1082,11 @@ mod tests {
             format!("MemTotal:       127533080 kB\nMemAvailable:   {available_kib} kB\n"),
         )
         .unwrap();
-        CopyHost { meminfo }
+        CopyHost {
+            meminfo,
+            lock: Some(dir.join("cache/wemm-device-copy.lock")),
+            wait: Duration::from_millis(200),
+        }
     }
 
     fn request(residence: WeightResidence, copy_min_free: u64) -> BindRequest {
@@ -1030,6 +1128,7 @@ mod tests {
         // An unreadable MemAvailable refuses the same way.
         let unreadable = CopyHost {
             meminfo: dir.path().join("no-such-meminfo"),
+            ..copy_host(dir.path(), "unused", 0)
         };
         let error = bind_error(&pile, request(WeightResidence::DeviceCopy, 0), &unreadable);
         assert!(error.contains("could not be read"), "{error}");
@@ -1051,6 +1150,91 @@ mod tests {
                 "{error}"
             );
         }
+
+        // Every bind above released the copy lock when it returned, and a
+        // copy waits for one that holds it while a zero-copy bind does not.
+        let lock = roomy.lock.as_deref().unwrap();
+        let other = CopyLock::acquire(lock, Duration::ZERO).unwrap();
+        let error = bind_error(&pile, request(WeightResidence::DeviceCopy, margin), &roomy);
+        assert!(error.contains("still holds"), "{error}");
+        let error = bind_error(&pile, request(WeightResidence::PileAliased, margin), &roomy);
+        assert!(error.contains("absent.pile"), "{error}");
+        drop(other);
+    }
+
+    /// Two contenders open the lock file separately, so they hold separate
+    /// open file descriptions: for `flock` that is the same as two processes.
+    #[test]
+    fn a_second_device_copy_waits_for_the_first_and_then_gives_up_clearly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache/wemm-device-copy.lock");
+        let first = CopyLock::acquire(&path, Duration::ZERO).unwrap();
+        let started = Instant::now();
+        let Err(error) = CopyLock::acquire(&path, Duration::from_millis(300)) else {
+            panic!("two device copies held the lock at once");
+        };
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let error = format!("{error:#}");
+        assert!(error.contains(COPY_WEIGHTS_ENV), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        drop(first);
+        // Released, never removed: the next copy locks the same file.
+        assert!(path.exists());
+        let _next = CopyLock::acquire(&path, Duration::ZERO).unwrap();
+    }
+
+    #[test]
+    fn a_waiting_device_copy_proceeds_once_the_first_has_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wemm-device-copy.lock");
+        let (held, is_held) = std::sync::mpsc::channel();
+        let holder = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let lock = CopyLock::acquire(&path, Duration::ZERO).unwrap();
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                drop(lock);
+            })
+        };
+        is_held.recv().unwrap();
+        let started = Instant::now();
+        let _lock = CopyLock::acquire(&path, Duration::from_secs(30)).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "it did not wait for the first copy"
+        );
+        holder.join().unwrap();
+    }
+
+    /// The lock spans the reading: an admission takes it before it reads
+    /// MemAvailable (with the lock held elsewhere, even an unreadable
+    /// meminfo is not reached) and keeps it until it is dropped.
+    #[test]
+    fn an_admission_holds_the_copy_lock_from_before_its_reading_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = copy_host(dir.path(), "meminfo", 1 << 30);
+        let lock = host.lock.clone().unwrap();
+        let unreadable = CopyHost {
+            meminfo: dir.path().join("no-such-meminfo"),
+            ..copy_host(dir.path(), "unused", 0)
+        };
+        let other = CopyLock::acquire(&lock, Duration::ZERO).unwrap();
+        let Err(error) = CopyAdmission::begin(&unreadable, 0) else {
+            panic!("admitted with no MemAvailable");
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("still holds"), "{error}");
+        assert!(CopyAdmission::begin(&host, 0).is_err());
+        drop(other);
+
+        let admission = CopyAdmission::begin(&host, 0).unwrap();
+        assert!(
+            CopyLock::acquire(&lock, Duration::ZERO).is_err(),
+            "an admitted copy did not hold the lock"
+        );
+        drop(admission);
+        CopyLock::acquire(&lock, Duration::ZERO).unwrap();
     }
 
     #[test]
