@@ -79,9 +79,10 @@ enum Command {
     /// Needs a GB10, the complete WeMM root in the models collection
     /// TRIBLESPACE_COLLECTION_MODELS names (the root is looked for there and
     /// nowhere else), and WEMM_ROOT naming it. WEMM_PROFILE chooses the
-    /// kernel profile: bf16 (unset, the default) from a BF16 root, or w4a4
+    /// kernel profile: bf16 (unset, the default) from a BF16 root, w4a4
     /// (the decoder's projections as NVFP4 W4A4) from a root that stores
-    /// them as NVFP4. An index's identity is the collection, the root and
+    /// them as NVFP4, or w4a4-vw4a16 (that decoder plus the vision linears as
+    /// NVFP4 on W4A16) from a root that stores both so. An index's identity is the collection, the root and
     /// the profile, so a process derives only the indexes of the three it
     /// binds, two daemons configured differently keep two sets of indexes,
     /// and a query reads the indexes of its own configuration. WEMM_COPY_WEIGHTS=1 copies the weights into

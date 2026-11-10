@@ -43,7 +43,10 @@
 //! [`PROFILE_ENV`] chooses the kernel profile, and with it which index a
 //! process derives and searches: `bf16` (the default) runs every projection
 //! in BF16 from a BF16 root, `w4a4` runs the decoder's 248 projections as
-//! NVFP4 W4A4 from a root that stores them as NVFP4 (`models_import wemm`).
+//! NVFP4 W4A4 from a root that stores them as NVFP4 (`models_import wemm`),
+//! and `w4a4-vw4a16` runs that decoder and the vision tower's 83 NVFP4
+//! linears on the W4A16 lane from a root that stores both as NVFP4
+//! (`models_import wemm --vision-nvfp4`).
 //! The model collection, the root and the profile are all the index's
 //! identity (JP, 2026-11-10: an index describes fully where its model lives),
 //! so each configuration has its own indexes, and a process only ever
@@ -96,50 +99,116 @@ const ROLES: usize = 759;
 
 /// The kernel profile: `bf16` or unset for every projection in BF16 (the
 /// default), `w4a4` for the decoder's projections as NVFP4 W4A4 from a root
-/// that stores them as NVFP4. Read once, when a [`Session`] binds; `WEMM_ROOT`
-/// must name a root of the matching kind, or the bind is refused.
+/// that stores them as NVFP4, `w4a4-vw4a16` for that decoder plus the vision
+/// tower's 83 NVFP4 linears on the W4A16 lane, from a root that stores both
+/// as NVFP4 (`models_import wemm --vision-nvfp4`). Read once, when a
+/// [`Session`] binds; `WEMM_ROOT` must name a root of the matching kind, or
+/// the bind is refused.
 pub const PROFILE_ENV: &str = "WEMM_PROFILE";
 
 /// The kernel profile [`PROFILE_ENV`]'s value chooses. Any value other than
-/// unset, `bf16` or `w4a4` is refused, so a typo never silently selects the
-/// default (and with it another index).
+/// unset, `bf16`, `w4a4` or `w4a4-vw4a16` is refused, so a typo never
+/// silently selects the default (and with it another index).
 pub fn profile_from_env_value(value: Option<&std::ffi::OsStr>) -> Result<WemmProfile> {
     let Some(value) = value else {
         return Ok(WemmProfile::Bf16);
     };
     value.to_str().and_then(WemmProfile::parse).with_context(|| {
         format!(
-            "{PROFILE_ENV} must be bf16 (every projection in BF16, the default), w4a4 (the decoder's projections as NVFP4 W4A4, from a root that stores them so) or unset; got {value:?}"
+            "{PROFILE_ENV} must be bf16 (every projection in BF16, the default), w4a4 (the decoder's projections as NVFP4 W4A4, from a root that stores them so), w4a4-vw4a16 (that decoder and the vision linears as NVFP4 on W4A16, from a root that stores both so) or unset; got {value:?}"
         )
     })
 }
 
-/// Whether `root` states decoder weights as stored NVFP4 leaves: what
-/// decides the one profile it can be bound with.
-fn stores_nvfp4_projections(facts: &TribleSet, root: Id) -> bool {
-    use mary::format::attrs;
-    use mary::leaf::leaf;
-    use triblespace::core::blob::encodings::tensor::elements::NVFP4;
-    exists!(pattern!(facts, [
-        { root @ attrs::member: _?member },
-        { _?member @ attrs::weight: _?weight },
-        { _?weight @ leaf::<NVFP4, 2>(): _?leaf }
-    ]))
+/// Which of a root's linears it stores as NVFP4 leaves: what decides the
+/// one profile it can be bound with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StoredNvfp4 {
+    /// Decoder projections (`gdn_mixer::is_decoder_projection`).
+    decoder: bool,
+    /// Vision linears (`gdn_mixer::is_vision_nvfp4_linear`).
+    vision: bool,
 }
 
-/// Refuse a root `profile` cannot run, before any device work: a BF16 root
-/// under `w4a4` (the W4A4 profile never quantizes at load, so the root names
-/// the exact weights its kernels read) and an NVFP4 root under `bf16`.
-fn require_root_fits(profile: WemmProfile, root: Id, stores_nvfp4: bool) -> Result<()> {
-    match (profile, stores_nvfp4) {
-        (WemmProfile::Bf16, false) | (WemmProfile::W4a4, true) => Ok(()),
-        (WemmProfile::W4a4, false) => anyhow::bail!(
-            "WEMM_ROOT {root:X} stores its decoder projections in BF16, and {PROFILE_ENV}=w4a4 binds only a root that stores them as NVFP4 (made by `models_import wemm`); name that root, or unset {PROFILE_ENV} for this one"
-        ),
-        (WemmProfile::Bf16, true) => anyhow::bail!(
-            "WEMM_ROOT {root:X} stores its decoder projections as NVFP4, which the BF16 profile cannot run; set {PROFILE_ENV}=w4a4, or name the BF16 root"
-        ),
+/// What `root` stores as NVFP4 leaves, by the names of its NVFP4 members.
+/// An NVFP4 member of any other name says nothing about either (open world).
+fn stored_nvfp4(
+    facts: &TribleSet,
+    store: &impl triblespace::core::repo::BlobStoreGet,
+    root: Id,
+) -> Result<StoredNvfp4> {
+    use mary::format::attrs;
+    use mary::leaf::leaf;
+    use mary::models::qwen3_5::gdn_mixer::{is_decoder_projection, is_vision_nvfp4_linear};
+    use triblespace::core::blob::encodings::tensor::elements::NVFP4;
+    let mut stored = StoredNvfp4::default();
+    for (path,) in find!(
+        (path: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
+        pattern!(facts, [
+            { root @ attrs::member: _?member },
+            { _?member @ attrs::safetensor_path: ?path, attrs::weight: _?weight },
+            { _?weight @ leaf::<NVFP4, 2>(): _?leaf }
+        ])
+    ) {
+        let name: anybytes::View<str> = store
+            .get(path)
+            .map_err(|e| anyhow::anyhow!("WEMM_ROOT {root:X}: read an NVFP4 member's name: {e}"))?;
+        stored.decoder |= is_decoder_projection(&name);
+        stored.vision |= is_vision_nvfp4_linear(&name);
     }
+    Ok(stored)
+}
+
+/// Refuse a root `profile` cannot run, before any device work. An NVFP4
+/// profile never quantizes at load, so the root names the exact weights its
+/// kernels read: `w4a4` needs a root storing its decoder projections, and
+/// only them, as NVFP4; `w4a4-vw4a16` one storing both its decoder
+/// projections and its vision linears so; `bf16` a root storing neither.
+fn require_root_fits(profile: WemmProfile, root: Id, stored: StoredNvfp4) -> Result<()> {
+    let wants = match profile {
+        WemmProfile::Bf16 => StoredNvfp4 {
+            decoder: false,
+            vision: false,
+        },
+        WemmProfile::W4a4 => StoredNvfp4 {
+            decoder: true,
+            vision: false,
+        },
+        WemmProfile::W4a4Vw4a16 => StoredNvfp4 {
+            decoder: true,
+            vision: true,
+        },
+    };
+    if stored == wants {
+        return Ok(());
+    }
+    let kind = |nvfp4: bool| if nvfp4 { "as NVFP4" } else { "in BF16" };
+    let fits = match stored {
+        StoredNvfp4 {
+            decoder: false,
+            vision: false,
+        } => "unset it (bf16)",
+        StoredNvfp4 {
+            decoder: true,
+            vision: false,
+        } => "set it to w4a4",
+        StoredNvfp4 {
+            decoder: true,
+            vision: true,
+        } => "set it to w4a4-vw4a16",
+        StoredNvfp4 {
+            decoder: false,
+            vision: true,
+        } => "no profile runs this root",
+    };
+    anyhow::bail!(
+        "WEMM_ROOT {root:X} stores its decoder projections {} and its vision linears {}, which {PROFILE_ENV}={} cannot run (it binds only a root storing them {} and {}, made by `models_import wemm`); {fits}, or name the root this profile runs",
+        kind(stored.decoder),
+        kind(stored.vision),
+        profile.label(),
+        kind(wants.decoder),
+        kind(wants.vision),
+    )
 }
 
 /// Refuse a runtime whose identity, read from what was bound, is not the one
@@ -572,7 +641,7 @@ impl Session {
         require_root_fits(
             profile,
             root,
-            stores_nvfp4_projections(snapshot.facts(), root),
+            stored_nvfp4(snapshot.facts(), snapshot.store(), root)?,
         )?;
         let codec: InputCodec = assets.codec().clone();
         let tokenizer = mary::selection::model_root_parts(snapshot.facts(), root)
@@ -593,7 +662,7 @@ impl Session {
         // rewritten in place while this process runs (module docs); every
         // aliased leaf lies in the prefix `snapshot` observed.
         let native = unsafe {
-            NativeWemm::from_frozen_with(
+            NativeWemm::from_frozen_with_vision(
                 snapshot.facts(),
                 snapshot.store(),
                 root,
@@ -611,6 +680,7 @@ impl Session {
                     Ok(())
                 },
                 profile.precision(),
+                profile.vision_precision(),
             )
         }?;
         if let Some(admission) = &admission {
@@ -1120,10 +1190,11 @@ mod tests {
     }
 
     #[test]
-    fn the_profile_is_bf16_unless_w4a4_is_chosen_exactly() {
+    fn the_profile_is_bf16_unless_another_is_chosen_exactly() {
+        use mary::models::qwen3_5::gdn_mixer::DecoderPrecision;
         use std::ffi::OsStr;
         use triblespace_search::semantic_wemm::{
-            GB10_NATIVE_BF16_PROFILE, GB10_NATIVE_W4A4_PROFILE,
+            GB10_NATIVE_BF16_PROFILE, GB10_NATIVE_W4A4_PROFILE, GB10_NATIVE_W4A4_VW4A16_PROFILE,
         };
         // Unset is the BF16 profile, whose id every live index was derived
         // under: an unconfigured process finds exactly the indexes it found.
@@ -1141,61 +1212,161 @@ mod tests {
         assert_eq!(w4a4, WemmProfile::W4a4);
         assert_eq!(w4a4.id(), GB10_NATIVE_W4A4_PROFILE);
         assert_ne!(GB10_NATIVE_W4A4_PROFILE, GB10_NATIVE_BF16_PROFILE);
-        for typo in ["", "W4A4", "fp4", " w4a4", "w4a16", "nvfp4", "BF16", "0"] {
+        let vision = profile_from_env_value(Some(OsStr::new("w4a4-vw4a16"))).unwrap();
+        assert_eq!(vision, WemmProfile::W4a4Vw4a16);
+        assert_eq!(
+            vision.id(),
+            Id::from_hex("673F5BA327F6D89F52773B4EAA13537B").unwrap()
+        );
+        assert_eq!(vision.id(), GB10_NATIVE_W4A4_VW4A16_PROFILE);
+        assert_eq!(
+            (vision.precision(), vision.vision_precision()),
+            (DecoderPrecision::W4a4, DecoderPrecision::W4a16)
+        );
+        assert_eq!(
+            (w4a4.precision(), w4a4.vision_precision()),
+            (DecoderPrecision::W4a4, DecoderPrecision::Bf16)
+        );
+        for typo in [
+            "",
+            "W4A4",
+            "fp4",
+            " w4a4",
+            "w4a16",
+            "nvfp4",
+            "BF16",
+            "0",
+            "w4a4-vw4a4",
+            "W4A4-VW4A16",
+            "w4a4vw4a16",
+            "w4a4-vw4a16 ",
+            "vw4a16",
+        ] {
             let error = profile_from_env_value(Some(OsStr::new(typo))).unwrap_err();
             assert!(error.to_string().contains(PROFILE_ENV), "{error}");
         }
     }
 
-    /// The root decides the profile it can be bound with: a BF16 root only
-    /// under bf16, a root storing NVFP4 projections only under w4a4.
+    /// The root decides the profile it can be bound with, by the names of
+    /// its NVFP4 members: a BF16 root only under bf16, a root storing NVFP4
+    /// decoder projections only under w4a4, one storing NVFP4 decoder
+    /// projections and vision linears only under w4a4-vw4a16.
     #[test]
     fn a_root_binds_only_under_the_profile_of_what_it_stores() {
         use mary::format::attrs;
         use mary::leaf::leaf;
         use triblespace::core::blob::encodings::tensor::elements::{BF16, NVFP4};
+        use triblespace::core::blob::MemoryBlobStore;
         use triblespace::core::inline::encodings::hash::Handle;
-        use triblespace::core::trible::Trible;
-        let root = Id::new([1; 16]).unwrap();
-        let (member, weight) = (Id::new([2; 16]).unwrap(), Id::new([3; 16]).unwrap());
-        let gen = |id: Id| -> Inline<triblespace::core::inline::encodings::genid::GenId> {
-            id.to_inline()
+        type Leaf<E> = Inline<Handle<triblespace::core::blob::encodings::tensor::Tensor<E, 2>>>;
+        let mut blobs = MemoryBlobStore::new();
+        // One member per (name, NVFP4?) under `root`.
+        let mut root_with = |root: &ExclusiveId, members: &[(&str, bool)]| {
+            let mut facts = TribleSet::new();
+            for (at, (name, nvfp4)) in members.iter().enumerate() {
+                let (member, weight) = (ufoid(), ufoid());
+                let path = blobs
+                    .put::<blobencodings::UTF8String, _>(name.to_string())
+                    .unwrap();
+                facts += entity! { root @ attrs::member: &member };
+                facts += entity! { &member @ attrs::safetensor_path: path, attrs::weight: &weight };
+                facts += if *nvfp4 {
+                    entity! { &weight @ leaf::<NVFP4, 2>(): Leaf::<NVFP4>::new([at as u8; 32]) }
+                } else {
+                    entity! { &weight @ leaf::<BF16, 2>(): Leaf::<BF16>::new([at as u8; 32]) }
+                };
+            }
+            facts
         };
-        let mut bf16 = TribleSet::new();
-        bf16.insert(&Trible::force(&root, &attrs::member.id(), &gen(member)));
-        bf16.insert(&Trible::force(&member, &attrs::weight.id(), &gen(weight)));
-        let mut nvfp4 = bf16.clone();
-        bf16.insert(&Trible::force(
-            &weight,
-            &leaf::<BF16, 2>().id(),
-            &Inline::<Handle<triblespace::core::blob::encodings::tensor::Tensor<BF16, 2>>>::new(
-                [7; 32],
+        let decoder = "model.language_model.layers.0.mlp.up_proj.weight";
+        let vision = "model.visual.blocks.0.attn.qkv.weight";
+        let other = "model.visual.blocks.0.mlp.linear_fc2.weight";
+        let root = ufoid();
+        let mut facts = TribleSet::new();
+        let cases = [
+            (
+                [(decoder, false), (vision, false)],
+                StoredNvfp4 {
+                    decoder: false,
+                    vision: false,
+                },
             ),
-        ));
-        nvfp4.insert(&Trible::force(
-            &weight,
-            &leaf::<NVFP4, 2>().id(),
-            &Inline::<Handle<triblespace::core::blob::encodings::tensor::Tensor<NVFP4, 2>>>::new(
-                [8; 32],
+            (
+                [(decoder, true), (vision, false)],
+                StoredNvfp4 {
+                    decoder: true,
+                    vision: false,
+                },
             ),
-        ));
-        assert!(!stores_nvfp4_projections(&bf16, root));
-        assert!(stores_nvfp4_projections(&nvfp4, root));
+            (
+                [(decoder, true), (vision, true)],
+                StoredNvfp4 {
+                    decoder: true,
+                    vision: true,
+                },
+            ),
+            (
+                [(decoder, false), (vision, true)],
+                StoredNvfp4 {
+                    decoder: false,
+                    vision: true,
+                },
+            ),
+        ];
+        let mut stored = Vec::new();
+        for (members, expected) in &cases {
+            let root = ufoid();
+            let mut these = root_with(&root, members);
+            // An NVFP4 member of no profile's name says nothing.
+            these += root_with(&root, &[(other, true)]);
+            stored.push((root.id, *expected));
+            facts += these;
+        }
         // Another root's NVFP4 leaves say nothing about this one.
-        assert!(!stores_nvfp4_projections(&nvfp4, Id::new([9; 16]).unwrap()));
+        facts += root_with(&root, &[(decoder, false)]);
+        let snapshot = blobs.snapshot().unwrap();
+        for (id, expected) in &stored {
+            assert_eq!(stored_nvfp4(&facts, &snapshot, *id).unwrap(), *expected);
+        }
+        assert_eq!(
+            stored_nvfp4(&facts, &snapshot, root.id).unwrap(),
+            StoredNvfp4::default()
+        );
 
-        assert!(require_root_fits(WemmProfile::Bf16, root, false).is_ok());
-        assert!(require_root_fits(WemmProfile::W4a4, root, true).is_ok());
-        let error = require_root_fits(WemmProfile::W4a4, root, false).unwrap_err();
+        let [bf16_root, decoder_root, both_root, vision_root] = [0, 1, 2, 3].map(|i| cases[i].1);
+        let id = root.id;
+        assert!(require_root_fits(WemmProfile::Bf16, id, bf16_root).is_ok());
+        assert!(require_root_fits(WemmProfile::W4a4, id, decoder_root).is_ok());
+        assert!(require_root_fits(WemmProfile::W4a4Vw4a16, id, both_root).is_ok());
+        for profile in WemmProfile::ALL {
+            let error = require_root_fits(profile, id, vision_root).unwrap_err();
+            assert!(
+                error.to_string().contains("no profile runs this root"),
+                "{error}"
+            );
+        }
+        let error = require_root_fits(WemmProfile::W4a4, id, bf16_root).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains("stores its decoder projections in BF16"),
             "{error}"
         );
-        let error = require_root_fits(WemmProfile::Bf16, root, true).unwrap_err();
+        let error = require_root_fits(WemmProfile::Bf16, id, decoder_root).unwrap_err();
         assert!(error.to_string().contains("as NVFP4"), "{error}");
         assert!(error.to_string().contains(PROFILE_ENV), "{error}");
+        // The decoder-only root (4C72's) never binds under the vision
+        // profile, and the vision root never under 4C72 or BF16.
+        let error = require_root_fits(WemmProfile::W4a4Vw4a16, id, decoder_root).unwrap_err();
+        assert!(error.to_string().contains("set it to w4a4,"), "{error}");
+        for profile in [WemmProfile::Bf16, WemmProfile::W4a4] {
+            let error = require_root_fits(profile, id, both_root).unwrap_err();
+            assert!(
+                error.to_string().contains("set it to w4a4-vw4a16"),
+                "{error}"
+            );
+        }
+        assert!(require_root_fits(WemmProfile::W4a4Vw4a16, id, bf16_root).is_err());
     }
 
     /// A bind whose runtime reads back another collection, root or profile
@@ -1818,7 +1989,10 @@ mod tests {
     /// holds the NVFP4 root
     /// `WEMM_ROOT`, alone in its directory: the test initializes a signing
     /// key beside it and writes Memory entries and their index into it), and
-    /// optionally `WEMM_GATE_PNG` (a PNG to journal as a wordless image).
+    /// optionally `WEMM_GATE_PNG` (a PNG to journal as a wordless image) and
+    /// `WEMM_GATE_PROFILE` (`w4a4`, the default, or `w4a4-vw4a16` for a root
+    /// that also stores its vision linears as NVFP4; then the W4A4 profile
+    /// must refuse the root too, and "W4A4" below means that profile).
     ///
     /// Checks, in order: the BF16 profile refuses the NVFP4 root before any
     /// device work; a bind naming another `models` collection of the same
@@ -1848,6 +2022,15 @@ mod tests {
         let collection = mary::model_collection::parse_collection_handle(&models).unwrap();
         let root = Id::from_hex(&std::env::var("WEMM_ROOT").unwrap()).unwrap();
         let png = std::env::var_os("WEMM_GATE_PNG").map(|p| std::fs::read(p).unwrap());
+        let profile = match std::env::var_os("WEMM_GATE_PROFILE") {
+            None => WemmProfile::W4a4,
+            value => profile_from_env_value(value.as_deref()).unwrap(),
+        };
+        assert_ne!(
+            profile,
+            WemmProfile::Bf16,
+            "the gate binds an NVFP4 profile"
+        );
         crate::test_support::clear_ambient_environment();
         std::env::set_var("TRIBLESPACE_COLLECTION_MODELS", models);
         crate::storage::initialize_signer(&pile, None).unwrap();
@@ -1873,6 +2056,16 @@ mod tests {
         let refused = format!("{refused:#}");
         eprintln!("refused bf16 on the NVFP4 root: {refused}");
         assert!(refused.contains("as NVFP4"), "{refused}");
+        if profile == WemmProfile::W4a4Vw4a16 {
+            // 4C72 names a BF16 vision tower: it refuses a root storing
+            // NVFP4 vision linears before any device work.
+            let Err(refused) = bind(WemmProfile::W4a4) else {
+                panic!("the W4A4 profile bound a root that stores NVFP4 vision linears");
+            };
+            let refused = format!("{refused:#}");
+            eprintln!("refused w4a4 on the NVFP4-vision root: {refused}");
+            assert!(refused.contains("set it to w4a4-vw4a16"), "{refused}");
+        }
 
         // Another `models` collection in the same pile, which states
         // something but not the root: asked for, it is refused, although
@@ -1895,7 +2088,7 @@ mod tests {
             elsewhere.handle()
         };
         assert_ne!(elsewhere, collection);
-        let Err(refused) = bind_in(elsewhere, WemmProfile::W4a4) else {
+        let Err(refused) = bind_in(elsewhere, profile) else {
             panic!("bound the root from a collection that does not state it");
         };
         let refused = format!("{refused:#}");
@@ -1910,16 +2103,27 @@ mod tests {
         );
 
         let started = Instant::now();
-        let session = bind(WemmProfile::W4a4).unwrap();
-        eprintln!("wemm w4a4 bind {:.1} s", started.elapsed().as_secs_f64());
+        let session = bind(profile).unwrap();
+        eprintln!(
+            "wemm {} bind {:.1} s",
+            profile.label(),
+            started.elapsed().as_secs_f64()
+        );
         assert_eq!(
             session.identity(),
             WemmIdentity {
                 model_collection: collection,
                 model_root: root,
-                kernel_profile: GB10_NATIVE_W4A4_PROFILE,
+                kernel_profile: profile.id(),
             }
         );
+        assert_eq!(
+            WemmProfile::of(session.identity().kernel_profile),
+            Some(profile)
+        );
+        if profile == WemmProfile::W4a4 {
+            assert_eq!(session.identity().kernel_profile, GB10_NATIVE_W4A4_PROFILE);
+        }
         eprintln!(
             "identity collection {} root {:X} profile {:X}",
             collection_hex(session.identity().model_collection),
