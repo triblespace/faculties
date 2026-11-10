@@ -266,30 +266,104 @@ pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolv
     })
 }
 
-impl Session {
-    /// Bind the model `WEMM_ROOT` names from the `models` collection of the
-    /// pile at `pile`, the pile its indexes are written to as well.
-    pub fn from_env(pile: &Path) -> Result<Self> {
+/// What a bind is asked for: the model root, where its weights go, and for
+/// a device copy the margin [`COPY_MIN_FREE_ENV`] chose.
+struct BindRequest {
+    root: Id,
+    residence: WeightResidence,
+    copy_min_free: u64,
+}
+
+impl BindRequest {
+    fn from_env() -> Result<Self> {
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
         let residence = residence_from_env_value(std::env::var_os(COPY_WEIGHTS_ENV).as_deref())?;
+        // Read only when copying, so a malformed margin never stops a
+        // zero-copy bind.
+        let copy_min_free = match residence {
+            WeightResidence::DeviceCopy => {
+                copy_min_free_from_env_value(std::env::var_os(COPY_MIN_FREE_ENV).as_deref())?
+            }
+            WeightResidence::PileAliased => 0,
+        };
+        Ok(Self {
+            root,
+            residence,
+            copy_min_free,
+        })
+    }
+}
+
+/// Where a device-copy bind reads the host's memory: `/proc/meminfo`, or a
+/// test's stand-in.
+struct CopyHost {
+    meminfo: PathBuf,
+}
+
+impl CopyHost {
+    fn this_host() -> Self {
+        Self {
+            meminfo: PathBuf::from("/proc/meminfo"),
+        }
+    }
+}
+
+/// A device copy admitted against one `MemAvailable` reading: the margin
+/// alone when it begins, then the weights as each tensor is selected.
+struct CopyAdmission {
+    available: u64,
+    min_free: u64,
+    selected: u64,
+}
+
+impl CopyAdmission {
+    /// Read `MemAvailable` and admit the margin alone; an unreadable
+    /// `MemAvailable` is refused.
+    fn begin(host: &CopyHost, min_free: u64) -> Result<Self> {
+        let available = std::fs::read_to_string(&host.meminfo)
+            .ok()
+            .and_then(|text| mem_available_bytes(&text));
+        admit_copy(available, 0, min_free).map_err(anyhow::Error::msg)?;
+        Ok(Self {
+            // admit_copy has refused an unreadable reading; 0 would refuse
+            // every selection anyway.
+            available: available.unwrap_or(0),
+            min_free,
+            selected: 0,
+        })
+    }
+
+    /// Count one more selected tensor's payload bytes, refused once the
+    /// weights selected so far no longer fit the reading.
+    fn select(&mut self, bytes: u64) -> std::result::Result<(), String> {
+        self.selected = self.selected.saturating_add(bytes);
+        admit_copy(Some(self.available), self.selected, self.min_free)
+    }
+}
+
+impl Session {
+    /// Bind the model `WEMM_ROOT` names from the `models` collection of the
+    /// pile at `pile`, the pile its indexes are written to as well.
+    pub fn from_env(pile: &Path) -> Result<Self> {
+        Self::bind(pile, BindRequest::from_env()?, &CopyHost::this_host())
+    }
+
+    fn bind(pile: &Path, request: BindRequest, host: &CopyHost) -> Result<Self> {
+        let BindRequest {
+            root,
+            residence,
+            copy_min_free,
+        } = request;
         // A device copy is admitted against MemAvailable read once, here,
         // before anything is bound. The margin alone is checked now (and an
         // unreadable MemAvailable refused); the weights' bytes are added as
         // each tensor is selected below. Every selection precedes the first
         // copy, and in any order a copy follows its own selection, so the
         // bytes copied never exceed what this reading admitted.
-        let copy_budget = match residence {
-            WeightResidence::DeviceCopy => {
-                let min_free =
-                    copy_min_free_from_env_value(std::env::var_os(COPY_MIN_FREE_ENV).as_deref())?;
-                let available = std::fs::read_to_string("/proc/meminfo")
-                    .ok()
-                    .and_then(|text| mem_available_bytes(&text));
-                admit_copy(available, 0, min_free).map_err(anyhow::Error::msg)?;
-                available.map(|available| (available, min_free))
-            }
+        let mut admission = match residence {
+            WeightResidence::DeviceCopy => Some(CopyAdmission::begin(host, copy_min_free)?),
             WeightResidence::PileAliased => None,
         };
         let model = pile.to_path_buf();
@@ -315,7 +389,6 @@ impl Session {
             .with_residence(residence);
         let started = std::time::Instant::now();
         let mut roles = 0usize;
-        let mut selected_bytes = 0u64;
         // SAFETY: the pile is append-only and is neither truncated nor
         // rewritten in place while this process runs (module docs); every
         // aliased leaf lies in the prefix `snapshot` observed.
@@ -328,9 +401,8 @@ impl Session {
                 &mut aliases,
                 |_, _, _, payload| {
                     roles += 1;
-                    selected_bytes = selected_bytes.saturating_add(payload.len() as u64);
-                    if let Some((available, min_free)) = copy_budget {
-                        admit_copy(Some(available), selected_bytes, min_free).map_err(|e| {
+                    if let Some(admission) = admission.as_mut() {
+                        admission.select(payload.len() as u64).map_err(|e| {
                             format!("after selecting {roles} of {ROLES} tensors: {e}")
                         })?;
                     }
@@ -338,9 +410,18 @@ impl Session {
                 },
             )
         }?;
-        if let Some((available, min_free)) = copy_budget {
+        if let Some(admission) = &admission {
+            // Every copy follows its own selection, so nothing copied went
+            // uncounted; a bind that copied more than it admitted says so.
+            let copied = aliases.stats().copied_bytes;
+            anyhow::ensure!(
+                copied <= admission.selected,
+                "{COPY_WEIGHTS_ENV}=1 copied {copied} bytes to device memory but admitted only {} selected bytes",
+                admission.selected
+            );
             eprintln!(
-                "wemm: copy admitted: {selected_bytes} bytes of weights + {min_free} ({COPY_MIN_FREE_ENV}) <= MemAvailable {available} bytes at bind start"
+                "wemm: copy admitted: {} bytes of weights + {} ({COPY_MIN_FREE_ENV}) <= MemAvailable {} bytes at bind start",
+                admission.selected, admission.min_free, admission.available
             );
         }
         backing.require_still(&model)?;
@@ -896,6 +977,93 @@ mod tests {
             let error = copy_min_free_from_env_value(Some(OsStr::new(typo))).unwrap_err();
             assert!(error.to_string().contains(COPY_MIN_FREE_ENV), "{error}");
         }
+    }
+
+    /// A host whose `/proc/meminfo` stand-in, `name` in `dir`, reports
+    /// `available_kib` as MemAvailable.
+    fn copy_host(dir: &Path, name: &str, available_kib: u64) -> CopyHost {
+        let meminfo = dir.join(name);
+        std::fs::write(
+            &meminfo,
+            format!("MemTotal:       127533080 kB\nMemAvailable:   {available_kib} kB\n"),
+        )
+        .unwrap();
+        CopyHost { meminfo }
+    }
+
+    fn request(residence: WeightResidence, copy_min_free: u64) -> BindRequest {
+        BindRequest {
+            root: Id::from_hex("85B6ACD39E6CB93EE8BA31FDEF6C4F4F").unwrap(),
+            residence,
+            copy_min_free,
+        }
+    }
+
+    fn bind_error(pile: &Path, request: BindRequest, host: &CopyHost) -> String {
+        match Session::bind(pile, request, host) {
+            Ok(_) => panic!("bound a model from a pile that does not exist"),
+            Err(error) => format!("{error:#}"),
+        }
+    }
+
+    /// The admission is wired into the bind: a device copy whose margin
+    /// MemAvailable cannot cover is refused before the pile is even looked
+    /// at, so before any device work. The pile here does not exist, and
+    /// stat-ing it is the bind's first step after the admission.
+    #[test]
+    fn a_device_copy_bind_refuses_before_the_pile_or_the_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("absent.pile");
+        let margin = DEFAULT_COPY_MIN_FREE_BYTES;
+        let short = copy_host(dir.path(), "short", 8 << 20); // 8 GiB
+        let error = bind_error(&pile, request(WeightResidence::DeviceCopy, margin), &short);
+        assert!(error.contains("refused before copying"), "{error}");
+        assert!(
+            error.contains(&format!("{COPY_MIN_FREE_ENV} alone")),
+            "{error}"
+        );
+        assert!(
+            !error.contains("absent.pile"),
+            "it reached the pile: {error}"
+        );
+
+        // An unreadable MemAvailable refuses the same way.
+        let unreadable = CopyHost {
+            meminfo: dir.path().join("no-such-meminfo"),
+        };
+        let error = bind_error(&pile, request(WeightResidence::DeviceCopy, 0), &unreadable);
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(
+            !error.contains("absent.pile"),
+            "it reached the pile: {error}"
+        );
+
+        // Controls: with room the copy is admitted and the bind goes on to
+        // the pile, and a zero-copy bind never asks.
+        let roomy = copy_host(dir.path(), "roomy", 1 << 30); // 1 TiB
+        for (residence, host) in [
+            (WeightResidence::DeviceCopy, &roomy),
+            (WeightResidence::PileAliased, &short),
+        ] {
+            let error = bind_error(&pile, request(residence, margin), host);
+            assert!(
+                error.contains("stat") && error.contains("absent.pile"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_past_the_reading_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = copy_host(dir.path(), "meminfo", 1 << 20); // 1 GiB
+        let mut admission = CopyAdmission::begin(&host, 512 << 20).unwrap();
+        assert_eq!(admission.select(256 << 20), Ok(()));
+        // Exactly MemAvailable: weights plus margin.
+        assert_eq!(admission.select(256 << 20), Ok(()));
+        let error = admission.select(1).unwrap_err();
+        assert!(error.contains(&((1u64 << 30) + 1).to_string()), "{error}");
+        assert!(error.contains("the weights need"), "{error}");
     }
 
     #[test]
