@@ -44,7 +44,7 @@ use mary::models::qwen3_5::native::{device_identity, Assets, NativeWemm};
 use mary::nn::cuda_bf16_alias::{CudaBf16Aliases, WeightResidence};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
@@ -263,7 +263,12 @@ impl Session {
     /// [`probe::PROBE_EVERY_FOUNDATIONS`] foundations this thread derives.
     /// Returns whether it is on. Only the setup can fail; a later probe that
     /// cannot run is logged and skipped, never an error of the derive.
+    ///
+    /// The latest call decides this thread's probe: whatever probe ran before
+    /// is stopped first, also when this call leaves the probe off. The probe
+    /// never keeps the model bound; it ends with its [`Session`].
     pub fn start_probe_from_env(&self) -> Result<bool> {
+        PROBE.with(|slot| *slot.borrow_mut() = None);
         let Some(dir) =
             probe::dir_from_env_value(std::env::var_os(probe::PROBE_DIR_ENV).as_deref())
         else {
@@ -311,12 +316,7 @@ impl Session {
         for line in checker.observe(output.forward, output.raw, &now())? {
             eprintln!("{line}");
         }
-        PROBE.with(|slot| {
-            *slot.borrow_mut() = Some(Probe {
-                checker,
-                runtime: Rc::clone(&self.runtime),
-            })
-        });
+        PROBE.with(|slot| install_probe(slot, checker, &self.runtime));
         Ok(true)
     }
 
@@ -408,6 +408,14 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    /// Stop this session's probe, so nothing of the session outlives it on
+    /// this thread. During thread teardown the slot may already be gone.
+    fn drop(&mut self) {
+        let _ = PROBE.try_with(|slot| release_probe(slot, &self.runtime));
+    }
+}
+
 /// What one derive pass over one index did, and what is left.
 #[derive(Clone, Copy, Debug)]
 pub struct Derived {
@@ -471,9 +479,39 @@ thread_local! {
     static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) };
 }
 
-struct Probe {
+/// The running self-check. It holds its session's runtime weakly: the model
+/// stays bound exactly as long as the [`Session`] that started the probe.
+struct Probe<R = WemmRuntime> {
     checker: probe::Checker,
-    runtime: Rc<RefCell<WemmRuntime>>,
+    runtime: Weak<RefCell<R>>,
+}
+
+/// Put a probe on `runtime` in `slot`, replacing (and dropping) any probe
+/// that was there.
+fn install_probe<R>(
+    slot: &RefCell<Option<Probe<R>>>,
+    checker: probe::Checker,
+    runtime: &Rc<RefCell<R>>,
+) {
+    *slot.borrow_mut() = Some(Probe {
+        checker,
+        runtime: Rc::downgrade(runtime),
+    });
+}
+
+/// Clear `slot` if its probe is on `runtime`. A probe of another session is
+/// left alone. A slot that is in use is left too: the weak reference already
+/// keeps it from holding the model.
+fn release_probe<R>(slot: &RefCell<Option<Probe<R>>>, runtime: &Rc<RefCell<R>>) {
+    let Ok(mut slot) = slot.try_borrow_mut() else {
+        return;
+    };
+    if slot
+        .as_ref()
+        .is_some_and(|probe| Weak::ptr_eq(&probe.runtime, &Rc::downgrade(runtime)))
+    {
+        *slot = None;
+    }
 }
 
 fn now() -> String {
@@ -491,7 +529,12 @@ fn probe_after_foundation() {
         if !probe.checker.foundation_derived() {
             return;
         }
-        let output = match probe.runtime.try_borrow_mut() {
+        let Some(runtime) = probe.runtime.upgrade() else {
+            eprintln!("wemm probe: off, its session has ended");
+            *slot = None;
+            return;
+        };
+        let output = match runtime.try_borrow_mut() {
             Ok(mut runtime) => runtime.probe_texts(&probe::PROBE_TEXTS),
             Err(_) => {
                 eprintln!("wemm probe: skipped, the runtime is in use");
@@ -561,6 +604,60 @@ impl DeriveMapping for Progress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in for the bound runtime that records when it is dropped.
+    struct Model(Rc<Cell<bool>>);
+
+    impl Drop for Model {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    fn model() -> (Rc<RefCell<Model>>, Rc<Cell<bool>>) {
+        let dropped = Rc::new(Cell::new(false));
+        (Rc::new(RefCell::new(Model(dropped.clone()))), dropped)
+    }
+
+    fn checker(dir: &Path) -> probe::Checker {
+        let identity = probe::Provenance::default()
+            .with("model_root", "85B6ACD39E6CB93EE8BA31FDEF6C4F4F")
+            .with("probe_ids_sha256", "0123456789abcdef0123");
+        probe::Checker::new(dir, identity, 4).unwrap()
+    }
+
+    #[test]
+    fn a_probe_never_keeps_its_sessions_model_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = RefCell::new(None::<Probe<Model>>);
+        let (first, first_dropped) = model();
+        install_probe(&slot, checker(dir.path()), &first);
+        // The session ends while its probe is still installed.
+        drop(first);
+        assert!(first_dropped.get(), "the probe kept the model alive");
+
+        // A later session's probe replaces it and is just as weak.
+        let (second, second_dropped) = model();
+        install_probe(&slot, checker(dir.path()), &second);
+        drop(second);
+        assert!(second_dropped.get(), "the probe kept the model alive");
+    }
+
+    #[test]
+    fn a_session_releases_only_its_own_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = RefCell::new(None::<Probe<Model>>);
+        let (mine, _) = model();
+        let (other, _) = model();
+        install_probe(&slot, checker(dir.path()), &mine);
+        release_probe(&slot, &other);
+        assert!(
+            slot.borrow().is_some(),
+            "another session cleared this probe"
+        );
+        release_probe(&slot, &mine);
+        assert!(slot.borrow().is_none(), "the session's own probe stayed");
+    }
 
     #[test]
     fn weights_stay_in_the_pile_unless_copying_is_chosen() {
