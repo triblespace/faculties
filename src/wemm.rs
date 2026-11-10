@@ -30,8 +30,10 @@
 //!
 //! [`COPY_WEIGHTS_ENV`]` = 1` instead copies every weight into device memory
 //! at bind, so forwards never read the mapped pile pages. It costs device
-//! memory and bind time, and is off unless chosen. [`probe`] is an optional
-//! self-check for the maintenance daemon.
+//! memory and bind time, and is off unless chosen. On a GB10 that device
+//! memory is host RAM no cgroup limit sees, so the bind refuses unless host
+//! `MemAvailable` covers the weights plus [`COPY_MIN_FREE_ENV`]'s margin.
+//! [`probe`] is an optional self-check for the maintenance daemon.
 
 pub mod probe;
 
@@ -117,6 +119,77 @@ pub fn bind_note(
     )
 }
 
+/// The bytes host `MemAvailable` must exceed the weights by before
+/// [`COPY_WEIGHTS_ENV`]` = 1` may copy them; unset means
+/// [`DEFAULT_COPY_MIN_FREE_BYTES`]. A decimal byte count; anything else is
+/// refused rather than read as the default.
+pub const COPY_MIN_FREE_ENV: &str = "WEMM_COPY_MIN_FREE_BYTES";
+
+/// 16 GiB. On a GB10 a device copy is host RAM that neither `MemoryMax` nor
+/// RSS nor earlyoom sees, so a bind with copying on is admitted only while
+/// `MemAvailable` covers the weights' payload bytes plus this margin. Measured
+/// on sky 2026-11-10 under the daemon's CubeCL configuration (default
+/// pooling) for the 16,783,407,584 payload bytes of WeMM-Embedding-9B BF16:
+/// CubeCL reserved 17,758,986,752 bytes of device memory (0.91 GiB over the
+/// payload), and the copy phase held two further host buffers of about
+/// 2.03 GB each for about a second (3.79 GiB). That is 4.70 GiB over the
+/// payload at the bind's peak. The rest, 11.3 GiB, is what the box keeps at
+/// that peak: sky's earlyoom sends SIGTERM at 5% of its 121.6 GiB (6.08 GiB),
+/// so the peak stays about 5 GiB above it, and 15.1 GiB stays free once the
+/// transient has gone. With these weights a copy needs about 31.6 GiB.
+pub const DEFAULT_COPY_MIN_FREE_BYTES: u64 = 16 << 30;
+
+/// The margin [`COPY_MIN_FREE_ENV`]'s value chooses.
+pub fn copy_min_free_from_env_value(value: Option<&std::ffi::OsStr>) -> Result<u64> {
+    match value.map(|v| v.to_str()) {
+        None => Ok(DEFAULT_COPY_MIN_FREE_BYTES),
+        Some(Some(text)) if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) => text
+            .parse()
+            .with_context(|| format!("{COPY_MIN_FREE_ENV} {text:?} does not fit in 64 bits")),
+        Some(other) => anyhow::bail!(
+            "{COPY_MIN_FREE_ENV} must be a decimal byte count, or unset for {DEFAULT_COPY_MIN_FREE_BYTES}; got {other:?}"
+        ),
+    }
+}
+
+/// `MemAvailable` in bytes from the text of `/proc/meminfo`, or `None` when
+/// the line is missing or unreadable.
+pub fn mem_available_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let kib = line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// The admission decision for copying weights to device memory: refused
+/// unless `mem_available` (bytes; `None` when it could not be read) is at
+/// least `copy_bytes + min_free`. Refusal is the only alternative; nothing
+/// falls back to reading the weights zero-copy.
+pub fn admit_copy(
+    mem_available: Option<u64>,
+    copy_bytes: u64,
+    min_free: u64,
+) -> std::result::Result<(), String> {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let Some(available) = mem_available else {
+        return Err(format!(
+            "{COPY_WEIGHTS_ENV}=1 refused: host MemAvailable could not be read from /proc/meminfo, so a device copy of {copy_bytes} bytes cannot be admitted; unset {COPY_WEIGHTS_ENV} to read the weights zero-copy from the pile"
+        ));
+    };
+    let needed = copy_bytes.checked_add(min_free);
+    if needed.is_some_and(|needed| available >= needed) {
+        return Ok(());
+    }
+    let needed = needed.map_or_else(|| "more than 2^64".to_owned(), |n| n.to_string());
+    Err(format!(
+        "{COPY_WEIGHTS_ENV}=1 refused before copying: the weights need {copy_bytes} bytes ({:.2} GiB) of device memory, which on this box is host RAM, and {COPY_MIN_FREE_ENV} keeps {min_free} bytes ({:.2} GiB) free beyond them, {needed} bytes in all, but host MemAvailable is {available} bytes ({:.2} GiB); unset {COPY_WEIGHTS_ENV} to read the weights zero-copy from the pile",
+        gib(copy_bytes),
+        gib(min_free),
+        gib(available)
+    ))
+}
+
 /// What a query asks about: text, or content bytes read the way the index
 /// reads them (an image whole, the text of text, HTML or a PDF).
 pub enum Query<'a> {
@@ -182,6 +255,24 @@ impl Session {
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
         let residence = residence_from_env_value(std::env::var_os(COPY_WEIGHTS_ENV).as_deref())?;
+        // A device copy is admitted against MemAvailable read once, here,
+        // before anything is bound. The margin alone is checked now (and an
+        // unreadable MemAvailable refused); the weights' bytes are added as
+        // each tensor is selected below. Every selection precedes the first
+        // copy, and in any order a copy follows its own selection, so the
+        // bytes copied never exceed what this reading admitted.
+        let copy_budget = match residence {
+            WeightResidence::DeviceCopy => {
+                let min_free =
+                    copy_min_free_from_env_value(std::env::var_os(COPY_MIN_FREE_ENV).as_deref())?;
+                let available = std::fs::read_to_string("/proc/meminfo")
+                    .ok()
+                    .and_then(|text| mem_available_bytes(&text));
+                admit_copy(available, 0, min_free).map_err(anyhow::Error::msg)?;
+                available.map(|available| (available, min_free))
+            }
+            WeightResidence::PileAliased => None,
+        };
         let model = pile.to_path_buf();
         let backing = BackingIdentity::of(&model)?;
         let Resolved {
@@ -205,6 +296,7 @@ impl Session {
             .with_residence(residence);
         let started = std::time::Instant::now();
         let mut roles = 0usize;
+        let mut selected_bytes = 0u64;
         // SAFETY: the pile is append-only and is neither truncated nor
         // rewritten in place while this process runs (module docs); every
         // aliased leaf lies in the prefix `snapshot` observed.
@@ -215,12 +307,23 @@ impl Session {
                 root,
                 assets,
                 &mut aliases,
-                |_, _, _, _| {
+                |_, _, _, payload| {
                     roles += 1;
+                    selected_bytes = selected_bytes.saturating_add(payload.len() as u64);
+                    if let Some((available, min_free)) = copy_budget {
+                        admit_copy(Some(available), selected_bytes, min_free).map_err(|e| {
+                            format!("after selecting {roles} of {ROLES} tensors: {e}")
+                        })?;
+                    }
                     Ok(())
                 },
             )
         }?;
+        if let Some((available, min_free)) = copy_budget {
+            eprintln!(
+                "wemm: copy admitted: {selected_bytes} bytes of weights + {min_free} ({COPY_MIN_FREE_ENV}) <= MemAvailable {available} bytes at bind start"
+            );
+        }
         backing.require_still(&model)?;
         let identity = WemmIdentity {
             model_root: native.model_root(),
@@ -678,6 +781,84 @@ mod tests {
         for typo in ["", "yes", "true", " 1", "2"] {
             let error = residence_from_env_value(Some(OsStr::new(typo))).unwrap_err();
             assert!(error.to_string().contains(COPY_WEIGHTS_ENV), "{error}");
+        }
+    }
+
+    /// WeMM-Embedding-9B BF16's payload bytes (byte check, 2026-11-10).
+    const WEMM_PAYLOAD: u64 = 16_783_407_584;
+
+    #[test]
+    fn a_copy_is_refused_when_memavailable_is_short_of_the_weights_plus_the_margin() {
+        let margin = DEFAULT_COPY_MIN_FREE_BYTES;
+        let error = admit_copy(Some(WEMM_PAYLOAD + margin - 1), WEMM_PAYLOAD, margin).unwrap_err();
+        // Both numbers are named: what is needed and what is available.
+        assert!(
+            error.contains(&(WEMM_PAYLOAD + margin).to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(&(WEMM_PAYLOAD + margin - 1).to_string()),
+            "{error}"
+        );
+        assert!(error.contains(&WEMM_PAYLOAD.to_string()), "{error}");
+        assert!(error.contains(COPY_MIN_FREE_ENV), "{error}");
+        // A box with far less than the weights alone.
+        assert!(admit_copy(Some(8 << 30), WEMM_PAYLOAD, margin).is_err());
+        // The margin alone can refuse, before any tensor is selected.
+        assert!(admit_copy(Some(margin - 1), 0, margin).is_err());
+        // A sum past 2^64 is refused, not wrapped into a small number.
+        assert!(admit_copy(Some(u64::MAX), u64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn a_copy_is_admitted_with_exactly_enough_or_plenty() {
+        let margin = DEFAULT_COPY_MIN_FREE_BYTES;
+        assert_eq!(
+            admit_copy(Some(WEMM_PAYLOAD + margin), WEMM_PAYLOAD, margin),
+            Ok(())
+        );
+        assert_eq!(admit_copy(Some(120 << 30), WEMM_PAYLOAD, margin), Ok(()));
+        assert_eq!(admit_copy(Some(margin), 0, margin), Ok(()));
+    }
+
+    #[test]
+    fn an_unreadable_memavailable_refuses_the_copy() {
+        let error = admit_copy(None, WEMM_PAYLOAD, 0).unwrap_err();
+        assert!(error.contains("could not be read"), "{error}");
+        assert!(admit_copy(None, 0, 0).is_err());
+        for broken in [
+            "",
+            "MemTotal:       127533080 kB\nMemFree:  1 kB\n",
+            "MemAvailable:   lots kB\n",
+            "MemAvailable:   87084912\n",
+            "MemAvailable:   87084912 MB\n",
+            "MemAvailable: 18446744073709551615 kB\n",
+        ] {
+            assert_eq!(mem_available_bytes(broken), None, "{broken:?}");
+        }
+        assert_eq!(
+            mem_available_bytes(
+                "MemTotal:       127533080 kB\nMemFree:        50331648 kB\nMemAvailable:   87084912 kB\nBuffers: 1 kB\n"
+            ),
+            Some(87_084_912 * 1024)
+        );
+    }
+
+    #[test]
+    fn the_copy_margin_is_a_byte_count_or_its_default() {
+        use std::ffi::OsStr;
+        assert_eq!(copy_min_free_from_env_value(None).unwrap(), 16 << 30);
+        assert_eq!(
+            copy_min_free_from_env_value(Some(OsStr::new("0"))).unwrap(),
+            0
+        );
+        assert_eq!(
+            copy_min_free_from_env_value(Some(OsStr::new("34359738368"))).unwrap(),
+            32 << 30
+        );
+        for typo in ["", "16G", "-1", " 1", "1e9", "99999999999999999999"] {
+            let error = copy_min_free_from_env_value(Some(OsStr::new(typo))).unwrap_err();
+            assert!(error.to_string().contains(COPY_MIN_FREE_ENV), "{error}");
         }
     }
 
