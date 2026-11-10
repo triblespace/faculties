@@ -9,8 +9,10 @@
 //! that finds none, and is never overwritten.
 //!
 //! Both baselines are comparison points, not oracles. A forward early in a
-//! process is where earlier observations found disagreeing outputs, so a
-//! baseline can itself be the odd one out, and a disagreement does not say
+//! process is where earlier observations found disagreeing outputs, so only a
+//! probe in the later stratum (forward at least [`EARLY_FORWARDS`]) becomes a
+//! baseline. An early probe is compared with whatever baselines already exist.
+//! A baseline can still be the odd one out, and a disagreement does not say
 //! which side differs from the usual bytes. Results are therefore only
 //! "agreement" or "disagreement". Each one is logged with the identity of
 //! both sides, and on disagreement both sides' raw bytes stay on disk. A
@@ -264,10 +266,12 @@ impl Checker {
         let mut lines = Vec::new();
 
         if !self.reference_resolved {
-            self.reference_resolved = true;
-            lines.push(self.resolve_reference(&raw, &provenance));
+            if let Some(line) = self.resolve_reference(&raw, &provenance, early) {
+                lines.push(line);
+            }
         }
         let first = match &self.first {
+            None if early => None,
             None => {
                 self.first = Some(Baseline {
                     raw: raw.clone(),
@@ -325,7 +329,10 @@ impl Checker {
                 f.provenance.digest(),
                 c.words()
             ),
-            _ => "this is the first probe of this process".into(),
+            (None, Some(_)) => "this is this process's first-probe baseline".into(),
+            (_, None) => {
+                "no first-probe baseline yet (only a later-stratum probe becomes one)".into()
+            }
         };
         let reference_words = match (&reference, &self.reference) {
             (Some(c), Some(r)) => {
@@ -345,9 +352,30 @@ impl Checker {
     }
 
     /// Load the reference, or write this probe as the reference when there
-    /// is none. An existing reference is never overwritten.
-    fn resolve_reference(&mut self, raw: &[u8], provenance: &Provenance) -> String {
+    /// is none and this probe is in the later stratum. An existing reference
+    /// is never overwritten. Returns `None`, leaving the reference
+    /// unresolved, when there is none and this early probe may not become it.
+    fn resolve_reference(
+        &mut self,
+        raw: &[u8],
+        provenance: &Provenance,
+        early: bool,
+    ) -> Option<String> {
         let path = self.reference_path();
+        if early && !path.exists() {
+            return None;
+        }
+        self.reference_resolved = true;
+        Some(self.load_or_write_reference(&path, raw, provenance))
+    }
+
+    fn load_or_write_reference(
+        &mut self,
+        path: &Path,
+        raw: &[u8],
+        provenance: &Provenance,
+    ) -> String {
+        let path = path.to_owned();
         match write_new(&self.dir, &self.stem, raw, provenance) {
             Ok(true) => {
                 self.reference = Some(Baseline {
@@ -450,12 +478,12 @@ mod tests {
     fn the_reference_is_written_once_and_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let mut a = Checker::new(dir.path(), identity("pile-aliased"), 4).unwrap();
-        let lines = a.observe(0, rows(1), "t0").unwrap();
+        let lines = a.observe(EARLY_FORWARDS, rows(1), "t0").unwrap();
         assert!(lines[0].contains("wrote the reference"), "{lines:?}");
         let path = a.reference_path();
         assert_eq!(std::fs::read(&path).unwrap(), rows(1));
         let written = std::fs::read_to_string(path.with_extension("provenance")).unwrap();
-        assert!(written.contains("forward=0\n") && written.contains("weights=pile-aliased\n"));
+        assert!(written.contains("forward=3\n") && written.contains("weights=pile-aliased\n"));
 
         // A second process with different bytes reads it and leaves it alone.
         let mut b = Checker::new(dir.path(), identity("device-copy"), 4).unwrap();
@@ -496,14 +524,40 @@ mod tests {
     fn strata_and_baselines_are_counted_per_forward() {
         let dir = tempfile::tempdir().unwrap();
         let mut checker = Checker::new(dir.path(), identity("pile-aliased"), 4).unwrap();
-        checker.observe(0, rows(1), "t0").unwrap();
-        // One differing byte in row 2, early.
+        // One differing byte in row 2.
         let mut odd = rows(1);
         odd[2 * 16 + 3] = 9;
-        let lines = checker.observe(2, odd, "t1").unwrap();
-        let line = lines.last().unwrap();
-        assert!(line.contains("forward 2 (early)"), "{line}");
-        assert!(line.contains("vs first probe of this process"), "{line}");
+        // An early probe with no baseline anywhere becomes neither baseline.
+        let lines = checker.observe(0, odd.clone(), "t0").unwrap();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("forward 0 (early)")
+                && lines[0].contains("no first-probe baseline yet")
+                && lines[0].contains("no reference to compare"),
+            "{lines:?}"
+        );
+        assert!(!checker.reference_path().exists());
+        // The first later-stratum probe becomes both baselines.
+        let lines = checker.observe(EARLY_FORWARDS, rows(1), "t1").unwrap();
+        assert!(lines[0].contains("wrote the reference"), "{lines:?}");
+        assert!(
+            lines[1].contains("this is this process's first-probe baseline"),
+            "{lines:?}"
+        );
+        // A later probe agrees with both.
+        let line = checker.observe(40, rows(1), "t2").unwrap().pop().unwrap();
+        assert!(
+            line.contains("(later)")
+                && line.contains("vs first probe of this process")
+                && line.contains("agreement; vs reference"),
+            "{line}"
+        );
+        // A later probe with the odd byte disagrees with both.
+        let line = checker
+            .observe(41, odd.clone(), "t3")
+            .unwrap()
+            .pop()
+            .unwrap();
         assert!(
             line.contains("disagreement in 1 of 4 rows, 1 bytes"),
             "{line}"
@@ -512,35 +566,22 @@ mod tests {
             !line.contains("corrupt") && !line.contains("correct"),
             "{line}"
         );
-        // Later forwards agree.
-        for forward in [3, 40] {
-            let line = checker
-                .observe(forward, rows(1), "t")
-                .unwrap()
-                .pop()
-                .unwrap();
-            assert!(
-                line.contains("(later)") && line.contains("agreement; vs reference"),
-                "{line}"
-            );
-        }
         assert_eq!(
             checker.strata,
             [
                 Tally {
-                    attempts: 2,
-                    first_disagreements: 1,
-                    reference_disagreements: 1
-                },
-                Tally {
-                    attempts: 2,
+                    attempts: 1,
                     first_disagreements: 0,
                     reference_disagreements: 0
                 },
+                Tally {
+                    attempts: 3,
+                    first_disagreements: 1,
+                    reference_disagreements: 1
+                },
             ]
         );
-        // The first probe of the process was saved beside the disagreement,
-        // once.
+        // The first-probe baseline was saved beside the disagreement, once.
         let pid = std::process::id();
         assert_eq!(
             std::fs::read(dir.path().join(format!("first-{pid}.bin"))).unwrap(),
@@ -548,8 +589,29 @@ mod tests {
         );
         assert!(dir
             .path()
-            .join(format!("disagreement-{pid}-probe1-forward2.bin"))
+            .join(format!("disagreement-{pid}-probe3-forward41.bin"))
             .exists());
+
+        // In another process an early probe is compared with the existing
+        // reference and counted in the early stratum.
+        let mut other = Checker::new(dir.path(), identity("device-copy"), 4).unwrap();
+        let lines = other.observe(0, odd, "t4").unwrap();
+        assert!(lines[0].contains("taken with"), "{lines:?}");
+        assert!(
+            lines[1].contains("forward 0 (early)")
+                && lines[1].contains("no first-probe baseline yet")
+                && lines[1].contains("vs reference")
+                && lines[1].contains("disagreement in 1 of 4 rows, 1 bytes"),
+            "{lines:?}"
+        );
+        assert_eq!(
+            other.strata[0],
+            Tally {
+                attempts: 1,
+                first_disagreements: 0,
+                reference_disagreements: 1
+            }
+        );
     }
 
     #[test]

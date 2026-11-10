@@ -302,8 +302,9 @@ impl Session {
             .with("pid", std::process::id());
         let mut checker = probe::Checker::new(&dir, identity, probe::PROBE_TEXTS.len())?;
         eprintln!(
-            "wemm probe: on, every {} derived foundations, results are agreement or disagreement with two baselines (this process's first probe and the reference), neither an oracle; identity {}: {}",
+            "wemm probe: on, every {} derived foundations, results are agreement or disagreement with two baselines (this process's first later-stratum probe and the reference, both taken at forward {} or later), neither an oracle; identity {}: {}",
             probe::PROBE_EVERY_FOUNDATIONS,
+            probe::EARLY_FORWARDS,
             checker.identity().digest(),
             checker.identity().line()
         );
