@@ -18,8 +18,15 @@
 //! ([`guards`]) are pure functions over these readers and an explicit clock;
 //! the follower that executes the ladder is a separate step.
 
+pub mod cli;
 pub mod guards;
 pub mod ladder;
+pub mod mcp;
+pub mod operations;
+pub mod render;
+pub mod rungs;
+
+pub use operations::{Alarm, Clock, RaiseRequest, Raised, SystemClock};
 
 use anyhow::{bail, Context, Result};
 use hifitime::{Duration, Epoch};
@@ -302,6 +309,11 @@ pub struct Step {
     pub outcome: Outcome,
     /// The Discord message anchor the step posted.
     pub discord_message: Option<Id>,
+    /// The Discord snowflake of the message the step posted, as Discord's
+    /// send receipt names it (`discord::message_id`, the value the message's
+    /// anchor carries). Ack detection joins a reply to a step on this value,
+    /// so it never computes an anchor id to look one up.
+    pub discord_message_id: Option<String>,
     /// The say request a voice step published.
     pub say_request: Option<Id>,
 }
@@ -322,6 +334,13 @@ pub fn step_fragment(step: &Step) -> Result<(Fragment, Id)> {
             Some(fragment.put::<blobencodings::UTF8String, _>(required(error, "step error")?)),
         ),
     };
+    let snowflake: Option<TextHandle> = match step.discord_message_id.as_deref() {
+        Some(snowflake) => {
+            crate::discord::validate_snowflake(snowflake).context("a step's Discord message id")?;
+            Some(fragment.put(snowflake.to_owned()))
+        }
+        None => None,
+    };
     let started = point_at(step.started)?;
     let finished = point_at(step.finished)?;
     let record = entity! {
@@ -333,6 +352,7 @@ pub fn step_fragment(step: &Step) -> Result<(Fragment, Id)> {
         metadata::finished_at: finished,
         metadata::description?: error,
         discord_attrs::message?: step.discord_message,
+        discord_attrs::message_id?: snowflake,
         discord_attrs::say_request?: step.say_request,
     };
     let id = record.root().expect("a step has one intrinsic root");

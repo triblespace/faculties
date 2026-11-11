@@ -279,6 +279,12 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "one unambiguous aggregate registry"
     );
     for name in [
+        "alarm_raise",
+        "alarm_ack",
+        "alarm_resolve",
+        "alarm_note",
+        "alarm_list",
+        "alarm_show",
         "compass_add",
         "compass_list",
         "compass_move",

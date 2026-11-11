@@ -12,10 +12,10 @@ use std::sync::Arc;
 use super::Faculty;
 use crate::storage::Storage;
 use crate::{
-    archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord, duplex,
-    files, gauge, habits, headspace, hear, home, imagine, linkedin, mail, memory, message, orient,
-    patience, planner, posture, quota, reason, relations, search, secrets, teams, triage, viewer,
-    voice, web, wiki, world,
+    alarm, archive, atlas, body, bootstrap, care, code, cognition, compass, decide, discord,
+    duplex, files, gauge, habits, headspace, hear, home, imagine, linkedin, mail, memory, message,
+    orient, patience, planner, posture, quota, reason, relations, search, secrets, teams, triage,
+    viewer, voice, web, wiki, world,
 };
 
 /// Trusted launcher configuration, never supplied as MCP tool arguments.
@@ -96,6 +96,7 @@ impl Catalog {
         };
         let orient = Arc::new(orient);
         let faculties: Vec<Box<dyn Faculty + Send + Sync>> = vec![
+            Box::new(alarm::mcp::Alarm::with_storage(storage.clone())),
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),

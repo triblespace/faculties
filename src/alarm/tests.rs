@@ -68,6 +68,7 @@ fn step(alarm: Id, rung: Id, started: i128) -> (Fragment, Id) {
         finished: started + SECOND,
         outcome: Outcome::Delivered,
         discord_message: None,
+        discord_message_id: None,
         say_request: None,
     })
     .unwrap()
@@ -279,6 +280,7 @@ fn the_alarm_writers_refuse_what_is_not_a_record() {
         finished: T0,
         outcome: Outcome::Delivered,
         discord_message: None,
+        discord_message_id: None,
         say_request: None,
     })
     .is_err());
@@ -297,6 +299,7 @@ fn a_failed_alarm_step_reads_back_as_failed() {
         finished: T0 + SECOND,
         outcome: Outcome::Failed("unreachable from stars".to_owned()),
         discord_message: None,
+        discord_message_id: None,
         say_request: None,
     })
     .unwrap();
