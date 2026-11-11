@@ -5,6 +5,7 @@ use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource};
 use triblespace::macros::id_hex;
 
+use super::ladder::{next_action, Capabilities, Due, Next};
 use super::*;
 use crate::schemas::alarm::*;
 
@@ -301,4 +302,152 @@ fn a_failed_alarm_step_reads_back_as_failed() {
     let rows = steps(&facts, alarm);
     assert_eq!(rows.len(), 1);
     assert!(rows[0].failed && !rows[0].delivered);
+}
+
+// ---- step 3: the ladder ------------------------------------------------------
+
+fn row(rung: Id, started_min: i128) -> StepRow {
+    StepRow {
+        step: id(0x30),
+        rung,
+        started: T0 + started_min,
+        delivered: true,
+        failed: false,
+    }
+}
+
+fn run(rungs: &[(Id, i128)]) -> Next {
+    Next::Run(
+        rungs
+            .iter()
+            .map(|(rung, at)| Due {
+                rung: *rung,
+                at: *at,
+            })
+            .collect(),
+    )
+}
+
+fn r0_steps() -> Vec<StepRow> {
+    vec![row(RUNG_COLONY, 0), row(RUNG_DISCORD_MENTION, 0)]
+}
+
+fn through_r1() -> Vec<StepRow> {
+    let mut steps = r0_steps();
+    steps.extend([
+        row(RUNG_DISCORD_MENTION, 3 * MINUTE),
+        row(RUNG_DISCORD_VOICE, 3 * MINUTE),
+        row(RUNG_MAC_NOTIFY, 3 * MINUTE),
+    ]);
+    steps
+}
+
+/// Every rung due before the stop, stepped at its last occurrence.
+fn everything_before_stop() -> Vec<StepRow> {
+    let mut steps = through_r1();
+    steps.extend([
+        row(RUNG_MAC_SOUND, 58 * MINUTE),
+        row(RUNG_REACHY_SHOUT, 58 * MINUTE),
+        row(RUNG_HUE_ALERT, 58 * MINUTE),
+        row(RUNG_DISCORD_MENTION, 53 * MINUTE),
+    ]);
+    steps
+}
+
+#[test]
+fn the_alarm_ladder_follows_its_table_on_a_fake_clock() {
+    let voice = Capabilities {
+        unreachable: vec![],
+        jp_in_voice: true,
+    };
+    let no_voice = Capabilities::default();
+    let no_hue = Capabilities {
+        unreachable: vec![RUNG_HUE_ALERT],
+        jp_in_voice: true,
+    };
+    let sec = SECOND;
+    let min = MINUTE;
+    let mut final_steps = everything_before_stop();
+    final_steps.extend([
+        row(RUNG_FINAL_DISCORD, 60 * MINUTE),
+        row(RUNG_FINAL_COLONY, 60 * MINUTE),
+    ]);
+    let mut hue_failed = through_r1();
+    hue_failed.extend([
+        row(RUNG_MAC_SOUND, 6 * MINUTE),
+        row(RUNG_REACHY_SHOUT, 6 * MINUTE),
+        StepRow {
+            failed: true,
+            delivered: false,
+            ..row(RUNG_HUE_ALERT, 10 * MINUTE)
+        },
+    ]);
+    let failed_mention = vec![
+        row(RUNG_COLONY, 0),
+        StepRow {
+            failed: true,
+            delivered: false,
+            ..row(RUNG_DISCORD_MENTION, 0)
+        },
+    ];
+    #[rustfmt::skip]
+    let table: Vec<(&str, i128, Vec<StepRow>, bool, bool, &Capabilities, Next)> = vec![
+        ("t=0 runs R0", 0, vec![], true, false, &voice,
+            run(&[(RUNG_COLONY, 0), (RUNG_DISCORD_MENTION, 0)])),
+        ("t=2:59 waits for R1", 2 * min + 59 * sec, r0_steps(), true, false, &voice,
+            Next::Wait(T0 + 3 * min)),
+        ("t=3:00 runs R1", 3 * min, r0_steps(), true, false, &voice,
+            run(&[(RUNG_DISCORD_MENTION, 3 * min), (RUNG_DISCORD_VOICE, 3 * min), (RUNG_MAC_NOTIFY, 3 * min)])),
+        ("R1 without JP in voice skips the voice rung", 3 * min, r0_steps(), true, false, &no_voice,
+            run(&[(RUNG_DISCORD_MENTION, 3 * min), (RUNG_MAC_NOTIFY, 3 * min)])),
+        ("a rung already stepped is not repeated", 3 * min + 30 * sec, through_r1(), true, false, &voice,
+            Next::Wait(T0 + 6 * min)),
+        ("a failed step covers its occurrence", min, failed_mention, true, false, &voice,
+            Next::Wait(T0 + 3 * min)),
+        ("t=6 runs R2", 6 * min, through_r1(), true, false, &voice,
+            run(&[(RUNG_MAC_SOUND, 6 * min), (RUNG_REACHY_SHOUT, 6 * min)])),
+        ("an unreachable rung is returned once", 10 * min, through_r1(), true, false, &no_hue,
+            run(&[(RUNG_MAC_SOUND, 6 * min), (RUNG_REACHY_SHOUT, 6 * min), (RUNG_HUE_ALERT, 10 * min)])),
+        ("then never again", 13 * min, hue_failed, true, false, &no_hue,
+            run(&[(RUNG_DISCORD_MENTION, 13 * min), (RUNG_MAC_SOUND, 13 * min), (RUNG_REACHY_SHOUT, 13 * min)])),
+        ("a follower down for 20 min runs each overdue rung once", 20 * min, r0_steps(), true, false, &no_voice,
+            run(&[(RUNG_DISCORD_MENTION, 13 * min), (RUNG_MAC_NOTIFY, 3 * min), (RUNG_MAC_SOUND, 19 * min), (RUNG_REACHY_SHOUT, 19 * min), (RUNG_HUE_ALERT, 19 * min)])),
+        ("closed stops at once", 7 * min, through_r1(), false, false, &voice,
+            Next::Stop),
+        ("a test runs R0", 0, vec![], true, true, &voice,
+            run(&[(RUNG_COLONY, 0), (RUNG_DISCORD_MENTION, 0)])),
+        ("a test stops after R0", 3 * min, r0_steps(), true, true, &voice,
+            Next::Stop),
+        ("t>60 sends the final line and sounds nothing", 61 * min, through_r1(), true, false, &voice,
+            run(&[(RUNG_FINAL_DISCORD, 60 * min), (RUNG_FINAL_COLONY, 60 * min)])),
+        ("before the stop it waits for the next repeat", 58 * min + sec, everything_before_stop(), true, false, &voice,
+            Next::Wait(T0 + 60 * min)),
+        ("after the final line, nothing", 62 * min, final_steps, true, false, &voice,
+            Next::Stop),
+    ];
+    let mut wrong = Vec::new();
+    for (case, now, steps, open, is_test, capabilities, expected) in table {
+        let got = next_action(T0, T0 + now, &steps, open, is_test, capabilities);
+        if got != expected {
+            wrong.push(format!("{case}: got {got:?}, expected {expected:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "ladder cases wrong:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn the_alarm_ladder_stops_sounding_at_sixty_minutes() {
+    let schedule = ladder::schedule();
+    for (at, rung) in &schedule {
+        if *at >= ladder::STOP_SOUNDING {
+            assert!(ladder::FINAL.contains(rung), "{rung:x} at {at}");
+        } else {
+            assert!(!ladder::FINAL.contains(rung));
+        }
+    }
+    assert!(schedule.windows(2).all(|pair| pair[0].0 <= pair[1].0));
 }

@@ -13,6 +13,11 @@
 //! which is monotone: a union of piles can close an alarm, never reopen one.
 //! A fact this build does not model is ignored, and an optional field that is
 //! absent leaves the record listed.
+//!
+//! The escalation ladder ([`ladder`]) is a pure function over these readers
+//! and an explicit clock; the follower that executes it is a separate step.
+
+pub mod ladder;
 
 use anyhow::{bail, Context, Result};
 use hifitime::{Duration, Epoch};
