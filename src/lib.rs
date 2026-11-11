@@ -36,6 +36,7 @@ pub fn model_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".cache/faculties/models")
 }
 
+pub mod alarm;
 pub mod archive;
 pub mod archive_agy;
 pub mod archive_bm25;
