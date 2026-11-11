@@ -14,9 +14,11 @@
 //! A fact this build does not model is ignored, and an optional field that is
 //! absent leaves the record listed.
 //!
-//! The escalation ladder ([`ladder`]) is a pure function over these readers
-//! and an explicit clock; the follower that executes it is a separate step.
+//! The escalation ladder ([`ladder`]) and the credibility guards
+//! ([`guards`]) are pure functions over these readers and an explicit clock;
+//! the follower that executes the ladder is a separate step.
 
+pub mod guards;
 pub mod ladder;
 
 use anyhow::{bail, Context, Result};

@@ -3,14 +3,17 @@ use triblespace::core::blob::encodings::UnknownBlob;
 use triblespace::core::collection::{CollectionRead, CollectionStore, CollectionStoreExt};
 use triblespace::core::repo::memoryrepo::MemoryRepo;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource};
+use triblespace::core::trible::TribleSet;
 use triblespace::macros::id_hex;
 
+use super::guards::{decide, Decision, HOUR, THE_CHECK};
 use super::ladder::{next_action, Capabilities, Due, Next};
 use super::*;
 use crate::schemas::alarm::*;
 
 const JP: Id = id_hex!("10101010101010101010101010101010");
 const CC: Id = id_hex!("11111111111111111111111111111111");
+const ASTRA: Id = id_hex!("12121212121212121212121212121212");
 /// 2026-11-11 in TAI nanoseconds, roughly; only differences matter.
 const T0: i128 = 1_978_000_000 * SECOND;
 
@@ -450,4 +453,207 @@ fn the_alarm_ladder_stops_sounding_at_sixty_minutes() {
         }
     }
     assert!(schedule.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+}
+
+// ---- step 4: guards ------------------------------------------------------------
+
+fn with(fragments: &[&Fragment]) -> TribleSet {
+    let mut facts = TribleSet::new();
+    for fragment in fragments {
+        facts += fragment.facts().clone();
+    }
+    facts
+}
+
+#[test]
+fn an_alarm_raise_without_decays_or_with_an_unknown_class_is_refused() {
+    let empty = TribleSet::new();
+    let mut no_decay = raise("pile truncated");
+    no_decay.decays = String::new();
+    match decide(&empty, &no_decay, false, T0) {
+        Decision::Refuse(why) => {
+            assert!(why.contains("decays"), "{why}");
+            assert!(why.contains(THE_CHECK), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let mut no_evidence = raise("pile truncated");
+    no_evidence.evidence = " ".to_owned();
+    assert!(matches!(
+        decide(&empty, &no_evidence, false, T0),
+        Decision::Refuse(_)
+    ));
+    let mut unknown = raise("pile truncated");
+    unknown.class = id(0x55);
+    assert!(matches!(
+        decide(&empty, &unknown, false, T0),
+        Decision::Refuse(_)
+    ));
+    // Even a test must say what decays.
+    no_decay.test = true;
+    assert!(matches!(
+        decide(&empty, &no_decay, false, T0),
+        Decision::Refuse(_)
+    ));
+    assert_eq!(
+        decide(&empty, &raise("pile truncated"), false, T0),
+        Decision::Raise
+    );
+}
+
+#[test]
+fn a_second_alarm_raise_within_thirty_minutes_is_refused() {
+    let (first, alarm) = raise_fragment(&raise("pile truncated")).unwrap();
+    let (closed, _) = resolve(alarm, T0 + MINUTE, false);
+    let facts = with(&[&first, &closed]);
+    let mut second = raise("host hung");
+    second.class = CLASS_HUNG_HOST;
+    second.raised_at = T0 + 20 * MINUTE;
+    match decide(&facts, &second, false, T0 + 20 * MINUTE) {
+        Decision::Refuse(why) => assert!(why.contains(&format!("{alarm:x}")), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // Another raiser is not limited by CC's raise.
+    second.raiser = ASTRA;
+    assert_eq!(
+        decide(&facts, &second, false, T0 + 20 * MINUTE),
+        Decision::Raise
+    );
+    // Nor is CC after 30 min.
+    second.raiser = CC;
+    assert_eq!(
+        decide(&facts, &second, false, T0 + 31 * MINUTE),
+        Decision::Raise
+    );
+    // A test raise is never limited.
+    second.test = true;
+    assert_eq!(
+        decide(&facts, &second, false, T0 + 20 * MINUTE),
+        Decision::Raise
+    );
+}
+
+#[test]
+fn the_same_alarm_incident_or_text_becomes_a_note() {
+    let mut first = raise("pile truncated");
+    first.incident = Some("pile-truncation:sky:self.pile".to_owned());
+    let (raised, alarm) = raise_fragment(&first).unwrap();
+    let mut again = raise("self.pile is 19 KB");
+    again.raiser = ASTRA;
+    again.incident = Some("pile-truncation:sky:self.pile".to_owned());
+    let open = with(&[&raised]);
+    assert!(matches!(
+        decide(&open, &again, false, T0 + 2 * HOUR),
+        Decision::Note { on, .. } if on == alarm
+    ));
+    // Closed five hours ago: still the same incident.
+    let (closed, _) = resolve(alarm, T0 + HOUR, false);
+    let closed = with(&[&raised, &closed]);
+    assert!(matches!(
+        decide(&closed, &again, false, T0 + 6 * HOUR),
+        Decision::Note { on, .. } if on == alarm
+    ));
+    // Closed more than six hours ago: a new alarm.
+    assert_eq!(
+        decide(&closed, &again, false, T0 + 8 * HOUR),
+        Decision::Raise
+    );
+    // Without an incident, the same text within 30 min, from anyone.
+    let (plain, plain_id) = raise_fragment(&raise("pile truncated")).unwrap();
+    let (plain_closed, _) = resolve(plain_id, T0 + MINUTE, false);
+    let plain = with(&[&plain, &plain_closed]);
+    let mut same_text = raise("  pile truncated ");
+    same_text.raiser = ASTRA;
+    assert!(matches!(
+        decide(&plain, &same_text, false, T0 + 10 * MINUTE),
+        Decision::Note { on, .. } if on == plain_id
+    ));
+    assert_eq!(
+        decide(&plain, &same_text, false, T0 + 40 * MINUTE),
+        Decision::Raise
+    );
+}
+
+#[test]
+fn an_alarm_raise_while_another_is_open_becomes_a_note() {
+    let (raised, alarm) = raise_fragment(&raise("pile truncated")).unwrap();
+    let facts = with(&[&raised]);
+    let mut other = raise("sky is hung");
+    other.raiser = ASTRA;
+    other.class = CLASS_HUNG_HOST;
+    let now = T0 + 2 * HOUR;
+    assert!(matches!(
+        decide(&facts, &other, false, now),
+        Decision::Note { on, .. } if on == alarm
+    ));
+    // --separate with a different class starts a second ladder.
+    assert_eq!(decide(&facts, &other, true, now), Decision::Raise);
+    // --separate with the same class does not.
+    other.class = CLASS_DATA_LOSS;
+    assert!(matches!(
+        decide(&facts, &other, true, now),
+        Decision::Note { on, .. } if on == alarm
+    ));
+    // An open TEST alarm does not hold the ladder.
+    let mut test = raise("drill");
+    test.test = true;
+    let (test, _) = raise_fragment(&test).unwrap();
+    let tests_only = with(&[&test]);
+    assert_eq!(decide(&tests_only, &other, false, now), Decision::Raise);
+}
+
+#[test]
+fn a_false_alarm_halves_the_raisers_daily_alarm_allowance() {
+    // CC raised one alarm at T0, resolved within the minute.
+    let (first, alarm) = raise_fragment(&raise("pile truncated")).unwrap();
+    let (honest, _) = resolve(alarm, T0 + MINUTE, false);
+    let (false_alarm, _) = resolve(alarm, T0 + MINUTE, true);
+    let mut second = raise("host hung");
+    second.class = CLASS_HUNG_HOST;
+    let now = T0 + 2 * HOUR;
+    second.raised_at = now;
+    let honest = with(&[&first, &honest]);
+    assert_eq!(guards::daily_allowance(&honest, CC, now), 3);
+    assert_eq!(decide(&honest, &second, false, now), Decision::Raise);
+    let falsely = with(&[&first, &false_alarm]);
+    assert_eq!(guards::false_alarms(&falsely, CC, now), 1);
+    assert_eq!(guards::daily_allowance(&falsely, CC, now), 1);
+    match decide(&falsely, &second, false, now) {
+        Decision::Refuse(why) => assert!(why.contains("allowance is 1"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // It halves only the raiser's allowance, and only for seven days.
+    assert_eq!(guards::daily_allowance(&falsely, ASTRA, now), 3);
+    assert_eq!(
+        guards::daily_allowance(&falsely, CC, T0 + 8 * guards::DAY),
+        3
+    );
+}
+
+#[test]
+fn the_colony_raises_at_most_five_alarms_a_day() {
+    let mut fragments = Vec::new();
+    for (index, raiser) in [CC, ASTRA, id(0x13), id(0x14), id(0x15)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut draft = raise(&format!("incident {index}"));
+        draft.raiser = raiser;
+        draft.raised_at = T0 + index as i128 * HOUR;
+        let (raised, alarm) = raise_fragment(&draft).unwrap();
+        let (closed, _) = resolve(alarm, draft.raised_at + MINUTE, false);
+        fragments.push(raised);
+        fragments.push(closed);
+    }
+    let facts = with(&fragments.iter().collect::<Vec<_>>());
+    let mut sixth = raise("incident 6");
+    sixth.raiser = id(0x16);
+    match decide(&facts, &sixth, false, T0 + 10 * HOUR) {
+        Decision::Refuse(why) => assert!(why.contains("limit is 5"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        decide(&facts, &sixth, false, T0 + 25 * HOUR),
+        Decision::Raise
+    );
 }
