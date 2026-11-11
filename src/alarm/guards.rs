@@ -31,9 +31,9 @@
 //! across hosts or across concurrent processes on one host: two zooids that
 //! decide at the same moment, or on hosts that have not yet synced each
 //! other's raises, can both be told `Raise`. So the one-ladder rule and the
-//! rate limits are best-effort per host. Step 5 owns that contract (and the
-//! follower, by keeping one ladder per open alarm, bounds what a duplicate
-//! costs); nothing in this module guarantees it.
+//! rate limits are best-effort per host. Two such raises are two open
+//! alarms, and each gets a ladder. Step 5 owns that contract; nothing in
+//! this module guarantees it.
 
 use std::collections::BTreeSet;
 
