@@ -10,13 +10,42 @@
 //! Only a raise that would start a new ladder is rate-limited. A test raise
 //! is checked for its reason and nothing else: it never mentions JP and never
 //! goes past R0, so it neither joins a real alarm nor spends an allowance.
+//!
+//! Each rule is one query, constrained to what it asks: the alarms with this
+//! incident, the same text since 30 min ago, the open alarms (of this class),
+//! this raiser's raises since a time, everyone's raises since a time, and
+//! this raiser's alarms with a false resolution in the last 7 days. Time
+//! windows are `value_range` constraints on the raise or resolve time.
+//! What the engine cannot say positively is checked per candidate with
+//! `exists!`: that an alarm is not a test, and that nothing has closed it.
+//! The engine emits one row per witness, so a set of alarm ids is collected
+//! wherever the answer is a count.
+//!
+//! What a decision can promise. The guards answer for the facts they are
+//! given and nothing more. A raise whose commit has not yet arrived is not
+//! counted, so `decide` must be fed a complete observation of the alarm
+//! collection (`storage::acquire_facts`, or `require_complete_attached_read`
+//! on an attached read); the tolerant read [`super::observe`] uses, and
+//! `storage::acquire_facts_read`, are for the follower and for display,
+//! never for a guard. And even a complete local read cannot serialise raises
+//! across hosts or across concurrent processes on one host: two zooids that
+//! decide at the same moment, or on hosts that have not yet synced each
+//! other's raises, can both be told `Raise`. So the one-ladder rule and the
+//! rate limits are best-effort per host. Step 5 owns that contract (and the
+//! follower, by keeping one ladder per open alarm, bounds what a duplicate
+//! costs); nothing in this module guarantees it.
+
+use std::collections::BTreeSet;
 
 use triblespace::core::inline::encodings::time::Lower;
 use triblespace::core::metadata;
+use triblespace::core::query::rangeconstraint::value_range;
 use triblespace::core::query::TriblePattern;
 use triblespace::prelude::*;
 
-use super::{is_open, text_handle, validate_raise, Raise, MINUTE};
+use super::{
+    closed_at, is_closed, point_at, text_handle, validate_raise, IntervalValue, Raise, MINUTE,
+};
 use crate::schemas::alarm::{alarm, KIND_ALARM, KIND_FALSE_ALARM, KIND_RESOLVE, KIND_TEST};
 use crate::schemas::message::local as message;
 
@@ -51,45 +80,42 @@ pub enum Decision {
     Refuse(String),
 }
 
-/// A non-test raise: its id and its earliest raise time.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Raised {
-    alarm: Id,
-    at: i128,
+/// Inclusive `value_range` bounds selecting every time interval whose lower
+/// bound is after `after` and, when `until` is given, at or before it.
+/// NsTAIInterval orders by lower bound, then upper (core/inline/encodings/
+/// time.rs), so the minimum takes the lowest upper half and the maximum the
+/// highest; a point-valued bound would cut off non-point intervals.
+fn lower_after(after: i128, until: Option<i128>) -> (IntervalValue, IntervalValue) {
+    let mut min = point_at(after.saturating_add(1)).expect("a point interval always encodes");
+    min.raw[16..].fill(0);
+    let max = match until {
+        Some(until) => {
+            let mut max = point_at(until).expect("a point interval always encodes");
+            max.raw[16..].fill(255);
+            max
+        }
+        None => IntervalValue::new([255; 32]),
+    };
+    (min, max)
 }
 
-/// Every raise with a time, test raises left out, earliest time per alarm.
-fn real_raises<P>(facts: &P) -> Vec<Raised>
+fn is_test<P>(facts: &P, alarm: Id) -> bool
 where
     P: TriblePattern + ?Sized,
 {
-    let mut raised: Vec<(Id, i128)> = find!(
-        (alarm: Id, at: Lower),
-        pattern!(facts, [{ ?alarm @ metadata::tag: &KIND_ALARM, metadata::created_at: ?at }])
-    )
-    .filter(|(alarm, _)| {
-        let alarm = *alarm;
-        !exists!(pattern!(facts, [{ alarm @ metadata::tag: &KIND_TEST }]))
-    })
-    .map(|(alarm, at)| (alarm, at.0))
-    .collect();
-    raised.sort();
-    raised.dedup_by_key(|(alarm, _)| *alarm);
-    raised
-        .into_iter()
-        .map(|(alarm, at)| Raised { alarm, at })
-        .collect()
+    exists!(pattern!(facts, [{ alarm @ metadata::tag: &KIND_TEST }]))
 }
 
-fn newest(mut alarms: Vec<Raised>) -> Option<Raised> {
-    alarms.sort_by_key(|raised| (raised.at, raised.alarm));
-    alarms.pop()
+/// The newest of `(alarm, raised at)` rows, by raise time, then id.
+fn newest(rows: impl Iterator<Item = (Id, Lower)>) -> Option<Id> {
+    rows.max_by_key(|(alarm, at)| (at.0, *alarm))
+        .map(|(alarm, _)| alarm)
 }
 
-fn ids(alarms: &[Raised]) -> String {
+fn ids(alarms: &BTreeSet<Id>) -> String {
     alarms
         .iter()
-        .map(|raised| format!("{:x}", raised.alarm))
+        .map(|alarm| format!("{alarm:x}"))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -103,29 +129,27 @@ pub fn false_alarms<P>(facts: &P, raiser: Id, now: i128) -> usize
 where
     P: TriblePattern + ?Sized,
 {
-    let mut resolved: Vec<Id> = find!(
-        (alarm: Id, at: Lower),
-        pattern!(facts, [
-            { _?resolve @
-                metadata::tag: &KIND_RESOLVE,
-                metadata::tag: &KIND_FALSE_ALARM,
-                alarm::of: ?alarm,
-                metadata::created_at: ?at,
-            },
-            { ?alarm @ metadata::tag: &KIND_ALARM, message::from: raiser }
-        ])
+    let (min, max) = lower_after(now - FALSE_ALARM_WINDOW, Some(now));
+    let false_resolved: BTreeSet<Id> = find!(
+        alarm: Id,
+        temp!((at), and!(
+            pattern!(facts, [
+                { _?resolve @
+                    metadata::tag: &KIND_RESOLVE,
+                    metadata::tag: &KIND_FALSE_ALARM,
+                    alarm::of: ?alarm,
+                    metadata::created_at: ?at,
+                },
+                { ?alarm @ metadata::tag: &KIND_ALARM, message::from: raiser }
+            ]),
+            value_range(at, min, max),
+        ))
     )
-    .filter(|(alarm, at)| {
-        let alarm = *alarm;
-        at.0 > now - FALSE_ALARM_WINDOW
-            && at.0 <= now
-            && !exists!(pattern!(facts, [{ alarm @ metadata::tag: &KIND_TEST }]))
-    })
-    .map(|(alarm, _)| alarm)
     .collect();
-    resolved.sort();
-    resolved.dedup();
-    resolved.len()
+    false_resolved
+        .into_iter()
+        .filter(|alarm| !is_test(facts, *alarm))
+        .count()
 }
 
 /// The raiser's daily allowance: [`RAISER_DAILY`], halved per recent false
@@ -153,77 +177,89 @@ where
     if draft.test {
         return Decision::Raise;
     }
-    let raises = real_raises(facts);
-    let open: Vec<Raised> = raises
-        .iter()
-        .copied()
-        .filter(|raised| is_open(facts, raised.alarm))
-        .collect();
+    let real = |alarm: &Id| !is_test(facts, *alarm);
 
     // Dedupe: a known incident, or the same text from anyone.
     if let Some(incident) = draft.incident.as_deref() {
         let key = text_handle(incident.trim());
-        let same: Vec<Raised> = raises
-            .iter()
-            .copied()
-            .filter(|raised| {
-                let id = raised.alarm;
-                exists!(pattern!(facts, [{ id @ alarm::incident: key }]))
-                    && (is_open(facts, raised.alarm)
-                        || super::closed_at(facts, raised.alarm)
+        let same = newest(
+            find!(
+                (alarm: Id, at: Lower),
+                pattern!(facts, [{ ?alarm @
+                    metadata::tag: &KIND_ALARM,
+                    alarm::incident: key,
+                    metadata::created_at: ?at,
+                }])
+            )
+            .filter(|(alarm, _)| {
+                real(alarm)
+                    && (!is_closed(facts, *alarm)
+                        || closed_at(facts, *alarm)
                             .is_some_and(|closed| closed > now - INCIDENT_WINDOW))
-            })
-            .collect();
-        if let Some(on) = newest(same) {
+            }),
+        );
+        if let Some(on) = same {
             return Decision::Note {
-                on: on.alarm,
-                why: format!(
-                    "incident {incident:?} is already alarm {:x}; added as a note",
-                    on.alarm
-                ),
+                on,
+                why: format!("incident {incident:?} is already alarm {on:x}; added as a note"),
             };
         }
     } else {
         let what = text_handle(draft.what.trim());
-        let same: Vec<Raised> = raises
-            .iter()
-            .copied()
-            .filter(|raised| {
-                let id = raised.alarm;
-                raised.at > now - SAME_TEXT_WINDOW
-                    && exists!(pattern!(facts, [{ id @ metadata::description: what }]))
-            })
-            .collect();
-        if let Some(on) = newest(same) {
+        let (min, max) = lower_after(now - SAME_TEXT_WINDOW, None);
+        let same = newest(
+            find!(
+                (alarm: Id, at: Lower),
+                and!(
+                    pattern!(facts, [{ ?alarm @
+                        metadata::tag: &KIND_ALARM,
+                        metadata::description: what,
+                        metadata::created_at: ?at,
+                    }]),
+                    value_range(at, min, max),
+                )
+            )
+            .filter(|(alarm, _)| real(alarm)),
+        );
+        if let Some(on) = same {
             return Decision::Note {
-                on: on.alarm,
+                on,
                 why: format!(
-                    "the same text was raised as alarm {:x} within 30 min; added as a note",
-                    on.alarm
+                    "the same text was raised as alarm {on:x} within 30 min; added as a note"
                 ),
             };
         }
     }
 
-    // One ladder at a time.
+    // One ladder at a time: an open real alarm, of this class with --separate.
+    let open = |(alarm, _): &(Id, Lower)| real(alarm) && !is_closed(facts, *alarm);
     let class = draft.class;
-    let joins: Vec<Raised> = if separate {
-        open.iter()
-            .copied()
-            .filter(|raised| {
-                let id = raised.alarm;
-                exists!(pattern!(facts, [{ id @ metadata::tag: class }]))
-            })
-            .collect()
+    let joins = if separate {
+        newest(
+            find!(
+                (alarm: Id, at: Lower),
+                pattern!(facts, [{ ?alarm @
+                    metadata::tag: &KIND_ALARM,
+                    metadata::tag: class,
+                    metadata::created_at: ?at,
+                }])
+            )
+            .filter(open),
+        )
     } else {
-        open.clone()
+        newest(
+            find!(
+                (alarm: Id, at: Lower),
+                pattern!(facts, [{ ?alarm @ metadata::tag: &KIND_ALARM, metadata::created_at: ?at }])
+            )
+            .filter(open),
+        )
     };
-    if let Some(on) = newest(joins) {
+    if let Some(on) = joins {
         return Decision::Note {
-            on: on.alarm,
+            on,
             why: format!(
-                "alarm {:x} is still open and its ladder is running; added as a note{}",
-                on.alarm,
+                "alarm {on:x} is still open and its ladder is running; added as a note{}",
                 if separate {
                     " (it has the same class, so --separate does not apply)"
                 } else {
@@ -235,19 +271,25 @@ where
 
     // Rate limits, for a raise that would start a ladder.
     let raiser = draft.raiser;
-    let by_raiser: Vec<Raised> = raises
-        .iter()
-        .copied()
-        .filter(|raised| {
-            let id = raised.alarm;
-            exists!(pattern!(facts, [{ id @ message::from: raiser }]))
-        })
-        .collect();
-    let recent: Vec<Raised> = by_raiser
-        .iter()
-        .copied()
-        .filter(|raised| raised.at > now - RAISER_WINDOW)
-        .collect();
+    let raised_by_since = |after: i128| -> BTreeSet<Id> {
+        let (min, max) = lower_after(after, None);
+        find!(
+            alarm: Id,
+            temp!((at), and!(
+                pattern!(facts, [{ ?alarm @
+                    metadata::tag: &KIND_ALARM,
+                    message::from: raiser,
+                    metadata::created_at: ?at,
+                }]),
+                value_range(at, min, max),
+            ))
+        )
+        .collect::<BTreeSet<Id>>()
+        .into_iter()
+        .filter(real)
+        .collect()
+    };
+    let recent = raised_by_since(now - RAISER_WINDOW);
     if !recent.is_empty() {
         return Decision::Refuse(format!(
             "you raised a real alarm within the last 30 min ({}); one per 30 min. \
@@ -255,12 +297,8 @@ where
             ids(&recent)
         ));
     }
-    let today: Vec<Raised> = by_raiser
-        .iter()
-        .copied()
-        .filter(|raised| raised.at > now - DAY)
-        .collect();
-    let allowance = daily_allowance(facts, draft.raiser, now);
+    let today = raised_by_since(now - DAY);
+    let allowance = daily_allowance(facts, raiser, now);
     if today.len() as u64 >= u64::from(allowance) {
         return Decision::Refuse(format!(
             "you have raised {} real alarm(s) in 24 h ({}); your allowance is {allowance} \
@@ -268,14 +306,21 @@ where
              Before raising again: {THE_CHECK}.",
             today.len(),
             ids(&today),
-            false_alarms(facts, draft.raiser, now)
+            false_alarms(facts, raiser, now)
         ));
     }
-    let everyone: Vec<Raised> = raises
-        .iter()
-        .copied()
-        .filter(|raised| raised.at > now - DAY)
-        .collect();
+    let (min, max) = lower_after(now - DAY, None);
+    let everyone: BTreeSet<Id> = find!(
+        alarm: Id,
+        temp!((at), and!(
+            pattern!(facts, [{ ?alarm @ metadata::tag: &KIND_ALARM, metadata::created_at: ?at }]),
+            value_range(at, min, max),
+        ))
+    )
+    .collect::<BTreeSet<Id>>()
+    .into_iter()
+    .filter(real)
+    .collect();
     if everyone.len() as u64 >= u64::from(GLOBAL_DAILY) {
         return Decision::Refuse(format!(
             "{} real alarms were raised in 24 h ({}); the colony's limit is {GLOBAL_DAILY}. \

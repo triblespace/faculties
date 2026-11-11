@@ -507,8 +507,9 @@ where
 /// picks it up on a later read once sync brings the bytes. That makes every
 /// answer here provisional in one direction: an ack still in flight leaves
 /// its alarm reading open (the ladder keeps sounding a little longer), and a
-/// raise still in flight is not yet counted by the guards. Callers that act
-/// on a count say `unread` beside it.
+/// raise still in flight would not be counted by the guards. So this read
+/// is for the follower and for display; [`guards::decide`] is fed a complete
+/// observation instead (see the guards' module doc).
 pub struct Observed {
     pub facts: FactArchive,
     pub unread: usize,
