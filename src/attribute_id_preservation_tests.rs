@@ -236,3 +236,208 @@ fn relations_snapshot_algebra_keeps_its_minted_ids() {
         assert_id(path, got, expected);
     }
 }
+
+/// The Alarm schema's ids, minted with `trible genid` on 2026-11-11. The
+/// constants are pinned byte-exact. The attributes are anchored, so each
+/// recorded id is the value derived from its minted anchor (in
+/// `schemas::alarm`) and its encoding, and a change of either is caught here.
+#[test]
+fn alarm_ids_keep_their_minted_values() {
+    use crate::schemas::alarm::{self as schema, alarm};
+
+    let mut drifted = Vec::new();
+    for (path, got, expected) in [
+        (
+            "alarm::of",
+            format!("{:X}", alarm::of.id()),
+            "92D7B7AABD7EF269D4EFCC1B3F2F22BA",
+        ),
+        (
+            "alarm::decays",
+            format!("{:X}", alarm::decays.id()),
+            "F647D5B1B14FCA07814EB1EACD7B63C1",
+        ),
+        (
+            "alarm::evidence",
+            format!("{:X}", alarm::evidence.id()),
+            "F80535FDE2B1DA331095AD4824E178E8",
+        ),
+        (
+            "alarm::incident",
+            format!("{:X}", alarm::incident.id()),
+            "CCD194F72F49F62148DC5095A397AE81",
+        ),
+        (
+            "alarm::rung",
+            format!("{:X}", alarm::rung.id()),
+            "2552758B96077A310B8A63533251DCC4",
+        ),
+        (
+            "alarm::via",
+            format!("{:X}", alarm::via.id()),
+            "260AC3E516461D2ADF6C5A608B4A9234",
+        ),
+        (
+            "alarm::for_person",
+            format!("{:X}", alarm::for_person.id()),
+            "9DD0263DEF9000161152C5DB890341D1",
+        ),
+    ] {
+        if got != expected {
+            drifted.push(format!("{path}: {got} (pinned {expected})"));
+        }
+    }
+
+    for (path, got, expected) in [
+        (
+            "DEFAULT_SCOPE_ID",
+            schema::DEFAULT_SCOPE_ID,
+            "16F26F0830541F6B8C8C080BB66758A4",
+        ),
+        (
+            "KIND_ALARM",
+            schema::KIND_ALARM,
+            "9E1AA740F7555FD47295C0F10E50753E",
+        ),
+        (
+            "KIND_ACK",
+            schema::KIND_ACK,
+            "4E2A034FB34F5962FBAEBB2516A2434D",
+        ),
+        (
+            "KIND_RESOLVE",
+            schema::KIND_RESOLVE,
+            "BA6E1060E775C1FB982D2C5C668F7A6C",
+        ),
+        (
+            "KIND_NOTE",
+            schema::KIND_NOTE,
+            "D3CC6BF340AE35337D532369710D4C0D",
+        ),
+        (
+            "KIND_STEP",
+            schema::KIND_STEP,
+            "83B784CC26C756591772C4BDE5C59F28",
+        ),
+        (
+            "KIND_STEP_DELIVERED",
+            schema::KIND_STEP_DELIVERED,
+            "30CC8AC8BBC08D28FDA4DF152E824DFE",
+        ),
+        (
+            "KIND_STEP_FAILED",
+            schema::KIND_STEP_FAILED,
+            "438B08CE4F8B32C82872D186E76874B1",
+        ),
+        (
+            "KIND_TEST",
+            schema::KIND_TEST,
+            "B481E6D1AF08C281354359E9859BF72C",
+        ),
+        (
+            "KIND_FALSE_ALARM",
+            schema::KIND_FALSE_ALARM,
+            "622345A4D7BCD5584DE7E2C8D7AB071E",
+        ),
+        (
+            "CLASS_DATA_LOSS",
+            schema::CLASS_DATA_LOSS,
+            "F30BAA9AE12E21BDC9C0A49B4DC890F5",
+        ),
+        (
+            "CLASS_RECOVERY_WINDOW",
+            schema::CLASS_RECOVERY_WINDOW,
+            "2FEAC5443995B3CF5BEA937C30B8C99E",
+        ),
+        (
+            "CLASS_HUNG_HOST",
+            schema::CLASS_HUNG_HOST,
+            "4BAC7221E2B42150B7DD9DCB7E5C9ECB",
+        ),
+        (
+            "CLASS_SECURITY",
+            schema::CLASS_SECURITY,
+            "19902F164719EF63D47CA331879E133A",
+        ),
+        (
+            "RUNG_COLONY",
+            schema::RUNG_COLONY,
+            "F4E6FCC62A5C14921D44DBD2A508C545",
+        ),
+        (
+            "RUNG_DISCORD_MENTION",
+            schema::RUNG_DISCORD_MENTION,
+            "94AE05554D4C2470A9625D0F7FC58112",
+        ),
+        (
+            "RUNG_DISCORD_VOICE",
+            schema::RUNG_DISCORD_VOICE,
+            "2445FE1A93253B871E512173C73AAEBD",
+        ),
+        (
+            "RUNG_MAC_NOTIFY",
+            schema::RUNG_MAC_NOTIFY,
+            "CA5596B34C32DA4DEE63B076FF8D6E27",
+        ),
+        (
+            "RUNG_MAC_SOUND",
+            schema::RUNG_MAC_SOUND,
+            "22998FE7FFB6159EEB87E03ABAC5D3F5",
+        ),
+        (
+            "RUNG_REACHY_SHOUT",
+            schema::RUNG_REACHY_SHOUT,
+            "A814C945124580BFEC2315E1B8143B86",
+        ),
+        (
+            "RUNG_HUE_ALERT",
+            schema::RUNG_HUE_ALERT,
+            "F867BB343CE049F3BEA072687589CEA9",
+        ),
+        (
+            "RUNG_FINAL_DISCORD",
+            schema::RUNG_FINAL_DISCORD,
+            "3BE15BB9D7E0C8954050B924399E12FF",
+        ),
+        (
+            "RUNG_FINAL_COLONY",
+            schema::RUNG_FINAL_COLONY,
+            "58D8A3B2EB98BE2A24BD7EB17A4DFCB5",
+        ),
+        (
+            "VIA_CLI",
+            schema::VIA_CLI,
+            "0ACF79419247D63ED199602D7407838F",
+        ),
+        (
+            "VIA_RELAYED",
+            schema::VIA_RELAYED,
+            "E9F88F3150934517FFC4FFC207C229F4",
+        ),
+        (
+            "VIA_DISCORD_REPLY",
+            schema::VIA_DISCORD_REPLY,
+            "0B6EC3EACCAB8B57E3316F4F6473F5CF",
+        ),
+        (
+            "VIA_DISCORD_LINE",
+            schema::VIA_DISCORD_LINE,
+            "006D7F135067837D9D10BCB54303BE22",
+        ),
+        (
+            "VIA_VOICE",
+            schema::VIA_VOICE,
+            "15EA7DFF6E70293D2BC151833518222E",
+        ),
+    ] {
+        let got = format!("{got:X}");
+        if got != expected {
+            drifted.push(format!("{path}: {got} (pinned {expected})"));
+        }
+    }
+    assert!(
+        drifted.is_empty(),
+        "alarm ids no longer resolve to their published values:\n{}",
+        drifted.join("\n")
+    );
+}

@@ -34,8 +34,8 @@ use triblespace::core::repo::{
 use triblespace::core::trible::TribleSet;
 
 use crate::schemas::{
-    atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings, files,
-    habit, headspace, home, mail, memory, message, models, orient, planner, posture, quota,
+    alarm, atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings,
+    files, habit, headspace, home, mail, memory, message, models, orient, planner, posture, quota,
     relations, status, swarm_health, teams, voice, web, wiki,
 };
 use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
@@ -65,6 +65,7 @@ use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 ///   own explicit admission policy.
 pub fn table() -> Vec<(Id, &'static str)> {
     vec![
+        (alarm::DEFAULT_SCOPE_ID, "alarm"),
         (atlas::DEFAULT_SCOPE_ID, "atlas"),
         (blockdag::DEFAULT_SCOPE_ID, "archive"),
         (body::DEFAULT_SCOPE_ID, "body"),
@@ -1169,6 +1170,14 @@ mod tests {
                 "two collections normalize to one override variable"
             );
         }
+    }
+
+    #[test]
+    fn the_alarm_collection_is_in_the_name_table() {
+        assert_eq!(
+            name_for(crate::schemas::alarm::DEFAULT_SCOPE_ID),
+            Some("alarm")
+        );
     }
 
     #[test]
