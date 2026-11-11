@@ -631,6 +631,45 @@ fn a_false_alarm_halves_the_raisers_daily_alarm_allowance() {
 }
 
 #[test]
+fn two_false_resolutions_of_one_alarm_halve_the_allowance_once() {
+    // One false alarm, resolved as false twice: by different zooids, at
+    // different times, for different reasons, so the two resolves are two
+    // entities. It is still one false alarm, and it halves once.
+    let (first, alarm) = raise_fragment(&raise("pile truncated")).unwrap();
+    let (by_cc, _) = resolve(alarm, T0 + MINUTE, true);
+    let (by_astra, _) = resolve_fragment(&Resolve {
+        alarm,
+        by: ASTRA,
+        at: T0 + 2 * MINUTE,
+        reason: "the pile was never truncated; df read the wrong mount".to_owned(),
+        false_alarm: true,
+    })
+    .unwrap();
+    let now = T0 + 2 * HOUR;
+    let twice = with(&[&first, &by_cc, &by_astra]);
+    assert_eq!(guards::false_alarms(&twice, CC, now), 1);
+    assert_eq!(guards::daily_allowance(&twice, CC, now), 1);
+}
+
+#[test]
+fn a_false_resolved_test_alarm_leaves_the_real_allowance_whole() {
+    // A test raise spends no allowance, so resolving it as false does not
+    // halve the raiser's allowance for real alarms either.
+    let mut drill = raise("drill");
+    drill.test = true;
+    let (drill, alarm) = raise_fragment(&drill).unwrap();
+    let (false_alarm, _) = resolve(alarm, T0 + MINUTE, true);
+    let now = T0 + 2 * HOUR;
+    let facts = with(&[&drill, &false_alarm]);
+    assert_eq!(guards::false_alarms(&facts, CC, now), 0);
+    assert_eq!(guards::daily_allowance(&facts, CC, now), 3);
+    let mut real = raise("host hung");
+    real.class = CLASS_HUNG_HOST;
+    real.raised_at = now;
+    assert_eq!(decide(&facts, &real, false, now), Decision::Raise);
+}
+
+#[test]
 fn the_colony_raises_at_most_five_alarms_a_day() {
     let mut fragments = Vec::new();
     for (index, raiser) in [CC, ASTRA, id(0x13), id(0x14), id(0x15)]

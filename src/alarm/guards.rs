@@ -94,26 +94,34 @@ fn ids(alarms: &[Raised]) -> String {
         .join(", ")
 }
 
-/// The number of false alarms raised by `raiser` and resolved as false
-/// within [`FALSE_ALARM_WINDOW`] before `now`.
+/// The number of real alarms raised by `raiser` that were resolved as false
+/// within [`FALSE_ALARM_WINDOW`] before `now`. It counts alarms, not
+/// resolutions: one alarm resolved as false twice, by two zooids or by
+/// concurrent writers, is one false alarm. A test raise spends no allowance,
+/// so a test resolved as false does not halve it either.
 pub fn false_alarms<P>(facts: &P, raiser: Id, now: i128) -> usize
 where
     P: TriblePattern + ?Sized,
 {
     let mut resolved: Vec<Id> = find!(
-        (resolve: Id, at: Lower),
+        (alarm: Id, at: Lower),
         pattern!(facts, [
-            { ?resolve @
+            { _?resolve @
                 metadata::tag: &KIND_RESOLVE,
                 metadata::tag: &KIND_FALSE_ALARM,
-                alarm::of: _?alarm,
+                alarm::of: ?alarm,
                 metadata::created_at: ?at,
             },
-            { _?alarm @ metadata::tag: &KIND_ALARM, message::from: raiser }
+            { ?alarm @ metadata::tag: &KIND_ALARM, message::from: raiser }
         ])
     )
-    .filter(|(_, at)| at.0 > now - FALSE_ALARM_WINDOW && at.0 <= now)
-    .map(|(resolve, _)| resolve)
+    .filter(|(alarm, at)| {
+        let alarm = *alarm;
+        at.0 > now - FALSE_ALARM_WINDOW
+            && at.0 <= now
+            && !exists!(pattern!(facts, [{ alarm @ metadata::tag: &KIND_TEST }]))
+    })
+    .map(|(alarm, _)| alarm)
     .collect();
     resolved.sort();
     resolved.dedup();
