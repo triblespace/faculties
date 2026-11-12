@@ -365,6 +365,10 @@ fn the_alarm_follower_command_is_a_capped_user_unit_with_absolute_paths_and_rout
         ]
     );
     assert!(args.contains(&"TRIBLESPACE_COLLECTION_ALARM=0123".to_owned()));
+    assert!(
+        args.contains(&UNIT_RUNTIME_MAX.to_owned()),
+        "the unit has a runtime backstop"
+    );
     let tail = &args[args.iter().position(|arg| arg == "--").unwrap()..];
     assert_eq!(
         tail,
@@ -478,6 +482,10 @@ impl<F: FnMut(&mut FollowState)> Ledger for Partial<'_, F> {
         self.inner.record_detected(alarm, detected)
     }
 
+    fn note(&self, alarm: Id, by: Id, text: &str, at: i128) -> Result<Id> {
+        self.inner.note_as(alarm, by, text, at)
+    }
+
     fn run_rungs(
         &self,
         subject: &Subject,
@@ -548,7 +556,9 @@ fn an_incomplete_observation_that_hides_the_raise_does_not_end_the_follower_as_c
             via: VIA_DISCORD_REPLY
         }
     );
-    assert_eq!(*hidden.borrow(), 3);
+    // The follower pulls Discord while it cannot see the raise, so JP's
+    // reply may be found (and win) while the raise is still hidden.
+    assert!((1..=3).contains(&*hidden.borrow()));
     // Nothing ran while the raise was hidden: R0's two steps only.
     let shown = fixture.alarm.show(&format!("{alarm:x}")).unwrap();
     assert_eq!(shown.steps.len(), 2);
@@ -671,4 +681,189 @@ fn the_follower_is_given_the_workspace_and_routes_the_raise_used_not_the_ambient
         .env
         .contains(&("TRIBLESPACE_COLLECTION_ALARM".to_owned(), "bb".repeat(32))));
     assert!(!names(&command).contains(&"FACULTIES_WORKSPACE".to_owned()));
+}
+
+/// Hide every observation after the first `complete` turns (raise and steps
+/// unseen, one commit unread) until turn `until`; the ack, if any, stays
+/// visible.
+fn hiding(
+    complete: usize,
+    until: usize,
+    turns: &std::cell::Cell<usize>,
+) -> impl FnMut(&mut FollowState) + '_ {
+    move |state: &mut FollowState| {
+        let turn = turns.get() + 1;
+        turns.set(turn);
+        if turn > complete && turn <= until {
+            state.raised = false;
+            state.steps.clear();
+            state.unread += 1;
+        }
+    }
+}
+
+fn rungs_ran(fixture: &crate::alarm::operations::tests::Fixture, alarm: Id) -> Vec<(String, i128)> {
+    fixture
+        .alarm
+        .show(&format!("{alarm:x}"))
+        .unwrap()
+        .steps
+        .into_iter()
+        .map(|step| (step.rung, step.started))
+        .collect()
+}
+
+#[test]
+fn past_the_grace_a_degraded_follower_escalates_from_its_last_complete_observation_once_per_rung() {
+    let fixture = fixture();
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    // One complete observation, then incomplete ones for a long time (the
+    // limit only keeps a follower that never acts from running forever).
+    let turns = std::cell::Cell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(hiding(1, 400, &turns)),
+    };
+    // JP answers once the lights have breathed (R3, at 10 min).
+    let mut pull = || {
+        if rungs_ran(&fixture, alarm)
+            .iter()
+            .any(|(rung, _)| rung == "hue-alert")
+        {
+            reply(&fixture, T0 + 11 * MINUTE)?;
+        }
+        Ok(())
+    };
+    let ended = follow(&ledger, alarm, &mut runner, &mut clock, Some(JP), &mut pull).unwrap();
+    // The ack wins although the observation that shows it is incomplete.
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
+    assert!(turns.get() < 400, "acked while still degraded");
+    let ran = rungs_ran(&fixture, alarm);
+    let count = |rung: &str| ran.iter().filter(|(name, _)| name == rung).count();
+    // Each due occurrence once, not once per degraded turn.
+    assert_eq!(count("discord-mention"), 2, "{ran:?}");
+    assert_eq!(count("mac-notify"), 1, "{ran:?}");
+    assert_eq!(count("mac-sound"), 1, "{ran:?}");
+    assert_eq!(count("reachy-shout"), 1, "{ran:?}");
+    assert_eq!(count("hue-alert"), 1, "{ran:?}");
+    // R1 ran on time, from the old observation: within the grace of R1's slot.
+    let r1 = ran
+        .iter()
+        .filter(|(rung, _)| rung == "discord-mention")
+        .map(|(_, at)| *at)
+        .max()
+        .unwrap();
+    assert!(
+        r1 >= T0 + 3 * MINUTE && r1 < T0 + 3 * MINUTE + 10 * SECOND,
+        "R1 at {r1}"
+    );
+    let calls = &runner.transport.calls;
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.contains("'afplay'"))
+            .count(),
+        3
+    );
+    // And it said so in the ledger.
+    let shown = fixture.alarm.show(&format!("{alarm:x}")).unwrap();
+    assert!(
+        shown.events.iter().any(|event| event.kind == "note"
+            && event
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("acts on the observation from"))),
+        "{:?}",
+        shown.events
+    );
+}
+
+#[test]
+fn a_follower_that_never_saw_a_complete_observation_does_not_act() {
+    let fixture = fixture();
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    // Incomplete from the first turn for five minutes of turns, then whole.
+    let turns = std::cell::Cell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(hiding(0, 60, &turns)),
+    };
+    let mut pull = || {
+        let mentions = rungs_ran(&fixture, alarm)
+            .iter()
+            .filter(|(rung, _)| rung == "discord-mention")
+            .count();
+        if mentions >= 2 {
+            reply(&fixture, T0 + 6 * MINUTE)?;
+        }
+        Ok(())
+    };
+    let ended = follow(&ledger, alarm, &mut runner, &mut clock, Some(JP), &mut pull).unwrap();
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
+    let r1 = rungs_ran(&fixture, alarm)
+        .iter()
+        .filter(|(rung, _)| rung == "discord-mention")
+        .map(|(_, at)| *at)
+        .max()
+        .unwrap();
+    assert!(
+        r1 >= T0 + 5 * MINUTE,
+        "nothing ran before a complete observation: R1 at {r1}"
+    );
+}
+
+#[test]
+fn a_follower_that_cannot_observe_stops_at_its_wall_cap_and_never_says_closed() {
+    let fixture = fixture();
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    let turns = std::cell::Cell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(hiding(0, 1_600, &turns)),
+    };
+    let ended = follow(
+        &ledger,
+        alarm,
+        &mut runner,
+        &mut clock,
+        Some(JP),
+        &mut || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(ended, Ended::TimedOut);
+    assert!(clock.now >= T0 + 120 * MINUTE && clock.now < T0 + 121 * MINUTE);
 }

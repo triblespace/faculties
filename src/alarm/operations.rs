@@ -445,6 +445,21 @@ impl Alarm {
         })
     }
 
+    /// Record a note on `alarm` as `by` at `at`, by id: the follower's own
+    /// account of what it did.
+    pub fn note_as(&self, alarm: Id, by: Id, text: &str, at: i128) -> Result<Id> {
+        let (fragment, note) = note_fragment(&Note {
+            alarm,
+            by,
+            at,
+            text: text.to_owned(),
+        })?;
+        self.storage.with_store(|pile, signer, runtime| {
+            commit_alarm(&self.storage, pile, signer, runtime, fragment)
+        })?;
+        Ok(note)
+    }
+
     fn record(
         &self,
         alarm: &str,

@@ -240,6 +240,10 @@ pub fn ended(alarm: triblespace::prelude::Id, ended: Ended, output: &mut Out<'_>
             super::via_name(via).unwrap_or("unknown way")
         ),
         Ended::Closed => format!("alarm {} is closed; the follower stops", short(alarm)),
+        Ended::TimedOut => format!(
+            "alarm {}: the follower reached its wall cap and stops; the alarm stays as it is",
+            short(alarm)
+        ),
         Ended::Finished => format!(
             "alarm {}: the ladder is over; the follower stops (an alarm still open stays open)",
             short(alarm)

@@ -27,6 +27,7 @@ use super::ack::Detected;
 use super::ladder::{next_action, Due, Next, SOUND_REPEAT};
 use super::operations::{Alarm, Clock, FollowState, StepReport};
 use super::rungs::{RungRunner, Settings, Subject};
+use super::StepRow;
 use super::SECOND;
 
 /// The longest the follower sleeps before it reads the pile again.
@@ -35,6 +36,15 @@ pub const POLL: i128 = 5 * SECOND;
 pub const PULL_EVERY: i128 = 20 * SECOND;
 /// An open alarm with no step this recent has lost its follower.
 pub const STALE_AFTER: i128 = 2 * SOUND_REPEAT;
+/// The longest a follower runs, whatever happens: above the 60-minute
+/// ladder, so it only ends a follower that is stuck.
+pub const WALL_CAP: i128 = 2 * 60 * 60 * SECOND;
+/// How long a follower waits on incomplete observations before it goes on
+/// escalating from the last complete one. For an alarm, silence is the
+/// dangerous failure and a repeated rung only noise.
+pub const GRACE: i128 = 2 * 60 * SECOND;
+/// The transient unit's own backstop, above [`WALL_CAP`].
+pub const UNIT_RUNTIME_MAX: &str = "RuntimeMaxSec=7800";
 
 /// Why a follower stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +55,9 @@ pub enum Ended {
     Closed,
     /// The ladder is over (a test after R0, or the final notice sent).
     Finished,
+    /// The follower ran for [`WALL_CAP`] without the alarm closing or its
+    /// ladder ending (for instance, it could not observe it completely).
+    TimedOut,
 }
 
 /// What the follower reads and writes: [`Alarm`] over a pile, or a stand-in
@@ -53,6 +66,8 @@ pub trait Ledger {
     fn subject(&self, alarm: Id) -> Result<Subject>;
     fn state(&self, alarm: Id, jp_user: Option<&str>) -> Result<FollowState>;
     fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>>;
+    /// Record a note on `alarm` by `by` at `at`.
+    fn note(&self, alarm: Id, by: Id, text: &str, at: i128) -> Result<Id>;
     fn run_rungs(
         &self,
         subject: &Subject,
@@ -73,6 +88,10 @@ impl Ledger for Alarm {
 
     fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>> {
         Alarm::record_detected(self, alarm, detected)
+    }
+
+    fn note(&self, alarm: Id, by: Id, text: &str, at: i128) -> Result<Id> {
+        Alarm::note_as(self, alarm, by, text, at)
     }
 
     fn run_rungs(
@@ -108,9 +127,20 @@ pub fn follow(
     // an alarm that is already closed touches nothing.
     let mut capabilities = None;
     let mut pulled: Option<i128> = None;
+    let started = clock.now()?;
+    // The last complete observation (when, and its steps), with every rung
+    // this follower ran since appended, so a rung it attempted is never
+    // replayed from the same stale observation.
+    let mut basis: Option<(i128, Vec<StepRow>)> = None;
+    let mut incomplete_since: Option<i128> = None;
+    let mut noted = false;
     loop {
         let now = clock.now()?;
+        if now - started >= WALL_CAP {
+            return Ok(Ended::TimedOut);
+        }
         let state = operations.state(alarm, jp_user)?;
+        // Positive evidence wins in any observation, complete or not.
         if state.closed {
             return Ok(Ended::Closed);
         }
@@ -118,44 +148,102 @@ pub fn follow(
             operations.record_detected(alarm, detected)?;
             return Ok(Ended::Acked { via: detected.via });
         }
-        if state.unread > 0 || !state.raised {
-            eprintln!(
-                "alarm follow: {} alarm commit(s) unread{}; no rung this turn",
-                state.unread,
-                if state.raised {
-                    ""
-                } else {
-                    " and the raise is not visible"
+        let complete = state.unread == 0 && state.raised;
+        if complete {
+            basis = Some((now, state.steps.clone()));
+            incomplete_since = None;
+            noted = false;
+        } else {
+            let since = *incomplete_since.get_or_insert(now);
+            let acting = match &basis {
+                None => {
+                    eprintln!(
+                        "alarm follow: {} alarm commit(s) unread and no complete observation \
+                         of this alarm yet; it cannot act without knowing its raise",
+                        state.unread
+                    );
+                    false
                 }
-            );
-            clock.sleep_until(now + POLL)?;
-            continue;
+                Some(_) if now - since < GRACE => {
+                    eprintln!(
+                        "alarm follow: {} alarm commit(s) unread; no rung this turn (grace)",
+                        state.unread
+                    );
+                    false
+                }
+                Some((observed, _)) => {
+                    if !noted {
+                        let text = format!(
+                            "the follower acts on the observation from {} with {} commit(s) \
+                             unread: it could not read the alarm completely for {} s",
+                            super::render::utc(*observed),
+                            state.unread,
+                            (now - since) / SECOND
+                        );
+                        if let Err(error) = operations.note(alarm, subject.raiser, &text, now) {
+                            eprintln!("alarm follow: could not record that note: {error:#}");
+                        }
+                        noted = true;
+                    }
+                    true
+                }
+            };
+            if !acting {
+                wait(now, now + POLL, jp_user, &mut pulled, pull, clock)?;
+                continue;
+            }
         }
+        let steps = basis
+            .as_ref()
+            .expect("a complete observation was seen")
+            .1
+            .clone();
         let capabilities = capabilities.get_or_insert_with(|| runner.capabilities(&subject));
         capabilities.jp_in_voice = state.jp_in_voice;
+        // The alarm's own identity throughout: its raise time and whether it
+        // is a test come from the raise, never from a later observation.
         match next_action(
             subject.raised_at,
             now,
-            &state.steps,
+            &steps,
             true,
             subject.test,
             capabilities,
         ) {
             Next::Run(due) => {
-                operations.run_rungs(&subject, &due, runner, clock)?;
+                let reports = operations.run_rungs(&subject, &due, runner, clock)?;
+                if let Some((_, steps)) = &mut basis {
+                    steps.extend(reports.iter().map(|report| StepRow {
+                        step: report.step,
+                        rung: report.rung,
+                        started: now,
+                        delivered: report.outcome == super::Outcome::Delivered,
+                        failed: report.outcome != super::Outcome::Delivered,
+                    }));
+                }
             }
             Next::Stop => return Ok(Ended::Finished),
-            Next::Wait(at) => {
-                if jp_user.is_some() && pulled.is_none_or(|last| now - last >= PULL_EVERY) {
-                    if let Err(error) = pull() {
-                        eprintln!("alarm follow: Discord pull failed, going on: {error:#}");
-                    }
-                    pulled = Some(now);
-                }
-                clock.sleep_until(at.min(now + POLL))?;
-            }
+            Next::Wait(at) => wait(now, at.min(now + POLL), jp_user, &mut pulled, pull, clock)?,
         }
     }
+}
+
+/// Pull the Discord channel when due, then sleep until `until`.
+fn wait(
+    now: i128,
+    until: i128,
+    jp_user: Option<&str>,
+    pulled: &mut Option<i128>,
+    pull: &mut dyn FnMut() -> Result<()>,
+    clock: &mut dyn Clock,
+) -> Result<()> {
+    if jp_user.is_some() && pulled.is_none_or(|last| now - last >= PULL_EVERY) {
+        if let Err(error) = pull() {
+            eprintln!("alarm follow: Discord pull failed, going on: {error:#}");
+        }
+        *pulled = Some(now);
+    }
+    clock.sleep_until(until)
 }
 
 /// The lock that keeps one follower per alarm on a host: an exclusive
@@ -273,6 +361,8 @@ impl FollowerCommand {
             "MemoryMax=1G",
             "-p",
             "OOMScoreAdjust=500",
+            "-p",
+            UNIT_RUNTIME_MAX,
         ]
         .iter()
         .map(|word| word.to_string())
