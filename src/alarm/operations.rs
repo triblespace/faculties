@@ -202,7 +202,15 @@ pub struct ShowView {
 /// What the follower reads on each turn.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FollowState {
-    pub open: bool,
+    /// The raise is present in this observation.
+    pub raised: bool,
+    /// An ack or resolve naming the alarm is present: positive evidence
+    /// that it is closed. Absence of one is not evidence of anything.
+    pub closed: bool,
+    /// Selected commits of the alarm collection this observation could not
+    /// read. While any are unread, a missing raise, step or close may only
+    /// be in flight, so the follower takes no rung action.
+    pub unread: usize,
     pub steps: Vec<StepRow>,
     /// An ack JP left on Discord that nothing recorded yet.
     pub detected: Option<Detected>,
@@ -580,8 +588,12 @@ impl Alarm {
                 ),
                 _ => (None, false),
             };
+            let facts = &view.alarm;
+            let raised = exists!(pattern!(facts, [{ alarm @ metadata::tag: &KIND_ALARM }]));
             Ok(FollowState {
-                open: super::is_open(&view.alarm, alarm),
+                raised,
+                closed: is_closed(&view.alarm, alarm),
+                unread: view.unread,
                 steps: steps(&view.alarm, alarm),
                 detected,
                 jp_in_voice,
@@ -592,9 +604,13 @@ impl Alarm {
     /// The open, real alarms whose newest activity (the raise or a step) is
     /// more than `stale` before `now`, and whose ladder is not over: the
     /// ones a follower that died left behind.
-    pub fn orphans(&self, now: i128, stale: i128) -> Result<Vec<Id>> {
+    ///
+    /// It decides from absence (no close, no recent step), so it reads the
+    /// alarm collection completely ([`observe_complete`]), retried while
+    /// commits are in flight and then refused rather than guessed.
+    pub fn orphans(&self, now: i128, stale: i128, clock: &mut dyn Clock) -> Result<Vec<Id>> {
         self.storage.with_store(|pile, signer, runtime| {
-            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
+            let view = observe_complete(&self.storage, pile, signer, runtime, clock)?;
             let facts = &view.alarm;
             Ok(super::list(facts)
                 .into_iter()

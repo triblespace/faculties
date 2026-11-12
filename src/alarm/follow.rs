@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::prelude::*;
 
-use super::ladder::{next_action, Next, SOUND_REPEAT};
-use super::operations::{Alarm, Clock};
-use super::rungs::{RungRunner, Settings};
+use super::ack::Detected;
+use super::ladder::{next_action, Due, Next, SOUND_REPEAT};
+use super::operations::{Alarm, Clock, FollowState, StepReport};
+use super::rungs::{RungRunner, Settings, Subject};
 use super::SECOND;
 
 /// The longest the follower sleeps before it reads the pile again.
@@ -46,10 +47,56 @@ pub enum Ended {
     Finished,
 }
 
+/// What the follower reads and writes: [`Alarm`] over a pile, or a stand-in
+/// under test.
+pub trait Ledger {
+    fn subject(&self, alarm: Id) -> Result<Subject>;
+    fn state(&self, alarm: Id, jp_user: Option<&str>) -> Result<FollowState>;
+    fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>>;
+    fn run_rungs(
+        &self,
+        subject: &Subject,
+        due: &[Due],
+        runner: &mut dyn RungRunner,
+        clock: &mut dyn Clock,
+    ) -> Result<Vec<StepReport>>;
+}
+
+impl Ledger for Alarm {
+    fn subject(&self, alarm: Id) -> Result<Subject> {
+        Alarm::subject(self, alarm)
+    }
+
+    fn state(&self, alarm: Id, jp_user: Option<&str>) -> Result<FollowState> {
+        Alarm::state(self, alarm, jp_user)
+    }
+
+    fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>> {
+        Alarm::record_detected(self, alarm, detected)
+    }
+
+    fn run_rungs(
+        &self,
+        subject: &Subject,
+        due: &[Due],
+        runner: &mut dyn RungRunner,
+        clock: &mut dyn Clock,
+    ) -> Result<Vec<StepReport>> {
+        Alarm::run_rungs(self, subject, due, runner, clock)
+    }
+}
+
 /// Run `alarm`'s ladder to its end. `pull` refreshes the Discord facts (the
 /// alarm's channel); its failures are reported and the ladder goes on.
+///
+/// Every observation is tolerant, so every decision is made only on what is
+/// PRESENT: the follower ends as [`Ended::Closed`] only on an ack or resolve
+/// record it can see, never because the raise is missing, and while the
+/// observation has unread commits (a step or a close may be in flight) it
+/// runs no rung that turn, reports it, and looks again after [`POLL`]. An ack
+/// it detects is positive evidence and is recorded whatever else is unread.
 pub fn follow(
-    operations: &Alarm,
+    operations: &dyn Ledger,
     alarm: Id,
     runner: &mut dyn RungRunner,
     clock: &mut dyn Clock,
@@ -64,12 +111,25 @@ pub fn follow(
     loop {
         let now = clock.now()?;
         let state = operations.state(alarm, jp_user)?;
-        if !state.open {
+        if state.closed {
             return Ok(Ended::Closed);
         }
         if let Some(detected) = state.detected {
             operations.record_detected(alarm, detected)?;
             return Ok(Ended::Acked { via: detected.via });
+        }
+        if state.unread > 0 || !state.raised {
+            eprintln!(
+                "alarm follow: {} alarm commit(s) unread{}; no rung this turn",
+                state.unread,
+                if state.raised {
+                    ""
+                } else {
+                    " and the raise is not visible"
+                }
+            );
+            clock.sleep_until(now + POLL)?;
+            continue;
         }
         let capabilities = capabilities.get_or_insert_with(|| runner.capabilities(&subject));
         capabilities.jp_in_voice = state.jp_in_voice;
@@ -417,7 +477,7 @@ pub fn resume(
 ) -> Result<Vec<Id>> {
     let now = clock.now()?;
     let mut adopted = Vec::new();
-    for orphan in operations.orphans(now, STALE_AFTER)? {
+    for orphan in operations.orphans(now, STALE_AFTER, clock)? {
         if Lock::held(lock_directory, orphan)? {
             continue;
         }

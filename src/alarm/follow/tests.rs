@@ -5,12 +5,16 @@ use std::cell::RefCell;
 
 use super::*;
 use crate::alarm::ack::tests::message;
+use crate::alarm::ack::Detected;
+use crate::alarm::ladder::Due;
 use crate::alarm::operations::tests::{fixture, request, FakeClock, T0};
 use crate::alarm::operations::{commit_to, Raised};
+use crate::alarm::operations::{FollowState, StepReport};
 use crate::alarm::rungs::tests::{settings, FakeTransport};
 use crate::alarm::rungs::Executor;
+use crate::alarm::rungs::Subject;
 use crate::alarm::MINUTE;
-use crate::schemas::alarm::VIA_DISCORD_REPLY;
+use crate::schemas::alarm::{RUNG_DISCORD_MENTION, VIA_DISCORD_REPLY};
 use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
 
 const JP: &str = "100000000000000777";
@@ -450,4 +454,152 @@ fn alarm_follower_lock_racers_exactly_one_wins() {
             .count();
         assert_eq!(winners, 1);
     }
+}
+
+/// The real ledger, with each observation passed through `edit` first: a
+/// stand-in for a read that could not see every selected commit.
+struct Partial<'a, F: FnMut(&mut FollowState)> {
+    inner: &'a crate::alarm::Alarm,
+    edit: RefCell<F>,
+}
+
+impl<F: FnMut(&mut FollowState)> Ledger for Partial<'_, F> {
+    fn subject(&self, alarm: Id) -> Result<Subject> {
+        self.inner.subject(alarm)
+    }
+
+    fn state(&self, alarm: Id, jp_user: Option<&str>) -> Result<FollowState> {
+        let mut state = self.inner.state(alarm, jp_user)?;
+        (self.edit.borrow_mut())(&mut state);
+        Ok(state)
+    }
+
+    fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>> {
+        self.inner.record_detected(alarm, detected)
+    }
+
+    fn run_rungs(
+        &self,
+        subject: &Subject,
+        due: &[Due],
+        runner: &mut dyn RungRunner,
+        clock: &mut dyn Clock,
+    ) -> Result<Vec<StepReport>> {
+        self.inner.run_rungs(subject, due, runner, clock)
+    }
+}
+
+/// Commit a JP reply to the first mention.
+fn reply(fixture: &crate::alarm::operations::tests::Fixture, at: i128) -> Result<()> {
+    let reply = message(
+        "100000000000000613",
+        JP,
+        "here",
+        at,
+        Some("100000000000000901"),
+    );
+    fixture
+        .storage
+        .with_store(|pile, signer, runtime| {
+            commit_to(
+                &fixture.storage,
+                pile,
+                signer,
+                runtime,
+                DISCORD_SCOPE_ID,
+                "Discord",
+                reply,
+            )
+        })
+        .map(drop)
+}
+
+#[test]
+fn an_incomplete_observation_that_hides_the_raise_does_not_end_the_follower_as_closed() {
+    let fixture = fixture();
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    // The first three turns cannot see the raise: its commit is unread.
+    let hidden = RefCell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(|state: &mut FollowState| {
+            let mut hidden = hidden.borrow_mut();
+            if *hidden < 3 {
+                *hidden += 1;
+                state.raised = false;
+                state.steps.clear();
+                state.unread += 1;
+            }
+        }),
+    };
+    let mut pull = || reply(&fixture, T0 + MINUTE);
+    let ended = follow(&ledger, alarm, &mut runner, &mut clock, Some(JP), &mut pull).unwrap();
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
+    assert_eq!(*hidden.borrow(), 3);
+    // Nothing ran while the raise was hidden: R0's two steps only.
+    let shown = fixture.alarm.show(&format!("{alarm:x}")).unwrap();
+    assert_eq!(shown.steps.len(), 2);
+}
+
+#[test]
+fn an_incomplete_observation_that_hides_a_step_does_not_repeat_the_rung() {
+    let fixture = fixture();
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    // Once R1's mention is recorded, the next three turns cannot see it.
+    let hidden = std::cell::Cell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(|state: &mut FollowState| {
+            let r1 = state.steps.iter().position(|step| {
+                step.rung == RUNG_DISCORD_MENTION && step.started >= T0 + 3 * MINUTE
+            });
+            if let (Some(r1), true) = (r1, hidden.get() < 3) {
+                hidden.set(hidden.get() + 1);
+                state.steps.remove(r1);
+                state.unread += 1;
+            }
+        }),
+    };
+    let mut pull = || {
+        if hidden.get() >= 3 {
+            reply(&fixture, T0 + 4 * MINUTE)?;
+        }
+        Ok(())
+    };
+    let ended = follow(&ledger, alarm, &mut runner, &mut clock, Some(JP), &mut pull).unwrap();
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
+    assert_eq!(hidden.get(), 3);
+    let re_mentions = runner
+        .transport
+        .calls
+        .iter()
+        .filter(|call| call.contains("after 3 min"))
+        .count();
+    assert_eq!(re_mentions, 1, "{:?}", runner.transport.calls);
 }
