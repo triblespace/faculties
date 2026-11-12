@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
+use super::follow;
 use super::guards::THE_CHECK;
-use super::operations::{Alarm, RaiseRequest, SystemClock};
+use super::operations::{Alarm, RaiseRequest, Raised, SystemClock};
 use super::render;
 use super::rungs::{Executor, Live, Settings};
 use crate::out::Out;
@@ -207,6 +208,20 @@ enum Command {
         /// Alarm id or unique prefix.
         id: String,
     },
+    /// Run an alarm's ladder until it is acked, resolved or over. `raise`
+    /// starts this in a transient unit; run it by hand when raise says the
+    /// ladder is not running. Best-effort across hosts: a follower on each
+    /// of two hosts would both run the ladder.
+    Follow {
+        /// Alarm id or unique prefix.
+        #[arg(required_unless_present = "resume", conflicts_with = "resume")]
+        id: Option<String>,
+        /// Start a follower for every open alarm whose follower is gone
+        /// (its newest step is older than twice the sound interval and no
+        /// live process holds its lock here). For a boot path.
+        #[arg(long)]
+        resume: bool,
+    },
 }
 
 fn persona(persona: &Option<String>) -> Result<String> {
@@ -263,10 +278,36 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             if dry_run {
                 return render::preview(&alarm.preview(&request, &mut clock)?, output);
             }
-            let mut executor =
-                Executor::new(Live::new(storage), settings, crate::quota::local_host()?);
+            let mut executor = Executor::new(
+                Live::new(storage.clone()),
+                settings.clone(),
+                crate::quota::local_host()?,
+            );
             let raised = alarm.raise(&request, &mut executor, &mut clock)?;
-            render::raised(&raised, output)
+            render::raised(&raised, output)?;
+            if let Raised::Alarm {
+                alarm: id, subject, ..
+            } = &raised
+            {
+                if subject.test {
+                    output.line("test: no follower, the ladder stops after R0")?;
+                } else {
+                    let locks = follow::runtime_dir()?;
+                    match follow::start(
+                        &storage,
+                        &settings,
+                        &follow::ambient_routes(),
+                        *id,
+                        &mut *follow::default_spawner(&locks),
+                    ) {
+                        Ok(unit) => output.line(format!("follower started: {unit}"))?,
+                        Err(error) => bail!(
+                            "rung 0 sent; ladder NOT running ({error:#}); run `alarm follow {id:x}`"
+                        ),
+                    }
+                }
+            }
+            Ok(())
         }
         Command::Ack {
             id,
@@ -305,6 +346,65 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             output,
         ),
         Command::Show { id } => render::show(&alarm.show(&id)?, output),
+        Command::Follow { id, resume } => {
+            let locks = follow::runtime_dir()?;
+            if resume {
+                let routes = follow::ambient_routes();
+                let adopted = follow::resume(
+                    &alarm,
+                    &mut clock,
+                    &locks,
+                    &mut *follow::default_spawner(&locks),
+                    &|id| {
+                        let pile = std::fs::canonicalize(storage.path())?;
+                        let key = std::fs::canonicalize(crate::storage::signer_path(
+                            &pile,
+                            storage.key_path(),
+                        ))?;
+                        follow::follower_command(
+                            &follow::alarm_program()?,
+                            &pile,
+                            &key,
+                            id,
+                            follow::follower_env(&settings, routes.iter().cloned()),
+                        )
+                    },
+                )?;
+                return render::adopted(&adopted, output);
+            }
+            let id = alarm.resolve_id(id.as_deref().expect("clap requires an id"))?;
+            let _lock = follow::Lock::acquire(&locks, id)?;
+            // One store for the whole ladder: opening the pile is the
+            // expensive part, and the follower reads it every few seconds.
+            let storage = storage.retained();
+            let alarm = Alarm::with_storage(storage.clone());
+            let mut executor = Executor::new(
+                Live::new(storage.clone()),
+                settings.clone(),
+                crate::quota::local_host()?,
+            )
+            .probing_the_mac();
+            let discord = crate::discord::Discord::with_storage(storage.clone());
+            let channel = settings.discord_channel.clone();
+            let mut pull = || match &channel {
+                Some(channel) => discord
+                    .pull(crate::discord::PullOptions {
+                        channel_id: Some(channel.clone()),
+                        ..Default::default()
+                    })
+                    .map(drop),
+                None => Ok(()),
+            };
+            let ended = follow::follow(
+                &alarm,
+                id,
+                &mut executor,
+                &mut clock,
+                settings.jp_discord_user.as_deref(),
+                &mut pull,
+            );
+            storage.finish(ended.and_then(|ended| render::ended(id, ended, output)))
+        }
     }
 }
 
@@ -387,6 +487,10 @@ mod tests {
         assert!(parses(&["note", "9e1a", "the copy finished"]));
         assert!(parses(&["list", "--open"]));
         assert!(parses(&["show", "9e1a"]));
+        assert!(parses(&["follow", "9e1a"]));
+        assert!(parses(&["follow", "--resume"]));
+        assert!(!parses(&["follow"]));
+        assert!(!parses(&["follow", "9e1a", "--resume"]));
         assert!(!parses(&["show"]));
     }
 

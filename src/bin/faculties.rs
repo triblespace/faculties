@@ -178,6 +178,7 @@ fn run(command: Command) -> Result<()> {
                 world_url,
                 world_session: world_session_file,
                 alarm: alarm.settings(),
+                alarm_routes: faculties::alarm::follow::ambient_routes(),
             });
             let result = match http_listen {
                 Some(bind) => {

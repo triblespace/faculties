@@ -3,6 +3,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 
+use super::follow::Ended;
 use super::guards::Decision;
 use super::operations::{ListView, Preview, Raised, Recorded, ShowView, StepReport};
 use super::{rung_name, Outcome, MINUTE, SECOND};
@@ -224,6 +225,31 @@ pub fn show(view: &ShowView, output: &mut Out<'_>) -> Result<()> {
             "  {} alarm commit(s) could not be read here yet",
             view.unread
         ))?;
+    }
+    Ok(())
+}
+
+pub fn ended(alarm: triblespace::prelude::Id, ended: Ended, output: &mut Out<'_>) -> Result<()> {
+    output.line(match ended {
+        Ended::Acked { via } => format!(
+            "alarm {} acked by JP ({}); the follower stops",
+            short(alarm),
+            super::via_name(via).unwrap_or("unknown way")
+        ),
+        Ended::Closed => format!("alarm {} is closed; the follower stops", short(alarm)),
+        Ended::Finished => format!(
+            "alarm {}: the ladder is over; the follower stops (an alarm still open stays open)",
+            short(alarm)
+        ),
+    })
+}
+
+pub fn adopted(adopted: &[triblespace::prelude::Id], output: &mut Out<'_>) -> Result<()> {
+    if adopted.is_empty() {
+        return output.line("no open alarm without a follower");
+    }
+    for alarm in adopted {
+        output.line(format!("adopted alarm {}: follower started", short(*alarm)))?;
     }
     Ok(())
 }

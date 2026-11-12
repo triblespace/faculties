@@ -32,6 +32,8 @@ pub struct Config {
     pub world_session: Option<PathBuf>,
     /// Where alarm rungs go; every target unset when not configured.
     pub alarm: alarm::rungs::Settings,
+    /// The collection routes an alarm follower inherits.
+    pub alarm_routes: Vec<(String, String)>,
 }
 
 impl Config {
@@ -47,6 +49,7 @@ impl Config {
             world_url: None,
             world_session: None,
             alarm: alarm::rungs::Settings::default(),
+            alarm_routes: Vec::new(),
         }
     }
 }
@@ -91,6 +94,7 @@ impl Catalog {
             world_url,
             world_session,
             alarm: alarm_settings,
+            alarm_routes,
         } = config;
         let discord = discord::mcp::Discord::with_storage(storage.clone());
         let linkedin = linkedin::mcp::LinkedIn::with_storage(storage.clone());
@@ -100,10 +104,10 @@ impl Catalog {
         };
         let orient = Arc::new(orient);
         let faculties: Vec<Box<dyn Faculty + Send + Sync>> = vec![
-            Box::new(alarm::mcp::Alarm::with_settings(
-                storage.clone(),
-                alarm_settings,
-            )),
+            Box::new(
+                alarm::mcp::Alarm::with_settings(storage.clone(), alarm_settings)
+                    .with_follower_routes(alarm_routes),
+            ),
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),

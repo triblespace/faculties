@@ -8,7 +8,8 @@ use anybytes::Bytes;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
-use super::operations::{Alarm as Operations, RaiseRequest, SystemClock};
+use super::follow;
+use super::operations::{Alarm as Operations, RaiseRequest, Raised, SystemClock};
 use super::render;
 use super::rungs::{Executor, Live, Settings};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
@@ -122,6 +123,8 @@ pub struct Alarm {
     /// Where the rungs go, from the launcher: never read from the server's
     /// environment here.
     settings: Settings,
+    /// The collection routes a follower inherits, from the launcher.
+    routes: Vec<(String, String)>,
 }
 
 impl Alarm {
@@ -137,7 +140,14 @@ impl Alarm {
         Self {
             operations: Operations::with_storage(storage),
             settings,
+            routes: Vec::new(),
         }
+    }
+
+    /// The routes a follower started by `alarm_raise` is given.
+    pub fn with_follower_routes(mut self, routes: Vec<(String, String)>) -> Self {
+        self.routes = routes;
+        self
     }
 }
 
@@ -175,7 +185,29 @@ impl Faculty for Alarm {
                     crate::quota::local_host()?,
                 );
                 let raised = self.operations.raise(&request, &mut executor, &mut clock)?;
-                render::raised(&raised, output)
+                render::raised(&raised, output)?;
+                if let Raised::Alarm {
+                    alarm: id, subject, ..
+                } = &raised
+                {
+                    if !subject.test {
+                        let locks = follow::runtime_dir()?;
+                        match follow::start(
+                            self.operations.storage(),
+                            &self.settings,
+                            &self.routes,
+                            *id,
+                            &mut *follow::default_spawner(&locks),
+                        ) {
+                            Ok(unit) => output.line(format!("follower started: {unit}"))?,
+                            Err(error) => bail!(
+                                "rung 0 sent; ladder NOT running ({error:#}); run `alarm follow \
+                                 {id:x}`"
+                            ),
+                        }
+                    }
+                }
+                Ok(())
             }
             "alarm_ack" => {
                 let args: AckArguments = decode_arguments(arguments)?;

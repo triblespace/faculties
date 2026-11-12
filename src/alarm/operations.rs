@@ -35,7 +35,7 @@ use super::ladder::{self, Due, Next};
 use super::rungs::{RungRunner, Subject};
 use super::{
     ack_fragment, class_id, class_name, is_closed, note_fragment, raise_fragment, resolve_fragment,
-    rung_name, step_fragment, steps, via_name, Ack, Note, Outcome, Raise, Resolve, Step,
+    rung_name, step_fragment, steps, via_name, Ack, Note, Outcome, Raise, Resolve, Step, StepRow,
     TextHandle, SECOND,
 };
 use crate::relations::{self, Head};
@@ -197,6 +197,16 @@ pub struct ShowView {
     pub steps: Vec<StepLine>,
     pub events: Vec<Event>,
     pub unread: usize,
+}
+
+/// What the follower reads on each turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FollowState {
+    pub open: bool,
+    pub steps: Vec<StepRow>,
+    /// An ack JP left on Discord that nothing recorded yet.
+    pub detected: Option<Detected>,
+    pub jp_in_voice: bool,
 }
 
 /// A written ack, resolve or note.
@@ -541,6 +551,72 @@ impl Alarm {
             let view = observe(&self.storage, pile, signer, runtime, false, false)?;
             let alarm = resolve_alarm(&view.alarm, alarm)?;
             show_from(&view, alarm)
+        })
+    }
+
+    /// The alarm an id or unique id prefix names.
+    pub fn resolve_id(&self, selector: &str) -> Result<Id> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
+            resolve_alarm(&view.alarm, selector)
+        })
+    }
+
+    /// What the follower reads on each turn, from one tolerant observation.
+    pub fn state(&self, alarm: Id, jp_user: Option<&str>) -> Result<FollowState> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let view = observe(
+                &self.storage,
+                pile,
+                signer,
+                runtime,
+                false,
+                jp_user.is_some(),
+            )?;
+            let (detected, jp_in_voice) = match (jp_user, &view.discord) {
+                (Some(jp), Some(discord)) => (
+                    ack::detect(&view.alarm, discord, &view.reader, alarm, jp),
+                    ack::jp_in_voice(discord, jp),
+                ),
+                _ => (None, false),
+            };
+            Ok(FollowState {
+                open: super::is_open(&view.alarm, alarm),
+                steps: steps(&view.alarm, alarm),
+                detected,
+                jp_in_voice,
+            })
+        })
+    }
+
+    /// The open, real alarms whose newest activity (the raise or a step) is
+    /// more than `stale` before `now`, and whose ladder is not over: the
+    /// ones a follower that died left behind.
+    pub fn orphans(&self, now: i128, stale: i128) -> Result<Vec<Id>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
+            let facts = &view.alarm;
+            Ok(super::list(facts)
+                .into_iter()
+                .filter(|row| row.open && !row.test)
+                .filter_map(|row| {
+                    let rows = steps(facts, row.alarm);
+                    let newest = rows
+                        .iter()
+                        .map(|step| step.started)
+                        .max()
+                        .map_or(row.raised, |started| started.max(row.raised));
+                    let over = ladder::next_action(
+                        row.raised,
+                        now,
+                        &rows,
+                        true,
+                        false,
+                        &ladder::Capabilities::default(),
+                    ) == Next::Stop;
+                    (now - newest > stale && !over).then_some(row.alarm)
+                })
+                .collect())
         })
     }
 

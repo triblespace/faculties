@@ -24,7 +24,7 @@ const POSTED: &str = "100000000000000501";
 
 /// One stored Discord message: its anchor, author and channel anchors, and
 /// the observation linking them, as intake builds it.
-fn message(
+pub(crate) fn message(
     snowflake: &str,
     author: &str,
     content: &str,

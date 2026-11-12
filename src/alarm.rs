@@ -20,6 +20,7 @@
 
 pub mod ack;
 pub mod cli;
+pub mod follow;
 pub mod guards;
 pub mod ladder;
 pub mod mcp;
