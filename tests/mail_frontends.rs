@@ -150,7 +150,9 @@ impl Fixture {
         let reader = pile.snapshot().unwrap();
         let mail = reader.attached(indexes[0]).unwrap().facts().unwrap();
         let files = reader.attached(indexes[1]).unwrap().facts().unwrap();
-        let value = mail::materialize_draft(&reader, &mail, &files, id).unwrap();
+        let value =
+            mail::materialize_draft(&reader, &mail, &files, id, mail::MAX_DRAFT_ATTACHMENT_BYTES)
+                .unwrap();
         pile.close().unwrap();
         value
     }
