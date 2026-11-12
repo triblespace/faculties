@@ -316,9 +316,16 @@ pub fn bri_to_percent(bri: u8) -> u8 {
 /// What a light-changing command asks of a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    On { bri: Option<u8> },
+    On {
+        bri: Option<u8>,
+    },
     Off,
-    Scene { id: String },
+    Scene {
+        id: String,
+    },
+    /// Hue's v1 group alert: the lights breathe for about fifteen seconds
+    /// (`lselect`), then return to their state.
+    Alert,
 }
 
 impl Change {
@@ -328,6 +335,7 @@ impl Change {
             Self::On { bri: Some(bri) } => json!({ "on": true, "bri": bri }),
             Self::Off => json!({ "on": false }),
             Self::Scene { id } => json!({ "scene": id }),
+            Self::Alert => json!({ "alert": "lselect" }),
         }
     }
 }

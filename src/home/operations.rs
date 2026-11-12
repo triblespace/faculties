@@ -114,10 +114,19 @@ pub struct Binding {
 /// What a light-changing command asks for, before names are resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    On { bri: Option<u8> },
+    On {
+        bri: Option<u8>,
+    },
     Off,
-    Dim { percent: u8 },
-    Scene { name: String },
+    Dim {
+        percent: u8,
+    },
+    Scene {
+        name: String,
+    },
+    /// Breathe the lights for about fifteen seconds and return them to
+    /// their state: a signal, not a change.
+    Alert,
 }
 
 impl Request {
@@ -518,6 +527,7 @@ impl Home {
         let (change, scene) = match request {
             Request::On { bri } => (Change::On { bri: *bri }, None),
             Request::Off => (Change::Off, None),
+            Request::Alert => (Change::Alert, None),
             Request::Dim { percent } => (
                 Change::On {
                     bri: Some(bridge::percent_to_bri(*percent)),

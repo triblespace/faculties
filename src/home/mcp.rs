@@ -50,6 +50,14 @@ const TOOLS: &[Tool] = &[
         ),
     },
     Tool {
+        name: "home_alert",
+        description: "Make a room's or zone's lights breathe for about fifteen seconds, then return to their state (the Hue group alert). Signals real lights. Records the action unless record=false.",
+        input_schema: schema!(
+            r#""room":{"type":"string","description":"Hue room or zone name (case-insensitive) or group id"},"record":{"type":"boolean","default":true}"#,
+            r#""room""#
+        ),
+    },
+    Tool {
         name: "home_dim",
         description: "Set a room or zone to a brightness percentage (1-100), turning it on. Changes real lights. Records the action unless record=false.",
         input_schema: schema!(
@@ -198,6 +206,10 @@ impl Faculty for Home {
             "home_off" => {
                 let args: Off = decode_arguments(arguments)?;
                 self.change(&args.room, Request::Off, args.record, out)
+            }
+            "home_alert" => {
+                let args: Off = decode_arguments(arguments)?;
+                self.change(&args.room, Request::Alert, args.record, out)
             }
             "home_dim" => {
                 let args: Dim = decode_arguments(arguments)?;

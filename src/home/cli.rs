@@ -62,6 +62,9 @@ enum Command {
     },
     /// Turn a room or zone off.
     Off { room: String },
+    /// Make a room's or zone's lights breathe for about fifteen seconds,
+    /// then return to their state (the Hue group alert `lselect`).
+    Alert { room: String },
     /// Set a room or zone to a brightness percentage (turning it on).
     Dim { room: String, percent: u8 },
     /// List scenes, or the scenes of one room or zone.
@@ -141,6 +144,7 @@ pub fn run() -> Result<()> {
             },
         }),
         Command::Off { .. } => Some(Request::Off),
+        Command::Alert { .. } => Some(Request::Alert),
         Command::Dim { percent, .. } => Some(Request::Dim { percent: *percent }),
         Command::Scene { name, .. } => Some(Request::Scene { name: name.clone() }),
         _ => None,
@@ -179,6 +183,7 @@ pub fn run() -> Result<()> {
             Command::Scenes { room } => presentation::scenes(&home.scenes(room.as_deref())?, out),
             Command::On { room, .. }
             | Command::Off { room }
+            | Command::Alert { room }
             | Command::Dim { room, .. }
             | Command::Scene { room, .. } => {
                 let request = request.as_ref().expect("a light change");

@@ -577,7 +577,7 @@ fn invalid_requests_are_rejected_before_credentials_or_network() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("absent.pile");
     let adapter = home::mcp::Home::new(pile.clone(), None);
-    assert_eq!(adapter.tools().len(), 7);
+    assert_eq!(adapter.tools().len(), 8);
     for (tool, input) in [
         ("home_on", json!({"room": "x", "bri": 0})),
         ("home_on", json!({"room": "x", "bri": 255})),
@@ -591,6 +591,11 @@ fn invalid_requests_are_rejected_before_credentials_or_network() {
         ("home_dim", json!({"room": "x"})),
         ("home_scene", json!({"room": "x", "scene": "  "})),
         ("home_rooms", json!({"address": "10.0.0.1"})),
+        ("home_alert", json!({})),
+        (
+            "home_alert",
+            json!({"room": "x", "body": {"alert": "none"}}),
+        ),
     ] {
         let error = call(&adapter, tool, input.clone()).unwrap_err();
         assert!(
@@ -971,4 +976,43 @@ fn a_candidate_that_never_speaks_cannot_hold_the_search() {
         [vec![host(&silent_base), host(&right.base)]]
     );
     drop(silent);
+}
+
+#[test]
+fn an_alert_breathes_a_room_or_zone_with_one_group_action() {
+    let bridge = fake_bridge();
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let home = Home::new(pile.clone(), None)
+        .with_address(bridge.base.clone())
+        .with_username(USER)
+        .with_pin(bridge.pin);
+    let report = home.change("living ROOM", &Request::Alert).unwrap();
+    assert_eq!(report.target, "groups/2/action");
+    assert_eq!(report.group.name, "Living room");
+    assert_eq!(report.body, json!({"alert": "lselect"}));
+    assert!(!report.refused());
+    // A zone by its typed name, typographic apostrophe or not.
+    let zone = home.change("kim's lights", &Request::Alert).unwrap();
+    assert_eq!(zone.target, "groups/81/action");
+    let puts: Vec<_> = bridge
+        .puts()
+        .into_iter()
+        .map(|seen| (seen.path.replace(USER, "<u>"), seen.body.unwrap()))
+        .collect();
+    assert_eq!(
+        puts,
+        [
+            (
+                "/api/<u>/groups/2/action".to_owned(),
+                json!({"alert": "lselect"})
+            ),
+            (
+                "/api/<u>/groups/81/action".to_owned(),
+                json!({"alert": "lselect"})
+            ),
+        ]
+    );
+    // Nothing is written by the change itself.
+    assert!(!pile.exists());
 }
