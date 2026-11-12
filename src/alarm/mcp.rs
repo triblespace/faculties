@@ -8,10 +8,9 @@ use anybytes::Bytes;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
-use super::ladder::{Capabilities, Due};
 use super::operations::{Alarm as Operations, RaiseRequest, SystemClock};
 use super::render;
-use super::rungs::{RungResult, RungRunner, Subject};
+use super::rungs::{Executor, Live, Settings};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use crate::schemas::alarm::{VIA_CLI, VIA_RELAYED};
@@ -118,21 +117,11 @@ fn from(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-/// The rung executor of a build without transports (see the CLI's).
-struct Unwired;
-
-impl RungRunner for Unwired {
-    fn capabilities(&mut self, _subject: &Subject) -> Capabilities {
-        Capabilities::default()
-    }
-
-    fn run(&mut self, _subject: &Subject, _due: Due) -> RungResult {
-        RungResult::failed("no rung executor in this build")
-    }
-}
-
 pub struct Alarm {
     operations: Operations,
+    /// Where the rungs go, from the launcher: never read from the server's
+    /// environment here.
+    settings: Settings,
 }
 
 impl Alarm {
@@ -141,8 +130,13 @@ impl Alarm {
     }
 
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self::with_settings(storage, Settings::default())
+    }
+
+    pub fn with_settings(storage: crate::storage::Storage, settings: Settings) -> Self {
         Self {
             operations: Operations::with_storage(storage),
+            settings,
         }
     }
 }
@@ -175,7 +169,12 @@ impl Faculty for Alarm {
                         output,
                     );
                 }
-                let raised = self.operations.raise(&request, &mut Unwired, &mut clock)?;
+                let mut executor = Executor::new(
+                    Live::new(self.operations.storage().clone()),
+                    self.settings.clone(),
+                    crate::quota::local_host()?,
+                );
+                let raised = self.operations.raise(&request, &mut executor, &mut clock)?;
                 render::raised(&raised, output)
             }
             "alarm_ack" => {

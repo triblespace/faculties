@@ -6,10 +6,9 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 
 use super::guards::THE_CHECK;
-use super::ladder::{Capabilities, Due};
 use super::operations::{Alarm, RaiseRequest, SystemClock};
 use super::render;
-use super::rungs::{RungResult, RungRunner, Subject};
+use super::rungs::{Executor, Live, Settings};
 use crate::out::Out;
 use crate::schemas::alarm::{VIA_CLI, VIA_RELAYED};
 
@@ -37,8 +36,89 @@ pub struct Cli {
     /// The Relations person an alarm wakes. No default.
     #[arg(long = "for", env = "ALARM_FOR", global = true, value_name = "PERSON")]
     for_person: Option<String>,
+    #[command(flatten)]
+    settings: SettingsArgs,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Where the rungs go on this deployment. No value has a default: a rung
+/// whose target is unset is recorded as unreachable from this host.
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct SettingsArgs {
+    /// JP's Discord user id (a snowflake): the mention pings it, and his
+    /// lines are read by it to detect an ack.
+    #[arg(
+        long,
+        env = "ALARM_JP_DISCORD_USER",
+        global = true,
+        value_name = "SNOWFLAKE"
+    )]
+    pub jp_discord_user: Option<String>,
+    /// The Discord channel a real alarm's mention goes to.
+    #[arg(
+        long,
+        env = "ALARM_DISCORD_CHANNEL",
+        global = true,
+        value_name = "SNOWFLAKE"
+    )]
+    pub discord_channel: Option<String>,
+    /// The Discord channel a test alarm goes to: the raiser's own.
+    #[arg(
+        long,
+        env = "ALARM_TEST_DISCORD_CHANNEL",
+        global = true,
+        value_name = "SNOWFLAKE"
+    )]
+    pub test_discord_channel: Option<String>,
+    /// The Discord voice channel the voice rung asks to speak in.
+    #[arg(
+        long,
+        env = "ALARM_VOICE_CHANNEL",
+        global = true,
+        value_name = "SNOWFLAKE"
+    )]
+    pub voice_channel: Option<String>,
+    /// The voice channel's guild, when the say request should name it.
+    #[arg(
+        long,
+        env = "ALARM_VOICE_GUILD",
+        global = true,
+        value_name = "SNOWFLAKE"
+    )]
+    pub voice_guild: Option<String>,
+    /// The Relations group of every live zooid: the colony rung's recipient.
+    #[arg(long, env = "ALARM_COLONY_GROUP", global = true, value_name = "GROUP")]
+    pub colony_group: Option<String>,
+    /// The ssh destination of the Mac for banners, sound and shout. Unset on
+    /// a Mac, they run locally.
+    #[arg(long, env = "ALARM_MAC_SSH", global = true, value_name = "DESTINATION")]
+    pub mac_ssh: Option<String>,
+    /// The Hue room or zone whose lights breathe.
+    #[arg(long, env = "ALARM_HUE_TARGET", global = true, value_name = "ROOM")]
+    pub hue_target: Option<String>,
+}
+
+impl SettingsArgs {
+    pub fn settings(&self) -> Settings {
+        let clean = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        };
+        Settings {
+            jp_discord_user: clean(&self.jp_discord_user),
+            discord_channel: clean(&self.discord_channel),
+            test_channel: clean(&self.test_discord_channel),
+            voice_channel: clean(&self.voice_channel),
+            voice_guild: clean(&self.voice_guild),
+            colony_group: clean(&self.colony_group),
+            mac_ssh: clean(&self.mac_ssh),
+            hue_target: clean(&self.hue_target),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -129,20 +209,6 @@ enum Command {
     },
 }
 
-/// The rung executor of a build without transports: every rung it is asked
-/// to run is recorded failed, so the ledger never claims a delivery.
-struct Unwired;
-
-impl RungRunner for Unwired {
-    fn capabilities(&mut self, _subject: &Subject) -> Capabilities {
-        Capabilities::default()
-    }
-
-    fn run(&mut self, _subject: &Subject, _due: Due) -> RungResult {
-        RungResult::failed("no rung executor in this build")
-    }
-}
-
 fn persona(persona: &Option<String>) -> Result<String> {
     match persona.as_deref().map(str::trim) {
         Some(persona) if !persona.is_empty() => Ok(persona.to_owned()),
@@ -155,7 +221,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.text(Cli::command().render_help().to_string());
     };
-    let alarm = Alarm::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
+    let storage = cli.workspace.storage(cli.pile, cli.key)?;
+    let alarm = Alarm::with_storage(storage.clone());
+    let settings = cli.settings.settings();
     let mut clock = SystemClock;
     match command {
         Command::Raise {
@@ -195,7 +263,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             if dry_run {
                 return render::preview(&alarm.preview(&request, &mut clock)?, output);
             }
-            let raised = alarm.raise(&request, &mut Unwired, &mut clock)?;
+            let mut executor =
+                Executor::new(Live::new(storage), settings, crate::quota::local_host()?);
+            let raised = alarm.raise(&request, &mut executor, &mut clock)?;
             render::raised(&raised, output)
         }
         Command::Ack {

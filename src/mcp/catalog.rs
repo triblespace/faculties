@@ -30,6 +30,8 @@ pub struct Config {
     pub world_url: Option<String>,
     /// Session file shared with the `world` CLI; in memory when unset.
     pub world_session: Option<PathBuf>,
+    /// Where alarm rungs go; every target unset when not configured.
+    pub alarm: alarm::rungs::Settings,
 }
 
 impl Config {
@@ -44,6 +46,7 @@ impl Config {
             hear: None,
             world_url: None,
             world_session: None,
+            alarm: alarm::rungs::Settings::default(),
         }
     }
 }
@@ -87,6 +90,7 @@ impl Catalog {
             hear: hear_config,
             world_url,
             world_session,
+            alarm: alarm_settings,
         } = config;
         let discord = discord::mcp::Discord::with_storage(storage.clone());
         let linkedin = linkedin::mcp::LinkedIn::with_storage(storage.clone());
@@ -96,7 +100,10 @@ impl Catalog {
         };
         let orient = Arc::new(orient);
         let faculties: Vec<Box<dyn Faculty + Send + Sync>> = vec![
-            Box::new(alarm::mcp::Alarm::with_storage(storage.clone())),
+            Box::new(alarm::mcp::Alarm::with_settings(
+                storage.clone(),
+                alarm_settings,
+            )),
             Box::new(archive::mcp::Archive::with_storage(storage.clone())),
             Box::new(atlas::mcp::Atlas::with_storage(storage.clone())),
             Box::new(body::mcp::Body::with_storage(storage.clone())),

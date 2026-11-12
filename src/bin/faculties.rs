@@ -55,6 +55,9 @@ enum Command {
         /// Session file shared with the `world` CLI; in memory when unset.
         #[arg(long, env = "WORLD_SESSION_FILE")]
         world_session_file: Option<PathBuf>,
+        /// Where the alarm tools' rungs go.
+        #[command(flatten)]
+        alarm: faculties::alarm::cli::SettingsArgs,
         /// Bind a Streamable HTTP listener instead of using stdio.
         #[arg(long, value_name = "ADDR", requires = "http_token_file")]
         http_listen: Option<SocketAddr>,
@@ -145,6 +148,7 @@ fn run(command: Command) -> Result<()> {
             hear_tokenizer_json,
             world_url,
             world_session_file,
+            alarm,
             http_listen,
             http_token_file,
             http_origin,
@@ -173,6 +177,7 @@ fn run(command: Command) -> Result<()> {
                 hear,
                 world_url,
                 world_session: world_session_file,
+                alarm: alarm.settings(),
             });
             let result = match http_listen {
                 Some(bind) => {

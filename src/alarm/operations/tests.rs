@@ -38,6 +38,10 @@ pub(crate) struct FakeRunner {
 }
 
 impl RungRunner for FakeRunner {
+    fn host(&self) -> &str {
+        "sky"
+    }
+
     fn capabilities(&mut self, _subject: &Subject) -> Capabilities {
         Capabilities::default()
     }
@@ -60,7 +64,7 @@ pub(crate) struct Fixture {
     pub alarm: Alarm,
 }
 
-/// A pile with three zooids (cc, astra, and a retired one) and jp.
+/// A pile with three zooids (cyan, astra, and a retired one) and jp.
 pub(crate) fn fixture() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("alarm.pile");
@@ -78,7 +82,8 @@ pub(crate) fn fixture() -> Fixture {
         },
         ..Default::default()
     };
-    relations.add(person("cc", true), None, &[]).unwrap();
+    // Labels are not hex, so no label can also read as an id prefix.
+    relations.add(person("cyan", true), None, &[]).unwrap();
     relations.add(person("astra", true), None, &[]).unwrap();
     relations.add(person("old-zooid", true), None, &[]).unwrap();
     relations.retire("old-zooid").unwrap();
@@ -112,7 +117,7 @@ fn an_alarm_raise_runs_r0_and_records_each_rung_as_a_step() {
     let mut runner = FakeRunner::default();
     let raised = fixture
         .alarm
-        .raise(&request("cc", "pile truncated"), &mut runner, &mut clock)
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
         .unwrap();
     let Raised::Alarm {
         alarm,
@@ -123,7 +128,7 @@ fn an_alarm_raise_runs_r0_and_records_each_rung_as_a_step() {
         panic!("a first raise starts a ladder: {raised:?}");
     };
     assert_eq!(subject.alarm, alarm);
-    assert_eq!(subject.raiser_label, "cc");
+    assert_eq!(subject.raiser_label, "cyan");
     assert_eq!(subject.class, "data-loss");
     let rungs: Vec<Id> = runner.ran.iter().map(|(rung, _)| *rung).collect();
     assert_eq!(rungs, vec![RUNG_COLONY, RUNG_DISCORD_MENTION]);
@@ -143,21 +148,18 @@ fn an_alarm_raise_runs_r0_and_records_each_rung_as_a_step() {
     );
     assert_eq!(shown.subject.host, "sky");
     assert_eq!(shown.subject.raised_at, T0);
-    assert_eq!(
-        shown
-            .steps
-            .iter()
-            .map(|step| step.rung.as_str())
-            .collect::<Vec<_>>(),
-        ["colony", "discord-mention"]
-    );
+    // Both steps started at the same (fake) instant, so their order is
+    // only their ids': compare them as a set.
+    let mut rungs: Vec<&str> = shown.steps.iter().map(|step| step.rung.as_str()).collect();
+    rungs.sort();
+    assert_eq!(rungs, ["colony", "discord-mention"]);
     assert!(shown
         .steps
         .iter()
         .all(|step| step.delivered && !step.failed));
     let listed = fixture.alarm.list(true, &mut clock).unwrap();
     assert_eq!(listed.alarms.len(), 1);
-    assert_eq!(listed.alarms[0].raisers, vec!["cc".to_owned()]);
+    assert_eq!(listed.alarms[0].raisers, vec!["cyan".to_owned()]);
     assert_eq!(listed.alarms[0].steps, 2);
 }
 
@@ -192,14 +194,14 @@ fn an_alarm_raise_without_its_reason_is_refused_with_the_check_and_writes_nothin
     let fixture = fixture();
     let mut clock = FakeClock { now: T0 };
     let mut runner = FakeRunner::default();
-    let mut bare = request("cc", "pile truncated");
+    let mut bare = request("cyan", "pile truncated");
     bare.decays = "  ";
     let error = fixture
         .alarm
         .raise(&bare, &mut runner, &mut clock)
         .unwrap_err();
     assert!(format!("{error:#}").contains(THE_CHECK), "{error:#}");
-    let mut unknown = request("cc", "pile truncated");
+    let mut unknown = request("cyan", "pile truncated");
     unknown.class = "unsure";
     let error = fixture
         .alarm
@@ -222,7 +224,7 @@ fn an_alarm_raise_the_guards_fold_becomes_a_note_and_runs_no_rung() {
     let mut runner = FakeRunner::default();
     let Raised::Alarm { alarm, .. } = fixture
         .alarm
-        .raise(&request("cc", "pile truncated"), &mut runner, &mut clock)
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
         .unwrap()
     else {
         panic!("the first raise starts a ladder");
@@ -259,7 +261,7 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
     let mut runner = FakeRunner::default();
     let Raised::Alarm { alarm, .. } = fixture
         .alarm
-        .raise(&request("cc", "pile truncated"), &mut runner, &mut clock)
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
         .unwrap()
     else {
         panic!("a first raise starts a ladder");
@@ -268,12 +270,12 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
     clock.now += 30 * SECOND;
     let noted = fixture
         .alarm
-        .note(&id[..8], "cc", "the copy is running", &mut clock)
+        .note(&id[..8], "cyan", "the copy is running", &mut clock)
         .unwrap();
     assert!(!noted.was_closed);
     let error = fixture
         .alarm
-        .ack(&id, "cc", VIA_RELAYED, None, &mut clock)
+        .ack(&id, "cyan", VIA_RELAYED, None, &mut clock)
         .unwrap_err();
     assert!(format!("{error:#}").contains("evidence"), "{error:#}");
     clock.now += 30 * SECOND;
@@ -300,7 +302,7 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
             .iter()
             .map(|event| (event.kind, event.by.as_str()))
             .collect::<Vec<_>>(),
-        [("note", "cc"), ("ack", "jp")]
+        [("note", "cyan"), ("ack", "jp")]
     );
     assert_eq!(shown.events[1].via.as_deref(), Some("cli"));
 

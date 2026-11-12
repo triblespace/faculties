@@ -305,7 +305,7 @@ impl Alarm {
             Next::Run(due) => due,
             _ => Vec::new(),
         };
-        let steps = self.run_rungs(&subject, &due, request.host, runner, clock)?;
+        let steps = self.run_rungs(&subject, &due, runner, clock)?;
         Ok(Raised::Alarm {
             alarm: subject.alarm,
             subject,
@@ -319,7 +319,6 @@ impl Alarm {
         &self,
         subject: &Subject,
         due: &[Due],
-        host: &str,
         runner: &mut dyn RungRunner,
         clock: &mut dyn Clock,
     ) -> Result<Vec<StepReport>> {
@@ -331,7 +330,7 @@ impl Alarm {
             let (fragment, step) = step_fragment(&Step {
                 alarm: subject.alarm,
                 rung: due.rung,
-                host: host.to_owned(),
+                host: runner.host().to_owned(),
                 started,
                 finished,
                 outcome: result.outcome.clone(),
