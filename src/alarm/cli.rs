@@ -34,7 +34,10 @@ pub struct Cli {
     /// resolves and notes are attributed to it.
     #[arg(long, env = "PERSONA", global = true, hide_env_values = true)]
     persona: Option<String>,
-    /// The Relations person an alarm wakes. No default.
+    /// The Relations person an alarm wakes. No default. It must be the person
+    /// whose Discord user is ALARM_JP_DISCORD_USER: the mention pings that
+    /// user and a Discord ack is recorded as this person's. Nothing links
+    /// the two, so this is a deployment contract, not a check.
     #[arg(long = "for", env = "ALARM_FOR", global = true, value_name = "PERSON")]
     for_person: Option<String>,
     #[command(flatten)]
@@ -48,7 +51,8 @@ pub struct Cli {
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct SettingsArgs {
     /// JP's Discord user id (a snowflake): the mention pings it, and his
-    /// lines are read by it to detect an ack.
+    /// lines are read by it to detect an ack. It must be the Discord user of
+    /// the --for person (see there).
     #[arg(
         long,
         env = "ALARM_JP_DISCORD_USER",

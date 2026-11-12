@@ -74,7 +74,10 @@ pub fn raised(raised: &Raised, output: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn preview(preview: &Preview, output: &mut Out<'_>) -> Result<()> {
-    output.line("DRY RUN: nothing written, nothing sent.")?;
+    output.line(
+        "DRY RUN: no alarm record written, nothing sent (reading may still bring derived \
+         views up to date).",
+    )?;
     match &preview.decision {
         Decision::Raise => output.line(format!(
             "would raise alarm {} ({})",
