@@ -749,14 +749,6 @@ fn past_the_grace_a_degraded_follower_escalates_from_its_last_complete_observati
         Ok(())
     };
     let ended = follow(&ledger, alarm, &mut runner, &mut clock, Some(JP), &mut pull).unwrap();
-    // The ack wins although the observation that shows it is incomplete.
-    assert_eq!(
-        ended,
-        Ended::Acked {
-            via: VIA_DISCORD_REPLY
-        }
-    );
-    assert!(turns.get() < 400, "acked while still degraded");
     let ran = rungs_ran(&fixture, alarm);
     let count = |rung: &str| ran.iter().filter(|(name, _)| name == rung).count();
     // Each due occurrence once, not once per degraded turn.
@@ -765,6 +757,14 @@ fn past_the_grace_a_degraded_follower_escalates_from_its_last_complete_observati
     assert_eq!(count("mac-sound"), 1, "{ran:?}");
     assert_eq!(count("reachy-shout"), 1, "{ran:?}");
     assert_eq!(count("hue-alert"), 1, "{ran:?}");
+    // Only then: the ack wins although the observation that shows it is incomplete.
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
+    assert!(turns.get() < 400, "acked while still degraded");
     // R1 ran on time, from the old observation: within the grace of R1's slot.
     let r1 = ran
         .iter()
@@ -872,4 +872,107 @@ fn a_follower_that_cannot_observe_stops_at_its_wall_cap_and_never_says_closed() 
     .unwrap();
     assert_eq!(ended, Ended::TimedOut);
     assert!(clock.now >= T0 + 120 * MINUTE && clock.now < T0 + 121 * MINUTE);
+}
+
+/// A fake clock that several holders advance together.
+#[derive(Clone)]
+struct SharedClock(std::rc::Rc<std::cell::Cell<i128>>);
+
+impl Clock for SharedClock {
+    fn now(&mut self) -> Result<i128> {
+        Ok(self.0.get())
+    }
+
+    fn sleep_until(&mut self, at: i128) -> Result<()> {
+        self.0.set(self.0.get().max(at));
+        Ok(())
+    }
+}
+
+/// An executor whose `slow` rung takes `takes` on the shared clock.
+struct Slow {
+    inner: Executor<FakeTransport>,
+    clock: SharedClock,
+    slow: Id,
+    takes: i128,
+}
+
+impl RungRunner for Slow {
+    fn host(&self) -> &str {
+        self.inner.host()
+    }
+
+    fn capabilities(&mut self, subject: &Subject) -> crate::alarm::ladder::Capabilities {
+        self.inner.capabilities(subject)
+    }
+
+    fn run(&mut self, subject: &Subject, due: Due) -> crate::alarm::rungs::RungResult {
+        let result = self.inner.run(subject, due);
+        if due.rung == self.slow {
+            let now = self.clock.0.get();
+            self.clock.0.set(now + self.takes);
+        }
+        result
+    }
+}
+
+#[test]
+fn a_degraded_follower_remembers_each_step_at_its_recorded_start_and_does_not_repeat_it() {
+    let fixture = fixture();
+    let mut raise_clock = FakeClock { now: T0 };
+    let mut runner = Executor::new(FakeTransport::default(), settings(), "sky");
+    let Raised::Alarm { alarm, .. } = fixture
+        .alarm
+        .raise(
+            &request("cyan", "pile truncated"),
+            &mut runner,
+            &mut raise_clock,
+        )
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    // The follower's first (and only) complete view comes at 12:59, with R0
+    // only. Its mention takes 2 s, so the Mac sound starts at 13:01: that is
+    // the start the step records, and it covers the 13-minute occurrence.
+    let shared = SharedClock(std::rc::Rc::new(std::cell::Cell::new(
+        T0 + 12 * MINUTE + 59 * SECOND,
+    )));
+    let mut clock = shared.clone();
+    let mut slow = Slow {
+        inner: Executor::new(FakeTransport::default(), settings(), "sky"),
+        clock: shared.clone(),
+        slow: RUNG_DISCORD_MENTION,
+        takes: 2 * SECOND,
+    };
+    let turns = std::cell::Cell::new(0);
+    let ledger = Partial {
+        inner: &fixture.alarm,
+        edit: RefCell::new(hiding(1, 10_000, &turns)),
+    };
+    // Incomplete through the grace (15:01); JP answers at 15:30, before the
+    // 16-minute sound is due.
+    let mut pull = || {
+        if shared.0.get() >= T0 + 15 * MINUTE + 30 * SECOND {
+            reply(&fixture, T0 + 15 * MINUTE + 30 * SECOND)?;
+        }
+        Ok(())
+    };
+    let ended = follow(&ledger, alarm, &mut slow, &mut clock, Some(JP), &mut pull).unwrap();
+    let sounds: Vec<i128> = rungs_ran(&fixture, alarm)
+        .into_iter()
+        .filter(|(rung, _)| rung == "mac-sound")
+        .map(|(_, started)| started - T0)
+        .collect();
+    assert_eq!(
+        sounds,
+        vec![13 * MINUTE + SECOND],
+        "the 13:01 sound covers the 13-minute slot; a degraded turn must not repeat it"
+    );
+    assert_eq!(
+        ended,
+        Ended::Acked {
+            via: VIA_DISCORD_REPLY
+        }
+    );
 }

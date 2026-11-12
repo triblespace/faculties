@@ -116,6 +116,9 @@ pub struct RaiseRequest<'a> {
 pub struct StepReport {
     pub step: Id,
     pub rung: Id,
+    /// TAI nanoseconds: the start the step record carries, read from the
+    /// clock just before the rung ran.
+    pub started: i128,
     pub outcome: Outcome,
 }
 
@@ -368,6 +371,7 @@ impl Alarm {
             reports.push(StepReport {
                 step,
                 rung: due.rung,
+                started,
                 outcome: result.outcome,
             });
         }

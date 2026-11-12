@@ -108,12 +108,17 @@ impl Ledger for Alarm {
 /// Run `alarm`'s ladder to its end. `pull` refreshes the Discord facts (the
 /// alarm's channel); its failures are reported and the ladder goes on.
 ///
-/// Every observation is tolerant, so every decision is made only on what is
-/// PRESENT: the follower ends as [`Ended::Closed`] only on an ack or resolve
-/// record it can see, never because the raise is missing, and while the
-/// observation has unread commits (a step or a close may be in flight) it
-/// runs no rung that turn, reports it, and looks again after [`POLL`]. An ack
-/// it detects is positive evidence and is recorded whatever else is unread.
+/// Every observation is tolerant. An ack or resolve it can see, in any
+/// observation, complete or not, ends the follower at once; it ends as
+/// [`Ended::Closed`] only on such a record, never because the raise is
+/// missing. While observations are incomplete (unread commits, or the raise
+/// not visible) it pulls Discord and reads again every [`POLL`], running no
+/// rung for up to [`GRACE`]; after that it escalates from the last complete
+/// observation it saw, with the alarm's own raise time and test flag,
+/// remembering every rung it runs at the start its step recorded, so each
+/// due occurrence fires once, and notes once that it does so. A follower that
+/// never had a complete observation does not act. It stops after
+/// [`WALL_CAP`] as [`Ended::TimedOut`].
 pub fn follow(
     operations: &dyn Ledger,
     alarm: Id,
@@ -216,7 +221,9 @@ pub fn follow(
                     steps.extend(reports.iter().map(|report| StepRow {
                         step: report.step,
                         rung: report.rung,
-                        started: now,
+                        // The start the committed step records, never the
+                        // turn's time: coverage compares exactly this.
+                        started: report.started,
                         delivered: report.outcome == super::Outcome::Delivered,
                         failed: report.outcome != super::Outcome::Delivered,
                     }));
