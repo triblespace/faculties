@@ -409,7 +409,7 @@ fn executable_export_stays_raw_while_show_uses_the_configured_sensory_route() {
 fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     let fixture = Fixture::new();
     let faculty = fixture.mcp();
-    assert_eq!(faculty.tools().len(), 22);
+    assert_eq!(faculty.tools().len(), 21);
     for tool in faculty.tools() {
         let schema: Value = serde_json::from_str(tool.input_schema).unwrap();
         assert_eq!(schema["additionalProperties"], false);
