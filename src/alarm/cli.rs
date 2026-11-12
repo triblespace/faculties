@@ -356,17 +356,12 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                     &locks,
                     &mut *follow::default_spawner(&locks),
                     &|id| {
-                        let pile = std::fs::canonicalize(storage.path())?;
-                        let key = std::fs::canonicalize(crate::storage::signer_path(
-                            &pile,
-                            storage.key_path(),
-                        ))?;
-                        follow::follower_command(
+                        follow::command_for(
                             &follow::alarm_program()?,
-                            &pile,
-                            &key,
+                            &storage,
+                            &settings,
+                            &routes,
                             id,
-                            follow::follower_env(&settings, routes.iter().cloned()),
                         )
                     },
                 )?;

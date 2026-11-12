@@ -289,10 +289,12 @@ impl FollowerCommand {
 }
 
 /// The environment a follower is given: the settings as `ALARM_*`
-/// variables, and the collection routes and workspace of `ambient` (a
-/// transient unit gets the user manager's environment, not the shell's, so
-/// the routes must be passed). Nothing else is passed: no key path (the key
-/// is an argument) and no persona (the follower acts as nobody).
+/// variables, and the collection routes and peers of `ambient` (a transient
+/// unit gets the user manager's environment, not the shell's, so the routes
+/// must be passed). Nothing else is passed: no key path (the key is an
+/// argument), no persona (the follower acts as nobody), and no workspace
+/// selector: the workspace the raise used travels as an explicit flag
+/// ([`command_for`]), never as whatever the environment happens to name.
 pub fn follower_env(
     settings: &Settings,
     ambient: impl IntoIterator<Item = (String, String)>,
@@ -302,7 +304,6 @@ pub fn follower_env(
         .filter(|(name, _)| {
             name.starts_with(crate::collection_names::COLLECTION_OVERRIDE_PREFIX)
                 || name == "TRIBLESPACE_PEERS"
-                || name == "FACULTIES_WORKSPACE"
         })
         .collect();
     let mut setting = |name: &str, value: &Option<String>| {
@@ -351,6 +352,72 @@ pub fn follower_command(
         ],
         env,
     })
+}
+
+/// How the follower reaches the same collections the raise did, from the
+/// raise's own storage, never from ambient selection:
+/// - a selected workspace: `--workspace <its exact revision>`, and no
+///   collection variables (a workspace carries its own routes);
+/// - explicit routes without a workspace (an MCP launcher's routed
+///   storage): each route as its exact `TRIBLESPACE_COLLECTION_<NAME>`
+///   descriptor variable, in place of any ambient ones;
+/// - neither (legacy CLI routing, which reads those variables itself): the
+///   ambient collection variables, as the raise read them.
+/// The extra follower arguments and the environment, in that order.
+pub fn routing(
+    storage: &crate::storage::Storage,
+    settings: &Settings,
+    ambient: &[(String, String)],
+) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    let not_routes = |(name, _): &(String, String)| {
+        !name.starts_with(crate::collection_names::COLLECTION_OVERRIDE_PREFIX)
+    };
+    match (storage.selected_workspace(), storage.collection_routes()) {
+        (Some(workspace), _) => Ok((
+            vec!["--workspace".to_owned(), format!("{:X}", workspace.id)],
+            follower_env(
+                settings,
+                ambient.iter().filter(|var| not_routes(var)).cloned(),
+            ),
+        )),
+        (None, Some(routes)) => {
+            let mut explicit = Vec::new();
+            for (scope, handle) in routes {
+                let Some(_) = crate::collection_names::name_for(*scope) else {
+                    bail!("route for scope {scope:x} has no collection name to pass on");
+                };
+                explicit.push((
+                    crate::collection_names::override_env_name(*scope),
+                    hex::encode(handle.raw),
+                ));
+            }
+            let kept = ambient.iter().filter(|var| not_routes(var)).cloned();
+            Ok((Vec::new(), follower_env(settings, kept.chain(explicit))))
+        }
+        (None, None) => Ok((Vec::new(), follower_env(settings, ambient.iter().cloned()))),
+    }
+}
+
+/// The command that follows `alarm` with `program`, on the raise's pile,
+/// key and routing ([`routing`]).
+pub fn command_for(
+    program: &Path,
+    storage: &crate::storage::Storage,
+    settings: &Settings,
+    ambient: &[(String, String)],
+    alarm: Id,
+) -> Result<FollowerCommand> {
+    let pile = std::fs::canonicalize(storage.path())
+        .with_context(|| format!("resolve the pile {}", storage.path().display()))?;
+    let key = crate::storage::signer_path(&pile, storage.key_path());
+    let key = std::fs::canonicalize(&key)
+        .with_context(|| format!("resolve the signing key {}", key.display()))?;
+    let (extra, env) = routing(storage, settings, ambient)?;
+    let mut command = follower_command(program, &pile, &key, alarm, env)?;
+    // Global arguments go before the subcommand.
+    let at = command.args.len() - 2;
+    command.args.splice(at..at, extra);
+    Ok(command)
 }
 
 /// The `alarm` binary a follower runs: this process when it is `alarm`,
@@ -448,18 +515,7 @@ pub fn start(
     alarm: Id,
     spawner: &mut dyn Spawner,
 ) -> Result<String> {
-    let pile = std::fs::canonicalize(storage.path())
-        .with_context(|| format!("resolve the pile {}", storage.path().display()))?;
-    let key = crate::storage::signer_path(&pile, storage.key_path());
-    let key = std::fs::canonicalize(&key)
-        .with_context(|| format!("resolve the signing key {}", key.display()))?;
-    let command = follower_command(
-        &alarm_program()?,
-        &pile,
-        &key,
-        alarm,
-        follower_env(settings, routes.iter().cloned()),
-    )?;
+    let command = command_for(&alarm_program()?, storage, settings, routes, alarm)?;
     spawner.spawn(&command)?;
     Ok(command.unit)
 }

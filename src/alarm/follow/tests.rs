@@ -603,3 +603,72 @@ fn an_incomplete_observation_that_hides_a_step_does_not_repeat_the_rung() {
         .count();
     assert_eq!(re_mentions, 1, "{:?}", runner.transport.calls);
 }
+
+#[test]
+fn the_follower_is_given_the_workspace_and_routes_the_raise_used_not_the_ambient_ones() {
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("self.pile");
+    let key = directory.path().join("self.key");
+    std::fs::write(&pile, b"").unwrap();
+    std::fs::write(&key, b"").unwrap();
+    let alarm = Id::new([0xab; 16]).unwrap();
+    let program = Path::new("/opt/cohort/alarm");
+    let ambient_v = Id::new([0x56; 16]).unwrap();
+    let ambient = vec![
+        ("FACULTIES_WORKSPACE".to_owned(), format!("{ambient_v:X}")),
+        ("TRIBLESPACE_COLLECTION_ALARM".to_owned(), "bb".repeat(32)),
+        ("TRIBLESPACE_PEERS".to_owned(), "peer".to_owned()),
+    ];
+    let names = |command: &FollowerCommand| -> Vec<String> {
+        command.env.iter().map(|(name, _)| name.clone()).collect()
+    };
+
+    // The raise ran in workspace W while the environment named V.
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]).verifying_key();
+    let workspace = crate::workspace::Workspace::new("the raise's workspace");
+    let w = workspace.id;
+    let storage = crate::storage::Storage::new(pile.clone(), Some(key.clone()))
+        .with_workspace(workspace, signer);
+    let command = super::command_for(program, &storage, &settings(), &ambient, alarm).unwrap();
+    let follow_at = command.args.iter().position(|arg| arg == "follow").unwrap();
+    let flag = command
+        .args
+        .iter()
+        .position(|arg| arg == "--workspace")
+        .unwrap();
+    assert!(flag < follow_at, "{:?}", command.args);
+    assert_eq!(command.args[flag + 1], format!("{w:X}"));
+    assert!(!command.args.contains(&format!("{ambient_v:X}")));
+    assert!(!names(&command).contains(&"FACULTIES_WORKSPACE".to_owned()));
+    assert!(!names(&command).contains(&"TRIBLESPACE_COLLECTION_ALARM".to_owned()));
+    assert!(names(&command).contains(&"TRIBLESPACE_PEERS".to_owned()));
+
+    // Explicit routes without a workspace travel as exact descriptors, in
+    // place of the ambient ones.
+    let routed = crate::storage::Storage::new(pile.clone(), Some(key.clone())).with_collections(
+        std::collections::BTreeMap::from([(
+            crate::schemas::alarm::DEFAULT_SCOPE_ID,
+            Inline::new([0xaa; 32]),
+        )]),
+    );
+    let command = super::command_for(program, &routed, &settings(), &ambient, alarm).unwrap();
+    assert!(!command.args.contains(&"--workspace".to_owned()));
+    assert!(command
+        .env
+        .contains(&("TRIBLESPACE_COLLECTION_ALARM".to_owned(), "aa".repeat(32))));
+    assert!(!command
+        .env
+        .iter()
+        .any(|(_, value)| *value == "bb".repeat(32)));
+    assert!(!names(&command).contains(&"FACULTIES_WORKSPACE".to_owned()));
+
+    // Legacy routing: the raise itself read the ambient collection
+    // variables, so they are what the follower gets; still no selector.
+    let legacy = crate::storage::Storage::new(pile, Some(key));
+    let command = super::command_for(program, &legacy, &settings(), &ambient, alarm).unwrap();
+    assert!(!command.args.contains(&"--workspace".to_owned()));
+    assert!(command
+        .env
+        .contains(&("TRIBLESPACE_COLLECTION_ALARM".to_owned(), "bb".repeat(32))));
+    assert!(!names(&command).contains(&"FACULTIES_WORKSPACE".to_owned()));
+}
