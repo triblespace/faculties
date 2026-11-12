@@ -1,64 +1,71 @@
 //! `faculties maintain --declared`: maintain every WeMM index the pile's
-//! records name, each with the model its own descriptor names.
+//! records name, each with the model its own descriptor names, through one
+//! maintenance registration ([`Registration`]) that an application's
+//! maintenance Driver can run as well (`Driver::with_registered`).
 //!
-//! A pass asks the store which WeMM indexes exist
-//! ([`declared_indexes`]: the collections some record names, matched by
-//! their descriptors) and how far behind each one is, both from one
-//! snapshot. Indexes are grouped by the model their descriptors name (the
-//! model collection, the root and the kernel profile). A group with nothing
-//! to derive binds nothing. A group with work binds exactly its model, once,
-//! and every index of the group is maintained with it; the runtime derives
-//! only indexes of its own identity, so no index is ever computed by another
-//! model. The list is never kept: the next pass asks again, so an index
-//! first named by a record after start (a leaf replicated from another host,
-//! or the first leaf the single-model mode derived) is maintained from then
-//! on.
+//! At the start of each pass the registration asks the store which WeMM
+//! indexes exist (`declared_indexes`: the collections some record names whose
+//! descriptor is a complete WeMM descriptor) and how far
+//! behind each one is, both from one snapshot. Indexes are grouped by the
+//! model their descriptors name (the model collection, the root and the
+//! kernel profile). An index with nothing to derive binds nothing. An index
+//! with work binds exactly its model, once, and keeps it bound; the runtime
+//! derives only indexes of its own identity, so no index is ever computed by
+//! another model. The list is never kept: the next pass asks again, so an
+//! index first named by a record after start (a leaf replicated from another
+//! host, or the first leaf the single-model mode derived) is maintained from
+//! then on.
 //!
-//! A group whose model cannot be bound (a profile this build does not run,
-//! a root its collection does not state or that is not here, a copy the
-//! host's memory cannot admit) is skipped with one line naming its indexes,
-//! and the others are maintained. It is tried again only after
-//! [`BIND_RETRY_ENV`] seconds, because a bind opens the pile and may copy
-//! gigabytes before it fails; the pass names that moment
-//! ([`Pass::retry_at`]) and the daemon runs a pass then even if the pile has
-//! not grown, since memory can come free without any write. Nothing falls
-//! back to another model.
+//! A model that cannot be bound (a profile this build does not run, a root
+//! its collection does not state or that is not here, a copy the host's
+//! memory cannot admit) is skipped with one line naming its indexes, and the
+//! others are maintained. It is tried again only after [`BIND_RETRY_ENV`]
+//! seconds, because a bind opens the pile and may copy gigabytes before it
+//! fails; the registration names that moment (`Mappings::due`) and
+//! the daemon runs a pass then even if the pile has not grown, since memory
+//! can come free without any write. Nothing falls back to another model.
+//! When [`MAX_BOUND_ENV`] models are bound and each has work this pass,
+//! another model's index waits for the next pass (which is then due at
+//! once), and in that pass may release the bound model served least
+//! recently: the bound models are served before another is bound, and a
+//! pass binds each slot at most once.
 //!
 //! Descriptors are read only from what is here: discovery never fetches, so
 //! a collection whose descriptor has not arrived is passed over until it
-//! has. Backlogs, model weights and leaves are read as maintenance reads
-//! them.
+//! has.
 //!
 //! What it does not do: a descriptor that is registered but named by no
 //! record is an ordinary blob, which no store indexes by what it describes,
 //! so such an index is not found until its first leaf exists.
 //!
 //! Which indexes a host maintains is its own choice, as its merges and
-//! attachments are: only those whose descriptor names a model of
-//! [`MODELS_ENV`]. A declaration can never be withdrawn from a grow-only
-//! store, so every retired model stays declared; a positive list keeps a
-//! retired model out without anyone having to remember it, and a new index
-//! of a listed model is still picked up on the next pass.
-//!
-//! Each pass also maintains every attached index the records name whose
-//! mapping faculties defines (the Archive BM25; [`crate::maintenance`]),
-//! on the CPU and with no list: the first search that kept its images
-//! declared it.
+//! attachments are: only those whose descriptor names a listed model
+//! ([`Config::models`]; the daemon reads [`MODELS_ENV`]). A declaration can
+//! never be withdrawn from a grow-only store, so every retired model stays
+//! declared; a positive list keeps a retired model out without anyone having
+//! to remember it, and a new index of a listed model is still picked up on
+//! the next pass. Nothing coordinates two maintainers on one host: if the
+//! daemon and an application's Driver both list a model, both bind it (two
+//! copies of its weights) and both derive its indexes (the same leaves,
+//! twice).
 
-use super::{Derived, Target};
-use crate::storage::{AcquiringReader, FacultyStore, Storage};
+use super::{Derived, Session, Target};
+use crate::maintenance::Sink;
+use crate::storage::underived;
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use std::ffi::OsStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionHandle, CollectionRead};
-use triblespace::core::repo::BlobStoreGet;
-use triblespace::core::repo::StoreRead;
+use triblespace::core::collection::{
+    Collection, CollectionHandle, CollectionRealizationError, Maintenance, Mappings,
+};
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+use triblespace::core::repo::{SnapshotSource, Store, StoreRead};
 use triblespace::prelude::*;
 use triblespace_search::semantic_wemm::{
-    collection_hex, declared_indexes, DeclaredIndex, WemmIdentity, WemmProfile,
+    collection_hex, declared_indexes, WemmIdentity, WemmProfile, WEMM_CONTENT_WINDOWS_TO_NVFP4,
 };
 
 /// How many models may be bound at once (default 1). Groups are served one
@@ -250,7 +257,7 @@ impl Config {
     /// The line the declared mode starts with.
     pub fn describe(&self) -> String {
         format!(
-            "maintain: every WeMM index the pile's records name whose descriptor names one of {} ({MODELS_ENV}), each with that model; at most {} bound ({MAX_BOUND_ENV}), a failed bind retried after {} s ({BIND_RETRY_ENV})",
+            "maintain: every WeMM index the pile's records name whose descriptor names one of {} ({MODELS_ENV}), each with that model; at most {} bound ({MAX_BOUND_ENV}), a failed bind retried after {} s ({BIND_RETRY_ENV}); nothing coordinates another maintainer on this host (an application's Driver) that lists the same model, which binds it too",
             self.models
                 .iter()
                 .map(Listed::name)
@@ -290,8 +297,9 @@ fn parse_listed(item: &str) -> Result<Listed> {
 
 /// How a host binds a model and maintains an index with it: the bound
 /// session on a GB10 ([`SessionBinder`]), or a stand-in in tests.
-pub trait Binder {
-    type Model;
+pub trait Binder: Send {
+    /// A bound model, shared by the registration and the maintenance it runs.
+    type Model: Clone + Send + Sync + 'static;
     /// Bind exactly the model `identity` names, or say why not.
     fn bind(&mut self, identity: WemmIdentity) -> Result<Self::Model>;
     /// Whether whatever a bind registers stays until the process exits, so
@@ -302,16 +310,18 @@ pub trait Binder {
     fn keeps_every_bind(&self) -> bool {
         false
     }
-    /// Maintain the index `target`, derived from `source`, with `model`.
-    fn maintain(
-        &mut self,
+    /// Maintain the index `target`, which lacks `backlog` foundations, with
+    /// `model`: the future derives them.
+    fn maintain<'a, S>(
+        &self,
         model: &Self::Model,
-        store: &mut FacultyStore,
-        source: Collection<SimpleArchive>,
+        pile: &'a mut S,
         target: Target,
-        signer: &SigningKey,
-        runtime: &Arc<tokio::runtime::Runtime>,
-    ) -> Result<Derived>;
+        backlog: usize,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send;
 }
 
 /// The bound WeMM session, with the weight residence and copy margin read
@@ -343,33 +353,31 @@ impl SessionBinder {
 }
 
 impl Binder for SessionBinder {
-    type Model = super::Session;
+    type Model = Arc<Session>;
 
-    fn bind(&mut self, identity: WemmIdentity) -> Result<super::Session> {
-        let session = super::Session::bind_identity(
-            &self.pile,
-            identity,
-            self.residence,
-            self.copy_min_free,
-        )?;
+    fn bind(&mut self, identity: WemmIdentity) -> Result<Arc<Session>> {
+        let session =
+            Session::bind_identity(&self.pile, identity, self.residence, self.copy_min_free)?;
         session.start_probe_from_env()?;
-        Ok(session)
+        Ok(Arc::new(session))
     }
 
     fn keeps_every_bind(&self) -> bool {
         self.residence == mary::nn::cuda_bf16_alias::WeightResidence::PileAliased
     }
 
-    fn maintain(
-        &mut self,
-        model: &super::Session,
-        store: &mut FacultyStore,
-        source: Collection<SimpleArchive>,
+    fn maintain<'a, S>(
+        &self,
+        model: &Arc<Session>,
+        pile: &'a mut S,
         target: Target,
-        signer: &SigningKey,
-        runtime: &Arc<tokio::runtime::Runtime>,
-    ) -> Result<Derived> {
-        model.maintain(store, source, target, signer, runtime)
+        backlog: usize,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        Session::maintain_in(model, pile, target, backlog, signer)
     }
 }
 
@@ -390,7 +398,7 @@ fn short(handle: CollectionHandle) -> String {
     collection_hex(handle)[..16].to_owned()
 }
 
-/// A sort key for one model: the passes group indexes by it.
+/// A sort key for one model: a pass groups indexes by it.
 fn key(identity: &WemmIdentity) -> ([u8; 32], Id, Id) {
     (
         identity.model_collection.raw,
@@ -399,6 +407,14 @@ fn key(identity: &WemmIdentity) -> ([u8; 32], Id, Id) {
     )
 }
 
+fn resolution(what: &str, error: impl std::fmt::Display) -> CollectionRealizationError {
+    CollectionRealizationError::Resolution(format!("{what}: {error:#}"))
+}
+
+/// One index this pass found of a listed model: its handle, its source, and
+/// its backlog, `None` when that could not be read (the line says so).
+type Member = (CollectionHandle, CollectionHandle, Option<usize>);
+
 struct Bound<M> {
     identity: WemmIdentity,
     model: M,
@@ -406,13 +422,11 @@ struct Bound<M> {
     served: u64,
 }
 
-/// The process side of the declared mode: the models it holds bound, the
-/// binds that failed and when, and which models it has named. A few
-/// entries per model; the indexes themselves are never kept.
-pub struct Maintainer<B: Binder> {
-    storage: Storage,
+/// What the registration keeps between passes: the models it holds bound,
+/// the binds that failed and when, and which models it has named. A few
+/// entries per model; the indexes themselves are only this pass's.
+struct State<B: Binder> {
     binder: B,
-    config: Config,
     bound: Vec<Bound<B::Model>>,
     failed: Vec<(WemmIdentity, Instant)>,
     named: Vec<WemmIdentity>,
@@ -420,30 +434,78 @@ pub struct Maintainer<B: Binder> {
     /// bind ([`Binder::keeps_every_bind`]).
     first_bound: Option<WemmIdentity>,
     passes: u64,
-    /// The attached indexes faculties defines ([`crate::maintenance`]).
-    attached: crate::maintenance::AttachedUpkeep,
+    /// This pass: each listed model's indexes, and the models with work.
+    groups: Vec<(WemmIdentity, Vec<Member>)>,
+    wanted: Vec<WemmIdentity>,
+    /// This pass: the models whose indexes wait for the next one.
+    waiting: Vec<WemmIdentity>,
+    /// This pass: the models that waited in the last one, which may release
+    /// a bound model with work, and how many binds the pass has made.
+    entitled: Vec<WemmIdentity>,
+    binds: usize,
 }
 
-/// What one pass did: the lines to log, and when the next pass is due even
-/// if the pile does not grow (the earliest bind retry still pending).
-pub struct Pass {
-    pub lines: Vec<String>,
-    pub retry_at: Option<Instant>,
+/// The WeMM maintenance registration: runs the WeMM algorithm for every
+/// index of a listed model, binding each model on demand through `B` and
+/// keeping it bound ([`Config`]: which models, how many at once, when a
+/// failed bind is tried again). Its lines go to the sink it is built with.
+pub struct Registration<B: Binder = SessionBinder> {
+    config: Config,
+    sink: Sink,
+    state: Mutex<State<B>>,
 }
 
-impl<B: Binder> Maintainer<B> {
-    pub fn new(storage: Storage, binder: B, config: Config) -> Self {
+impl Registration<SessionBinder> {
+    /// The registration `faculties maintain --declared` runs: the models
+    /// and limits of the environment ([`Config::from_env`]), bound from the
+    /// pile at `pile` as the environment says ([`SessionBinder::from_env`]).
+    pub fn from_env(pile: &std::path::Path, sink: Sink) -> Result<Self> {
+        Ok(Self::new(
+            Config::from_env()?,
+            SessionBinder::from_env(pile)?,
+            sink,
+        ))
+    }
+}
+
+impl<B: Binder> Registration<B> {
+    pub fn new(config: Config, binder: B, sink: Sink) -> Self {
         Self {
-            storage,
-            binder,
             config,
-            bound: Vec::new(),
-            failed: Vec::new(),
-            named: Vec::new(),
-            first_bound: None,
-            passes: 0,
-            attached: crate::maintenance::AttachedUpkeep::new(),
+            sink,
+            state: Mutex::new(State {
+                binder,
+                bound: Vec::new(),
+                failed: Vec::new(),
+                named: Vec::new(),
+                first_bound: None,
+                passes: 0,
+                groups: Vec::new(),
+                wanted: Vec::new(),
+                waiting: Vec::new(),
+                entitled: Vec::new(),
+                binds: 0,
+            }),
         }
+    }
+
+    fn log(&self, line: String) {
+        (self.sink)(&line);
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State<B>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The models bound now.
+    pub fn bound(&self) -> Vec<WemmIdentity> {
+        self.state()
+            .bound
+            .iter()
+            .map(|bound| bound.identity)
+            .collect()
     }
 
     /// The interval between two attempts to bind one model, from the end of
@@ -452,198 +514,86 @@ impl<B: Binder> Maintainer<B> {
         self.config.retry.max(MIN_BIND_RETRY)
     }
 
-    /// The models bound now.
-    pub fn bound(&self) -> Vec<WemmIdentity> {
-        self.bound.iter().map(|bound| bound.identity).collect()
-    }
-
-    /// One pass: find the indexes, bind what has work, maintain it. Returns
-    /// the lines to log: an index only when the pass derived something or
-    /// left something missing, a model when it is first found (listed and
-    /// maintained, or not listed) and when it is skipped, bound or released.
-    /// Only a failure to read the store at all is an error; one index or one
-    /// model failing is a line, and the rest go on.
-    pub fn pass(&mut self) -> Result<Pass> {
-        self.passes += 1;
-        let mut lines = Vec::new();
-        // One snapshot answers which indexes exist and how far behind each
-        // listed one is; an index of a model not listed is not read further.
-        let config = &self.config;
-        let mut declared = self.storage.with_store(|store, _, runtime| {
-            // The snapshot's own reads are resident-only; the acquiring
-            // reader is what maintenance reads the backlog through.
-            let snapshot = store.snapshot()?;
-            let reader = AcquiringReader::new(snapshot.clone(), runtime.clone());
-            discover(&snapshot, &reader, config)
-        })?;
-        declared.sort_by_key(|(index, _)| (key(&index.identity), index.index));
-        let mut groups: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
-        let mut unlisted: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
-        for (index, backlog) in declared {
-            let backlog = match backlog {
-                None => {
-                    match unlisted.last_mut() {
-                        Some((identity, members)) if *identity == index.identity => {
-                            members.push((index, 0))
-                        }
-                        _ => unlisted.push((index.identity, vec![(index, 0)])),
-                    }
-                    continue;
-                }
-                Some(Ok(backlog)) => backlog,
-                Some(Err(error)) => {
-                    lines.push(format!(
-                        "maintain: index {} (model {}) not read: {error:#}",
-                        short(index.index),
-                        model_name(&index.identity)
-                    ));
-                    continue;
-                }
-            };
-            match groups.last_mut() {
-                Some((identity, members)) if *identity == index.identity => {
-                    members.push((index, backlog))
-                }
-                _ => groups.push((index.identity, vec![(index, backlog)])),
-            }
-        }
-        // Each model is named once, when it is first found: at the first
-        // pass every model then declared, later only new ones.
-        for (identity, members) in &unlisted {
-            if !self.named.contains(identity) {
-                self.named.push(*identity);
-                lines.push(format!(
-                    "maintain: model {} is not listed ({MODELS_ENV}); its index(es) {} are not maintained here",
-                    model_name(identity),
-                    names(members)
-                ));
-            }
-        }
-        let mut work = Vec::new();
-        for (identity, members) in groups {
-            if !self.named.contains(&identity) {
-                self.named.push(identity);
-                lines.push(format!(
-                    "maintain: model {} is listed; maintaining its index(es) {}",
-                    model_name(&identity),
-                    names(&members)
-                ));
-            }
-            if members.iter().any(|(_, backlog)| *backlog > 0) {
-                work.push((identity, members));
-            }
-        }
-        // Models already bound first, so a bound model is not released for
-        // another while it still has work of its own this pass.
-        work.sort_by_key(|(identity, _)| !self.bound.iter().any(|b| b.identity == *identity));
-        let wanted: Vec<WemmIdentity> = work.iter().map(|(identity, _)| *identity).collect();
-        for (identity, members) in work {
-            let Some(slot) = self.ensure_bound(identity, &members, &wanted, &mut lines) else {
-                continue;
-            };
-            self.bound[slot].served = self.passes;
-            for (index, _) in members {
-                let model = &self.bound[slot].model;
-                let binder = &mut self.binder;
-                let result = self.storage.with_store(|store, signer, runtime| {
-                    let snapshot = store.snapshot()?;
-                    let source = Collection::<SimpleArchive>::open(&snapshot, index.source)
-                        .map_err(|e| anyhow::anyhow!("open the index's source: {e}"))?;
-                    let target = Target::open(&snapshot, index.index)
-                        .map_err(|e| anyhow::anyhow!("open the index: {e}"))?;
-                    drop(snapshot);
-                    binder.maintain(model, store, source, target, signer, runtime)
-                });
-                match result {
-                    Ok(derived) if derived.derived > 0 || derived.missing > 0 => lines.push(
-                        format!("maintain: {derived} (model {})", model_name(&identity)),
-                    ),
-                    Ok(_) => {}
-                    Err(error) => lines.push(format!(
-                        "maintain: index {} (model {}) failed: {error:#}",
-                        short(index.index),
-                        model_name(&identity)
-                    )),
-                }
-            }
-        }
-        // The attached indexes, after the models: one failing is a line.
-        match self.attached.pass(&self.storage) {
-            Ok(attached) => lines.extend(attached),
-            Err(error) => lines.push(format!(
-                "maintain: attached indexes not maintained this pass: {error:#}"
-            )),
-        }
-        // The next attempt of every failed model that still has work, also
-        // one already due (it came while later models were maintained):
-        // the daemon then passes again at once, and that pass makes the
-        // attempt and pushes its next one forward by the interval.
-        let retry = self.retry();
-        let retry_at = self
-            .failed
-            .iter()
-            .filter(|(identity, _)| wanted.contains(identity))
-            .map(|(_, ended)| *ended + retry)
-            .min();
-        Ok(Pass { lines, retry_at })
-    }
-
-    /// The slot of a bound model `identity`, binding it if need be; `None`
-    /// when it cannot be bound now, with a line saying why.
-    fn ensure_bound(
-        &mut self,
-        identity: WemmIdentity,
-        members: &[(DeclaredIndex, usize)],
-        wanted: &[WemmIdentity],
-        lines: &mut Vec<String>,
-    ) -> Option<usize> {
-        if let Some(slot) = self.bound.iter().position(|b| b.identity == identity) {
+    /// Bind `identity` for `index` if it is not bound, or say why not.
+    /// `None` when it cannot be bound now, with a line saying why the first
+    /// time.
+    fn ensure_bound(&self, state: &mut State<B>, identity: WemmIdentity) -> Option<usize> {
+        if let Some(slot) = state.bound.iter().position(|b| b.identity == identity) {
             return Some(slot);
         }
+        let members: Vec<Member> = state
+            .groups
+            .iter()
+            .find(|(model, _)| *model == identity)
+            .map(|(_, members)| members.clone())
+            .unwrap_or_default();
         let now = Instant::now();
-        if let Some(position) = self
+        if let Some(position) = state
             .failed
             .iter()
             .position(|(failed, _)| *failed == identity)
         {
-            if now.duration_since(self.failed[position].1) < self.retry() {
+            if now.duration_since(state.failed[position].1) < self.retry() {
                 return None;
             }
-            self.failed.remove(position);
+            state.failed.remove(position);
         }
-        if let Some(first) = self.first_bound {
-            if first != identity && self.binder.keeps_every_bind() {
+        if let Some(first) = state.first_bound {
+            if first != identity && state.binder.keeps_every_bind() {
                 // Once per retry interval, like a failed bind.
-                lines.push(format!(
+                self.log(format!(
                     "maintain: not binding model {}: this process bound {} with weights aliased from the pile, whose registrations stay until it exits, so it binds no other model; set WEMM_COPY_WEIGHTS=1 for several models",
                     model_name(&identity),
                     model_name(&first)
                 ));
-                self.failed.push((identity, now));
+                state.failed.push((identity, now));
                 return None;
             }
         }
-        if self.bound.len() >= self.config.max_bound {
-            // A bound model with nothing to derive this pass goes first, else
-            // the one served least recently.
-            let release = self
+        if state.bound.len() >= self.config.max_bound {
+            // A bound model with nothing to derive this pass goes first. A
+            // model that waited last pass may then release the one served
+            // least recently while this pass has bound fewer models than
+            // there are slots; any other waits for the next pass. So a pass
+            // binds at most once per slot, and the bound models are served
+            // before another is bound.
+            let release = state
                 .bound
                 .iter()
-                .position(|b| !wanted.contains(&b.identity))
+                .position(|b| !state.wanted.contains(&b.identity))
                 .or_else(|| {
-                    self.bound
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, b)| b.served)
-                        .map(|(slot, _)| slot)
-                })
-                .expect("a full set of bound models is not empty");
-            let released = self.bound.remove(release);
-            lines.push(format!(
+                    state
+                        .entitled
+                        .contains(&identity)
+                        .then_some(())
+                        .filter(|()| state.binds < self.config.max_bound)
+                        .and_then(|()| {
+                            state
+                                .bound
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, b)| b.served)
+                                .map(|(slot, _)| slot)
+                        })
+                });
+            let Some(release) = release else {
+                if !state.waiting.contains(&identity) {
+                    state.waiting.push(identity);
+                    self.log(format!(
+                        "maintain: model {} waits for the next pass: the {} bound model(s) have work this one ({MAX_BOUND_ENV}={})",
+                        model_name(&identity),
+                        state.bound.len(),
+                        self.config.max_bound
+                    ));
+                }
+                return None;
+            };
+            let released = state.bound.remove(release);
+            self.log(format!(
                 "maintain: releasing model {} to bind {} ({} model(s) have work, {MAX_BOUND_ENV}={})",
                 model_name(&released.identity),
                 model_name(&identity),
-                wanted.len(),
+                state.wanted.len(),
                 self.config.max_bound
             ));
             // Dropping the session drops what it owns: the runtime, its
@@ -656,77 +606,252 @@ impl<B: Binder> Maintainer<B> {
             // reach this release for another model.
             drop(released);
         }
-        match self.binder.bind(identity) {
+        match state.binder.bind(identity) {
             Ok(model) => {
-                self.first_bound.get_or_insert(identity);
-                lines.push(format!(
+                state.first_bound.get_or_insert(identity);
+                state.binds += 1;
+                self.log(format!(
                     "maintain: bound model {} for index(es) {}",
                     model_name(&identity),
-                    names(members)
+                    names(&members)
                 ));
-                self.bound.push(Bound {
+                state.bound.push(Bound {
                     identity,
                     model,
-                    served: self.passes,
+                    served: 0,
                 });
-                Some(self.bound.len() - 1)
+                Some(state.bound.len() - 1)
             }
             Err(error) => {
                 // From when the attempt ended: a bind slower than the
                 // interval is still due again an interval later.
-                self.failed.push((identity, Instant::now()));
-                lines.push(format!(
+                state.failed.push((identity, Instant::now()));
+                self.log(format!(
                     "maintain: skip model {}: {error:#}; index(es) {} not maintained, bind retried after {} s",
                     model_name(&identity),
-                    names(members),
+                    names(&members),
                     self.retry().as_secs()
                 ));
                 None
             }
         }
     }
+
+    /// The model and the member this pass found for `index`.
+    fn found(state: &State<B>, index: CollectionHandle) -> Option<(WemmIdentity, Member)> {
+        state.groups.iter().find_map(|(identity, members)| {
+            members
+                .iter()
+                .find(|(member, _, _)| *member == index)
+                .map(|member| (*identity, *member))
+        })
+    }
 }
 
-fn names(members: &[(DeclaredIndex, usize)]) -> String {
+fn names(members: &[Member]) -> String {
     members
         .iter()
-        .map(|(index, _)| short(index.index))
+        .map(|(index, _, _)| short(*index))
         .collect::<Vec<_>>()
         .join(",")
 }
 
-/// The WeMM indexes `resident`'s records name, from descriptors that are
-/// here: descriptors are read only from `resident`, which never fetches, so
-/// a collection whose descriptor is not here is passed over and nothing is
-/// requested for it. Each index of a listed model comes with its backlog,
-/// read through `acquiring` as maintenance reads it; other indexes are not
-/// read further.
-fn discover<P, A>(
-    resident: &P,
-    acquiring: &A,
-    config: &Config,
-) -> Result<Vec<(DeclaredIndex, Option<Result<usize>>)>>
-where
-    P: CollectionRead + BlobStoreGet,
-    A: StoreRead,
-{
-    let mut declared = Vec::new();
-    for index in declared_indexes(resident).context("find the declared WeMM indexes")? {
-        let backlog = config
-            .lists(&index.identity)
-            .then(|| backlog(acquiring, &index));
-        declared.push((index, backlog));
+impl<B: Binder> Mappings for Registration<B> {
+    fn runs(&self, algorithm: Id) -> bool {
+        algorithm == WEMM_CONTENT_WINDOWS_TO_NVFP4
     }
-    Ok(declared)
-}
 
-/// How many foundations of `index`'s source have no usable leaf in it.
-fn backlog<R: StoreRead>(reader: &R, index: &DeclaredIndex) -> Result<usize> {
-    let source = Collection::<SimpleArchive>::open(reader, index.source)
-        .map_err(|e| anyhow::anyhow!("open the index's source: {e}"))?;
-    let target =
-        Target::open(reader, index.index).map_err(|e| anyhow::anyhow!("open the index: {e}"))?;
-    crate::storage::underived(reader, source, target)
+    /// Find this pass's indexes ([`declared_indexes`]), group them by model
+    /// with their backlogs, and name each model the first time it is found.
+    fn begin_pass<R: StoreRead>(&self, snapshot: &R) {
+        let mut state = self.state();
+        let state = &mut *state;
+        state.passes += 1;
+        state.groups.clear();
+        state.wanted.clear();
+        state.entitled = std::mem::take(&mut state.waiting);
+        state.binds = 0;
+        let mut declared = match declared_indexes(snapshot) {
+            Ok(declared) => declared,
+            Err(error) => {
+                self.log(format!(
+                    "maintain: find the declared WeMM indexes: {error:?}"
+                ));
+                return;
+            }
+        };
+        declared.sort_by_key(|index| (key(&index.identity), index.index));
+        let mut unlisted: Vec<(WemmIdentity, Vec<Member>)> = Vec::new();
+        for index in declared {
+            let listed = self.config.lists(&index.identity);
+            let backlog = if listed {
+                let backlog = Collection::<SimpleArchive>::open(snapshot, index.source)
+                    .map_err(|e| anyhow::anyhow!("open the index's source: {e}"))
+                    .and_then(|source| {
+                        let target = Target::open(snapshot, index.index)
+                            .map_err(|e| anyhow::anyhow!("open the index: {e}"))?;
+                        underived(snapshot, source, target)
+                    });
+                match backlog {
+                    Ok(backlog) => Some(backlog),
+                    Err(error) => {
+                        self.log(format!(
+                            "maintain: index {} (model {}) not read: {error:#}",
+                            short(index.index),
+                            model_name(&index.identity)
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let groups = if listed {
+                &mut state.groups
+            } else {
+                &mut unlisted
+            };
+            let member = (index.index, index.source, backlog);
+            match groups.last_mut() {
+                Some((model, members)) if *model == index.identity => members.push(member),
+                _ => groups.push((index.identity, vec![member])),
+            }
+        }
+        // Each model is named once, when it is first found: at the first
+        // pass every model then declared, later only new ones.
+        for (identity, members) in &unlisted {
+            if !state.named.contains(identity) {
+                state.named.push(*identity);
+                self.log(format!(
+                    "maintain: model {} is not listed ({MODELS_ENV}); its index(es) {} are not maintained here",
+                    model_name(identity),
+                    names(members)
+                ));
+            }
+        }
+        for (identity, members) in &state.groups {
+            if !state.named.contains(identity) {
+                state.named.push(*identity);
+                self.log(format!(
+                    "maintain: model {} is listed; maintaining its index(es) {}",
+                    model_name(identity),
+                    names(members)
+                ));
+            }
+            if members
+                .iter()
+                .any(|(_, _, backlog)| backlog.unwrap_or(0) > 0)
+            {
+                state.wanted.push(*identity);
+            }
+        }
+    }
+
+    /// The backlog this pass found; none for an index of a model not
+    /// listed, one that could not be read (its line is out), or one the
+    /// pass did not find.
+    fn pending<R: StoreRead>(
+        &self,
+        _snapshot: &R,
+        handle: CollectionHandle,
+        _algorithm: Id,
+    ) -> Result<usize, CollectionRealizationError> {
+        Ok(Self::found(&self.state(), handle)
+            .and_then(|(_, (_, _, backlog))| backlog)
+            .unwrap_or(0))
+    }
+
+    /// Bind the index's model if it has work and is not bound (or say why
+    /// not), then derive its backlog with it.
+    fn maintain<'a, S>(
+        &'a self,
+        pile: &'a mut S,
+        snapshot: &S::Snapshot,
+        handle: CollectionHandle,
+        _algorithm: Id,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        let opened = |source| -> Result<_, CollectionRealizationError> {
+            let source = Collection::<SimpleArchive>::open(snapshot, source)
+                .map_err(|e| resolution("open the index's source", e))?;
+            let target =
+                Target::open(snapshot, handle).map_err(|e| resolution("open the index", e))?;
+            Ok((source, target))
+        };
+        let work = {
+            let mut state = self.state();
+            match Self::found(&state, handle) {
+                Some((identity, (_, source, Some(backlog)))) if backlog > 0 => {
+                    self.ensure_bound(&mut state, identity).map(|slot| {
+                        state.bound[slot].served = state.passes;
+                        (
+                            identity,
+                            opened(source),
+                            backlog,
+                            state.bound[slot].model.clone(),
+                        )
+                    })
+                }
+                _ => None,
+            }
+        };
+        Box::pin(async move {
+            let Some((identity, opened, backlog, model)) = work else {
+                return pile
+                    .snapshot()
+                    .map_err(|e| resolution("observe the index", e));
+            };
+            let started = Instant::now();
+            let (source, target) = opened?;
+            let future = self
+                .state()
+                .binder
+                .maintain(&model, &mut *pile, target, backlog, signer);
+            let result = future.await;
+            let after = pile
+                .snapshot()
+                .map_err(|e| resolution("observe the index", e))?;
+            let derived = Derived::observe(&after, source, target, backlog, started)
+                .map_err(|e| resolution("count the index's backlog", e))?;
+            match result {
+                Ok(_) if derived.derived > 0 || derived.missing > 0 => self.log(format!(
+                    "maintain: {derived} (model {})",
+                    model_name(&identity)
+                )),
+                Ok(_) => {}
+                Err(error) => self.log(format!(
+                    "maintain: index {} (model {}) failed: {error}",
+                    short(handle),
+                    model_name(&identity)
+                )),
+            }
+            Ok(after)
+        })
+    }
+
+    /// The next attempt of every failed model that still has work, also one
+    /// already due (it came while later models were maintained): the daemon
+    /// then passes again at once, and that pass makes the attempt and pushes
+    /// its next one forward by the interval. A model that waits for the next
+    /// pass is due now.
+    fn due(&self) -> Option<Instant> {
+        let state = self.state();
+        let retry = self.retry();
+        let failed = state
+            .failed
+            .iter()
+            .filter(|(identity, _)| state.wanted.contains(identity))
+            .map(|(_, ended)| *ended + retry)
+            .min();
+        if state.waiting.is_empty() {
+            failed
+        } else {
+            Some(failed.map_or_else(Instant::now, |failed| failed.min(Instant::now())))
+        }
+    }
 }
 
 #[cfg(test)]

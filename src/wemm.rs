@@ -72,16 +72,17 @@ use mary::models::qwen3_5::native::{device_identity, Assets, NativeWemm};
 use mary::nn::cuda_bf16_alias::{CudaBf16Aliases, WeightResidence};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionOperationError, CollectionSnapshotExt,
-    CollectionStoreExt, DeriveMapping,
+    Collection, CollectionHandle, CollectionOperationError, CollectionRealizationError,
+    CollectionSnapshotExt, CollectionStoreExt, DeriveMapping, Maintenance,
 };
 use triblespace::core::inline::encodings::UnknownInline;
+use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
+use triblespace::core::repo::Store;
 use triblespace::core::repo::StoreRead;
 use triblespace::core::trible::Fragment;
 use triblespace::prelude::*;
@@ -380,7 +381,7 @@ pub enum Query<'a> {
 /// costs 30 to 110 s. Deliberately not `Send`; it lends its runtime only to
 /// synchronous work on this thread.
 pub struct Session {
-    runtime: Rc<RefCell<WemmRuntime>>,
+    runtime: Arc<Mutex<WemmRuntime>>,
     identity: WemmIdentity,
     profile: WemmProfile,
     residence: WeightResidence,
@@ -764,7 +765,7 @@ impl Session {
         // MemAvailable reading already sees them: only now may it read.
         drop(admission);
         Ok(Self {
-            runtime: Rc::new(RefCell::new(runtime)),
+            runtime: Arc::new(Mutex::new(runtime)),
             identity,
             profile,
             residence,
@@ -814,7 +815,7 @@ impl Session {
         };
         let output = self
             .runtime
-            .try_borrow_mut()
+            .try_lock()
             .map_err(|_| anyhow::anyhow!("WeMM runtime is busy"))?
             .probe_texts(&probe::PROBE_TEXTS)?;
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
@@ -922,26 +923,40 @@ impl Session {
         runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Result<Derived> {
         let started = std::time::Instant::now();
-        self.backing.require_still(&self.model)?;
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let backlog = crate::storage::underived(&reader, source, target)?;
-        PROGRESS.with(|progress| progress.set((0, backlog)));
-        let maintained = with_wemm_runtime(Rc::clone(&self.runtime), || {
-            runtime.block_on(store.maintain_with::<Progress>(target, signer))
-        })?;
+        let maintained = runtime.block_on(self.maintain_in(store, target, backlog, signer));
         let after = AcquiringReader::new(store.snapshot()?, runtime.clone());
-        let derived = Derived {
-            index: target.handle(),
-            derived: PROGRESS.with(Cell::get).0,
-            missing: crate::storage::underived(&after, source, target)?,
-            rows: after
-                .collection_acquiring(target)?
-                .view::<NvFp4CosineIndex<Embedding>>()?
-                .len(),
-            elapsed: started.elapsed(),
-        };
+        let derived = Derived::observe(&after, source, target, backlog, started)?;
         maintained.with_context(|| format!("derive the WeMM index ({derived})"))?;
         Ok(derived)
+    }
+
+    /// [`Self::maintain`] for any store, as a future: `target`'s backlog of
+    /// `backlog` foundations derived with this session's model, the runtime
+    /// installed around each poll (so whichever thread polls it computes
+    /// with this model), and nothing counted or logged beyond the per
+    /// foundation progress lines. What [`Self::maintain`] and a maintenance
+    /// registration ([`declared::Registration`]) run.
+    pub fn maintain_in<'a, S>(
+        &self,
+        pile: &'a mut S,
+        target: Target,
+        backlog: usize,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        if let Err(error) = self.backing.require_still(&self.model) {
+            let error = CollectionRealizationError::Resolution(format!("{error:#}"));
+            return Box::pin(async move { Err(error) });
+        }
+        PROGRESS.with(|progress| progress.set((0, backlog)));
+        Box::pin(InRuntime {
+            runtime: Arc::clone(&self.runtime),
+            inner: Box::pin(pile.maintain_with::<Progress>(target, signer)),
+        })
     }
 
     /// Score `query` against the rows of `source`'s index as they stand. It
@@ -968,7 +983,7 @@ impl Session {
                 profile: self.profile,
             });
         }
-        let cosines = with_wemm_runtime(Rc::clone(&self.runtime), || match query {
+        let cosines = with_wemm_runtime(Arc::clone(&self.runtime), || match query {
             Query::Text(text) => mapping.reconstructed_cosines(&index, text),
             Query::Content(bytes) => mapping.reconstructed_cosines_content(&index, bytes),
         })??;
@@ -988,6 +1003,34 @@ impl Drop for Session {
     }
 }
 
+/// A future polled with a WeMM runtime installed in this thread's slot for
+/// the duration of each poll, and removed between polls.
+struct InRuntime<F> {
+    runtime: Arc<Mutex<WemmRuntime>>,
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F, T> std::future::Future for InRuntime<F>
+where
+    F: std::future::Future<Output = std::result::Result<T, CollectionRealizationError>>,
+{
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let inner = this.inner.as_mut();
+        match with_wemm_runtime(Arc::clone(&this.runtime), || inner.poll(context)) {
+            Ok(poll) => poll,
+            Err(error) => std::task::Poll::Ready(Err(CollectionRealizationError::Resolution(
+                format!("install the WeMM runtime: {error}"),
+            ))),
+        }
+    }
+}
+
 /// What one derive pass over one index did, and what is left.
 #[derive(Clone, Copy, Debug)]
 pub struct Derived {
@@ -999,6 +1042,30 @@ pub struct Derived {
     /// Rows the index holds after the pass.
     pub rows: usize,
     pub elapsed: std::time::Duration,
+}
+
+impl Derived {
+    /// What a pass that started at `started` with `backlog` foundations to
+    /// derive left in `after`.
+    pub fn observe(
+        after: &impl StoreRead,
+        source: Collection<SimpleArchive>,
+        target: Target,
+        backlog: usize,
+        started: std::time::Instant,
+    ) -> Result<Self> {
+        let missing = crate::storage::underived(after, source, target)?;
+        Ok(Self {
+            index: target.handle(),
+            derived: backlog.saturating_sub(missing),
+            missing,
+            rows: after
+                .collection_acquiring(target)?
+                .view::<NvFp4CosineIndex<Embedding>>()?
+                .len(),
+            elapsed: started.elapsed(),
+        })
+    }
 }
 
 impl std::fmt::Display for Derived {
@@ -1059,7 +1126,7 @@ thread_local! {
 /// stays bound exactly as long as the [`Session`] that started the probe.
 struct Probe<R = WemmRuntime> {
     checker: probe::Checker,
-    runtime: Weak<RefCell<R>>,
+    runtime: Weak<Mutex<R>>,
 }
 
 /// Put a probe on `runtime` in `slot`, replacing (and dropping) any probe
@@ -1067,24 +1134,24 @@ struct Probe<R = WemmRuntime> {
 fn install_probe<R>(
     slot: &RefCell<Option<Probe<R>>>,
     checker: probe::Checker,
-    runtime: &Rc<RefCell<R>>,
+    runtime: &Arc<Mutex<R>>,
 ) {
     *slot.borrow_mut() = Some(Probe {
         checker,
-        runtime: Rc::downgrade(runtime),
+        runtime: Arc::downgrade(runtime),
     });
 }
 
 /// Clear `slot` if its probe is on `runtime`. A probe of another session is
 /// left alone. A slot that is in use is left too: the weak reference already
 /// keeps it from holding the model.
-fn release_probe<R>(slot: &RefCell<Option<Probe<R>>>, runtime: &Rc<RefCell<R>>) {
+fn release_probe<R>(slot: &RefCell<Option<Probe<R>>>, runtime: &Arc<Mutex<R>>) {
     let Ok(mut slot) = slot.try_borrow_mut() else {
         return;
     };
     if slot
         .as_ref()
-        .is_some_and(|probe| Weak::ptr_eq(&probe.runtime, &Rc::downgrade(runtime)))
+        .is_some_and(|probe| Weak::ptr_eq(&probe.runtime, &Arc::downgrade(runtime)))
     {
         *slot = None;
     }
@@ -1110,7 +1177,7 @@ fn probe_after_foundation() {
             *slot = None;
             return;
         };
-        let output = match runtime.try_borrow_mut() {
+        let output = match runtime.try_lock() {
             Ok(mut runtime) => runtime.probe_texts(&probe::PROBE_TEXTS),
             Err(_) => {
                 eprintln!("wemm probe: skipped, the runtime is in use");
@@ -1182,7 +1249,7 @@ mod tests {
     use super::*;
 
     /// A stand-in for the bound runtime that records when it is dropped.
-    struct Model(Rc<Cell<bool>>);
+    struct Model(std::rc::Rc<Cell<bool>>);
 
     impl Drop for Model {
         fn drop(&mut self) {
@@ -1190,9 +1257,9 @@ mod tests {
         }
     }
 
-    fn model() -> (Rc<RefCell<Model>>, Rc<Cell<bool>>) {
-        let dropped = Rc::new(Cell::new(false));
-        (Rc::new(RefCell::new(Model(dropped.clone()))), dropped)
+    fn model() -> (Arc<Mutex<Model>>, std::rc::Rc<Cell<bool>>) {
+        let dropped = std::rc::Rc::new(Cell::new(false));
+        (Arc::new(Mutex::new(Model(dropped.clone()))), dropped)
     }
 
     fn checker(dir: &Path) -> probe::Checker {
@@ -2180,7 +2247,7 @@ mod tests {
         // Every row is computed independently: a text's row alone and in a
         // batch of four are the same bytes (after the early forwards).
         {
-            let mut runtime = session.runtime.borrow_mut();
+            let mut runtime = session.runtime.lock().unwrap();
             for _ in 0..probe::EARLY_FORWARDS {
                 runtime.probe_texts(&probe::PROBE_TEXTS).unwrap();
             }
@@ -2300,7 +2367,7 @@ mod tests {
         ));
         let mut repo = triblespace::core::repo::memoryrepo::MemoryRepo::default();
         let reader = repo.snapshot().unwrap();
-        let (computable, refusals) = with_wemm_runtime(Rc::clone(&session.runtime), || {
+        let (computable, refusals) = with_wemm_runtime(Arc::clone(&session.runtime), || {
             (
                 (
                     bf16.computable_here(),

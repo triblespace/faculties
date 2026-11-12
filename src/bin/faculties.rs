@@ -277,7 +277,7 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
 /// name, each with its own descriptor's model (faculties::wemm::declared).
 #[cfg(feature = "wemm")]
 fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
-    use faculties::wemm::declared::{Binder, Config, Maintainer, SessionBinder};
+    use faculties::wemm::declared::{Binder, Config, Registration, SessionBinder};
     anyhow::ensure!(
         std::env::var_os("FACULTIES_WORKSPACE").is_none(),
         "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE"
@@ -286,26 +286,22 @@ fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<(
     let binder = SessionBinder::from_env(&pile)?;
     let note = config.check_residence(binder.keeps_every_bind())?;
     eprintln!("{}", config.describe());
-    eprintln!("{}", faculties::maintenance::AttachedUpkeep::describe());
+    eprintln!("{}", faculties::maintenance::describe());
     if let Some(note) = note {
         eprintln!("{note}");
     }
     let storage = faculties::storage::Storage::shared(pile.clone(), key);
     let backing = faculties::pile_watch::BackingIdentity::of(&pile)?;
-    let mut maintainer = Maintainer::new(storage.clone(), binder, config);
-    // A pass runs when the pile grows or when a deferred bind retry is due,
-    // whichever is first.
+    let sink: faculties::maintenance::Sink = std::sync::Arc::new(|line| eprintln!("{line}"));
+    let mut upkeep =
+        faculties::maintenance::Upkeep::new(Registration::new(config, binder, sink.clone()), sink);
+    // A pass runs when the pile grows or when deferred work (a bind retry, a
+    // model waiting for the next pass) is due, whichever is first.
     let result = faculties::pile_watch::run_until_replaced_or_due(
         &pile,
         &backing,
         std::time::Duration::from_secs(poll),
-        || {
-            let pass = maintainer.pass()?;
-            for line in pass.lines {
-                eprintln!("{line}");
-            }
-            Ok(pass.retry_at)
-        },
+        || upkeep.pass(&storage),
     );
     if result.is_ok() {
         eprintln!(
@@ -313,7 +309,7 @@ fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<(
             pile.display()
         );
     }
-    drop(maintainer);
+    drop(upkeep);
     let closed = storage.close();
     result.and(closed)
 }

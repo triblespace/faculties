@@ -2,13 +2,13 @@
 //! only while the model its descriptor names is the one bound, as the
 //! runtime does (`WemmRuntime::matches`).
 use super::*;
-use crate::storage::{initialize_signer, underived};
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use crate::maintenance::{Sink, Upkeep};
+use crate::storage::{initialize_signer, AcquiringReader, Storage};
+use std::cell::Cell;
 use triblespace::core::blob::Blob;
 use triblespace::core::collection::{
-    CollectionDerive, CollectionOperationError, CollectionPolicy, CollectionRecord,
-    CollectionStore, CollectionStoreExt, DeriveMapping, SourceLocator,
+    registered_targets, CollectionDerive, CollectionOperationError, CollectionPolicy,
+    CollectionRecord, CollectionStore, CollectionStoreExt, DeriveMapping, SourceLocator,
 };
 use triblespace::core::metadata;
 use triblespace::core::trible::Fragment;
@@ -64,7 +64,7 @@ struct Log {
 /// Binds every model but the roots in `unbindable`, and maintains through
 /// the stand-in with the model it was handed.
 struct TestBinder {
-    log: Rc<RefCell<Log>>,
+    log: Arc<Mutex<Log>>,
     unbindable: Vec<Id>,
     keeps_every_bind: bool,
     /// How long a bind takes before it answers.
@@ -73,11 +73,33 @@ struct TestBinder {
     maintain_takes: Duration,
 }
 
+/// A future polled with the stand-in's model bound on the polling thread,
+/// as the runtime is installed around each poll.
+struct WithBound<F> {
+    model: WemmIdentity,
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for WithBound<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        BOUND.set(Some(this.model));
+        let poll = this.inner.as_mut().poll(context);
+        BOUND.set(None);
+        poll
+    }
+}
+
 impl Binder for TestBinder {
     type Model = WemmIdentity;
 
     fn bind(&mut self, identity: WemmIdentity) -> Result<WemmIdentity> {
-        self.log.borrow_mut().binds.push(identity);
+        self.log.lock().unwrap().binds.push(identity);
         std::thread::sleep(self.bind_takes);
         anyhow::ensure!(
             !self.unbindable.contains(&identity.model_root),
@@ -91,41 +113,77 @@ impl Binder for TestBinder {
         self.keeps_every_bind
     }
 
-    fn maintain(
-        &mut self,
+    fn maintain<'a, S>(
+        &self,
         model: &WemmIdentity,
-        store: &mut FacultyStore,
-        source: Collection<SimpleArchive>,
+        pile: &'a mut S,
         target: Target,
-        signer: &SigningKey,
-        runtime: &Arc<tokio::runtime::Runtime>,
-    ) -> Result<Derived> {
-        let before = underived(
-            &AcquiringReader::new(store.snapshot()?, runtime.clone()),
-            source,
-            target,
-        )?;
+        _backlog: usize,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
         std::thread::sleep(self.maintain_takes);
-        BOUND.set(Some(*model));
-        let maintained = runtime.block_on(store.maintain_with::<StandIn>(target, signer));
-        BOUND.set(None);
-        maintained.context("maintain through the stand-in")?;
-        let missing = underived(
-            &AcquiringReader::new(store.snapshot()?, runtime.clone()),
-            source,
-            target,
-        )?;
-        self.log
-            .borrow_mut()
-            .maintained
-            .push((*model, target.handle()));
-        Ok(Derived {
-            index: target.handle(),
-            derived: before - missing,
-            missing,
-            rows: 0,
-            elapsed: Duration::ZERO,
+        let (log, model) = (self.log.clone(), *model);
+        let inner = WithBound {
+            model,
+            inner: Box::pin(pile.maintain_with::<StandIn>(target, signer)),
+        };
+        Box::pin(async move {
+            let after = inner.await?;
+            log.lock()
+                .unwrap()
+                .maintained
+                .push((model, target.handle()));
+            Ok(after)
         })
+    }
+}
+
+/// The daemon's passes over a fixture: the one upkeep, with the WeMM
+/// registration over a stand-in binder.
+struct Daemon {
+    upkeep: Upkeep<Registration<TestBinder>>,
+    storage: Storage,
+    lines: Arc<Mutex<Vec<String>>>,
+}
+
+/// What one pass logged, and when the next is due.
+struct Pass {
+    lines: Vec<String>,
+    retry_at: Option<Instant>,
+}
+
+/// A sink that collects into `lines`.
+fn collector(lines: &Arc<Mutex<Vec<String>>>) -> Sink {
+    let lines = lines.clone();
+    Arc::new(move |line: &str| lines.lock().unwrap().push(line.to_owned()))
+}
+
+impl Daemon {
+    fn new(storage: Storage, binder: TestBinder, config: Config) -> Self {
+        let lines = Arc::default();
+        Self {
+            upkeep: Upkeep::new(
+                Registration::new(config, binder, collector(&lines)),
+                collector(&lines),
+            ),
+            storage,
+            lines,
+        }
+    }
+
+    fn pass(&mut self) -> Result<Pass> {
+        let retry_at = self.upkeep.pass(&self.storage)?;
+        Ok(Pass {
+            lines: std::mem::take(&mut *self.lines.lock().unwrap()),
+            retry_at,
+        })
+    }
+
+    fn bound(&self) -> Vec<WemmIdentity> {
+        self.upkeep.other().bound()
     }
 }
 
@@ -224,12 +282,8 @@ impl Fixture {
             .unwrap()
     }
 
-    fn maintainer(
-        &self,
-        config: Config,
-        unbindable: Vec<Id>,
-    ) -> (Maintainer<TestBinder>, Rc<RefCell<Log>>) {
-        let log = Rc::new(RefCell::new(Log::default()));
+    fn maintainer(&self, config: Config, unbindable: Vec<Id>) -> (Daemon, Arc<Mutex<Log>>) {
+        let log = Arc::new(Mutex::new(Log::default()));
         let binder = TestBinder {
             log: log.clone(),
             unbindable,
@@ -237,7 +291,7 @@ impl Fixture {
             bind_takes: Duration::ZERO,
             maintain_takes: Duration::ZERO,
         };
-        (Maintainer::new(self.storage.clone(), binder, config), log)
+        (Daemon::new(self.storage.clone(), binder, config), log)
     }
 }
 
@@ -284,8 +338,11 @@ fn each_declared_index_is_maintained_with_the_model_its_descriptor_names() {
         fixture.maintainer(config(2, &[first_model, second_model]), Vec::new());
     let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
-    assert_eq!(log.borrow().binds, vec![first_model, second_model]);
-    let mut maintained = log.borrow().maintained.clone();
+    // Bound in the order their indexes are maintained, each once.
+    let mut binds = log.lock().unwrap().binds.clone();
+    binds.sort_by_key(|model| model.model_root);
+    assert_eq!(binds, vec![first_model, second_model]);
+    let mut maintained = log.lock().unwrap().maintained.clone();
     maintained.sort_by_key(|(_, index)| *index);
     let mut expected = vec![
         (first_model, first.handle()),
@@ -303,7 +360,11 @@ fn each_declared_index_is_maintained_with_the_model_its_descriptor_names() {
     fixture.add_member();
     maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
-    assert_eq!(log.borrow().binds.len(), 2, "a bound model is bound again");
+    assert_eq!(
+        log.lock().unwrap().binds.len(),
+        2,
+        "a bound model is bound again"
+    );
     // A pass with nothing to derive binds and logs nothing.
     assert!(maintainer.pass().unwrap().lines.is_empty());
 }
@@ -317,7 +378,7 @@ fn an_index_is_not_derived_under_another_model() {
     let model = identity(2, GB10_NATIVE_BF16_PROFILE);
     let index = fixture.declare(model);
     let (_, log) = fixture.maintainer(config(1, &[model]), Vec::new());
-    let mut binder = TestBinder {
+    let binder = TestBinder {
         log,
         unbindable: Vec::new(),
         keeps_every_bind: false,
@@ -325,18 +386,19 @@ fn an_index_is_not_derived_under_another_model() {
         maintain_takes: Duration::ZERO,
     };
     let other = identity(3, GB10_NATIVE_BF16_PROFILE);
-    let derived = fixture
+    fixture
         .storage
         .with_store(|store, signer, runtime| {
-            binder.maintain(&other, store, fixture.source, index, signer, runtime)
+            Ok(runtime.block_on(binder.maintain(&other, store, index, 2, signer))?)
         })
         .unwrap();
-    assert_eq!((derived.derived, derived.missing), (0, 2));
+    assert_eq!(fixture.missing(index), 2);
 }
 
 /// A model that cannot be bound is skipped with a line naming it and its
 /// index; the other model's index is maintained; the bind is tried again
-/// only after the retry interval.
+/// only after the retry interval. With one slot, whichever model's index
+/// comes second waits a pass, so this takes up to two passes.
 #[test]
 fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
     let fixture = Fixture::new(3);
@@ -351,7 +413,8 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
         config(1, &[good_model, bad_model]),
         vec![bad_model.model_root],
     );
-    let lines = maintainer.pass().unwrap().lines;
+    let mut lines = maintainer.pass().unwrap().lines;
+    lines.extend(maintainer.pass().unwrap().lines);
     assert_eq!((fixture.missing(good), fixture.missing(bad)), (0, 3));
     let skip = lines
         .iter()
@@ -364,7 +427,8 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
         "{skip}"
     );
     assert!(log
-        .borrow()
+        .lock()
+        .unwrap()
         .maintained
         .iter()
         .all(|(model, index)| *model == good_model && *index == good.handle()));
@@ -373,7 +437,11 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
     let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(good), fixture.missing(bad)), (0, 4));
     let attempts = |log: &Log| log.binds.iter().filter(|m| **m == bad_model).count();
-    assert_eq!(attempts(&log.borrow()), 1, "retried before the interval");
+    assert_eq!(
+        attempts(&log.lock().unwrap()),
+        1,
+        "retried before the interval"
+    );
     assert!(!lines.iter().any(|line| line.contains("skip model")));
 }
 
@@ -399,20 +467,23 @@ fn an_index_named_after_start_is_maintained_on_the_next_pass() {
         2,
         "a registered-only index was found"
     );
-    assert_eq!(log.borrow().binds, vec![first_model]);
+    assert_eq!(log.lock().unwrap().binds, vec![first_model]);
 
     fixture.name_by_a_record(later);
     let lines = maintainer.pass().unwrap().lines;
     assert_eq!(fixture.missing(later), 0, "{lines:#?}");
-    assert_eq!(log.borrow().binds, vec![first_model, later_model]);
+    assert_eq!(log.lock().unwrap().binds, vec![first_model, later_model]);
     assert!(log
-        .borrow()
+        .lock()
+        .unwrap()
         .maintained
         .contains(&(later_model, later.handle())));
 }
 
 /// With one model bound at a time, two models with work are served in
-/// turn, the bound one first, and the release is said.
+/// turn: a pass binds the one slot once, the other model waits for the next
+/// pass (due at once), and a bound model with work is served before another
+/// is bound. No pass binds twice.
 #[test]
 fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     let fixture = Fixture::new(2);
@@ -424,25 +495,92 @@ fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     fixture.name_by_a_record(second);
     let (mut maintainer, log) =
         fixture.maintainer(config(1, &[first_model, second_model]), Vec::new());
-    let lines = maintainer.pass().unwrap().lines;
-    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
-    assert_eq!(log.borrow().binds, vec![first_model, second_model]);
-    assert_eq!(maintainer.bound(), vec![second_model]);
-    assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("releasing model") && line.contains("2 model(s) have work")),
-        "{lines:#?}"
-    );
-
-    fixture.add_member();
-    maintainer.pass().unwrap().lines;
-    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
+    let binds = |log: &Arc<Mutex<Log>>| log.lock().unwrap().binds.len();
+    // The first pass binds one model; the other waits, due at once.
+    let pass = maintainer.pass().unwrap();
+    assert_eq!(binds(&log), 1, "{:#?}", pass.lines);
+    let served = maintainer.bound()[0];
+    let (served_index, waiting_index) = if served == first_model {
+        (first, second)
+    } else {
+        (second, first)
+    };
     assert_eq!(
-        log.borrow().binds,
-        vec![first_model, second_model, first_model],
-        "the bound model is served before another is bound"
+        (
+            fixture.missing(served_index),
+            fixture.missing(waiting_index)
+        ),
+        (0, 2)
     );
+    assert!(
+        pass.lines
+            .iter()
+            .any(|line| line.contains("waits for the next pass")),
+        "{:#?}",
+        pass.lines
+    );
+    assert!(pass.retry_at.is_some_and(|due| due <= Instant::now()));
+    // The next pass releases the model with nothing left to derive.
+    let pass = maintainer.pass().unwrap();
+    assert_eq!(binds(&log), 2);
+    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
+    assert!(
+        pass.lines
+            .iter()
+            .any(|line| line.contains("releasing model") && line.contains("1 model(s) have work")),
+        "{:#?}",
+        pass.lines
+    );
+    let bound = maintainer.bound()[0];
+    assert_ne!(bound, served);
+
+    // Both have work again: the bound one is served first, the other
+    // waits, and binds in the pass after; one bind per pass.
+    fixture.add_member();
+    maintainer.pass().unwrap();
+    assert_eq!(
+        binds(&log),
+        2,
+        "a pass bound another before serving the bound one"
+    );
+    assert_eq!(maintainer.bound(), vec![bound]);
+    maintainer.pass().unwrap();
+    assert_eq!(binds(&log), 3);
+    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
+    assert_eq!(log.lock().unwrap().binds, vec![served, bound, served]);
+}
+
+/// Two listed models with work in every pass and one slot: each pass binds
+/// at most once, and both are maintained; no pass alternates binds.
+#[test]
+fn two_models_with_work_every_pass_never_alternate_binds_within_a_pass() {
+    let fixture = Fixture::new(1);
+    let first_model = identity(2, GB10_NATIVE_BF16_PROFILE);
+    let second_model = identity(3, GB10_NATIVE_W4A4_PROFILE);
+    let first = fixture.declare(first_model);
+    let second = fixture.declare(second_model);
+    fixture.name_by_a_record(first);
+    fixture.name_by_a_record(second);
+    let (mut maintainer, log) =
+        fixture.maintainer(config(1, &[first_model, second_model]), Vec::new());
+    let mut previous = 0;
+    for _ in 0..4 {
+        fixture.add_member();
+        maintainer.pass().unwrap();
+        let binds = log.lock().unwrap().binds.len();
+        assert!(
+            binds - previous <= 1,
+            "a pass bound {} models",
+            binds - previous
+        );
+        previous = binds;
+    }
+    // A last quiet pass catches up whoever waited.
+    maintainer.pass().unwrap();
+    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
+    let maintained = log.lock().unwrap().maintained.clone();
+    assert!(maintained.contains(&(first_model, first.handle())));
+    assert!(maintained.contains(&(second_model, second.handle())));
 }
 
 /// Of two declared models only the listed one is bound and maintained;
@@ -471,9 +609,10 @@ fn only_a_listed_model_is_bound_and_maintained() {
     let mut lines = maintainer.pass().unwrap().lines;
     fixture.add_member();
     lines.extend(maintainer.pass().unwrap().lines);
-    assert_eq!(log.borrow().binds, vec![kept_model]);
+    assert_eq!(log.lock().unwrap().binds, vec![kept_model]);
     assert!(log
-        .borrow()
+        .lock()
+        .unwrap()
         .maintained
         .iter()
         .all(|(model, index)| *model == kept_model && *index == kept.handle()));
@@ -623,8 +762,7 @@ fn an_unknown_profile_is_refused_before_anything_is_opened() {
 }
 
 /// Discovery reads descriptors only from what is here. An index that a
-/// record names but whose descriptor is not here is passed over, even when
-/// the reader maintenance acquires through holds the descriptor; with the
+/// record names but whose descriptor is not here is passed over; with the
 /// descriptor here it is found, and its backlog read.
 #[test]
 fn discovery_reads_descriptors_only_from_what_is_here() {
@@ -649,27 +787,45 @@ fn discovery_reads_descriptors_only_from_what_is_here() {
     full.insert(record()).unwrap();
     let mut records_only = MemoryRepo::default();
     records_only.insert(record()).unwrap();
-    let config = config(1, &[model]);
+    let logged = Arc::default();
+    let registration = Registration::new(
+        config(1, &[model]),
+        TestBinder {
+            log: Default::default(),
+            unbindable: Vec::new(),
+            keeps_every_bind: false,
+            bind_takes: Duration::ZERO,
+            maintain_takes: Duration::ZERO,
+        },
+        collector(&logged),
+    );
 
-    let here = discover(
-        &full.snapshot().unwrap(),
-        &full.snapshot().unwrap(),
-        &config,
-    )
-    .unwrap();
-    assert_eq!(here.len(), 1);
-    assert_eq!(here[0].0.index, target.handle());
-    assert!(matches!(here[0].1, Some(Ok(0))), "{:?}", here[0].1);
-
-    let absent = discover(
-        &records_only.snapshot().unwrap(),
-        &full.snapshot().unwrap(),
-        &config,
-    )
-    .unwrap();
+    let here = full.snapshot().unwrap();
+    assert_eq!(
+        registered_targets(&here, &registration).unwrap(),
+        vec![(target.handle(), WEMM_CONTENT_WINDOWS_TO_NVFP4)]
+    );
+    registration.begin_pass(&here);
+    assert_eq!(
+        registration
+            .pending(&here, target.handle(), WEMM_CONTENT_WINDOWS_TO_NVFP4)
+            .unwrap(),
+        0
+    );
+    let lines = std::mem::take(&mut *logged.lock().unwrap());
     assert!(
-        absent.is_empty(),
-        "a descriptor not here was read: {absent:?}"
+        lines
+            .iter()
+            .any(|line| line.contains("is listed; maintaining")),
+        "{lines:#?}"
+    );
+
+    let absent = records_only.snapshot().unwrap();
+    assert!(
+        registered_targets(&absent, &registration)
+            .unwrap()
+            .is_empty(),
+        "a descriptor not here was read"
     );
 }
 
@@ -700,10 +856,10 @@ fn a_failed_bind_names_its_retry_and_is_retried_then_without_growth() {
     assert!(due > before && due <= Instant::now() + retry, "{due:?}");
     let early = maintainer.pass().unwrap();
     assert_eq!(early.retry_at, Some(due));
-    assert_eq!(attempts(&log.borrow()), 1);
+    assert_eq!(attempts(&log.lock().unwrap()), 1);
     std::thread::sleep(due.saturating_duration_since(Instant::now()));
     let retried = maintainer.pass().unwrap();
-    assert_eq!(attempts(&log.borrow()), 2);
+    assert_eq!(attempts(&log.lock().unwrap()), 2);
     assert!(retried.retry_at.is_some_and(|next| next > due));
     assert_eq!(fixture.missing(bad), 2);
 }
@@ -720,7 +876,7 @@ fn an_aliasing_binder_binds_one_model_per_process() {
     let second = fixture.declare(second_model);
     fixture.name_by_a_record(first);
     fixture.name_by_a_record(second);
-    let log = Rc::new(RefCell::new(Log::default()));
+    let log = Arc::new(Mutex::new(Log::default()));
     let binder = TestBinder {
         log: log.clone(),
         unbindable: Vec::new(),
@@ -728,15 +884,23 @@ fn an_aliasing_binder_binds_one_model_per_process() {
         bind_takes: Duration::ZERO,
         maintain_takes: Duration::ZERO,
     };
-    let mut maintainer = Maintainer::new(
+    let mut maintainer = Daemon::new(
         fixture.storage.clone(),
         binder,
         config(1, &[first_model, second_model]),
     );
     let lines = maintainer.pass().unwrap().lines;
-    assert_eq!(log.borrow().binds, vec![first_model]);
-    assert_eq!(maintainer.bound(), vec![first_model]);
-    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 2));
+    // Whichever index is maintained first binds its model; the other model
+    // is refused.
+    let bound = log.lock().unwrap().binds.clone();
+    assert_eq!(bound.len(), 1, "{lines:#?}");
+    assert_eq!(maintainer.bound(), bound);
+    let (served, refused) = if bound[0] == first_model {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!((fixture.missing(served), fixture.missing(refused)), (0, 2));
     assert!(
         lines
             .iter()
@@ -767,7 +931,7 @@ fn several_models_need_device_copies_and_say_what_is_unverified() {
 }
 
 fn slow_binder(
-    log: &Rc<RefCell<Log>>,
+    log: &Arc<Mutex<Log>>,
     unbindable: Vec<Id>,
     bind_takes: Duration,
     maintain_takes: Duration,
@@ -791,8 +955,8 @@ fn a_bind_that_fails_slower_than_the_retry_interval_is_still_retried() {
     let bad = fixture.declare(bad_model);
     fixture.name_by_a_record(bad);
     let retry = Duration::from_secs(1);
-    let log = Rc::new(RefCell::new(Log::default()));
-    let mut maintainer = Maintainer::new(
+    let log = Arc::new(Mutex::new(Log::default()));
+    let mut maintainer = Daemon::new(
         fixture.storage.clone(),
         slow_binder(
             &log,
@@ -814,12 +978,13 @@ fn a_bind_that_fails_slower_than_the_retry_interval_is_still_retried() {
     );
     std::thread::sleep(due.saturating_duration_since(Instant::now()));
     maintainer.pass().unwrap();
-    assert_eq!(log.borrow().binds.len(), 2);
+    assert_eq!(log.lock().unwrap().binds.len(), 2);
 }
 
-/// A failed model whose next attempt came due while a later model was
-/// being maintained is still named: the pass returns that moment although
-/// it has passed, so the daemon runs the next pass at once.
+/// A failed model whose next attempt has come due (here while another
+/// model was maintained, or after the pass) is still named: the
+/// registration returns that moment although it has passed, so the daemon
+/// runs the next pass at once.
 #[test]
 fn a_retry_that_came_due_during_the_pass_is_still_named() {
     let fixture = Fixture::new(2);
@@ -829,8 +994,8 @@ fn a_retry_that_came_due_during_the_pass_is_still_named() {
     let slow = fixture.declare(slow_model);
     fixture.name_by_a_record(bad);
     fixture.name_by_a_record(slow);
-    let log = Rc::new(RefCell::new(Log::default()));
-    let mut maintainer = Maintainer::new(
+    let log = Arc::new(Mutex::new(Log::default()));
+    let mut maintainer = Daemon::new(
         fixture.storage.clone(),
         slow_binder(
             &log,
@@ -845,11 +1010,20 @@ fn a_retry_that_came_due_during_the_pass_is_still_named() {
     );
     let pass = maintainer.pass().unwrap();
     assert_eq!(fixture.missing(slow), 0);
-    let due = pass.retry_at.expect("the pending retry was dropped");
+    let first = pass.retry_at.expect("the pending retry was dropped");
+    // Once its moment has passed, the retry is still named (the daemon then
+    // passes at once), not dropped.
+    std::thread::sleep(first.saturating_duration_since(Instant::now()));
+    let due = maintainer
+        .upkeep
+        .other()
+        .due()
+        .expect("the pending retry was dropped");
     assert!(due <= Instant::now(), "{due:?}");
     maintainer.pass().unwrap();
     assert_eq!(
-        log.borrow()
+        log.lock()
+            .unwrap()
             .binds
             .iter()
             .filter(|m| **m == bad_model)
@@ -880,7 +1054,11 @@ fn a_zero_retry_interval_does_not_retry_faster_than_the_floor() {
     for _ in 0..5 {
         maintainer.pass().unwrap();
     }
-    assert_eq!(log.borrow().binds.len(), 1, "retried faster than the floor");
+    assert_eq!(
+        log.lock().unwrap().binds.len(),
+        1,
+        "retried faster than the floor"
+    );
     let due = first.retry_at.expect("a failed bind is due again");
     assert!(
         due + Duration::from_millis(100) >= failed + Duration::from_secs(1),
@@ -905,5 +1083,64 @@ fn the_daemon_floors_the_retry_interval_at_its_poll() {
     assert_eq!(
         long.floor_retry(Duration::from_secs(60)).retry,
         Duration::from_secs(3600)
+    );
+}
+
+/// The registration through the generic seam alone, as a Driver calls it:
+/// it finds a WeMM index the records name, says its backlog, and maintains
+/// it with the model its descriptor names (bound once, through the stand-in).
+#[test]
+fn the_registration_finds_and_maintains_a_wemm_index_through_the_seam() {
+    let fixture = Fixture::new(3);
+    let model = identity(2, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let index = fixture.declare(model);
+    fixture.name_by_a_record(index);
+    let log: Arc<Mutex<Log>> = Default::default();
+    let logged = Arc::default();
+    let registration = Registration::new(
+        config(1, &[model]),
+        TestBinder {
+            log: log.clone(),
+            unbindable: Vec::new(),
+            keeps_every_bind: false,
+            bind_takes: Duration::ZERO,
+            maintain_takes: Duration::ZERO,
+        },
+        collector(&logged),
+    );
+    fixture
+        .storage
+        .with_store(|store, signer, runtime| {
+            let snapshot = store.snapshot()?;
+            assert!(registration.runs(WEMM_CONTENT_WINDOWS_TO_NVFP4));
+            registration.begin_pass(&snapshot);
+            let targets = registered_targets(&snapshot, &registration)?;
+            assert_eq!(
+                targets,
+                vec![(index.handle(), WEMM_CONTENT_WINDOWS_TO_NVFP4)]
+            );
+            assert_eq!(
+                registration.pending(&snapshot, index.handle(), WEMM_CONTENT_WINDOWS_TO_NVFP4)?,
+                3
+            );
+            let after = runtime.block_on(registration.maintain(
+                store,
+                &snapshot,
+                index.handle(),
+                WEMM_CONTENT_WINDOWS_TO_NVFP4,
+                signer,
+            ))?;
+            assert_eq!(underived(&after, fixture.source, index)?, 0);
+            assert_eq!(registration.due(), None);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(log.lock().unwrap().binds, vec![model]);
+    let lines = std::mem::take(&mut *logged.lock().unwrap());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("derived 3 foundation(s)")),
+        "{lines:#?}"
     );
 }

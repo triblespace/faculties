@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- WeMM maintenance is one registration, `faculties::wemm::declared::Registration`
+  (the core `Mappings` seam), which both `faculties maintain --declared` and
+  an application's maintenance Driver run
+  (`driver.with_registered(Registration::from_env(&pile, sink)?)`). It does
+  what the declared mode did: finds the WeMM indexes the records name
+  (`declared_indexes`), binds a listed model on demand and keeps it bound,
+  releases one at `WEMM_MAINTAIN_MAX_BOUND`, retries a failed bind after
+  `WEMM_MAINTAIN_BIND_RETRY_SECS` (with the floor), keeps the aliased-weights
+  rule and copy admission, and logs the same lines, to a sink given at
+  construction. New: when every slot holds a model with work, another
+  model's index waits for the next pass (due at once) instead of releasing
+  one, so a pass binds each slot at most once and the bound models are
+  served first. The daemon's pass is `faculties::maintenance::Upkeep`, one
+  loop over the attached mappings and that registration; `Maintainer` and
+  `AttachedUpkeep` are gone. The describe line says that another maintainer
+  on the host listing the same model binds it too; nothing coordinates them.
+  `Session` holds its runtime in an `Arc<Mutex<..>>`, is `Send + Sync`, and
+  the single-model mode derives through the same `Session::maintain_in`.
+
 - `archive search` keeps what it builds. It reads the BM25 cover plus images
   of the Archive commits the index does not reach, mapped in the searching
   process up to 16 MiB of source nodes (at least one), and
@@ -20,7 +39,7 @@ All notable changes to this project will be documented in this file.
   environment. The WeMM half is unchanged.
   `faculties::maintenance::mappings()` is the registration an application
   chains onto the generic maintenance Driver
-  (`driver.with_attached(faculties::maintenance::mappings())`).
+  (`driver.with_registered(faculties::maintenance::mappings())`).
 
 - `faculties maintain --declared` maintains every WeMM index the pile's
   records name whose descriptor names a model of `WEMM_MAINTAIN_MODELS`

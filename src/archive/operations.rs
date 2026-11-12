@@ -2900,8 +2900,18 @@ mod tests {
             "one.jsonl",
             r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
         );
-        let mut upkeep = crate::maintenance::AttachedUpkeep::new();
-        assert!(upkeep.pass(storage(&fixture).storage).unwrap().is_empty());
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let collected = collected.clone();
+            std::sync::Arc::new(move |line: &str| collected.lock().unwrap().push(line.to_owned()))
+        };
+        let mut upkeep = crate::maintenance::Upkeep::new((), sink);
+        // A pass, and the lines it logged.
+        let pass = |upkeep: &mut crate::maintenance::Upkeep| {
+            upkeep.pass(storage(&fixture).storage).unwrap();
+            std::mem::take(&mut *collected.lock().unwrap())
+        };
+        assert!(pass(&mut upkeep).is_empty());
         assert_eq!(observe(), (false, 3), "nothing names the index yet");
 
         // budget 0: one commit indexed and kept, which declares the index.
@@ -2910,7 +2920,7 @@ mod tests {
         assert_eq!(lag.index, 2);
         assert_eq!(observe(), (true, 2));
 
-        let lines = upkeep.pass(storage(&fixture).storage).unwrap();
+        let lines = pass(&mut upkeep);
         assert!(
             lines.iter().any(|line| line.contains("attached in")),
             "{lines:?}"
@@ -2923,7 +2933,7 @@ mod tests {
         );
         let (named, lagging) = observe();
         assert!(named && lagging > 0, "{lagging}");
-        let lines = upkeep.pass(storage(&fixture).storage).unwrap();
+        let lines = pass(&mut upkeep);
         assert!(
             lines.iter().any(|line| line.contains("attached in")),
             "{lines:?}"
@@ -2943,7 +2953,7 @@ mod tests {
         );
         drop(index);
         // Nothing new: the pass maintains nothing.
-        assert!(upkeep.pass(storage(&fixture).storage).unwrap().is_empty());
+        assert!(pass(&mut upkeep).is_empty());
     }
 
     /// A search maps at most its budget of the commits the index does not
