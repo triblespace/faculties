@@ -183,15 +183,21 @@ fn a_jp_seen_after_the_raise_acks_and_the_same_line_before_it_does_not() {
 
 #[test]
 fn a_seen_from_someone_else_or_from_the_bot_does_not_ack() {
+    // JP is known to the pile (an earlier, unrelated line of his), so his
+    // user anchor exists and only the author constraint keeps the other
+    // person's "seen" from counting.
     assert_eq!(
         detect_in(
-            vec![message(
-                "100000000000000606",
-                SOMEONE,
-                "seen",
-                T0 + MINUTE,
-                None
-            )],
+            vec![
+                message(
+                    "100000000000000612",
+                    JP,
+                    "good night",
+                    T0 - 60 * MINUTE,
+                    None
+                ),
+                message("100000000000000606", SOMEONE, "seen", T0 + MINUTE, None),
+            ],
             JP
         ),
         None
