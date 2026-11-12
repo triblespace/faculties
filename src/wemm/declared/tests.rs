@@ -930,6 +930,45 @@ fn several_models_need_device_copies_and_say_what_is_unverified() {
     assert!(note.contains("NOT verified"), "{note}");
 }
 
+/// The one constructor refuses what the binder cannot run (several
+/// models with aliased weights) before anything is bound, and otherwise
+/// logs what it will maintain and the check's note.
+#[test]
+fn the_checked_constructor_refuses_what_the_binder_cannot_run() {
+    let several = config(
+        1,
+        &[
+            identity(2, GB10_NATIVE_BF16_PROFILE),
+            identity(3, GB10_NATIVE_W4A4_PROFILE),
+        ],
+    );
+    let binder = |keeps_every_bind| TestBinder {
+        log: Default::default(),
+        unbindable: Vec::new(),
+        keeps_every_bind,
+        bind_takes: Duration::ZERO,
+        maintain_takes: Duration::ZERO,
+    };
+    let logged = Arc::default();
+    let error = match Registration::checked(several.clone(), binder(true), collector(&logged)) {
+        Ok(_) => panic!("aliased weights for several models were accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("WEMM_COPY_WEIGHTS=1"), "{error}");
+    assert!(logged.lock().unwrap().is_empty());
+    let registration = Registration::checked(several, binder(false), collector(&logged)).unwrap();
+    assert!(registration.bound().is_empty());
+    let lines = std::mem::take(&mut *logged.lock().unwrap());
+    assert!(
+        lines[0].starts_with("maintain: every WeMM index"),
+        "{lines:#?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("NOT verified")),
+        "{lines:#?}"
+    );
+}
+
 fn slow_binder(
     log: &Arc<Mutex<Log>>,
     unbindable: Vec<Id>,

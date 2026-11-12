@@ -456,20 +456,34 @@ pub struct Registration<B: Binder = SessionBinder> {
 }
 
 impl Registration<SessionBinder> {
-    /// The registration `faculties maintain --declared` runs: the models
-    /// and limits of the environment ([`Config::from_env`]), bound from the
-    /// pile at `pile` as the environment says ([`SessionBinder::from_env`]).
+    /// The registration of the environment: its models and limits
+    /// ([`Config::from_env`]; a configuration that lists no model, neither
+    /// in [`MODELS_ENV`] nor through `WEMM_ROOT`, or an empty list, is
+    /// refused, so a caller with WeMM disabled leaves this registration out),
+    /// bound from
+    /// the pile at `pile` as the environment says
+    /// ([`SessionBinder::from_env`]), through [`Registration::checked`].
     pub fn from_env(pile: &std::path::Path, sink: Sink) -> Result<Self> {
-        Ok(Self::new(
-            Config::from_env()?,
-            SessionBinder::from_env(pile)?,
-            sink,
-        ))
+        Self::checked(Config::from_env()?, SessionBinder::from_env(pile)?, sink)
     }
 }
 
 impl<B: Binder> Registration<B> {
-    pub fn new(config: Config, binder: B, sink: Sink) -> Self {
+    /// The one way to make a registration: refuses a configuration `binder`
+    /// cannot run ([`Config::check_residence`]: several models with weights
+    /// aliased from the pile), then logs what it will maintain
+    /// ([`Config::describe`]) and any note the check made. What
+    /// [`Self::from_env`] and `faculties maintain --declared` both call.
+    pub fn checked(config: Config, binder: B, sink: Sink) -> Result<Self> {
+        let note = config.check_residence(binder.keeps_every_bind())?;
+        sink(&config.describe());
+        if let Some(note) = note {
+            sink(&note);
+        }
+        Ok(Self::new(config, binder, sink))
+    }
+
+    fn new(config: Config, binder: B, sink: Sink) -> Self {
         Self {
             config,
             sink,

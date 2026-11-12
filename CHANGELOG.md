@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `wemm::declared::Registration::checked(config, binder, sink)` is the one
+  constructor: it refuses a configuration the binder cannot run (several
+  models with weights aliased from the pile, `Config::check_residence`) and
+  logs what it will maintain. `Registration::from_env` and
+  `faculties maintain --declared` both go through it, so an application gets
+  the same early refusal as the daemon; `from_env` refuses a configuration
+  that lists no model (leave the registration out when WeMM is disabled).
+
 - WeMM maintenance is one registration, `faculties::wemm::declared::Registration`
   (the core `Mappings` seam), which both `faculties maintain --declared` and
   an application's maintenance Driver run
