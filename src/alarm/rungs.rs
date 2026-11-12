@@ -80,6 +80,8 @@ pub trait RungRunner {
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::discord::AllowedMentions;
+
 use crate::schemas::alarm::{
     RUNG_COLONY, RUNG_DISCORD_MENTION, RUNG_DISCORD_VOICE, RUNG_FINAL_COLONY, RUNG_FINAL_DISCORD,
     RUNG_HUE_ALERT, RUNG_MAC_NOTIFY, RUNG_MAC_SOUND, RUNG_REACHY_SHOUT,
@@ -125,8 +127,14 @@ pub trait Transport {
     /// Send literal text from `from` (a Relations person) to a Relations
     /// person or group.
     fn message(&mut self, from: Id, to: &str, text: &str) -> Result<()>;
-    /// Post literal text in a Discord channel; the posted message's snowflake.
-    fn discord_send(&mut self, channel: &str, text: &str) -> Result<String>;
+    /// Post literal text in a Discord channel, pinging only what `mentions`
+    /// allows; the posted message's snowflake.
+    fn discord_send(
+        &mut self,
+        channel: &str,
+        text: &str,
+        mentions: &crate::discord::AllowedMentions,
+    ) -> Result<String>;
     /// Whether this host can open the Discord credential.
     fn discord_ready(&mut self) -> Result<()>;
     /// Publish a say request for a voice channel; its id.
@@ -395,7 +403,10 @@ impl<T: Transport> Executor<T> {
                 }
             }
             rung if rung == RUNG_DISCORD_MENTION => {
-                let (channel, text) = if subject.test {
+                // Every line says whom it may ping: a test nobody, a real
+                // alarm JP alone, so an @everyone or a quoted <@someone> in
+                // what or decays stays text.
+                let (channel, text, mentions) = if subject.test {
                     (
                         Self::configured(
                             &self.settings.test_channel,
@@ -403,6 +414,7 @@ impl<T: Transport> Executor<T> {
                         )?
                         .to_owned(),
                         test_line(subject),
+                        AllowedMentions::nobody(),
                     )
                 } else {
                     let jp = self.jp()?.to_owned();
@@ -414,19 +426,21 @@ impl<T: Transport> Executor<T> {
                     } else {
                         re_mention_line(subject, &jp, due.at / super::MINUTE)
                     };
-                    (channel, text)
+                    (channel, text, AllowedMentions::only([jp]))
                 };
-                result.discord_message_id = Some(self.transport.discord_send(&channel, &text)?);
+                result.discord_message_id =
+                    Some(self.transport.discord_send(&channel, &text, &mentions)?);
             }
             rung if rung == RUNG_FINAL_DISCORD => {
                 let jp = self.jp()?.to_owned();
                 let channel =
                     Self::configured(&self.settings.discord_channel, "ALARM_DISCORD_CHANNEL")?
                         .to_owned();
-                result.discord_message_id = Some(
-                    self.transport
-                        .discord_send(&channel, &final_line(subject, &jp))?,
-                );
+                result.discord_message_id = Some(self.transport.discord_send(
+                    &channel,
+                    &final_line(subject, &jp),
+                    &AllowedMentions::only([jp.clone()]),
+                )?);
             }
             rung if rung == RUNG_FINAL_COLONY => {
                 let group =
@@ -579,9 +593,14 @@ impl Transport for Live {
             .map(drop)
     }
 
-    fn discord_send(&mut self, channel: &str, text: &str) -> Result<String> {
+    fn discord_send(
+        &mut self,
+        channel: &str,
+        text: &str,
+        mentions: &crate::discord::AllowedMentions,
+    ) -> Result<String> {
         crate::discord::Discord::with_storage(self.storage.clone())
-            .send(channel, text)
+            .send_mentioning(channel, text, mentions)
             .map(|receipt| receipt.message_id)
     }
 

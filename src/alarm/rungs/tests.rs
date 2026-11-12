@@ -14,6 +14,8 @@ const JP: &str = "100000000000000777";
 #[derive(Default)]
 pub(crate) struct FakeTransport {
     pub calls: Vec<String>,
+    /// The request body each Discord send would carry.
+    pub bodies: Vec<serde_json::Value>,
     pub fail: Vec<&'static str>,
     pub volume: String,
     pub next_snowflake: u64,
@@ -39,7 +41,14 @@ impl Transport for FakeTransport {
         self.record(format!("message from {from:x} to {to}: {text}"))
     }
 
-    fn discord_send(&mut self, channel: &str, text: &str) -> Result<String> {
+    fn discord_send(
+        &mut self,
+        channel: &str,
+        text: &str,
+        mentions: &crate::discord::AllowedMentions,
+    ) -> Result<String> {
+        self.bodies
+            .push(crate::discord::message_body(text, Some(mentions)));
         self.record(format!("discord {channel}: {text}"))?;
         self.next_snowflake += 1;
         Ok((100_000_000_000_000_900 + self.next_snowflake).to_string())
@@ -437,4 +446,60 @@ fn a_program_rung_past_its_deadline_is_killed_with_its_whole_group() {
     let took = started.elapsed();
     assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
     assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+}
+
+#[test]
+fn every_alarm_discord_line_says_exactly_whom_it_may_ping() {
+    let quoted = "check <@100000000000000123> and @everyone";
+    let mut test = subject(true);
+    test.what = quoted.to_owned();
+    test.decays = "<@&100000000000000124> @here".to_owned();
+    let mut runner = executor(FakeTransport::default(), settings());
+    runner.run(
+        &test,
+        Due {
+            rung: RUNG_DISCORD_MENTION,
+            at: 0,
+        },
+    );
+    let body = &runner.transport.bodies[0];
+    assert!(body["content"].as_str().unwrap().contains(quoted), "{body}");
+    assert_eq!(
+        body["allowed_mentions"],
+        serde_json::json!({"parse": [], "users": []}),
+        "a test pings nobody, whatever its text says"
+    );
+
+    let mut real = subject(false);
+    real.what = quoted.to_owned();
+    let mut runner = executor(FakeTransport::default(), settings());
+    runner.run(
+        &real,
+        Due {
+            rung: RUNG_DISCORD_MENTION,
+            at: 0,
+        },
+    );
+    runner.run(
+        &real,
+        Due {
+            rung: RUNG_DISCORD_MENTION,
+            at: 3 * MINUTE,
+        },
+    );
+    runner.run(
+        &real,
+        Due {
+            rung: RUNG_FINAL_DISCORD,
+            at: 60 * MINUTE,
+        },
+    );
+    assert_eq!(runner.transport.bodies.len(), 3);
+    for body in &runner.transport.bodies {
+        assert_eq!(
+            body["allowed_mentions"],
+            serde_json::json!({"parse": [], "users": [JP]}),
+            "a real alarm pings JP alone: {body}"
+        );
+    }
 }

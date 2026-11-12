@@ -462,6 +462,25 @@ impl Discord {
     pub fn send(&self, channel_id: &str, text: &str) -> Result<SendReceipt> {
         self.send_attachments(channel_id, text, &[])
     }
+    /// [`Self::send`] with an explicit mention policy: only what `mentions`
+    /// allows can ping, whatever the text contains. Additive: `send` keeps
+    /// Discord's default.
+    pub fn send_mentioning(
+        &self,
+        channel_id: &str,
+        text: &str,
+        mentions: &AllowedMentions,
+    ) -> Result<SendReceipt> {
+        mentions.validate()?;
+        self.send_using(
+            channel_id,
+            text,
+            &[],
+            |token, channel, text, attachments| {
+                post_message_with(token, channel, text, attachments, Some(mentions))
+            },
+        )
+    }
     /// Send text and/or files through the same authentication and observation path.
     /// Never retry automatically: an uncertain response or failed retention can
     /// follow a successful external send.
@@ -1102,6 +1121,51 @@ pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<
     post_message_attachments(token, channel_id, text, &[])
 }
 
+/// Which mentions in a message Discord may turn into pings: its
+/// `allowed_mentions`, with no mention type parsed from the text (`parse`
+/// empty: no @everyone, @here, role or user mention by syntax alone) and only
+/// the listed users pinged. A send without one keeps Discord's default, which
+/// pings every mention the text contains.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllowedMentions {
+    /// User snowflakes that may be pinged.
+    pub users: Vec<String>,
+}
+
+impl AllowedMentions {
+    /// Nobody is pinged, whatever the text says.
+    pub fn nobody() -> Self {
+        Self::default()
+    }
+
+    /// Only these users are pinged, and only where the text mentions them.
+    pub fn only(users: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            users: users.into_iter().collect(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for user in &self.users {
+            discord_model::validate_snowflake(user).context("an allowed mention")?;
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> JsonValue {
+        json!({ "parse": [], "users": self.users })
+    }
+}
+
+/// The JSON body of a text-only send, with its mention policy when given.
+pub fn message_body(text: &str, mentions: Option<&AllowedMentions>) -> JsonValue {
+    let mut body = json!({ "content": text });
+    if let Some(mentions) = mentions {
+        body["allowed_mentions"] = mentions.to_json();
+    }
+    body
+}
+
 fn message_request(
     client: &Client,
     url: &str,
@@ -1109,13 +1173,14 @@ fn message_request(
     channel_id: &str,
     text: &str,
     attachments: &[SendAttachment],
+    mentions: Option<&AllowedMentions>,
 ) -> Result<reqwest::blocking::RequestBuilder> {
     validate_send(channel_id, text, attachments)?;
     let request = client
         .post(url)
         .header("Authorization", authorization(token)?);
     if attachments.is_empty() {
-        return Ok(request.json(&json!({ "content": text })));
+        return Ok(request.json(&message_body(text, mentions)));
     }
     // https://docs.discord.com/developers/reference#uploading-files
     // Each attachment id names its matching files[n] multipart part.
@@ -1127,6 +1192,9 @@ fn message_request(
     let mut payload = json!({"attachments": metadata});
     if !text.is_empty() {
         payload["content"] = json!(text);
+    }
+    if let Some(mentions) = mentions {
+        payload["allowed_mentions"] = mentions.to_json();
     }
     let mut form = reqwest::blocking::multipart::Form::new().part(
         "payload_json",
@@ -1151,15 +1219,31 @@ fn post_message_attachments(
     text: &str,
     attachments: &[SendAttachment],
 ) -> Result<JsonValue> {
+    post_message_with(token, channel_id, text, attachments, None)
+}
+
+fn post_message_with(
+    token: &str,
+    channel_id: &str,
+    text: &str,
+    attachments: &[SendAttachment],
+    mentions: Option<&AllowedMentions>,
+) -> Result<JsonValue> {
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
-    let response = message_request(&client, &url, token, channel_id, text, attachments)?
-        .send()
-        .with_context(|| {
-            format!(
-                "Discord send outcome unknown in channel {channel_id}; do not resend automatically"
-            )
-        })?;
+    let response = message_request(
+        &client,
+        &url,
+        token,
+        channel_id,
+        text,
+        attachments,
+        mentions,
+    )?
+    .send()
+    .with_context(|| {
+        format!("Discord send outcome unknown in channel {channel_id}; do not resend automatically")
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         bail!("discord send failed ({status}) in channel {channel_id}; do not retry automatically");
@@ -3146,10 +3230,63 @@ mod tests {
     }
 
     #[test]
+    fn a_send_with_a_mention_policy_carries_it_and_one_without_keeps_the_default() {
+        let client = build_client().unwrap();
+        let url = "https://discord.invalid/channels/1/messages";
+        let body = |mentions: Option<&AllowedMentions>| -> JsonValue {
+            let mut request = message_request(
+                &client,
+                url,
+                "fixture",
+                "1",
+                "<@2> @everyone",
+                &[],
+                mentions,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            serde_json::from_slice(request.body_mut().as_mut().unwrap().buffer().unwrap()).unwrap()
+        };
+        assert_eq!(body(None), json!({"content": "<@2> @everyone"}));
+        assert_eq!(
+            body(Some(&AllowedMentions::nobody())),
+            json!({"content": "<@2> @everyone", "allowed_mentions": {"parse": [], "users": []}})
+        );
+        assert_eq!(
+            body(Some(&AllowedMentions::only(["3".to_owned()])))["allowed_mentions"],
+            json!({"parse": [], "users": ["3"]})
+        );
+        let attachments = [upload("a.bin", b"x")];
+        let mut request = message_request(
+            &client,
+            url,
+            "fixture",
+            "1",
+            "@everyone",
+            &attachments,
+            Some(&AllowedMentions::nobody()),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let rendered =
+            String::from_utf8_lossy(request.body_mut().as_mut().unwrap().buffer().unwrap())
+                .into_owned();
+        assert!(
+            rendered.contains(r#""allowed_mentions":{"parse":[],"users":[]}"#),
+            "{rendered}"
+        );
+        assert!(AllowedMentions::only(["not a snowflake".to_owned()])
+            .validate()
+            .is_err());
+    }
+
+    #[test]
     fn send_requests_preserve_text_and_frame_indexed_binary_parts() {
         let client = build_client().unwrap();
         let url = "https://discord.invalid/channels/1/messages";
-        let mut text = message_request(&client, url, "fixture", "1", "@-", &[])
+        let mut text = message_request(&client, url, "fixture", "1", "@-", &[], None)
             .unwrap()
             .build()
             .unwrap();
@@ -3165,10 +3302,11 @@ mod tests {
             upload("same.bin", b"second"),
         ];
         for content in ["", "literal @-"] {
-            let mut request = message_request(&client, url, "fixture", "1", content, &attachments)
-                .unwrap()
-                .build()
-                .unwrap();
+            let mut request =
+                message_request(&client, url, "fixture", "1", content, &attachments, None)
+                    .unwrap()
+                    .build()
+                    .unwrap();
             let content_type = request.headers()["content-type"]
                 .to_str()
                 .unwrap()
