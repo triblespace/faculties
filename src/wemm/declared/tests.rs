@@ -67,6 +67,10 @@ struct TestBinder {
     log: Rc<RefCell<Log>>,
     unbindable: Vec<Id>,
     keeps_every_bind: bool,
+    /// How long a bind takes before it answers.
+    bind_takes: Duration,
+    /// How long maintaining one index takes.
+    maintain_takes: Duration,
 }
 
 impl Binder for TestBinder {
@@ -74,6 +78,7 @@ impl Binder for TestBinder {
 
     fn bind(&mut self, identity: WemmIdentity) -> Result<WemmIdentity> {
         self.log.borrow_mut().binds.push(identity);
+        std::thread::sleep(self.bind_takes);
         anyhow::ensure!(
             !self.unbindable.contains(&identity.model_root),
             "WEMM_ROOT {:X} is not stated by the model collection",
@@ -100,6 +105,7 @@ impl Binder for TestBinder {
             source,
             target,
         )?;
+        std::thread::sleep(self.maintain_takes);
         BOUND.set(Some(*model));
         let maintained = runtime.block_on(store.maintain_with::<StandIn>(target, signer));
         BOUND.set(None);
@@ -228,6 +234,8 @@ impl Fixture {
             log: log.clone(),
             unbindable,
             keeps_every_bind: false,
+            bind_takes: Duration::ZERO,
+            maintain_takes: Duration::ZERO,
         };
         (Maintainer::new(self.storage.clone(), binder, config), log)
     }
@@ -313,6 +321,8 @@ fn an_index_is_not_derived_under_another_model() {
         log,
         unbindable: Vec::new(),
         keeps_every_bind: false,
+        bind_takes: Duration::ZERO,
+        maintain_takes: Duration::ZERO,
     };
     let other = identity(3, GB10_NATIVE_BF16_PROFILE);
     let derived = fixture
@@ -365,19 +375,6 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
     let attempts = |log: &Log| log.binds.iter().filter(|m| **m == bad_model).count();
     assert_eq!(attempts(&log.borrow()), 1, "retried before the interval");
     assert!(!lines.iter().any(|line| line.contains("skip model")));
-
-    // With no interval it is tried on every pass, and still never replaced.
-    let (mut eager, log) = fixture.maintainer(
-        Config {
-            retry: Duration::ZERO,
-            ..config(1, &[good_model, bad_model])
-        },
-        vec![bad_model.model_root],
-    );
-    eager.pass().unwrap().lines;
-    eager.pass().unwrap().lines;
-    assert_eq!(attempts(&log.borrow()), 2);
-    assert_eq!(fixture.missing(bad), 4);
 }
 
 /// An index only registered is not found, so it is not maintained; once a
@@ -685,7 +682,7 @@ fn a_failed_bind_names_its_retry_and_is_retried_then_without_growth() {
     let bad_model = identity(9, GB10_NATIVE_W4A4_VW4A16_PROFILE);
     let bad = fixture.declare(bad_model);
     fixture.name_by_a_record(bad);
-    let retry = Duration::from_millis(200);
+    let retry = Duration::from_secs(1);
     let (mut maintainer, log) = fixture.maintainer(
         Config {
             retry,
@@ -728,6 +725,8 @@ fn an_aliasing_binder_binds_one_model_per_process() {
         log: log.clone(),
         unbindable: Vec::new(),
         keeps_every_bind: true,
+        bind_takes: Duration::ZERO,
+        maintain_takes: Duration::ZERO,
     };
     let mut maintainer = Maintainer::new(
         fixture.storage.clone(),
@@ -765,4 +764,146 @@ fn several_models_need_device_copies_and_say_what_is_unverified() {
     assert!(error.contains("WEMM_COPY_WEIGHTS=1"), "{error}");
     let note = several.check_residence(false).unwrap().unwrap();
     assert!(note.contains("NOT verified"), "{note}");
+}
+
+fn slow_binder(
+    log: &Rc<RefCell<Log>>,
+    unbindable: Vec<Id>,
+    bind_takes: Duration,
+    maintain_takes: Duration,
+) -> TestBinder {
+    TestBinder {
+        log: log.clone(),
+        unbindable,
+        keeps_every_bind: false,
+        bind_takes,
+        maintain_takes,
+    }
+}
+
+/// A bind that fails after taking longer than the retry interval is still
+/// due again: the interval counts from when the attempt ended, so the pass
+/// names a moment after it, and the attempt then happens on a quiet pile.
+#[test]
+fn a_bind_that_fails_slower_than_the_retry_interval_is_still_retried() {
+    let fixture = Fixture::new(2);
+    let bad_model = identity(9, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let bad = fixture.declare(bad_model);
+    fixture.name_by_a_record(bad);
+    let retry = Duration::from_secs(1);
+    let log = Rc::new(RefCell::new(Log::default()));
+    let mut maintainer = Maintainer::new(
+        fixture.storage.clone(),
+        slow_binder(
+            &log,
+            vec![bad_model.model_root],
+            Duration::from_millis(1300),
+            Duration::ZERO,
+        ),
+        Config {
+            retry,
+            ..config(1, &[bad_model])
+        },
+    );
+    let pass = maintainer.pass().unwrap();
+    let ended = Instant::now();
+    let due = pass.retry_at.expect("the failed bind has no next attempt");
+    assert!(
+        due + Duration::from_millis(100) >= ended + retry,
+        "{due:?} {ended:?}"
+    );
+    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    maintainer.pass().unwrap();
+    assert_eq!(log.borrow().binds.len(), 2);
+}
+
+/// A failed model whose next attempt came due while a later model was
+/// being maintained is still named: the pass returns that moment although
+/// it has passed, so the daemon runs the next pass at once.
+#[test]
+fn a_retry_that_came_due_during_the_pass_is_still_named() {
+    let fixture = Fixture::new(2);
+    let bad_model = identity(1, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let slow_model = identity(2, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let bad = fixture.declare(bad_model);
+    let slow = fixture.declare(slow_model);
+    fixture.name_by_a_record(bad);
+    fixture.name_by_a_record(slow);
+    let log = Rc::new(RefCell::new(Log::default()));
+    let mut maintainer = Maintainer::new(
+        fixture.storage.clone(),
+        slow_binder(
+            &log,
+            vec![bad_model.model_root],
+            Duration::ZERO,
+            Duration::from_millis(1300),
+        ),
+        Config {
+            retry: Duration::from_secs(1),
+            ..config(2, &[bad_model, slow_model])
+        },
+    );
+    let pass = maintainer.pass().unwrap();
+    assert_eq!(fixture.missing(slow), 0);
+    let due = pass.retry_at.expect("the pending retry was dropped");
+    assert!(due <= Instant::now(), "{due:?}");
+    maintainer.pass().unwrap();
+    assert_eq!(
+        log.borrow()
+            .binds
+            .iter()
+            .filter(|m| **m == bad_model)
+            .count(),
+        2
+    );
+}
+
+/// With no retry interval a failing bind is still not tried faster than
+/// the floor (one second here, the poll interval in the daemon): an
+/// immediate pass does not try it again, and the next attempt is named
+/// at least the floor after the failure.
+#[test]
+fn a_zero_retry_interval_does_not_retry_faster_than_the_floor() {
+    let fixture = Fixture::new(2);
+    let bad_model = identity(9, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let bad = fixture.declare(bad_model);
+    fixture.name_by_a_record(bad);
+    let (mut maintainer, log) = fixture.maintainer(
+        Config {
+            retry: Duration::ZERO,
+            ..config(1, &[bad_model])
+        },
+        vec![bad_model.model_root],
+    );
+    let first = maintainer.pass().unwrap();
+    let failed = Instant::now();
+    for _ in 0..5 {
+        maintainer.pass().unwrap();
+    }
+    assert_eq!(log.borrow().binds.len(), 1, "retried faster than the floor");
+    let due = first.retry_at.expect("a failed bind is due again");
+    assert!(
+        due + Duration::from_millis(100) >= failed + Duration::from_secs(1),
+        "{due:?}"
+    );
+}
+
+/// The daemon floors the retry interval at its poll interval, or at one
+/// second when it polls continuously; a longer interval is kept.
+#[test]
+fn the_daemon_floors_the_retry_interval_at_its_poll() {
+    let zero = Config {
+        retry: Duration::ZERO,
+        ..config(1, &[identity(2, GB10_NATIVE_BF16_PROFILE)])
+    };
+    assert_eq!(
+        zero.clone().floor_retry(Duration::from_secs(60)).retry,
+        Duration::from_secs(60)
+    );
+    assert_eq!(zero.floor_retry(Duration::ZERO).retry, MIN_BIND_RETRY);
+    let long = config(1, &[identity(2, GB10_NATIVE_BF16_PROFILE)]);
+    assert_eq!(
+        long.floor_retry(Duration::from_secs(60)).retry,
+        Duration::from_secs(3600)
+    );
 }

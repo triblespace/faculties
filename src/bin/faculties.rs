@@ -282,7 +282,7 @@ fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<(
         std::env::var_os("FACULTIES_WORKSPACE").is_none(),
         "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE"
     );
-    let config = Config::from_env()?;
+    let config = Config::from_env()?.floor_retry(std::time::Duration::from_secs(poll));
     let binder = SessionBinder::from_env(&pile)?;
     let note = config.check_residence(binder.keeps_every_bind())?;
     eprintln!("{}", config.describe());

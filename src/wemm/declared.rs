@@ -70,6 +70,10 @@ pub const MODELS_ENV: &str = "WEMM_MAINTAIN_MODELS";
 /// Seconds before a model whose bind failed is tried again (default 1800).
 pub const BIND_RETRY_ENV: &str = "WEMM_MAINTAIN_BIND_RETRY_SECS";
 pub const DEFAULT_BIND_RETRY: Duration = Duration::from_secs(1800);
+/// The shortest interval between two attempts to bind one model, whatever
+/// is configured: a failing bind is never tried in a loop. The daemon also
+/// floors the interval at its poll interval ([`Config::floor_retry`]).
+pub const MIN_BIND_RETRY: Duration = Duration::from_secs(1);
 
 /// One model of [`MODELS_ENV`]: a root under a profile, in one model
 /// collection when one is named, else in any.
@@ -223,6 +227,15 @@ impl Config {
             "maintain: {} models listed, bound in turn with device copies; that the allocator returns a released model's device memory before the next bind reads MemAvailable is NOT verified on the GPU",
             self.models.len()
         )))
+    }
+
+    /// This configuration with its retry interval at least `poll`, the
+    /// daemon's look interval (one second when `poll` is zero), so a retry
+    /// that is due never comes round faster than the daemon looks anyway.
+    pub fn floor_retry(mut self, poll: Duration) -> Self {
+        let floor = if poll.is_zero() { MIN_BIND_RETRY } else { poll };
+        self.retry = self.retry.max(floor);
+        self
     }
 
     fn lists(&self, identity: &WemmIdentity) -> bool {
@@ -425,6 +438,12 @@ impl<B: Binder> Maintainer<B> {
         }
     }
 
+    /// The interval between two attempts to bind one model, from the end of
+    /// the first: the configured one, never under [`MIN_BIND_RETRY`].
+    fn retry(&self) -> Duration {
+        self.config.retry.max(MIN_BIND_RETRY)
+    }
+
     /// The models bound now.
     pub fn bound(&self) -> Vec<WemmIdentity> {
         self.bound.iter().map(|bound| bound.identity).collect()
@@ -540,12 +559,16 @@ impl<B: Binder> Maintainer<B> {
                 }
             }
         }
-        let now = Instant::now();
+        // The next attempt of every failed model that still has work, also
+        // one already due (it came while later models were maintained):
+        // the daemon then passes again at once, and that pass makes the
+        // attempt and pushes its next one forward by the interval.
+        let retry = self.retry();
         let retry_at = self
             .failed
             .iter()
-            .map(|(_, failed)| *failed + self.config.retry)
-            .filter(|due| *due > now)
+            .filter(|(identity, _)| wanted.contains(identity))
+            .map(|(_, ended)| *ended + retry)
             .min();
         Ok(Pass { lines, retry_at })
     }
@@ -568,7 +591,7 @@ impl<B: Binder> Maintainer<B> {
             .iter()
             .position(|(failed, _)| *failed == identity)
         {
-            if now.duration_since(self.failed[position].1) < self.config.retry {
+            if now.duration_since(self.failed[position].1) < self.retry() {
                 return None;
             }
             self.failed.remove(position);
@@ -634,12 +657,14 @@ impl<B: Binder> Maintainer<B> {
                 Some(self.bound.len() - 1)
             }
             Err(error) => {
-                self.failed.push((identity, now));
+                // From when the attempt ended: a bind slower than the
+                // interval is still due again an interval later.
+                self.failed.push((identity, Instant::now()));
                 lines.push(format!(
                     "maintain: skip model {}: {error:#}; index(es) {} not maintained, bind retried after {} s",
                     model_name(&identity),
                     names(members),
-                    self.config.retry.as_secs()
+                    self.retry().as_secs()
                 ));
                 None
             }

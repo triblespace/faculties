@@ -16,7 +16,9 @@ All notable changes to this project will be documented in this file.
   cannot be bound is skipped with a line and retried after
   `WEMM_MAINTAIN_BIND_RETRY_SECS` (1800), never replaced by another; that
   retry runs when due even if the pile has not grown
-  (`pile_watch::run_until_replaced_or_due`). Descriptors are read only from
+  (`pile_watch::run_until_replaced_or_due`), counted from when the failed
+  attempt ended, also when it came due during a pass, and never more often
+  than the poll interval (one second at the least). Descriptors are read only from
   what is here, never fetched. `WEMM_MAINTAIN_MAX_BOUND` (1) caps the models
   bound at once. Several listed models need `WEMM_COPY_WEIGHTS=1`: aliased
   weights keep their registrations until the process exits, so the mode
