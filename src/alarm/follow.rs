@@ -10,12 +10,13 @@
 //! occurrence (at most [`POLL`]), pulling the alarm's Discord channel every
 //! [`PULL_EVERY`] so an ack does not wait for intake.
 //!
-//! One follower per alarm and host: a lock file in the runtime directory
-//! holds its pid ([`Lock`]). `alarm follow --resume` adopts every open, real
-//! alarm whose newest activity is older than [`STALE_AFTER`] and whose lock
-//! no live process holds ([`resume`]): a follower that died with its host.
-//! Across hosts nothing serialises followers; two hosts adopting the same
-//! alarm both run its ladder, which repeats a ping and nothing worse.
+//! One follower per alarm and host: an exclusive flock on a lock file in the
+//! runtime directory, held for the follower's life ([`Lock`]). `alarm follow
+//! --resume` adopts every open, real alarm whose newest activity is older
+//! than [`STALE_AFTER`] and whose lock no process holds ([`resume`]): a
+//! follower that died with its host. Across hosts nothing serialises
+//! followers: two hosts adopting the same alarm both run its whole ladder,
+//! sound, voice and lights included, not only the pings.
 
 use std::path::{Path, PathBuf};
 
@@ -97,13 +98,18 @@ pub fn follow(
     }
 }
 
-/// The lock that keeps one follower per alarm on a host: a file holding the
-/// follower's pid, removed when it ends. A lock whose pid is not alive is
-/// stale and is taken over.
+/// The lock that keeps one follower per alarm on a host: an exclusive
+/// `flock` on `alarm-<id>.lock`, held for the follower's whole life by the
+/// open file this value owns, and released by the kernel when the process
+/// ends, however it ends. Liveness is exactly "the lock is held": a holder
+/// that died leaves a free lock, with no staleness rule and no pid check.
+/// The file is never unlinked (unlinking a locked path is what lets two
+/// processes each lock a different inode of "the same" lock). The pid is
+/// written into it for people to read, and never used to decide anything.
 #[derive(Debug)]
 pub struct Lock {
-    path: PathBuf,
-    pid: u32,
+    /// The open file whose flock is the lock; dropping it releases it.
+    _held: std::fs::File,
 }
 
 impl Lock {
@@ -111,74 +117,68 @@ impl Lock {
         directory.join(format!("alarm-{alarm:x}.lock"))
     }
 
-    /// The pid holding `alarm`'s lock, when a live process does.
-    pub fn holder(directory: &Path, alarm: Id) -> Option<u32> {
+    fn open(path: &Path) -> Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open {}", path.display()))
+    }
+
+    /// Take the lock without waiting: `Ok(false)` when another holds it.
+    fn try_lock(file: &std::fs::File, path: &Path) -> Result<bool> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a descriptor `file` owns for as long as it lives.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(false)
+        } else {
+            Err(error).with_context(|| format!("lock {}", path.display()))
+        }
+    }
+
+    /// Whether a live process holds `alarm`'s lock on this host. Taken and
+    /// released at once when it is free.
+    pub fn held(directory: &Path, alarm: Id) -> Result<bool> {
+        let path = Self::path(directory, alarm);
+        let file = Self::open(&path)?;
+        Ok(!Self::try_lock(&file, &path)?)
+    }
+
+    /// The pid the holder wrote, for display only.
+    pub fn recorded_pid(directory: &Path, alarm: Id) -> Option<u32> {
         std::fs::read_to_string(Self::path(directory, alarm))
             .ok()
             .and_then(|text| text.trim().parse::<u32>().ok())
-            .filter(|pid| pid_alive(*pid))
     }
 
     pub fn acquire(directory: &Path, alarm: Id) -> Result<Self> {
         let path = Self::path(directory, alarm);
-        let pid = std::process::id();
-        for _ in 0..2 {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    use std::io::Write;
-                    writeln!(file, "{pid}").with_context(|| format!("write {}", path.display()))?;
-                    return Ok(Self { path, pid });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Some(holder) = Self::holder(directory, alarm) {
-                        bail!(
-                            "a follower (pid {holder}) already runs alarm {alarm:x} on this \
-                             host ({})",
-                            path.display()
-                        );
-                    }
-                    // Stale: its process is gone. Take it over.
-                    std::fs::remove_file(&path)
-                        .with_context(|| format!("remove stale {}", path.display()))?;
-                }
-                Err(error) => {
-                    return Err(error).with_context(|| format!("create {}", path.display()))
-                }
-            }
+        let file = Self::open(&path)?;
+        if !Self::try_lock(&file, &path)? {
+            let shown = Self::recorded_pid(directory, alarm)
+                .map(|pid| format!(" (it wrote pid {pid})"))
+                .unwrap_or_default();
+            bail!(
+                "a follower already runs alarm {alarm:x} on this host: {} is locked{shown}",
+                path.display()
+            );
         }
-        bail!("could not take {}", path.display())
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let ours = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            == Some(self.pid);
-        if ours {
-            let _ = std::fs::remove_file(&self.path);
+        {
+            use std::io::{Seek, Write};
+            let mut writer = &file;
+            file.set_len(0)
+                .and_then(|()| writer.seek(std::io::SeekFrom::Start(0)).map(drop))
+                .and_then(|()| writeln!(writer, "{}", std::process::id()))
+                .with_context(|| format!("write {}", path.display()))?;
         }
+        Ok(Self { _held: file })
     }
-}
-
-/// Whether a process with this pid exists (on this host).
-pub fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: signal 0 only checks that the process exists.
-    if unsafe { libc::kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// The runtime directory lock files live in.
@@ -418,7 +418,7 @@ pub fn resume(
     let now = clock.now()?;
     let mut adopted = Vec::new();
     for orphan in operations.orphans(now, STALE_AFTER)? {
-        if Lock::holder(lock_directory, orphan).is_some() {
+        if Lock::held(lock_directory, orphan)? {
             continue;
         }
         spawner.spawn(&command(orphan)?)?;

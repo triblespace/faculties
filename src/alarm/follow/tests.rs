@@ -185,8 +185,9 @@ fn a_second_alarm_follower_is_refused_by_the_lock() {
     let directory = tempfile::tempdir().unwrap();
     let alarm = Id::new([0xab; 16]).unwrap();
     let first = Lock::acquire(directory.path(), alarm).unwrap();
+    assert!(Lock::held(directory.path(), alarm).unwrap());
     assert_eq!(
-        Lock::holder(directory.path(), alarm),
+        Lock::recorded_pid(directory.path(), alarm),
         Some(std::process::id())
     );
     let error = Lock::acquire(directory.path(), alarm).unwrap_err();
@@ -195,15 +196,11 @@ fn a_second_alarm_follower_is_refused_by_the_lock() {
     let other = Lock::acquire(directory.path(), Id::new([0xcd; 16]).unwrap()).unwrap();
     drop(other);
     drop(first);
-    assert!(!Lock::path(directory.path(), alarm).exists());
-    // A lock left by a process that is gone is taken over.
-    std::fs::write(Lock::path(directory.path(), alarm), "4000000000\n").unwrap();
-    assert_eq!(Lock::holder(directory.path(), alarm), None);
+    // Released, never unlinked.
+    assert!(Lock::path(directory.path(), alarm).exists());
+    assert!(!Lock::held(directory.path(), alarm).unwrap());
     let taken = Lock::acquire(directory.path(), alarm).unwrap();
-    assert_eq!(
-        Lock::holder(directory.path(), alarm),
-        Some(std::process::id())
-    );
+    assert!(Lock::held(directory.path(), alarm).unwrap());
     drop(taken);
 }
 
@@ -394,4 +391,63 @@ fn the_alarm_follower_command_is_a_capped_user_unit_with_absolute_paths_and_rout
         Vec::new()
     )
     .is_err());
+}
+
+#[test]
+fn a_follower_lock_is_decided_by_a_held_flock_not_by_the_recorded_pid() {
+    use std::os::unix::io::AsRawFd;
+    let directory = tempfile::tempdir().unwrap();
+    let alarm = Id::new([0xab; 16]).unwrap();
+    let path = Lock::path(directory.path(), alarm);
+    // A file naming a live process (this one) that holds no lock is free:
+    // the pid is display, never a decision.
+    std::fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+    let lock = Lock::acquire(directory.path(), alarm).expect("nobody holds the lock");
+    drop(lock);
+    // An empty file another open description holds locked is held.
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .unwrap();
+    std::fs::write(&path, "").unwrap();
+    // SAFETY: flock on a file descriptor this test owns.
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(Lock::acquire(directory.path(), alarm).is_err());
+    drop(holder);
+    // Its holder gone, the lock is free again, with no staleness rule.
+    assert!(Lock::acquire(directory.path(), alarm).is_ok());
+}
+
+#[test]
+fn alarm_follower_lock_racers_exactly_one_wins() {
+    use std::sync::{Arc, Barrier};
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let alarm = Id::new([0xab; 16]).unwrap();
+    for _round in 0..20 {
+        let start = Arc::new(Barrier::new(8));
+        let done = Arc::new(Barrier::new(8));
+        let racers: Vec<_> = (0..8)
+            .map(|_| {
+                let (directory, start, done) = (directory.clone(), start.clone(), done.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let won = Lock::acquire(directory.path(), alarm);
+                    // Every winner holds its lock until all have tried.
+                    done.wait();
+                    won.is_ok()
+                })
+            })
+            .collect();
+        let winners = racers
+            .into_iter()
+            .map(|racer| racer.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 1);
+    }
 }
