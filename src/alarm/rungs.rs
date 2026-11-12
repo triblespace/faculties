@@ -641,70 +641,94 @@ impl Transport for Live {
 pub const OUTPUT_CAP: usize = 64 * 1024;
 /// The most stderr a program rung keeps for its error.
 const ERROR_CAP: usize = 8 * 1024;
-/// How long the output of a program that has exited may stay open (a
-/// descendant holding it) before the program's group is killed.
-const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+/// The one settle window: after the program exits (or is killed at its
+/// deadline), how long its output may stay open, or its killed leader stay
+/// unreaped, before the rung is given up as unsettled.
+pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What one pipe reader ended with: the bytes kept, or the read error.
+type Drained = std::result::Result<Vec<u8>, String>;
 
 /// Read a pipe to its end on its own thread, keeping at most `cap` bytes, so
-/// a program that prints a lot never blocks on a full pipe.
+/// a program that prints a lot never blocks on a full pipe. A read error is
+/// reported, never taken for the end of the output.
 fn drain<R: std::io::Read + Send + 'static>(
     mut pipe: R,
     cap: usize,
-) -> std::sync::mpsc::Receiver<Vec<u8>> {
+) -> std::sync::mpsc::Receiver<Drained> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut buffer = [0u8; 8192];
-        loop {
+        let ended = loop {
             match pipe.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break Ok(kept),
                 Ok(read) => {
                     let room = cap.saturating_sub(kept.len());
                     kept.extend_from_slice(&buffer[..read.min(room)]);
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => break Err(format!("reading its output failed: {error}")),
             }
-        }
-        let _ = sender.send(kept);
+        };
+        let _ = sender.send(ended);
     });
     receiver
 }
 
-/// Kill a whole process group (the program and every descendant it left).
-fn kill_group(pgid: u32) {
-    if let Ok(pgid) = i32::try_from(pgid) {
-        if pgid > 0 {
-            // SAFETY: SIGKILL to a process group this function started.
-            unsafe {
-                libc::killpg(pgid, libc::SIGKILL);
-            }
-        }
+/// SIGKILL a whole process group (the program and every descendant still
+/// in it). A group that is already gone is not an error.
+fn kill_group(pgid: u32) -> std::result::Result<(), String> {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return Err(format!("process group {pgid} is out of range"));
+    };
+    if pgid <= 0 {
+        return Err(format!("process group {pgid} is not one this started"));
+    }
+    // SAFETY: SIGKILL to the process group this module started.
+    if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!("killing process group {pgid} failed: {error}"))
     }
 }
 
 /// Run a program with no stdin and return its stdout (at most
-/// [`OUTPUT_CAP`] bytes), all within `timeout` plus a bounded settle.
+/// [`OUTPUT_CAP`] bytes).
 ///
-/// What is bounded: the program runs in its own process group; stdout and
-/// stderr are drained on their own threads while it runs, so a large output
-/// cannot block it; at the deadline the whole group is killed and the
-/// output is not waited for any longer; after the program exits, output a
-/// descendant still holds open is waited for at most [`SETTLE`], then the
-/// group is killed and the readers are given [`SETTLE`] once more before
-/// they are abandoned. So this returns within about `timeout + 2 * SETTLE`.
-/// For an `ssh` rung that bounds the ssh CLIENT; whether the remote command
-/// stops when the client is killed is up to the remote side.
+/// The call returns within `timeout` plus one [`SETTLE`] window (and the
+/// 20 ms polling step). The program runs in its own process group, and its
+/// stdout and stderr are drained concurrently while it runs, so a large
+/// output never blocks it. At the deadline the whole group is killed (the
+/// kill's result is checked and reported) and the killed leader is reaped
+/// by polling for at most one settle window; if it is not, the call returns
+/// "unsettled" instead of blocking. After the program exits, both pipes are
+/// waited for against ONE shared settle window; output that has not
+/// settled by then (a descendant still holds it) gets the group killed and
+/// makes the call an error, "output not settled", even when the program
+/// exited 0. A read error is an error too. A failed `try_wait` kills the
+/// group before returning. Every error becomes a FAILED step.
 ///
-/// What is not bounded here: the rungs that are not programs. Discord
-/// sends, pulls and say requests rely on the Discord client's per-request
-/// timeout, the Hue alert on the bridge client's, and the message faculty
-/// and the pile operations around every step on nothing of their own.
+/// What is NOT bounded or settled here: a descendant that escaped the
+/// group (`setsid`, a daemon) and keeps running, or keeps a pipe whose
+/// reader thread is then abandoned; for an `ssh` rung, the remote command,
+/// which may outlive the killed client; a group id reused after the group
+/// is gone; and every rung that is not a program: Discord sends, pulls and
+/// say requests (the Discord client's per-request timeout), the Hue alert
+/// (the bridge client's), the message faculty, and the pile writes around
+/// each step (nothing of their own).
 pub fn run_with_timeout(
     program: &str,
     args: &[String],
     timeout: std::time::Duration,
 ) -> Result<String> {
     use std::os::unix::process::CommandExt;
-    let started = std::time::Instant::now();
+    use std::time::Instant;
+    let started = Instant::now();
     let mut child = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -716,33 +740,56 @@ pub fn run_with_timeout(
     let group = child.id();
     let stdout = drain(child.stdout.take().expect("piped stdout"), OUTPUT_CAP);
     let stderr = drain(child.stderr.take().expect("piped stderr"), ERROR_CAP);
+    let killed = |why: String| -> anyhow::Error {
+        match kill_group(group) {
+            Ok(()) => anyhow!("{why}; its process group was killed"),
+            Err(kill) => anyhow!("{why}; {kill}"),
+        }
+    };
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("wait for {program}"))?
-        {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => return Err(killed(format!("waiting for {program} failed: {error}"))),
         }
         if started.elapsed() > timeout {
-            kill_group(group);
-            let _ = child.wait();
-            bail!("{program} did not finish within {} s", timeout.as_secs());
+            let error = killed(format!(
+                "{program} did not finish within {} s",
+                timeout.as_secs()
+            ));
+            let reap_by = Instant::now() + SETTLE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return Err(error),
+                    Ok(None) if Instant::now() < reap_by => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    _ => {
+                        return Err(error.context(format!(
+                            "{program} was not reaped within {} s of the kill: unsettled",
+                            SETTLE.as_secs()
+                        )))
+                    }
+                }
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let settle = |receiver: &std::sync::mpsc::Receiver<Vec<u8>>| {
-        receiver
-            .recv_timeout(SETTLE)
-            .or_else(|_| {
-                // A descendant holds the output open: end the group, and
-                // give the reader one more bounded wait.
-                kill_group(group);
-                receiver.recv_timeout(SETTLE)
-            })
-            .unwrap_or_default()
+    // Both pipes against one shared window.
+    let settle_by = Instant::now() + SETTLE;
+    let collect = |receiver: &std::sync::mpsc::Receiver<Drained>| {
+        receiver.recv_timeout(settle_by.saturating_duration_since(Instant::now()))
     };
-    let out = settle(&stdout);
-    let err = settle(&stderr);
+    let (out, err) = (collect(&stdout), collect(&stderr));
+    let (Ok(out), Ok(err)) = (out, err) else {
+        return Err(killed(format!(
+            "{program} exited ({status}) but its output not settled within {} s (a \
+             descendant holds it)",
+            SETTLE.as_secs()
+        )));
+    };
+    let out = out.map_err(|error| anyhow!("{program}: {error}"))?;
+    let err = err.map_err(|error| anyhow!("{program}: {error}"))?;
     if !status.success() {
         bail!(
             "{program} failed ({status}): {}",

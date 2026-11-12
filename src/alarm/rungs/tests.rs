@@ -416,8 +416,31 @@ fn a_program_rung_returns_by_its_deadline_though_a_descendant_holds_its_output()
         std::time::Duration::from_secs(3),
     );
     let took = started.elapsed();
-    assert!(took < std::time::Duration::from_secs(6), "took {took:?}");
-    assert_eq!(out.unwrap().trim(), "started");
+    assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    // The output never settled while the descendant held it: not a success,
+    // although the direct child exited 0.
+    let error = out.unwrap_err();
+    assert!(format!("{error:#}").contains("not settled"), "{error:#}");
+}
+
+#[test]
+fn an_escaped_descendant_holding_both_pipes_fails_the_rung_within_one_settle_window() {
+    // setsid puts the sleep in its own session, out of the program's group:
+    // killing the group cannot reach it, and it holds stdout and stderr.
+    let started = std::time::Instant::now();
+    let out = run_with_timeout(
+        "sh",
+        &sh("setsid sleep 6 & echo started"),
+        std::time::Duration::from_secs(3),
+    );
+    let took = started.elapsed();
+    // One shared settle window (1 s) after the exit, not one per pipe.
+    assert!(
+        took < std::time::Duration::from_millis(1800),
+        "took {took:?}"
+    );
+    let error = out.unwrap_err();
+    assert!(format!("{error:#}").contains("not settled"), "{error:#}");
 }
 
 #[test]
