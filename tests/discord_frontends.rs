@@ -165,16 +165,40 @@ fn native_and_mcp_resident_reads_need_no_bot_token() {
         call(&fixture.mcp(), "discord_read", json!({})).unwrap()
     );
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_discord"));
-    clean_child(&mut command);
-    let output = command
-        .arg("--pile")
-        .arg(&fixture.pile)
-        .arg("--key")
-        .arg(&fixture.key)
-        .args(["read", CHANNEL])
-        .output()
+    // The CLI `read` is resident-only since e9e1addd, like `discord_read`:
+    // no token, and the same rendering as MCP.
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_discord"));
+        clean_child(&mut command);
+        command
+            .arg("--pile")
+            .arg(&fixture.pile)
+            .arg("--key")
+            .arg(&fixture.key)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let output = run(&["read", CHANNEL]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let channel = fixture
+        .operations()
+        .read(ReadOptions {
+            channel_id: Some(CHANNEL.into()),
+            ..ReadOptions::default()
+        })
         .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        collect(|out| discord::render::history(&channel, out)).unwrap()
+    );
+
+    // Fetching from Discord is `pull`, and that still needs the token.
+    let output = run(&["pull", CHANNEL]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("Discord authentication is not configured"));
