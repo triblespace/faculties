@@ -60,6 +60,7 @@
 //! read the same three variables, so they agree exactly when they are
 //! configured alike.
 
+pub mod declared;
 pub mod probe;
 
 use crate::pile_watch::BackingIdentity;
@@ -92,7 +93,8 @@ use triblespace_search::semantic_wemm::{
 };
 
 type Index = WemmIndex<Embedding>;
-type Target = Collection<NvFp4CosineSet<Embedding>>;
+/// A WeMM index: the derived collection of NVFP4 rows.
+pub type Target = Collection<NvFp4CosineSet<Embedding>>;
 
 /// WeMM-Embedding-9B's BF16 tensors, one alias registration each.
 const ROLES: usize = 759;
@@ -612,6 +614,34 @@ impl Session {
         Self::bind(pile, BindRequest::from_env()?, &CopyHost::this_host())
     }
 
+    /// Bind exactly the model `identity` names: its root, resolved only in
+    /// its collection, under its profile, from the pile at `pile`. What
+    /// `faculties maintain --declared` binds for the indexes whose
+    /// descriptors name it; `WEMM_ROOT`, `WEMM_PROFILE` and
+    /// `TRIBLESPACE_COLLECTION_MODELS` play no part. A profile this build
+    /// does not know is refused before anything is opened.
+    pub fn bind_identity(
+        pile: &Path,
+        identity: WemmIdentity,
+        residence: WeightResidence,
+        copy_min_free: u64,
+    ) -> Result<Self> {
+        let profile = WemmProfile::of(identity.kernel_profile).with_context(|| {
+            format!(
+                "kernel profile {:X} is not one this build runs (bf16, w4a4, w4a4-vw4a16)",
+                identity.kernel_profile
+            )
+        })?;
+        let request = BindRequest {
+            collection: identity.model_collection,
+            root: identity.model_root,
+            profile,
+            residence,
+            copy_min_free,
+        };
+        Self::bind(pile, request, &CopyHost::this_host())
+    }
+
     fn bind(pile: &Path, request: BindRequest, host: &CopyHost) -> Result<Self> {
         let BindRequest {
             collection,
@@ -874,9 +904,25 @@ impl Session {
         signer: &SigningKey,
         runtime: &Arc<tokio::runtime::Runtime>,
     ) -> Result<Derived> {
-        let started = std::time::Instant::now();
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let (_, target) = self.register(store, source, attributes, &reader)?;
+        self.maintain(store, source, target, signer, runtime)
+    }
+
+    /// Derive rows for every foundation of `source` that the index `target`
+    /// has none for, with this session's model, which must be the one the
+    /// index's descriptor names: the runtime computes only indexes of its
+    /// own identity, so another index derives nothing. Registers nothing.
+    pub fn maintain(
+        &self,
+        store: &mut FacultyStore,
+        source: Collection<SimpleArchive>,
+        target: Target,
+        signer: &SigningKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<Derived> {
+        let started = std::time::Instant::now();
+        self.backing.require_still(&self.model)?;
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         let backlog = crate::storage::underived(&reader, source, target)?;
         PROGRESS.with(|progress| progress.set((0, backlog)));
