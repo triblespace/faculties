@@ -66,6 +66,7 @@ struct Log {
 struct TestBinder {
     log: Rc<RefCell<Log>>,
     unbindable: Vec<Id>,
+    keeps_every_bind: bool,
 }
 
 impl Binder for TestBinder {
@@ -79,6 +80,10 @@ impl Binder for TestBinder {
             identity.model_root
         );
         Ok(identity)
+    }
+
+    fn keeps_every_bind(&self) -> bool {
+        self.keeps_every_bind
     }
 
     fn maintain(
@@ -222,6 +227,7 @@ impl Fixture {
         let binder = TestBinder {
             log: log.clone(),
             unbindable,
+            keeps_every_bind: false,
         };
         (Maintainer::new(self.storage.clone(), binder, config), log)
     }
@@ -268,7 +274,7 @@ fn each_declared_index_is_maintained_with_the_model_its_descriptor_names() {
 
     let (mut maintainer, log) =
         fixture.maintainer(config(2, &[first_model, second_model]), Vec::new());
-    let lines = maintainer.pass().unwrap();
+    let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(log.borrow().binds, vec![first_model, second_model]);
     let mut maintained = log.borrow().maintained.clone();
@@ -287,11 +293,11 @@ fn each_declared_index_is_maintained_with_the_model_its_descriptor_names() {
     );
 
     fixture.add_member();
-    maintainer.pass().unwrap();
+    maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(log.borrow().binds.len(), 2, "a bound model is bound again");
     // A pass with nothing to derive binds and logs nothing.
-    assert!(maintainer.pass().unwrap().is_empty());
+    assert!(maintainer.pass().unwrap().lines.is_empty());
 }
 
 /// The stand-in mirrors the runtime: under another model it derives
@@ -306,6 +312,7 @@ fn an_index_is_not_derived_under_another_model() {
     let mut binder = TestBinder {
         log,
         unbindable: Vec::new(),
+        keeps_every_bind: false,
     };
     let other = identity(3, GB10_NATIVE_BF16_PROFILE);
     let derived = fixture
@@ -334,7 +341,7 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
         config(1, &[good_model, bad_model]),
         vec![bad_model.model_root],
     );
-    let lines = maintainer.pass().unwrap();
+    let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(good), fixture.missing(bad)), (0, 3));
     let skip = lines
         .iter()
@@ -353,7 +360,7 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
         .all(|(model, index)| *model == good_model && *index == good.handle()));
 
     fixture.add_member();
-    let lines = maintainer.pass().unwrap();
+    let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(good), fixture.missing(bad)), (0, 4));
     let attempts = |log: &Log| log.binds.iter().filter(|m| **m == bad_model).count();
     assert_eq!(attempts(&log.borrow()), 1, "retried before the interval");
@@ -367,8 +374,8 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
         },
         vec![bad_model.model_root],
     );
-    eager.pass().unwrap();
-    eager.pass().unwrap();
+    eager.pass().unwrap().lines;
+    eager.pass().unwrap().lines;
     assert_eq!(attempts(&log.borrow()), 2);
     assert_eq!(fixture.missing(bad), 4);
 }
@@ -385,11 +392,11 @@ fn an_index_named_after_start_is_maintained_on_the_next_pass() {
     fixture.name_by_a_record(first);
     let (mut maintainer, log) =
         fixture.maintainer(config(2, &[first_model, later_model]), Vec::new());
-    maintainer.pass().unwrap();
+    maintainer.pass().unwrap().lines;
     assert_eq!(fixture.missing(first), 0);
 
     let later = fixture.declare(later_model);
-    maintainer.pass().unwrap();
+    maintainer.pass().unwrap().lines;
     assert_eq!(
         fixture.missing(later),
         2,
@@ -398,7 +405,7 @@ fn an_index_named_after_start_is_maintained_on_the_next_pass() {
     assert_eq!(log.borrow().binds, vec![first_model]);
 
     fixture.name_by_a_record(later);
-    let lines = maintainer.pass().unwrap();
+    let lines = maintainer.pass().unwrap().lines;
     assert_eq!(fixture.missing(later), 0, "{lines:#?}");
     assert_eq!(log.borrow().binds, vec![first_model, later_model]);
     assert!(log
@@ -420,7 +427,7 @@ fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     fixture.name_by_a_record(second);
     let (mut maintainer, log) =
         fixture.maintainer(config(1, &[first_model, second_model]), Vec::new());
-    let lines = maintainer.pass().unwrap();
+    let lines = maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(log.borrow().binds, vec![first_model, second_model]);
     assert_eq!(maintainer.bound(), vec![second_model]);
@@ -432,7 +439,7 @@ fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     );
 
     fixture.add_member();
-    maintainer.pass().unwrap();
+    maintainer.pass().unwrap().lines;
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(
         log.borrow().binds,
@@ -464,9 +471,9 @@ fn only_a_listed_model_is_bound_and_maintained() {
     )
     .unwrap();
     let (mut maintainer, log) = fixture.maintainer(only, Vec::new());
-    let mut lines = maintainer.pass().unwrap();
+    let mut lines = maintainer.pass().unwrap().lines;
     fixture.add_member();
-    lines.extend(maintainer.pass().unwrap());
+    lines.extend(maintainer.pass().unwrap().lines);
     assert_eq!(log.borrow().binds, vec![kept_model]);
     assert!(log
         .borrow()
@@ -616,4 +623,146 @@ fn an_unknown_profile_is_refused_before_anything_is_opened() {
         Err(error) => format!("{error:#}"),
     };
     assert!(error.contains("is not one this build runs"), "{error}");
+}
+
+/// Discovery reads descriptors only from what is here. An index that a
+/// record names but whose descriptor is not here is passed over, even when
+/// the reader maintenance acquires through holds the descriptor; with the
+/// descriptor here it is found, and its backlog read.
+#[test]
+fn discovery_reads_descriptors_only_from_what_is_here() {
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::SnapshotSource;
+    let signer = SigningKey::from_bytes(&[9; 32]);
+    let policy = crate::collection_names::private_policy(signer.verifying_key());
+    let model = identity(2, GB10_NATIVE_BF16_PROFILE);
+    let mut full = MemoryRepo::default();
+    let source = full.collection("source", policy.clone()).unwrap();
+    let mapping =
+        WemmIndex::<Embedding>::new([metadata::name.id()], model, DEFAULT_WINDOW_CAP).unwrap();
+    let target: Target = full.derive_with(source, mapping, policy).unwrap();
+    let record = || {
+        CollectionRecord::Derive(CollectionDerive::sign(
+            &signer,
+            target.handle(),
+            SourceLocator::of([5; 32]),
+            Inline::new([6; 32]),
+        ))
+    };
+    full.insert(record()).unwrap();
+    let mut records_only = MemoryRepo::default();
+    records_only.insert(record()).unwrap();
+    let config = config(1, &[model]);
+
+    let here = discover(
+        &full.snapshot().unwrap(),
+        &full.snapshot().unwrap(),
+        &config,
+    )
+    .unwrap();
+    assert_eq!(here.len(), 1);
+    assert_eq!(here[0].0.index, target.handle());
+    assert!(matches!(here[0].1, Some(Ok(0))), "{:?}", here[0].1);
+
+    let absent = discover(
+        &records_only.snapshot().unwrap(),
+        &full.snapshot().unwrap(),
+        &config,
+    )
+    .unwrap();
+    assert!(
+        absent.is_empty(),
+        "a descriptor not here was read: {absent:?}"
+    );
+}
+
+/// A failed bind names when it is due again; a pass before then does not
+/// bind, and the pass at that moment binds again although the pile has not
+/// grown (the daemon loop runs that pass: pile_watch's deadline tests).
+#[test]
+fn a_failed_bind_names_its_retry_and_is_retried_then_without_growth() {
+    let fixture = Fixture::new(2);
+    let bad_model = identity(9, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+    let bad = fixture.declare(bad_model);
+    fixture.name_by_a_record(bad);
+    let retry = Duration::from_millis(200);
+    let (mut maintainer, log) = fixture.maintainer(
+        Config {
+            retry,
+            ..config(1, &[bad_model])
+        },
+        vec![bad_model.model_root],
+    );
+    let attempts = |log: &Log| log.binds.len();
+    let before = Instant::now();
+    let due = maintainer
+        .pass()
+        .unwrap()
+        .retry_at
+        .expect("a failed bind names when it is retried");
+    assert!(due > before && due <= Instant::now() + retry, "{due:?}");
+    let early = maintainer.pass().unwrap();
+    assert_eq!(early.retry_at, Some(due));
+    assert_eq!(attempts(&log.borrow()), 1);
+    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+    let retried = maintainer.pass().unwrap();
+    assert_eq!(attempts(&log.borrow()), 2);
+    assert!(retried.retry_at.is_some_and(|next| next > due));
+    assert_eq!(fixture.missing(bad), 2);
+}
+
+/// A binder whose binds stay until the process exits (weights aliased from
+/// the pile) binds one model per process: a second model with work is
+/// refused with a line, never bound in turn.
+#[test]
+fn an_aliasing_binder_binds_one_model_per_process() {
+    let fixture = Fixture::new(2);
+    let first_model = identity(2, GB10_NATIVE_BF16_PROFILE);
+    let second_model = identity(3, GB10_NATIVE_BF16_PROFILE);
+    let first = fixture.declare(first_model);
+    let second = fixture.declare(second_model);
+    fixture.name_by_a_record(first);
+    fixture.name_by_a_record(second);
+    let log = Rc::new(RefCell::new(Log::default()));
+    let binder = TestBinder {
+        log: log.clone(),
+        unbindable: Vec::new(),
+        keeps_every_bind: true,
+    };
+    let mut maintainer = Maintainer::new(
+        fixture.storage.clone(),
+        binder,
+        config(1, &[first_model, second_model]),
+    );
+    let lines = maintainer.pass().unwrap().lines;
+    assert_eq!(log.borrow().binds, vec![first_model]);
+    assert_eq!(maintainer.bound(), vec![first_model]);
+    assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 2));
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("not binding model") && line.contains("WEMM_COPY_WEIGHTS=1")),
+        "{lines:#?}"
+    );
+}
+
+/// Several listed models refuse to start with aliased weights and start
+/// with device copies, saying the release between binds is unverified; one
+/// model runs either way, as today.
+#[test]
+fn several_models_need_device_copies_and_say_what_is_unverified() {
+    let one = config(1, &[identity(2, GB10_NATIVE_BF16_PROFILE)]);
+    assert_eq!(one.check_residence(true).unwrap(), None);
+    assert_eq!(one.check_residence(false).unwrap(), None);
+    let several = config(
+        1,
+        &[
+            identity(2, GB10_NATIVE_BF16_PROFILE),
+            identity(3, GB10_NATIVE_W4A4_PROFILE),
+        ],
+    );
+    let error = several.check_residence(true).unwrap_err().to_string();
+    assert!(error.contains("WEMM_COPY_WEIGHTS=1"), "{error}");
+    let note = several.check_residence(false).unwrap().unwrap();
+    assert!(note.contains("NOT verified"), "{note}");
 }

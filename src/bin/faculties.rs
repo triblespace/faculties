@@ -277,25 +277,33 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
 /// name, each with its own descriptor's model (faculties::wemm::declared).
 #[cfg(feature = "wemm")]
 fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
-    use faculties::wemm::declared::{Config, Maintainer, SessionBinder};
+    use faculties::wemm::declared::{Binder, Config, Maintainer, SessionBinder};
     anyhow::ensure!(
         std::env::var_os("FACULTIES_WORKSPACE").is_none(),
         "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE"
     );
     let config = Config::from_env()?;
+    let binder = SessionBinder::from_env(&pile)?;
+    let note = config.check_residence(binder.keeps_every_bind())?;
     eprintln!("{}", config.describe());
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
     let storage = faculties::storage::Storage::shared(pile.clone(), key);
     let backing = faculties::pile_watch::BackingIdentity::of(&pile)?;
-    let mut maintainer = Maintainer::new(storage.clone(), SessionBinder::from_env(&pile)?, config);
-    let result = faculties::pile_watch::run_until_replaced(
+    let mut maintainer = Maintainer::new(storage.clone(), binder, config);
+    // A pass runs when the pile grows or when a deferred bind retry is due,
+    // whichever is first.
+    let result = faculties::pile_watch::run_until_replaced_or_due(
         &pile,
         &backing,
         std::time::Duration::from_secs(poll),
         || {
-            for line in maintainer.pass()? {
+            let pass = maintainer.pass()?;
+            for line in pass.lines {
                 eprintln!("{line}");
             }
-            Ok(())
+            Ok(pass.retry_at)
         },
     );
     if result.is_ok() {

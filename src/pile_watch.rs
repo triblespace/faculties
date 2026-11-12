@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// An observed backing file identity: diagnostic evidence, not proof that
 /// another process cannot change mapped pages.
@@ -76,17 +76,38 @@ pub fn run_until_replaced(
     poll: Duration,
     mut pass: impl FnMut() -> Result<()>,
 ) -> Result<()> {
+    run_until_replaced_or_due(path, bound, poll, || pass().map(|()| None))
+}
+
+/// [`run_until_replaced`] for a pass that may also name when it is next due
+/// whatever the pile does (a retry it deferred): the next pass runs when the
+/// pile has grown or that moment has come, whichever is first. The wait
+/// sleeps until the earlier of the next look and the deadline, so a deadline
+/// costs no polling; a deadline already past when the pass returns is
+/// ignored, so it cannot make the loop spin.
+pub fn run_until_replaced_or_due(
+    path: &Path,
+    bound: &BackingIdentity,
+    poll: Duration,
+    mut pass: impl FnMut() -> Result<Option<Instant>>,
+) -> Result<()> {
     loop {
         let Some(seen) = bound.observe(path)? else {
             return Ok(());
         };
-        pass()?;
+        let due = pass()?.filter(|due| *due > Instant::now());
         loop {
-            std::thread::sleep(poll);
+            let wait = due.map_or(poll, |due| {
+                poll.min(due.saturating_duration_since(Instant::now()))
+            });
+            std::thread::sleep(wait);
             match bound.observe(path)? {
                 None => return Ok(()),
                 Some(bytes) if bytes != seen => break,
                 Some(_) => {}
+            }
+            if due.is_some_and(|due| Instant::now() >= due) {
+                break;
             }
         }
     }
@@ -148,6 +169,68 @@ mod tests {
                 _ => panic!("a pass after the pile was replaced"),
             }
             Ok(())
+        })
+        .unwrap();
+        assert_eq!(passes, 2);
+    }
+
+    /// A deadline a pass names runs the next pass when it comes, on a pile
+    /// that never grows, even when the look interval is an hour.
+    #[test]
+    fn a_pass_runs_at_the_deadline_the_last_one_named_on_a_quiet_pile() {
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("self.pile");
+        std::fs::write(&pile, b"prefix").unwrap();
+        let bound = BackingIdentity::of(&pile).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut passes = 0;
+            let result =
+                run_until_replaced_or_due(&pile, &bound, Duration::from_secs(3600), || {
+                    passes += 1;
+                    match passes {
+                        1 => Ok(Some(Instant::now() + Duration::from_millis(100))),
+                        _ => anyhow::bail!("the second pass"),
+                    }
+                });
+            let _ = done.send((passes, started.elapsed(), result.is_err()));
+        });
+        let (passes, elapsed, ended) = finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("no pass ran at the deadline on a quiet pile");
+        assert_eq!((passes, ended), (2, true));
+        assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+    }
+
+    /// A deadline already past is not a reason to pass again: the loop waits
+    /// for growth instead of spinning.
+    #[test]
+    fn a_past_deadline_does_not_spin_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let pile = dir.path().join("self.pile");
+        std::fs::write(&pile, b"prefix").unwrap();
+        let bound = BackingIdentity::of(&pile).unwrap();
+        let mut passes = 0;
+        run_until_replaced_or_due(&pile, &bound, Duration::from_millis(20), || {
+            passes += 1;
+            match passes {
+                1 => {
+                    let grow = pile.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(200));
+                        append(&grow, b" later");
+                    });
+                    Ok(Some(Instant::now() - Duration::from_secs(1)))
+                }
+                2 => {
+                    let compacted = dir.path().join("compacted.pile");
+                    std::fs::write(&compacted, b"compacted").unwrap();
+                    std::fs::rename(&compacted, &pile).unwrap();
+                    Ok(None)
+                }
+                _ => panic!("a pass with neither growth nor a deadline due"),
+            }
         })
         .unwrap();
         assert_eq!(passes, 2);

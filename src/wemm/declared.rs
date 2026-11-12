@@ -19,7 +19,15 @@
 //! host's memory cannot admit) is skipped with one line naming its indexes,
 //! and the others are maintained. It is tried again only after
 //! [`BIND_RETRY_ENV`] seconds, because a bind opens the pile and may copy
-//! gigabytes before it fails. Nothing falls back to another model.
+//! gigabytes before it fails; the pass names that moment
+//! ([`Pass::retry_at`]) and the daemon runs a pass then even if the pile has
+//! not grown, since memory can come free without any write. Nothing falls
+//! back to another model.
+//!
+//! Descriptors are read only from what is here: discovery never fetches, so
+//! a collection whose descriptor has not arrived is passed over until it
+//! has. Backlogs, model weights and leaves are read as maintenance reads
+//! them.
 //!
 //! What it does not do: a descriptor that is registered but named by no
 //! record is an ordinary blob, which no store indexes by what it describes,
@@ -40,7 +48,8 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace::core::collection::{Collection, CollectionHandle};
+use triblespace::core::collection::{Collection, CollectionHandle, CollectionRead};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::core::repo::StoreRead;
 use triblespace::prelude::*;
 use triblespace_search::semantic_wemm::{
@@ -193,6 +202,29 @@ impl Config {
         })
     }
 
+    /// Whether this list can run with weights `aliased` from the pile or
+    /// copied to the device, and the line to log at start if so. Aliased
+    /// binds keep their registrations until the process exits, so binding
+    /// several models in turn would accumulate them: several models need
+    /// device copies. With device copies, a released model's memory is
+    /// dropped with its session, but whether the allocator has returned it
+    /// before the next bind reads MemAvailable has not been verified on the
+    /// GPU, and the start line says so.
+    pub fn check_residence(&self, aliased: bool) -> Result<Option<String>> {
+        if self.models.len() <= 1 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            !aliased,
+            "{MODELS_ENV} lists {} models, and weights aliased from the pile (WEMM_COPY_WEIGHTS unset or 0) keep every bind's registrations until the process exits, so models bound in turn would accumulate them; set WEMM_COPY_WEIGHTS=1 (device copies), the supported mode for several models, or list one model",
+            self.models.len()
+        );
+        Ok(Some(format!(
+            "maintain: {} models listed, bound in turn with device copies; that the allocator returns a released model's device memory before the next bind reads MemAvailable is NOT verified on the GPU",
+            self.models.len()
+        )))
+    }
+
     fn lists(&self, identity: &WemmIdentity) -> bool {
         self.models.iter().any(|listed| listed.covers(identity))
     }
@@ -244,6 +276,14 @@ pub trait Binder {
     type Model;
     /// Bind exactly the model `identity` names, or say why not.
     fn bind(&mut self, identity: WemmIdentity) -> Result<Self::Model>;
+    /// Whether whatever a bind registers stays until the process exits, so
+    /// that this process must never bind a second model: true for weights
+    /// aliased from the pile, whose external registrations the CUDA runtime
+    /// keeps until its teardown (mary `cuda_bf16_alias`), not until the
+    /// session is dropped.
+    fn keeps_every_bind(&self) -> bool {
+        false
+    }
     /// Maintain the index `target`, derived from `source`, with `model`.
     fn maintain(
         &mut self,
@@ -296,6 +336,10 @@ impl Binder for SessionBinder {
         )?;
         session.start_probe_from_env()?;
         Ok(session)
+    }
+
+    fn keeps_every_bind(&self) -> bool {
+        self.residence == mary::nn::cuda_bf16_alias::WeightResidence::PileAliased
     }
 
     fn maintain(
@@ -354,7 +398,17 @@ pub struct Maintainer<B: Binder> {
     bound: Vec<Bound<B::Model>>,
     failed: Vec<(WemmIdentity, Instant)>,
     named: Vec<WemmIdentity>,
+    /// The first model this process bound, for a binder that keeps every
+    /// bind ([`Binder::keeps_every_bind`]).
+    first_bound: Option<WemmIdentity>,
     passes: u64,
+}
+
+/// What one pass did: the lines to log, and when the next pass is due even
+/// if the pile does not grow (the earliest bind retry still pending).
+pub struct Pass {
+    pub lines: Vec<String>,
+    pub retry_at: Option<Instant>,
 }
 
 impl<B: Binder> Maintainer<B> {
@@ -366,6 +420,7 @@ impl<B: Binder> Maintainer<B> {
             bound: Vec::new(),
             failed: Vec::new(),
             named: Vec::new(),
+            first_bound: None,
             passes: 0,
         }
     }
@@ -378,24 +433,21 @@ impl<B: Binder> Maintainer<B> {
     /// One pass: find the indexes, bind what has work, maintain it. Returns
     /// the lines to log: an index only when the pass derived something or
     /// left something missing, a model when it is first found (listed and
-    /// maintained, or not listed) and when it is skipped, bound or released. Only a failure to read the store at all is an error; one
-    /// index or one model failing is a line, and the rest go on.
-    pub fn pass(&mut self) -> Result<Vec<String>> {
+    /// maintained, or not listed) and when it is skipped, bound or released.
+    /// Only a failure to read the store at all is an error; one index or one
+    /// model failing is a line, and the rest go on.
+    pub fn pass(&mut self) -> Result<Pass> {
         self.passes += 1;
         let mut lines = Vec::new();
         // One snapshot answers which indexes exist and how far behind each
         // listed one is; an index of a model not listed is not read further.
         let config = &self.config;
         let mut declared = self.storage.with_store(|store, _, runtime| {
-            let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
-            let mut declared = Vec::new();
-            for index in declared_indexes(&reader).context("find the declared WeMM indexes")? {
-                let backlog = config
-                    .lists(&index.identity)
-                    .then(|| backlog(&reader, &index));
-                declared.push((index, backlog));
-            }
-            Ok(declared)
+            // The snapshot's own reads are resident-only; the acquiring
+            // reader is what maintenance reads the backlog through.
+            let snapshot = store.snapshot()?;
+            let reader = AcquiringReader::new(snapshot.clone(), runtime.clone());
+            discover(&snapshot, &reader, config)
         })?;
         declared.sort_by_key(|(index, _)| (key(&index.identity), index.index));
         let mut groups: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
@@ -488,7 +540,14 @@ impl<B: Binder> Maintainer<B> {
                 }
             }
         }
-        Ok(lines)
+        let now = Instant::now();
+        let retry_at = self
+            .failed
+            .iter()
+            .map(|(_, failed)| *failed + self.config.retry)
+            .filter(|due| *due > now)
+            .min();
+        Ok(Pass { lines, retry_at })
     }
 
     /// The slot of a bound model `identity`, binding it if need be; `None`
@@ -514,6 +573,18 @@ impl<B: Binder> Maintainer<B> {
             }
             self.failed.remove(position);
         }
+        if let Some(first) = self.first_bound {
+            if first != identity && self.binder.keeps_every_bind() {
+                // Once per retry interval, like a failed bind.
+                lines.push(format!(
+                    "maintain: not binding model {}: this process bound {} with weights aliased from the pile, whose registrations stay until it exits, so it binds no other model; set WEMM_COPY_WEIGHTS=1 for several models",
+                    model_name(&identity),
+                    model_name(&first)
+                ));
+                self.failed.push((identity, now));
+                return None;
+            }
+        }
         if self.bound.len() >= self.config.max_bound {
             // A bound model with nothing to derive this pass goes first, else
             // the one served least recently.
@@ -537,12 +608,19 @@ impl<B: Binder> Maintainer<B> {
                 wanted.len(),
                 self.config.max_bound
             ));
-            // Its device memory is released before the next bind reads
-            // MemAvailable.
+            // Dropping the session drops what it owns: the runtime, its
+            // tensors and the pile snapshot. That this returns device memory
+            // to the host before the next bind reads MemAvailable is not
+            // established: CubeCL may keep freed pool pages for reuse, and
+            // nothing here asks the allocator to give them back. Aliased
+            // weights' registrations stay until the process exits
+            // (`Binder::keeps_every_bind`), which is why aliased binds never
+            // reach this release for another model.
             drop(released);
         }
         match self.binder.bind(identity) {
             Ok(model) => {
+                self.first_bound.get_or_insert(identity);
                 lines.push(format!(
                     "maintain: bound model {} for index(es) {}",
                     model_name(&identity),
@@ -575,6 +653,31 @@ fn names(members: &[(DeclaredIndex, usize)]) -> String {
         .map(|(index, _)| short(index.index))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The WeMM indexes `resident`'s records name, from descriptors that are
+/// here: descriptors are read only from `resident`, which never fetches, so
+/// a collection whose descriptor is not here is passed over and nothing is
+/// requested for it. Each index of a listed model comes with its backlog,
+/// read through `acquiring` as maintenance reads it; other indexes are not
+/// read further.
+fn discover<P, A>(
+    resident: &P,
+    acquiring: &A,
+    config: &Config,
+) -> Result<Vec<(DeclaredIndex, Option<Result<usize>>)>>
+where
+    P: CollectionRead + BlobStoreGet,
+    A: StoreRead,
+{
+    let mut declared = Vec::new();
+    for index in declared_indexes(resident).context("find the declared WeMM indexes")? {
+        let backlog = config
+            .lists(&index.identity)
+            .then(|| backlog(acquiring, &index));
+        declared.push((index, backlog));
+    }
+    Ok(declared)
 }
 
 /// How many foundations of `index`'s source have no usable leaf in it.
