@@ -393,3 +393,48 @@ fn alarm_words_are_quoted_for_ssh_and_applescript() {
     );
     assert_eq!(runner.transport.calls[1], "hue Kim's lights");
 }
+
+fn sh(script: &str) -> Vec<String> {
+    vec!["-c".to_owned(), script.to_owned()]
+}
+
+#[test]
+fn a_program_rung_returns_by_its_deadline_though_a_descendant_holds_its_output() {
+    let started = std::time::Instant::now();
+    let out = run_with_timeout(
+        "sh",
+        &sh("sleep 20 & echo started"),
+        std::time::Duration::from_secs(3),
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(6), "took {took:?}");
+    assert_eq!(out.unwrap().trim(), "started");
+}
+
+#[test]
+fn a_program_rung_that_prints_a_lot_is_drained_and_capped_by_its_deadline() {
+    let started = std::time::Instant::now();
+    let out = run_with_timeout(
+        "sh",
+        &sh("head -c 5000000 /dev/zero; echo noise >&2"),
+        std::time::Duration::from_secs(5),
+    );
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(8), "took {took:?}");
+    let out = out.unwrap();
+    assert!(out.len() <= OUTPUT_CAP, "{} bytes kept", out.len());
+}
+
+#[test]
+fn a_program_rung_past_its_deadline_is_killed_with_its_whole_group() {
+    let started = std::time::Instant::now();
+    let error = run_with_timeout(
+        "sh",
+        &sh("sleep 30 & sleep 30"),
+        std::time::Duration::from_secs(1),
+    )
+    .unwrap_err();
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+}

@@ -2,7 +2,10 @@
 //!
 //! The ladder ([`super::ladder`]) says which rungs are due; a [`RungRunner`]
 //! runs one and says how it ended. Operations record the step afterwards,
-//! whatever the outcome, so one dead channel never stalls the escalation.
+//! whatever the outcome, so a channel that FAILS never stalls the escalation.
+//! One that hangs is bounded only as far as its transport is: a program
+//! rung by [`run_with_timeout`], an HTTP rung by its client's per-request
+//! timeout.
 
 use triblespace::prelude::*;
 
@@ -615,21 +618,85 @@ impl Transport for Live {
     }
 }
 
-/// Run a program with no stdin, killing it after `timeout`; its stdout.
+/// The most stdout a program rung keeps; the rest is read and dropped.
+pub const OUTPUT_CAP: usize = 64 * 1024;
+/// The most stderr a program rung keeps for its error.
+const ERROR_CAP: usize = 8 * 1024;
+/// How long the output of a program that has exited may stay open (a
+/// descendant holding it) before the program's group is killed.
+const SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read a pipe to its end on its own thread, keeping at most `cap` bytes, so
+/// a program that prints a lot never blocks on a full pipe.
+fn drain<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    cap: usize,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let room = cap.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buffer[..read.min(room)]);
+                }
+            }
+        }
+        let _ = sender.send(kept);
+    });
+    receiver
+}
+
+/// Kill a whole process group (the program and every descendant it left).
+fn kill_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        if pgid > 0 {
+            // SAFETY: SIGKILL to a process group this function started.
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Run a program with no stdin and return its stdout (at most
+/// [`OUTPUT_CAP`] bytes), all within `timeout` plus a bounded settle.
+///
+/// What is bounded: the program runs in its own process group; stdout and
+/// stderr are drained on their own threads while it runs, so a large output
+/// cannot block it; at the deadline the whole group is killed and the
+/// output is not waited for any longer; after the program exits, output a
+/// descendant still holds open is waited for at most [`SETTLE`], then the
+/// group is killed and the readers are given [`SETTLE`] once more before
+/// they are abandoned. So this returns within about `timeout + 2 * SETTLE`.
+/// For an `ssh` rung that bounds the ssh CLIENT; whether the remote command
+/// stops when the client is killed is up to the remote side.
+///
+/// What is not bounded here: the rungs that are not programs. Discord
+/// sends, pulls and say requests rely on the Discord client's per-request
+/// timeout, the Hue alert on the bridge client's, and the message faculty
+/// and the pile operations around every step on nothing of their own.
 pub fn run_with_timeout(
     program: &str,
     args: &[String],
     timeout: std::time::Duration,
 ) -> Result<String> {
-    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    let started = std::time::Instant::now();
     let mut child = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("start {program}"))?;
-    let started = std::time::Instant::now();
+    let group = child.id();
+    let stdout = drain(child.stdout.take().expect("piped stdout"), OUTPUT_CAP);
+    let stderr = drain(child.stderr.take().expect("piped stderr"), ERROR_CAP);
     let status = loop {
         if let Some(status) = child
             .try_wait()
@@ -638,24 +705,32 @@ pub fn run_with_timeout(
             break status;
         }
         if started.elapsed() > timeout {
-            let _ = child.kill();
+            kill_group(group);
             let _ = child.wait();
             bail!("{program} did not finish within {} s", timeout.as_secs());
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    let settle = |receiver: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        receiver
+            .recv_timeout(SETTLE)
+            .or_else(|_| {
+                // A descendant holds the output open: end the group, and
+                // give the reader one more bounded wait.
+                kill_group(group);
+                receiver.recv_timeout(SETTLE)
+            })
+            .unwrap_or_default()
+    };
+    let out = settle(&stdout);
+    let err = settle(&stderr);
     if !status.success() {
-        bail!("{program} failed ({status}): {}", stderr.trim());
+        bail!(
+            "{program} failed ({status}): {}",
+            String::from_utf8_lossy(&err).trim()
+        );
     }
-    Ok(stdout)
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 #[cfg(test)]
