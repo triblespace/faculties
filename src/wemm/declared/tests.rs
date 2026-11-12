@@ -235,11 +235,20 @@ fn identity(root: u8, profile: Id) -> WemmIdentity {
     }
 }
 
-fn config(max_bound: usize) -> Config {
+/// `models` listed exactly, each in its own collection.
+fn config(max_bound: usize, models: &[WemmIdentity]) -> Config {
     Config {
         max_bound,
-        skip: Vec::new(),
+        models: models.iter().map(listed).collect(),
         retry: Duration::from_secs(3600),
+    }
+}
+
+fn listed(model: &WemmIdentity) -> Listed {
+    Listed {
+        collection: Some(model.model_collection),
+        root: model.model_root,
+        profile: WemmProfile::of(model.kernel_profile).unwrap(),
     }
 }
 
@@ -257,7 +266,8 @@ fn each_declared_index_is_maintained_with_the_model_its_descriptor_names() {
     fixture.name_by_a_record(second);
     assert_eq!((fixture.missing(first), fixture.missing(second)), (3, 3));
 
-    let (mut maintainer, log) = fixture.maintainer(config(2), Vec::new());
+    let (mut maintainer, log) =
+        fixture.maintainer(config(2, &[first_model, second_model]), Vec::new());
     let lines = maintainer.pass().unwrap();
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(log.borrow().binds, vec![first_model, second_model]);
@@ -292,7 +302,7 @@ fn an_index_is_not_derived_under_another_model() {
     let fixture = Fixture::new(2);
     let model = identity(2, GB10_NATIVE_BF16_PROFILE);
     let index = fixture.declare(model);
-    let (_, log) = fixture.maintainer(config(1), Vec::new());
+    let (_, log) = fixture.maintainer(config(1, &[model]), Vec::new());
     let mut binder = TestBinder {
         log,
         unbindable: Vec::new(),
@@ -320,7 +330,10 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
     fixture.name_by_a_record(good);
     fixture.name_by_a_record(bad);
 
-    let (mut maintainer, log) = fixture.maintainer(config(1), vec![bad_model.model_root]);
+    let (mut maintainer, log) = fixture.maintainer(
+        config(1, &[good_model, bad_model]),
+        vec![bad_model.model_root],
+    );
     let lines = maintainer.pass().unwrap();
     assert_eq!((fixture.missing(good), fixture.missing(bad)), (0, 3));
     let skip = lines
@@ -350,7 +363,7 @@ fn an_unbindable_model_is_skipped_with_a_line_and_the_others_are_maintained() {
     let (mut eager, log) = fixture.maintainer(
         Config {
             retry: Duration::ZERO,
-            ..config(1)
+            ..config(1, &[good_model, bad_model])
         },
         vec![bad_model.model_root],
     );
@@ -370,7 +383,8 @@ fn an_index_named_after_start_is_maintained_on_the_next_pass() {
     let later_model = identity(4, GB10_NATIVE_W4A4_PROFILE);
     let first = fixture.declare(first_model);
     fixture.name_by_a_record(first);
-    let (mut maintainer, log) = fixture.maintainer(config(2), Vec::new());
+    let (mut maintainer, log) =
+        fixture.maintainer(config(2, &[first_model, later_model]), Vec::new());
     maintainer.pass().unwrap();
     assert_eq!(fixture.missing(first), 0);
 
@@ -404,7 +418,8 @@ fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     let second = fixture.declare(second_model);
     fixture.name_by_a_record(first);
     fixture.name_by_a_record(second);
-    let (mut maintainer, log) = fixture.maintainer(config(1), Vec::new());
+    let (mut maintainer, log) =
+        fixture.maintainer(config(1, &[first_model, second_model]), Vec::new());
     let lines = maintainer.pass().unwrap();
     assert_eq!((fixture.missing(first), fixture.missing(second)), (0, 0));
     assert_eq!(log.borrow().binds, vec![first_model, second_model]);
@@ -426,9 +441,11 @@ fn one_bound_model_at_a_time_serves_every_model_in_turn() {
     );
 }
 
-/// A model on the skip list is never bound; it is named once.
+/// Of two declared models only the listed one is bound and maintained;
+/// each model is named once, the listed one as maintained and the other as
+/// not listed, and the unlisted one's index is left as it is.
 #[test]
-fn a_skipped_model_is_never_bound_and_is_named_once() {
+fn only_a_listed_model_is_bound_and_maintained() {
     let fixture = Fixture::new(2);
     let kept_model = identity(2, GB10_NATIVE_W4A4_VW4A16_PROFILE);
     let retired_model = identity(3, GB10_NATIVE_W4A4_PROFILE);
@@ -436,70 +453,150 @@ fn a_skipped_model_is_never_bound_and_is_named_once() {
     let retired = fixture.declare(retired_model);
     fixture.name_by_a_record(kept);
     fixture.name_by_a_record(retired);
-    let skip = Config::from_env_values(
+    let only = Config::from_env_values(
         None,
-        Some(OsStr::new(&format!("{:X}/w4a4", retired_model.model_root))),
+        Some(OsStr::new(&format!(
+            "{:X}/w4a4-vw4a16",
+            kept_model.model_root
+        ))),
         None,
+        || panic!("the configured model is read only when nothing is listed"),
     )
     .unwrap();
-    let (mut maintainer, log) = fixture.maintainer(skip, Vec::new());
+    let (mut maintainer, log) = fixture.maintainer(only, Vec::new());
     let mut lines = maintainer.pass().unwrap();
     fixture.add_member();
     lines.extend(maintainer.pass().unwrap());
     assert_eq!(log.borrow().binds, vec![kept_model]);
+    assert!(log
+        .borrow()
+        .maintained
+        .iter()
+        .all(|(model, index)| *model == kept_model && *index == kept.handle()));
     assert_eq!((fixture.missing(kept), fixture.missing(retired)), (0, 3));
-    assert_eq!(
-        lines
-            .iter()
-            .filter(|line| line.contains("not binding model"))
-            .count(),
-        1,
-        "{lines:#?}"
+    let count = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+    assert_eq!(count("is not listed"), 1, "{lines:#?}");
+    assert_eq!(count("is listed; maintaining"), 1, "{lines:#?}");
+    let not_listed = lines
+        .iter()
+        .find(|line| line.contains("is not listed"))
+        .unwrap();
+    assert!(
+        not_listed.contains(&format!("{:X}", retired_model.model_root))
+            && not_listed.contains(&collection_hex(retired.handle())[..16]),
+        "{not_listed}"
     );
 }
 
+/// A model listed with its collection does not cover the same root and
+/// profile in another collection.
 #[test]
-fn the_configuration_is_its_defaults_or_exactly_what_is_written() {
-    let defaults = Config::from_env_values(None, None, None).unwrap();
-    assert_eq!(defaults, config(1).with_retry(DEFAULT_BIND_RETRY));
+fn a_collection_qualified_model_covers_only_its_own_collection() {
+    let model = identity(2, GB10_NATIVE_BF16_PROFILE);
+    let elsewhere = WemmIdentity {
+        model_collection: Inline::new([2; 32]),
+        ..model
+    };
+    let qualified = listed(&model);
+    let unqualified = Listed {
+        collection: None,
+        ..qualified
+    };
+    assert!(qualified.covers(&model) && !qualified.covers(&elsewhere));
+    assert!(unqualified.covers(&model) && unqualified.covers(&elsewhere));
+    let other_profile = WemmIdentity {
+        kernel_profile: GB10_NATIVE_W4A4_PROFILE,
+        ..model
+    };
+    assert!(!unqualified.covers(&other_profile));
+}
+
+/// Unset, the list is the one model the single-model mode is configured
+/// with; with nothing listed and nothing configured the mode refuses to
+/// start, and so does a list with no model in it.
+#[test]
+fn with_no_model_listed_or_configured_the_declared_mode_refuses() {
+    let configured = listed(&identity(2, GB10_NATIVE_W4A4_VW4A16_PROFILE));
+    let defaults = Config::from_env_values(None, None, None, || Ok(Some(configured))).unwrap();
+    assert_eq!(
+        defaults,
+        Config {
+            max_bound: 1,
+            models: vec![configured],
+            retry: DEFAULT_BIND_RETRY,
+        }
+    );
+    let error = Config::from_env_values(None, None, None, || Ok(None))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("none is") && error.contains(MODELS_ENV) && error.contains("WEMM_ROOT"),
+        "{error}"
+    );
+    for empty in ["", " , ,"] {
+        assert!(
+            Config::from_env_values(None, Some(OsStr::new(empty)), None, || Ok(Some(configured)))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn the_configuration_is_exactly_what_is_written() {
     let root = "25A3305015AC1B827E7856DE37DBF723";
     let other = "E1A7DFB9D59FD338DB1C89F96E9672E1";
+    let collection = "a03d075c3cc31e5644b80dda054d0d59ec5b6c898cae1305143de055b0fb75e7";
     let written = Config::from_env_values(
         Some(OsStr::new("2")),
-        Some(OsStr::new(&format!("{root}, {other}/w4a4,"))),
+        Some(OsStr::new(&format!(
+            "{root}/w4a4-vw4a16, {collection}/{other}/w4a4,"
+        ))),
         Some(OsStr::new("60")),
+        || panic!("not read"),
     )
     .unwrap();
     assert_eq!(written.max_bound, 2);
     assert_eq!(written.retry, Duration::from_secs(60));
     assert_eq!(
-        written.skip,
+        written.models,
         vec![
-            Skip {
+            Listed {
+                collection: None,
                 root: Id::from_hex(root).unwrap(),
-                profile: None,
+                profile: WemmProfile::W4a4Vw4a16,
             },
-            Skip {
+            Listed {
+                collection: Some(
+                    mary::model_collection::parse_collection_handle(collection).unwrap()
+                ),
                 root: Id::from_hex(other).unwrap(),
-                profile: Some(WemmProfile::W4a4),
+                profile: WemmProfile::W4a4,
             },
         ]
     );
-    for (max_bound, skip, retry) in [
-        (Some("0"), None, None),
-        (Some("one"), None, None),
-        (None, Some("25A3"), None),
+    let some = format!("{root}/bf16");
+    for (max_bound, models, retry) in [
+        (Some("0"), Some(some.as_str()), None),
+        (Some("one"), Some(some.as_str()), None),
+        (None, Some(root), None),
+        (None, Some("25A3/bf16"), None),
         (None, Some("25A3305015AC1B827E7856DE37DBF723/fp4"), None),
-        (None, None, Some("soon")),
+        (
+            None,
+            Some("abc/25A3305015AC1B827E7856DE37DBF723/bf16"),
+            None,
+        ),
+        (None, Some(some.as_str()), Some("soon")),
     ] {
         assert!(
             Config::from_env_values(
                 max_bound.map(OsStr::new),
-                skip.map(OsStr::new),
-                retry.map(OsStr::new)
+                models.map(OsStr::new),
+                retry.map(OsStr::new),
+                || Ok(None)
             )
             .is_err(),
-            "{max_bound:?} {skip:?} {retry:?} accepted"
+            "{max_bound:?} {models:?} {retry:?} accepted"
         );
     }
 }
@@ -519,11 +616,4 @@ fn an_unknown_profile_is_refused_before_anything_is_opened() {
         Err(error) => format!("{error:#}"),
     };
     assert!(error.contains("is not one this build runs"), "{error}");
-}
-
-impl Config {
-    fn with_retry(mut self, retry: Duration) -> Self {
-        self.retry = retry;
-        self
-    }
 }

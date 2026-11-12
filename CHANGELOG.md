@@ -5,15 +5,18 @@ All notable changes to this project will be documented in this file.
 ## Unreleased
 
 - `faculties maintain --declared` maintains every WeMM index the pile's
-  records name, each with the model its own descriptor names (collection,
-  root, profile), instead of the one model `WEMM_ROOT`/`WEMM_PROFILE` name and
-  the three faculty indexes listed in code. Indexes are found again on every
-  pass, grouped by model; a model with nothing to derive is not bound; a
-  model that cannot be bound is skipped with a line and retried after
+  records name whose descriptor names a model of `WEMM_MAINTAIN_MODELS`
+  (`ROOT/profile` or `COLLECTION/ROOT/profile`, comma-separated), each with
+  that model, instead of the three faculty indexes listed in code. Unset, the
+  list is the one model `WEMM_ROOT`, `WEMM_PROFILE` and
+  `TRIBLESPACE_COLLECTION_MODELS` configure; with neither it refuses to
+  start. Indexes are found again on every pass, so a new index of a listed
+  model is picked up; each model found is named once (maintained, or not
+  listed). A listed model with nothing to derive is not bound; one that
+  cannot be bound is skipped with a line and retried after
   `WEMM_MAINTAIN_BIND_RETRY_SECS` (1800), never replaced by another.
-  `WEMM_MAINTAIN_MAX_BOUND` (1) caps the models bound at once and
-  `WEMM_MAINTAIN_SKIP` lists models this host never binds. An index is found
-  from its first leaf on; one that is only registered is not, so the
+  `WEMM_MAINTAIN_MAX_BOUND` (1) caps the models bound at once. An index is
+  found from its first leaf on; one that is only registered is not, so the
   single-model mode (unchanged, the default) is still how an index gets its
   first leaf. `Session::maintain` maintains an index without registering it,
   and `Session::bind_identity` binds exactly the model an identity names.

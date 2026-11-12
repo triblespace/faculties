@@ -109,17 +109,19 @@ enum Command {
         /// can run.
         #[arg(long, value_name = "SECONDS", default_value_t = 60)]
         poll: u64,
-        /// Maintain every WeMM index the pile's records name, each with the
-        /// model its own descriptor names (its collection, root and profile),
-        /// instead of the one model WEMM_ROOT and WEMM_PROFILE name; those two
-        /// and TRIBLESPACE_COLLECTION_MODELS are then ignored. A model that
-        /// cannot be bound is skipped with a line and tried again later; the
-        /// other models' indexes are maintained. An index is found from its
-        /// first leaf on: one that is only registered is not found. Configured
-        /// by WEMM_MAINTAIN_MAX_BOUND (models bound at once, default 1),
-        /// WEMM_MAINTAIN_SKIP (roots, or ROOT/profile, never bound) and
-        /// WEMM_MAINTAIN_BIND_RETRY_SECS (default 1800), plus
-        /// WEMM_COPY_WEIGHTS and WEMM_PROBE_DIR as above, for every bind.
+        /// Maintain every WeMM index the pile's records name whose descriptor
+        /// names a listed model, each with that model (its collection, root and
+        /// profile as the descriptor states them), instead of the three faculty
+        /// indexes of the one model WEMM_ROOT and WEMM_PROFILE name.
+        /// WEMM_MAINTAIN_MODELS lists the models, comma-separated, as
+        /// ROOT/profile or COLLECTION/ROOT/profile; unset, it is the one model
+        /// WEMM_ROOT, WEMM_PROFILE and TRIBLESPACE_COLLECTION_MODELS configure,
+        /// and with neither it refuses to start. A new index of a listed model
+        /// is picked up on the next pass; an index that is only registered (no
+        /// leaf yet) is not found. A model that cannot be bound is skipped with
+        /// a line and tried again after WEMM_MAINTAIN_BIND_RETRY_SECS (default
+        /// 1800); WEMM_MAINTAIN_MAX_BOUND (default 1) caps the models bound at
+        /// once. WEMM_COPY_WEIGHTS and WEMM_PROBE_DIR apply to every bind.
         #[arg(long)]
         declared: bool,
     },

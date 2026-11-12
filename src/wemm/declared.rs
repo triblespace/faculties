@@ -23,9 +23,14 @@
 //!
 //! What it does not do: a descriptor that is registered but named by no
 //! record is an ordinary blob, which no store indexes by what it describes,
-//! so such an index is not found until its first leaf exists. And a
-//! declaration cannot be withdrawn from a grow-only store, so a model that
-//! is retired is excluded by this host's [`SKIP_ENV`].
+//! so such an index is not found until its first leaf exists.
+//!
+//! Which indexes a host maintains is its own choice, as its merges and
+//! attachments are: only those whose descriptor names a model of
+//! [`MODELS_ENV`]. A declaration can never be withdrawn from a grow-only
+//! store, so every retired model stays declared; a positive list keeps a
+//! retired model out without anyone having to remember it, and a new index
+//! of a listed model is still picked up on the next pass.
 
 use super::{Derived, Target};
 use crate::storage::{AcquiringReader, FacultyStore, Storage};
@@ -47,34 +52,69 @@ use triblespace_search::semantic_wemm::{
 /// releases one first, a bound one with nothing to derive if there is one,
 /// else the one served least recently.
 pub const MAX_BOUND_ENV: &str = "WEMM_MAINTAIN_MAX_BOUND";
-/// Models this host never binds, comma-separated: a root as 32 hex digits
-/// (every profile of it), or `ROOT/profile` with a profile label.
-pub const SKIP_ENV: &str = "WEMM_MAINTAIN_SKIP";
+/// The models whose indexes this host maintains, comma-separated:
+/// `ROOT/profile`, or `COLLECTION/ROOT/profile` to name the model collection
+/// too (64 hex digits). Unset, it is the one model `WEMM_ROOT`,
+/// `WEMM_PROFILE` and `TRIBLESPACE_COLLECTION_MODELS` configure; with
+/// neither, the declared mode refuses to start.
+pub const MODELS_ENV: &str = "WEMM_MAINTAIN_MODELS";
 /// Seconds before a model whose bind failed is tried again (default 1800).
 pub const BIND_RETRY_ENV: &str = "WEMM_MAINTAIN_BIND_RETRY_SECS";
 pub const DEFAULT_BIND_RETRY: Duration = Duration::from_secs(1800);
 
-/// One model of [`SKIP_ENV`]: a root, and a profile when one is named.
+/// One model of [`MODELS_ENV`]: a root under a profile, in one model
+/// collection when one is named, else in any.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Skip {
+pub struct Listed {
+    pub collection: Option<CollectionHandle>,
     pub root: Id,
-    pub profile: Option<WemmProfile>,
+    pub profile: WemmProfile,
 }
 
-impl Skip {
+impl Listed {
     fn covers(&self, identity: &WemmIdentity) -> bool {
         self.root == identity.model_root
+            && self.profile.id() == identity.kernel_profile
             && self
-                .profile
-                .is_none_or(|profile| profile.id() == identity.kernel_profile)
+                .collection
+                .is_none_or(|collection| collection == identity.model_collection)
     }
+
+    fn name(&self) -> String {
+        match self.collection {
+            Some(collection) => format!(
+                "{}/{:X}/{}",
+                collection_hex(collection),
+                self.root,
+                self.profile.label()
+            ),
+            None => format!("{:X}/{}", self.root, self.profile.label()),
+        }
+    }
+}
+
+/// The one model the single-model mode would bind: `WEMM_ROOT` under
+/// `WEMM_PROFILE` in the collection `TRIBLESPACE_COLLECTION_MODELS` names,
+/// or `None` when `WEMM_ROOT` is unset.
+pub fn configured_model() -> Result<Option<Listed>> {
+    let Ok(root) = std::env::var("WEMM_ROOT") else {
+        return Ok(None);
+    };
+    let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
+    let profile = super::profile_from_env_value(std::env::var_os(super::PROFILE_ENV).as_deref())?;
+    let collection = crate::model_storage::models_handle()?;
+    Ok(Some(Listed {
+        collection: Some(collection),
+        root,
+        profile,
+    }))
 }
 
 /// What the declared mode is configured with, read once at start.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub max_bound: usize,
-    pub skip: Vec<Skip>,
+    pub models: Vec<Listed>,
     pub retry: Duration,
 }
 
@@ -82,17 +122,21 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         Self::from_env_values(
             std::env::var_os(MAX_BOUND_ENV).as_deref(),
-            std::env::var_os(SKIP_ENV).as_deref(),
+            std::env::var_os(MODELS_ENV).as_deref(),
             std::env::var_os(BIND_RETRY_ENV).as_deref(),
+            configured_model,
         )
     }
 
-    /// The configuration these values give; anything malformed is refused,
-    /// so a typo never quietly binds a model that was meant to be skipped.
+    /// The configuration these values give, `configured` supplying the
+    /// model when [`MODELS_ENV`] is unset. Anything malformed is refused,
+    /// and so is a configuration that lists no model: which indexes a host
+    /// maintains is never guessed.
     pub fn from_env_values(
         max_bound: Option<&OsStr>,
-        skip: Option<&OsStr>,
+        models: Option<&OsStr>,
         retry: Option<&OsStr>,
+        configured: impl FnOnce() -> Result<Option<Listed>>,
     ) -> Result<Self> {
         let text = |name: &str, value: &OsStr| -> Result<String> {
             value
@@ -111,30 +155,26 @@ impl Config {
                     format!("{MAX_BOUND_ENV} must be a positive number of models; got {value:?}")
                 })?,
         };
-        let mut skipped = Vec::new();
-        if let Some(value) = skip {
-            for item in text(SKIP_ENV, value)?.split(',') {
-                let item = item.trim();
-                if item.is_empty() {
-                    continue;
+        let mut listed = Vec::new();
+        match models {
+            Some(value) => {
+                for item in text(MODELS_ENV, value)?.split(',') {
+                    let item = item.trim();
+                    if !item.is_empty() {
+                        listed.push(parse_listed(item)?);
+                    }
                 }
-                let (root, profile) = match item.split_once('/') {
-                    Some((root, label)) => (
-                        root,
-                        Some(WemmProfile::parse(label).with_context(|| {
-                            format!(
-                                "{SKIP_ENV}: {label:?} is not a profile (bf16, w4a4, w4a4-vw4a16)"
-                            )
-                        })?),
-                    ),
-                    None => (item, None),
-                };
-                let root = Id::from_hex(root).with_context(|| {
-                    format!("{SKIP_ENV}: {root:?} is not a 32-hex-digit model root")
-                })?;
-                skipped.push(Skip { root, profile });
+                anyhow::ensure!(
+                    !listed.is_empty(),
+                    "{MODELS_ENV} lists no model; it names ROOT/profile or COLLECTION/ROOT/profile, comma-separated"
+                );
             }
+            None => listed.extend(configured()?),
         }
+        anyhow::ensure!(
+            !listed.is_empty(),
+            "faculties maintain --declared maintains only listed models, and none is: set {MODELS_ENV} (ROOT/profile or COLLECTION/ROOT/profile, comma-separated), or WEMM_ROOT and WEMM_PROFILE with TRIBLESPACE_COLLECTION_MODELS for the one model the single-model mode binds"
+        );
         let retry = match retry {
             None => DEFAULT_BIND_RETRY,
             Some(value) => Duration::from_secs(
@@ -148,31 +188,54 @@ impl Config {
         };
         Ok(Self {
             max_bound,
-            skip: skipped,
+            models: listed,
             retry,
         })
     }
 
+    fn lists(&self, identity: &WemmIdentity) -> bool {
+        self.models.iter().any(|listed| listed.covers(identity))
+    }
+
     /// The line the declared mode starts with.
     pub fn describe(&self) -> String {
-        let skip = if self.skip.is_empty() {
-            "none".to_owned()
-        } else {
-            self.skip
-                .iter()
-                .map(|skip| match skip.profile {
-                    Some(profile) => format!("{:X}/{}", skip.root, profile.label()),
-                    None => format!("{:X}", skip.root),
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        };
         format!(
-            "maintain: every WeMM index the pile's records name, each with the model its descriptor names; at most {} bound ({MAX_BOUND_ENV}), never binding {skip} ({SKIP_ENV}), a failed bind retried after {} s ({BIND_RETRY_ENV})",
+            "maintain: every WeMM index the pile's records name whose descriptor names one of {} ({MODELS_ENV}), each with that model; at most {} bound ({MAX_BOUND_ENV}), a failed bind retried after {} s ({BIND_RETRY_ENV})",
+            self.models
+                .iter()
+                .map(Listed::name)
+                .collect::<Vec<_>>()
+                .join(","),
             self.max_bound,
             self.retry.as_secs()
         )
     }
+}
+
+fn parse_listed(item: &str) -> Result<Listed> {
+    let parts: Vec<&str> = item.split('/').collect();
+    let (collection, root, label) = match parts.as_slice() {
+        [root, label] => (None, *root, *label),
+        [collection, root, label] => (
+            Some(
+                mary::model_collection::parse_collection_handle(collection)
+                    .with_context(|| format!("{MODELS_ENV}: in {item:?}"))?,
+            ),
+            *root,
+            *label,
+        ),
+        _ => anyhow::bail!("{MODELS_ENV}: {item:?} is not ROOT/profile or COLLECTION/ROOT/profile"),
+    };
+    let root = Id::from_hex(root)
+        .with_context(|| format!("{MODELS_ENV}: {root:?} is not a 32-hex-digit model root"))?;
+    let profile = WemmProfile::parse(label).with_context(|| {
+        format!("{MODELS_ENV}: {label:?} is not a profile (bf16, w4a4, w4a4-vw4a16)")
+    })?;
+    Ok(Listed {
+        collection,
+        root,
+        profile,
+    })
 }
 
 /// How a host binds a model and maintains an index with it: the bound
@@ -282,7 +345,7 @@ struct Bound<M> {
 }
 
 /// The process side of the declared mode: the models it holds bound, the
-/// binds that failed and when, and which skipped models it has named. A few
+/// binds that failed and when, and which models it has named. A few
 /// entries per model; the indexes themselves are never kept.
 pub struct Maintainer<B: Binder> {
     storage: Storage,
@@ -290,7 +353,7 @@ pub struct Maintainer<B: Binder> {
     config: Config,
     bound: Vec<Bound<B::Model>>,
     failed: Vec<(WemmIdentity, Instant)>,
-    named_skips: Vec<WemmIdentity>,
+    named: Vec<WemmIdentity>,
     passes: u64,
 }
 
@@ -302,7 +365,7 @@ impl<B: Binder> Maintainer<B> {
             config,
             bound: Vec::new(),
             failed: Vec::new(),
-            named_skips: Vec::new(),
+            named: Vec::new(),
             passes: 0,
         }
     }
@@ -314,27 +377,42 @@ impl<B: Binder> Maintainer<B> {
 
     /// One pass: find the indexes, bind what has work, maintain it. Returns
     /// the lines to log: an index only when the pass derived something or
-    /// left something missing, a model only when it was skipped, bound or
-    /// released. Only a failure to read the store at all is an error; one
+    /// left something missing, a model when it is first found (listed and
+    /// maintained, or not listed) and when it is skipped, bound or released. Only a failure to read the store at all is an error; one
     /// index or one model failing is a line, and the rest go on.
     pub fn pass(&mut self) -> Result<Vec<String>> {
         self.passes += 1;
         let mut lines = Vec::new();
-        // One snapshot answers which indexes exist and how far behind each is.
+        // One snapshot answers which indexes exist and how far behind each
+        // listed one is; an index of a model not listed is not read further.
+        let config = &self.config;
         let mut declared = self.storage.with_store(|store, _, runtime| {
             let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
             let mut declared = Vec::new();
             for index in declared_indexes(&reader).context("find the declared WeMM indexes")? {
-                declared.push((index, backlog(&reader, &index)));
+                let backlog = config
+                    .lists(&index.identity)
+                    .then(|| backlog(&reader, &index));
+                declared.push((index, backlog));
             }
             Ok(declared)
         })?;
         declared.sort_by_key(|(index, _)| (key(&index.identity), index.index));
         let mut groups: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
+        let mut unlisted: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
         for (index, backlog) in declared {
             let backlog = match backlog {
-                Ok(backlog) => backlog,
-                Err(error) => {
+                None => {
+                    match unlisted.last_mut() {
+                        Some((identity, members)) if *identity == index.identity => {
+                            members.push((index, 0))
+                        }
+                        _ => unlisted.push((index.identity, vec![(index, 0)])),
+                    }
+                    continue;
+                }
+                Some(Ok(backlog)) => backlog,
+                Some(Err(error)) => {
                     lines.push(format!(
                         "maintain: index {} (model {}) not read: {error:#}",
                         short(index.index),
@@ -350,18 +428,27 @@ impl<B: Binder> Maintainer<B> {
                 _ => groups.push((index.identity, vec![(index, backlog)])),
             }
         }
+        // Each model is named once, when it is first found: at the first
+        // pass every model then declared, later only new ones.
+        for (identity, members) in &unlisted {
+            if !self.named.contains(identity) {
+                self.named.push(*identity);
+                lines.push(format!(
+                    "maintain: model {} is not listed ({MODELS_ENV}); its index(es) {} are not maintained here",
+                    model_name(identity),
+                    names(members)
+                ));
+            }
+        }
         let mut work = Vec::new();
         for (identity, members) in groups {
-            if self.config.skip.iter().any(|skip| skip.covers(&identity)) {
-                if !self.named_skips.contains(&identity) {
-                    self.named_skips.push(identity);
-                    lines.push(format!(
-                        "maintain: not binding model {} ({SKIP_ENV}); its index(es) {} are not maintained here",
-                        model_name(&identity),
-                        names(&members)
-                    ));
-                }
-                continue;
+            if !self.named.contains(&identity) {
+                self.named.push(identity);
+                lines.push(format!(
+                    "maintain: model {} is listed; maintaining its index(es) {}",
+                    model_name(&identity),
+                    names(&members)
+                ));
             }
             if members.iter().any(|(_, backlog)| *backlog > 0) {
                 work.push((identity, members));
