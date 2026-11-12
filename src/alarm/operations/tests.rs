@@ -157,7 +157,7 @@ fn an_alarm_raise_runs_r0_and_records_each_rung_as_a_step() {
         .steps
         .iter()
         .all(|step| step.delivered && !step.failed));
-    let listed = fixture.alarm.list(true, &mut clock).unwrap();
+    let listed = fixture.alarm.list(true, None, &mut clock).unwrap();
     assert_eq!(listed.alarms.len(), 1);
     assert_eq!(listed.alarms[0].raisers, vec!["cyan".to_owned()]);
     assert_eq!(listed.alarms[0].steps, 2);
@@ -183,7 +183,7 @@ fn an_alarm_raise_by_someone_who_is_not_a_live_zooid_is_refused() {
     assert!(runner.ran.is_empty());
     assert!(fixture
         .alarm
-        .list(false, &mut clock)
+        .list(false, None, &mut clock)
         .unwrap()
         .alarms
         .is_empty());
@@ -211,7 +211,7 @@ fn an_alarm_raise_without_its_reason_is_refused_with_the_check_and_writes_nothin
     assert!(runner.ran.is_empty());
     assert!(fixture
         .alarm
-        .list(false, &mut clock)
+        .list(false, None, &mut clock)
         .unwrap()
         .alarms
         .is_empty());
@@ -249,7 +249,12 @@ fn an_alarm_raise_the_guards_fold_becomes_a_note_and_runs_no_rung() {
         .unwrap()
         .contains("raised again by astra"));
     assert_eq!(
-        fixture.alarm.list(false, &mut clock).unwrap().alarms.len(),
+        fixture
+            .alarm
+            .list(false, None, &mut clock)
+            .unwrap()
+            .alarms
+            .len(),
         1
     );
 }
@@ -285,12 +290,12 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
         .unwrap();
     assert_eq!(acked.alarm, alarm);
     assert!(!acked.was_closed);
-    let listed = fixture.alarm.list(false, &mut clock).unwrap();
+    let listed = fixture.alarm.list(false, None, &mut clock).unwrap();
     assert!(!listed.alarms[0].open);
     assert_eq!(listed.alarms[0].closed_at, Some(T0 + 60 * SECOND));
     assert!(fixture
         .alarm
-        .list(true, &mut clock)
+        .list(true, None, &mut clock)
         .unwrap()
         .alarms
         .is_empty());
@@ -326,7 +331,7 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
         )
         .unwrap();
     assert!(!resolved.was_closed);
-    let listed = fixture.alarm.list(false, &mut clock).unwrap();
+    let listed = fixture.alarm.list(false, None, &mut clock).unwrap();
     assert_eq!(listed.false_alarms, vec![("astra".to_owned(), 1)]);
     assert!(listed.alarms.iter().all(|alarm| !alarm.open));
     // Acking a closed alarm is recorded and says so.

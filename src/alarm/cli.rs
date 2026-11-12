@@ -300,7 +300,10 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             let recorded = alarm.note(&id, &by, &text, &mut clock)?;
             render::recorded("note", &recorded, output)
         }
-        Command::List { open } => render::list(&alarm.list(open, &mut clock)?, output),
+        Command::List { open } => render::list(
+            &alarm.list(open, settings.jp_discord_user.as_deref(), &mut clock)?,
+            output,
+        ),
         Command::Show { id } => render::show(&alarm.show(&id)?, output),
     }
 }

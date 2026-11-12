@@ -85,7 +85,7 @@ pub enum Decision {
 /// NsTAIInterval orders by lower bound, then upper (core/inline/encodings/
 /// time.rs), so the minimum takes the lowest upper half and the maximum the
 /// highest; a point-valued bound would cut off non-point intervals.
-fn lower_after(after: i128, until: Option<i128>) -> (IntervalValue, IntervalValue) {
+pub(crate) fn lower_after(after: i128, until: Option<i128>) -> (IntervalValue, IntervalValue) {
     let mut min = point_at(after.saturating_add(1)).expect("a point interval always encodes");
     min.raw[16..].fill(0);
     let max = match until {

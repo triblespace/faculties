@@ -29,6 +29,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
+use super::ack::{self, Detected};
 use super::guards::{self, Decision};
 use super::ladder::{self, Due, Next};
 use super::rungs::{RungRunner, Subject};
@@ -42,6 +43,7 @@ use crate::schemas::alarm::{
     alarm as attrs, CLASSES, DEFAULT_SCOPE_ID, KIND_ACK, KIND_ALARM, KIND_FALSE_ALARM, KIND_NOTE,
     KIND_RESOLVE, KIND_TEST, VIA_RELAYED,
 };
+use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
 use crate::schemas::message::local as message;
 use crate::schemas::quota::quota as quota_attrs;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
@@ -152,6 +154,8 @@ pub struct Listed {
     pub closed_at: Option<i128>,
     pub steps: usize,
     pub failed_steps: usize,
+    /// An ack JP left on Discord that nothing has recorded yet: its via.
+    pub pending_ack: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +213,8 @@ pub struct Recorded {
 pub(crate) struct View {
     pub alarm: FactArchive,
     pub relations: FactArchive,
+    /// The Discord facts, when the call reads them (ack detection).
+    pub discord: Option<FactArchive>,
     pub reader: Reader,
     pub unread: usize,
 }
@@ -428,7 +434,7 @@ impl Alarm {
         build: impl FnOnce(Id, Id) -> Result<(Fragment, Id)>,
     ) -> Result<Recorded> {
         self.storage.with_store(|pile, signer, runtime| {
-            let view = observe(&self.storage, pile, signer, runtime, false)?;
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
             let alarm = resolve_alarm(&view.alarm, alarm)?;
             let by = resolve_active(&view, by)?;
             let was_closed = is_closed(&view.alarm, alarm);
@@ -443,10 +449,24 @@ impl Alarm {
     }
 
     /// Every alarm, newest first; `open_only` keeps the open ones.
-    pub fn list(&self, open_only: bool, clock: &mut dyn Clock) -> Result<ListView> {
+    /// With JP's Discord user, an open alarm he acked on Discord that
+    /// nothing recorded yet says so.
+    pub fn list(
+        &self,
+        open_only: bool,
+        jp_user: Option<&str>,
+        clock: &mut dyn Clock,
+    ) -> Result<ListView> {
         let now = clock.now()?;
         self.storage.with_store(|pile, signer, runtime| {
-            let view = observe(&self.storage, pile, signer, runtime, false)?;
+            let view = observe(
+                &self.storage,
+                pile,
+                signer,
+                runtime,
+                false,
+                jp_user.is_some(),
+            )?;
             let facts = &view.alarm;
             let mut raisers: Vec<Id> = Vec::new();
             let alarms = super::list(facts)
@@ -486,6 +506,13 @@ impl Alarm {
                         closed_at: super::closed_at(facts, row.alarm),
                         steps: rows.len(),
                         failed_steps: rows.iter().filter(|step| step.failed).count(),
+                        pending_ack: match (row.open, jp_user, &view.discord) {
+                            (true, Some(jp), Some(discord)) => {
+                                ack::detect(facts, discord, &view.reader, row.alarm, jp)
+                                    .and_then(|detected| via_name(detected.via))
+                            }
+                            _ => None,
+                        },
                     }
                 })
                 .collect();
@@ -511,16 +538,54 @@ impl Alarm {
     /// One alarm with its steps and every record about it.
     pub fn show(&self, alarm: &str) -> Result<ShowView> {
         self.storage.with_store(|pile, signer, runtime| {
-            let view = observe(&self.storage, pile, signer, runtime, false)?;
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
             let alarm = resolve_alarm(&view.alarm, alarm)?;
             show_from(&view, alarm)
+        })
+    }
+
+    /// The ack JP left on Discord for `alarm`, if any, read tolerantly.
+    pub fn detect_ack(&self, alarm: Id, jp_user: &str) -> Result<Option<Detected>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let view = observe(&self.storage, pile, signer, runtime, false, true)?;
+            Ok(view.discord.as_ref().and_then(|discord| {
+                ack::detect(&view.alarm, discord, &view.reader, alarm, jp_user)
+            }))
+        })
+    }
+
+    /// Record a detected ack as JP's (the alarm's `for` person), unless the
+    /// alarm is closed already; the ack's id when one was written.
+    pub fn record_detected(&self, alarm: Id, detected: Detected) -> Result<Option<Id>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
+            if is_closed(&view.alarm, alarm) {
+                return Ok(None);
+            }
+            let facts = &view.alarm;
+            let by = find!(
+                person: Id,
+                pattern!(facts, [{ alarm @ attrs::for_person: ?person }])
+            )
+            .min()
+            .ok_or_else(|| anyhow!("alarm {alarm:x} names nobody it is for"))?;
+            let (fragment, ack) = ack_fragment(&Ack {
+                alarm,
+                by,
+                via: detected.via,
+                at: detected.at,
+                discord_message: Some(detected.message),
+                note: None,
+            })?;
+            commit_alarm(&self.storage, pile, signer, runtime, fragment)?;
+            Ok(Some(ack))
         })
     }
 
     /// Read what a rung says about `alarm`, for the follower.
     pub fn subject(&self, alarm: Id) -> Result<Subject> {
         self.storage.with_store(|pile, signer, runtime| {
-            let view = observe(&self.storage, pile, signer, runtime, false)?;
+            let view = observe(&self.storage, pile, signer, runtime, false, false)?;
             subject_of(&view, alarm)
         })
     }
@@ -819,8 +884,21 @@ pub(crate) fn observe(
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
     strict: bool,
+    with_discord: bool,
 ) -> Result<View> {
     let alarm = attach(storage, pile, signer, runtime, DEFAULT_SCOPE_ID, "Alarm")?;
+    let discord = if with_discord {
+        Some(attach(
+            storage,
+            pile,
+            signer,
+            runtime,
+            DISCORD_SCOPE_ID,
+            "Discord",
+        )?)
+    } else {
+        None
+    };
     let relation = attach(
         storage,
         pile,
@@ -845,9 +923,16 @@ pub(crate) fn observe(
     };
     let relations =
         crate::storage::acquire_facts(&reader, relation).context("read Relations facts")?;
+    // Discord is read tolerantly: a message still in flight is one the next
+    // read will see, and nothing here counts or ranks by absence.
+    let discord = match discord {
+        Some(discord) => Some(crate::storage::acquire_facts_read(&reader, discord)?.into_value()),
+        None => None,
+    };
     Ok(View {
         alarm: facts,
         relations,
+        discord,
         reader,
         unread,
     })
@@ -864,7 +949,7 @@ fn observe_complete(
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match observe(storage, pile, signer, runtime, true) {
+        match observe(storage, pile, signer, runtime, true, false) {
             Ok(view) => return Ok(view),
             Err(error)
                 if attempt < COMPLETE_READ_ATTEMPTS

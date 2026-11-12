@@ -139,7 +139,7 @@ fn a_failing_alarm_transport_records_a_failed_step_and_the_next_rung_still_runs(
     let facts = fixture
         .storage
         .with_store(|pile, signer, runtime| {
-            crate::alarm::operations::observe(&fixture.storage, pile, signer, runtime, true)
+            crate::alarm::operations::observe(&fixture.storage, pile, signer, runtime, true, false)
                 .map(|view| view.alarm)
         })
         .unwrap();

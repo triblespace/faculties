@@ -135,6 +135,13 @@ pub fn list(view: &ListView, output: &mut Out<'_>) -> Result<()> {
             utc(alarm.raised),
             (view.now - alarm.raised) / MINUTE,
         ))?;
+        if let Some(via) = alarm.pending_ack {
+            output.line(format!(
+                "  acked by JP ({via}), not yet recorded: the follower records it, or \
+                 `alarm ack {} --by <him>`",
+                short(alarm.alarm)
+            ))?;
+        }
     }
     for (raiser, count) in &view.false_alarms {
         output.line(format!(

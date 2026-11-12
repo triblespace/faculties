@@ -18,6 +18,7 @@
 //! ([`guards`]) are pure functions over these readers and an explicit clock;
 //! the follower that executes the ladder is a separate step.
 
+pub mod ack;
 pub mod cli;
 pub mod guards;
 pub mod ladder;

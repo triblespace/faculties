@@ -214,7 +214,14 @@ impl Faculty for Alarm {
             }
             "alarm_list" => {
                 let args: ListArguments = decode_arguments(arguments)?;
-                render::list(&self.operations.list(args.open, &mut clock)?, output)
+                render::list(
+                    &self.operations.list(
+                        args.open,
+                        self.settings.jp_discord_user.as_deref(),
+                        &mut clock,
+                    )?,
+                    output,
+                )
             }
             "alarm_show" => {
                 let args: ShowArguments = decode_arguments(arguments)?;
