@@ -99,6 +99,17 @@ reconciliation.
   Use a process-local clean test environment; do not change the host profile
   or loosen collection admission to make a fixture pass. On 2026-09-13,
   inherited live descriptors caused 226 unrelated fixture failures.
+* A landing gate runs every test target, not only `--lib`:
+  `cargo test --locked -p faculties --no-default-features --tests --no-fail-fast`.
+  The integration tests under `tests/` (one `*_frontends.rs` per faculty)
+  are where the CLI and MCP frontends are checked, and `--lib` never builds
+  them. On 2026-11-12 three had gone unseen on main for days: a test that
+  no longer compiled after a signature change (which also stops every
+  target after it unless `--no-fail-fast` is given), a stale assertion
+  about the Discord `read`/`pull` split, and a stale MCP tool count. A
+  libtest name filter of `::` selects only module-path tests, so it runs
+  zero integration tests. Read the per-target result lines, not only the
+  exit status.
 * `.github/workflows/release.yml` fires on `v*` tags. It builds
   every CLI faculty for x86_64-linux-gnu, native aarch64-linux-gnu,
   and aarch64-apple-darwin, then
