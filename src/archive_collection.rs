@@ -839,19 +839,51 @@ pub fn ensure_search_local_with_storage(
     })
 }
 
-/// Acquire a query's fixed Archive fact and BM25 observations without
-/// maintaining either. Both views select their support at the same
-/// watermark; exact-byte arrival below does not reselect either of them.
-/// The surrounding operation owns the store.
+/// How many bytes of Archive source nodes one search maps into BM25 images
+/// for the commits the index does not reach yet, smallest first
+/// ([`AttachedSnapshot::read_within_with`]). The smallest is mapped whatever
+/// its size, so a search on a store whose index reaches nothing still
+/// leaves an attachment, and so a MAP record naming the index.
+pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
+
+/// Acquire a query's fixed Archive fact and BM25 observations, and keep what
+/// the BM25 read builds.
 ///
-/// The index is the attached BM25 cover alone. Its residual is reported as
-/// lag and never built here: only `archive index` maintains this cover, so
-/// the residual can be most of the Archive, and building it in a search
-/// costs what maintaining it costs. On 2026-10-26 a search that maintained
-/// first mapped a whole merge node of the Archive in the searching process
-/// and grew to about 62 GB.
+/// Both views select their support at the same watermark; exact-byte
+/// arrival below does not reselect either of them. The surrounding operation
+/// owns the store.
+///
+/// The index is the attached BM25 cover plus images of the residual: the
+/// Archive commits no attachment reaches, mapped in this process smallest
+/// first up to [`SEARCH_BUILD_BUDGET`] bytes of source nodes. Those images
+/// are kept as this host's attachments (`keep_attached`: the images and
+/// host-signed MAPs), so the next search takes them instead of building
+/// them, and the store's records name the index, which is how a maintainer
+/// finds it. What the budget leaves out is reported as lag. A search never
+/// maps a whole merge node: on 2026-10-26 a search that maintained first
+/// did, and grew to about 62 GB; `archive index` and maintenance carry and
+/// attach the merged frontier.
+///
+/// Keeping needs the store opened as the signing key, which every faculty
+/// store is; a key that is not the store's host keeps nothing, and the
+/// search still reads what it built.
 pub(crate) fn search_views_with_storage(
     storage: &crate::storage::Storage,
+) -> Result<(
+    AttachedSnapshot<
+        crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
+        Rank9AcceleratedSuccinctArchiveBlob,
+    >,
+    archive_bm25::ArchiveBM25View,
+    ArchiveSearchLag,
+)> {
+    search_views_within(storage, SEARCH_BUILD_BUDGET)
+}
+
+/// [`search_views_with_storage`] with its build budget given.
+pub(crate) fn search_views_within(
+    storage: &crate::storage::Storage,
+    budget: u64,
 ) -> Result<(
     AttachedSnapshot<
         crate::storage::AcquiringReader<crate::storage::FacultySnapshot>,
@@ -872,14 +904,18 @@ pub(crate) fn search_views_with_storage(
         let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let facts = after.attached_acquiring(rank9)?;
         let search = after.attached_acquiring(target)?;
+        let read = search
+            .read_within_with::<archive_bm25::ArchiveTextBm25Mapping, archive_bm25::ArchiveBM25View>(
+                budget,
+            )
+            .map_err(|error| anyhow!("read Archive BM25 cover: {error}"))?;
+        crate::storage::tolerate_own_lag(store.keep_attached(read.built(), signer))
+            .context("keep the Archive BM25 images this search built")?;
         let lag = ArchiveSearchLag {
             facts: FactLag::of(&after, source, succinct, rank9)?,
-            index: search.residual().len(),
+            index: read.unread().len(),
         };
-        let index = search
-            .view::<archive_bm25::ArchiveBM25View>()
-            .context("read Archive BM25 cover")?;
-        Ok((facts, index, lag))
+        Ok((facts, read.into_value(), lag))
     })
 }
 

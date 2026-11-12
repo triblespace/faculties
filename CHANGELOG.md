@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `archive search` keeps what it builds. It reads the BM25 cover plus images
+  of the Archive commits the index does not reach, mapped in the searching
+  process smallest first up to 16 MiB of source nodes (at least one), and
+  keeps them as this host's attachments (images and host-signed `MAP`s). The
+  next search takes them, and the store's records then name the index. The
+  rest is reported as lag, as before; a search never maps a merge node.
+  On a store whose index reaches nothing, the first search declares it.
+
 - `faculties maintain --declared` maintains every WeMM index the pile's
   records name whose descriptor names a model of `WEMM_MAINTAIN_MODELS`
   (`ROOT/profile` or `COLLECTION/ROOT/profile`, comma-separated), each with

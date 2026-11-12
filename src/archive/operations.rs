@@ -1685,8 +1685,11 @@ fn run_search(
     if !lag.is_current() {
         out.note(format!(
             "searching what is present; facts: {}; index: {} source commit(s) not yet \
-             derived (`archive index` derives them)",
-            lag.facts, lag.index,
+             indexed (a search indexes up to {} MiB of them and keeps them; `archive index` \
+             indexes the rest)",
+            lag.facts,
+            lag.index,
+            archive_collection::SEARCH_BUILD_BUDGET >> 20,
         ))?;
     }
     let facts = crate::storage::acquire_attached_facts(&observed)?;
@@ -2754,11 +2757,13 @@ mod tests {
         assert_eq!(archive_root_payloads(&fixture), 5);
     }
 
-    /// Search reads the BM25 cover as maintained and names its lag. Deriving
-    /// is `archive index`'s work: done inside a search over a large lag, it
-    /// mapped a whole merge node of the Archive in the searching process.
+    /// The first search on a store whose BM25 index reaches nothing builds
+    /// the index's images and keeps them: the store's records then name the
+    /// index (a host-signed MAP), and the next search reads it with no
+    /// residual and builds nothing.
     #[test]
-    fn search_names_an_underived_index_and_leaves_deriving_to_index() {
+    fn the_first_search_keeps_its_index_and_the_next_reads_it() {
+        use triblespace::core::collection::CollectionRead;
         let fixture = fixture();
         let source = fixture._directory.path().join("one.jsonl");
         fs::write(
@@ -2786,24 +2791,103 @@ mod tests {
             .unwrap();
             (printed, notes)
         };
+        // What the records name, and what the index's selection leaves out,
+        // in a fresh observation.
+        let observe = || {
+            storage(&fixture)
+                .storage
+                .with_store(|store, signer, runtime| {
+                    let source = storage(&fixture).storage.open_collection_read(
+                        store,
+                        archive_schema::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )?;
+                    let target =
+                        store.attach_with(source, crate::archive_bm25::ArchiveTextBm25Mapping)?;
+                    let snapshot = store.snapshot()?;
+                    let named = snapshot.collections()?.contains(&target.handle());
+                    let attached = snapshot.attached(target)?;
+                    Ok((named, attached.cover().len(), attached.residual().len()))
+                })
+                .unwrap()
+        };
 
-        // The lag is a note beside the hits, never one of them, so every
-        // frontend says the search saw only what is derived.
-        let (before, notes) = search("quasar");
-        assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(
-            notes[0].starts_with("searching what is present;"),
-            "{notes:?}"
+        let (named, cover, residual) = observe();
+        assert!(!named, "no record names the index before a search");
+        assert_eq!(
+            (cover, residual),
+            (0, 3),
+            "the vocabulary and the unit's two"
         );
-        assert!(notes[0].contains("not yet derived"), "{notes:?}");
-        assert!(!before.contains("not yet derived"), "{before}");
-        assert!(!before.contains("quasar needle"), "{before}");
-        archive_collection::ensure_bm25_index(&fixture.pile, Some(&fixture.key)).unwrap();
 
-        let (after, notes) = search("quasar");
-        assert!(notes.is_empty(), "{notes:?}");
-        assert!(!after.contains("not yet derived"), "{after}");
-        assert!(after.contains("quasar needle"), "{after}");
+        // The facts are not maintained here, so their lag is still named;
+        // the index's is not.
+        let index_current = |notes: &[String]| {
+            notes
+                .iter()
+                .all(|note| note.contains("; index: 0 source commit"))
+        };
+        let (first, notes) = search("quasar");
+        assert!(
+            index_current(&notes),
+            "the first search indexed it all: {notes:?}"
+        );
+        assert!(first.contains("quasar needle"), "{first}");
+        // Kept: three MAPs, nothing left. Two of the three commits may map to
+        // one image (no text is the empty index), and a cover is a set.
+        let (named, cover, residual) = observe();
+        assert!(
+            named && cover > 0 && residual == 0,
+            "{named} {cover} {residual}"
+        );
+
+        let size = fs::metadata(&fixture.pile).unwrap().len();
+        let (_, index, lag) =
+            archive_collection::search_views_with_storage(storage(&fixture).storage).unwrap();
+        assert_eq!(lag.index, 0);
+        assert_eq!(
+            index
+                .query()
+                .unwrap()
+                .query_multi(&hash_tokens("quasar"))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(index);
+        let (second, notes) = search("quasar");
+        assert!(index_current(&notes), "{notes:?}");
+        assert_eq!(second, first);
+        assert_eq!(
+            fs::metadata(&fixture.pile).unwrap().len(),
+            size,
+            "a search with nothing to build writes nothing"
+        );
+    }
+
+    /// A search maps at most its budget of the commits the index does not
+    /// reach, smallest first and at least one, keeps them, and names the
+    /// rest as lag; each later search goes on from there.
+    #[test]
+    fn a_search_builds_within_its_budget_and_names_the_rest() {
+        let fixture = fixture();
+        let source = fixture._directory.path().join("one.jsonl");
+        fs::write(
+            &source,
+            r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        let lags: Vec<usize> = (0..4)
+            .map(|_| {
+                archive_collection::search_views_within(storage(&fixture).storage, 0)
+                    .unwrap()
+                    .2
+                    .index
+            })
+            .collect();
+        assert_eq!(lags, [2, 1, 0, 0]);
     }
 
     #[test]
