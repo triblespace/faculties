@@ -12,6 +12,7 @@ use super::render;
 use super::rungs::{Executor, Live, Settings};
 use crate::out::Out;
 use crate::schemas::alarm::{VIA_CLI, VIA_RELAYED};
+use triblespace::prelude::{Id, Inline};
 
 #[derive(Parser)]
 #[command(
@@ -22,8 +23,18 @@ use crate::schemas::alarm::{VIA_CLI, VIA_RELAYED};
                   you care about, and ask whether the system ever promised they would agree."
 )]
 pub struct Cli {
-    #[command(flatten)]
-    workspace: crate::cli_workspace::WorkspaceArgs,
+    /// Exact workspace revision from `faculties workspace list`. Without this
+    /// or --route, FACULTIES_WORKSPACE is read as every faculty reads it; with
+    /// either, the environment's workspace and collection routes are ignored.
+    #[arg(long, global = true, value_name = "REVISION", value_parser = crate::cli_workspace::parse_revision)]
+    workspace: Option<Id>,
+    /// One exact collection route, NAME=DESCRIPTOR (the collection's name and
+    /// its 64-hex descriptor handle); repeat it for each. Together they are the
+    /// whole explicit map: a role not in it is an error, never a fallback to
+    /// the environment or a default. What `raise` gives a follower when it was
+    /// itself explicitly routed.
+    #[arg(long = "route", global = true, value_name = "NAME=DESCRIPTOR", value_parser = parse_route)]
+    routes: Vec<(Id, [u8; 32])>,
     /// Path to the pile file.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
@@ -235,12 +246,109 @@ fn persona(persona: &Option<String>) -> Result<String> {
     }
 }
 
+/// One `--route` value: a collection name and its exact descriptor handle.
+fn parse_route(value: &str) -> std::result::Result<(Id, [u8; 32]), String> {
+    let (name, descriptor) = value
+        .split_once('=')
+        .ok_or_else(|| "a route is NAME=DESCRIPTOR".to_owned())?;
+    let scope = crate::collection_names::table()
+        .into_iter()
+        .find(|(_, known)| *known == name.trim())
+        .map(|(scope, _)| scope)
+        .ok_or_else(|| format!("{name:?} is not a collection this build names"))?;
+    let descriptor = descriptor.trim();
+    let descriptor = descriptor.strip_prefix("blake3:").unwrap_or(descriptor);
+    let mut bytes = [0_u8; 32];
+    if descriptor.len() != 64 || hex::decode_to_slice(descriptor, &mut bytes).is_err() {
+        return Err(format!(
+            "{name}: the descriptor must be 64 hexadecimal digits"
+        ));
+    }
+    Ok((scope, bytes))
+}
+
+/// Which routing a CLI call uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Selection {
+    /// An exact workspace revision (its own routes).
+    Workspace(Id),
+    /// An explicit route map, nothing else.
+    Routes(crate::storage::CollectionRoutes),
+    /// The legacy configured routing (collection variables, pile config).
+    Legacy,
+}
+
+/// The routing a call uses. An explicit selector (`--workspace` or the
+/// `--route` map) wins, and then the ambient workspace selector is ignored
+/// here, in code, whatever the process environment holds; only without one
+/// is `ambient_workspace` (FACULTIES_WORKSPACE) read. Both explicit
+/// selectors at once are refused.
+pub fn select(
+    workspace: Option<Id>,
+    routes: Vec<(Id, [u8; 32])>,
+    ambient_workspace: Option<&str>,
+) -> Result<Selection> {
+    if !routes.is_empty() {
+        if workspace.is_some() {
+            bail!("--workspace and --route are two routings; give one");
+        }
+        let mut map = crate::storage::CollectionRoutes::new();
+        for (scope, descriptor) in routes {
+            if map.insert(scope, Inline::new(descriptor)).is_some() {
+                bail!(
+                    "--route names {} twice",
+                    crate::collection_names::name_for(scope).unwrap_or("a collection")
+                );
+            }
+        }
+        return Ok(Selection::Routes(map));
+    }
+    if let Some(workspace) = workspace {
+        return Ok(Selection::Workspace(workspace));
+    }
+    match ambient_workspace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => crate::cli_workspace::parse_revision(value)
+            .map(Selection::Workspace)
+            .map_err(|error| anyhow::anyhow!("FACULTIES_WORKSPACE: {error}")),
+        None => Ok(Selection::Legacy),
+    }
+}
+
+/// The storage a selection opens: a workspace through its exact revision,
+/// an explicit map through the strict explicit-routes constructor (an
+/// absent role is an error, and no collection variable is ever read), or
+/// the legacy configured storage.
+pub fn storage_for(
+    selection: Selection,
+    pile: PathBuf,
+    key: Option<PathBuf>,
+) -> Result<crate::storage::Storage> {
+    match selection {
+        Selection::Workspace(revision) => crate::cli_workspace::WorkspaceArgs {
+            workspace: Some(revision),
+        }
+        .storage(pile, key),
+        Selection::Routes(routes) => {
+            Ok(crate::storage::Storage::new(pile, key).with_collections(routes))
+        }
+        Selection::Legacy => Ok(crate::storage::Storage::new(pile, key)),
+    }
+}
+
 /// Execute a parsed command. No subcommand prints usage and opens nothing.
 pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return output.text(Cli::command().render_help().to_string());
     };
-    let storage = cli.workspace.storage(cli.pile, cli.key)?;
+    let selection = select(
+        cli.workspace,
+        cli.routes,
+        std::env::var("FACULTIES_WORKSPACE").ok().as_deref(),
+    )?;
+    let storage = storage_for(selection, cli.pile, cli.key)?;
     let alarm = Alarm::with_storage(storage.clone());
     let settings = cli.settings.settings();
     let mut clock = SystemClock;
@@ -491,6 +599,84 @@ mod tests {
         assert!(!parses(&["follow"]));
         assert!(!parses(&["follow", "9e1a", "--resume"]));
         assert!(!parses(&["show"]));
+    }
+
+    fn route(scope: Id, byte: u8) -> (Id, [u8; 32]) {
+        (scope, [byte; 32])
+    }
+
+    #[test]
+    fn an_explicit_alarm_selector_wins_over_the_ambient_workspace() {
+        use crate::schemas::alarm::DEFAULT_SCOPE_ID as ALARM;
+        let w = Id::new([0x57; 16]).unwrap();
+        let v = format!("{:X}", Id::new([0x56; 16]).unwrap());
+        // The explicit map, with FACULTIES_WORKSPACE=V in the environment.
+        let Selection::Routes(map) = select(None, vec![route(ALARM, 0xaa)], Some(&v)).unwrap()
+        else {
+            panic!("an explicit map is the routing");
+        };
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&ALARM].raw, [0xaa; 32]);
+        // An explicit workspace, likewise.
+        assert_eq!(
+            select(Some(w), Vec::new(), Some(&v)).unwrap(),
+            Selection::Workspace(w)
+        );
+        // Only without one is the ambient selector read.
+        assert_eq!(
+            select(None, Vec::new(), Some(&v)).unwrap(),
+            Selection::Workspace(Id::new([0x56; 16]).unwrap())
+        );
+        assert_eq!(select(None, Vec::new(), None).unwrap(), Selection::Legacy);
+        assert!(select(Some(w), vec![route(ALARM, 0xaa)], None).is_err());
+        assert!(select(None, vec![route(ALARM, 0xaa), route(ALARM, 0xbb)], None).is_err());
+        assert!(parse_route("alarm=zz").is_err());
+        assert!(parse_route("no-such-collection=".to_owned().as_str()).is_err());
+        assert_eq!(
+            parse_route(&format!("alarm={}", "ab".repeat(32))).unwrap(),
+            route(ALARM, 0xab)
+        );
+    }
+
+    #[test]
+    fn a_follower_given_an_explicit_map_refuses_a_role_it_omits() {
+        use crate::schemas::alarm::DEFAULT_SCOPE_ID as ALARM;
+        use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS;
+        // What a routed raise hands its follower, parsed as the follower does.
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("self.pile");
+        let key = directory.path().join("self.key");
+        std::fs::write(&pile, b"").unwrap();
+        std::fs::write(&key, b"").unwrap();
+        let routed =
+            crate::storage::Storage::new(pile.clone(), Some(key.clone())).with_collections(
+                std::collections::BTreeMap::from([(ALARM, Inline::new([0xaa; 32]))]),
+            );
+        let command = super::super::follow::command_for(
+            std::path::Path::new("/opt/cohort/alarm"),
+            &routed,
+            &Settings::default(),
+            &[],
+            Id::new([0xab; 16]).unwrap(),
+        )
+        .unwrap();
+        let cli =
+            Cli::try_parse_from(std::iter::once("alarm".to_owned()).chain(command.args.clone()))
+                .unwrap();
+        let v = format!("{:X}", Id::new([0x56; 16]).unwrap());
+        let selection = select(cli.workspace, cli.routes, Some(&v)).unwrap();
+        let storage = storage_for(selection, cli.pile, cli.key).unwrap();
+        assert_eq!(
+            storage
+                .collection_handle(ALARM)
+                .unwrap()
+                .map(|handle| handle.raw),
+            Some([0xaa; 32])
+        );
+        // Relations is not in the map: an error, not the environment's or a
+        // default route.
+        let error = storage.collection_handle(RELATIONS).unwrap_err();
+        assert!(format!("{error:#}").contains("unconfigured"), "{error:#}");
     }
 
     #[test]

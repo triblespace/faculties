@@ -446,13 +446,15 @@ pub fn follower_command(
 
 /// How the follower reaches the same collections the raise did, from the
 /// raise's own storage, never from ambient selection:
-/// - a selected workspace: `--workspace <its exact revision>`, and no
-///   collection variables (a workspace carries its own routes);
+/// - a selected workspace: `--workspace <its exact revision>`;
 /// - explicit routes without a workspace (an MCP launcher's routed
-///   storage): each route as its exact `TRIBLESPACE_COLLECTION_<NAME>`
-///   descriptor variable, in place of any ambient ones;
-/// - neither (legacy CLI routing, which reads those variables itself): the
-///   ambient collection variables, as the raise read them.
+///   storage): the whole map as `--route NAME=DESCRIPTOR` flags, which the
+///   follower opens with the strict explicit-routes constructor (a role not
+///   in the map is an error there, not a fallback);
+/// - neither (legacy CLI routing, which reads the collection variables
+///   itself): the ambient collection variables, as the raise read them.
+/// With either explicit selector no collection variable is passed, and the
+/// follower ignores any its unit inherits ([`super::cli::select`]).
 /// The extra follower arguments and the environment, in that order.
 pub fn routing(
     storage: &crate::storage::Storage,
@@ -471,18 +473,21 @@ pub fn routing(
             ),
         )),
         (None, Some(routes)) => {
-            let mut explicit = Vec::new();
+            let mut args = Vec::new();
             for (scope, handle) in routes {
-                let Some(_) = crate::collection_names::name_for(*scope) else {
+                let Some(name) = crate::collection_names::name_for(*scope) else {
                     bail!("route for scope {scope:x} has no collection name to pass on");
                 };
-                explicit.push((
-                    crate::collection_names::override_env_name(*scope),
-                    hex::encode(handle.raw),
-                ));
+                args.push("--route".to_owned());
+                args.push(format!("{name}={}", hex::encode(handle.raw)));
             }
-            let kept = ambient.iter().filter(|var| not_routes(var)).cloned();
-            Ok((Vec::new(), follower_env(settings, kept.chain(explicit))))
+            Ok((
+                args,
+                follower_env(
+                    settings,
+                    ambient.iter().filter(|var| not_routes(var)).cloned(),
+                ),
+            ))
         }
         (None, None) => Ok((Vec::new(), follower_env(settings, ambient.iter().cloned()))),
     }

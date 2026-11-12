@@ -653,8 +653,8 @@ fn the_follower_is_given_the_workspace_and_routes_the_raise_used_not_the_ambient
     assert!(!names(&command).contains(&"TRIBLESPACE_COLLECTION_ALARM".to_owned()));
     assert!(names(&command).contains(&"TRIBLESPACE_PEERS".to_owned()));
 
-    // Explicit routes without a workspace travel as exact descriptors, in
-    // place of the ambient ones.
+    // Explicit routes without a workspace travel as the whole map in
+    // explicit --route flags, never as collection variables.
     let routed = crate::storage::Storage::new(pile.clone(), Some(key.clone())).with_collections(
         std::collections::BTreeMap::from([(
             crate::schemas::alarm::DEFAULT_SCOPE_ID,
@@ -663,13 +663,19 @@ fn the_follower_is_given_the_workspace_and_routes_the_raise_used_not_the_ambient
     );
     let command = super::command_for(program, &routed, &settings(), &ambient, alarm).unwrap();
     assert!(!command.args.contains(&"--workspace".to_owned()));
-    assert!(command
-        .env
-        .contains(&("TRIBLESPACE_COLLECTION_ALARM".to_owned(), "aa".repeat(32))));
-    assert!(!command
-        .env
+    let route = command
+        .args
         .iter()
-        .any(|(_, value)| *value == "bb".repeat(32)));
+        .position(|arg| arg == "--route")
+        .unwrap();
+    assert!(route < command.args.iter().position(|arg| arg == "follow").unwrap());
+    assert_eq!(
+        command.args[route + 1],
+        format!("alarm={}", "aa".repeat(32))
+    );
+    assert!(!names(&command)
+        .iter()
+        .any(|name| name.starts_with("TRIBLESPACE_COLLECTION_")));
     assert!(!names(&command).contains(&"FACULTIES_WORKSPACE".to_owned()));
 
     // Legacy routing: the raise itself read the ambient collection
