@@ -1,0 +1,503 @@
+//! `faculties maintain --declared`: maintain every WeMM index the pile's
+//! records name, each with the model its own descriptor names.
+//!
+//! A pass asks the store which WeMM indexes exist
+//! ([`declared_indexes`]: the collections some record names, matched by
+//! their descriptors) and how far behind each one is, both from one
+//! snapshot. Indexes are grouped by the model their descriptors name (the
+//! model collection, the root and the kernel profile). A group with nothing
+//! to derive binds nothing. A group with work binds exactly its model, once,
+//! and every index of the group is maintained with it; the runtime derives
+//! only indexes of its own identity, so no index is ever computed by another
+//! model. The list is never kept: the next pass asks again, so an index
+//! first named by a record after start (a leaf replicated from another host,
+//! or the first leaf the single-model mode derived) is maintained from then
+//! on.
+//!
+//! A group whose model cannot be bound (a profile this build does not run,
+//! a root its collection does not state or that is not here, a copy the
+//! host's memory cannot admit) is skipped with one line naming its indexes,
+//! and the others are maintained. It is tried again only after
+//! [`BIND_RETRY_ENV`] seconds, because a bind opens the pile and may copy
+//! gigabytes before it fails. Nothing falls back to another model.
+//!
+//! What it does not do: a descriptor that is registered but named by no
+//! record is an ordinary blob, which no store indexes by what it describes,
+//! so such an index is not found until its first leaf exists. And a
+//! declaration cannot be withdrawn from a grow-only store, so a model that
+//! is retired is excluded by this host's [`SKIP_ENV`].
+
+use super::{Derived, Target};
+use crate::storage::{AcquiringReader, FacultyStore, Storage};
+use anyhow::{Context, Result};
+use ed25519_dalek::SigningKey;
+use std::ffi::OsStr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::collection::{Collection, CollectionHandle};
+use triblespace::core::repo::StoreRead;
+use triblespace::prelude::*;
+use triblespace_search::semantic_wemm::{
+    collection_hex, declared_indexes, DeclaredIndex, WemmIdentity, WemmProfile,
+};
+
+/// How many models may be bound at once (default 1). Groups are served one
+/// after another; a group that needs a model when this many are bound
+/// releases one first, a bound one with nothing to derive if there is one,
+/// else the one served least recently.
+pub const MAX_BOUND_ENV: &str = "WEMM_MAINTAIN_MAX_BOUND";
+/// Models this host never binds, comma-separated: a root as 32 hex digits
+/// (every profile of it), or `ROOT/profile` with a profile label.
+pub const SKIP_ENV: &str = "WEMM_MAINTAIN_SKIP";
+/// Seconds before a model whose bind failed is tried again (default 1800).
+pub const BIND_RETRY_ENV: &str = "WEMM_MAINTAIN_BIND_RETRY_SECS";
+pub const DEFAULT_BIND_RETRY: Duration = Duration::from_secs(1800);
+
+/// One model of [`SKIP_ENV`]: a root, and a profile when one is named.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Skip {
+    pub root: Id,
+    pub profile: Option<WemmProfile>,
+}
+
+impl Skip {
+    fn covers(&self, identity: &WemmIdentity) -> bool {
+        self.root == identity.model_root
+            && self
+                .profile
+                .is_none_or(|profile| profile.id() == identity.kernel_profile)
+    }
+}
+
+/// What the declared mode is configured with, read once at start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub max_bound: usize,
+    pub skip: Vec<Skip>,
+    pub retry: Duration,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_values(
+            std::env::var_os(MAX_BOUND_ENV).as_deref(),
+            std::env::var_os(SKIP_ENV).as_deref(),
+            std::env::var_os(BIND_RETRY_ENV).as_deref(),
+        )
+    }
+
+    /// The configuration these values give; anything malformed is refused,
+    /// so a typo never quietly binds a model that was meant to be skipped.
+    pub fn from_env_values(
+        max_bound: Option<&OsStr>,
+        skip: Option<&OsStr>,
+        retry: Option<&OsStr>,
+    ) -> Result<Self> {
+        let text = |name: &str, value: &OsStr| -> Result<String> {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .with_context(|| format!("{name} is not UTF-8: {value:?}"))
+        };
+        let max_bound = match max_bound {
+            None => 1,
+            Some(value) => text(MAX_BOUND_ENV, value)?
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .with_context(|| {
+                    format!("{MAX_BOUND_ENV} must be a positive number of models; got {value:?}")
+                })?,
+        };
+        let mut skipped = Vec::new();
+        if let Some(value) = skip {
+            for item in text(SKIP_ENV, value)?.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let (root, profile) = match item.split_once('/') {
+                    Some((root, label)) => (
+                        root,
+                        Some(WemmProfile::parse(label).with_context(|| {
+                            format!(
+                                "{SKIP_ENV}: {label:?} is not a profile (bf16, w4a4, w4a4-vw4a16)"
+                            )
+                        })?),
+                    ),
+                    None => (item, None),
+                };
+                let root = Id::from_hex(root).with_context(|| {
+                    format!("{SKIP_ENV}: {root:?} is not a 32-hex-digit model root")
+                })?;
+                skipped.push(Skip { root, profile });
+            }
+        }
+        let retry = match retry {
+            None => DEFAULT_BIND_RETRY,
+            Some(value) => Duration::from_secs(
+                text(BIND_RETRY_ENV, value)?
+                    .trim()
+                    .parse::<u64>()
+                    .with_context(|| {
+                        format!("{BIND_RETRY_ENV} must be a number of seconds; got {value:?}")
+                    })?,
+            ),
+        };
+        Ok(Self {
+            max_bound,
+            skip: skipped,
+            retry,
+        })
+    }
+
+    /// The line the declared mode starts with.
+    pub fn describe(&self) -> String {
+        let skip = if self.skip.is_empty() {
+            "none".to_owned()
+        } else {
+            self.skip
+                .iter()
+                .map(|skip| match skip.profile {
+                    Some(profile) => format!("{:X}/{}", skip.root, profile.label()),
+                    None => format!("{:X}", skip.root),
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "maintain: every WeMM index the pile's records name, each with the model its descriptor names; at most {} bound ({MAX_BOUND_ENV}), never binding {skip} ({SKIP_ENV}), a failed bind retried after {} s ({BIND_RETRY_ENV})",
+            self.max_bound,
+            self.retry.as_secs()
+        )
+    }
+}
+
+/// How a host binds a model and maintains an index with it: the bound
+/// session on a GB10 ([`SessionBinder`]), or a stand-in in tests.
+pub trait Binder {
+    type Model;
+    /// Bind exactly the model `identity` names, or say why not.
+    fn bind(&mut self, identity: WemmIdentity) -> Result<Self::Model>;
+    /// Maintain the index `target`, derived from `source`, with `model`.
+    fn maintain(
+        &mut self,
+        model: &Self::Model,
+        store: &mut FacultyStore,
+        source: Collection<SimpleArchive>,
+        target: Target,
+        signer: &SigningKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<Derived>;
+}
+
+/// The bound WeMM session, with the weight residence and copy margin read
+/// once at start, and the probe started for each model it binds when
+/// `WEMM_PROBE_DIR` names a directory.
+pub struct SessionBinder {
+    pub pile: std::path::PathBuf,
+    pub residence: mary::nn::cuda_bf16_alias::WeightResidence,
+    pub copy_min_free: u64,
+}
+
+impl SessionBinder {
+    pub fn from_env(pile: &std::path::Path) -> Result<Self> {
+        use mary::nn::cuda_bf16_alias::WeightResidence;
+        let residence =
+            super::residence_from_env_value(std::env::var_os(super::COPY_WEIGHTS_ENV).as_deref())?;
+        let copy_min_free = match residence {
+            WeightResidence::DeviceCopy => super::copy_min_free_from_env_value(
+                std::env::var_os(super::COPY_MIN_FREE_ENV).as_deref(),
+            )?,
+            WeightResidence::PileAliased => 0,
+        };
+        Ok(Self {
+            pile: pile.to_path_buf(),
+            residence,
+            copy_min_free,
+        })
+    }
+}
+
+impl Binder for SessionBinder {
+    type Model = super::Session;
+
+    fn bind(&mut self, identity: WemmIdentity) -> Result<super::Session> {
+        let session = super::Session::bind_identity(
+            &self.pile,
+            identity,
+            self.residence,
+            self.copy_min_free,
+        )?;
+        session.start_probe_from_env()?;
+        Ok(session)
+    }
+
+    fn maintain(
+        &mut self,
+        model: &super::Session,
+        store: &mut FacultyStore,
+        source: Collection<SimpleArchive>,
+        target: Target,
+        signer: &SigningKey,
+        runtime: &Arc<tokio::runtime::Runtime>,
+    ) -> Result<Derived> {
+        model.maintain(store, source, target, signer, runtime)
+    }
+}
+
+/// A model, as a log line names it.
+pub fn model_name(identity: &WemmIdentity) -> String {
+    let profile = WemmProfile::of(identity.kernel_profile).map_or_else(
+        || format!("{:X}", identity.kernel_profile),
+        |p| p.label().to_owned(),
+    );
+    format!(
+        "{:X}/{profile} in {}",
+        identity.model_root,
+        &collection_hex(identity.model_collection)[..16]
+    )
+}
+
+fn short(handle: CollectionHandle) -> String {
+    collection_hex(handle)[..16].to_owned()
+}
+
+/// A sort key for one model: the passes group indexes by it.
+fn key(identity: &WemmIdentity) -> ([u8; 32], Id, Id) {
+    (
+        identity.model_collection.raw,
+        identity.model_root,
+        identity.kernel_profile,
+    )
+}
+
+struct Bound<M> {
+    identity: WemmIdentity,
+    model: M,
+    /// The pass that last maintained with it.
+    served: u64,
+}
+
+/// The process side of the declared mode: the models it holds bound, the
+/// binds that failed and when, and which skipped models it has named. A few
+/// entries per model; the indexes themselves are never kept.
+pub struct Maintainer<B: Binder> {
+    storage: Storage,
+    binder: B,
+    config: Config,
+    bound: Vec<Bound<B::Model>>,
+    failed: Vec<(WemmIdentity, Instant)>,
+    named_skips: Vec<WemmIdentity>,
+    passes: u64,
+}
+
+impl<B: Binder> Maintainer<B> {
+    pub fn new(storage: Storage, binder: B, config: Config) -> Self {
+        Self {
+            storage,
+            binder,
+            config,
+            bound: Vec::new(),
+            failed: Vec::new(),
+            named_skips: Vec::new(),
+            passes: 0,
+        }
+    }
+
+    /// The models bound now.
+    pub fn bound(&self) -> Vec<WemmIdentity> {
+        self.bound.iter().map(|bound| bound.identity).collect()
+    }
+
+    /// One pass: find the indexes, bind what has work, maintain it. Returns
+    /// the lines to log: an index only when the pass derived something or
+    /// left something missing, a model only when it was skipped, bound or
+    /// released. Only a failure to read the store at all is an error; one
+    /// index or one model failing is a line, and the rest go on.
+    pub fn pass(&mut self) -> Result<Vec<String>> {
+        self.passes += 1;
+        let mut lines = Vec::new();
+        // One snapshot answers which indexes exist and how far behind each is.
+        let mut declared = self.storage.with_store(|store, _, runtime| {
+            let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+            let mut declared = Vec::new();
+            for index in declared_indexes(&reader).context("find the declared WeMM indexes")? {
+                declared.push((index, backlog(&reader, &index)));
+            }
+            Ok(declared)
+        })?;
+        declared.sort_by_key(|(index, _)| (key(&index.identity), index.index));
+        let mut groups: Vec<(WemmIdentity, Vec<(DeclaredIndex, usize)>)> = Vec::new();
+        for (index, backlog) in declared {
+            let backlog = match backlog {
+                Ok(backlog) => backlog,
+                Err(error) => {
+                    lines.push(format!(
+                        "maintain: index {} (model {}) not read: {error:#}",
+                        short(index.index),
+                        model_name(&index.identity)
+                    ));
+                    continue;
+                }
+            };
+            match groups.last_mut() {
+                Some((identity, members)) if *identity == index.identity => {
+                    members.push((index, backlog))
+                }
+                _ => groups.push((index.identity, vec![(index, backlog)])),
+            }
+        }
+        let mut work = Vec::new();
+        for (identity, members) in groups {
+            if self.config.skip.iter().any(|skip| skip.covers(&identity)) {
+                if !self.named_skips.contains(&identity) {
+                    self.named_skips.push(identity);
+                    lines.push(format!(
+                        "maintain: not binding model {} ({SKIP_ENV}); its index(es) {} are not maintained here",
+                        model_name(&identity),
+                        names(&members)
+                    ));
+                }
+                continue;
+            }
+            if members.iter().any(|(_, backlog)| *backlog > 0) {
+                work.push((identity, members));
+            }
+        }
+        // Models already bound first, so a bound model is not released for
+        // another while it still has work of its own this pass.
+        work.sort_by_key(|(identity, _)| !self.bound.iter().any(|b| b.identity == *identity));
+        let wanted: Vec<WemmIdentity> = work.iter().map(|(identity, _)| *identity).collect();
+        for (identity, members) in work {
+            let Some(slot) = self.ensure_bound(identity, &members, &wanted, &mut lines) else {
+                continue;
+            };
+            self.bound[slot].served = self.passes;
+            for (index, _) in members {
+                let model = &self.bound[slot].model;
+                let binder = &mut self.binder;
+                let result = self.storage.with_store(|store, signer, runtime| {
+                    let snapshot = store.snapshot()?;
+                    let source = Collection::<SimpleArchive>::open(&snapshot, index.source)
+                        .map_err(|e| anyhow::anyhow!("open the index's source: {e}"))?;
+                    let target = Target::open(&snapshot, index.index)
+                        .map_err(|e| anyhow::anyhow!("open the index: {e}"))?;
+                    drop(snapshot);
+                    binder.maintain(model, store, source, target, signer, runtime)
+                });
+                match result {
+                    Ok(derived) if derived.derived > 0 || derived.missing > 0 => lines.push(
+                        format!("maintain: {derived} (model {})", model_name(&identity)),
+                    ),
+                    Ok(_) => {}
+                    Err(error) => lines.push(format!(
+                        "maintain: index {} (model {}) failed: {error:#}",
+                        short(index.index),
+                        model_name(&identity)
+                    )),
+                }
+            }
+        }
+        Ok(lines)
+    }
+
+    /// The slot of a bound model `identity`, binding it if need be; `None`
+    /// when it cannot be bound now, with a line saying why.
+    fn ensure_bound(
+        &mut self,
+        identity: WemmIdentity,
+        members: &[(DeclaredIndex, usize)],
+        wanted: &[WemmIdentity],
+        lines: &mut Vec<String>,
+    ) -> Option<usize> {
+        if let Some(slot) = self.bound.iter().position(|b| b.identity == identity) {
+            return Some(slot);
+        }
+        let now = Instant::now();
+        if let Some(position) = self
+            .failed
+            .iter()
+            .position(|(failed, _)| *failed == identity)
+        {
+            if now.duration_since(self.failed[position].1) < self.config.retry {
+                return None;
+            }
+            self.failed.remove(position);
+        }
+        if self.bound.len() >= self.config.max_bound {
+            // A bound model with nothing to derive this pass goes first, else
+            // the one served least recently.
+            let release = self
+                .bound
+                .iter()
+                .position(|b| !wanted.contains(&b.identity))
+                .or_else(|| {
+                    self.bound
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, b)| b.served)
+                        .map(|(slot, _)| slot)
+                })
+                .expect("a full set of bound models is not empty");
+            let released = self.bound.remove(release);
+            lines.push(format!(
+                "maintain: releasing model {} to bind {} ({} model(s) have work, {MAX_BOUND_ENV}={})",
+                model_name(&released.identity),
+                model_name(&identity),
+                wanted.len(),
+                self.config.max_bound
+            ));
+            // Its device memory is released before the next bind reads
+            // MemAvailable.
+            drop(released);
+        }
+        match self.binder.bind(identity) {
+            Ok(model) => {
+                lines.push(format!(
+                    "maintain: bound model {} for index(es) {}",
+                    model_name(&identity),
+                    names(members)
+                ));
+                self.bound.push(Bound {
+                    identity,
+                    model,
+                    served: self.passes,
+                });
+                Some(self.bound.len() - 1)
+            }
+            Err(error) => {
+                self.failed.push((identity, now));
+                lines.push(format!(
+                    "maintain: skip model {}: {error:#}; index(es) {} not maintained, bind retried after {} s",
+                    model_name(&identity),
+                    names(members),
+                    self.config.retry.as_secs()
+                ));
+                None
+            }
+        }
+    }
+}
+
+fn names(members: &[(DeclaredIndex, usize)]) -> String {
+    members
+        .iter()
+        .map(|(index, _)| short(index.index))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// How many foundations of `index`'s source have no usable leaf in it.
+fn backlog<R: StoreRead>(reader: &R, index: &DeclaredIndex) -> Result<usize> {
+    let source = Collection::<SimpleArchive>::open(reader, index.source)
+        .map_err(|e| anyhow::anyhow!("open the index's source: {e}"))?;
+    let target =
+        Target::open(reader, index.index).map_err(|e| anyhow::anyhow!("open the index: {e}"))?;
+    crate::storage::underived(reader, source, target)
+}
+
+#[cfg(test)]
+mod tests;

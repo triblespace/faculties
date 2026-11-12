@@ -109,6 +109,19 @@ enum Command {
         /// can run.
         #[arg(long, value_name = "SECONDS", default_value_t = 60)]
         poll: u64,
+        /// Maintain every WeMM index the pile's records name, each with the
+        /// model its own descriptor names (its collection, root and profile),
+        /// instead of the one model WEMM_ROOT and WEMM_PROFILE name; those two
+        /// and TRIBLESPACE_COLLECTION_MODELS are then ignored. A model that
+        /// cannot be bound is skipped with a line and tried again later; the
+        /// other models' indexes are maintained. An index is found from its
+        /// first leaf on: one that is only registered is not found. Configured
+        /// by WEMM_MAINTAIN_MAX_BOUND (models bound at once, default 1),
+        /// WEMM_MAINTAIN_SKIP (roots, or ROOT/profile, never bound) and
+        /// WEMM_MAINTAIN_BIND_RETRY_SECS (default 1800), plus
+        /// WEMM_COPY_WEIGHTS and WEMM_PROBE_DIR as above, for every bind.
+        #[arg(long)]
+        declared: bool,
     },
 }
 
@@ -196,7 +209,19 @@ fn run(command: Command) -> Result<()> {
             catalog.finish(result)
         }
         #[cfg(feature = "wemm")]
-        Command::Maintain { pile, key, poll } => maintain(pile, key, poll),
+        Command::Maintain {
+            pile,
+            key,
+            poll,
+            declared: false,
+        } => maintain(pile, key, poll),
+        #[cfg(feature = "wemm")]
+        Command::Maintain {
+            pile,
+            key,
+            poll,
+            declared: true,
+        } => maintain_declared(pile, key, poll),
     }
 }
 
@@ -242,6 +267,42 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
             pile.display()
         );
     }
+    let closed = storage.close();
+    result.and(closed)
+}
+
+/// `faculties maintain --declared`: every WeMM index the pile's records
+/// name, each with its own descriptor's model (faculties::wemm::declared).
+#[cfg(feature = "wemm")]
+fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
+    use faculties::wemm::declared::{Config, Maintainer, SessionBinder};
+    anyhow::ensure!(
+        std::env::var_os("FACULTIES_WORKSPACE").is_none(),
+        "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE"
+    );
+    let config = Config::from_env()?;
+    eprintln!("{}", config.describe());
+    let storage = faculties::storage::Storage::shared(pile.clone(), key);
+    let backing = faculties::pile_watch::BackingIdentity::of(&pile)?;
+    let mut maintainer = Maintainer::new(storage.clone(), SessionBinder::from_env(&pile)?, config);
+    let result = faculties::pile_watch::run_until_replaced(
+        &pile,
+        &backing,
+        std::time::Duration::from_secs(poll),
+        || {
+            for line in maintainer.pass()? {
+                eprintln!("{line}");
+            }
+            Ok(())
+        },
+    );
+    if result.is_ok() {
+        eprintln!(
+            "maintain: {} was replaced; exiting so a fresh bind maps the new file",
+            pile.display()
+        );
+    }
+    drop(maintainer);
     let closed = storage.close();
     result.and(closed)
 }
