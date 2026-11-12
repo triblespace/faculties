@@ -14,8 +14,13 @@ All notable changes to this project will be documented in this file.
   model is picked up; each model found is named once (maintained, or not
   listed). A listed model with nothing to derive is not bound; one that
   cannot be bound is skipped with a line and retried after
-  `WEMM_MAINTAIN_BIND_RETRY_SECS` (1800), never replaced by another.
-  `WEMM_MAINTAIN_MAX_BOUND` (1) caps the models bound at once. An index is
+  `WEMM_MAINTAIN_BIND_RETRY_SECS` (1800), never replaced by another; that
+  retry runs when due even if the pile has not grown
+  (`pile_watch::run_until_replaced_or_due`). Descriptors are read only from
+  what is here, never fetched. `WEMM_MAINTAIN_MAX_BOUND` (1) caps the models
+  bound at once. Several listed models need `WEMM_COPY_WEIGHTS=1`: aliased
+  weights keep their registrations until the process exits, so the mode
+  refuses to start with several models and aliased weights. An index is
   found from its first leaf on; one that is only registered is not, so the
   single-model mode (unchanged, the default) is still how an index gets its
   first leaf. `Session::maintain` maintains an index without registering it,
