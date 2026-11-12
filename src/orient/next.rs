@@ -411,8 +411,12 @@ mod tests {
                 timeout: Some(Duration::from_secs(seconds)), poll_interval: Duration::from_millis(10),
                 ..Default::default()
             }).unwrap().start().unwrap();
-        let mut second = start(1);
-        let timeout = second.ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The wait's deadline also bounds acquiring its snapshot, and under a
+        // loaded whole suite one second was not always enough to acquire
+        // (2026-11-12: "exact acquisition deadline exceeded"). Five seconds
+        // still exercises a real timeout.
+        let mut second = start(5);
+        let timeout = second.ready.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(timeout.kind(), NextKind::Timeout);
         second.acknowledge(timeout).unwrap();
         assert!(second.is_settled());
