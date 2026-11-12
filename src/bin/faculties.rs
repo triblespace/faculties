@@ -286,6 +286,7 @@ fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<(
     let binder = SessionBinder::from_env(&pile)?;
     let note = config.check_residence(binder.keeps_every_bind())?;
     eprintln!("{}", config.describe());
+    eprintln!("{}", faculties::maintenance::AttachedUpkeep::describe());
     if let Some(note) = note {
         eprintln!("{note}");
     }

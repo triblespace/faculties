@@ -2866,6 +2866,86 @@ mod tests {
         );
     }
 
+    /// The daemon's attached pass finds the BM25 index once a search's MAP
+    /// names it, and after new commits maintains it until a search has
+    /// nothing left to build; with nothing new it does nothing.
+    #[test]
+    fn the_daemon_pass_maintains_the_index_a_search_declared() {
+        use triblespace::core::collection::CollectionRead;
+        let fixture = fixture();
+        let import = |name: &str, line: &str| {
+            let source = fixture._directory.path().join(name);
+            fs::write(&source, line).unwrap();
+            run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        };
+        let observe = || {
+            storage(&fixture)
+                .storage
+                .with_store(|store, signer, runtime| {
+                    let source = storage(&fixture).storage.open_collection_read(
+                        store,
+                        archive_schema::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )?;
+                    let target =
+                        store.attach_with(source, crate::archive_bm25::ArchiveTextBm25Mapping)?;
+                    let snapshot = store.snapshot()?;
+                    let named = snapshot.collections()?.contains(&target.handle());
+                    Ok((named, snapshot.attached(target)?.residual().len()))
+                })
+                .unwrap()
+        };
+        import(
+            "one.jsonl",
+            r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
+        );
+        let mut upkeep = crate::maintenance::AttachedUpkeep::new();
+        assert!(upkeep.pass(storage(&fixture).storage).unwrap().is_empty());
+        assert_eq!(observe(), (false, 3), "nothing names the index yet");
+
+        // budget 0: one commit indexed and kept, which declares the index.
+        let (_, _, lag) =
+            archive_collection::search_views_within(storage(&fixture).storage, 0).unwrap();
+        assert_eq!(lag.index, 2);
+        assert_eq!(observe(), (true, 2));
+
+        let lines = upkeep.pass(storage(&fixture).storage).unwrap();
+        assert!(
+            lines.iter().any(|line| line.contains("attached in")),
+            "{lines:?}"
+        );
+        assert_eq!(observe(), (true, 0));
+
+        import(
+            "two.jsonl",
+            r#"{"type":"user","sessionId":"later","uuid":"two","timestamp":"2026-03-02T15:34:01Z","message":{"role":"user","content":"pulsar thread"}}"#,
+        );
+        let (named, lagging) = observe();
+        assert!(named && lagging > 0, "{lagging}");
+        let lines = upkeep.pass(storage(&fixture).storage).unwrap();
+        assert!(
+            lines.iter().any(|line| line.contains("attached in")),
+            "{lines:?}"
+        );
+        assert_eq!(observe(), (true, 0));
+        let (_, index, lag) =
+            archive_collection::search_views_within(storage(&fixture).storage, 0).unwrap();
+        assert_eq!(lag.index, 0);
+        assert_eq!(
+            index
+                .query()
+                .unwrap()
+                .query_multi(&hash_tokens("pulsar"))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(index);
+        // Nothing new: the pass maintains nothing.
+        assert!(upkeep.pass(storage(&fixture).storage).unwrap().is_empty());
+    }
+
     /// A search maps at most its budget of the commits the index does not
     /// reach, at least one, keeps them, and names the
     /// rest as lag; each later search goes on from there.

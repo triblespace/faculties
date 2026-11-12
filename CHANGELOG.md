@@ -12,6 +12,16 @@ All notable changes to this project will be documented in this file.
   rest is reported as lag, as before; a search never maps a merge node.
   On a store whose index reaches nothing, the first search declares it.
 
+- `faculties maintain --declared` also keeps current every attached index the
+  records name whose mapping faculties defines (today the Archive BM25,
+  `archive-text-bm25-v3`): each pass finds them with
+  `registered_targets` and maintains each that lags through its
+  registration (`maintain_attached_with`), on the CPU, with no list and no
+  environment. The WeMM half is unchanged.
+  `faculties::maintenance::mappings()` is the registration an application
+  chains onto the generic maintenance Driver
+  (`driver.with_attached(faculties::maintenance::mappings())`).
+
 - `faculties maintain --declared` maintains every WeMM index the pile's
   records name whose descriptor names a model of `WEMM_MAINTAIN_MODELS`
   (`ROOT/profile` or `COLLECTION/ROOT/profile`, comma-separated), each with

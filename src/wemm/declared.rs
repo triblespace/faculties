@@ -39,6 +39,11 @@
 //! store, so every retired model stays declared; a positive list keeps a
 //! retired model out without anyone having to remember it, and a new index
 //! of a listed model is still picked up on the next pass.
+//!
+//! Each pass also maintains every attached index the records name whose
+//! mapping faculties defines (the Archive BM25; [`crate::maintenance`]),
+//! on the CPU and with no list: the first search that kept its images
+//! declared it.
 
 use super::{Derived, Target};
 use crate::storage::{AcquiringReader, FacultyStore, Storage};
@@ -415,6 +420,8 @@ pub struct Maintainer<B: Binder> {
     /// bind ([`Binder::keeps_every_bind`]).
     first_bound: Option<WemmIdentity>,
     passes: u64,
+    /// The attached indexes faculties defines ([`crate::maintenance`]).
+    attached: crate::maintenance::AttachedUpkeep,
 }
 
 /// What one pass did: the lines to log, and when the next pass is due even
@@ -435,6 +442,7 @@ impl<B: Binder> Maintainer<B> {
             named: Vec::new(),
             first_bound: None,
             passes: 0,
+            attached: crate::maintenance::AttachedUpkeep::new(),
         }
     }
 
@@ -558,6 +566,13 @@ impl<B: Binder> Maintainer<B> {
                     )),
                 }
             }
+        }
+        // The attached indexes, after the models: one failing is a line.
+        match self.attached.pass(&self.storage) {
+            Ok(attached) => lines.extend(attached),
+            Err(error) => lines.push(format!(
+                "maintain: attached indexes not maintained this pass: {error:#}"
+            )),
         }
         // The next attempt of every failed model that still has work, also
         // one already due (it came while later models were maintained):
