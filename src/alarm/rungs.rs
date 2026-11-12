@@ -602,8 +602,16 @@ impl Transport for Live {
         run_with_timeout(program, args, self.timeout)
     }
 
-    fn hue_alert(&mut self, _target: &str) -> Result<()> {
-        bail!("this build has no Hue alert")
+    fn hue_alert(&mut self, target: &str) -> Result<()> {
+        let report = crate::home::Home::with_storage(self.storage.clone())
+            .change(target, &crate::home::Request::Alert)?;
+        if report.refused() {
+            bail!(
+                "the Hue bridge refused the alert: {}",
+                report.errors.join("; ")
+            );
+        }
+        Ok(())
     }
 }
 
