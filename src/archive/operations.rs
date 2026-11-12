@@ -2867,7 +2867,7 @@ mod tests {
     }
 
     /// A search maps at most its budget of the commits the index does not
-    /// reach, smallest first and at least one, keeps them, and names the
+    /// reach, at least one, keeps them, and names the
     /// rest as lag; each later search goes on from there.
     #[test]
     fn a_search_builds_within_its_budget_and_names_the_rest() {

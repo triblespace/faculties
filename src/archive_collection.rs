@@ -840,10 +840,16 @@ pub fn ensure_search_local_with_storage(
 }
 
 /// How many bytes of Archive source nodes one search maps into BM25 images
-/// for the commits the index does not reach yet, smallest first
-/// ([`AttachedSnapshot::read_within_with`]). The smallest is mapped whatever
+/// for the commits the index does not reach yet
+/// ([`AttachedSnapshot::read_within_with`]). The first is mapped whatever
 /// its size, so a search on a store whose index reaches nothing still
 /// leaves an attachment, and so a MAP record naming the index.
+///
+/// Measured read-only on sky's pile, 2026-11-12 (lane
+/// attached-bm25-20261112), per search, with no Archive commit attached
+/// (all 59,405 of them residual): 16 MiB is 68 commits, mapped in 0.9 s
+/// into 13 MB of images, against 0.4 s for the cover-only view and query.
+/// The largest commit is 7.4 MB and the median 82 KB.
 pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
 
 /// Acquire a query's fixed Archive fact and BM25 observations, and keep what
@@ -854,8 +860,9 @@ pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
 /// owns the store.
 ///
 /// The index is the attached BM25 cover plus images of the residual: the
-/// Archive commits no attachment reaches, mapped in this process smallest
-/// first up to [`SEARCH_BUILD_BUDGET`] bytes of source nodes. Those images
+/// Archive commits no attachment reaches, mapped in this process up to
+/// [`SEARCH_BUILD_BUDGET`] bytes of source nodes, in the residual's order,
+/// looking at no more of it than that. Those images
 /// are kept as this host's attachments (`keep_attached`: the images and
 /// host-signed MAPs), so the next search takes them instead of building
 /// them, and the store's records name the index, which is how a maintainer
