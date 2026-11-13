@@ -300,6 +300,10 @@ pub struct Receipt {
     pub file: Id,
     pub generation: Id,
     pub generated: Generated,
+    /// Set when the Files commit stands but the upkeep of its derived views
+    /// failed: the image is stored, and readers fall back to the raw facts
+    /// until maintenance catches up.
+    pub warning: Option<String>,
 }
 
 /// Image generation with automatic provenance. Every successful generation
@@ -315,6 +319,8 @@ pub struct Imagine {
     storage: Storage,
     flux: Option<ModelSources>,
     openai: super::openai::Endpoint,
+    /// Where a generated image goes when it could not be stored in Files.
+    unstored: Option<PathBuf>,
 }
 impl Imagine {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
@@ -331,7 +337,15 @@ impl Imagine {
             storage,
             flux,
             openai: super::openai::Endpoint::from_environment(),
+            unstored: std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache/faculties/imagine-unstored")),
         }
+    }
+    /// Where images that could not be stored in Files are kept instead
+    /// (default `~/.cache/faculties/imagine-unstored`).
+    pub fn with_unstored_directory(mut self, directory: PathBuf) -> Self {
+        self.unstored = Some(directory);
+        self
     }
     /// Explicit FLUX model locations. A routed storage still has no FLUX.
     pub fn with_flux_sources(mut self, sources: ModelSources) -> Self {
@@ -353,17 +367,30 @@ impl Imagine {
 
     /// Generate, then publish the exact bytes and their provenance in one
     /// Files commit. Files WRITE is proven before the provider is called. The
-    /// provider is called at most once; nothing is retried. If storing fails
-    /// after a successful (paid) generation, the error says so.
+    /// provider is called at most once; nothing is retried.
+    ///
+    /// Once the commit stands the result is a [`Receipt`], with a warning if
+    /// the derived views could not be brought up to date. If the provider
+    /// produced an image but it could not be committed, the exact bytes are
+    /// written to the unstored directory (mode 0600) and the error names that
+    /// path, or says that writing it failed too.
     pub fn generate(&self, request: &Request) -> Result<Receipt> {
         request.validate()?;
         if let Request::Flux(_) = request {
+            // Both refusals come before any storage is touched.
             anyhow::ensure!(
                 self.flux.is_some(),
                 "imagine generate: workspace model-asset routing is unconfigured"
             );
+            anyhow::ensure!(
+                cfg!(feature = "imagine"),
+                "FLUX generation requires a build with the `imagine` feature"
+            );
         }
-        self.storage.scope(|storage| {
+        let mut produced: Option<Generated> = None;
+        let mut hint = request.provider().to_owned();
+        let mut committed = false;
+        let result = self.storage.scope(|storage| {
             let files = crate::files::Files::with_storage(storage.clone());
             files
                 .preflight_write()
@@ -379,29 +406,67 @@ impl Imagine {
                     Generated::OpenAi(super::openai::generate(&self.openai, &key, options)?)
                 }
             };
+            produced = Some(generated.clone());
             let name = format!(
                 "imagine-{}-{nanos}.{}",
                 request.provider(),
                 generated.extension()
             );
             let staged = super::provenance::stage(request, &generated, requested_at, &name)
-                .context(
-                    "image generated, but staging its record failed; generation is not retried",
-                )?;
-            files.publish(staged.fragment).with_context(|| {
-                format!(
-                    "image generated ({} bytes, {}), but storing it in Files failed; generation \
-                     is not retried",
-                    generated.bytes().len(),
-                    generated.media_type()
-                )
-            })?;
+                .context("staging its Files record failed")?;
+            hint = format!("{}-{:x}", request.provider(), staged.generation);
+            let published = files
+                .publish(staged.fragment)
+                .context("committing it to Files failed")?;
+            committed = true;
+            let warning = match published {
+                crate::files::Published::Current(_) => None,
+                crate::files::Published::Lagging { upkeep, .. } => Some(format!(
+                    "the image is stored, but bringing Files' derived views up to date failed \
+                     ({upkeep:#}); readers use the raw facts until maintenance catches up"
+                )),
+            };
             Ok(Receipt {
                 file: staged.file,
                 generation: staged.generation,
                 generated,
+                warning,
             })
-        })
+        });
+        match (result, produced) {
+            (Ok(receipt), _) => Ok(receipt),
+            (Err(error), Some(generated)) => {
+                Err(self.keep_unstored(error, &generated, &hint, committed))
+            }
+            (Err(error), None) => Err(error),
+        }
+    }
+
+    /// The image was produced but is not known to be stored: keep its exact
+    /// bytes in a private local file and say where, or say that this failed.
+    fn keep_unstored(
+        &self,
+        error: anyhow::Error,
+        generated: &Generated,
+        hint: &str,
+        committed: bool,
+    ) -> anyhow::Error {
+        let state = if committed {
+            "its Files commit was appended but storage reported a failure afterwards, so it may not be durable"
+        } else {
+            "it was not stored in Files"
+        };
+        match save_unstored(self.unstored.as_deref(), hint, generated) {
+            Ok(path) => error.context(format!(
+                "the image was generated but {state}; its exact bytes ({} bytes, {}) were saved to {}; generation is not retried",
+                generated.bytes().len(),
+                generated.media_type(),
+                path.display()
+            )),
+            Err(write) => error.context(format!(
+                "the image was generated but {state}, and saving its bytes locally also failed ({write:#}); the image is lost; generation is not retried"
+            )),
+        }
     }
 
     /// Metadata only: no Secrets version is opened.
@@ -417,6 +482,47 @@ impl Imagine {
     ) -> Result<(Id, super::auth::Credential)> {
         super::auth::auth_set(&self.storage, provider, selector)
     }
+}
+
+/// Write `generated`'s exact bytes to `directory/<UTC time>-<hint>.<ext>`,
+/// readable by this user only, never overwriting an existing file.
+fn save_unstored(directory: Option<&Path>, hint: &str, generated: &Generated) -> Result<PathBuf> {
+    use std::io::Write as _;
+    let directory = directory.context("no HOME, so there is no unstored-image directory")?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(directory)
+        .with_context(|| format!("create {}", directory.display()))?;
+    let (year, month, day, hour, minute, second, nanos) = crate::clock::now()?.to_gregorian_utc();
+    let hint: String = hint
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = directory.join(format!(
+        "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}.{:03}Z-{hint}.{}",
+        nanos / 1_000_000,
+        generated.extension()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    file.write_all(generated.bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
 }
 
 pub(super) fn remember_range(raw: &str) -> Result<(hifitime::Epoch, hifitime::Epoch)> {

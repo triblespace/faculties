@@ -268,12 +268,16 @@ pub fn run() -> Result<()> {
     };
     let range = cli.remember.as_deref().map(remember_range).transpose()?;
     let storage = storage_for(&cli)?;
+    // Refused before the prompt is read, so `@-` never waits on stdin.
+    if storage.is_none() && cli.provider == ProviderArg::Openai {
+        bail!("openai generation stores its result in Files and reads its credential from Secrets; it needs --pile or PILE");
+    }
     let request = request(&cli, prompt)?;
     request.validate()?;
     let Some(storage) = storage else {
         // Nowhere to store: only FLUX can run, and it saves a readable file.
         let Request::Flux(options) = &request else {
-            bail!("openai generation stores its result in Files and reads its credential from Secrets; it needs --pile or PILE");
+            unreachable!("openai without storage is refused above");
         };
         let generated = Flux::new(ModelSources::from_environment()).generate(options)?;
         let path = match &cli.out {
@@ -304,6 +308,9 @@ pub fn run() -> Result<()> {
         })?;
     }
     eprintln!("imagine: {}", generated.diagnostic());
+    if let Some(warning) = &receipt.warning {
+        eprintln!("imagine: warning: {warning}");
+    }
     crate::cli::with_output("imagine", |out| {
         if std::env::var_os("DRIVE_ENDPOINT").is_some() {
             out.image(generated.bytes().clone(), generated.media_type())?;

@@ -176,6 +176,9 @@ impl Faculty for Imagine {
             bytes.len(),
             receipt.generation
         ))?;
+        if let Some(warning) = &receipt.warning {
+            out.line(format!("warning: {warning}"))?;
+        }
         if fits_response(bytes.len()) {
             out.image(bytes.clone(), generated.media_type())?;
         } else {

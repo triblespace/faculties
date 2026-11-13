@@ -37,12 +37,18 @@ fn bound(storage: &Storage, server: &Server) -> Imagine {
     let secret = crate::secrets::Secrets::with_storage(storage.clone())
         .add("openai", KEY.as_bytes())
         .unwrap();
-    let imagine =
-        Imagine::with_storage(storage.clone()).with_openai_endpoint(Endpoint::new(&server.base));
+    let imagine = Imagine::with_storage(storage.clone())
+        .with_openai_endpoint(Endpoint::new(&server.base))
+        .with_unstored_directory(unstored(storage));
     imagine
         .auth_set(Provider::OpenAi, Selector::Version(secret))
         .unwrap();
     imagine
+}
+
+/// The test's own unstored-image directory, beside its pile.
+fn unstored(storage: &Storage) -> PathBuf {
+    storage.path().parent().unwrap().join("unstored")
 }
 
 /// COMMIT records targeting the selected collection for `scope`.
@@ -603,4 +609,114 @@ fn the_tool_schema_carries_no_encoded_bytes() {
     let text = format!("{}{}", tools[0].description, tools[0].input_schema).to_ascii_lowercase();
     assert!(!text.contains("base64") && !text.contains("b64_json"));
     assert!(properties.contains_key("provider") && properties.contains_key("quality"));
+}
+
+#[test]
+fn a_post_commit_upkeep_failure_still_returns_the_receipt_with_a_warning() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let imagine = bound(&storage, &server);
+    arm(Fault::AfterCommit);
+    let receipt = imagine
+        .generate(&Request::OpenAi(openai_request("a lagging view")))
+        .unwrap();
+    let warning = receipt.warning.as_deref().expect("a lag warning");
+    assert!(warning.contains("derived views"), "{warning}");
+    assert!(
+        warning.contains("injected Files upkeep failure"),
+        "{warning}"
+    );
+    assert_eq!(commits_to(&storage, FILES), 1);
+    assert_stored(
+        &storage,
+        receipt.file,
+        receipt.generation,
+        &png,
+        "image/png",
+        "a lagging view",
+    );
+    assert!(
+        !unstored(&storage).exists(),
+        "a committed image is not kept locally"
+    );
+
+    // Through MCP: the receipt, then the warning, then the image.
+    let adapter = super::mcp::Imagine::from_operations(imagine);
+    arm(Fault::AfterCommit);
+    let parts = call(&adapter, serde_json::json!({"prompt": "again"})).unwrap();
+    assert!(matches!(&parts[0], Part::Text { text } if text.starts_with("files:")));
+    assert!(matches!(&parts[1], Part::Text { text } if text.starts_with("warning: ")));
+    assert!(matches!(&parts[2], Part::Image { bytes, .. } if bytes.as_ref() == png.as_slice()));
+    assert_eq!(server.count(), 2);
+}
+
+#[test]
+fn a_failed_commit_keeps_the_exact_bytes_in_a_private_local_file() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let imagine = bound(&storage, &server);
+    arm(Fault::BeforeCommit);
+    let error = imagine
+        .generate(&Request::OpenAi(openai_request("an unstored image")))
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("injected Files commit failure"), "{text}");
+    assert!(text.contains("not stored in Files"), "{text}");
+    let saved: Vec<PathBuf> = std::fs::read_dir(unstored(&storage))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1);
+    let path = &saved[0];
+    assert!(
+        error.to_string().contains(&path.display().to_string()),
+        "{error}"
+    );
+    let name = path.file_name().unwrap().to_str().unwrap();
+    assert!(
+        name.ends_with(".png") && name.contains("Z-openai-"),
+        "{name}"
+    );
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        png,
+        "the exact provider bytes"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    assert_eq!(commits_to(&storage, FILES), 0);
+    assert_eq!(server.count(), 1, "never retried");
+}
+
+#[test]
+fn when_the_local_fallback_fails_too_the_error_says_the_image_is_lost() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let blocker = directory.path().join("not-a-directory");
+    std::fs::write(&blocker, b"").unwrap();
+    let imagine = bound(&storage, &server).with_unstored_directory(blocker.join("unstored"));
+    arm(Fault::BeforeCommit);
+    let error = imagine
+        .generate(&Request::OpenAi(openai_request("a lost image")))
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(
+        text.contains("saving its bytes locally also failed"),
+        "{text}"
+    );
+    assert!(text.contains("lost"), "{text}");
+    assert_eq!(commits_to(&storage, FILES), 0);
 }

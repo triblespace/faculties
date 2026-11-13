@@ -24,7 +24,7 @@ pub mod mcp;
 pub mod operations;
 pub mod presentation;
 
-pub use operations::Files;
+pub use operations::{Files, Published};
 
 use anyhow::{anyhow, Context, Result};
 use ed25519_dalek::SigningKey;

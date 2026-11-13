@@ -1841,6 +1841,58 @@ impl SimilarityOptions<'_> {
     }
 }
 
+/// What [`Files::publish`] did once its commit was appended.
+#[derive(Debug)]
+pub enum Published {
+    /// Committed, and the derived views were ensured.
+    Current(CollectionCommit),
+    /// Committed; ensuring the derived views failed with `upkeep`. The facts
+    /// stand and readers fall back to them until maintenance catches up.
+    Lagging {
+        commit: CollectionCommit,
+        upkeep: anyhow::Error,
+    },
+}
+
+impl Published {
+    pub fn commit(&self) -> CollectionCommit {
+        match self {
+            Self::Current(commit) | Self::Lagging { commit, .. } => *commit,
+        }
+    }
+}
+
+/// Test-only fault injection for [`Files::publish`], per thread: the next
+/// publish on this thread fails at the armed point.
+#[cfg(test)]
+pub(crate) mod publish_fault {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Fault {
+        BeforeCommit,
+        AfterCommit,
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<Fault>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn arm(fault: Fault) {
+        ARMED.with(|armed| armed.set(Some(fault)));
+    }
+
+    pub(crate) fn take(fault: Fault) -> bool {
+        ARMED.with(|armed| {
+            let hit = armed.get() == Some(fault);
+            if hit {
+                armed.set(None);
+            }
+            hit
+        })
+    }
+}
+
 impl Files {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self::with_storage(Storage::new(pile, key))
@@ -1941,16 +1993,34 @@ impl Files {
     /// selected Files collection, then ensure its derived views. Workspace
     /// routes are honoured; the fragment is the ownership unit, so its blobs
     /// travel with it.
-    pub fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
+    ///
+    /// `Err` means nothing was committed. Once the commit is appended the
+    /// result is `Ok`: [`Published::Lagging`] says the commit stands but the
+    /// upkeep of the derived views failed, which readers survive by reading
+    /// the raw facts until maintenance catches up.
+    pub fn publish(&self, fragment: Fragment) -> Result<Published> {
         with_files_write_store(&self.storage, |store, collection, signer, runtime| {
             crate::collection_names::require_command_write_admission_acquiring(
                 store, collection, signer, "Files", "files", runtime,
             )?;
+            #[cfg(test)]
+            if publish_fault::take(publish_fault::Fault::BeforeCommit) {
+                anyhow::bail!("injected Files commit failure");
+            }
             let commit = store
                 .commit(collection, signer, fragment)
                 .context("commit Files fragment")?;
-            ensure_files_after_commit(store, collection, signer, runtime)?;
-            Ok(commit)
+            let upkeep = ensure_files_after_commit(store, collection, signer, runtime);
+            #[cfg(test)]
+            let upkeep = if publish_fault::take(publish_fault::Fault::AfterCommit) {
+                Err(anyhow::anyhow!("injected Files upkeep failure"))
+            } else {
+                upkeep
+            };
+            Ok(match upkeep {
+                Ok(()) => Published::Current(commit),
+                Err(upkeep) => Published::Lagging { commit, upkeep },
+            })
         })
     }
 
