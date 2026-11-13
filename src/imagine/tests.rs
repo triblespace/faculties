@@ -141,7 +141,7 @@ fn openai_request(prompt: &str) -> openai::Options {
 fn a_generation_is_one_files_commit_with_exact_bytes_and_provenance() {
     let (_directory, pile, key) = fresh();
     let storage = Storage::new(pile, Some(key));
-    let png = fake::image(image::ImageFormat::Png);
+    let png = fake::provider_png();
     let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
     let imagine = bound(&storage, &server);
     assert_eq!(commits_to(&storage, FILES), 0);
@@ -393,7 +393,7 @@ fn an_item_field_credential_binds_by_exact_ids_and_is_used() {
         .expect("the credential field")
         .0;
 
-    let png = fake::image(image::ImageFormat::Png);
+    let png = fake::provider_png();
     let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
     let imagine =
         Imagine::with_storage(storage.clone()).with_openai_endpoint(Endpoint::new(&server.base));
@@ -455,7 +455,7 @@ fn a_routed_workspace_storage_runs_the_openai_path_through_its_routes() {
         })
         .unwrap();
     let routed = base.clone().with_collections(routes.clone());
-    let png = fake::image(image::ImageFormat::Png);
+    let png = fake::provider_png();
     let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
     let imagine = bound(&routed, &server);
     let receipt = imagine

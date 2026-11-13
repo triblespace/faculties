@@ -783,6 +783,36 @@ pub(crate) mod fake {
         encoded.into_inner()
     }
 
+    /// A PNG as a provider might send it: valid, and carrying an ancillary
+    /// `tEXt` chunk that any decode and re-encode would drop, so a test can
+    /// tell the provider's exact bytes from a re-encoding of them.
+    pub fn provider_png() -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0_u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut png = image(image::ImageFormat::Png);
+        let iend = png.len() - 12;
+        let data = b"Software\0fake OpenAI provider";
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        let mut typed = b"tEXt".to_vec();
+        typed.extend_from_slice(data);
+        chunk.extend_from_slice(&typed);
+        chunk.extend_from_slice(&crc32(&typed).to_be_bytes());
+        png.splice(iend..iend, chunk);
+        png
+    }
+
     /// A success answer carrying `bytes` base64-encoded.
     pub fn success(bytes: &[u8], output_format: &str) -> String {
         use base64::Engine as _;
@@ -812,7 +842,7 @@ mod tests {
 
     #[test]
     fn success_decodes_exact_bytes_and_reports_the_answer() {
-        let png = fake::image(image::ImageFormat::Png);
+        let png = fake::provider_png();
         let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
         let mut options = Options::new("a lighthouse at dusk");
         options.quality = Quality::Medium;
@@ -976,5 +1006,10 @@ mod tests {
             Some(OutputFormat::Webp)
         );
         assert_eq!(OutputFormat::sniff(b"nothing"), None);
+        // The provider-shaped fixture is a valid PNG that differs from its re-encoding.
+        let provider = fake::provider_png();
+        assert_eq!(OutputFormat::sniff(&provider), Some(OutputFormat::Png));
+        assert!(image::load_from_memory(&provider).is_ok());
+        assert_ne!(provider, fake::image(image::ImageFormat::Png));
     }
 }
