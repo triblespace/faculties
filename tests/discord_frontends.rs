@@ -427,7 +427,13 @@ fn read_shows_each_message_id_and_what_a_reply_replies_to() {
         fragment += entity! { ExclusiveId::force_ref(&observation) @ archive::reply_to: reply_id };
         fixture.publish(fragment);
     }
-    let shown = call(&fixture.mcp(), "discord_read", json!({"limit": 0})).unwrap();
+    // Read one channel, so no line carries the channel label.
+    let shown = call(
+        &fixture.mcp(),
+        "discord_read",
+        json!({"channel_id": CHANNEL, "limit": 0}),
+    )
+    .unwrap();
     assert!(
         shown.contains(&format!("] id={target} Ada: is anyone there?")),
         "{shown}"
@@ -451,7 +457,7 @@ fn read_shows_each_message_id_and_what_a_reply_replies_to() {
         .arg(&fixture.pile)
         .arg("--key")
         .arg(&fixture.key)
-        .args(["read", "--limit", "0"])
+        .args(["read", CHANNEL, "--limit", "0"])
         .output()
         .unwrap();
     assert!(
