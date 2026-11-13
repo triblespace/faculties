@@ -2,6 +2,9 @@ use anybytes::Bytes;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use triblespace::prelude::Id;
+
+use crate::storage::Storage;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,8 +34,9 @@ impl Variant {
     }
 }
 
+/// Options of the local FLUX.2 pipeline.
 #[derive(Clone, Debug)]
-pub struct Options {
+pub struct FluxOptions {
     pub prompt: String,
     pub variant: Variant,
     pub steps: Option<usize>,
@@ -41,7 +45,7 @@ pub struct Options {
     pub height: usize,
     pub guidance: f32,
 }
-impl Options {
+impl FluxOptions {
     /// Reject malformed or accidentally enormous jobs before loading weights.
     /// These are request limits, not a guarantee that a device has enough RAM.
     pub fn validate(&self) -> Result<()> {
@@ -177,16 +181,17 @@ impl GeneratedImage {
     }
 }
 
+/// The local FLUX.2 generator. Needs the `imagine` cargo feature and weights.
 #[derive(Clone, Debug)]
-pub struct Imagine {
+pub struct Flux {
     pub sources: ModelSources,
 }
-impl Imagine {
+impl Flux {
     pub fn new(sources: ModelSources) -> Self {
         Self { sources }
     }
 
-    pub fn generate(&self, options: &Options) -> Result<GeneratedImage> {
+    pub fn generate(&self, options: &FluxOptions) -> Result<GeneratedImage> {
         options.validate()?;
         #[cfg(not(feature = "imagine"))]
         anyhow::bail!("image generation requires a build with the `imagine` feature");
@@ -223,6 +228,194 @@ impl Imagine {
             );
             GeneratedImage::from_rgb(image, started.elapsed())
         }
+    }
+}
+
+/// One generation request: provider-specific, typed options.
+#[derive(Clone, Debug)]
+pub enum Request {
+    Flux(FluxOptions),
+    OpenAi(super::openai::Options),
+}
+impl Request {
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::Flux(options) => &options.prompt,
+            Self::OpenAi(options) => &options.prompt,
+        }
+    }
+    pub fn provider(&self) -> &'static str {
+        match self {
+            Self::Flux(_) => "flux",
+            Self::OpenAi(_) => "openai",
+        }
+    }
+    /// Local checks only: no credential, model or network is touched.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Flux(options) => options.validate(),
+            Self::OpenAi(options) => options.validate(),
+        }
+    }
+}
+
+/// One answered generation, exactly as its provider produced it.
+#[derive(Clone, Debug)]
+pub enum Generated {
+    Flux(GeneratedImage),
+    OpenAi(super::openai::Generated),
+}
+impl Generated {
+    /// The original encoded bytes (FLUX: its PNG; OpenAI: the decoded answer).
+    pub fn bytes(&self) -> &Bytes {
+        match self {
+            Self::Flux(image) => &image.png,
+            Self::OpenAi(answer) => &answer.bytes,
+        }
+    }
+    pub fn media_type(&self) -> &'static str {
+        match self {
+            Self::Flux(_) => "image/png",
+            Self::OpenAi(answer) => answer.media_type(),
+        }
+    }
+    pub fn extension(&self) -> &'static str {
+        match self {
+            Self::Flux(_) => "png",
+            Self::OpenAi(answer) => answer.format.extension(),
+        }
+    }
+    pub fn diagnostic(&self) -> String {
+        match self {
+            Self::Flux(image) => image.diagnostic(),
+            Self::OpenAi(answer) => answer.diagnostic(),
+        }
+    }
+}
+
+/// A stored generation: the Files entity holding the bytes, the generation
+/// entity describing them (both in one Files commit), and the result itself.
+#[derive(Clone, Debug)]
+pub struct Receipt {
+    pub file: Id,
+    pub generation: Id,
+    pub generated: Generated,
+}
+
+/// Image generation with automatic provenance. Every successful generation
+/// is published to the selected Files collection as one commit holding the
+/// file and its generation record; a failed provider call writes nothing.
+///
+/// Remote providers use the supplied [`Storage`] as given, workspace routes
+/// included: Files for the result, Secrets and the `imagine` collection for
+/// the credential. Only the local FLUX path depends on model assets, whose
+/// workspace routing does not exist yet, so a routed storage has no FLUX.
+#[derive(Clone, Debug)]
+pub struct Imagine {
+    storage: Storage,
+    flux: Option<ModelSources>,
+    openai: super::openai::Endpoint,
+}
+impl Imagine {
+    pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(Storage::new(pile, key))
+    }
+    /// Reads launcher configuration only (FLUX model locations, the OpenAI
+    /// base URL); opens nothing.
+    pub fn with_storage(storage: Storage) -> Self {
+        let flux = storage
+            .collection_routes()
+            .is_none()
+            .then(ModelSources::from_environment);
+        Self {
+            storage,
+            flux,
+            openai: super::openai::Endpoint::from_environment(),
+        }
+    }
+    /// Explicit FLUX model locations. A routed storage still has no FLUX.
+    pub fn with_flux_sources(mut self, sources: ModelSources) -> Self {
+        self.flux = self
+            .storage
+            .collection_routes()
+            .is_none()
+            .then_some(sources);
+        self
+    }
+    /// Explicit OpenAI endpoint (a proxy, or a fake server in tests).
+    pub fn with_openai_endpoint(mut self, endpoint: super::openai::Endpoint) -> Self {
+        self.openai = endpoint;
+        self
+    }
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    /// Generate, then publish the exact bytes and their provenance in one
+    /// Files commit. Files WRITE is proven before the provider is called. The
+    /// provider is called at most once; nothing is retried. If storing fails
+    /// after a successful (paid) generation, the error says so.
+    pub fn generate(&self, request: &Request) -> Result<Receipt> {
+        request.validate()?;
+        if let Request::Flux(_) = request {
+            anyhow::ensure!(
+                self.flux.is_some(),
+                "imagine generate: workspace model-asset routing is unconfigured"
+            );
+        }
+        self.storage.scope(|storage| {
+            let files = crate::files::Files::with_storage(storage.clone());
+            files
+                .preflight_write()
+                .context("imagine: the result could not be stored, so nothing was generated")?;
+            let requested_at = crate::clock::point_now()?;
+            let nanos = crate::clock::tai_nanoseconds_now()?;
+            let generated = match request {
+                Request::Flux(options) => Generated::Flux(
+                    Flux::new(self.flux.clone().expect("checked above")).generate(options)?,
+                ),
+                Request::OpenAi(options) => {
+                    let key = super::auth::open_key(storage, super::auth::Provider::OpenAi)?;
+                    Generated::OpenAi(super::openai::generate(&self.openai, &key, options)?)
+                }
+            };
+            let name = format!(
+                "imagine-{}-{nanos}.{}",
+                request.provider(),
+                generated.extension()
+            );
+            let staged = super::provenance::stage(request, &generated, requested_at, &name)
+                .context(
+                    "image generated, but staging its record failed; generation is not retried",
+                )?;
+            files.publish(staged.fragment).with_context(|| {
+                format!(
+                    "image generated ({} bytes, {}), but storing it in Files failed; generation \
+                     is not retried",
+                    generated.bytes().len(),
+                    generated.media_type()
+                )
+            })?;
+            Ok(Receipt {
+                file: staged.file,
+                generation: staged.generation,
+                generated,
+            })
+        })
+    }
+
+    /// Metadata only: no Secrets version is opened.
+    pub fn auth_status(&self, provider: super::auth::Provider) -> Result<super::auth::AuthStatus> {
+        super::auth::auth_status(&self.storage, provider)
+    }
+
+    /// Bind one exact Secrets selector for `provider`, proving it opens.
+    pub fn auth_set(
+        &self,
+        provider: super::auth::Provider,
+        selector: super::auth::Selector,
+    ) -> Result<(Id, super::auth::Credential)> {
+        super::auth::auth_set(&self.storage, provider, selector)
     }
 }
 
