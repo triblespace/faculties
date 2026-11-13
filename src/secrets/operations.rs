@@ -151,9 +151,11 @@ impl Secrets {
                         collection.source(),
                         signer,
                     ))
-                    .context(
-                        "Encrypted secret was committed, but ensuring its derived views failed",
-                    )?,
+                    .with_context(|| {
+                        format!(
+                            "Encrypted secret {secret:x} was committed and delivered, but ensuring its derived views failed"
+                        )
+                    })?,
             );
             Ok(secret)
         })
@@ -186,9 +188,11 @@ impl Secrets {
                         collection.source(),
                         signer,
                     ))
-                    .context(
-                        "Encrypted item was committed, but ensuring its derived views failed",
-                    )?,
+                    .with_context(|| {
+                        format!(
+                            "Encrypted item {id:x} was committed and delivered, but ensuring its derived views failed"
+                        )
+                    })?,
             );
             Ok(id)
         })
@@ -618,10 +622,12 @@ impl Secrets {
     }
     /// Bind every existing ordinary version this key opens, not protected and
     /// not already in a vault, to the colony vault, keeping its version id.
-    /// With `commit` false nothing is written and the plan is returned; with
-    /// `commit` true the bindings publish in one commit and the vault's hosts
-    /// receive their envelopes. Running it again adopts nothing. Never opens
-    /// or returns plaintext.
+    /// A version whose bound descriptor cannot be read is skipped and
+    /// reported. With `commit` false there is no adoption commit and the plan
+    /// is returned (reads may still fetch or cache blobs); with `commit` true
+    /// the bindings publish in one commit and the vault's hosts receive their
+    /// envelopes. Running it again adopts nothing. Plaintext is never printed
+    /// or returned, but bodies are decrypted internally to authenticate keys.
     pub fn adopt_colony(&self, commit: bool) -> Result<secret_storage::ColonyAdoption> {
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(

@@ -549,3 +549,186 @@ fn a_planted_vault_that_widens_delivery_is_not_the_colony_vault() {
         assert!(found.created.is_some(), "the genuine one is still absent");
     }
 }
+
+/// Review F1: a definition that is not here at selection may arrive later.
+/// A candidate is certified only when every typed delivery binding on it is
+/// readable and equal to the colony policy.
+#[test]
+fn a_candidate_with_an_unreadable_delivery_definition_is_never_chosen() {
+    use crate::schema::{resource_vault, COLONY_VAULT, KIND_SECRET_VAULT};
+    use triblespace::core::blob::{Blob, IntoBlob};
+    use triblespace::core::capability::policy::{resource_handle, resource_policy};
+    use triblespace::core::metadata;
+    let mut colony = colony();
+    let collection = colony.collection;
+    let policy = resource::colony_policy(
+        &AdmissionPolicy::quorum(
+            [
+                colony.a.verifying_key(),
+                colony.b.verifying_key(),
+                colony.c.verifying_key(),
+            ],
+            1,
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let genuine = resource::colony_vault(&policy).resource;
+    // C1: the readable canonical definition. C2: a valid key-delivery
+    // definition with distinct bytes, absent when the holder selects.
+    let delayed = entity! {
+        triblespace::core::capability::capability_action: crate::schema::ACTION_KEY_DELIVERY,
+        triblespace::core::capability::capability_delegate_action: crate::schema::ACTION_KEY_DELIVERY,
+    };
+    let mut planted = triblespace::core::trible::Fragment::empty();
+    let c1 = planted.put::<SimpleArchive, _>(crate::key_delivery_definition().into_facts());
+    let c2_blob: Blob<SimpleArchive> = delayed.into_facts().to_blob();
+    let c2 = c2_blob.get_handle();
+    let descriptor = entity! {
+        metadata::tag: crate::schema::KIND_SECRET_RESOURCE,
+        resource_vault: COLONY_VAULT,
+        resource_policy*: policy.binding(c1),
+        resource_policy*: AdmissionPolicy::direct(colony.outsider.verifying_key()).binding(c2),
+    };
+    let planted_resource = planted.put::<SimpleArchive, _>(descriptor.into_facts());
+    planted += entity! { metadata::tag: KIND_SECRET_VAULT, resource_handle: planted_resource };
+    colony
+        .store
+        .commit(collection.source(), &colony.a, planted)
+        .unwrap();
+
+    let observed = view(&mut colony);
+    let found = colony_vault(&observed, collection).unwrap();
+    assert_ne!(
+        found.resource, planted_resource,
+        "a partial view certifies nothing"
+    );
+    assert_eq!(found.resource, genuine);
+    assert!(
+        found.created.is_some(),
+        "no candidate is eligible, so prepare the intrinsic one"
+    );
+    drop(observed);
+    let added = add_raw(&mut colony, "synthetic while C2 is absent").unwrap();
+    assert_eq!(added.vault, genuine);
+
+    // C2 arrives.
+    colony.store.put::<SimpleArchive, _>(c2_blob).unwrap();
+    let observed = view(&mut colony);
+    let found = colony_vault(&observed, collection).unwrap();
+    assert_eq!(found.resource, genuine);
+    assert!(found.created.is_none());
+    // The planted R now would deliver to the outsider; nothing is bound to it.
+    assert_eq!(
+        maintain_recipient_envelopes(
+            &mut colony.store,
+            &colony.a,
+            &observed,
+            collection,
+            &colony.a,
+            now()
+        )
+        .unwrap(),
+        0
+    );
+    drop(observed);
+    assert!(view(&mut colony)
+        .open(added.secret, &colony.outsider)
+        .is_err());
+}
+
+/// Review F2: an unreadable vault descriptor is not evidence of "no vault".
+#[test]
+fn adoption_skips_a_version_whose_resource_descriptor_is_missing() {
+    let mut colony = colony();
+    let collection = colony.collection;
+    // The Care member is here; its Care vault descriptor is not.
+    let care = resource::create_signer_vault(&colony.a, "synthetic care vault", at(0)).unwrap();
+    let member = record::seal(
+        &colony.a,
+        "care record",
+        at(4),
+        Delivery::Vault(care.resource),
+        |sealer| {
+            let note = sealer.seal_blob::<blobencodings::UTF8String>(
+                "SYNTHETIC-PRIVATE-care".to_owned().to_blob(),
+                &[],
+            )?;
+            Ok(entity! { crate::schema::field_text: note }.into_facts())
+        },
+    )
+    .unwrap();
+    let member_id = member.secret;
+    colony
+        .store
+        .commit(collection.source(), &colony.a, member.fragment)
+        .unwrap();
+    for commit in [false, true] {
+        let report = adopt(&mut colony, commit).unwrap();
+        assert!(report.adopted.is_empty(), "commit={commit}");
+        assert!(!report.committed);
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|skip| skip.secret == member_id && skip.reason.contains("unavailable")),
+            "commit={commit}: {:?}",
+            report.skipped
+        );
+    }
+    assert!(record::open(
+        view(&mut colony).store_snapshot().clone(),
+        view(&mut colony).facts().unwrap(),
+        member_id,
+        &colony.b
+    )
+    .is_err());
+    // Once the descriptor arrives the member is known to be in a vault.
+    colony
+        .store
+        .commit(collection.source(), &colony.a, care.fragment)
+        .unwrap();
+    let report = adopt(&mut colony, true).unwrap();
+    assert!(report.adopted.is_empty());
+    assert!(report.skipped.is_empty());
+}
+
+/// When the version is published but delivery cannot follow, the error
+/// carries the new version id as a typed receipt.
+#[test]
+fn a_failed_delivery_after_the_commit_reports_the_version_id() {
+    let mut colony = colony();
+    let collection = colony.collection;
+    let mut calls = 0;
+    let error = add_secret_to_colony(
+        &mut colony.store,
+        &colony.a,
+        collection,
+        |store: &mut MemoryRepo| {
+            calls += 1;
+            if calls > 1 {
+                bail!("synthetic observation failure");
+            }
+            snapshot(store.snapshot().unwrap(), collection)
+        },
+        "synthetic receipt",
+        RAW,
+        at(1),
+        now(),
+    )
+    .unwrap_err();
+    let receipt = error
+        .downcast_ref::<CommittedUndelivered>()
+        .unwrap_or_else(|| panic!("no receipt in {error:#}"));
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!("{:x}", receipt.secret)),
+        "{message}"
+    );
+    assert!(message.contains("maintain"), "{message}");
+    assert_eq!(
+        view(&mut colony).open(receipt.secret, &colony.a).unwrap(),
+        RAW
+    );
+}

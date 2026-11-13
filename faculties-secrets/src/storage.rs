@@ -447,6 +447,33 @@ pub fn colony_vault<R: BlobStoreGet>(
     })
 }
 
+/// Receipt in the error of a colony add whose version was published but
+/// whose delivery (or the observation before it) failed. The version is
+/// final; `maintain` completes delivery. Recover it with
+/// `error.downcast_ref::<CommittedUndelivered>()`.
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedUndelivered {
+    pub secret: triblespace::core::id::Id,
+    pub vault: CollectionHandle,
+}
+
+impl std::fmt::Display for CommittedUndelivered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "version {:x} was committed into colony vault blake3:{}, but its delivery did not \
+             complete; run `secrets maintain --secret {:x}`",
+            self.secret,
+            self.vault
+                .raw
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            self.secret
+        )
+    }
+}
+
 /// One version sealed into the colony vault and delivered right after.
 #[derive(Clone, Copy, Debug)]
 pub struct ColonyAdd {
@@ -484,8 +511,11 @@ where
     store
         .commit(collection.source, signing_key, fragment)
         .map_err(|error| anyhow!("publish encrypted colony version: {error}"))?;
-    let observed = observe(store)
-        .context("version committed; observe it for colony delivery (run maintain)")?;
+    let receipt = CommittedUndelivered {
+        secret,
+        vault: vault.resource,
+    };
+    let observed = observe(store).context(receipt)?;
     let delivered = maintain_selected_recipient_envelopes(
         store,
         signing_key,
@@ -495,7 +525,7 @@ where
         &[SecretTarget::Secret(secret)],
         now,
     )
-    .context("version committed, colony delivery failed (run maintain)")?;
+    .context(receipt)?;
     Ok(ColonyAdd {
         secret,
         vault: vault.resource,
@@ -566,6 +596,16 @@ pub struct ColonyAdoption {
     pub committed: bool,
     /// Envelopes added for the vault's recipients after the commit.
     pub delivered: usize,
+    /// Versions left alone because what adoption must know about them could
+    /// not be read, with the reason. Retry once the bytes are here.
+    pub skipped: Vec<AdoptionSkip>,
+}
+
+/// One version adoption declined to judge.
+#[derive(Clone, Debug)]
+pub struct AdoptionSkip {
+    pub secret: triblespace::core::id::Id,
+    pub reason: String,
 }
 
 /// Bind existing versions to the colony vault, keeping their version ids.
@@ -575,10 +615,14 @@ pub struct ColonyAdoption {
 /// second binding: an envelope for the same secret id, body and DEK bound to
 /// the colony vault, plus the `resource_handle` fact naming it. The original
 /// binding stays as it was. Versions in another vault (Care's) keep that
-/// vault's audience. With `commit` false nothing is written and the plan is
-/// returned. With `commit` true the bindings are published in one commit and
-/// delivery maintenance runs for the vault. A second run adopts nothing,
-/// because the holder's colony binding is then present.
+/// vault's audience. A version with any bound descriptor that cannot be read
+/// is not judged: it is reported in `skipped` with the reason, never adopted.
+/// With `commit` false there is no adoption commit and the plan is returned
+/// (observing may still fetch or cache blobs). With `commit` true the
+/// bindings are published in one commit and delivery maintenance runs for
+/// the vault. A second run adopts nothing, because the holder's colony
+/// binding is then present. Plaintext is never returned, but bodies are
+/// decrypted internally to authenticate each recovered key.
 pub fn adopt_into_colony<S, R>(
     store: &mut S,
     signing_key: &SigningKey,
@@ -604,6 +648,7 @@ where
         adopted: Vec::new(),
         committed: false,
         delivered: 0,
+        skipped: Vec::new(),
     };
     let mut fragment = triblespace::core::trible::Fragment::empty();
     if let Some(facts) = observed.facts() {
@@ -623,11 +668,36 @@ where
                 continue;
             }
             let bindings = super::envelope::recover_all(reader, facts, secret, signing_key)?;
-            if bindings.is_empty()
-                || bindings
-                    .iter()
-                    .any(|binding| super::resource::is_vault(reader, binding.resource))
-            {
+            if bindings.is_empty() {
+                continue;
+            }
+            // Every bound descriptor must be read before judging: an
+            // unreadable one may be a vault (Care's, or the colony vault
+            // itself), and "unknown" must never read as "not in a vault".
+            let mut in_vault = false;
+            let mut unknown = None;
+            for binding in &bindings {
+                match super::resource::vault_status(reader, binding.resource) {
+                    Ok(true) => in_vault = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        unknown.get_or_insert(format!(
+                            "bound resource blake3:{} is unavailable ({error}); retry once it is here",
+                            binding
+                                .resource
+                                .raw
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        ));
+                    }
+                }
+            }
+            if in_vault {
+                continue;
+            }
+            if let Some(reason) = unknown {
+                report.skipped.push(AdoptionSkip { secret, reason });
                 continue;
             }
             let mut bodies = std::collections::BTreeSet::new();
@@ -681,8 +751,22 @@ where
         report.vault_created = false;
     }
     report.committed = !report.adopted.is_empty();
-    let observed = observe(store)
-        .context("adoption committed; observe it for colony delivery (run maintain)")?;
+    let vault_hex = vault
+        .resource
+        .raw
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pending = if report.committed {
+        format!(
+            "adoption of {} version(s) into colony vault blake3:{vault_hex} was committed, but its \
+             delivery did not complete; run `secrets maintain --resource {vault_hex}`",
+            report.adopted.len()
+        )
+    } else {
+        format!("colony delivery did not complete; run `secrets maintain --resource {vault_hex}`")
+    };
+    let observed = observe(store).context(pending.clone())?;
     report.delivered = maintain_selected_recipient_envelopes(
         store,
         signing_key,
@@ -692,7 +776,7 @@ where
         &[SecretTarget::Resource(vault.resource)],
         now,
     )
-    .context("adoption committed, colony delivery failed (run maintain)")?;
+    .context(pending)?;
     Ok(report)
 }
 

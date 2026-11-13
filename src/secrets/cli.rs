@@ -159,9 +159,13 @@ enum Command {
 enum VaultCommand {
     /// Bind existing ordinary versions this key opens to the colony vault,
     /// keeping their version ids. Protected versions and versions already in
-    /// a vault (Care's) are left alone. Lists what it would adopt and writes
-    /// nothing unless --commit is given; running it again adopts nothing.
-    /// A delivered key cannot be taken back: rotate a secret to remove access.
+    /// a vault (Care's) are left alone; a version whose bound descriptor is
+    /// not readable here is skipped and listed with the reason. Without
+    /// --commit it lists what it would adopt and makes no adoption commit
+    /// (reads may still fetch or cache blobs); running it again adopts
+    /// nothing. Plaintext is never printed, but bodies are decrypted
+    /// internally to authenticate keys. A delivered key cannot be taken back:
+    /// rotate a secret to remove access.
     Adopt {
         /// Publish the bindings and deliver them to the vault's hosts.
         #[arg(long)]
@@ -581,6 +585,9 @@ pub fn run() -> Result<()> {
                             .unwrap_or("(public name unavailable)"),
                     ))?;
                 }
+                for skip in &report.skipped {
+                    out.line(format!("skipped {:x}: {}", skip.secret, skip.reason))?;
+                }
                 let vault = format!(
                     "colony vault blake3:{}{}",
                     hex::encode(report.vault.raw),
@@ -596,19 +603,22 @@ pub fn run() -> Result<()> {
                 );
                 if report.committed {
                     out.line(format!(
-                        "adopted {} version(s) into {vault}; delivered {} envelope(s)",
+                        "adopted {} version(s) into {vault}, {} skipped; delivered {} envelope(s)",
                         report.adopted.len(),
+                        report.skipped.len(),
                         report.delivered
                     ))
                 } else if commit {
                     out.line(format!(
-                        "nothing to adopt into {vault}; delivered {} envelope(s)",
+                        "nothing to adopt into {vault}, {} skipped; delivered {} envelope(s)",
+                        report.skipped.len(),
                         report.delivered
                     ))
                 } else {
                     out.line(format!(
-                        "dry run: {} version(s) would be adopted into {vault}; rerun with --commit",
-                        report.adopted.len()
+                        "dry run, no adoption commit: {} version(s) would be adopted into {vault}, {} skipped; rerun with --commit",
+                        report.adopted.len(),
+                        report.skipped.len()
                     ))
                 }
             }

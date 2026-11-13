@@ -356,9 +356,9 @@ pub fn colony_vault(policy: &AdmissionPolicy) -> SealedVault {
 }
 
 /// Find a colony vault for `policy` among the vaults these facts declare:
-/// a vault entity's descriptor that carries the colony marker and whose
-/// key-delivery bindings all have exactly this policy. A query, never a lookup
-/// of a computed handle. Duplicates may exist; the smallest handle is chosen.
+/// a vault entity's descriptor that carries the colony marker and that
+/// [`certifies_only`] `policy`. A query, never a lookup of a computed
+/// handle. Duplicates may exist; the smallest eligible handle is chosen.
 pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
     reader: &R,
     facts: &P,
@@ -372,21 +372,65 @@ pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
         reader
             .get::<TribleSet, _>(*resource)
             .is_ok_and(|descriptor| {
-                // Every key-delivery policy delivery would honour for this
-                // descriptor must be the colony policy: a writer could
-                // otherwise plant a marked descriptor with one more binding
-                // and receive every new colony secret.
-                let delivery = policies(reader, &descriptor, None, true);
                 exists!(pattern!(&descriptor, [{
                     metadata::tag: KIND_SECRET_RESOURCE, resource_vault: COLONY_VAULT
-                }])) && !delivery.is_empty()
-                    && delivery.iter().all(|found| found == policy)
+                }])) && certifies_only(reader, &descriptor, policy)
             })
     })
     .min()
 }
 
-/// Whether this exact descriptor is a vault resource.
+/// Strict read for choosing a destination: true only when every typed policy
+/// binding on every resource entity of this descriptor has a readable
+/// capability definition, at least one of them invokes key delivery, and
+/// every one that does has exactly `policy`.
+///
+/// [`policies`] skips a definition it cannot read, which is right for
+/// enumerating today's recipients and wrong for proving there is no other
+/// one: a valid definition absent now can arrive later, and delivery would
+/// then honour it for every version already bound here. So a binding whose
+/// definition is not here makes the descriptor ineligible, never ignored.
+/// Unknown policy kinds stay ignored, as delivery ignores them too.
+fn certifies_only<R: BlobStoreGet>(
+    reader: &R,
+    descriptor: &TribleSet,
+    policy: &AdmissionPolicy,
+) -> bool {
+    let entities: Vec<Id> = find!(entity: Id, pattern!(descriptor, [{
+        ?entity @ metadata::tag: KIND_SECRET_RESOURCE
+    }]))
+    .collect();
+    let mut delivers = false;
+    for entity in entities {
+        for (definition, found) in resource_policies(descriptor, entity, None) {
+            let Ok(definition) = reader.get::<TribleSet, _>(definition) else {
+                return false;
+            };
+            if exists!(pattern!(&definition, [{ capability_action: ACTION_KEY_DELIVERY }])) {
+                if found != *policy {
+                    return false;
+                }
+                delivers = true;
+            }
+        }
+    }
+    delivers
+}
+
+/// Whether this exact descriptor is a vault resource, or an error when its
+/// bytes cannot be read: an unreadable descriptor is unknown, not "no vault".
+pub fn vault_status<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> Result<bool> {
+    let facts = reader
+        .get::<TribleSet, _>(resource)
+        .map_err(|error| anyhow!("resource descriptor unavailable: {error}"))?;
+    Ok(exists!(
+        pattern!(&facts, [{ metadata::tag: KIND_SECRET_RESOURCE,
+        crate::schema::resource_vault: _?vault }])
+    ))
+}
+
+/// Whether this exact descriptor is a vault resource (false when unreadable;
+/// use [`vault_status`] where unknown must not read as no).
 pub fn is_vault<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> bool {
     reader.get::<TribleSet, _>(resource).is_ok_and(|facts| {
         exists!(pattern!(&facts, [{ metadata::tag: KIND_SECRET_RESOURCE,
