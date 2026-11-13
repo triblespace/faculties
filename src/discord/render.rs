@@ -23,14 +23,25 @@ pub fn auth(status: &super::AuthStatus, out: &mut Out<'_>) -> Result<()> {
 pub fn sent(receipt: &SendReceipt, out: &mut Out<'_>) -> Result<()> {
     // What Discord's returned message says it replies to is what was stored
     // and what a read shows; a send that asked for a reply and got back a
-    // message naming another target, or none, says so.
-    let reply = match (&receipt.requested_reply_to, &receipt.reply_to) {
-        (None, None) => String::new(),
-        (Some(asked), Some(stored)) if asked == stored => format!(" as a reply to {stored}"),
-        (asked, stored) => format!(
+    // message naming another target, or none, says so, and a relation that
+    // could not be read is said as that, with why, never as no target.
+    let asked = receipt.requested_reply_to.as_deref();
+    let reply = match (asked, &receipt.reply) {
+        (None, ReplyRelation::NotReply) => String::new(),
+        (Some(asked), ReplyRelation::Reply(stored)) if asked == stored => {
+            format!(" as a reply to {stored}")
+        }
+        (asked, ReplyRelation::Unreadable(reason)) => format!(
+            "; {}the reply relation in Discord's returned message is unreadable ({reason}), so \
+             it was stored without one",
+            asked
+                .map(|asked| format!("asked to reply to {asked}, but "))
+                .unwrap_or_default()
+        ),
+        (asked, relation) => format!(
             "; asked to reply to {}, and Discord's returned message names {} as its reply target",
-            asked.as_deref().unwrap_or("nothing"),
-            stored.as_deref().unwrap_or("nothing")
+            asked.unwrap_or("nothing"),
+            relation.target().unwrap_or("nothing")
         ),
     };
     out.line(format!(
@@ -197,6 +208,17 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
     Ok(())
 }
 pub fn channel_receipt(value: &ChannelReceipt, out: &mut Out<'_>) -> Result<()> {
+    channel_receipt_counts(value, out)?;
+    for unreadable in &value.unreadable_replies {
+        out.line(format!(
+            "  ! {}: message {} stored without its reply relation, which is unreadable ({})",
+            unreadable.channel_id, unreadable.message_id, unreadable.reason
+        ))?;
+    }
+    Ok(())
+}
+
+fn channel_receipt_counts(value: &ChannelReceipt, out: &mut Out<'_>) -> Result<()> {
     if value.observations == 0 {
         return out.line(format!("  {}: no observations", value.channel_id));
     }

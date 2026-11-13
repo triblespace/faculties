@@ -139,10 +139,44 @@ pub struct SendReceipt {
     pub channel_id: String,
     /// The message the send asked to reply to, if it asked.
     pub requested_reply_to: Option<String>,
-    /// The message Discord's returned message says it replies to, as stored
-    /// with it: what a later read shows.
-    pub reply_to: Option<String>,
+    /// What Discord's returned message says it replies to. A reply is stored
+    /// with it and a later read shows it; an unreadable relation is stored
+    /// as no reply, and said here with its reason.
+    pub reply: ReplyRelation,
     pub commit: CollectionCommit,
+}
+
+/// What one Discord message object says it replies to ([`replied_to`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplyRelation {
+    /// It replies to the message Discord names by this id.
+    Reply(String),
+    /// It is no reply: not of type REPLY, or its reference is no reply's.
+    NotReply,
+    /// It is a REPLY whose relation cannot be read, for the reason given: a
+    /// malformed `message_reference`, an invalid or missing target id, or a
+    /// `referenced_message` naming another message than the reference. The
+    /// message is stored all the same, without a reply target.
+    Unreadable(String),
+}
+
+impl ReplyRelation {
+    /// The target id, for a reply that could be read.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Self::Reply(target) => Some(target),
+            Self::NotReply | Self::Unreadable(_) => None,
+        }
+    }
+}
+
+/// A message stored without its reply relation because the relation could
+/// not be read ([`ReplyRelation::Unreadable`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnreadableReply {
+    pub channel_id: String,
+    pub message_id: String,
+    pub reason: String,
 }
 #[derive(Clone, Debug)]
 pub struct PullOptions {
@@ -200,6 +234,9 @@ pub struct ChannelReceipt {
     /// The forward read stopped at its page budget with more to read: pull
     /// again to go on.
     pub more: bool,
+    /// Stored messages whose reply relation could not be read, so they were
+    /// stored without it.
+    pub unreadable_replies: Vec<UnreadableReply>,
 }
 #[derive(Clone, Debug)]
 pub struct ChannelPull {
@@ -503,9 +540,9 @@ impl Discord {
     /// A target not stored there is refused before anything is posted, and
     /// Discord is asked to refuse the reply rather than post it as an
     /// ordinary message should the target be gone upstream. No
-    /// `allowed_mentions` is sent, so whether the target's author is
-    /// mentioned is Discord's default for that case, which its documentation
-    /// does not state ([`AllowedMentions`]).
+    /// `allowed_mentions` is sent, which Discord documents as parsing every
+    /// mention type with `replied_user` at its default, false: the target's
+    /// author is not mentioned for being replied to ([`AllowedMentions`]).
     pub fn send_reply(
         &self,
         channel_id: &str,
@@ -1204,7 +1241,7 @@ fn send_with(
             message_id: message_id.to_owned(),
             channel_id: channel_id.to_owned(),
             requested_reply_to: reply_to.map(str::to_owned),
-            reply_to: message.reply_to_external_id.clone(),
+            reply: message.reply.clone(),
             commit,
         })
     })().with_context(|| format!(
@@ -1224,8 +1261,10 @@ pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<
 ///
 /// It never sets `replied_user`, which Discord documents as defaulting to
 /// false: a reply sent with this policy does not mention the author of the
-/// message it replies to. What a reply sent without any `allowed_mentions`
-/// does about that author the documentation does not say.
+/// message it replies to. Nor does one sent without any: Discord documents
+/// an omitted `allowed_mentions` on a regular message as equivalent to
+/// `{"parse": ["users", "roles", "everyone"]}`, which leaves `replied_user`
+/// at that same default.
 /// https://docs.discord.com/developers/resources/message#allowed-mentions-object
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowedMentions {
@@ -1434,6 +1473,8 @@ fn message_fragment(
 ) -> Result<(Fragment, String, String)> {
     let channel_id = required_snowflake(&message, "channel_id", "message")?;
     let messages = parse_messages(vec![message], &channel_id)?;
+    // Logged here, for intake's gateway messages as for its REST fetches.
+    unreadable_replies(&messages);
     let message_id = messages
         .first()
         .map(|message| message.external_id.clone())
@@ -1575,6 +1616,7 @@ fn pull_channel(
     let intake = floor
         .map(|floor| discord_model::intake_fragment(channel_id, floor))
         .transpose()?;
+    let unreadable = unreadable_replies(&messages);
     if messages.is_empty() {
         let mut commit = None;
         if let (Some(floor), Some(intake)) = (floor, intake) {
@@ -1603,6 +1645,7 @@ fn pull_channel(
             coverage: None,
             commit,
             more: false,
+            unreadable_replies: unreadable,
         });
     }
 
@@ -1643,6 +1686,7 @@ fn pull_channel(
         coverage: forward.coverage,
         commit: Some(commit),
         more: forward.more,
+        unreadable_replies: unreadable,
     })
 }
 
@@ -1833,7 +1877,7 @@ struct IncomingMessage {
     content: String,
     created_at: Inline<NsTAIInterval>,
     edited_at: Option<Inline<NsTAIInterval>>,
-    reply_to_external_id: Option<String>,
+    reply: ReplyRelation,
     attachments: Vec<AttachmentSource>,
     /// A system notice (a pin, a member joining) rather than something
     /// somebody wrote.
@@ -1899,8 +1943,9 @@ fn parse_messages(
             .with_context(|| format!("parse edited timestamp for message {external_id}"))?;
         // A message without a type is a default one.
         let kind = payload.get("type").and_then(JsonValue::as_u64).unwrap_or(0);
-        let reply_to_external_id = replied_to(&payload, kind)
-            .with_context(|| format!("read what message {external_id} replies to"))?;
+        // An unreadable relation never refuses the message: it is stored
+        // without one, and whoever stores it says so.
+        let reply = replied_to(&payload, kind);
 
         let attachments = match payload.get("attachments") {
             None | Some(JsonValue::Null) => Vec::new(),
@@ -1945,7 +1990,7 @@ fn parse_messages(
             content,
             created_at,
             edited_at,
-            reply_to_external_id,
+            reply,
             attachments,
             system: !WRITTEN_MESSAGE_TYPES.contains(&kind),
         });
@@ -1972,8 +2017,8 @@ struct MessageReference {
     message_id: Option<String>,
 }
 
-/// The message a Discord message object of type `kind` replies to: the one
-/// place intake and a sent message's retention both read it from.
+/// What a Discord message object of type `kind` replies to: the one place
+/// intake and a sent message's retention both read it from.
 ///
 /// A message is a reply only when its own type is `REPLY` and its
 /// `message_reference` is of the reply type (`DEFAULT`, or unset); the target
@@ -1983,36 +2028,70 @@ struct MessageReference {
 /// starter, whose references are `DEFAULT` too. The embedded
 /// `referenced_message` only corroborates: it may be absent (Discord did not
 /// fetch the target) or null (the target was deleted) on a reply all the
-/// same, it never makes a message a reply on its own, and one naming another
-/// message than the reference is refused as contradictory.
-fn replied_to(payload: &JsonValue, kind: u64) -> Result<Option<String>> {
+/// same, and it never makes a message a reply on its own.
+///
+/// A REPLY whose relation cannot be read (a malformed reference, a missing
+/// or invalid target id, an embedded message naming another message than
+/// the reference) is [`ReplyRelation::Unreadable`], never an error: the rest
+/// of the message is good, and refusing it would hold back every message
+/// stored with it.
+fn replied_to(payload: &JsonValue, kind: u64) -> ReplyRelation {
     if kind != REPLY_MESSAGE_TYPE {
-        return Ok(None);
+        return ReplyRelation::NotReply;
     }
     let reference = match payload.get("message_reference") {
-        None | Some(JsonValue::Null) => return Ok(None),
-        Some(value) => serde_json::from_value::<MessageReference>(value.clone())
-            .context("malformed message_reference")?,
+        None | Some(JsonValue::Null) => return ReplyRelation::NotReply,
+        Some(value) => match serde_json::from_value::<MessageReference>(value.clone()) {
+            Ok(reference) => reference,
+            Err(error) => {
+                return ReplyRelation::Unreadable(format!("malformed message_reference: {error}"))
+            }
+        },
     };
     if reference.kind.unwrap_or(DEFAULT_MESSAGE_REFERENCE) != DEFAULT_MESSAGE_REFERENCE {
-        return Ok(None);
+        return ReplyRelation::NotReply;
     }
     let Some(target) = reference.message_id else {
-        return Ok(None);
+        return ReplyRelation::Unreadable("its message_reference names no message_id".to_owned());
     };
-    discord_model::validate_snowflake(&target)
-        .with_context(|| format!("invalid reply target id '{target}'"))?;
+    if let Err(error) = discord_model::validate_snowflake(&target) {
+        return ReplyRelation::Unreadable(format!("invalid reply target id '{target}': {error:#}"));
+    }
     if let Some(embedded) = payload
         .get("referenced_message")
         .and_then(|message| message.get("id"))
         .and_then(JsonValue::as_str)
     {
-        ensure!(
-            embedded == target,
-            "its message_reference names {target} but its referenced_message is {embedded}"
-        );
+        if embedded != target {
+            return ReplyRelation::Unreadable(format!(
+                "its message_reference names {target} but its referenced_message is {embedded}"
+            ));
+        }
     }
-    Ok(Some(target))
+    ReplyRelation::Reply(target)
+}
+
+/// The messages of `messages` whose reply relation could not be read, each
+/// logged as a warning: they are stored without it.
+fn unreadable_replies(messages: &[IncomingMessage]) -> Vec<UnreadableReply> {
+    messages
+        .iter()
+        .filter_map(|message| match &message.reply {
+            ReplyRelation::Unreadable(reason) => {
+                eprintln!(
+                    "[discord] message {} in channel {}: its reply relation is unreadable \
+                     ({reason}); stored without it",
+                    message.external_id, message.channel_external_id
+                );
+                Some(UnreadableReply {
+                    channel_id: message.channel_external_id.clone(),
+                    message_id: message.external_id.clone(),
+                    reason: reason.clone(),
+                })
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn required_snowflake(value: &JsonValue, field: &str, subject: &str) -> Result<String> {
@@ -2203,7 +2282,7 @@ where
             };
         }
 
-        let reply_to = match message.reply_to_external_id.as_deref() {
+        let reply_to = match message.reply.target() {
             Some(external) => {
                 let anchor = discord_model::message_anchor_fragment(external)?;
                 let id = anchor.root().expect("intrinsic reply anchor has one root");
@@ -3872,7 +3951,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(posted, [Some("100000000000000005".to_owned())]);
-        assert_eq!(receipt.reply_to.as_deref(), Some("100000000000000005"));
+        assert_eq!(
+            receipt.reply,
+            ReplyRelation::Reply("100000000000000005".to_owned())
+        );
         assert_eq!(
             receipt.requested_reply_to.as_deref(),
             Some("100000000000000005")
@@ -4007,7 +4089,7 @@ mod tests {
         kind: u64,
         reference: Option<JsonValue>,
         referenced: Option<JsonValue>,
-    ) -> Result<Option<String>> {
+    ) -> ReplyRelation {
         let channel = "100000000000000002";
         let mut payload = message_json("100000000000000006", channel, "x", None, json!([]));
         payload["type"] = json!(kind);
@@ -4021,9 +4103,10 @@ mod tests {
         if let Some(referenced) = referenced {
             payload["referenced_message"] = referenced;
         }
-        Ok(parse_messages(vec![payload], channel)?
+        parse_messages(vec![payload], channel)
+            .expect("an unreadable reply relation never refuses the message")
             .remove(0)
-            .reply_to_external_id)
+            .reply
     }
 
     /// A reply is read from its `message_reference`: the target is there
@@ -4040,8 +4123,8 @@ mod tests {
             ("null", Some(JsonValue::Null)),
         ] {
             assert_eq!(
-                replies_to_of(19, Some(reference.clone()), referenced).unwrap(),
-                Some(target.to_owned()),
+                replies_to_of(19, Some(reference.clone()), referenced),
+                ReplyRelation::Reply(target.to_owned()),
                 "{case}"
             );
         }
@@ -4049,22 +4132,58 @@ mod tests {
         let mut typed = reference.clone();
         typed["type"] = json!(0);
         assert_eq!(
-            replies_to_of(19, Some(typed), None).unwrap(),
-            Some(target.to_owned())
+            replies_to_of(19, Some(typed), None),
+            ReplyRelation::Reply(target.to_owned())
         );
         // The embedded message is never a fallback for a missing reference.
-        assert_eq!(replies_to_of(19, None, Some(embedded)).unwrap(), None);
-        // A reference and an embedded message that disagree are refused.
-        let error = replies_to_of(
-            19,
-            Some(reference),
-            Some(json!({"id": "100000000000000004"})),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("message_reference names"),
-            "{error:#}"
+        assert_eq!(
+            replies_to_of(19, None, Some(embedded)),
+            ReplyRelation::NotReply
         );
+    }
+
+    /// A REPLY whose relation cannot be read is said to be unreadable, with
+    /// why, and the message itself still parses: a reference and an
+    /// embedded message that disagree, a malformed reference, an invalid
+    /// target id, and a reference that names no message.
+    #[test]
+    fn an_unreadable_reply_relation_is_said_and_never_refuses_the_message() {
+        let target = "100000000000000005";
+        let reference = json!({"message_id": target, "channel_id": "100000000000000002"});
+        for (case, reference, referenced, says) in [
+            (
+                "contradiction",
+                reference.clone(),
+                Some(json!({"id": "100000000000000004"})),
+                "its message_reference names 100000000000000005 but its referenced_message \
+                 is 100000000000000004",
+            ),
+            (
+                "malformed",
+                json!({"message_id": 5}),
+                None,
+                "malformed message_reference",
+            ),
+            (
+                "invalid id",
+                json!({"message_id": "05"}),
+                None,
+                "invalid reply target id '05'",
+            ),
+            (
+                "no target",
+                json!({"channel_id": "100000000000000002"}),
+                None,
+                "names no message_id",
+            ),
+        ] {
+            match replies_to_of(19, Some(reference), referenced) {
+                ReplyRelation::Unreadable(reason) => {
+                    assert!(reason.contains(says), "{case}: {reason}")
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+        }
     }
 
     /// Only a message of type REPLY with a reply-type reference replies. A
@@ -4090,8 +4209,8 @@ mod tests {
             ("thread starter", 21, reference, Some(json!({"id": target}))),
         ] {
             assert_eq!(
-                replies_to_of(kind, Some(reference), referenced).unwrap(),
-                None,
+                replies_to_of(kind, Some(reference), referenced),
+                ReplyRelation::NotReply,
                 "{case}"
             );
         }
@@ -4132,8 +4251,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                receipt.reply_to.as_deref(),
-                Some("100000000000000005"),
+                receipt.reply,
+                ReplyRelation::Reply("100000000000000005".to_owned()),
                 "case {index}"
             );
             let mut sent = String::new();
@@ -4164,6 +4283,160 @@ mod tests {
                 "case {index}"
             );
         }
+    }
+
+    /// Text a renderer writes, as one string.
+    fn text_of(render: impl FnOnce(&mut crate::out::Out<'_>) -> Result<()>) -> String {
+        let mut text = String::new();
+        render(&mut crate::out::Out::new(&mut |part| {
+            if let crate::out::Part::Text { text: line } = part {
+                text.push_str(&line);
+            }
+            Ok(())
+        }))
+        .unwrap();
+        text
+    }
+
+    /// Discord as one fixed newest page, which is all a first pull reads.
+    struct OnePage(Vec<JsonValue>);
+    impl Source for OnePage {
+        fn page(&mut self, _: &str, request: PageRequest) -> Result<Vec<JsonValue>> {
+            assert_eq!(request.after, None, "a first pull reads one newest page");
+            Ok(self.0.clone())
+        }
+        fn message(&mut self, _: &str, _: u64) -> Result<Option<JsonValue>> {
+            unreachable!("nothing is fetched by id")
+        }
+        fn attachment(&mut self, _: &str, _: u64) -> Result<Vec<u8>> {
+            unreachable!("no attachments")
+        }
+    }
+
+    /// One message with an unreadable reply relation never holds back the
+    /// batch it came in: a pull stores every message, a malformed reference
+    /// and a contradictory one without a reply target, a good reply with its
+    /// own, and says which two were stored without one, and why.
+    #[test]
+    fn a_pull_stores_a_batch_whose_reply_relations_are_partly_unreadable() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let discord = Discord::new(pile, Some(key));
+        let channel = "100000000000000002";
+        let target = message_json("100000000000000005", channel, "first", None, json!([]));
+        let mut malformed = reply_json("100000000000000006", channel, "malformed", target.clone());
+        malformed["message_reference"] = json!({"message_id": 5});
+        let mut contradictory = reply_json(
+            "100000000000000007",
+            channel,
+            "contradictory",
+            target.clone(),
+        );
+        contradictory["referenced_message"] = json!({"id": "100000000000000004"});
+        let good = reply_json("100000000000000008", channel, "good", target.clone());
+        // Newest first, as Discord pages.
+        let mut source = OnePage(vec![good, contradictory, malformed, target]);
+        let receipt = discord.pull_channel(channel, None, &mut source).unwrap();
+        assert_eq!(receipt.observations, 4);
+        assert!(receipt.commit.is_some());
+        let unreadable: Vec<(&str, &str)> = receipt
+            .unreadable_replies
+            .iter()
+            .map(|reply| (reply.message_id.as_str(), reply.reason.as_str()))
+            .collect();
+        assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+        assert_eq!(unreadable[0].0, "100000000000000006");
+        assert!(unreadable[0].1.contains("malformed message_reference"));
+        assert_eq!(unreadable[1].0, "100000000000000007");
+        assert!(unreadable[1]
+            .1
+            .contains("its referenced_message is 100000000000000004"));
+        let said = text_of(|out| super::super::render::channel_receipt(&receipt, out));
+        assert!(
+            said.contains(&format!(
+                "  ! {channel}: message 100000000000000006 stored without its reply relation, \
+                 which is unreadable (malformed message_reference"
+            )),
+            "{said}"
+        );
+        assert!(
+            said.contains("message 100000000000000007 stored without"),
+            "{said}"
+        );
+
+        let history = discord
+            .read(ReadOptions {
+                limit: 0,
+                ..ReadOptions::default()
+            })
+            .unwrap();
+        let replies = |content: &str| {
+            history
+                .messages
+                .iter()
+                .find(|message| message.content == content)
+                .unwrap_or_else(|| panic!("{content} was not stored"))
+                .replies_to
+                .iter()
+                .map(|target| target.message_ids.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(replies("malformed").is_empty());
+        assert!(replies("contradictory").is_empty());
+        assert_eq!(replies("good"), [["100000000000000005"]]);
+        assert!(replies("first").is_empty());
+    }
+
+    /// A send whose returned message carries a contradictory reply relation
+    /// is still retained, and its receipt says the relation was unreadable,
+    /// with why, never that Discord named nothing.
+    #[test]
+    fn a_send_with_an_unreadable_reply_relation_says_so() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile, Some(key));
+        let storage = test_storage(&owner);
+        let channel = "100000000000000002";
+        let target = message_json("100000000000000005", channel, "first", None, json!([]));
+        store(storage, channel, vec![target.clone()]);
+        let receipt = send_with(
+            storage,
+            "fixture",
+            channel,
+            "second",
+            &[],
+            Some("100000000000000005"),
+            |_, actual_channel, body, _, _| {
+                let mut reply =
+                    reply_json("100000000000000006", actual_channel, body, target.clone());
+                reply["referenced_message"] = json!({"id": "100000000000000004"});
+                Ok(reply)
+            },
+            |_, _| unreachable!("text has no attachments"),
+        )
+        .unwrap();
+        assert!(
+            matches!(&receipt.reply, ReplyRelation::Unreadable(reason)
+                if reason.contains("its referenced_message is 100000000000000004")),
+            "{:?}",
+            receipt.reply
+        );
+        let sent = text_of(|out| super::super::render::sent(&receipt, out));
+        assert!(
+            sent.contains(
+                "asked to reply to 100000000000000005, but the reply relation in Discord's \
+                 returned message is unreadable (its message_reference names"
+            ),
+            "{sent}"
+        );
+        assert!(!sent.contains("names nothing"), "{sent}");
+        let history = read_history(&storage.view().unwrap(), &ReadOptions::default()).unwrap();
+        let second = history
+            .messages
+            .iter()
+            .find(|message| message.content == "second")
+            .unwrap();
+        assert!(second.replies_to.is_empty());
     }
 
     #[test]

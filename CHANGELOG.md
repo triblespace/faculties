@@ -18,7 +18,12 @@ All notable changes to this project will be documented in this file.
   and are not replies. A thread starter or context-menu command used to be
   stored as replying to its embedded message, and a reply whose target was
   not embedded as no reply; observed again, such a message is a second
-  observation of it, shown as a divergent version.
+  observation of it, shown as a divergent version. A REPLY whose relation
+  cannot be read (malformed reference, invalid or missing target id, an
+  embedded message contradicting the reference) is stored without a reply
+  target instead of refusing its batch: intake logs a warning, `discord
+  pull` lists it, and a send's receipt says the relation was unreadable and
+  why.
   `discord read`/`discord_read` lines now carry each message's Discord id
   (`id=...`), and a reply says what it replies to: the target's id, author
   and first words when it is stored, its id and "not stored here" when not.
