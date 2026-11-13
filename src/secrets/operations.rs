@@ -122,7 +122,9 @@ impl Secrets {
             storage: &self.storage,
         }
     }
-    /// Encrypt resident bytes once, returning the exact newly authored version.
+    /// Encrypt resident bytes once into the colony vault, returning the exact
+    /// newly authored version. Every host the collection's READ policy admits
+    /// receives an envelope right after the commit, with no grant.
     pub fn add(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
@@ -131,14 +133,17 @@ impl Secrets {
                 runtime,
                 true,
             )?;
-            let secret = secret_storage::add_secret(
+            let secret = secret_storage::add_secret_to_colony(
                 pile,
                 signer,
                 collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
                 name,
                 plaintext,
                 clock::point_now()?,
-            )?;
+                clock::now()?,
+            )?
+            .secret;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(
@@ -153,7 +158,8 @@ impl Secrets {
             Ok(secret)
         })
     }
-    /// One fresh whole-item key and one immutable structured version.
+    /// One fresh whole-item key and one immutable structured version, sealed
+    /// into the colony vault and delivered to its hosts like [`Self::add`].
     pub fn add_item(&self, public_label: &str, input: secrets::item::ItemInput<'_>) -> Result<Id> {
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
@@ -162,14 +168,17 @@ impl Secrets {
                 runtime,
                 true,
             )?;
-            let id = secret_storage::add_item(
+            let id = secret_storage::add_item_to_colony(
                 pile,
                 signer,
                 collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
                 public_label,
                 input,
                 clock::point_now()?,
-            )?;
+                clock::now()?,
+            )?
+            .secret;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(
@@ -605,6 +614,44 @@ impl Secrets {
                     })
                 })
                 .collect()
+        })
+    }
+    /// Bind every existing ordinary version this key opens, not protected and
+    /// not already in a vault, to the colony vault, keeping its version id.
+    /// With `commit` false nothing is written and the plan is returned; with
+    /// `commit` true the bindings publish in one commit and the vault's hosts
+    /// receive their envelopes. Running it again adopts nothing. Never opens
+    /// or returns plaintext.
+    pub fn adopt_colony(&self, commit: bool) -> Result<secret_storage::ColonyAdoption> {
+        self.storage().with_store(|pile, signer, runtime| {
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                commit,
+            )?;
+            let report = secret_storage::adopt_into_colony(
+                pile,
+                signer,
+                collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
+                clock::now()?,
+                commit,
+            )?;
+            if report.committed || report.delivered != 0 {
+                drop(
+                    runtime
+                        .block_on(crate::storage::ensure_downstream(
+                            pile,
+                            collection.source(),
+                            signer,
+                        ))
+                        .context(
+                            "Colony adoption was committed, but ensuring its derived views failed",
+                        )?,
+                );
+            }
+            Ok(report)
         })
     }
     /// Explicit key-delivery maintenance; does not grant new capabilities.
@@ -1157,6 +1204,70 @@ mod tests {
         assert!(listed
             .iter()
             .any(|row| row.id == missing_id && row.name.is_none()));
+    }
+
+    #[test]
+    fn colony_adoption_dry_runs_then_binds_old_versions_once() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("adopt.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Secrets::new(path.clone(), None);
+        // One version sealed the old way, under its own direct(signer) R.
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let instant = hifitime::Epoch::from_unix_seconds(1.0);
+        let old = secret_storage::add_secret(
+            &mut pile,
+            &signer,
+            collection,
+            "synthetic old",
+            b"synthetic old value",
+            (instant, instant).try_to_inline().unwrap(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+        // New ordinary adds are already in the colony vault; protected ones never are.
+        let fresh = operations
+            .add("synthetic fresh", b"synthetic fresh value")
+            .unwrap();
+        let protected = operations
+            .add_protected(
+                "synthetic protected",
+                b"synthetic protected value",
+                Protection {
+                    password: b"synthetic passphrase",
+                    device: None,
+                },
+            )
+            .unwrap();
+
+        let plan = operations.adopt_colony(false).unwrap();
+        assert!(!plan.committed);
+        assert!(!plan.vault_created, "the fresh add created it");
+        assert_eq!(plan.adopted.len(), 1);
+        assert_eq!(plan.adopted[0].secret, old);
+        assert_eq!(plan.adopted[0].name.as_deref(), Some("synthetic old"));
+        assert!(!plan
+            .adopted
+            .iter()
+            .any(|a| a.secret == fresh || a.secret == protected));
+        assert_eq!(
+            operations.adopt_colony(false).unwrap().adopted.len(),
+            1,
+            "dry run wrote nothing"
+        );
+
+        let done = operations.adopt_colony(true).unwrap();
+        assert!(done.committed);
+        assert_eq!(done.vault, plan.vault);
+        assert_eq!(done.adopted.len(), 1);
+        let again = operations.adopt_colony(true).unwrap();
+        assert!(!again.committed);
+        assert!(again.adopted.is_empty());
+        assert_eq!(again.delivered, 0);
+        assert_eq!(&*operations.get(old).unwrap(), b"synthetic old value");
+        assert_eq!(&*operations.get(fresh).unwrap(), b"synthetic fresh value");
     }
 
     #[test]

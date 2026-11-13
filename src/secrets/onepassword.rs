@@ -380,6 +380,7 @@ impl<'a> OnePasswordArchive<'a> {
             "1Password original export",
             self.original,
             created_at,
+            crate::secrets::record::Delivery::Own,
         )?;
         let archive = anchor.secret;
         let archive_resource = prepared_resource(&anchor)?;
@@ -405,6 +406,7 @@ impl<'a> OnePasswordArchive<'a> {
                     attachments: &projection.attachments,
                 },
                 created_at,
+                crate::secrets::record::Delivery::Own,
             )?;
             // Query the newly authored fragment; opaque identifiers are never
             // reconstructed from content or validated against a derived id.
@@ -427,6 +429,7 @@ impl<'a> OnePasswordArchive<'a> {
             "1Password import receipt",
             plaintext.bytes.as_ref(),
             created_at,
+            crate::secrets::record::Delivery::Own,
         )?;
         let receipt_id = receipt.secret;
         fragment += receipt.fragment;
@@ -1339,8 +1342,14 @@ pub(crate) mod tests {
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         // A well-shaped candidate locator with a wrong encrypted receipt body
         // is not proof of a prior import.
-        let wrong = resource::seal_version(&signer, "wrong receipt", b"not a native archive", at())
-            .unwrap();
+        let wrong = resource::seal_version(
+            &signer,
+            "wrong receipt",
+            b"not a native archive",
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let mut fragment = wrong.fragment;
         fragment += entity! { ExclusiveId::force_ref(&wrong.secret) @
         metadata::tag: KIND_1PASSWORD_IMPORT, source_fingerprint: archive.fingerprint() };
@@ -1353,8 +1362,14 @@ pub(crate) mod tests {
             .import(&mut store, &signer, collection, &observed, at())
             .unwrap();
         assert!(!first.reused);
-        let unrelated =
-            item::prepare(&signer, "unrelated public item", ItemInput::default(), at()).unwrap();
+        let unrelated = item::prepare(
+            &signer,
+            "unrelated public item",
+            ItemInput::default(),
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let unrelated_id = unrelated.secret;
         let mut additions = unrelated.fragment;
         additions += entity! { ExclusiveId::force_ref(&first.receipt) @
@@ -1400,7 +1415,14 @@ pub(crate) mod tests {
         let signer = SigningKey::from_bytes(&[85; 32]);
         let mut store = MemoryRepo::for_host(signer.verifying_key());
         let collection = collection(&mut store, &signer);
-        let anchor = resource::seal_version(&signer, "original", &bytes, at()).unwrap();
+        let anchor = resource::seal_version(
+            &signer,
+            "original",
+            &bytes,
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let archive_id = anchor.secret;
         let archive_resource = prepared_resource(&anchor).unwrap();
         let private = entity! {
@@ -1410,8 +1432,14 @@ pub(crate) mod tests {
             resource_handle: archive_resource,
         };
         let private: Blob<SimpleArchive> = private.into_facts().to_blob();
-        let sealed =
-            resource::seal_version(&signer, "receipt", private.bytes.as_ref(), at()).unwrap();
+        let sealed = resource::seal_version(
+            &signer,
+            "receipt",
+            private.bytes.as_ref(),
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let receipt = sealed.secret;
         let mut binding = anchor.fragment;
         binding += sealed.fragment;
@@ -1494,11 +1522,24 @@ pub(crate) mod tests {
             attacker.verifying_key(),
         )
         .unwrap();
-        let anchor = resource::seal_version(&owner, "original", &bytes, at()).unwrap();
+        let anchor = resource::seal_version(
+            &owner,
+            "original",
+            &bytes,
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let archive_id = anchor.secret;
         let archive_resource = prepared_resource(&anchor).unwrap();
-        let unrelated =
-            item::prepare(&owner, "unrelated owner item", ItemInput::default(), at()).unwrap();
+        let unrelated = item::prepare(
+            &owner,
+            "unrelated owner item",
+            ItemInput::default(),
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let id = unrelated.secret;
         let target = prepared_resource(&unrelated).unwrap();
         let body = find!(body: ItemBody, pattern!(unrelated.fragment.facts(), [{ id @ structured_body: ?body }])).next().unwrap();
@@ -1514,9 +1555,14 @@ pub(crate) mod tests {
         source_fingerprint: archive.fingerprint(), source_archive: archive_id,
         resource_handle: archive_resource, import_entry*: entries };
         let forged: Blob<SimpleArchive> = forged.into_facts().to_blob();
-        let sealed =
-            resource::seal_version(&attacker, "forged receipt", forged.bytes.as_ref(), at())
-                .unwrap();
+        let sealed = resource::seal_version(
+            &attacker,
+            "forged receipt",
+            forged.bytes.as_ref(),
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let forged_id = sealed.secret;
         let mut fragment = sealed.fragment;
         fragment += entity! { ExclusiveId::force_ref(&forged_id) @ metadata::tag: KIND_1PASSWORD_IMPORT,
@@ -1587,8 +1633,14 @@ pub(crate) mod tests {
             resource_handle: resource, metadata::tag: genid().id };
         }
         let blob: Blob<SimpleArchive> = private.into_facts().to_blob();
-        let sealed =
-            resource::seal_version(&signer, "opaque receipt", blob.bytes.as_ref(), at()).unwrap();
+        let sealed = resource::seal_version(
+            &signer,
+            "opaque receipt",
+            blob.bytes.as_ref(),
+            at(),
+            crate::secrets::record::Delivery::Own,
+        )
+        .unwrap();
         let opaque = sealed.secret;
         let mut fragment = sealed.fragment;
         fragment += entity! { ExclusiveId::force_ref(&opaque) @ metadata::tag: KIND_1PASSWORD_IMPORT,

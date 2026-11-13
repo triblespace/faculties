@@ -53,6 +53,12 @@ pub const KIND_SECRET_RESOURCE: Id = id_hex!("8DE676F5445D85A874435C68C9C387E4")
 /// whose envelope binds it. Minted with `trible genid` on 2026-10-31.
 pub const KIND_SECRET_VAULT: Id = id_hex!("971ECB6B0D4111372A86227638EE5009");
 
+/// The vault value of the colony vault's descriptor: marks a vault whose
+/// key-delivery policy is its collection's READ policy. A constant, so the
+/// colony vault's descriptor is intrinsic and identical on every host.
+/// Minted with `trible genid` on 2026-11-13.
+pub const COLONY_VAULT: Id = id_hex!("769702E076F1F74C0FA2659FA433CCB8");
+
 /// Bound recipient-envelope format. Minted with `trible genid` on 2026-09-14.
 pub const BOUND_ENVELOPE_MAGIC: [u8; 16] = id_hex!("0AFF57FBB4533A0E74171F2B7893BDC9").raw();
 

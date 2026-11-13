@@ -95,6 +95,7 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
             attachments: &[],
         },
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let id = sealed.secret;
@@ -182,7 +183,15 @@ fn totp_binds_exact_field_child_and_tolerates_open_world_relations() {
     private += entity! { field_text: detached, metadata::tag: unknown_role };
     let bundle = sealer.finish_facts(private.into_facts()).unwrap();
     let body = bundle.root();
-    let sealed = resource::seal_item_bundle(&signer, "synthetic TOTP", key, bundle, at(0)).unwrap();
+    let sealed = resource::seal_item_bundle(
+        &signer,
+        "synthetic TOTP",
+        key,
+        bundle,
+        at(0),
+        crate::record::Delivery::Own,
+    )
+    .unwrap();
     let public = sealed.fragment.facts().clone();
     store
         .commit(collection.source(), &signer, sealed.fragment)
@@ -279,6 +288,7 @@ fn native_fields_binary_and_private_names_survive_commit_reopen_and_blind_traver
             }],
         },
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let id = sealed.secret;
@@ -400,7 +410,15 @@ fn missing_selected_child_fails_locally_and_unknown_repeated_opaque_facts_remain
     field_text*: [first, second], metadata::tag: unknown };
     let bundle = sealer.finish_facts(private.into_facts()).unwrap();
     let body = bundle.root();
-    let sealed = resource::seal_item_bundle(&signer, "public opaque", key, bundle, at(0)).unwrap();
+    let sealed = resource::seal_item_bundle(
+        &signer,
+        "public opaque",
+        key,
+        bundle,
+        at(0),
+        crate::record::Delivery::Own,
+    )
+    .unwrap();
     let public = sealed.fragment.facts().clone();
     store
         .commit(collection.source(), &signer, sealed.fragment)
@@ -566,9 +584,15 @@ fn valid_competing_bodies_are_disclosed_and_missing_or_foreign_resources_do_not_
         .finish_facts(entity! { metadata::tag: KIND_ITEM }.into_facts())
         .unwrap();
     let competing_body = bundle.root();
-    let mut competing =
-        resource::seal_item_bundle(&attacker, "public competing", competing_key, bundle, at(0))
-            .unwrap();
+    let mut competing = resource::seal_item_bundle(
+        &attacker,
+        "public competing",
+        competing_key,
+        bundle,
+        at(0),
+        crate::record::Delivery::Own,
+    )
+    .unwrap();
     let competing_resource = find!(resource: CollectionHandle, pattern!(competing.fragment.facts(),
         [{ first @ triblespace::core::capability::policy::resource_handle: ?resource }]))
     .next()

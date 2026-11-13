@@ -102,7 +102,7 @@ fn one_vault_grant_covers_every_member_including_later_ones_and_nothing_else() {
     let (mut store, collection, alice) = fixture(63);
     let bob = SigningKey::from_bytes(&[64; 32]);
     let carol = SigningKey::from_bytes(&[65; 32]);
-    let vault = resource::create_vault(&alice, "synthetic vault", at(0)).unwrap();
+    let vault = resource::create_signer_vault(&alice, "synthetic vault", at(0)).unwrap();
     let resource = vault.resource;
     store
         .commit(collection.source(), &alice, vault.fragment)

@@ -63,14 +63,16 @@ pub fn rows<P: TriblePattern>(facts: &P) -> Vec<ItemRow> {
 
 /// Prepare all ciphertext, immutable authority and the initial holder envelope.
 /// The sole public label is explicit; private field labels/filenames are sealed.
+/// `delivery` selects the item's own descriptor or a vault.
 pub fn prepare(
     signer: &SigningKey,
     public_label: &str,
     input: ItemInput<'_>,
     created_at: IntervalValue,
+    delivery: crate::record::Delivery,
 ) -> Result<SealedVersion> {
     prepare_using(public_label, input, created_at, |key, bundle| {
-        super::resource::seal_item_bundle(signer, public_label, key, bundle, created_at)
+        super::resource::seal_item_bundle(signer, public_label, key, bundle, created_at, delivery)
     })
 }
 

@@ -214,7 +214,7 @@ impl Care {
             let group = match existing {
                 Some(group) => group,
                 None => {
-                    let created = resource::create_vault(signer, GROUP_LABEL, sealed_at)?;
+                    let created = resource::create_signer_vault(signer, GROUP_LABEL, sealed_at)?;
                     public += created.fragment;
                     created.resource
                 }

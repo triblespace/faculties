@@ -4,6 +4,19 @@
 //! delivery policy for a recovered DEK: the opened envelope supplies R. A new R
 //! names no collection; the grants over it reach every participant of R by
 //! grant gossip, whichever collection declares the version.
+//!
+//! A vault is an R that binds no single version: its descriptor carries one
+//! key-delivery policy, every version whose envelope binds it is a member,
+//! and a grant over it covers every member. There is no vault key: each
+//! member's DEK is still wrapped directly to each recipient.
+//!
+//! The colony vault is the vault whose policy is the Secrets collection's own
+//! READ policy, so every host that replicates the collection can also open
+//! what is sealed into it. Ordinary adds seal into it. Its descriptor is
+//! intrinsic, so every host prepares the same bytes. A delivered key cannot
+//! be taken back: removing a host from the policy stops future delivery
+//! only, and rotation (a new version) is the answer to a host that must lose
+//! access.
 
 use std::num::NonZeroUsize;
 
@@ -20,6 +33,7 @@ use triblespace::core::repo::{
 };
 
 use super::*;
+use crate::record::Delivery;
 use crate::schema::{
     delivery_expires_at, delivery_not_before, ACTION_KEY_DELIVERY, KIND_SECRET_RESOURCE,
 };
@@ -110,14 +124,17 @@ pub fn delivery_prefix_is_current<R: BlobStoreGet>(
     })
 }
 
-/// Prepare one bound raw secret and its signer-only envelope without publishing.
-/// The immutable resource binds the opaque secret id and exact body.
+/// Prepare one bound raw secret and the signer's envelope without publishing.
+/// With [`Delivery::Own`] a fresh immutable resource binds the opaque secret
+/// id and exact body under `direct(signer)`; with [`Delivery::Vault`] the
+/// envelope binds that vault's descriptor instead.
 /// Callers may compose its fragment with dependent facts before one commit.
 pub fn seal_version(
     signer: &SigningKey,
     name: &str,
     plaintext: &[u8],
     created_at: IntervalValue,
+    delivery: Delivery,
 ) -> Result<SealedVersion> {
     validate_name("secret name", name)?;
     point_value("secret creation time", created_at)?;
@@ -131,18 +148,25 @@ pub fn seal_version(
     let name = fragment.put(name.to_owned());
     fragment += secret_record(secret, name, body, created_at);
 
-    // Preserve the published capability definition bytes. The policy belongs
-    // inside this descriptor, not in appendable facts about the secret entity.
-    let definition = key_delivery_definition();
-    let capability = fragment.put::<blobencodings::SimpleArchive, _>(definition.facts().clone());
-    fragment += definition;
-    let descriptor = entity! {
-        metadata::tag: KIND_SECRET_RESOURCE,
-        wrap_secret: secret,
-        secret_body: body,
-        resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+    let resource = match delivery {
+        Delivery::Vault(resource) => resource,
+        Delivery::Own => {
+            // Preserve the published capability definition bytes. The policy
+            // belongs inside this descriptor, not in appendable facts about
+            // the secret entity.
+            let definition = key_delivery_definition();
+            let capability =
+                fragment.put::<blobencodings::SimpleArchive, _>(definition.facts().clone());
+            fragment += definition;
+            let descriptor = entity! {
+                metadata::tag: KIND_SECRET_RESOURCE,
+                wrap_secret: secret,
+                secret_body: body,
+                resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+            };
+            fragment.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
+        }
     };
-    let resource = fragment.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone());
     fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
     let binding = envelope::BoundKey {
         secret,
@@ -166,15 +190,9 @@ pub(crate) fn seal_item_bundle(
     key: crate::encrypted::ItemKey,
     bundle: Bundle<crate::encrypted::Encrypted<SimpleArchive>>,
     created_at: IntervalValue,
+    delivery: Delivery,
 ) -> Result<SealedVersion> {
-    seal_structured(
-        signer,
-        name,
-        key,
-        bundle,
-        created_at,
-        crate::record::Delivery::Own,
-    )
+    seal_structured(signer, name, key, bundle, created_at, delivery)
 }
 
 /// Publish-ready structured version S whose root H is `bundle`, delivered
@@ -197,8 +215,8 @@ pub(crate) fn seal_structured(
         structured_body*: bundle,
     };
     let resource = match delivery {
-        crate::record::Delivery::Vault(resource) => resource,
-        crate::record::Delivery::Own => {
+        Delivery::Vault(resource) => resource,
+        Delivery::Own => {
             let definition = key_delivery_definition();
             let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
             fragment += definition;
@@ -228,30 +246,18 @@ pub(crate) fn seal_structured(
     })
 }
 
-/// A new vault resource: one immutable descriptor whose key-delivery policy is
-/// rooted at the signer, plus its public vault entity.
+/// A new vault resource: one immutable descriptor carrying the vault's
+/// key-delivery policy, plus its public vault entity.
 pub struct SealedVault {
     pub fragment: Fragment,
     pub vault: Id,
     pub resource: CollectionHandle,
 }
 
-/// Prepare a vault descriptor. Versions sealed with
-/// `record::Delivery::Vault(resource)` are its members; one grant over the
-/// resource covers them, and delivery maintenance reaches each member under
-/// the vault's policy (future delivery only; delivered wraps stay usable).
-/// Membership is every version admitted to the collection whose authenticated
-/// envelope binds this descriptor, so it is gated by collection WRITE
-/// admission like every other version.
-pub fn create_vault(
-    signer: &SigningKey,
-    public_label: &str,
-    created_at: IntervalValue,
-) -> Result<SealedVault> {
-    use crate::schema::{resource_vault, KIND_SECRET_VAULT};
-    validate_name("public vault label", public_label)?;
-    point_value("vault creation time", created_at)?;
-    let vault = genid().id;
+/// The descriptor of vault `vault` under `policy`, with the key-delivery
+/// definition it binds. Content-addressed: equal inputs give equal bytes.
+fn vault_descriptor(vault: Id, policy: &AdmissionPolicy) -> (Fragment, CollectionHandle) {
+    use crate::schema::resource_vault;
     let mut fragment = Fragment::empty();
     let definition = key_delivery_definition();
     let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
@@ -259,9 +265,29 @@ pub fn create_vault(
     let descriptor = entity! {
         metadata::tag: KIND_SECRET_RESOURCE,
         resource_vault: vault,
-        resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+        resource_policy*: policy.binding(capability),
     };
     let resource = fragment.put::<SimpleArchive, _>(descriptor.facts().clone());
+    (fragment, resource)
+}
+
+/// Prepare a vault descriptor whose key-delivery policy is `policy`.
+/// Versions sealed with `record::Delivery::Vault(resource)` are its members;
+/// one grant over the resource covers them, and delivery maintenance reaches
+/// each member under the vault's policy (future delivery only; delivered
+/// wraps stay usable). Membership is every version admitted to the
+/// collection whose authenticated envelope binds this descriptor, so it is
+/// gated by collection WRITE admission like every other version.
+pub fn create_vault(
+    policy: &AdmissionPolicy,
+    public_label: &str,
+    created_at: IntervalValue,
+) -> Result<SealedVault> {
+    use crate::schema::KIND_SECRET_VAULT;
+    validate_name("public vault label", public_label)?;
+    point_value("vault creation time", created_at)?;
+    let vault = genid().id;
+    let (mut fragment, resource) = vault_descriptor(vault, policy);
     fragment += entity! { ExclusiveId::force_ref(&vault) @
         metadata::tag: KIND_SECRET_VAULT,
         metadata::name: public_label.to_owned(),
@@ -273,6 +299,90 @@ pub fn create_vault(
         vault,
         resource,
     })
+}
+
+/// A vault rooted at the signer alone (`direct(signer)`), as Care uses.
+pub fn create_signer_vault(
+    signer: &SigningKey,
+    public_label: &str,
+    created_at: IntervalValue,
+) -> Result<SealedVault> {
+    create_vault(
+        &AdmissionPolicy::direct(signer.verifying_key()),
+        public_label,
+        created_at,
+    )
+}
+
+/// Public label of the colony vault entity.
+pub const COLONY_VAULT_LABEL: &str = "colony";
+
+/// The colony vault's key-delivery policy for a collection READ policy: the
+/// same roots and invocation threshold. An Open READ policy names no finite
+/// set of recipients to wrap a DEK for, so colony sealing refuses it.
+pub fn colony_policy(read: &AdmissionPolicy) -> Result<AdmissionPolicy> {
+    match read {
+        AdmissionPolicy::Open => bail!(
+            "the Secrets collection's READ policy is Open, so it names no finite set of hosts \
+             to deliver keys to; colony sealing needs a quorum READ policy"
+        ),
+        AdmissionPolicy::Quorum(quorum) => AdmissionPolicy::quorum(
+            quorum.roots().iter().copied(),
+            quorum.invoke_threshold(),
+            None,
+        )
+        .map_err(|error| anyhow!("colony vault policy: {error}")),
+    }
+}
+
+/// Prepare the colony vault for `policy` (see [`colony_policy`]). Nothing in
+/// it is fresh or time-dependent: the descriptor carries the minted colony
+/// marker as its vault value, so two hosts preparing it for the same policy
+/// produce the same descriptor and the same public facts, and concurrent
+/// creation converges by idempotence.
+pub fn colony_vault(policy: &AdmissionPolicy) -> SealedVault {
+    use crate::schema::{COLONY_VAULT, KIND_SECRET_VAULT};
+    let (mut fragment, resource) = vault_descriptor(COLONY_VAULT, policy);
+    fragment += entity! { ExclusiveId::force_ref(&COLONY_VAULT) @
+        metadata::tag: KIND_SECRET_VAULT,
+        metadata::name: COLONY_VAULT_LABEL.to_owned(),
+        resource_handle: resource,
+    };
+    SealedVault {
+        fragment,
+        vault: COLONY_VAULT,
+        resource,
+    }
+}
+
+/// Find a colony vault for `policy` among the vaults these facts declare:
+/// a vault entity's descriptor that carries the colony marker and a
+/// key-delivery binding with exactly this policy. A query, never a lookup
+/// of a computed handle. Duplicates may exist; the smallest handle is chosen.
+pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
+    reader: &R,
+    facts: &P,
+    policy: &AdmissionPolicy,
+) -> Option<CollectionHandle> {
+    use crate::schema::{resource_vault, COLONY_VAULT, KIND_SECRET_VAULT};
+    let capability = key_delivery_capability();
+    find!(resource: CollectionHandle, pattern!(facts, [{
+        _?vault @ metadata::tag: KIND_SECRET_VAULT, resource_handle: ?resource
+    }]))
+    .filter(|resource| {
+        reader
+            .get::<TribleSet, _>(*resource)
+            .is_ok_and(|descriptor| {
+                find!(entity: Id, pattern!(&descriptor, [{
+                    ?entity @ metadata::tag: KIND_SECRET_RESOURCE, resource_vault: COLONY_VAULT
+                }]))
+                .any(|entity| {
+                    resource_policies(&descriptor, entity, Some(capability))
+                        .any(|(_, found)| found == *policy)
+                })
+            })
+    })
+    .min()
 }
 
 /// Whether this exact descriptor is a vault resource.
