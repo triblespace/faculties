@@ -98,17 +98,17 @@ fn a_record_and_its_attachments_seal_as_one_version_and_open_together() {
 }
 
 #[test]
-fn one_group_grant_covers_every_member_including_later_ones_and_nothing_else() {
+fn one_vault_grant_covers_every_member_including_later_ones_and_nothing_else() {
     let (mut store, collection, alice) = fixture(63);
     let bob = SigningKey::from_bytes(&[64; 32]);
     let carol = SigningKey::from_bytes(&[65; 32]);
-    let group = resource::create_group(&alice, "synthetic group", at(0)).unwrap();
-    let resource = group.resource;
+    let vault = resource::create_vault(&alice, "synthetic vault", at(0)).unwrap();
+    let resource = vault.resource;
     store
-        .commit(collection.source(), &alice, group.fragment)
+        .commit(collection.source(), &alice, vault.fragment)
         .unwrap();
     let member = |store: &mut MemoryRepo| {
-        let sealed = record(&alice, genid().id, Delivery::Group(resource));
+        let sealed = record(&alice, genid().id, Delivery::Vault(resource));
         let id = sealed.secret;
         store
             .commit(collection.source(), &alice, sealed.fragment)
@@ -125,8 +125,8 @@ fn one_group_grant_covers_every_member_including_later_ones_and_nothing_else() {
 
     let snapshot =
         pollster::block_on(storage::ensure_and_snapshot(&mut store, collection, &alice)).unwrap();
-    assert!(resource::is_group(snapshot.store_snapshot(), resource));
-    // A grant naming one member never widens to its group.
+    assert!(resource::is_vault(snapshot.store_snapshot(), resource));
+    // A grant naming one member never widens to its vault.
     assert!(resource::grant(
         &mut store,
         &alice,
@@ -162,7 +162,7 @@ fn one_group_grant_covers_every_member_including_later_ones_and_nothing_else() {
     };
     assert_eq!(maintain(&mut store), 2, "one envelope per member for bob");
     // A member added after the grant reaches bob at the next maintenance:
-    // the group's policy decides future delivery.
+    // the vault's policy decides future delivery.
     let later = member(&mut store);
     assert_eq!(maintain(&mut store), 1);
     assert_eq!(

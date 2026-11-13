@@ -49,9 +49,9 @@ pub const KIND_WRAP: Id = id_hex!("EB8549BAF679C5D11ECEDB416AAD76E3");
 /// Minted with `trible genid` on 2026-09-14.
 pub const KIND_SECRET_RESOURCE: Id = id_hex!("8DE676F5445D85A874435C68C9C387E4");
 
-/// A group resource descriptor: one delivery policy shared by every version
+/// A vault resource descriptor: one delivery policy shared by every version
 /// whose envelope binds it. Minted with `trible genid` on 2026-10-31.
-pub const KIND_SECRET_GROUP: Id = id_hex!("971ECB6B0D4111372A86227638EE5009");
+pub const KIND_SECRET_VAULT: Id = id_hex!("971ECB6B0D4111372A86227638EE5009");
 
 /// Bound recipient-envelope format. Minted with `trible genid` on 2026-09-14.
 pub const BOUND_ENVELOPE_MAGIC: [u8; 16] = id_hex!("0AFF57FBB4533A0E74171F2B7893BDC9").raw();
@@ -101,11 +101,11 @@ attributes! {
     "B511AAEB955CD121B6C5E72B3DCEC70F" as pub wrap_recipient_key:
         inlineencodings::ED25519PublicKey;
 
-    /// The opaque group a group resource descriptor stands for. Its presence
-    /// is what makes a descriptor a group: membership is every version whose
+    /// The opaque vault a vault resource descriptor stands for. Its presence
+    /// is what makes a descriptor a vault: membership is every version whose
     /// authenticated envelope binds that descriptor. Anchor minted with
     /// `trible genid` on 2026-10-31.
-    "A9A1E54E683625214F4A90495B1D7ABF" as pub resource_group: inlineencodings::GenId;
+    "A9A1E54E683625214F4A90495B1D7ABF" as pub resource_vault: inlineencodings::GenId;
 
     /// Earliest delivery instant, inclusive. This constrains future envelopes,
     /// never opening an envelope already delivered. Minted 2026-09-14.
@@ -140,6 +140,10 @@ mod tests {
             (wrap_secret.id(), "D17EC6F6A9F9D6B7A3B9A329A9CFC4CC"),
             (wrap_dek.id(), "B30CE37D4DC3CAACC34D946B3D71E37C"),
             (wrap_recipient_key.id(), "082D781A1E4C849524EFC07280B42C8A"),
+            // Renamed from group to vault on 2026-11-13; ids unchanged, so
+            // every vault Care created before the rename still reads.
+            (KIND_SECRET_VAULT, "971ECB6B0D4111372A86227638EE5009"),
+            (resource_vault.id(), "0C6DA3CAF593206FF1E6F5B517A7B0E1"),
         ] {
             assert_eq!(format!("{actual:X}"), expected);
         }

@@ -21,7 +21,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "care_grant",
-        description: "Share a subject's health observations (optionally one kind) with another key through Secrets group grants, then deliver their keys. to is an Ed25519 public key as 64 hex characters. Later readings in the same groups reach that key at the next delivery maintenance.",
+        description: "Share a subject's health observations (optionally one kind) with another key through Secrets vault grants, then deliver their keys. to is an Ed25519 public key as 64 hex characters. Later readings in the same groups reach that key at the next delivery maintenance.",
         input_schema: r#"{"type":"object","properties":{"subject":{"type":"string"},"to":{"type":"string"},"kind":{"type":"string"}},"required":["subject","to"],"additionalProperties":false}"#,
     },
     Tool {

@@ -9,7 +9,7 @@
 //! its public label, creation time and ciphertext root) plus the envelope.
 //!
 //! Delivery follows the version's resource descriptor R: its own descriptor
-//! ([`Delivery::Own`]) or a shared group descriptor ([`Delivery::Group`]),
+//! ([`Delivery::Own`]) or a shared vault descriptor ([`Delivery::Vault`]),
 //! which one grant over that R covers.
 
 use super::*;
@@ -24,9 +24,9 @@ pub type RecordBody = Inline<inlineencodings::Handle<Encrypted<SimpleArchive>>>;
 pub enum Delivery {
     /// A fresh descriptor for this version alone, rooted at the signer.
     Own,
-    /// An existing group descriptor (see [`crate::resource::create_group`]).
+    /// An existing vault descriptor (see [`crate::resource::create_vault`]).
     /// A grant over it covers every version sealed into it.
-    Group(CollectionHandle),
+    Vault(CollectionHandle),
 }
 
 /// Seal one private relation and the blobs it references as one immutable
@@ -70,7 +70,7 @@ impl<R: BlobStoreGet> OpenedRecord<R> {
     pub fn key_id(&self) -> Id {
         self.key.id()
     }
-    /// The resource descriptor the opened envelope bound (own or group).
+    /// The resource descriptor the opened envelope bound (own or vault).
     pub fn resource(&self) -> Option<CollectionHandle> {
         self.resource
     }

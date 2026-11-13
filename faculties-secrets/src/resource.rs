@@ -178,7 +178,7 @@ pub(crate) fn seal_item_bundle(
 }
 
 /// Publish-ready structured version S whose root H is `bundle`, delivered
-/// under its own descriptor or a group descriptor, with the signer's envelope.
+/// under its own descriptor or a vault descriptor, with the signer's envelope.
 pub(crate) fn seal_structured(
     signer: &SigningKey,
     name: &str,
@@ -197,7 +197,7 @@ pub(crate) fn seal_structured(
         structured_body*: bundle,
     };
     let resource = match delivery {
-        crate::record::Delivery::Group(resource) => resource,
+        crate::record::Delivery::Vault(resource) => resource,
         crate::record::Delivery::Own => {
             let definition = key_delivery_definition();
             let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
@@ -228,58 +228,58 @@ pub(crate) fn seal_structured(
     })
 }
 
-/// A new group resource: one immutable descriptor whose key-delivery policy is
-/// rooted at the signer, plus its public group entity.
-pub struct SealedGroup {
+/// A new vault resource: one immutable descriptor whose key-delivery policy is
+/// rooted at the signer, plus its public vault entity.
+pub struct SealedVault {
     pub fragment: Fragment,
-    pub group: Id,
+    pub vault: Id,
     pub resource: CollectionHandle,
 }
 
-/// Prepare a group descriptor. Versions sealed with
-/// `record::Delivery::Group(resource)` are its members; one grant over the
+/// Prepare a vault descriptor. Versions sealed with
+/// `record::Delivery::Vault(resource)` are its members; one grant over the
 /// resource covers them, and delivery maintenance reaches each member under
-/// the group's policy (future delivery only; delivered wraps stay usable).
+/// the vault's policy (future delivery only; delivered wraps stay usable).
 /// Membership is every version admitted to the collection whose authenticated
 /// envelope binds this descriptor, so it is gated by collection WRITE
 /// admission like every other version.
-pub fn create_group(
+pub fn create_vault(
     signer: &SigningKey,
     public_label: &str,
     created_at: IntervalValue,
-) -> Result<SealedGroup> {
-    use crate::schema::{resource_group, KIND_SECRET_GROUP};
-    validate_name("public group label", public_label)?;
-    point_value("group creation time", created_at)?;
-    let group = genid().id;
+) -> Result<SealedVault> {
+    use crate::schema::{resource_vault, KIND_SECRET_VAULT};
+    validate_name("public vault label", public_label)?;
+    point_value("vault creation time", created_at)?;
+    let vault = genid().id;
     let mut fragment = Fragment::empty();
     let definition = key_delivery_definition();
     let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
     fragment += definition;
     let descriptor = entity! {
         metadata::tag: KIND_SECRET_RESOURCE,
-        resource_group: group,
+        resource_vault: vault,
         resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
     };
     let resource = fragment.put::<SimpleArchive, _>(descriptor.facts().clone());
-    fragment += entity! { ExclusiveId::force_ref(&group) @
-        metadata::tag: KIND_SECRET_GROUP,
+    fragment += entity! { ExclusiveId::force_ref(&vault) @
+        metadata::tag: KIND_SECRET_VAULT,
         metadata::name: public_label.to_owned(),
         metadata::created_at: created_at,
         resource_handle: resource,
     };
-    Ok(SealedGroup {
+    Ok(SealedVault {
         fragment,
-        group,
+        vault,
         resource,
     })
 }
 
-/// Whether this exact descriptor is a group resource.
-pub fn is_group<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> bool {
+/// Whether this exact descriptor is a vault resource.
+pub fn is_vault<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> bool {
     reader.get::<TribleSet, _>(resource).is_ok_and(|facts| {
         exists!(pattern!(&facts, [{ metadata::tag: KIND_SECRET_RESOURCE,
-            crate::schema::resource_group: _?group }]))
+            crate::schema::resource_vault: _?vault }]))
     })
 }
 
@@ -289,14 +289,14 @@ pub fn is_group<R: BlobStoreGet>(reader: &R, resource: CollectionHandle) -> bool
 /// R, not access to any collection. An old R may still carry the retired
 /// `resource_collection` annotation; nothing reads it.
 ///
-/// A group descriptor binds no single version: with `include_groups` its
+/// A vault descriptor binds no single version: with `include_vaults` its
 /// policy applies to any bound version (delivery), without it a grant naming
-/// one version never widens to that version's whole group.
+/// one version never widens to that version's whole vault.
 fn policies<R: BlobStoreGet>(
     reader: &R,
     facts: &TribleSet,
     bound: Option<(Id, BytesHandle)>,
-    include_groups: bool,
+    include_vaults: bool,
 ) -> Vec<AdmissionPolicy> {
     let raw = find!(
         (entity: Id, secret: Id, body: BytesHandle),
@@ -316,10 +316,10 @@ fn policies<R: BlobStoreGet>(
         .chain(structured)
         .map(|(entity, secret, body)| (entity, Some((secret, body))))
         .collect();
-    if include_groups {
+    if include_vaults {
         candidates.extend(
             find!(entity: Id, pattern!(facts, [{ ?entity @ metadata::tag: KIND_SECRET_RESOURCE,
-                crate::schema::resource_group: _?group }]))
+                crate::schema::resource_vault: _?vault }]))
             .map(|entity| (entity, None)),
         );
     }
