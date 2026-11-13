@@ -1852,12 +1852,21 @@ pub enum Published {
         commit: CollectionCommit,
         upkeep: anyhow::Error,
     },
+    /// Committed; closing the store afterwards failed with `close` (a
+    /// one-shot [`Storage`] closes it when the operation ends). The commit
+    /// was appended, but its durability is not established.
+    Unconfirmed {
+        commit: CollectionCommit,
+        close: anyhow::Error,
+    },
 }
 
 impl Published {
     pub fn commit(&self) -> CollectionCommit {
         match self {
-            Self::Current(commit) | Self::Lagging { commit, .. } => *commit,
+            Self::Current(commit)
+            | Self::Lagging { commit, .. }
+            | Self::Unconfirmed { commit, .. } => *commit,
         }
     }
 }
@@ -1872,6 +1881,8 @@ pub(crate) mod publish_fault {
     pub(crate) enum Fault {
         BeforeCommit,
         AfterCommit,
+        /// The store's close after a successful commit.
+        Close,
     }
 
     thread_local! {
@@ -1994,12 +2005,15 @@ impl Files {
     /// routes are honoured; the fragment is the ownership unit, so its blobs
     /// travel with it.
     ///
-    /// `Err` means nothing was committed. Once the commit is appended the
-    /// result is `Ok`: [`Published::Lagging`] says the commit stands but the
-    /// upkeep of the derived views failed, which readers survive by reading
-    /// the raw facts until maintenance catches up.
+    /// `Err` means no commit was appended. Once the commit is appended the
+    /// result is `Ok`, whatever fails afterwards: [`Published::Lagging`] says
+    /// the upkeep of the derived views failed, which readers survive by
+    /// reading the raw facts until maintenance catches up, and
+    /// [`Published::Unconfirmed`] says closing the store failed, so the
+    /// commit's durability is not established.
     pub fn publish(&self, fragment: Fragment) -> Result<Published> {
-        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
+        let mut appended = None;
+        let result = with_files_write_store(&self.storage, |store, collection, signer, runtime| {
             crate::collection_names::require_command_write_admission_acquiring(
                 store, collection, signer, "Files", "files", runtime,
             )?;
@@ -2010,6 +2024,7 @@ impl Files {
             let commit = store
                 .commit(collection, signer, fragment)
                 .context("commit Files fragment")?;
+            appended = Some(commit);
             let upkeep = ensure_files_after_commit(store, collection, signer, runtime);
             #[cfg(test)]
             let upkeep = if publish_fault::take(publish_fault::Fault::AfterCommit) {
@@ -2021,7 +2036,21 @@ impl Files {
                 Ok(()) => Published::Current(commit),
                 Err(upkeep) => Published::Lagging { commit, upkeep },
             })
-        })
+        });
+        #[cfg(test)]
+        let result = match result {
+            Ok(_) if publish_fault::take(publish_fault::Fault::Close) => {
+                Err(anyhow::anyhow!("injected Files store close failure"))
+            }
+            result => result,
+        };
+        // Nothing in the callback fails after the commit, so an error with a
+        // commit appended came from closing the store.
+        match (result, appended) {
+            (Ok(published), _) => Ok(published),
+            (Err(close), Some(commit)) => Ok(Published::Unconfirmed { commit, close }),
+            (Err(error), None) => Err(error),
+        }
     }
 
     pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<String> {

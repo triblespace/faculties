@@ -420,6 +420,11 @@ impl Imagine {
                 .context("committing it to Files failed")?;
             committed = true;
             let warning = match published {
+                crate::files::Published::Unconfirmed { close, .. } => {
+                    return Err(close.context(
+                        "the Files commit was appended, but closing storage afterwards failed",
+                    ));
+                }
                 crate::files::Published::Current(_) => None,
                 crate::files::Published::Lagging { upkeep, .. } => Some(format!(
                     "the image is stored, but bringing Files' derived views up to date failed \
@@ -452,7 +457,7 @@ impl Imagine {
         committed: bool,
     ) -> anyhow::Error {
         let state = if committed {
-            "its Files commit was appended but storage reported a failure afterwards, so it may not be durable"
+            "its Files commit was appended, but storage reported a failure afterwards, so its durability is not established"
         } else {
             "it was not stored in Files"
         };
@@ -463,9 +468,20 @@ impl Imagine {
                 generated.media_type(),
                 path.display()
             )),
-            Err(write) => error.context(format!(
-                "the image was generated but {state}, and saving its bytes locally also failed ({write:#}); the image is lost; generation is not retried"
-            )),
+            Err(Unstored { file, error: write }) => {
+                // Say only what is known: a created file may hold some or
+                // all of the bytes; without one, no local copy exists.
+                let local = match file {
+                    Some(path) => format!(
+                        "the local file {} may be incomplete",
+                        path.display()
+                    ),
+                    None => "no local copy was made".to_owned(),
+                };
+                error.context(format!(
+                    "the image was generated but {state}, and saving a local copy failed ({write:#}); {local}; generation is not retried"
+                ))
+            }
         }
     }
 
@@ -484,19 +500,50 @@ impl Imagine {
     }
 }
 
+/// Why [`save_unstored`] failed, and the file it created, if it got that far.
+struct Unstored {
+    file: Option<PathBuf>,
+    error: anyhow::Error,
+}
+
+/// Test-only: make the next unstored write on this thread fail after it
+/// created its file and wrote half the bytes.
+#[cfg(test)]
+pub(super) mod unstored_fault {
+    use std::cell::Cell;
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(in crate::imagine) fn arm() {
+        ARMED.with(|armed| armed.set(true));
+    }
+    pub(super) fn take() -> bool {
+        ARMED.with(|armed| armed.replace(false))
+    }
+}
+
 /// Write `generated`'s exact bytes to `directory/<UTC time>-<hint>.<ext>`,
 /// readable by this user only, never overwriting an existing file.
-fn save_unstored(directory: Option<&Path>, hint: &str, generated: &Generated) -> Result<PathBuf> {
+fn save_unstored(
+    directory: Option<&Path>,
+    hint: &str,
+    generated: &Generated,
+) -> std::result::Result<PathBuf, Unstored> {
     use std::io::Write as _;
-    let directory = directory.context("no HOME, so there is no unstored-image directory")?;
+    let before = |error: anyhow::Error| Unstored { file: None, error };
+    let directory = directory
+        .context("no HOME, so there is no unstored-image directory")
+        .map_err(before)?;
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder
         .create(directory)
-        .with_context(|| format!("create {}", directory.display()))?;
-    let (year, month, day, hour, minute, second, nanos) = crate::clock::now()?.to_gregorian_utc();
+        .with_context(|| format!("create {}", directory.display()))
+        .map_err(before)?;
+    let (year, month, day, hour, minute, second, nanos) =
+        crate::clock::now().map_err(before)?.to_gregorian_utc();
     let hint: String = hint
         .chars()
         .map(|c| {
@@ -518,11 +565,24 @@ fn save_unstored(directory: Option<&Path>, hint: &str, generated: &Generated) ->
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options
         .open(&path)
-        .with_context(|| format!("create {}", path.display()))?;
-    file.write_all(generated.bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(path)
+        .with_context(|| format!("create {}", path.display()))
+        .map_err(before)?;
+    let bytes: &[u8] = generated.bytes();
+    #[cfg(test)]
+    if unstored_fault::take() {
+        let _ = file.write_all(&bytes[..bytes.len() / 2]);
+        return Err(Unstored {
+            file: Some(path),
+            error: anyhow::anyhow!("injected unstored write failure"),
+        });
+    }
+    match file.write_all(bytes).and_then(|()| file.sync_all()) {
+        Ok(()) => Ok(path),
+        Err(error) => Err(Unstored {
+            error: anyhow::Error::new(error).context(format!("write {}", path.display())),
+            file: Some(path),
+        }),
+    }
 }
 
 pub(super) fn remember_range(raw: &str) -> Result<(hifitime::Epoch, hifitime::Epoch)> {

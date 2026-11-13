@@ -699,7 +699,7 @@ fn a_failed_commit_keeps_the_exact_bytes_in_a_private_local_file() {
 }
 
 #[test]
-fn when_the_local_fallback_fails_too_the_error_says_the_image_is_lost() {
+fn when_no_local_copy_can_be_made_the_error_says_so() {
     use crate::files::operations::publish_fault::{arm, Fault};
     let (directory, pile, key) = fresh();
     let storage = Storage::new(pile, Some(key));
@@ -713,10 +713,87 @@ fn when_the_local_fallback_fails_too_the_error_says_the_image_is_lost() {
         .generate(&Request::OpenAi(openai_request("a lost image")))
         .unwrap_err();
     let text = error.to_string();
+    assert!(text.contains("not stored in Files"), "{text}");
+    assert!(text.contains("saving a local copy failed"), "{text}");
+    assert!(text.contains("no local copy was made"), "{text}");
+    assert_eq!(commits_to(&storage, FILES), 0);
+}
+
+#[test]
+fn a_partial_local_copy_is_named_as_possibly_incomplete() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let imagine = bound(&storage, &server);
+    arm(Fault::BeforeCommit);
+    super::operations::unstored_fault::arm();
+    let error = imagine
+        .generate(&Request::OpenAi(openai_request("a half-written image")))
+        .unwrap_err();
+    let text = error.to_string();
+    let saved: Vec<PathBuf> = std::fs::read_dir(unstored(&storage))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1);
     assert!(
-        text.contains("saving its bytes locally also failed"),
+        text.contains(&format!("{} may be incomplete", saved[0].display())),
         "{text}"
     );
-    assert!(text.contains("lost"), "{text}");
-    assert_eq!(commits_to(&storage, FILES), 0);
+    assert!(!text.contains("lost"), "{text}");
+    assert_eq!(std::fs::read(&saved[0]).unwrap(), &png[..png.len() / 2]);
+}
+
+#[test]
+fn publish_reports_a_close_failure_after_its_commit_as_committed() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let files = crate::files::Files::with_storage(storage.clone());
+    arm(Fault::Close);
+    let published = files
+        .publish(crate::files::stage(b"closing".to_vec(), "close.txt", "text/plain").unwrap())
+        .unwrap();
+    let crate::files::Published::Unconfirmed { close, .. } = &published else {
+        panic!("a close failure after the commit is reported as committed: {published:?}");
+    };
+    assert!(format!("{close:#}").contains("injected Files store close failure"));
+    assert_eq!(commits_to(&storage, FILES), 1);
+    // Before any commit, a failure is still an Err.
+    arm(Fault::BeforeCommit);
+    assert!(files
+        .publish(crate::files::stage(b"never".to_vec(), "never.txt", "text/plain").unwrap())
+        .is_err());
+    assert_eq!(commits_to(&storage, FILES), 1);
+}
+
+#[test]
+fn an_unconfirmed_commit_keeps_a_local_copy_and_says_the_commit_happened() {
+    use crate::files::operations::publish_fault::{arm, Fault};
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let imagine = bound(&storage, &server);
+    arm(Fault::Close);
+    let error = imagine
+        .generate(&Request::OpenAi(openai_request("an unconfirmed image")))
+        .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(text.contains("commit was appended"), "{text}");
+    assert!(text.contains("durability is not established"), "{text}");
+    assert!(
+        text.contains("injected Files store close failure"),
+        "{text}"
+    );
+    let saved: Vec<PathBuf> = std::fs::read_dir(unstored(&storage))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(std::fs::read(&saved[0]).unwrap(), png);
+    assert_eq!(commits_to(&storage, FILES), 1);
+    assert_eq!(server.count(), 1, "never retried");
 }
