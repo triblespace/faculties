@@ -35,8 +35,8 @@ use triblespace::core::trible::TribleSet;
 
 use crate::schemas::{
     alarm, atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings,
-    files, habit, headspace, home, mail, memory, message, models, orient, planner, posture, quota,
-    relations, status, swarm_health, teams, voice, web, wiki,
+    files, habit, headspace, home, imagine, mail, memory, message, models, orient, planner,
+    posture, quota, relations, status, swarm_health, teams, voice, web, wiki,
 };
 use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 
@@ -80,6 +80,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (habit::DEFAULT_SCOPE_ID, "habit"),
         (headspace::DEFAULT_SCOPE_ID, "headspace"),
         (home::DEFAULT_SCOPE_ID, "home"),
+        (imagine::DEFAULT_SCOPE_ID, "imagine"),
         (mail::DEFAULT_SCOPE_ID, "mail"),
         (memory::DEFAULT_SCOPE_ID, "memory-journal"),
         (memory::DEFAULT_COMB_SCOPE_ID, "memory-comb"),
