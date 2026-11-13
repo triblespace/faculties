@@ -10,6 +10,15 @@ All notable changes to this project will be documented in this file.
   the channel does not hold is refused before anything is posted. The
   returned reply is stored with `archive::reply_to`, as intake stores one,
   and the receipt says what Discord's message names as its target.
+  Intake and send read what a message replies to in one place: a message
+  of type `REPLY` whose `message_reference` is of the reply type replies to
+  the reference's `message_id`. The embedded `referenced_message` only
+  corroborates it; when that is left out or null, the reply is still one.
+  Forwards, pin notices, crossposts and thread starters carry references
+  and are not replies. A thread starter or context-menu command used to be
+  stored as replying to its embedded message, and a reply whose target was
+  not embedded as no reply; observed again, such a message is a second
+  observation of it, shown as a divergent version.
   `discord read`/`discord_read` lines now carry each message's Discord id
   (`id=...`), and a reply says what it replies to: the target's id, author
   and first words when it is stored, its id and "not stored here" when not.

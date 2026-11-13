@@ -502,7 +502,10 @@ impl Discord {
     /// Discord id of a message stored in this channel (the id `read` shows).
     /// A target not stored there is refused before anything is posted, and
     /// Discord is asked to refuse the reply rather than post it as an
-    /// ordinary message should the target be gone upstream.
+    /// ordinary message should the target be gone upstream. No
+    /// `allowed_mentions` is sent, so whether the target's author is
+    /// mentioned is Discord's default for that case, which its documentation
+    /// does not state ([`AllowedMentions`]).
     pub fn send_reply(
         &self,
         channel_id: &str,
@@ -1218,6 +1221,12 @@ pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<
 /// empty: no @everyone, @here, role or user mention by syntax alone) and only
 /// the listed users pinged. A send without one keeps Discord's default, which
 /// pings every mention the text contains.
+///
+/// It never sets `replied_user`, which Discord documents as defaulting to
+/// false: a reply sent with this policy does not mention the author of the
+/// message it replies to. What a reply sent without any `allowed_mentions`
+/// does about that author the documentation does not say.
+/// https://docs.discord.com/developers/resources/message#allowed-mentions-object
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowedMentions {
     /// User snowflakes that may be pinged.
@@ -1888,16 +1897,10 @@ fn parse_messages(
             .map(parse_iso8601)
             .transpose()
             .with_context(|| format!("parse edited timestamp for message {external_id}"))?;
-        let reply_to_external_id = payload
-            .get("referenced_message")
-            .and_then(|value| value.get("id"))
-            .and_then(JsonValue::as_str)
-            .map(|raw| {
-                discord_model::validate_snowflake(raw)
-                    .with_context(|| format!("invalid reply target id '{raw}'"))
-                    .map(|_| raw.to_owned())
-            })
-            .transpose()?;
+        // A message without a type is a default one.
+        let kind = payload.get("type").and_then(JsonValue::as_u64).unwrap_or(0);
+        let reply_to_external_id = replied_to(&payload, kind)
+            .with_context(|| format!("read what message {external_id} replies to"))?;
 
         let attachments = match payload.get("attachments") {
             None | Some(JsonValue::Null) => Vec::new(),
@@ -1933,8 +1936,6 @@ fn parse_messages(
                 .collect::<Result<Vec<_>>>()?,
             Some(_) => bail!("message {external_id} attachments field is not an array"),
         };
-        // A message without a type is a default one.
-        let kind = payload.get("type").and_then(JsonValue::as_u64).unwrap_or(0);
 
         messages.push(IncomingMessage {
             external_id,
@@ -1952,6 +1953,66 @@ fn parse_messages(
     messages
         .sort_by_key(|message| discord_model::validate_snowflake(&message.external_id).unwrap());
     Ok(messages)
+}
+
+/// Discord's message type of a reply (`REPLY`).
+/// https://docs.discord.com/developers/resources/message#message-object-message-types
+const REPLY_MESSAGE_TYPE: u64 = 19;
+/// Discord's message reference type of a reply (`DEFAULT`; an unset type is
+/// this one). `FORWARD` (1) points at a message without replying to it.
+/// https://docs.discord.com/developers/resources/message#message-reference-types
+const DEFAULT_MESSAGE_REFERENCE: u64 = 0;
+
+/// The parts of Discord's message reference a reply is read from.
+/// https://docs.discord.com/developers/resources/message#message-reference-structure
+#[derive(serde::Deserialize)]
+struct MessageReference {
+    #[serde(rename = "type")]
+    kind: Option<u64>,
+    message_id: Option<String>,
+}
+
+/// The message a Discord message object of type `kind` replies to: the one
+/// place intake and a sent message's retention both read it from.
+///
+/// A message is a reply only when its own type is `REPLY` and its
+/// `message_reference` is of the reply type (`DEFAULT`, or unset); the target
+/// is the reference's `message_id`. Every other message that carries a
+/// reference is not a reply, whatever it names: a forward (reference type
+/// `FORWARD`), and a pin notice, crosspost, channel follow, or thread
+/// starter, whose references are `DEFAULT` too. The embedded
+/// `referenced_message` only corroborates: it may be absent (Discord did not
+/// fetch the target) or null (the target was deleted) on a reply all the
+/// same, it never makes a message a reply on its own, and one naming another
+/// message than the reference is refused as contradictory.
+fn replied_to(payload: &JsonValue, kind: u64) -> Result<Option<String>> {
+    if kind != REPLY_MESSAGE_TYPE {
+        return Ok(None);
+    }
+    let reference = match payload.get("message_reference") {
+        None | Some(JsonValue::Null) => return Ok(None),
+        Some(value) => serde_json::from_value::<MessageReference>(value.clone())
+            .context("malformed message_reference")?,
+    };
+    if reference.kind.unwrap_or(DEFAULT_MESSAGE_REFERENCE) != DEFAULT_MESSAGE_REFERENCE {
+        return Ok(None);
+    }
+    let Some(target) = reference.message_id else {
+        return Ok(None);
+    };
+    discord_model::validate_snowflake(&target)
+        .with_context(|| format!("invalid reply target id '{target}'"))?;
+    if let Some(embedded) = payload
+        .get("referenced_message")
+        .and_then(|message| message.get("id"))
+        .and_then(JsonValue::as_str)
+    {
+        ensure!(
+            embedded == target,
+            "its message_reference names {target} but its referenced_message is {embedded}"
+        );
+    }
+    Ok(Some(target))
 }
 
 fn required_snowflake(value: &JsonValue, field: &str, subject: &str) -> Result<String> {
@@ -3937,6 +3998,172 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// What `parse_messages` reads a message of `kind` with these reference
+    /// fields as replying to. A field given as `None` is left out of the
+    /// payload entirely, which Discord distinguishes from null.
+    fn replies_to_of(
+        kind: u64,
+        reference: Option<JsonValue>,
+        referenced: Option<JsonValue>,
+    ) -> Result<Option<String>> {
+        let channel = "100000000000000002";
+        let mut payload = message_json("100000000000000006", channel, "x", None, json!([]));
+        payload["type"] = json!(kind);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("referenced_message");
+        if let Some(reference) = reference {
+            payload["message_reference"] = reference;
+        }
+        if let Some(referenced) = referenced {
+            payload["referenced_message"] = referenced;
+        }
+        Ok(parse_messages(vec![payload], channel)?
+            .remove(0)
+            .reply_to_external_id)
+    }
+
+    /// A reply is read from its `message_reference`: the target is there
+    /// whether Discord embedded the referenced message, left it out, or
+    /// sent null for it (deleted), and an embedded one only corroborates.
+    #[test]
+    fn a_reply_is_read_from_its_message_reference() {
+        let target = "100000000000000005";
+        let reference = json!({"message_id": target, "channel_id": "100000000000000002"});
+        let embedded = json!({"id": target});
+        for (case, referenced) in [
+            ("embedded", Some(embedded.clone())),
+            ("absent", None),
+            ("null", Some(JsonValue::Null)),
+        ] {
+            assert_eq!(
+                replies_to_of(19, Some(reference.clone()), referenced).unwrap(),
+                Some(target.to_owned()),
+                "{case}"
+            );
+        }
+        // An explicit DEFAULT reference type is the unset one.
+        let mut typed = reference.clone();
+        typed["type"] = json!(0);
+        assert_eq!(
+            replies_to_of(19, Some(typed), None).unwrap(),
+            Some(target.to_owned())
+        );
+        // The embedded message is never a fallback for a missing reference.
+        assert_eq!(replies_to_of(19, None, Some(embedded)).unwrap(), None);
+        // A reference and an embedded message that disagree are refused.
+        let error = replies_to_of(
+            19,
+            Some(reference),
+            Some(json!({"id": "100000000000000004"})),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("message_reference names"),
+            "{error:#}"
+        );
+    }
+
+    /// Only a message of type REPLY with a reply-type reference replies. A
+    /// forward, a pin notice, a crosspost and a thread starter carry
+    /// references too, and none of them is a reply.
+    #[test]
+    fn a_reference_that_is_no_reply_is_not_read_as_one() {
+        let target = "100000000000000005";
+        let reference = json!({"message_id": target, "channel_id": "100000000000000002"});
+        let mut forward = reference.clone();
+        forward["type"] = json!(1);
+        for (case, kind, reference, referenced) in [
+            // A forward: a default message with a FORWARD reference.
+            ("forward", 0, forward.clone(), None),
+            // The reference type alone also says no: a FORWARD reference on
+            // a REPLY-typed message is not a reply.
+            ("forward reference on a reply", 19, forward, None),
+            // CHANNEL_PINNED_MESSAGE, with its DEFAULT reference.
+            ("pin notice", 6, reference.clone(), None),
+            // A crosspost: a default message with a DEFAULT reference.
+            ("crosspost", 0, reference.clone(), None),
+            // THREAD_STARTER_MESSAGE, which Discord embeds the message for.
+            ("thread starter", 21, reference, Some(json!({"id": target}))),
+        ] {
+            assert_eq!(
+                replies_to_of(kind, Some(reference), referenced).unwrap(),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    /// A reply whose returned message embeds no referenced message (left
+    /// out, or null) is still stored and reported as the reply it is: the
+    /// target comes from the reference Discord returned.
+    #[test]
+    fn a_reply_send_without_an_embedded_target_is_still_stored_as_one() {
+        let channel = "100000000000000002";
+        let target = message_json("100000000000000005", channel, "first", None, json!([]));
+        for (index, embedded) in [None, Some(JsonValue::Null)].into_iter().enumerate() {
+            let directory = tempfile::tempdir().unwrap();
+            let (pile, key) = fresh_storage(&directory);
+            let owner = crate::storage::Storage::new(pile, Some(key));
+            let storage = test_storage(&owner);
+            store(storage, channel, vec![target.clone()]);
+            let receipt = send_with(
+                storage,
+                "fixture",
+                channel,
+                "second",
+                &[],
+                Some("100000000000000005"),
+                |_, actual_channel, body, _, _| {
+                    let mut reply =
+                        reply_json("100000000000000006", actual_channel, body, target.clone());
+                    match &embedded {
+                        None => {
+                            reply.as_object_mut().unwrap().remove("referenced_message");
+                        }
+                        Some(value) => reply["referenced_message"] = value.clone(),
+                    }
+                    Ok(reply)
+                },
+                |_, _| unreachable!("text has no attachments"),
+            )
+            .unwrap();
+            assert_eq!(
+                receipt.reply_to.as_deref(),
+                Some("100000000000000005"),
+                "case {index}"
+            );
+            let mut sent = String::new();
+            super::super::render::sent(
+                &receipt,
+                &mut crate::out::Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text } = part {
+                        sent.push_str(&text);
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+            assert!(
+                sent.trim_end()
+                    .ends_with(" as a reply to 100000000000000005"),
+                "case {index}: {sent}"
+            );
+            let history = read_history(&storage.view().unwrap(), &ReadOptions::default()).unwrap();
+            let reply = history
+                .messages
+                .iter()
+                .find(|message| message.content == "second")
+                .unwrap();
+            assert_eq!(
+                reply.replies_to[0].message_ids,
+                ["100000000000000005"],
+                "case {index}"
+            );
+        }
     }
 
     #[test]
