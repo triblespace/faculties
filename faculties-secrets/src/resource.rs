@@ -12,7 +12,9 @@
 //!
 //! The colony vault is the vault whose policy is the Secrets collection's own
 //! READ policy, so every host that replicates the collection can also open
-//! what is sealed into it. Ordinary adds seal into it. Its descriptor is
+//! what is sealed into it. Ordinary adds seal into it and also keep their own
+//! direct(signer) descriptor, so a grant naming one version still works and
+//! never widens to the vault. Its descriptor is
 //! intrinsic, so every host prepares the same bytes. A delivered key cannot
 //! be taken back: removing a host from the policy stops future delivery
 //! only, and rotation (a new version) is the answer to a host that must lose
@@ -127,7 +129,8 @@ pub fn delivery_prefix_is_current<R: BlobStoreGet>(
 /// Prepare one bound raw secret and the signer's envelope without publishing.
 /// With [`Delivery::Own`] a fresh immutable resource binds the opaque secret
 /// id and exact body under `direct(signer)`; with [`Delivery::Vault`] the
-/// envelope binds that vault's descriptor instead.
+/// envelope binds that vault's descriptor instead; with
+/// [`Delivery::OwnAndVault`] the signer gets one envelope for each.
 /// Callers may compose its fragment with dependent facts before one commit.
 pub fn seal_version(
     signer: &SigningKey,
@@ -148,33 +151,34 @@ pub fn seal_version(
     let name = fragment.put(name.to_owned());
     fragment += secret_record(secret, name, body, created_at);
 
-    let resource = match delivery {
-        Delivery::Vault(resource) => resource,
-        Delivery::Own => {
-            // Preserve the published capability definition bytes. The policy
-            // belongs inside this descriptor, not in appendable facts about
-            // the secret entity.
-            let definition = key_delivery_definition();
-            let capability =
-                fragment.put::<blobencodings::SimpleArchive, _>(definition.facts().clone());
-            fragment += definition;
-            let descriptor = entity! {
-                metadata::tag: KIND_SECRET_RESOURCE,
-                wrap_secret: secret,
-                secret_body: body,
-                resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
-            };
-            fragment.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone())
-        }
-    };
-    fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
-    let binding = envelope::BoundKey {
-        secret,
-        body,
-        resource,
-        dek,
-    };
-    fragment += envelope::fragment(&binding, signer.verifying_key().to_bytes())?;
+    let mut resources = Vec::with_capacity(2);
+    if delivery.own() {
+        // Preserve the published capability definition bytes. The policy
+        // belongs inside this descriptor, not in appendable facts about
+        // the secret entity.
+        let definition = key_delivery_definition();
+        let capability =
+            fragment.put::<blobencodings::SimpleArchive, _>(definition.facts().clone());
+        fragment += definition;
+        let descriptor = entity! {
+            metadata::tag: KIND_SECRET_RESOURCE,
+            wrap_secret: secret,
+            secret_body: body,
+            resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+        };
+        resources.push(fragment.put::<blobencodings::SimpleArchive, _>(descriptor.facts().clone()));
+    }
+    resources.extend(delivery.vault());
+    for resource in resources {
+        fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
+        let binding = envelope::BoundKey {
+            secret,
+            body,
+            resource,
+            dek: dek.clone(),
+        };
+        fragment += envelope::fragment(&binding, signer.verifying_key().to_bytes())?;
+    }
     Ok(SealedVersion {
         fragment,
         secret,
@@ -214,31 +218,33 @@ pub(crate) fn seal_structured(
         metadata::created_at: created_at,
         structured_body*: bundle,
     };
-    let resource = match delivery {
-        Delivery::Vault(resource) => resource,
-        Delivery::Own => {
-            let definition = key_delivery_definition();
-            let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
-            fragment += definition;
-            let descriptor = entity! {
-                metadata::tag: KIND_SECRET_RESOURCE,
-                wrap_secret: secret,
-                structured_body: body,
-                resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
-            };
-            fragment.put::<SimpleArchive, _>(descriptor.facts().clone())
-        }
-    };
-    fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
-    fragment += envelope::fragment(
-        &envelope::BoundKey {
-            secret,
-            body: body.transmute(),
-            resource,
-            dek: key.into_dek(),
-        },
-        signer.verifying_key().to_bytes(),
-    )?;
+    let mut resources = Vec::with_capacity(2);
+    if delivery.own() {
+        let definition = key_delivery_definition();
+        let capability = fragment.put::<SimpleArchive, _>(definition.facts().clone());
+        fragment += definition;
+        let descriptor = entity! {
+            metadata::tag: KIND_SECRET_RESOURCE,
+            wrap_secret: secret,
+            structured_body: body,
+            resource_policy*: AdmissionPolicy::direct(signer.verifying_key()).binding(capability),
+        };
+        resources.push(fragment.put::<SimpleArchive, _>(descriptor.facts().clone()));
+    }
+    resources.extend(delivery.vault());
+    let dek = key.into_dek();
+    for resource in resources {
+        fragment += entity! { ExclusiveId::force_ref(&secret) @ resource_handle: resource };
+        fragment += envelope::fragment(
+            &envelope::BoundKey {
+                secret,
+                body: body.transmute(),
+                resource,
+                dek: dek.clone(),
+            },
+            signer.verifying_key().to_bytes(),
+        )?;
+    }
     Ok(SealedVersion {
         fragment,
         secret,

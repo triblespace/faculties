@@ -732,3 +732,72 @@ fn a_failed_delivery_after_the_commit_reports_the_version_id() {
         RAW
     );
 }
+
+/// A new colony secret also keeps its own direct(signer) binding, the shape
+/// adopt leaves, so one secret can still be granted to a key outside the
+/// colony. The grant reaches that secret only, never the whole vault.
+#[test]
+fn a_new_colony_secret_is_grantable_by_secret_to_an_outsider() {
+    let mut colony = colony();
+    let collection = colony.collection;
+    let shared = add_raw(&mut colony, "synthetic shared").unwrap();
+    let kept = add_raw(&mut colony, "synthetic kept").unwrap();
+    let item = add_login(&mut colony).unwrap();
+    let current = view(&mut colony);
+    // Two bindings for the holder, one body: own and colony.
+    let bindings = envelope::recover(
+        current.store_snapshot(),
+        current.facts().unwrap(),
+        shared.secret,
+        &colony.a,
+    )
+    .unwrap();
+    assert_eq!(bindings.len(), 2);
+    assert!(bindings
+        .iter()
+        .any(|binding| binding.resource == shared.vault));
+    assert!(bindings
+        .iter()
+        .any(|binding| !resource::is_vault(current.store_snapshot(), binding.resource)));
+    for target in [shared.secret, item.secret] {
+        let issued = resource::grant(
+            &mut colony.store,
+            &colony.a,
+            &current,
+            SecretTarget::Secret(target),
+            colony.outsider.verifying_key(),
+            DeliveryLimits::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(issued.len(), 1, "one proof, over the own resource only");
+    }
+    drop(current);
+    let current = view(&mut colony);
+    assert_eq!(
+        maintain_recipient_envelopes(
+            &mut colony.store,
+            &colony.a,
+            &current,
+            collection,
+            &colony.a,
+            now()
+        )
+        .unwrap(),
+        2
+    );
+    drop(current);
+    let after = view(&mut colony);
+    assert_eq!(after.open(shared.secret, &colony.outsider).unwrap(), RAW);
+    assert_eq!(
+        item_password(&after, item.secret, &colony.outsider).unwrap(),
+        PASSWORD
+    );
+    // The grant named one secret: it never widens to the colony vault.
+    assert!(after.open(kept.secret, &colony.outsider).is_err());
+    for host in [&colony.a, &colony.b, &colony.c] {
+        assert_eq!(after.open(shared.secret, host).unwrap(), RAW);
+        assert_eq!(after.open(kept.secret, host).unwrap(), RAW);
+        assert_eq!(item_password(&after, item.secret, host).unwrap(), PASSWORD);
+    }
+}

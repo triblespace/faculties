@@ -107,7 +107,9 @@ enum Command {
         child: [u8; 32],
     },
     /// Add one immutable encrypted version, sealed into the colony vault: every
-    /// host the collection's READ policy admits receives its key at once.
+    /// host the collection's READ policy admits receives its key at once. It
+    /// also keeps its own binding, so `grant --secret` can share this one
+    /// version with a key outside the colony.
     Add {
         #[arg(long)]
         name: String,

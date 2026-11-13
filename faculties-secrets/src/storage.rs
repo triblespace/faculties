@@ -483,8 +483,11 @@ pub struct ColonyAdd {
     pub delivered: usize,
 }
 
-/// Seal into the colony vault (creating it in the same commit when absent),
-/// publish, then wrap the new DEK for every recipient the vault admits.
+/// Seal into the colony vault (creating it in the same commit when absent)
+/// together with the version's own direct(signer) descriptor, publish, then
+/// wrap the new DEK for every recipient the vault admits. The own binding is
+/// the shape adopt leaves on older versions: it keeps a grant naming this one
+/// version possible, and such a grant never widens to the vault.
 ///
 /// `observe` reads the collection at the store's current boundary; it is
 /// called once before sealing and once after the commit. A failure after
@@ -502,7 +505,9 @@ where
     R: BlobStoreGet + CapabilityProofRead,
 {
     let vault = colony_vault(&observe(store)?, collection)?;
-    let sealed = seal(super::record::Delivery::Vault(vault.resource))?;
+    // The shape adopt leaves: an own direct(signer) binding, so one version
+    // can still be granted by itself, plus the colony-vault binding.
+    let sealed = seal(super::record::Delivery::OwnAndVault(vault.resource))?;
     let secret = sealed.secret;
     let mut fragment = sealed.fragment;
     if let Some(created) = vault.created {
