@@ -100,8 +100,8 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
     let id = sealed.secret;
     let resource = find!(resource: CollectionHandle,
         pattern!(sealed.fragment.facts(), [{ id @ resource_handle: ?resource }]))
-        .next()
-        .unwrap();
+    .next()
+    .unwrap();
     store
         .commit(source.source(), &alice, sealed.fragment.clone())
         .unwrap();
@@ -147,7 +147,10 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
         pollster::block_on(storage::ensure_and_snapshot(&mut store, target, &alice)).unwrap();
     let opened = delivered.open_item(id, &bob).unwrap().remove(0);
     let password = selected_text(&opened, ROLE_PASSWORD);
-    assert_eq!(opened.open_child(password).unwrap().bytes.as_ref(), PRIVATE.as_bytes());
+    assert_eq!(
+        opened.open_child(password).unwrap().bytes.as_ref(),
+        PRIVATE.as_bytes()
+    );
     let original = storage::snapshot(store.snapshot().unwrap(), source).unwrap();
     assert!(original.open_item(id, &bob).is_err());
 }
@@ -179,14 +182,7 @@ fn totp_binds_exact_field_child_and_tolerates_open_world_relations() {
     private += entity! { field_text: detached, metadata::tag: unknown_role };
     let bundle = sealer.finish_facts(private.into_facts()).unwrap();
     let body = bundle.root();
-    let sealed = resource::seal_item_bundle(
-        &signer,
-        "synthetic TOTP",
-        key,
-        bundle,
-        at(0),
-    )
-    .unwrap();
+    let sealed = resource::seal_item_bundle(&signer, "synthetic TOTP", key, bundle, at(0)).unwrap();
     let public = sealed.fragment.facts().clone();
     store
         .commit(collection.source(), &signer, sealed.fragment)
@@ -404,14 +400,7 @@ fn missing_selected_child_fails_locally_and_unknown_repeated_opaque_facts_remain
     field_text*: [first, second], metadata::tag: unknown };
     let bundle = sealer.finish_facts(private.into_facts()).unwrap();
     let body = bundle.root();
-    let sealed = resource::seal_item_bundle(
-        &signer,
-        "public opaque",
-        key,
-        bundle,
-        at(0),
-    )
-    .unwrap();
+    let sealed = resource::seal_item_bundle(&signer, "public opaque", key, bundle, at(0)).unwrap();
     let public = sealed.fragment.facts().clone();
     store
         .commit(collection.source(), &signer, sealed.fragment)
@@ -577,14 +566,9 @@ fn valid_competing_bodies_are_disclosed_and_missing_or_foreign_resources_do_not_
         .finish_facts(entity! { metadata::tag: KIND_ITEM }.into_facts())
         .unwrap();
     let competing_body = bundle.root();
-    let mut competing = resource::seal_item_bundle(
-        &attacker,
-        "public competing",
-        competing_key,
-        bundle,
-        at(0),
-    )
-    .unwrap();
+    let mut competing =
+        resource::seal_item_bundle(&attacker, "public competing", competing_key, bundle, at(0))
+            .unwrap();
     let competing_resource = find!(resource: CollectionHandle, pattern!(competing.fragment.facts(),
         [{ first @ triblespace::core::capability::policy::resource_handle: ?resource }]))
     .next()

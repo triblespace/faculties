@@ -294,12 +294,7 @@ pub fn add_item<S>(
 where
     S: Store + CollectionStoreExt,
 {
-    let sealed = super::item::prepare(
-        signing_key,
-        public_label,
-        input,
-        created_at,
-    )?;
+    let sealed = super::item::prepare(signing_key, public_label, input, created_at)?;
     let secret = sealed.secret;
     store
         .commit(collection.source, signing_key, sealed.fragment)
