@@ -153,10 +153,10 @@ pub enum ReplyRelation {
     Reply(String),
     /// It is no reply: not of type REPLY, or its reference is no reply's.
     NotReply,
-    /// It is a REPLY whose relation cannot be read, for the reason given: a
-    /// malformed `message_reference`, an invalid or missing target id, or a
-    /// `referenced_message` naming another message than the reference. The
-    /// message is stored all the same, without a reply target.
+    /// It is a REPLY whose relation cannot be read, for the reason given: no
+    /// `message_reference` at all, a malformed one, an invalid or missing
+    /// target id, or a `referenced_message` naming another message than the
+    /// reference. The message is kept all the same, without a reply target.
     Unreadable(String),
 }
 
@@ -2030,9 +2030,10 @@ struct MessageReference {
 /// fetch the target) or null (the target was deleted) on a reply all the
 /// same, and it never makes a message a reply on its own.
 ///
-/// A REPLY whose relation cannot be read (a malformed reference, a missing
-/// or invalid target id, an embedded message naming another message than
-/// the reference) is [`ReplyRelation::Unreadable`], never an error: the rest
+/// A REPLY whose relation cannot be read (no reference at all, a malformed
+/// reference, a missing or invalid target id, an embedded message naming
+/// another message than the reference) is [`ReplyRelation::Unreadable`],
+/// never an error: the rest
 /// of the message is good, and refusing it would hold back every message
 /// stored with it.
 fn replied_to(payload: &JsonValue, kind: u64) -> ReplyRelation {
@@ -2040,7 +2041,11 @@ fn replied_to(payload: &JsonValue, kind: u64) -> ReplyRelation {
         return ReplyRelation::NotReply;
     }
     let reference = match payload.get("message_reference") {
-        None | Some(JsonValue::Null) => return ReplyRelation::NotReply,
+        None | Some(JsonValue::Null) => {
+            return ReplyRelation::Unreadable(
+                "it is a REPLY without a message_reference".to_owned(),
+            )
+        }
         Some(value) => match serde_json::from_value::<MessageReference>(value.clone()) {
             Ok(reference) => reference,
             Err(error) => {
@@ -2072,7 +2077,8 @@ fn replied_to(payload: &JsonValue, kind: u64) -> ReplyRelation {
 }
 
 /// The messages of `messages` whose reply relation could not be read, each
-/// logged as a warning: they are stored without it.
+/// logged as a warning when the batch is parsed: they are kept without it.
+/// Whether they are then stored is up to the commit that follows.
 fn unreadable_replies(messages: &[IncomingMessage]) -> Vec<UnreadableReply> {
     messages
         .iter()
@@ -2080,7 +2086,7 @@ fn unreadable_replies(messages: &[IncomingMessage]) -> Vec<UnreadableReply> {
             ReplyRelation::Unreadable(reason) => {
                 eprintln!(
                     "[discord] message {} in channel {}: its reply relation is unreadable \
-                     ({reason}); stored without it",
+                     ({reason}); the message is kept without it",
                     message.external_id, message.channel_external_id
                 );
                 Some(UnreadableReply {
@@ -4135,11 +4141,20 @@ mod tests {
             replies_to_of(19, Some(typed), None),
             ReplyRelation::Reply(target.to_owned())
         );
-        // The embedded message is never a fallback for a missing reference.
-        assert_eq!(
-            replies_to_of(19, None, Some(embedded)),
-            ReplyRelation::NotReply
-        );
+        // A REPLY without a reference (absent or null) is a reply whose
+        // target cannot be read, and the embedded message is never a
+        // fallback for it.
+        for (case, reference) in [("absent", None), ("null", Some(JsonValue::Null))] {
+            for referenced in [None, Some(embedded.clone())] {
+                assert_eq!(
+                    replies_to_of(19, reference.clone(), referenced.clone()),
+                    ReplyRelation::Unreadable(
+                        "it is a REPLY without a message_reference".to_owned()
+                    ),
+                    "{case}, embedded {referenced:?}"
+                );
+            }
+        }
     }
 
     /// A REPLY whose relation cannot be read is said to be unreadable, with
@@ -4392,51 +4407,65 @@ mod tests {
     /// with why, never that Discord named nothing.
     #[test]
     fn a_send_with_an_unreadable_reply_relation_says_so() {
-        let directory = tempfile::tempdir().unwrap();
-        let (pile, key) = fresh_storage(&directory);
-        let owner = crate::storage::Storage::new(pile, Some(key));
-        let storage = test_storage(&owner);
         let channel = "100000000000000002";
         let target = message_json("100000000000000005", channel, "first", None, json!([]));
-        store(storage, channel, vec![target.clone()]);
-        let receipt = send_with(
-            storage,
-            "fixture",
-            channel,
-            "second",
-            &[],
-            Some("100000000000000005"),
-            |_, actual_channel, body, _, _| {
-                let mut reply =
-                    reply_json("100000000000000006", actual_channel, body, target.clone());
-                reply["referenced_message"] = json!({"id": "100000000000000004"});
-                Ok(reply)
-            },
-            |_, _| unreachable!("text has no attachments"),
-        )
-        .unwrap();
-        assert!(
-            matches!(&receipt.reply, ReplyRelation::Unreadable(reason)
-                if reason.contains("its referenced_message is 100000000000000004")),
-            "{:?}",
-            receipt.reply
-        );
-        let sent = text_of(|out| super::super::render::sent(&receipt, out));
-        assert!(
-            sent.contains(
-                "asked to reply to 100000000000000005, but the reply relation in Discord's \
-                 returned message is unreadable (its message_reference names"
+        for (case, says) in [
+            (
+                "contradictory",
+                "its message_reference names 100000000000000005 but",
             ),
-            "{sent}"
-        );
-        assert!(!sent.contains("names nothing"), "{sent}");
-        let history = read_history(&storage.view().unwrap(), &ReadOptions::default()).unwrap();
-        let second = history
-            .messages
-            .iter()
-            .find(|message| message.content == "second")
+            ("no reference", "it is a REPLY without a message_reference"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (pile, key) = fresh_storage(&directory);
+            let owner = crate::storage::Storage::new(pile, Some(key));
+            let storage = test_storage(&owner);
+            store(storage, channel, vec![target.clone()]);
+            let receipt = send_with(
+                storage,
+                "fixture",
+                channel,
+                "second",
+                &[],
+                Some("100000000000000005"),
+                |_, actual_channel, body, _, _| {
+                    let mut reply =
+                        reply_json("100000000000000006", actual_channel, body, target.clone());
+                    match case {
+                        "contradictory" => {
+                            reply["referenced_message"] = json!({"id": "100000000000000004"})
+                        }
+                        _ => {
+                            reply.as_object_mut().unwrap().remove("message_reference");
+                        }
+                    }
+                    Ok(reply)
+                },
+                |_, _| unreachable!("text has no attachments"),
+            )
             .unwrap();
-        assert!(second.replies_to.is_empty());
+            assert!(
+                matches!(&receipt.reply, ReplyRelation::Unreadable(reason) if reason.contains(says)),
+                "{case}: {:?}",
+                receipt.reply
+            );
+            let sent = text_of(|out| super::super::render::sent(&receipt, out));
+            assert!(
+                sent.contains(&format!(
+                    "asked to reply to 100000000000000005, but the reply relation in Discord's \
+                     returned message is unreadable ({says}"
+                )),
+                "{case}: {sent}"
+            );
+            assert!(!sent.contains("names nothing"), "{case}: {sent}");
+            let history = read_history(&storage.view().unwrap(), &ReadOptions::default()).unwrap();
+            let second = history
+                .messages
+                .iter()
+                .find(|message| message.content == "second")
+                .unwrap();
+            assert!(second.replies_to.is_empty(), "{case}");
+        }
     }
 
     #[test]
