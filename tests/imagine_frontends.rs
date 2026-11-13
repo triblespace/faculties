@@ -1,10 +1,10 @@
-use faculties::imagine::{self, GeneratedImage, Imagine, ModelSources, Options, Variant};
+use faculties::imagine::{self, Flux, FluxOptions, GeneratedImage, ModelSources, Variant};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::Out;
 use std::time::Duration;
 
-fn options() -> Options {
-    Options {
+fn options() -> FluxOptions {
+    FluxOptions {
         prompt: "@/literal-not-a-path".into(),
         variant: Variant::Klein,
         steps: None,
@@ -25,7 +25,7 @@ fn sources(root: &std::path::Path) -> ModelSources {
 #[test]
 fn native_requests_are_literal_and_validated_before_model_acquisition() {
     let directory = tempfile::tempdir().unwrap();
-    let generator = Imagine::new(sources(directory.path()));
+    let generator = Flux::new(sources(directory.path()));
     let mut request = options();
     request.validate().unwrap();
     assert_eq!(request.prompt, "@/literal-not-a-path");
@@ -114,7 +114,7 @@ fn discovery_and_malformed_calls_never_scan_models_or_open_the_pile() {
 
 #[test]
 #[cfg(not(feature = "imagine"))]
-fn disabled_generation_reports_capability_without_model_or_journal_side_effects() {
+fn disabled_flux_reports_capability_without_model_or_journal_side_effects() {
     let directory = tempfile::tempdir().unwrap();
     let adapter = imagine::mcp::Imagine::with_sources(
         directory.path().join("absent.pile"),
@@ -124,13 +124,38 @@ fn disabled_generation_reports_capability_without_model_or_journal_side_effects(
     let error = adapter
         .call(
             "imagine_generate",
+            r#"{"prompt":"@/literal","provider":"flux","remember":"2026-09-08T01:00:00"}"#
+                .to_owned()
+                .into(),
+            &mut Out::new(&mut |_| panic!("no generation")),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("`imagine` feature"), "{error:#}");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+/// The default provider is OpenAI. Without a usable bootstrap it fails at
+/// storage admission, before any credential, network or journal write.
+#[test]
+fn default_openai_without_a_bootstrap_fails_before_sending_or_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let operations = imagine::Imagine::new(directory.path().join("absent.pile"), None)
+        .with_openai_endpoint(imagine::openai::Endpoint::new("http://127.0.0.1:9/v1"))
+        .with_unstored_directory(directory.path().join("unstored"));
+    let adapter = imagine::mcp::Imagine::from_operations(operations);
+    let error = adapter
+        .call(
+            "imagine_generate",
             r#"{"prompt":"@/literal","remember":"2026-09-08T01:00:00"}"#
                 .to_owned()
                 .into(),
             &mut Out::new(&mut |_| panic!("no generation")),
         )
         .unwrap_err();
-    assert!(error.to_string().contains("`imagine` feature"));
+    assert!(
+        error.to_string().contains("nothing was generated"),
+        "{error:#}"
+    );
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
@@ -145,36 +170,52 @@ fn bare_cli_help_does_not_load_models() {
     assert!(String::from_utf8(result.stdout).unwrap().contains("Usage:"));
 }
 
+/// Run the CLI with a prompt that would read a file or stdin, keeping stdin
+/// OPEN: a refused generation must exit without waiting for an EOF that an
+/// interactive caller may never send. Returns stderr.
+fn refused_without_reading_the_prompt(arguments: &[&str]) -> String {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_imagine"))
+        .args(arguments)
+        .env_remove("DRIVE_ENDPOINT")
+        .env_remove("PILE")
+        .env_remove("FACULTIES_WORKSPACE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("imagine waited for prompt input: {arguments:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
 #[test]
 #[cfg(not(feature = "imagine"))]
-fn disabled_cli_does_not_read_prompt_files_or_wait_for_stdin() {
-    use std::process::{Command, Stdio};
+fn disabled_flux_cli_does_not_read_prompt_files_or_wait_for_stdin() {
     let directory = tempfile::tempdir().unwrap();
-    for prompt in [
-        format!("@{}", directory.path().join("absent.txt").display()),
-        "@-".into(),
-    ] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_imagine"))
-            .arg(prompt)
-            .env_remove("DRIVE_ENDPOINT")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        // Keep stdin OPEN: a disabled generator must exit without waiting
-        // for an EOF that an interactive caller may never send.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("disabled Imagine waited for prompt input");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("`imagine` feature"));
+    let absent = format!("@{}", directory.path().join("absent.txt").display());
+    for prompt in [absent.as_str(), "@-"] {
+        let stderr = refused_without_reading_the_prompt(&["--provider", "flux", prompt]);
+        assert!(stderr.contains("`imagine` feature"), "{stderr}");
+    }
+}
+
+#[test]
+fn openai_cli_without_a_pile_does_not_read_prompt_files_or_wait_for_stdin() {
+    let directory = tempfile::tempdir().unwrap();
+    let absent = format!("@{}", directory.path().join("absent.txt").display());
+    for prompt in [absent.as_str(), "@-"] {
+        let stderr = refused_without_reading_the_prompt(&[prompt]);
+        assert!(stderr.contains("needs --pile or PILE"), "{stderr}");
     }
 }
