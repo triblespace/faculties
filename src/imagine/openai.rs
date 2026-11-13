@@ -427,38 +427,6 @@ impl Generated {
 }
 
 #[derive(Deserialize)]
-struct Answer {
-    created: Option<i64>,
-    data: Option<Vec<AnswerImage>>,
-    background: Option<String>,
-    output_format: Option<String>,
-    quality: Option<String>,
-    size: Option<String>,
-    usage: Option<AnswerUsage>,
-}
-
-#[derive(Deserialize)]
-struct AnswerImage {
-    b64_json: Option<String>,
-    revised_prompt: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AnswerUsage {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    input_tokens_details: Option<TokenDetails>,
-    output_tokens_details: Option<TokenDetails>,
-}
-
-#[derive(Deserialize)]
-struct TokenDetails {
-    text_tokens: Option<u64>,
-    image_tokens: Option<u64>,
-}
-
-#[derive(Deserialize)]
 struct ErrorAnswer {
     error: ErrorBody,
 }
@@ -513,7 +481,10 @@ pub fn generate(endpoint: &Endpoint, key: &str, options: &Options) -> Result<Gen
             key
         ));
     }
+    // Whatever a malformed answer makes this say passes the same redaction
+    // as a refusal, although decode never quotes the body.
     decode(&body, options, request_id, started.elapsed())
+        .map_err(|error| anyhow!(redact(&format!("{error:#}"), key)))
 }
 
 fn authorization(key: &str) -> Result<reqwest::header::HeaderValue> {
@@ -589,66 +560,76 @@ fn redact(text: &str, key: &str) -> String {
         .collect()
 }
 
+/// Read a 2xx answer. Only the image is required; every metadata field is
+/// read when it has the documented type and ignored otherwise, so an answer
+/// whose metadata this reader cannot model still yields its (paid) image.
+/// No error built here quotes the body: a malformed answer is described by
+/// its shape (which field, what type), never by its values.
 fn decode(
     body: &[u8],
     options: &Options,
     request_id: Option<String>,
     elapsed: Duration,
 ) -> Result<Generated> {
+    use serde_json::Value;
     const CHARGED: &str = "the request was probably charged; nothing was stored; it is not retried";
-    let answer: Answer = serde_json::from_slice(body).map_err(|error| {
-        anyhow!("OpenAI's answer is not the expected JSON ({error}); {CHARGED}")
+    let answer: Value = serde_json::from_slice(body).map_err(|error| {
+        // Category and position only; serde's message can quote the input.
+        anyhow!(
+            "OpenAI's answer is not JSON ({:?} error at line {}, column {}); {CHARGED}",
+            error.classify(),
+            error.line(),
+            error.column()
+        )
     })?;
     let image = answer
-        .data
-        .unwrap_or_default()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("OpenAI's answer holds no image; {CHARGED}"))?;
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|data| data.first())
+        .filter(|image| image.is_object())
+        .ok_or_else(|| anyhow!("OpenAI's answer has no data[0] image object; {CHARGED}"))?;
     let encoded = image
-        .b64_json
-        .ok_or_else(|| anyhow!("OpenAI's answer holds no b64_json image; {CHARGED}"))?;
+        .get("b64_json")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("OpenAI's answer has no data[0].b64_json string; {CHARGED}"))?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded.as_bytes())
-        .map_err(|error| anyhow!("OpenAI's image is not valid base64 ({error}); {CHARGED}"))?;
+        .map_err(|_| anyhow!("OpenAI's data[0].b64_json is not valid base64; {CHARGED}"))?;
     ensure!(!bytes.is_empty(), "OpenAI's image is empty; {CHARGED}");
-    let output_format = answer
-        .output_format
-        .as_deref()
-        .and_then(OutputFormat::from_wire);
+    let text = |key: &str| answer.get(key).and_then(Value::as_str);
+    let count = |details: Option<&str>, key: &str| {
+        let usage = answer.get("usage")?;
+        let scope = match details {
+            Some(details) => usage.get(details)?,
+            None => usage,
+        };
+        scope.get(key)?.as_u64()
+    };
+    let output_format = text("output_format").and_then(OutputFormat::from_wire);
     let format = OutputFormat::sniff(&bytes)
         .or(output_format)
         .unwrap_or(options.output_format);
-    let usage = answer.usage.map_or_else(Usage::default, |usage| Usage {
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        total_tokens: usage.total_tokens,
-        input_text_tokens: usage
-            .input_tokens_details
-            .as_ref()
-            .and_then(|d| d.text_tokens),
-        input_image_tokens: usage
-            .input_tokens_details
-            .as_ref()
-            .and_then(|d| d.image_tokens),
-        output_text_tokens: usage
-            .output_tokens_details
-            .as_ref()
-            .and_then(|d| d.text_tokens),
-        output_image_tokens: usage
-            .output_tokens_details
-            .as_ref()
-            .and_then(|d| d.image_tokens),
-    });
+    let usage = Usage {
+        input_tokens: count(None, "input_tokens"),
+        output_tokens: count(None, "output_tokens"),
+        total_tokens: count(None, "total_tokens"),
+        input_text_tokens: count(Some("input_tokens_details"), "text_tokens"),
+        input_image_tokens: count(Some("input_tokens_details"), "image_tokens"),
+        output_text_tokens: count(Some("output_tokens_details"), "text_tokens"),
+        output_image_tokens: count(Some("output_tokens_details"), "image_tokens"),
+    };
     Ok(Generated {
         bytes: Bytes::from(bytes),
         format,
         elapsed,
-        created: answer.created,
-        revised_prompt: image.revised_prompt,
-        size: answer.size.as_deref().and_then(Size::parse_exact),
-        quality: answer.quality.as_deref().and_then(Quality::from_wire),
-        background: answer.background.as_deref().and_then(Background::from_wire),
+        created: answer.get("created").and_then(Value::as_i64),
+        revised_prompt: image
+            .get("revised_prompt")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        size: text("size").and_then(Size::parse_exact),
+        quality: text("quality").and_then(Quality::from_wire),
+        background: text("background").and_then(Background::from_wire),
         output_format,
         usage,
         request_id,
@@ -905,6 +886,45 @@ mod tests {
         assert!(!text.contains(KEY), "{text}");
         assert!(!text.contains("sk-"), "{text}");
         assert_eq!(server.count(), 1);
+    }
+
+    #[test]
+    fn a_malformed_success_answer_never_echoes_its_content() {
+        // Astra's fixture: serde's type error would quote this string.
+        for body in [
+            r#"{"created":"sk-proj-SYNTHETICKEY"}"#.to_owned(),
+            r#"{"created":1,"data":[{"b64_json":7,"revised_prompt":"sk-proj-SYNTHETICKEY"}]}"#
+                .to_owned(),
+            "sk-proj-SYNTHETICKEY is not JSON".to_owned(),
+            format!(r#"{{"data":[{{"b64_json":"{KEY}"}}]}}"#),
+        ] {
+            let server = Server::start(Reply::Json(200, body.clone()));
+            let error =
+                generate(&Endpoint::new(&server.base), KEY, &Options::new("x")).unwrap_err();
+            let text = format!("{error:#} {error:?}");
+            assert!(!text.contains("SYNTHETICKEY"), "{body}: {text}");
+            assert!(!text.contains(KEY), "{body}: {text}");
+            assert!(text.contains("not retried"), "{body}: {text}");
+            assert_eq!(server.count(), 1);
+        }
+    }
+
+    #[test]
+    fn metadata_of_an_unexpected_type_never_costs_the_image() {
+        use base64::Engine as _;
+        let png = fake::provider_png();
+        let body = serde_json::json!({
+            "created": "yesterday", "size": 1024, "quality": ["high"], "usage": "lots",
+            "data": [{"b64_json": base64::engine::general_purpose::STANDARD.encode(&png)}],
+        })
+        .to_string();
+        let server = Server::start(Reply::Json(200, body));
+        let generated = generate(&Endpoint::new(&server.base), KEY, &Options::new("x")).unwrap();
+        assert_eq!(generated.bytes.as_ref(), png.as_slice());
+        assert_eq!(generated.created, None);
+        assert_eq!(generated.size, None);
+        assert_eq!(generated.quality, None);
+        assert_eq!(generated.usage, Usage::default());
     }
 
     #[test]
