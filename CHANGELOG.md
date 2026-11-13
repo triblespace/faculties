@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Discord replies, both ways. `discord send --reply-to <MESSAGE_ID>` and
+  `discord_send`'s `reply_to` post as a Discord reply (`message_reference`,
+  with `fail_if_not_exists`) to a message stored in that channel; a target
+  the channel does not hold is refused before anything is posted. The
+  returned reply is stored with `archive::reply_to`, as intake stores one,
+  and the receipt says what Discord's message names as its target.
+  `discord read`/`discord_read` lines now carry each message's Discord id
+  (`id=...`), and a reply says what it replies to: the target's id, author
+  and first words when it is stored, its id and "not stored here" when not.
+
 - `wemm::declared::Registration::checked(config, binder, sink)` is the one
   constructor: it refuses a configuration the binder cannot run (several
   models with weights aliased from the pile, `Config::check_residence`) and

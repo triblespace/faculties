@@ -205,6 +205,11 @@ enum CommandMode {
         /// Attach a local file (repeatable, at most 10; 20 MiB total).
         #[arg(long = "file", value_name = "PATH")]
         files: Vec<PathBuf>,
+        /// Post as a reply to this message: its Discord id, as `discord read`
+        /// shows it (id=...). It must be stored in this channel; otherwise
+        /// nothing is sent.
+        #[arg(long, value_name = "MESSAGE_ID")]
+        reply_to: Option<String>,
     },
     /// Read the Discord observations already in the pile. No token or
     /// network; `discord live` keeps them current, and `pull` fetches.
@@ -353,15 +358,17 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
             channel_id,
             text,
             files,
+            reply_to,
         } => {
             let text = text
                 .as_deref()
                 .map(|text| crate::text_arg(text, "message text"))
                 .transpose()?
                 .unwrap_or_default();
+            validate_reply_to(reply_to.as_deref())?;
             let attachments = load_attachments(&files)?;
             render::sent(
-                &operations.send_attachments(&channel_id, &text, &attachments)?,
+                &operations.send_reply(&channel_id, &text, &attachments, reply_to.as_deref())?,
                 out,
             )
         }
@@ -1040,6 +1047,11 @@ mod tests {
             assert_eq!(text.as_deref(), args.contains(&"hello").then_some("hello"));
             assert_eq!(files.len(), if args.contains(&"--file") { 2 } else { 0 });
         }
+        let cli = Cli::try_parse_from(["discord", "send", "1", "yes", "--reply-to", "5"]).unwrap();
+        let Some(Command::Collection(CommandMode::Send { reply_to, .. })) = cli.command else {
+            panic!("expected send")
+        };
+        assert_eq!(reply_to.as_deref(), Some("5"));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.png");
         fs::write(&path, [0, 255, 10]).unwrap();

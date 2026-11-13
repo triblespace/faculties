@@ -137,6 +137,11 @@ pub fn validate_send(channel_id: &str, text: &str, attachments: &[SendAttachment
 pub struct SendReceipt {
     pub message_id: String,
     pub channel_id: String,
+    /// The message the send asked to reply to, if it asked.
+    pub requested_reply_to: Option<String>,
+    /// The message Discord's returned message says it replies to, as stored
+    /// with it: what a later read shows.
+    pub reply_to: Option<String>,
     pub commit: CollectionCommit,
 }
 #[derive(Clone, Debug)]
@@ -221,12 +226,15 @@ pub struct ObservedMessage {
     pub content: String,
     /// Every reply target the observation asserts; ordinarily none or one.
     pub reply_to: BTreeSet<Id>,
+    /// Each of `reply_to` as the store holds it ([`ReplyTarget`]).
+    pub replies_to: Vec<ReplyTarget>,
     pub attachments: BTreeSet<Id>,
     /// Each of `attachments` as the store holds it ([`AttachmentView`]).
     pub attached: Vec<AttachmentView>,
-    /// The Discord message ids the anchor asserts, read only for a message
-    /// with attachments: what resolves one back to the message it came with.
-    /// Sorted and deduplicated, ready to render.
+    /// The Discord message ids the anchor asserts (ordinarily one; none for
+    /// something said in a voice channel or a presence notice): what a send
+    /// names to reply to it, and what resolves an attachment back to the
+    /// message it came with. Sorted and deduplicated, ready to render.
     pub message_ids: Vec<String>,
     /// Somebody coming into or leaving a voice channel, when the message is
     /// that notice: presented as the event, never as its (empty) content.
@@ -238,6 +246,34 @@ pub struct ObservedMessage {
     pub alternative_index: usize,
     pub alternative_count: usize,
 }
+
+/// The message a shown message replies to, as the store holds it: its
+/// Discord ids, and who wrote it and how it begins when it is stored here.
+/// Read from the stored relations only; a target nothing here observed is
+/// shown by its id, never refused.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyTarget {
+    pub anchor: Id,
+    /// The Discord message ids the target's anchor asserts (ordinarily one),
+    /// sorted and deduplicated.
+    pub message_ids: Vec<String>,
+    /// The target's latest stored version (several when observations of it
+    /// diverge), each by its author with the start of its text; empty when
+    /// no observation of the target is stored here.
+    pub quotes: Vec<ReplyQuote>,
+}
+
+/// Who wrote a replied-to message and how it begins.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ReplyQuote {
+    pub author: String,
+    /// At most [`REPLY_SNIPPET_CHARS`] characters of its text, whitespace
+    /// runs folded to one space, with "…" when there was more.
+    pub snippet: String,
+}
+
+/// How much of a replied-to message's text a read shows.
+pub const REPLY_SNIPPET_CHARS: usize = 60;
 
 /// One attachment of a shown message, as intake stored it: every name and
 /// every stored content it asserts (ordinarily one of each, possibly none),
@@ -462,6 +498,26 @@ impl Discord {
     pub fn send(&self, channel_id: &str, text: &str) -> Result<SendReceipt> {
         self.send_attachments(channel_id, text, &[])
     }
+    /// [`Self::send_attachments`] as a reply to `reply_to`, when given: the
+    /// Discord id of a message stored in this channel (the id `read` shows).
+    /// A target not stored there is refused before anything is posted, and
+    /// Discord is asked to refuse the reply rather than post it as an
+    /// ordinary message should the target be gone upstream.
+    pub fn send_reply(
+        &self,
+        channel_id: &str,
+        text: &str,
+        attachments: &[SendAttachment],
+        reply_to: Option<&str>,
+    ) -> Result<SendReceipt> {
+        self.send_using(
+            channel_id,
+            text,
+            attachments,
+            reply_to,
+            post_message_attachments,
+        )
+    }
     /// [`Self::send`] with an explicit mention policy: only what `mentions`
     /// allows can ping, whatever the text contains. Additive: `send` keeps
     /// Discord's default.
@@ -476,8 +532,9 @@ impl Discord {
             channel_id,
             text,
             &[],
-            |token, channel, text, attachments| {
-                post_message_with(token, channel, text, attachments, Some(mentions))
+            None,
+            |token, channel, text, attachments, reply_to| {
+                post_message_with(token, channel, text, attachments, Some(mentions), reply_to)
             },
         )
     }
@@ -490,16 +547,18 @@ impl Discord {
         text: &str,
         attachments: &[SendAttachment],
     ) -> Result<SendReceipt> {
-        self.send_using(channel_id, text, attachments, post_message_attachments)
+        self.send_reply(channel_id, text, attachments, None)
     }
     fn send_using(
         &self,
         channel_id: &str,
         text: &str,
         attachments: &[SendAttachment],
-        post: impl FnOnce(&str, &str, &str, &[SendAttachment]) -> Result<JsonValue>,
+        reply_to: Option<&str>,
+        post: impl FnOnce(&str, &str, &str, &[SendAttachment], Option<&str>) -> Result<JsonValue>,
     ) -> Result<SendReceipt> {
         validate_send(channel_id, text, attachments)?;
+        validate_reply_to(reply_to)?;
         self.preflight_write()?;
         send_with(
             self.storage(),
@@ -507,6 +566,7 @@ impl Discord {
             channel_id,
             text,
             attachments,
+            reply_to,
             post,
             fetch_attachment_bytes,
         )
@@ -1076,20 +1136,50 @@ impl DiscordStorage<'_> {
     }
 }
 
+/// A reply target, when given, must be a Discord message id.
+pub fn validate_reply_to(reply_to: Option<&str>) -> Result<()> {
+    if let Some(target) = reply_to {
+        discord_model::validate_snowflake(target)
+            .with_context(|| format!("invalid message id to reply to '{target}'"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn send_with(
     storage: DiscordStorage<'_>,
     token: &str,
     channel_id: &str,
     text: &str,
     attachments: &[SendAttachment],
-    post: impl FnOnce(&str, &str, &str, &[SendAttachment]) -> Result<JsonValue>,
+    reply_to: Option<&str>,
+    post: impl FnOnce(&str, &str, &str, &[SendAttachment], Option<&str>) -> Result<JsonValue>,
     fetch: impl FnMut(&str, u64) -> Result<Vec<u8>>,
 ) -> Result<SendReceipt> {
     validate_send(channel_id, text, attachments)?;
+    validate_reply_to(reply_to)?;
     storage
         .preflight_write()
         .context("preflight Discord collection WRITE admission")?;
-    let payload = post(token, channel_id, text, attachments)?;
+    // A reply names a message stored in this channel, or nothing is posted:
+    // the id comes from a read, and one the channel does not hold is a
+    // mistaken target, never a reason to post an ordinary message instead.
+    if let Some(target) = reply_to {
+        let stored = storage.with_session(|session| {
+            Ok(discord_model::message_stored_in(
+                &session.facts,
+                channel_id,
+                target,
+            ))
+        })?;
+        ensure!(
+            stored,
+            "message {target} is not stored in channel {channel_id}, so nothing was sent; reply \
+             to a message id that discord read shows for this channel (discord pull brings newer \
+             messages in)"
+        );
+    }
+    let payload = post(token, channel_id, text, attachments, reply_to)?;
     let remote_id = payload
         .get("id")
         .and_then(JsonValue::as_str)
@@ -1110,6 +1200,8 @@ fn send_with(
         Ok(SendReceipt {
             message_id: message_id.to_owned(),
             channel_id: channel_id.to_owned(),
+            requested_reply_to: reply_to.map(str::to_owned),
+            reply_to: message.reply_to_external_id.clone(),
             commit,
         })
     })().with_context(|| format!(
@@ -1118,7 +1210,7 @@ fn send_with(
 }
 
 pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
-    post_message_attachments(token, channel_id, text, &[])
+    post_message_attachments(token, channel_id, text, &[], None)
 }
 
 /// Which mentions in a message Discord may turn into pings: its
@@ -1157,6 +1249,17 @@ impl AllowedMentions {
     }
 }
 
+/// Discord's `message_reference` for a reply to `message_id` in `channel_id`.
+/// `fail_if_not_exists` is said outright: should the target be gone, Discord
+/// refuses the send instead of posting it as an ordinary message.
+fn reply_reference(channel_id: &str, message_id: &str) -> JsonValue {
+    json!({
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "fail_if_not_exists": true,
+    })
+}
+
 /// The JSON body of a text-only send, with its mention policy when given.
 pub fn message_body(text: &str, mentions: Option<&AllowedMentions>) -> JsonValue {
     let mut body = json!({ "content": text });
@@ -1174,13 +1277,19 @@ fn message_request(
     text: &str,
     attachments: &[SendAttachment],
     mentions: Option<&AllowedMentions>,
+    reply_to: Option<&str>,
 ) -> Result<reqwest::blocking::RequestBuilder> {
     validate_send(channel_id, text, attachments)?;
+    validate_reply_to(reply_to)?;
     let request = client
         .post(url)
         .header("Authorization", authorization(token)?);
     if attachments.is_empty() {
-        return Ok(request.json(&message_body(text, mentions)));
+        let mut body = message_body(text, mentions);
+        if let Some(target) = reply_to {
+            body["message_reference"] = reply_reference(channel_id, target);
+        }
+        return Ok(request.json(&body));
     }
     // https://docs.discord.com/developers/reference#uploading-files
     // Each attachment id names its matching files[n] multipart part.
@@ -1195,6 +1304,9 @@ fn message_request(
     }
     if let Some(mentions) = mentions {
         payload["allowed_mentions"] = mentions.to_json();
+    }
+    if let Some(target) = reply_to {
+        payload["message_reference"] = reply_reference(channel_id, target);
     }
     let mut form = reqwest::blocking::multipart::Form::new().part(
         "payload_json",
@@ -1218,8 +1330,9 @@ fn post_message_attachments(
     channel_id: &str,
     text: &str,
     attachments: &[SendAttachment],
+    reply_to: Option<&str>,
 ) -> Result<JsonValue> {
-    post_message_with(token, channel_id, text, attachments, None)
+    post_message_with(token, channel_id, text, attachments, None, reply_to)
 }
 
 fn post_message_with(
@@ -1228,6 +1341,7 @@ fn post_message_with(
     text: &str,
     attachments: &[SendAttachment],
     mentions: Option<&AllowedMentions>,
+    reply_to: Option<&str>,
 ) -> Result<JsonValue> {
     let client = build_client()?;
     let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
@@ -1239,6 +1353,7 @@ fn post_message_with(
         text,
         attachments,
         mentions,
+        reply_to,
     )?
     .send()
     .with_context(|| {
@@ -2117,11 +2232,8 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             .unwrap_or_else(|| format!("{}", message.author));
         let channel_name = channel_names.get(&message.channel).cloned();
         let attached = attachment_views(&view.facts, &view.reader, &message.attachments);
-        let message_ids = if attached.is_empty() {
-            Vec::new()
-        } else {
-            message_ids_of(&view.facts, &view.reader, message.anchor)
-        };
+        let message_ids = message_ids_of(&view.facts, &view.reader, message.anchor);
+        let replies_to = reply_targets(&view.facts, &view.reader, &author_names, &message.reply_to);
         rows.push(observed_message(
             message,
             channel_name,
@@ -2129,6 +2241,7 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
             content,
             attached,
             message_ids,
+            replies_to,
         ));
     }
     Ok(History {
@@ -2145,6 +2258,7 @@ fn observed_message(
     content: String,
     attached: Vec<AttachmentView>,
     message_ids: Vec<String>,
+    replies_to: Vec<ReplyTarget>,
 ) -> ObservedMessage {
     ObservedMessage {
         observation: message.observation,
@@ -2156,6 +2270,7 @@ fn observed_message(
         author,
         content,
         reply_to: message.reply_to,
+        replies_to,
         attachments: message.attachments,
         attached,
         message_ids,
@@ -2200,6 +2315,97 @@ where
             }
         })
         .collect()
+}
+
+/// Each message `targets` names as one a shown message replies to: its
+/// Discord ids, and, when observations of it are stored, the latest of them
+/// (several when they diverge) by author label (`authors`, else the author's
+/// id) and the start of its text. The latest is the one whose newest edit,
+/// else creation, is newest, as a read selects. A text that cannot be read
+/// is said to be unreadable; nothing here fails the read.
+fn reply_targets<P, R>(
+    facts: &P,
+    reader: &R,
+    authors: &BTreeMap<Id, String>,
+    targets: &BTreeSet<Id>,
+) -> Vec<ReplyTarget>
+where
+    P: TriblePattern,
+    R: BlobStoreGet,
+{
+    targets
+        .iter()
+        .map(|&target| {
+            // Construction scratch for one target: each observation's
+            // version, and what it says.
+            let mut versions: BTreeMap<Id, i128> = BTreeMap::new();
+            let mut said: BTreeSet<(Id, Id, discord_model::TextHandle)> = BTreeSet::new();
+            for (observation, author, content, created_at) in find!(
+                (
+                    observation: Id,
+                    author: Id,
+                    content: discord_model::TextHandle,
+                    created_at: Inline<NsTAIInterval>,
+                ),
+                pattern!(facts, [{
+                    ?observation @
+                    metadata::tag: archive::kind_message,
+                    discord::message: target,
+                    archive::author: ?author,
+                    archive::content: ?content,
+                    metadata::created_at: ?created_at,
+                }])
+            ) {
+                let created = discord_model::interval_key(created_at);
+                let version = versions.entry(observation).or_insert(i128::MIN);
+                *version = (*version).max(created);
+                said.insert((observation, author, content));
+            }
+            for (&observation, version) in versions.iter_mut() {
+                if let Some(edited) = find!(
+                    edited: Inline<NsTAIInterval>,
+                    pattern!(facts, [{ observation @ archive::edited_at: ?edited }])
+                )
+                .map(discord_model::interval_key)
+                .max()
+                {
+                    *version = edited;
+                }
+            }
+            let latest = versions.values().copied().max();
+            let quotes: BTreeSet<ReplyQuote> = said
+                .into_iter()
+                .filter(|(observation, _, _)| Some(versions[observation]) == latest)
+                .map(|(_, author, content)| ReplyQuote {
+                    author: authors
+                        .get(&author)
+                        .cloned()
+                        .unwrap_or_else(|| format!("{author}")),
+                    snippet: match discord_model::read_text(reader, content, "replied-to content") {
+                        Ok(text) => snippet(&text),
+                        Err(_) => "(text unreadable here)".to_owned(),
+                    },
+                })
+                .collect();
+            ReplyTarget {
+                anchor: target,
+                message_ids: message_ids_of(facts, reader, target),
+                quotes: quotes.into_iter().collect(),
+            }
+        })
+        .collect()
+}
+
+/// The start of `text` as a reply pointer shows it: whitespace runs folded
+/// to one space, at most [`REPLY_SNIPPET_CHARS`] characters, "…" when cut.
+fn snippet(text: &str) -> String {
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if folded.chars().count() <= REPLY_SNIPPET_CHARS {
+        return folded;
+    }
+    let mut cut: String = folded.chars().take(REPLY_SNIPPET_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// The Discord message ids `anchor` asserts (ordinarily one), sorted.
@@ -2482,6 +2688,7 @@ mod tests {
                     content.to_string(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
                 )
             })
             .collect();
@@ -2539,8 +2746,9 @@ mod tests {
         text
     }
 
-    /// Every message of `fragment` as `read` builds it: content, attachments
-    /// and their message ids resolved from the fragment's own facts and blobs.
+    /// Every message of `fragment` as `read` builds it: content, attachments,
+    /// message ids and reply targets resolved from the fragment's own facts
+    /// and blobs.
     fn observed(fragment: &Fragment) -> Vec<ObservedMessage> {
         use triblespace::core::repo::BlobStoreGet as _;
         let mut staged = fragment.clone();
@@ -2551,11 +2759,13 @@ mod tests {
             .map(|message| {
                 let content: anybytes::View<str> = reader.get(message.content).unwrap();
                 let attached = attachment_views(fragment.facts(), &reader, &message.attachments);
-                let ids = if attached.is_empty() {
-                    Vec::new()
-                } else {
-                    message_ids_of(fragment.facts(), &reader, message.anchor)
-                };
+                let ids = message_ids_of(fragment.facts(), &reader, message.anchor);
+                let replies_to = reply_targets(
+                    fragment.facts(),
+                    &reader,
+                    &discord_model::user_labels(fragment.facts(), &reader).unwrap(),
+                    &message.reply_to,
+                );
                 observed_message(
                     message,
                     None,
@@ -2563,6 +2773,7 @@ mod tests {
                     content.to_string(),
                     attached,
                     ids,
+                    replies_to,
                 )
             })
             .collect()
@@ -2996,7 +3207,8 @@ mod tests {
                 channel,
                 "literal message",
                 &[],
-                |token, channel, body, _| {
+                None,
+                |token, channel, body, _, _| {
                     assert_eq!(token, "synthetic-second-token");
                     Ok(message_json(
                         "100000000000000001",
@@ -3030,7 +3242,7 @@ mod tests {
         let operations = Discord::with_storage(storage.clone());
         let assert_no_post = || {
             let error = operations
-                .send_using("1", "body", &[], |_, _, _, _| {
+                .send_using("1", "body", &[], None, |_, _, _, _, _| {
                     panic!("authentication failure must precede HTTP")
                 })
                 .unwrap_err();
@@ -3131,7 +3343,7 @@ mod tests {
             )
             .unwrap();
         let error = operations
-            .send_using("1", "body", &[], |_, _, _, _| {
+            .send_using("1", "body", &[], None, |_, _, _, _, _| {
                 panic!("cold auth reached HTTP")
             })
             .unwrap_err();
@@ -3165,7 +3377,8 @@ mod tests {
             channel,
             "@-",
             &[],
-            |token, actual_channel, body, _| {
+            None,
+            |token, actual_channel, body, _, _| {
                 assert_eq!(token, "fixture-token");
                 assert_eq!(actual_channel, channel);
                 assert_eq!(body, "@-");
@@ -3210,7 +3423,8 @@ mod tests {
             "100000000000000002",
             "must not leave this process",
             &[upload("private.bin", b"private attachment")],
-            |_, _, _, _| {
+            None,
+            |_, _, _, _, _| {
                 posts += 1;
                 Ok(json!({}))
             },
@@ -3242,6 +3456,7 @@ mod tests {
                 "<@2> @everyone",
                 &[],
                 mentions,
+                None,
             )
             .unwrap()
             .build()
@@ -3266,6 +3481,7 @@ mod tests {
             "@everyone",
             &attachments,
             Some(&AllowedMentions::nobody()),
+            None,
         )
         .unwrap()
         .build()
@@ -3286,7 +3502,7 @@ mod tests {
     fn send_requests_preserve_text_and_frame_indexed_binary_parts() {
         let client = build_client().unwrap();
         let url = "https://discord.invalid/channels/1/messages";
-        let mut text = message_request(&client, url, "fixture", "1", "@-", &[], None)
+        let mut text = message_request(&client, url, "fixture", "1", "@-", &[], None, None)
             .unwrap()
             .build()
             .unwrap();
@@ -3302,11 +3518,19 @@ mod tests {
             upload("same.bin", b"second"),
         ];
         for content in ["", "literal @-"] {
-            let mut request =
-                message_request(&client, url, "fixture", "1", content, &attachments, None)
-                    .unwrap()
-                    .build()
-                    .unwrap();
+            let mut request = message_request(
+                &client,
+                url,
+                "fixture",
+                "1",
+                content,
+                &attachments,
+                None,
+                None,
+            )
+            .unwrap()
+            .build()
+            .unwrap();
             let content_type = request.headers()["content-type"]
                 .to_str()
                 .unwrap()
@@ -3361,7 +3585,7 @@ mod tests {
             }],
         ] {
             let error = operations
-                .send_using("1", "", &attachments, |_, _, _, _| {
+                .send_using("1", "", &attachments, None, |_, _, _, _, _| {
                     panic!("invalid upload reached transport")
                 })
                 .unwrap_err();
@@ -3385,7 +3609,8 @@ mod tests {
             "2",
             "",
             &[upload("image.png", b"uploaded")],
-            |_, _, body, attachments| {
+            None,
+            |_, _, body, attachments, _| {
                 assert!(body.is_empty());
                 assert_eq!(attachments[0].bytes, b"uploaded");
                 Ok(message_json(
@@ -3433,7 +3658,8 @@ mod tests {
             "2",
             "",
             &[upload("x", b"x")],
-            |_, _, _, _| {
+            None,
+            |_, _, _, _, _| {
                 posts += 1;
                 Ok(message_json(
                     "1",
@@ -3466,6 +3692,250 @@ mod tests {
                 .unwrap()
                 .messages
                 .is_empty()
+        );
+    }
+
+    /// A message replying to `target`, as Discord returns it: type 19 with
+    /// its `message_reference` and the referenced message itself.
+    fn reply_json(id: &str, channel: &str, content: &str, target: JsonValue) -> JsonValue {
+        let mut reply = message_json(id, channel, content, None, json!([]));
+        reply["type"] = json!(19);
+        reply["message_reference"] = json!({
+            "message_id": target["id"],
+            "channel_id": channel,
+        });
+        reply["referenced_message"] = target;
+        reply
+    }
+
+    /// Store `payloads` (one channel) as a pull would.
+    fn store(storage: DiscordStorage<'_>, channel: &str, payloads: Vec<JsonValue>) {
+        let messages = parse_messages(payloads, channel).unwrap();
+        let fragment =
+            build_ingest_fragment(&messages, None, None, |_, _| unreachable!("no attachments"))
+                .unwrap();
+        storage
+            .publish(fragment, "fixture messages".to_owned())
+            .unwrap();
+    }
+
+    /// A reply asks Discord for one in the request itself: the text body and
+    /// the multipart payload both carry `message_reference` naming the target
+    /// and the channel, and saying the send fails rather than posting a
+    /// non-reply should the target be gone. A send that is no reply carries
+    /// none.
+    #[test]
+    fn a_reply_request_carries_its_message_reference() {
+        let client = build_client().unwrap();
+        let url = "https://discord.invalid/channels/1/messages";
+        let reference = json!({
+            "message_id": "5",
+            "channel_id": "1",
+            "fail_if_not_exists": true,
+        });
+        let body = |reply_to: Option<&str>| -> JsonValue {
+            let mut request =
+                message_request(&client, url, "fixture", "1", "yes", &[], None, reply_to)
+                    .unwrap()
+                    .build()
+                    .unwrap();
+            serde_json::from_slice(request.body_mut().as_mut().unwrap().buffer().unwrap()).unwrap()
+        };
+        assert_eq!(
+            body(Some("5")),
+            json!({"content": "yes", "message_reference": reference})
+        );
+        assert_eq!(body(None), json!({"content": "yes"}));
+        let attachments = [upload("a.bin", b"x")];
+        let mut request = message_request(
+            &client,
+            url,
+            "fixture",
+            "1",
+            "",
+            &attachments,
+            None,
+            Some("5"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let rendered =
+            String::from_utf8_lossy(request.body_mut().as_mut().unwrap().buffer().unwrap())
+                .into_owned();
+        let start = rendered.find("{\"attachments\"").unwrap();
+        let end = rendered[start..].find("\r\n").unwrap() + start;
+        let payload: JsonValue = serde_json::from_str(&rendered[start..end]).unwrap();
+        assert_eq!(payload["message_reference"], reference, "{rendered}");
+        assert!(
+            message_request(&client, url, "fixture", "1", "yes", &[], None, Some("05")).is_err()
+        );
+    }
+
+    /// A reply send names its target to the transport, and what Discord
+    /// returns is stored as intake stores a reply: with `archive::reply_to`,
+    /// so the send reads back as a reply to the stored target.
+    #[test]
+    fn a_reply_send_posts_its_target_and_reads_back_as_a_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile, Some(key));
+        let storage = test_storage(&owner);
+        let channel = "100000000000000002";
+        let target = message_json(
+            "100000000000000005",
+            channel,
+            "the   question\nasked here",
+            None,
+            json!([]),
+        );
+        store(storage, channel, vec![target.clone()]);
+        let mut posted = Vec::new();
+        let receipt = send_with(
+            storage,
+            "fixture",
+            channel,
+            "the answer",
+            &[],
+            Some("100000000000000005"),
+            |_, actual_channel, body, _, reply_to| {
+                posted.push(reply_to.map(str::to_owned));
+                Ok(reply_json(
+                    "100000000000000006",
+                    actual_channel,
+                    body,
+                    target.clone(),
+                ))
+            },
+            |_, _| unreachable!("text has no attachments"),
+        )
+        .unwrap();
+        assert_eq!(posted, [Some("100000000000000005".to_owned())]);
+        assert_eq!(receipt.reply_to.as_deref(), Some("100000000000000005"));
+        assert_eq!(
+            receipt.requested_reply_to.as_deref(),
+            Some("100000000000000005")
+        );
+        let history = read_history(&storage.view().unwrap(), &ReadOptions::default()).unwrap();
+        let reply = history
+            .messages
+            .iter()
+            .find(|message| message.content == "the answer")
+            .unwrap();
+        assert_eq!(reply.message_ids, ["100000000000000006"]);
+        assert_eq!(reply.replies_to.len(), 1);
+        assert_eq!(reply.replies_to[0].message_ids, ["100000000000000005"]);
+        assert_eq!(
+            reply.replies_to[0].quotes,
+            [ReplyQuote {
+                author: "Ada Lovelace".to_owned(),
+                snippet: "the question asked here".to_owned(),
+            }]
+        );
+        let text = rendered(history.messages);
+        assert!(
+            text.contains(
+                " id=100000000000000006 Ada Lovelace (reply to id=100000000000000005 by Ada \
+                 Lovelace: \"the question asked here\"): the answer"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(" id=100000000000000005 Ada Lovelace: the   question"),
+            "{text}"
+        );
+    }
+
+    /// A reply target this channel does not hold is refused before anything
+    /// is posted: one never stored, one stored in another channel, and an id
+    /// that is no Discord id. Nothing is posted as an ordinary message.
+    #[test]
+    fn an_unknown_reply_target_is_refused_before_any_post() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let owner = crate::storage::Storage::new(pile, Some(key));
+        let storage = test_storage(&owner);
+        let channel = "100000000000000002";
+        let elsewhere = "100000000000000003";
+        store(
+            storage,
+            elsewhere,
+            vec![message_json(
+                "100000000000000007",
+                elsewhere,
+                "over there",
+                None,
+                json!([]),
+            )],
+        );
+        let mut posts = 0;
+        for (target, says) in [
+            ("100000000000000005", "not stored in channel"),
+            ("100000000000000007", "not stored in channel"),
+            ("0100", "invalid message id to reply to"),
+        ] {
+            let error = send_with(
+                storage,
+                "fixture",
+                channel,
+                "a reply",
+                &[],
+                Some(target),
+                |_, _, _, _, _| {
+                    posts += 1;
+                    Ok(json!({}))
+                },
+                |_, _| unreachable!("nothing is fetched"),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(says), "{target}: {error:#}");
+        }
+        assert_eq!(posts, 0, "a refused reply must precede the HTTP POST");
+        assert!(
+            read_history(&storage.view().unwrap(), &ReadOptions::default())
+                .unwrap()
+                .messages
+                .iter()
+                .all(|message| message.content != "a reply")
+        );
+    }
+
+    /// A reply whose target is stored shows the target's id, author and the
+    /// start of its text; one whose target is not stored shows the target's
+    /// id and says so, and the read goes on.
+    #[test]
+    fn a_reply_reads_its_target_stored_or_not() {
+        let channel = "100000000000000002";
+        let long = "x".repeat(REPLY_SNIPPET_CHARS + 10);
+        let stored = message_json("100000000000000005", channel, &long, None, json!([]));
+        let gone = json!({"id": "100000000000000004"});
+        let messages = parse_messages(
+            vec![
+                stored.clone(),
+                reply_json("100000000000000006", channel, "to the stored", stored),
+                reply_json("100000000000000008", channel, "to the absent", gone),
+            ],
+            channel,
+        )
+        .unwrap();
+        let fragment =
+            build_ingest_fragment(&messages, None, None, |_, _| unreachable!("no attachments"))
+                .unwrap();
+        let text = rendered(observed(&fragment));
+        let cut = format!("{}…", "x".repeat(REPLY_SNIPPET_CHARS));
+        assert!(
+            text.contains(&format!(
+                " id=100000000000000006 author (reply to id=100000000000000005 by Ada \
+                 Lovelace: \"{cut}\"): to the stored"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                " id=100000000000000008 author (reply to id=100000000000000004, not stored \
+                 here): to the absent"
+            ),
+            "{text}"
         );
     }
 

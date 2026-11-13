@@ -21,10 +21,49 @@ pub fn auth(status: &super::AuthStatus, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn sent(receipt: &SendReceipt, out: &mut Out<'_>) -> Result<()> {
+    // What Discord's returned message says it replies to is what was stored
+    // and what a read shows; a send that asked for a reply and got back a
+    // message naming another target, or none, says so.
+    let reply = match (&receipt.requested_reply_to, &receipt.reply_to) {
+        (None, None) => String::new(),
+        (Some(asked), Some(stored)) if asked == stored => format!(" as a reply to {stored}"),
+        (asked, stored) => format!(
+            "; asked to reply to {}, and Discord's returned message names {} as its reply target",
+            asked.as_deref().unwrap_or("nothing"),
+            stored.as_deref().unwrap_or("nothing")
+        ),
+    };
     out.line(format!(
-        "Sent and stored message {} in channel {}",
+        "Sent and stored message {} in channel {}{reply}",
         receipt.message_id, receipt.channel_id
     ))
+}
+
+/// The Discord ids of a message as a read line carries them: `id=` and every
+/// id its anchor asserts (ordinarily one), the id a send names to reply.
+fn ids_label(ids: &[String]) -> String {
+    format!("id={}", ids.join("/"))
+}
+
+/// What a message replies to, as its read line says it: the target's id,
+/// and who wrote it and how it begins when it is stored here, or that it is
+/// not.
+fn reply_label(target: &ReplyTarget) -> String {
+    let id = if target.message_ids.is_empty() {
+        format!("anchor {:x}", target.anchor)
+    } else {
+        ids_label(&target.message_ids)
+    };
+    if target.quotes.is_empty() {
+        return format!("reply to {id}, not stored here");
+    }
+    let quotes = target
+        .quotes
+        .iter()
+        .map(|quote| format!("{}: \"{}\"", quote.author, quote.snippet))
+        .collect::<Vec<_>>()
+        .join(" / ");
+    format!("reply to {id} by {quotes}")
 }
 pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
     if value.messages.is_empty() {
@@ -90,8 +129,28 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
             Some(presence) => format!(" {} the voice channel", presence.verb()),
             None => format!(": {}", message.content),
         };
+        // The message's own Discord id, which a reply names; something said
+        // in a voice channel or a presence notice has none.
+        let id = if message.message_ids.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", ids_label(&message.message_ids))
+        };
+        let replying = if message.replies_to.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " ({})",
+                message
+                    .replies_to
+                    .iter()
+                    .map(reply_label)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         out.line(format!(
-            "[{}]{channel}{edited}{conflict} {}{said}",
+            "[{}]{channel}{edited}{conflict}{id} {}{replying}{said}",
             format_interval(message.created_at),
             message.author,
         ))?;

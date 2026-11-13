@@ -12,12 +12,12 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"# },
     Tool { name: "discord_auth_set", description: "Bind an existing exact encrypted Secrets version as this workspace's Discord bot credential, reconciling observed auth revisions. Requires access to that version and Discord collection WRITE; never imports plaintext or grants authority.",
         input_schema: r#"{"type":"object","properties":{"secret_version":{"type":"string","description":"Exact 32-character immutable Secrets version id; never a token or secret name."}},"required":["secret_version"],"additionalProperties":false}"# },
-    Tool { name: "discord_read", description: "Read resident Discord observations, including divergent latest versions. No token or network access required; call discord_pull explicitly for fresh data.",
+    Tool { name: "discord_read", description: "Read resident Discord observations, including divergent latest versions. Each message line carries its Discord message id (id=...), which discord_send takes as reply_to; a reply says which message it replies to: that message's id, and its author and first words when it is stored. No token or network access required; call discord_pull explicitly for fresh data.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"since":{"type":"string","description":"RFC3339 timestamp."},"limit":{"type":"integer","minimum":0,"default":20,"description":"Newest N messages; 0 means unlimited."},"descending":{"type":"boolean","default":false}},"additionalProperties":false}"# },
     Tool { name: "discord_pull", description: "Pull a complete forward interval and bounded recent edits into the archive using the workspace's Secrets-backed bot credential. Omit channel_id to visit all visible text-capable channels; partial channel failures are reported explicitly.",
         input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"fetch_limit":{"type":"integer","minimum":1,"maximum":100,"default":100},"reconcile_limit":{"type":"integer","minimum":1,"maximum":100,"default":50}},"additionalProperties":false}"# },
-    Tool { name: "discord_send", description: "Send literal text and/or attachments as the workspace's Secrets-backed Discord bot after collection WRITE admission, then store the returned observation and attachment bytes. At most 10 files and 20 MiB decoded bytes total; transport request limits may be smaller. An uncertain send or post-send retention failure must not be retried automatically.",
-        input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"text":{"type":"string","maxLength":2000,"description":"Optional literal message body. @file and @- never expand to host input."},"attachments":{"type":"array","maxItems":10,"items":{"type":"object","properties":{"filename":{"type":"string","minLength":1,"maxLength":255,"description":"Leaf filename, without path separators or control characters."},"media_type":{"type":"string","maxLength":255,"description":"MIME type, e.g. image/png or application/pdf."},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID in this workspace, resolved as files_get. Use the Entity or Import ID from files_show or files_add, not a content Hash. A folder import is refused."},"path":{"type":"string","description":"Absolute path of the file on the MCP server's host, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none."}},"required":["filename","media_type"],"oneOf":[{"required":["file_id"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["file_id"]}}],"additionalProperties":false}}},"required":["channel_id"],"additionalProperties":false}"# },
+    Tool { name: "discord_send", description: "Send literal text and/or attachments as the workspace's Secrets-backed Discord bot after collection WRITE admission, then store the returned observation and attachment bytes. With reply_to, the message is posted as a Discord reply to that stored message. At most 10 files and 20 MiB decoded bytes total; transport request limits may be smaller. An uncertain send or post-send retention failure must not be retried automatically.",
+        input_schema: r#"{"type":"object","properties":{"channel_id":{"type":"string"},"text":{"type":"string","maxLength":2000,"description":"Optional literal message body. @file and @- never expand to host input."},"reply_to":{"type":"string","pattern":"^[1-9][0-9]{0,19}$","description":"Optional Discord message id to reply to, as discord_read shows it (id=...). It must be a message stored in this channel; otherwise nothing is sent."},"attachments":{"type":"array","maxItems":10,"items":{"type":"object","properties":{"filename":{"type":"string","minLength":1,"maxLength":255,"description":"Leaf filename, without path separators or control characters."},"media_type":{"type":"string","maxLength":255,"description":"MIME type, e.g. image/png or application/pdf."},"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID in this workspace, resolved as files_get. Use the Entity or Import ID from files_show or files_add, not a content Hash. A folder import is refused."},"path":{"type":"string","description":"Absolute path of the file on the MCP server's host, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none."}},"required":["filename","media_type"],"oneOf":[{"required":["file_id"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["file_id"]}}],"additionalProperties":false}}},"required":["channel_id"],"additionalProperties":false}"# },
     Tool { name: "discord_channels_list", description: "List the guilds and channels visible to the workspace's Secrets-backed Discord bot through a finite REST query.",
         input_schema: r#"{"type":"object","properties":{"guild":{"type":"string","description":"Optional exact canonical Discord guild snowflake."}},"additionalProperties":false}"# },
 ];
@@ -57,6 +57,7 @@ struct Send {
     text: String,
     #[serde(default)]
     attachments: Vec<Attachment>,
+    reply_to: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +85,7 @@ impl Send {
             })
             .collect();
         validate_send(&self.channel_id, &self.text, &attachments)?;
+        validate_reply_to(self.reply_to.as_deref())?;
         // Check the whole input before reading any selected content.
         for source in &self.attachments {
             match (&source.file_id, &source.path) {
@@ -202,10 +204,11 @@ impl Faculty for Discord {
                     .decode_attachments(&self.files)
                     .map_err(invalid_arguments)?;
                 render::sent(
-                    &self.operations.send_attachments(
+                    &self.operations.send_reply(
                         &args.channel_id,
                         &args.text,
                         &attachments,
+                        args.reply_to.as_deref(),
                     )?,
                     out,
                 )

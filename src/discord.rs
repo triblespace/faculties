@@ -36,7 +36,7 @@ pub mod voice_message;
 pub use operations::{
     message_body, AllowedMentions, Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord,
     GuildChannels, History, ObservedMessage, PageRequest, PresenceChange, PullOptions, PullReport,
-    ReadOptions, Rest, SendReceipt, Sentence, Source, Utterance,
+    ReadOptions, ReplyQuote, ReplyTarget, Rest, SendReceipt, Sentence, Source, Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,6 +124,30 @@ pub fn validate_snowflake(raw: &str) -> Result<u64> {
 pub fn message_anchor_fragment(external_id: &str) -> Result<Fragment> {
     validate_snowflake(external_id).context("invalid Discord message id")?;
     Ok(entity! { _ @ discord::message_id: external_id.to_owned() })
+}
+
+/// Whether the message Discord names `message_external_id` is stored as a
+/// message in the channel Discord names `channel_external_id`: some
+/// observation of it there, whatever else it carries. What a send that
+/// replies to it asks before posting. Both are asked by their Discord ids,
+/// never by an anchor computed from them.
+pub fn message_stored_in<P: TriblePattern>(
+    facts: &P,
+    channel_external_id: &str,
+    message_external_id: &str,
+) -> bool {
+    let channel: TextHandle = channel_external_id.to_owned().to_blob().get_handle();
+    let message: TextHandle = message_external_id.to_owned().to_blob().get_handle();
+    exists!(pattern!(facts, [
+        { _?anchor @ discord::message_id: message },
+        {
+            _?observation @
+            metadata::tag: archive::kind_message,
+            discord::message: _?anchor,
+            discord::channel: _?channel,
+        },
+        { _?channel @ discord::channel_id: channel },
+    ]))
 }
 
 /// Something said in a voice channel, as a message there: the stable anchor

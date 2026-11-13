@@ -300,6 +300,14 @@ fn decoder_rejects_bad_ids_numeric_types_duplicates_and_host_fields_without_stor
             r#"{"channel_id":"1","text":"a","pile":"/elsewhere"}"#,
         ),
         (
+            "discord_send",
+            r#"{"channel_id":"1","text":"a","reply_to":"01"}"#,
+        ),
+        (
+            "discord_send",
+            r#"{"channel_id":"1","text":"a","reply_to":5}"#,
+        ),
+        (
             "discord_channels_list",
             r#"{"guild":"18446744073709551616"}"#,
         ),
@@ -391,4 +399,110 @@ fn output_failure_stops_history_delivery_without_mutating_resident_evidence() {
         .unwrap_err();
     assert!(error.to_string().contains("fixture delivery failure"));
     assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+}
+
+/// A message line carries its Discord id, and a reply says what it replies
+/// to: the target's author and first words when it is stored, its id when it
+/// is not. CLI and MCP render the same lines.
+#[test]
+fn read_shows_each_message_id_and_what_a_reply_replies_to() {
+    let fixture = Fixture::new();
+    let target = "100000000000000005";
+    let gone = "100000000000000009";
+    fixture.publish(observation(target, "is anyone there?", 10.0, None));
+    for (id, replies_to, text) in [
+        ("100000000000000006", target, "yes, here"),
+        ("100000000000000007", gone, "to a message never stored"),
+    ] {
+        let mut fragment = observation(id, text, 20.0, None);
+        let reply = discord::message_anchor_fragment(replies_to).unwrap();
+        let reply_id = reply.root().unwrap();
+        let observation = find!(
+            observation: Id,
+            pattern!(fragment.facts(), [{ ?observation @ metadata::tag: archive::kind_message }])
+        )
+        .next()
+        .unwrap();
+        fragment += reply;
+        fragment += entity! { ExclusiveId::force_ref(&observation) @ archive::reply_to: reply_id };
+        fixture.publish(fragment);
+    }
+    let shown = call(&fixture.mcp(), "discord_read", json!({"limit": 0})).unwrap();
+    assert!(
+        shown.contains(&format!("] id={target} Ada: is anyone there?")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!(
+            "] id=100000000000000006 Ada (reply to id={target} by Ada: \"is anyone there?\"): yes, here"
+        )),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!(
+            "] id=100000000000000007 Ada (reply to id={gone}, not stored here): to a message never stored"
+        )),
+        "{shown}"
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_discord"));
+    clean_child(&mut command);
+    let output = command
+        .arg("--pile")
+        .arg(&fixture.pile)
+        .arg("--key")
+        .arg(&fixture.key)
+        .args(["read", "--limit", "0"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), shown);
+}
+
+/// A reply to a message the channel does not hold is refused by CLI and MCP
+/// alike before anything is posted: the refusal names the target, and
+/// nothing reaches Discord (a post would fail as an unknown outcome, never
+/// as this).
+#[test]
+fn cli_and_mcp_refuse_a_reply_to_a_message_not_stored_in_the_channel() {
+    let fixture = Fixture::new();
+    let secret = faculties::secrets::Secrets::new(fixture.pile.clone(), Some(fixture.key.clone()))
+        .add("bot", b"synthetic-reply-credential")
+        .unwrap();
+    fixture.operations().auth_set(secret).unwrap();
+    // Stored, but in another channel.
+    fixture.publish(observation(MESSAGE, "elsewhere", 10.0, None));
+    for target in [MESSAGE, "100000000000000099"] {
+        let error = call(
+            &fixture.mcp(),
+            "discord_send",
+            json!({"channel_id": "100000000000000020", "text": "hi", "reply_to": target}),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "message {target} is not stored in channel 100000000000000020, so nothing was sent"
+            )),
+            "{error:#}"
+        );
+        let mut command = Command::new(env!("CARGO_BIN_EXE_discord"));
+        clean_child(&mut command);
+        let output = command
+            .arg("--pile")
+            .arg(&fixture.pile)
+            .arg("--key")
+            .arg(&fixture.key)
+            .args(["send", "100000000000000020", "hi", "--reply-to", target])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("so nothing was sent"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
