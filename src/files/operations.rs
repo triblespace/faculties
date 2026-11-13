@@ -25,7 +25,7 @@ use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::async_store::AsyncBlobStoreAcquire;
@@ -1922,6 +1922,35 @@ impl Files {
                 .context("commit Files byte import")?;
             ensure_files_after_commit(store, collection, signer, runtime)?;
             Ok(file_id)
+        })
+    }
+
+    /// Prove that this process may publish to the selected Files collection,
+    /// before an outbound side effect that must not be repeated (a paid image
+    /// generation). Nothing is written by the check itself.
+    pub fn preflight_write(&self) -> Result<()> {
+        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
+            crate::collection_names::require_command_write_admission_acquiring(
+                store, collection, signer, "Files", "files", runtime,
+            )
+        })
+    }
+
+    /// Publish one complete, self-contained fragment (a [`file_capability::stage`]d
+    /// file composed with whatever describes it) as exactly one commit to the
+    /// selected Files collection, then ensure its derived views. Workspace
+    /// routes are honoured; the fragment is the ownership unit, so its blobs
+    /// travel with it.
+    pub fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
+        with_files_write_store(&self.storage, |store, collection, signer, runtime| {
+            crate::collection_names::require_command_write_admission_acquiring(
+                store, collection, signer, "Files", "files", runtime,
+            )?;
+            let commit = store
+                .commit(collection, signer, fragment)
+                .context("commit Files fragment")?;
+            ensure_files_after_commit(store, collection, signer, runtime)?;
+            Ok(commit)
         })
     }
 
