@@ -356,8 +356,8 @@ pub fn colony_vault(policy: &AdmissionPolicy) -> SealedVault {
 }
 
 /// Find a colony vault for `policy` among the vaults these facts declare:
-/// a vault entity's descriptor that carries the colony marker and a
-/// key-delivery binding with exactly this policy. A query, never a lookup
+/// a vault entity's descriptor that carries the colony marker and whose
+/// key-delivery bindings all have exactly this policy. A query, never a lookup
 /// of a computed handle. Duplicates may exist; the smallest handle is chosen.
 pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
     reader: &R,
@@ -365,7 +365,6 @@ pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
     policy: &AdmissionPolicy,
 ) -> Option<CollectionHandle> {
     use crate::schema::{resource_vault, COLONY_VAULT, KIND_SECRET_VAULT};
-    let capability = key_delivery_capability();
     find!(resource: CollectionHandle, pattern!(facts, [{
         _?vault @ metadata::tag: KIND_SECRET_VAULT, resource_handle: ?resource
     }]))
@@ -373,13 +372,15 @@ pub fn find_colony_vault<R: BlobStoreGet, P: TriblePattern>(
         reader
             .get::<TribleSet, _>(*resource)
             .is_ok_and(|descriptor| {
-                find!(entity: Id, pattern!(&descriptor, [{
-                    ?entity @ metadata::tag: KIND_SECRET_RESOURCE, resource_vault: COLONY_VAULT
-                }]))
-                .any(|entity| {
-                    resource_policies(&descriptor, entity, Some(capability))
-                        .any(|(_, found)| found == *policy)
-                })
+                // Every key-delivery policy delivery would honour for this
+                // descriptor must be the colony policy: a writer could
+                // otherwise plant a marked descriptor with one more binding
+                // and receive every new colony secret.
+                let delivery = policies(reader, &descriptor, None, true);
+                exists!(pattern!(&descriptor, [{
+                    metadata::tag: KIND_SECRET_RESOURCE, resource_vault: COLONY_VAULT
+                }])) && !delivery.is_empty()
+                    && delivery.iter().all(|found| found == policy)
             })
     })
     .min()

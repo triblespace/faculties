@@ -493,3 +493,59 @@ fn an_open_read_policy_refuses_colony_sealing() {
         .facts()
         .is_none_or(|facts| crate::secret_rows(facts).is_empty()));
 }
+
+#[test]
+fn a_planted_vault_that_widens_delivery_is_not_the_colony_vault() {
+    use crate::schema::{resource_vault, COLONY_VAULT, KIND_SECRET_VAULT};
+    use triblespace::core::capability::policy::{resource_handle, resource_policy};
+    use triblespace::core::metadata;
+    let mut colony = colony();
+    let collection = colony.collection;
+    let observed = view(&mut colony);
+    let genuine = colony_vault(&observed, collection).unwrap();
+    drop(observed);
+    let policy = resource::colony_policy(
+        &AdmissionPolicy::quorum(
+            [
+                colony.a.verifying_key(),
+                colony.b.verifying_key(),
+                colony.c.verifying_key(),
+            ],
+            1,
+            None,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // A writer plants a descriptor with the colony marker and the READ
+    // policy, plus a second key-delivery binding rooted at an outsider.
+    for capability_definition in [
+        crate::key_delivery_definition(),
+        entity! { triblespace::core::capability::capability_action: crate::schema::ACTION_KEY_DELIVERY },
+    ] {
+        let mut planted = triblespace::core::trible::Fragment::empty();
+        let canonical =
+            planted.put::<SimpleArchive, _>(crate::key_delivery_definition().into_facts());
+        let other = planted.put::<SimpleArchive, _>(capability_definition.into_facts());
+        let descriptor = entity! {
+            metadata::tag: crate::schema::KIND_SECRET_RESOURCE,
+            resource_vault: COLONY_VAULT,
+            resource_policy*: policy.binding(canonical),
+            resource_policy*: AdmissionPolicy::direct(colony.outsider.verifying_key()).binding(other),
+        };
+        let resource = planted.put::<SimpleArchive, _>(descriptor.into_facts());
+        planted += entity! { metadata::tag: KIND_SECRET_VAULT, resource_handle: resource };
+        colony
+            .store
+            .commit(collection.source(), &colony.a, planted)
+            .unwrap();
+        let observed = view(&mut colony);
+        let found = colony_vault(&observed, collection).unwrap();
+        assert_ne!(
+            found.resource, resource,
+            "a widened descriptor is never chosen"
+        );
+        assert_eq!(found.resource, genuine.resource);
+        assert!(found.created.is_some(), "the genuine one is still absent");
+    }
+}
