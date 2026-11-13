@@ -6,8 +6,8 @@ use crate::storage::open_secrets_collection_read;
 use crate::storage::{AcquiringReader, FacultySnapshot};
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use faculties_secrets::protected::{self, ProtectedAccess, Protection, Purpose};
+use faculties_secrets::resource::{DeliveryLimits, SecretTarget};
 use std::path::PathBuf;
 use triblespace::core::capability::CapabilityProofId;
 use triblespace::core::repo::SnapshotSource;
@@ -46,12 +46,22 @@ impl Secrets {
         Self { storage }
     }
     /// User protection is prepared before opening storage. No node wrap is made.
-    pub fn add_protected(&self, name: &str, plaintext: &[u8], protection: Protection<'_>) -> Result<Id> {
+    pub fn add_protected(
+        &self,
+        name: &str,
+        plaintext: &[u8],
+        protection: Protection<'_>,
+    ) -> Result<Id> {
         let sealed = protected::prepare_raw(name, plaintext, clock::point_now()?, protection)?;
         self.publish_protected(sealed)
     }
 
-    pub fn add_item_protected(&self, name: &str, input: secrets::item::ItemInput<'_>, protection: Protection<'_>) -> Result<Id> {
+    pub fn add_item_protected(
+        &self,
+        name: &str,
+        input: secrets::item::ItemInput<'_>,
+        protection: Protection<'_>,
+    ) -> Result<Id> {
         let sealed = protected::prepare_item(name, input, clock::point_now()?, protection)?;
         self.publish_protected(sealed)
     }
@@ -59,21 +69,52 @@ impl Secrets {
     fn publish_protected(&self, sealed: secrets::SealedVersion) -> Result<Id> {
         use triblespace::core::collection::CollectionStoreExt;
         self.storage().with_store(|pile, signer, runtime| {
-            let collection = self.storage.open_secrets_collection(pile, signer.verifying_key(), runtime, true)?;
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                true,
+            )?;
             pile.commit(collection.source(), signer, sealed.fragment)
                 .context("publish protected secret")?;
-            drop(runtime.block_on(crate::storage::ensure_downstream(pile, collection.source(), signer))
-                .context("Protected secret committed, but ensuring its views failed")?);
+            drop(
+                runtime
+                    .block_on(crate::storage::ensure_downstream(
+                        pile,
+                        collection.source(),
+                        signer,
+                    ))
+                    .context("Protected secret committed, but ensuring its views failed")?,
+            );
             Ok(sealed.secret)
         })
     }
 
-    fn prepare_protected(&self, secret: Id, body: Option<secrets::BytesHandle>, purpose: Purpose) -> Result<Option<ProtectedAccess>> {
+    fn prepare_protected(
+        &self,
+        secret: Id,
+        body: Option<secrets::BytesHandle>,
+        purpose: Purpose,
+    ) -> Result<Option<ProtectedAccess>> {
         self.storage().with_store(|pile, signer, runtime| {
-            let collection = self.storage.open_secrets_collection(pile, signer.verifying_key(), runtime, false)?;
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                false,
+            )?;
             let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            let Some(facts) = snapshot.facts() else { return Ok(None); };
-            protected::prepare_access(snapshot.store_snapshot(), facts, collection.handle(), secret, body, purpose)
+            let Some(facts) = snapshot.facts() else {
+                return Ok(None);
+            };
+            protected::prepare_access(
+                snapshot.store_snapshot(),
+                facts,
+                collection.handle(),
+                secret,
+                body,
+                purpose,
+            )
         })
     }
     fn storage(&self) -> SecretsStorage<'_> {
@@ -81,7 +122,9 @@ impl Secrets {
             storage: &self.storage,
         }
     }
-    /// Encrypt resident bytes once, returning the exact newly authored version.
+    /// Encrypt resident bytes once into the colony vault, returning the exact
+    /// newly authored version. Every host the collection's READ policy admits
+    /// receives an envelope right after the commit, with no grant.
     pub fn add(&self, name: &str, plaintext: &[u8]) -> Result<Id> {
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
@@ -90,14 +133,17 @@ impl Secrets {
                 runtime,
                 true,
             )?;
-            let secret = secret_storage::add_secret(
+            let secret = secret_storage::add_secret_to_colony(
                 pile,
                 signer,
                 collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
                 name,
                 plaintext,
                 clock::point_now()?,
-            )?;
+                clock::now()?,
+            )?
+            .secret;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(
@@ -105,14 +151,17 @@ impl Secrets {
                         collection.source(),
                         signer,
                     ))
-                    .context(
-                        "Encrypted secret was committed, but ensuring its derived views failed",
-                    )?,
+                    .with_context(|| {
+                        format!(
+                            "Encrypted secret {secret:x} was committed and delivered, but ensuring its derived views failed"
+                        )
+                    })?,
             );
             Ok(secret)
         })
     }
-    /// One fresh whole-item key and one immutable structured version.
+    /// One fresh whole-item key and one immutable structured version, sealed
+    /// into the colony vault and delivered to its hosts like [`Self::add`].
     pub fn add_item(&self, public_label: &str, input: secrets::item::ItemInput<'_>) -> Result<Id> {
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
@@ -121,14 +170,17 @@ impl Secrets {
                 runtime,
                 true,
             )?;
-            let id = secret_storage::add_item(
+            let id = secret_storage::add_item_to_colony(
                 pile,
                 signer,
                 collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
                 public_label,
                 input,
                 clock::point_now()?,
-            )?;
+                clock::now()?,
+            )?
+            .secret;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(
@@ -136,9 +188,11 @@ impl Secrets {
                         collection.source(),
                         signer,
                     ))
-                    .context(
-                        "Encrypted item was committed, but ensuring its derived views failed",
-                    )?,
+                    .with_context(|| {
+                        format!(
+                            "Encrypted item {id:x} was committed and delivered, but ensuring its derived views failed"
+                        )
+                    })?,
             );
             Ok(id)
         })
@@ -186,34 +240,61 @@ impl Secrets {
         protection: Protection<'_>,
         previous_receipt: Option<Id>,
     ) -> Result<super::onepassword::ImportReport> {
-        use super::onepassword::{ProtectedImportCode, ProtectedImportRejection, ProtectedImportStage};
+        use super::onepassword::{
+            ProtectedImportCode, ProtectedImportRejection, ProtectedImportStage,
+        };
         let archive = super::onepassword::OnePasswordArchive::parse(bytes, limits)
             .map_err(ProtectedImportRejection::parse)?;
-        let (observed, signer) = self.storage().with_store(|pile, signer, runtime| {
-            let collection = self.storage.open_secrets_collection(pile, signer.verifying_key(), runtime, true)?;
-            // No view maintenance here: retries must not append incidental
-            // derived work. The acquiring reader outlives this short lease.
-            let observed = secret_storage::snapshot_acquiring(
-                AcquiringReader::new(pile.snapshot()?, runtime.clone()), collection,
-            )?;
-            Ok((observed, signer.clone()))
-        }).map_err(|error| ProtectedImportRejection::from_error(
-            ProtectedImportStage::DestinationObservation, ProtectedImportCode::DestinationUnavailable, &error,
-        ))?;
+        let (observed, signer) = self
+            .storage()
+            .with_store(|pile, signer, runtime| {
+                let collection = self.storage.open_secrets_collection(
+                    pile,
+                    signer.verifying_key(),
+                    runtime,
+                    true,
+                )?;
+                // No view maintenance here: retries must not append incidental
+                // derived work. The acquiring reader outlives this short lease.
+                let observed = secret_storage::snapshot_acquiring(
+                    AcquiringReader::new(pile.snapshot()?, runtime.clone()),
+                    collection,
+                )?;
+                Ok((observed, signer.clone()))
+            })
+            .map_err(|error| {
+                ProtectedImportRejection::from_error(
+                    ProtectedImportStage::DestinationObservation,
+                    ProtectedImportCode::DestinationUnavailable,
+                    &error,
+                )
+            })?;
         let created_at = clock::point_now().map_err(ProtectedImportRejection::preparation)?;
-        let prepared = archive.prepare_protected(&observed, &signer, created_at, protection, previous_receipt)
+        let prepared = archive
+            .prepare_protected(&observed, &signer, created_at, protection, previous_receipt)
             .map_err(ProtectedImportRejection::preparation)?;
         let receipt = prepared.receipt();
-        self.storage().with_store(|pile, signer, runtime| {
-            let collection = self.storage.open_secrets_collection(pile, signer.verifying_key(), runtime, true)?;
-            let mut report = prepared.publish(pile, signer, collection)?;
-            if !report.reused {
-                report.view_maintenance_pending = runtime.block_on(crate::storage::ensure_downstream(
-                    pile, collection.source(), signer,
-                )).is_err();
-            }
-            Ok(report)
-        }).map_err(|_| super::onepassword::ProtectedImportPublicationError { receipt }.into())
+        self.storage()
+            .with_store(|pile, signer, runtime| {
+                let collection = self.storage.open_secrets_collection(
+                    pile,
+                    signer.verifying_key(),
+                    runtime,
+                    true,
+                )?;
+                let mut report = prepared.publish(pile, signer, collection)?;
+                if !report.reused {
+                    report.view_maintenance_pending = runtime
+                        .block_on(crate::storage::ensure_downstream(
+                            pile,
+                            collection.source(),
+                            signer,
+                        ))
+                        .is_err();
+                }
+                Ok(report)
+            })
+            .map_err(|_| super::onepassword::ProtectedImportPublicationError { receipt }.into())
     }
     /// Issue native, non-delegating delivery grants for an explicit finite
     /// selection, then deliver missing envelopes in one selected maintenance
@@ -329,23 +410,31 @@ impl Secrets {
                 false,
             )?;
             let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            if snapshot.facts().is_some_and(|facts| exists!(pattern!(facts, [
-                { secret @ secrets::schema::protected_envelope: _?envelope }
-            ]))) {
+            if snapshot.facts().is_some_and(|facts| {
+                exists!(pattern!(facts, [
+                    { secret @ secrets::schema::protected_envelope: _?envelope }
+                ]))
+            }) {
                 // Body alternatives are public metadata. Do not decrypt merely
                 // to list a protected version's exact advertised selectors.
-                return Ok(snapshot.facts().map(|facts| secrets::item::rows(facts)
-                    .into_iter().filter(|row| row.id == secret).map(|row| row.body)
-                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect())
+                return Ok(snapshot
+                    .facts()
+                    .map(|facts| {
+                        secrets::item::rows(facts)
+                            .into_iter()
+                            .filter(|row| row.id == secret)
+                            .map(|row| row.body)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    })
                     .unwrap_or_default());
             }
-            Ok(
-                snapshot
-                    .open_item(secret, signer)?
-                    .into_iter()
-                    .map(|item| item.body())
-                    .collect(),
-            )
+            Ok(snapshot
+                .open_item(secret, signer)?
+                .into_iter()
+                .map(|item| item.body())
+                .collect())
         })
     }
     fn with_item_body<T>(
@@ -358,7 +447,10 @@ impl Secrets {
         let prepared = self.prepare_protected(secret, Some(body.transmute()), purpose.clone())?;
         // The preparation closure has returned and released its store lease.
         // No tool is replayed: only this explicit read continuation proceeds.
-        let unlocked = prepared.as_ref().map(|request| self.storage.resolve_protected(request)).transpose()?;
+        let unlocked = prepared
+            .as_ref()
+            .map(|request| self.storage.resolve_protected(request))
+            .transpose()?;
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
                 pile,
@@ -367,9 +459,20 @@ impl Secrets {
                 false,
             )?;
             let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            let fresh = snapshot.facts().map(|facts| protected::prepare_access(
-                snapshot.store_snapshot(), facts, collection.handle(), secret, Some(body.transmute()), purpose
-            )).transpose()?.flatten();
+            let fresh = snapshot
+                .facts()
+                .map(|facts| {
+                    protected::prepare_access(
+                        snapshot.store_snapshot(),
+                        facts,
+                        collection.handle(),
+                        secret,
+                        Some(body.transmute()),
+                        purpose,
+                    )
+                })
+                .transpose()?
+                .flatten();
             let item = match (prepared, unlocked, fresh) {
                 (Some(prepared), Some(unlocked), Some(fresh)) => {
                     unlocked.validate(&prepared)?;
@@ -383,7 +486,9 @@ impl Secrets {
     }
     /// Export native facts, not an acquiring reader whose owner has closed.
     pub fn open_item_body(&self, secret: Id, body: secrets::item::ItemBody) -> Result<TribleSet> {
-        self.with_item_body(secret, body, Purpose::OpenFacts, |item| Ok(item.facts().clone()))
+        self.with_item_body(secret, body, Purpose::OpenFacts, |item| {
+            Ok(item.facts().clone())
+        })
     }
     /// Selected cold acquisition and decryption happen while the store lease is
     /// alive. Only independently owned plaintext bytes leave the operation.
@@ -408,7 +513,9 @@ impl Secrets {
         body: secrets::item::ItemBody,
         child: secrets::item::PrivateText,
     ) -> Result<secrets::totp::Code> {
-        self.with_item_body(secret, body, Purpose::Totp { child: child.raw }, |item| item.totp(child))
+        self.with_item_body(secret, body, Purpose::Totp { child: child.raw }, |item| {
+            item.totp(child)
+        })
     }
     /// Read-only native relation inspection. Values/filenames stay encrypted;
     /// repeated relations and unknown role IDs are emitted without a catalog.
@@ -453,7 +560,10 @@ impl Secrets {
     /// Explicitly open one exact version. Callers decide how plaintext is used.
     pub fn get(&self, secret: Id) -> Result<Zeroizing<Vec<u8>>> {
         let prepared = self.prepare_protected(secret, None, Purpose::Get)?;
-        let unlocked = prepared.as_ref().map(|request| self.storage.resolve_protected(request)).transpose()?;
+        let unlocked = prepared
+            .as_ref()
+            .map(|request| self.storage.resolve_protected(request))
+            .transpose()?;
         self.storage().with_store(|pile, signer, runtime| {
             let collection = self.storage.open_secrets_collection(
                 pile,
@@ -462,9 +572,20 @@ impl Secrets {
                 false,
             )?;
             let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            let fresh = snapshot.facts().map(|facts| protected::prepare_access(
-                snapshot.store_snapshot(), facts, collection.handle(), secret, None, Purpose::Get
-            )).transpose()?.flatten();
+            let fresh = snapshot
+                .facts()
+                .map(|facts| {
+                    protected::prepare_access(
+                        snapshot.store_snapshot(),
+                        facts,
+                        collection.handle(),
+                        secret,
+                        None,
+                        Purpose::Get,
+                    )
+                })
+                .transpose()?
+                .flatten();
             match (prepared, unlocked, fresh) {
                 (Some(prepared), Some(unlocked), Some(fresh)) => {
                     unlocked.validate(&prepared)?;
@@ -497,6 +618,46 @@ impl Secrets {
                     })
                 })
                 .collect()
+        })
+    }
+    /// Bind every existing ordinary version this key opens, not protected and
+    /// not already in a vault, to the colony vault, keeping its version id.
+    /// A version whose bound descriptor cannot be read is skipped and
+    /// reported. With `commit` false there is no adoption commit and the plan
+    /// is returned (reads may still fetch or cache blobs); with `commit` true
+    /// the bindings publish in one commit and the vault's hosts receive their
+    /// envelopes. Running it again adopts nothing. Plaintext is never printed
+    /// or returned, but bodies are decrypted internally to authenticate keys.
+    pub fn adopt_colony(&self, commit: bool) -> Result<secret_storage::ColonyAdoption> {
+        self.storage().with_store(|pile, signer, runtime| {
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                commit,
+            )?;
+            let report = secret_storage::adopt_into_colony(
+                pile,
+                signer,
+                collection,
+                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
+                clock::now()?,
+                commit,
+            )?;
+            if report.committed || report.delivered != 0 {
+                drop(
+                    runtime
+                        .block_on(crate::storage::ensure_downstream(
+                            pile,
+                            collection.source(),
+                            signer,
+                        ))
+                        .context(
+                            "Colony adoption was committed, but ensuring its derived views failed",
+                        )?,
+                );
+            }
+            Ok(report)
         })
     }
     /// Explicit key-delivery maintenance; does not grant new capabilities.
@@ -636,31 +797,54 @@ mod tests {
 
     #[test]
     fn protected_facade_releases_lease_and_never_retains_unlock_or_delivers_node_wrap() {
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("protected.pile");
         std::fs::File::create(&path).unwrap();
         crate::storage::initialize_signer(&path, None).unwrap();
         let storage = crate::storage::Storage::shared_local(path, None);
         let plain = Secrets::with_storage(storage.clone());
-        let id = plain.add_protected("synthetic protected", b"synthetic private", Protection {
-            password: b"synthetic passphrase", device: None,
-        }).unwrap();
-        assert!(plain.get(id).unwrap_err().to_string().contains("local Erlkonig unlock"));
+        let id = plain
+            .add_protected(
+                "synthetic protected",
+                b"synthetic private",
+                Protection {
+                    password: b"synthetic passphrase",
+                    device: None,
+                },
+            )
+            .unwrap();
+        assert!(plain
+            .get(id)
+            .unwrap_err()
+            .to_string()
+            .contains("local Erlkonig unlock"));
         assert_eq!(plain.maintain().unwrap(), 0);
         let recipient = SigningKey::from_bytes(&[9; 32]).verifying_key();
-        assert!(plain.grant(SecretTarget::Secret(id), recipient, DeliveryLimits::default(), false).is_err());
+        assert!(plain
+            .grant(
+                SecretTarget::Secret(id),
+                recipient,
+                DeliveryLimits::default(),
+                false
+            )
+            .is_err());
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let reentrant_metadata = plain.clone();
-        let prompted = Secrets::with_storage(storage.clone().with_protected_access(Arc::new(move |request| {
-            // Would deadlock if the request still owned the shared store lease.
-            assert_eq!(reentrant_metadata.list().unwrap().len(), 1);
-            assert_eq!(request.secret(), id);
-            assert_eq!(request.purpose(), &Purpose::Get);
-            counted.fetch_add(1, Ordering::SeqCst);
-            request.unlock_password(b"synthetic passphrase")
-        })));
+        let prompted = Secrets::with_storage(storage.clone().with_protected_access(Arc::new(
+            move |request| {
+                // Would deadlock if the request still owned the shared store lease.
+                assert_eq!(reentrant_metadata.list().unwrap().len(), 1);
+                assert_eq!(request.secret(), id);
+                assert_eq!(request.purpose(), &Purpose::Get);
+                counted.fetch_add(1, Ordering::SeqCst);
+                request.unlock_password(b"synthetic passphrase")
+            },
+        )));
         assert_eq!(prompted.list().unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(&*prompted.get(id).unwrap(), b"synthetic private");
@@ -669,10 +853,16 @@ mod tests {
         let ordinary = plain.add("synthetic ordinary", b"ordinary").unwrap();
         assert_eq!(&*prompted.get(ordinary).unwrap(), b"ordinary");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        let denied = Secrets::with_storage(storage.clone().with_protected_access(Arc::new(|_| {
-            anyhow::bail!("local request cancelled")
-        })));
-        assert!(denied.get(id).unwrap_err().to_string().contains("cancelled"));
+        let denied = Secrets::with_storage(
+            storage
+                .clone()
+                .with_protected_access(Arc::new(|_| anyhow::bail!("local request cancelled"))),
+        );
+        assert!(denied
+            .get(id)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
         assert!(plain.get(id).is_err());
         storage.close().unwrap();
     }
@@ -688,23 +878,45 @@ mod tests {
         crate::storage::initialize_signer(&path, None).unwrap();
         let purposes = Arc::new(Mutex::new(Vec::new()));
         let recorded = purposes.clone();
-        let storage = crate::storage::Storage::shared_local(path, None).with_protected_access(Arc::new(move |request| {
-            recorded.lock().unwrap().push(request.purpose().clone());
-            request.unlock_password(b"synthetic passphrase")
-        }));
+        let storage = crate::storage::Storage::shared_local(path, None).with_protected_access(
+            Arc::new(move |request| {
+                recorded.lock().unwrap().push(request.purpose().clone());
+                request.unlock_password(b"synthetic passphrase")
+            }),
+        );
         let operations = Secrets::with_storage(storage.clone());
-        let id = operations.add_item_protected("synthetic protected login", ItemInput {
-            fields: &[FieldInput { role: ROLE_PASSWORD, label: None, value: FieldValue::Text("synthetic item value") }],
-            attachments: &[],
-        }, Protection { password: b"synthetic passphrase", device: None }).unwrap();
+        let id = operations
+            .add_item_protected(
+                "synthetic protected login",
+                ItemInput {
+                    fields: &[FieldInput {
+                        role: ROLE_PASSWORD,
+                        label: None,
+                        value: FieldValue::Text("synthetic item value"),
+                    }],
+                    attachments: &[],
+                },
+                Protection {
+                    password: b"synthetic passphrase",
+                    device: None,
+                },
+            )
+            .unwrap();
         assert_eq!(operations.list_items().unwrap().len(), 1);
         let body = operations.open_item(id).unwrap()[0];
         assert!(purposes.lock().unwrap().is_empty());
         let facts = operations.open_item_body(id, body).unwrap();
-        let child = find!(child: PrivateText, pattern!(&facts, [{ field_text: ?child }])).next().unwrap();
-        let bytes = operations.open_item_child::<blobencodings::UTF8String>(id, body, child).unwrap();
+        let child = find!(child: PrivateText, pattern!(&facts, [{ field_text: ?child }]))
+            .next()
+            .unwrap();
+        let bytes = operations
+            .open_item_child::<blobencodings::UTF8String>(id, body, child)
+            .unwrap();
         assert_eq!(bytes.bytes.as_ref(), b"synthetic item value");
-        assert_eq!(*purposes.lock().unwrap(), vec![Purpose::OpenFacts, Purpose::ExportText { child: child.raw }]);
+        assert_eq!(
+            *purposes.lock().unwrap(),
+            vec![Purpose::OpenFacts, Purpose::ExportText { child: child.raw }]
+        );
         storage.close().unwrap();
     }
 
@@ -761,55 +973,152 @@ mod tests {
             Ok(vec![1, 2, 3])
         };
         let started = std::time::Instant::now();
-        let first = operations.import_1password_protected(&bytes, limits, Protection {
-            password: b"synthetic-password", device: Some(protected::DeviceProtection {
-                key_id: b"synthetic-device", seal: &seal,
-            }),
-        }, None).unwrap();
+        let first = operations
+            .import_1password_protected(
+                &bytes,
+                limits,
+                Protection {
+                    password: b"synthetic-password",
+                    device: Some(protected::DeviceProtection {
+                        key_id: b"synthetic-device",
+                        seal: &seal,
+                    }),
+                },
+                None,
+            )
+            .unwrap();
         let new_elapsed = started.elapsed();
         assert_eq!(calls.get(), 4);
         assert!(!first.reused);
         let before = std::fs::read(&path).unwrap();
         let started = std::time::Instant::now();
-        let retry = operations.import_1password_protected(&bytes, limits, Protection {
-            password: b"synthetic-password", device: None,
-        }, Some(first.receipt)).unwrap();
-        eprintln!("synthetic debug protected import: items={}, new={:?}, explicit_retry={:?}",
-            first.counts.items, new_elapsed, started.elapsed());
+        let retry = operations
+            .import_1password_protected(
+                &bytes,
+                limits,
+                Protection {
+                    password: b"synthetic-password",
+                    device: None,
+                },
+                Some(first.receipt),
+            )
+            .unwrap();
+        eprintln!(
+            "synthetic debug protected import: items={}, new={:?}, explicit_retry={:?}",
+            first.counts.items,
+            new_elapsed,
+            started.elapsed()
+        );
         assert!(retry.reused);
         assert_eq!(retry.receipt, first.receipt);
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        let error = operations.import_1password_protected(&bytes, limits, Protection {
-            password: b"wrong-password", device: None,
-        }, Some(first.receipt)).unwrap_err();
-        let rejection = error.downcast_ref::<super::super::onepassword::ProtectedImportRejection>().unwrap();
-        assert_eq!(rejection.stage, super::super::onepassword::ProtectedImportStage::ReceiptVerification);
-        assert_eq!(rejection.code, super::super::onepassword::ProtectedImportCode::ReceiptRejected);
+        let error = operations
+            .import_1password_protected(
+                &bytes,
+                limits,
+                Protection {
+                    password: b"wrong-password",
+                    device: None,
+                },
+                Some(first.receipt),
+            )
+            .unwrap_err();
+        let rejection = error
+            .downcast_ref::<super::super::onepassword::ProtectedImportRejection>()
+            .unwrap();
+        assert_eq!(
+            rejection.stage,
+            super::super::onepassword::ProtectedImportStage::ReceiptVerification
+        );
+        assert_eq!(
+            rejection.code,
+            super::super::onepassword::ProtectedImportCode::ReceiptRejected
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         storage.close().unwrap();
     }
 
     #[test]
     fn protected_import_rejections_classify_parse_without_opening_destination() {
-        use super::super::onepassword::{ImportLimits, ProtectedImportCode as Code, ProtectedImportRejection, ProtectedImportStage};
+        use super::super::onepassword::{
+            ImportLimits, ProtectedImportCode as Code, ProtectedImportRejection,
+            ProtectedImportStage,
+        };
         let bytes = super::super::onepassword::tests::fixture();
         let defaults = ImportLimits::default();
         // These deliberately nonexistent paths must never be opened: parse
         // rejection precedes all destination/signing-key work.
-        let operations = Secrets::new(PathBuf::from("SYNTHETIC-PRIVATE-unused-destination"),
-            Some(PathBuf::from("SYNTHETIC-PRIVATE-unused-key")));
+        let operations = Secrets::new(
+            PathBuf::from("SYNTHETIC-PRIVATE-unused-destination"),
+            Some(PathBuf::from("SYNTHETIC-PRIVATE-unused-key")),
+        );
         let cases = [
-            (bytes.as_slice(), ImportLimits { archive_bytes: 0, ..defaults }, Code::ArchiveByteLimit),
-            (bytes.as_slice(), ImportLimits { entries: 0, ..defaults }, Code::ArchiveEntryLimit),
-            (bytes.as_slice(), ImportLimits { member_bytes: 0, ..defaults }, Code::MemberByteLimit),
-            (bytes.as_slice(), ImportLimits { expanded_bytes: 0, ..defaults }, Code::ExpandedByteLimit),
-            (bytes.as_slice(), ImportLimits { items: 0, ..defaults }, Code::ItemCountLimit),
-            (bytes.as_slice(), ImportLimits { projected_bytes: 0, ..defaults }, Code::ProjectedByteLimit),
-            (b"SYNTHETIC-PRIVATE-malformed".as_slice(), defaults, Code::ZipDirectory),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    archive_bytes: 0,
+                    ..defaults
+                },
+                Code::ArchiveByteLimit,
+            ),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    entries: 0,
+                    ..defaults
+                },
+                Code::ArchiveEntryLimit,
+            ),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    member_bytes: 0,
+                    ..defaults
+                },
+                Code::MemberByteLimit,
+            ),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    expanded_bytes: 0,
+                    ..defaults
+                },
+                Code::ExpandedByteLimit,
+            ),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    items: 0,
+                    ..defaults
+                },
+                Code::ItemCountLimit,
+            ),
+            (
+                bytes.as_slice(),
+                ImportLimits {
+                    projected_bytes: 0,
+                    ..defaults
+                },
+                Code::ProjectedByteLimit,
+            ),
+            (
+                b"SYNTHETIC-PRIVATE-malformed".as_slice(),
+                defaults,
+                Code::ZipDirectory,
+            ),
         ];
         for (input, limits, code) in cases {
-            let error = operations.import_1password_protected(input, limits,
-                Protection { password: b"SYNTHETIC-PRIVATE-password", device: None }, None).unwrap_err();
+            let error = operations
+                .import_1password_protected(
+                    input,
+                    limits,
+                    Protection {
+                        password: b"SYNTHETIC-PRIVATE-password",
+                        device: None,
+                    },
+                    None,
+                )
+                .unwrap_err();
             let rejection = error.downcast_ref::<ProtectedImportRejection>().unwrap();
             assert_eq!(rejection.stage, ProtectedImportStage::Parse);
             assert_eq!(rejection.code, code);
@@ -901,6 +1210,70 @@ mod tests {
         assert!(listed
             .iter()
             .any(|row| row.id == missing_id && row.name.is_none()));
+    }
+
+    #[test]
+    fn colony_adoption_dry_runs_then_binds_old_versions_once() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("adopt.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Secrets::new(path.clone(), None);
+        // One version sealed the old way, under its own direct(signer) R.
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let instant = hifitime::Epoch::from_unix_seconds(1.0);
+        let old = secret_storage::add_secret(
+            &mut pile,
+            &signer,
+            collection,
+            "synthetic old",
+            b"synthetic old value",
+            (instant, instant).try_to_inline().unwrap(),
+        )
+        .unwrap();
+        pile.close().unwrap();
+        // New ordinary adds are already in the colony vault; protected ones never are.
+        let fresh = operations
+            .add("synthetic fresh", b"synthetic fresh value")
+            .unwrap();
+        let protected = operations
+            .add_protected(
+                "synthetic protected",
+                b"synthetic protected value",
+                Protection {
+                    password: b"synthetic passphrase",
+                    device: None,
+                },
+            )
+            .unwrap();
+
+        let plan = operations.adopt_colony(false).unwrap();
+        assert!(!plan.committed);
+        assert!(!plan.vault_created, "the fresh add created it");
+        assert_eq!(plan.adopted.len(), 1);
+        assert_eq!(plan.adopted[0].secret, old);
+        assert_eq!(plan.adopted[0].name.as_deref(), Some("synthetic old"));
+        assert!(!plan
+            .adopted
+            .iter()
+            .any(|a| a.secret == fresh || a.secret == protected));
+        assert_eq!(
+            operations.adopt_colony(false).unwrap().adopted.len(),
+            1,
+            "dry run wrote nothing"
+        );
+
+        let done = operations.adopt_colony(true).unwrap();
+        assert!(done.committed);
+        assert_eq!(done.vault, plan.vault);
+        assert_eq!(done.adopted.len(), 1);
+        let again = operations.adopt_colony(true).unwrap();
+        assert!(!again.committed);
+        assert!(again.adopted.is_empty());
+        assert_eq!(again.delivered, 0);
+        assert_eq!(&*operations.get(old).unwrap(), b"synthetic old value");
+        assert_eq!(&*operations.get(fresh).unwrap(), b"synthetic fresh value");
     }
 
     #[test]

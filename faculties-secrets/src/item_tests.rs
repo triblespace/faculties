@@ -95,13 +95,14 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
             attachments: &[],
         },
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let id = sealed.secret;
     let resource = find!(resource: CollectionHandle,
         pattern!(sealed.fragment.facts(), [{ id @ resource_handle: ?resource }]))
-        .next()
-        .unwrap();
+    .next()
+    .unwrap();
     store
         .commit(source.source(), &alice, sealed.fragment.clone())
         .unwrap();
@@ -147,7 +148,10 @@ fn carried_structured_version_uses_its_resource_policy_not_a_home_collection() {
         pollster::block_on(storage::ensure_and_snapshot(&mut store, target, &alice)).unwrap();
     let opened = delivered.open_item(id, &bob).unwrap().remove(0);
     let password = selected_text(&opened, ROLE_PASSWORD);
-    assert_eq!(opened.open_child(password).unwrap().bytes.as_ref(), PRIVATE.as_bytes());
+    assert_eq!(
+        opened.open_child(password).unwrap().bytes.as_ref(),
+        PRIVATE.as_bytes()
+    );
     let original = storage::snapshot(store.snapshot().unwrap(), source).unwrap();
     assert!(original.open_item(id, &bob).is_err());
 }
@@ -185,6 +189,7 @@ fn totp_binds_exact_field_child_and_tolerates_open_world_relations() {
         key,
         bundle,
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let public = sealed.fragment.facts().clone();
@@ -283,6 +288,7 @@ fn native_fields_binary_and_private_names_survive_commit_reopen_and_blind_traver
             }],
         },
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let id = sealed.secret;
@@ -410,6 +416,7 @@ fn missing_selected_child_fails_locally_and_unknown_repeated_opaque_facts_remain
         key,
         bundle,
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let public = sealed.fragment.facts().clone();
@@ -583,6 +590,7 @@ fn valid_competing_bodies_are_disclosed_and_missing_or_foreign_resources_do_not_
         competing_key,
         bundle,
         at(0),
+        crate::record::Delivery::Own,
     )
     .unwrap();
     let competing_resource = find!(resource: CollectionHandle, pattern!(competing.fragment.facts(),

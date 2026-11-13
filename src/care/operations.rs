@@ -1,6 +1,6 @@
 //! Configured Care operations: seal observations as Secrets records, open
 //! what this key can read, query the opened relation at the point of use, and
-//! share a subject's readings through Secrets group grants.
+//! share a subject's readings through Secrets vault grants.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -61,7 +61,7 @@ pub struct Added {
     /// The Secrets record carrying the sealed observation.
     pub record: Id,
     pub subject: Id,
-    /// The Secrets group resource the record is delivered under.
+    /// The Secrets vault resource the record is delivered under.
     pub group: CollectionHandle,
 }
 
@@ -99,7 +99,7 @@ pub struct Table {
 pub struct Granted {
     pub subject: Id,
     pub recipient: VerifyingKey,
-    /// The Secrets group resources granted, one per kind.
+    /// The Secrets vault resources granted, one per kind.
     pub groups: Vec<CollectionHandle>,
     /// Envelopes delivered by the maintenance pass that followed.
     pub envelopes: usize,
@@ -164,7 +164,7 @@ impl Opened {
                 .any(|kind_id| kind.is_none_or(|want| want == kind_id))
             })
             .filter_map(|opened| opened.resource())
-            .filter(|handle| resource::is_group(&self.reader, *handle))
+            .filter(|handle| resource::is_vault(&self.reader, *handle))
             .collect()
     }
 }
@@ -214,7 +214,7 @@ impl Care {
             let group = match existing {
                 Some(group) => group,
                 None => {
-                    let created = resource::create_group(signer, GROUP_LABEL, sealed_at)?;
+                    let created = resource::create_signer_vault(signer, GROUP_LABEL, sealed_at)?;
                     public += created.fragment;
                     created.resource
                 }
@@ -224,7 +224,7 @@ impl Care {
                 signer,
                 RECORD_LABEL,
                 sealed_at,
-                Delivery::Group(group),
+                Delivery::Vault(group),
                 |sealer| {
                     let note: Option<NoteHandle> = note
                         .map(|text| {

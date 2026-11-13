@@ -79,7 +79,7 @@ enum Command {
         #[arg(long)]
         kind: Option<String>,
     },
-    /// Share a subject's readings with another key through Secrets group
+    /// Share a subject's readings with another key through Secrets vault
     /// grants (one per kind), then deliver their keys. Later readings in the
     /// same groups reach that key at the next delivery maintenance.
     Grant {

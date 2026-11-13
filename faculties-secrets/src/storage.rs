@@ -274,7 +274,13 @@ pub fn add_secret<S>(
 where
     S: Store + CollectionStoreExt,
 {
-    let sealed = super::resource::seal_version(signing_key, name, plaintext, created_at)?;
+    let sealed = super::resource::seal_version(
+        signing_key,
+        name,
+        plaintext,
+        created_at,
+        crate::record::Delivery::Own,
+    )?;
     let secret = sealed.secret;
     store
         .commit(collection.source, signing_key, sealed.fragment)
@@ -299,6 +305,7 @@ where
         public_label,
         input,
         created_at,
+        crate::record::Delivery::Own,
     )?;
     let secret = sealed.secret;
     store
@@ -394,6 +401,393 @@ where
         .map_err(|error| anyhow!("publish additive recipient envelopes: {error}"))?;
     Ok(count)
 }
+
+/// The colony vault of one Secrets collection: found in the observed facts,
+/// or prepared (not yet published) when absent.
+pub struct ColonyVault {
+    pub resource: CollectionHandle,
+    /// The vault's descriptor and public entity, when no colony vault was
+    /// found. Publish it in the same commit as its first member. Concurrent
+    /// preparation on several hosts yields identical bytes.
+    pub created: Option<triblespace::core::trible::Fragment>,
+}
+
+/// Find or prepare the colony vault: a vault whose key-delivery policy is
+/// this collection's own READ policy, so every host that may replicate the
+/// collection is also a delivery recipient of its members.
+///
+/// Finding is a query over vault entities in the observed collection whose
+/// descriptor carries the colony marker and exactly this policy, never a
+/// lookup of a computed handle. Duplicates are allowed; the smallest handle
+/// wins. An Open READ policy names no finite recipients and is refused.
+pub fn colony_vault<R: BlobStoreGet>(
+    secrets: &SecretsSnapshot<R>,
+    collection: SecretsCollection,
+) -> Result<ColonyVault> {
+    if secrets.collection() != collection.handle() {
+        bail!("Secrets snapshot belongs to a different collection");
+    }
+    let read = collection
+        .source
+        .policy(secrets.store_snapshot())
+        .map_err(|error| anyhow!("read the Secrets collection's READ policy: {error}"))?;
+    let policy = super::resource::colony_policy(read.read())?;
+    if let Some(resource) = secrets.facts().and_then(|facts| {
+        super::resource::find_colony_vault(secrets.store_snapshot(), facts, &policy)
+    }) {
+        return Ok(ColonyVault {
+            resource,
+            created: None,
+        });
+    }
+    let vault = super::resource::colony_vault(&policy);
+    Ok(ColonyVault {
+        resource: vault.resource,
+        created: Some(vault.fragment),
+    })
+}
+
+/// Receipt in the error of a colony add whose version was published but
+/// whose delivery (or the observation before it) failed. The version is
+/// final; `maintain` completes delivery. Recover it with
+/// `error.downcast_ref::<CommittedUndelivered>()`.
+#[derive(Clone, Copy, Debug)]
+pub struct CommittedUndelivered {
+    pub secret: triblespace::core::id::Id,
+    pub vault: CollectionHandle,
+}
+
+impl std::fmt::Display for CommittedUndelivered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "version {:x} was committed into colony vault blake3:{}, but its delivery did not \
+             complete; run `secrets maintain --secret {:x}`",
+            self.secret,
+            self.vault
+                .raw
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            self.secret
+        )
+    }
+}
+
+/// One version sealed into the colony vault and delivered right after.
+#[derive(Clone, Copy, Debug)]
+pub struct ColonyAdd {
+    pub secret: triblespace::core::id::Id,
+    pub vault: CollectionHandle,
+    /// Envelopes added for the vault's other recipients after the commit.
+    pub delivered: usize,
+}
+
+/// Seal into the colony vault (creating it in the same commit when absent)
+/// together with the version's own direct(signer) descriptor, publish, then
+/// wrap the new DEK for every recipient the vault admits. The own binding is
+/// the shape adopt leaves on older versions: it keeps a grant naming this one
+/// version possible, and such a grant never widens to the vault.
+///
+/// `observe` reads the collection at the store's current boundary; it is
+/// called once before sealing and once after the commit. A failure after
+/// the commit leaves the version published; `maintain` completes delivery.
+fn seal_into_colony<S, R>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    collection: SecretsCollection,
+    mut observe: impl FnMut(&mut S) -> Result<SecretsSnapshot<R>>,
+    now: Epoch,
+    seal: impl FnOnce(super::record::Delivery) -> Result<super::SealedVersion>,
+) -> Result<ColonyAdd>
+where
+    S: Store + CollectionStoreExt,
+    R: BlobStoreGet + CapabilityProofRead,
+{
+    let vault = colony_vault(&observe(store)?, collection)?;
+    // The shape adopt leaves: an own direct(signer) binding, so one version
+    // can still be granted by itself, plus the colony-vault binding.
+    let sealed = seal(super::record::Delivery::OwnAndVault(vault.resource))?;
+    let secret = sealed.secret;
+    let mut fragment = sealed.fragment;
+    if let Some(created) = vault.created {
+        fragment += created;
+    }
+    store
+        .commit(collection.source, signing_key, fragment)
+        .map_err(|error| anyhow!("publish encrypted colony version: {error}"))?;
+    let receipt = CommittedUndelivered {
+        secret,
+        vault: vault.resource,
+    };
+    let observed = observe(store).context(receipt)?;
+    let delivered = maintain_selected_recipient_envelopes(
+        store,
+        signing_key,
+        &observed,
+        collection,
+        signing_key,
+        &[SecretTarget::Secret(secret)],
+        now,
+    )
+    .context(receipt)?;
+    Ok(ColonyAdd {
+        secret,
+        vault: vault.resource,
+        delivered,
+    })
+}
+
+/// Publish one raw version into the colony vault and deliver it at once.
+#[allow(clippy::too_many_arguments)]
+pub fn add_secret_to_colony<S, R>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    collection: SecretsCollection,
+    observe: impl FnMut(&mut S) -> Result<SecretsSnapshot<R>>,
+    name: &str,
+    plaintext: &[u8],
+    created_at: IntervalValue,
+    now: Epoch,
+) -> Result<ColonyAdd>
+where
+    S: Store + CollectionStoreExt,
+    R: BlobStoreGet + CapabilityProofRead,
+{
+    seal_into_colony(store, signing_key, collection, observe, now, |delivery| {
+        super::resource::seal_version(signing_key, name, plaintext, created_at, delivery)
+    })
+}
+
+/// Publish one structured item into the colony vault and deliver it at once.
+#[allow(clippy::too_many_arguments)]
+pub fn add_item_to_colony<S, R>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    collection: SecretsCollection,
+    observe: impl FnMut(&mut S) -> Result<SecretsSnapshot<R>>,
+    public_label: &str,
+    input: super::item::ItemInput<'_>,
+    created_at: IntervalValue,
+    now: Epoch,
+) -> Result<ColonyAdd>
+where
+    S: Store + CollectionStoreExt,
+    R: BlobStoreGet + CapabilityProofRead,
+{
+    seal_into_colony(store, signing_key, collection, observe, now, |delivery| {
+        super::item::prepare(signing_key, public_label, input, created_at, delivery)
+    })
+}
+
+/// One existing version bound to the colony vault by adoption.
+#[derive(Clone, Debug)]
+pub struct Adoption {
+    pub secret: triblespace::core::id::Id,
+    pub body: super::BytesHandle,
+    /// A structured item/record version rather than a raw secret.
+    pub structured: bool,
+    /// The public label, when its bytes are here. Never plaintext.
+    pub name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ColonyAdoption {
+    pub vault: CollectionHandle,
+    /// The colony vault did not exist and was (or would be) created.
+    pub vault_created: bool,
+    pub adopted: Vec<Adoption>,
+    /// Whether anything was published (false for a dry run).
+    pub committed: bool,
+    /// Envelopes added for the vault's recipients after the commit.
+    pub delivered: usize,
+    /// Versions left alone because what adoption must know about them could
+    /// not be read, with the reason. Retry once the bytes are here.
+    pub skipped: Vec<AdoptionSkip>,
+}
+
+/// One version adoption declined to judge.
+#[derive(Clone, Debug)]
+pub struct AdoptionSkip {
+    pub secret: triblespace::core::id::Id,
+    pub reason: String,
+}
+
+/// Bind existing versions to the colony vault, keeping their version ids.
+///
+/// For every version this key opens through an ordinary node envelope, that
+/// is not protected and not already bound to any vault, adoption adds a
+/// second binding: an envelope for the same secret id, body and DEK bound to
+/// the colony vault, plus the `resource_handle` fact naming it. The original
+/// binding stays as it was. Versions in another vault (Care's) keep that
+/// vault's audience. A version with any bound descriptor that cannot be read
+/// is not judged: it is reported in `skipped` with the reason, never adopted.
+/// With `commit` false there is no adoption commit and the plan is returned
+/// (observing may still fetch or cache blobs). With `commit` true the
+/// bindings are published in one commit and delivery maintenance runs for
+/// the vault. A second run adopts nothing, because the holder's colony
+/// binding is then present. Plaintext is never returned, but bodies are
+/// decrypted internally to authenticate each recovered key.
+pub fn adopt_into_colony<S, R>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    collection: SecretsCollection,
+    mut observe: impl FnMut(&mut S) -> Result<SecretsSnapshot<R>>,
+    now: Epoch,
+    commit: bool,
+) -> Result<ColonyAdoption>
+where
+    S: Store + CollectionStoreExt,
+    R: BlobStoreGet + CapabilityProofRead,
+{
+    use triblespace::core::capability::policy::resource_handle;
+    use triblespace::core::id::{ExclusiveId, Id};
+    use triblespace::core::metadata;
+    use triblespace::macros::{entity, exists};
+
+    let observed = observe(store)?;
+    let vault = colony_vault(&observed, collection)?;
+    let mut report = ColonyAdoption {
+        vault: vault.resource,
+        vault_created: vault.created.is_some(),
+        adopted: Vec::new(),
+        committed: false,
+        delivered: 0,
+        skipped: Vec::new(),
+    };
+    let mut fragment = triblespace::core::trible::Fragment::empty();
+    if let Some(facts) = observed.facts() {
+        let reader = observed.store_snapshot();
+        let raw =
+            find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: super::schema::KIND_SECRET }]));
+        let structured = find!(id: Id,
+            pattern!(facts, [{ ?id @ metadata::tag: super::schema::KIND_ITEM_VERSION }]));
+        let versions = raw
+            .map(|id| (id, false))
+            .chain(structured.map(|id| (id, true)))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (secret, is_structured) in versions {
+            if exists!(
+                pattern!(facts, [{ secret @ super::schema::protected_envelope: _?envelope }])
+            ) {
+                continue;
+            }
+            let bindings = super::envelope::recover_all(reader, facts, secret, signing_key)?;
+            if bindings.is_empty() {
+                continue;
+            }
+            // Every bound descriptor must be read before judging: an
+            // unreadable one may be a vault (Care's, or the colony vault
+            // itself), and "unknown" must never read as "not in a vault".
+            let mut in_vault = false;
+            let mut unknown = None;
+            for binding in &bindings {
+                match super::resource::vault_status(reader, binding.resource) {
+                    Ok(true) => in_vault = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        unknown.get_or_insert(format!(
+                            "bound resource blake3:{} is unavailable ({error}); retry once it is here",
+                            binding
+                                .resource
+                                .raw
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        ));
+                    }
+                }
+            }
+            if in_vault {
+                continue;
+            }
+            if let Some(reason) = unknown {
+                report.skipped.push(AdoptionSkip { secret, reason });
+                continue;
+            }
+            let mut bodies = std::collections::BTreeSet::new();
+            for binding in bindings {
+                if !bodies.insert(binding.body) {
+                    continue;
+                }
+                fragment += super::envelope::fragment(
+                    &super::envelope::BoundKey {
+                        secret,
+                        body: binding.body,
+                        resource: vault.resource,
+                        dek: binding.dek,
+                    },
+                    signing_key.verifying_key().to_bytes(),
+                )?;
+                let name = if is_structured {
+                    super::item::rows(facts)
+                        .into_iter()
+                        .find(|row| row.id == secret && row.body.raw == binding.body.raw)
+                        .map(|row| row.name)
+                } else {
+                    super::secret_rows_for(facts, secret)
+                        .into_iter()
+                        .find(|row| row.body == binding.body)
+                        .map(|row| row.name)
+                };
+                report.adopted.push(Adoption {
+                    secret,
+                    body: binding.body,
+                    structured: is_structured,
+                    name: name.and_then(|name| super::read_text(reader, name).ok()),
+                });
+            }
+            fragment +=
+                entity! { ExclusiveId::force_ref(&secret) @ resource_handle: vault.resource };
+        }
+    }
+    drop(observed);
+    if !commit {
+        return Ok(report);
+    }
+    if !report.adopted.is_empty() {
+        if let Some(created) = vault.created {
+            fragment += created;
+        }
+        store
+            .commit(collection.source, signing_key, fragment)
+            .map_err(|error| anyhow!("publish colony adoption: {error}"))?;
+    } else {
+        report.vault_created = false;
+    }
+    report.committed = !report.adopted.is_empty();
+    let vault_hex = vault
+        .resource
+        .raw
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let pending = if report.committed {
+        format!(
+            "adoption of {} version(s) into colony vault blake3:{vault_hex} was committed, but its \
+             delivery did not complete; run `secrets maintain --resource {vault_hex}`",
+            report.adopted.len()
+        )
+    } else {
+        format!("colony delivery did not complete; run `secrets maintain --resource {vault_hex}`")
+    };
+    let observed = observe(store).context(pending.clone())?;
+    report.delivered = maintain_selected_recipient_envelopes(
+        store,
+        signing_key,
+        &observed,
+        collection,
+        signing_key,
+        &[SecretTarget::Resource(vault.resource)],
+        now,
+    )
+    .context(pending)?;
+    Ok(report)
+}
+
+#[cfg(test)]
+#[path = "vault_tests.rs"]
+mod vault_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1660,8 +2054,14 @@ mod tests {
             direct_policy(alice.verifying_key()),
         )
         .unwrap();
-        let sealed =
-            super::super::resource::seal_version(&alice, "token", b"declared", at(1)).unwrap();
+        let sealed = super::super::resource::seal_version(
+            &alice,
+            "token",
+            b"declared",
+            at(1),
+            crate::record::Delivery::Own,
+        )
+        .unwrap();
         let secret = sealed.secret;
         store
             .commit(elsewhere.source(), &alice, sealed.fragment)

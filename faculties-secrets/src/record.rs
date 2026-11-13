@@ -9,8 +9,8 @@
 //! its public label, creation time and ciphertext root) plus the envelope.
 //!
 //! Delivery follows the version's resource descriptor R: its own descriptor
-//! ([`Delivery::Own`]) or a shared group descriptor ([`Delivery::Group`]),
-//! which one grant over that R covers.
+//! ([`Delivery::Own`]), a shared vault descriptor ([`Delivery::Vault`]),
+//! which one grant over that R covers, or both ([`Delivery::OwnAndVault`]).
 
 use super::*;
 use crate::encrypted::{open_blob, Encrypted, ItemKey, ItemSealer};
@@ -24,9 +24,28 @@ pub type RecordBody = Inline<inlineencodings::Handle<Encrypted<SimpleArchive>>>;
 pub enum Delivery {
     /// A fresh descriptor for this version alone, rooted at the signer.
     Own,
-    /// An existing group descriptor (see [`crate::resource::create_group`]).
+    /// An existing vault descriptor (see [`crate::resource::create_vault`]).
     /// A grant over it covers every version sealed into it.
-    Group(CollectionHandle),
+    Vault(CollectionHandle),
+    /// Both: a fresh own descriptor rooted at the signer and an existing
+    /// vault, with one signer envelope per binding over the same S, H and
+    /// DEK. The vault delivers to its audience; the own descriptor keeps
+    /// grants naming this one version possible (they never widen to the
+    /// vault). Colony adds use it, so new and adopted versions look alike.
+    OwnAndVault(CollectionHandle),
+}
+
+impl Delivery {
+    pub(crate) const fn own(self) -> bool {
+        matches!(self, Self::Own | Self::OwnAndVault(_))
+    }
+
+    pub(crate) const fn vault(self) -> Option<CollectionHandle> {
+        match self {
+            Self::Vault(vault) | Self::OwnAndVault(vault) => Some(vault),
+            Self::Own => None,
+        }
+    }
 }
 
 /// Seal one private relation and the blobs it references as one immutable
@@ -70,7 +89,7 @@ impl<R: BlobStoreGet> OpenedRecord<R> {
     pub fn key_id(&self) -> Id {
         self.key.id()
     }
-    /// The resource descriptor the opened envelope bound (own or group).
+    /// The resource descriptor the opened envelope bound (own or vault).
     pub fn resource(&self) -> Option<CollectionHandle> {
         self.resource
     }

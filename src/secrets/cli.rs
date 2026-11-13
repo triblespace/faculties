@@ -51,6 +51,7 @@ enum Command {
     },
     /// Add a login. Only the explicit label is public; values come from files
     /// (use '-' for at most one stdin input), never literal secret argv values.
+    /// Sealed into the colony vault like `add`.
     AddLogin {
         #[arg(long)]
         label: String,
@@ -105,7 +106,10 @@ enum Command {
         #[arg(long, value_parser = parse_child)]
         child: [u8; 32],
     },
-    /// Add one immutable encrypted version.
+    /// Add one immutable encrypted version, sealed into the colony vault: every
+    /// host the collection's READ policy admits receives its key at once. It
+    /// also keeps its own binding, so `grant --secret` can share this one
+    /// version with a key outside the colony.
     Add {
         #[arg(long)]
         name: String,
@@ -138,12 +142,36 @@ enum Command {
         #[arg(long)]
         delegate: bool,
     },
+    /// The colony vault: one delivery policy (the collection's READ policy)
+    /// shared by every version sealed into it.
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
     /// Deliver DEKs for selected resources; without a selection, visit held bound resources.
     Maintain {
         #[arg(long, value_parser = parse_id)]
         secret: Vec<Id>,
         #[arg(long, value_parser = parse_resource)]
         resource: Vec<CollectionHandle>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultCommand {
+    /// Bind existing ordinary versions this key opens to the colony vault,
+    /// keeping their version ids. Protected versions and versions already in
+    /// a vault (Care's) are left alone; a version whose bound descriptor is
+    /// not readable here is skipped and listed with the reason. Without
+    /// --commit it lists what it would adopt and makes no adoption commit
+    /// (reads may still fetch or cache blobs); running it again adopts
+    /// nothing. Plaintext is never printed, but bodies are decrypted
+    /// internally to authenticate keys. A delivered key cannot be taken back:
+    /// rotate a secret to remove access.
+    Adopt {
+        /// Publish the bindings and deliver them to the vault's hosts.
+        #[arg(long)]
+        commit: bool,
     },
 }
 
@@ -534,6 +562,68 @@ pub fn run() -> Result<()> {
                         .collect::<Vec<_>>()
                 )?
             )),
+            Command::Vault {
+                command: VaultCommand::Adopt { commit },
+            } => {
+                let report = operations.adopt_colony(commit)?;
+                for adoption in &report.adopted {
+                    out.line(format!(
+                        "{} {} {:x} body blake3:{} {}",
+                        if report.committed {
+                            "adopted"
+                        } else {
+                            "would adopt"
+                        },
+                        if adoption.structured {
+                            "item"
+                        } else {
+                            "secret"
+                        },
+                        adoption.secret,
+                        hex::encode(adoption.body.raw),
+                        adoption
+                            .name
+                            .as_deref()
+                            .unwrap_or("(public name unavailable)"),
+                    ))?;
+                }
+                for skip in &report.skipped {
+                    out.line(format!("skipped {:x}: {}", skip.secret, skip.reason))?;
+                }
+                let vault = format!(
+                    "colony vault blake3:{}{}",
+                    hex::encode(report.vault.raw),
+                    if report.vault_created {
+                        if report.committed {
+                            " (created)"
+                        } else {
+                            " (would be created)"
+                        }
+                    } else {
+                        ""
+                    }
+                );
+                if report.committed {
+                    out.line(format!(
+                        "adopted {} version(s) into {vault}, {} skipped; delivered {} envelope(s)",
+                        report.adopted.len(),
+                        report.skipped.len(),
+                        report.delivered
+                    ))
+                } else if commit {
+                    out.line(format!(
+                        "nothing to adopt into {vault}, {} skipped; delivered {} envelope(s)",
+                        report.skipped.len(),
+                        report.delivered
+                    ))
+                } else {
+                    out.line(format!(
+                        "dry run, no adoption commit: {} version(s) would be adopted into {vault}, {} skipped; rerun with --commit",
+                        report.adopted.len(),
+                        report.skipped.len()
+                    ))
+                }
+            }
             Command::Get { .. }
             | Command::Import1password { .. }
             | Command::ItemOpen { .. }
