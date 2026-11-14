@@ -42,7 +42,7 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::inline::{Inline, InlineEncoding};
 use triblespace::core::macros::{find, pattern};
 use triblespace::core::metadata::{self, MetaDescribe};
-use triblespace::core::repo::pile::{Pile, PileSnapshot};
+use triblespace::core::repo::pile::{GetBlobError, Pile, PileSnapshot};
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta, BlobStorePut, SnapshotSource};
 use triblespace::core::trible::TribleSet;
 
@@ -413,7 +413,15 @@ impl Run<'_> {
             .snapshot
             .get::<Blob<SimpleArchive>, SimpleArchive>(metadata)
         {
-            Err(_) => Outcome::NonResident,
+            Err(GetBlobError::BlobNotFound(_)) => Outcome::NonResident,
+            // Damage to our own history stops the run: bytes that fail their
+            // own hash are not "absent", and a migration that skipped them
+            // would report success over a corrupt pile.
+            Err(GetBlobError::ValidationError(_)) => bail!(
+                "metadata archive {} fails its hash check: refusing to continue over corrupt bytes",
+                hex::encode_upper(metadata.raw)
+            ),
+            Err(GetBlobError::ConversionError(_)) => Outcome::Undecodable,
             Ok(blob) => match TribleSet::try_from_blob(blob) {
                 Err(_) => Outcome::Undecodable,
                 Ok(archive) => {
@@ -1259,6 +1267,49 @@ mod tests {
         assert_eq!(collection_report.undecodable, 1);
         assert_eq!(collection_report.unreadable_commits, 2);
         assert_eq!(report.new_commits(), 0);
+        assert_eq!(length(&fixture), before);
+    }
+
+    #[test]
+    fn corrupt_metadata_stops_the_run_naming_the_archive() {
+        let fixture = fixture();
+        let catalog = Catalog::frozen();
+        let (mut store, collection) = open(&fixture);
+        let handle = collection.handle();
+        let data = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        let text = "metadata bytes that will be damaged on disk after the write";
+        let damaged = store.put::<UTF8String, _>(text.to_owned()).unwrap();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &fixture.signer,
+                handle,
+                Handle::to_hash(data),
+                damaged.transmute(),
+            )))
+            .unwrap();
+        store.close().unwrap();
+
+        // Flip one byte of the stored payload, so the bytes no longer match
+        // the hash that names them.
+        let mut bytes = std::fs::read(&fixture.path).unwrap();
+        let at = bytes
+            .windows(text.len())
+            .position(|window| window == text.as_bytes())
+            .expect("payload is stored verbatim");
+        bytes[at] ^= 0xFF;
+        std::fs::write(&fixture.path, &bytes).unwrap();
+        let before = length(&fixture);
+
+        for apply in [false, true] {
+            let error = run_path(&fixture.path, &fixture.key, &catalog, &[handle], apply)
+                .expect_err("corrupt metadata must not be skipped");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("fails its hash check")
+                    && message.contains(&hex::encode_upper(damaged.raw)),
+                "{message}"
+            );
+        }
         assert_eq!(length(&fixture), before);
     }
 

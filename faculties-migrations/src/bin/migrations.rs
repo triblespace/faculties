@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 
@@ -310,6 +310,11 @@ fn main() -> Result<()> {
             list,
         } => {
             let catalog = Catalog::frozen();
+            // Sky, Stars and the Mac must write identical M' for identical M,
+            // so a writing run names the catalog it was rehearsed with.
+            if apply && expect_catalog.is_none() {
+                bail!("--apply requires --expect-catalog HASH (print it with a dry run)");
+            }
             if let Some(expected) = &expect_catalog {
                 encoding_descriptions::check_catalog(&catalog, expected)?;
             }
