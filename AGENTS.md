@@ -110,6 +110,11 @@ reconciliation.
   libtest name filter of `::` selects only module-path tests, so it runs
   zero integration tests. Read the per-target result lines, not only the
   exit status.
+  `--tests` does not build `examples/` either, so the gate also runs
+  `cargo check --locked -p faculties --features widgets --all-targets`.
+  On 2026-11-14 five examples had not compiled for about ten days (an
+  API change in GORBIE's `nb.state`, and two that still read a removed
+  catalog), and nothing noticed.
 * `.github/workflows/release.yml` fires on `v*` tags. It builds
   every CLI faculty for x86_64-linux-gnu, native aarch64-linux-gnu,
   and aarch64-apple-darwin, then
