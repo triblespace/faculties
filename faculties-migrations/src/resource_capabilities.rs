@@ -530,7 +530,9 @@ mod tests {
             CollectionMerge::sign(
                 &signer,
                 old,
-                [source.data(), Inline::new([3; 32])],
+                // MERGE takes exactly MERGE_INPUTS distinct inputs.
+                std::iter::once(source.data())
+                    .chain((0x30..0x37_u8).map(|seed| Inline::new([seed; 32]))),
                 source.data(),
             )
             .unwrap(),

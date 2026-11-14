@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use ed25519_dalek::VerifyingKey;
 
 use faculties_migrations::collection_policy::{self, CollectionPolicyPlan};
+use faculties_migrations::encoding_descriptions::{self, Catalog, Report};
 use faculties_migrations::resource_capabilities::{self, ResourceCapabilitiesPlan};
 
 #[derive(Parser)]
@@ -60,6 +61,30 @@ enum Command {
         /// several collections with the same human-readable name.
         #[arg(long)]
         handles: bool,
+    },
+    /// Re-sign the signer's old COMMITs with value-encoding descriptions
+    /// added to their metadata archives.
+    ///
+    /// For each COMMIT(collection, data, M) in a planned collection that the
+    /// `--key` signed, adds the description of every encoding M names that
+    /// this build's catalog knows. When that changes M, signs
+    /// COMMIT(collection, data, M') with the same key. Commits by other keys
+    /// are left alone; unknown encodings are reported, never fatal. A second
+    /// run writes nothing. Dry run unless `--apply`.
+    EncodingDescriptions {
+        /// File of collection handles (64 hex digits, optional `blake3:`),
+        /// one per line; `#` starts a comment.
+        #[arg(long, required_unless_present = "list")]
+        plan: Option<PathBuf>,
+        /// Write the enriched archives and COMMITs. Without it nothing is written.
+        #[arg(long)]
+        apply: bool,
+        /// Refuse to run unless the catalog hash is exactly this.
+        #[arg(long, value_name = "HASH")]
+        expect_catalog: Option<String>,
+        /// Print the catalog and every collection handle with its COMMIT count.
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -161,6 +186,81 @@ fn print_plan(plan: &CollectionPolicyPlan, handles: bool) {
     }
 }
 
+fn print_catalog(catalog: &Catalog) {
+    println!(
+        "catalog         : blake3:{} ({} encodings)",
+        hex::encode(catalog.hash().raw),
+        catalog.entries().len()
+    );
+}
+
+fn print_encoding_report(report: &Report, catalog: &Catalog) {
+    let verb = if report.applied {
+        "written"
+    } else {
+        "would write"
+    };
+    println!(
+        "Encoding-descriptions backfill ({})",
+        if report.applied { "applied" } else { "dry run" }
+    );
+    print_catalog(catalog);
+    println!("signer          : {}", hex::encode(report.signer));
+    for collection in &report.collections {
+        println!(
+            "collection blake3:{}",
+            hex::encode(collection.collection.raw)
+        );
+        println!(
+            "  commits={} signer-before={} signer-after={} other-signers={} bad-signatures={}",
+            collection.commits,
+            collection.signer_commits,
+            collection.signer_commits + collection.new_commits,
+            collection.other_signers,
+            collection.bad_signatures,
+        );
+        println!(
+            "  archives={} enriched={} current={} non-resident={} undecodable={} unreadable-commits={}",
+            collection.archives,
+            collection.archives_enriched,
+            collection.archives_current,
+            collection.non_resident,
+            collection.undecodable,
+            collection.unreadable_commits,
+        );
+        println!(
+            "  enriched-commits={} already-present={} new-commits={} new-blobs={} bytes={} ({verb})",
+            collection.enriched_commits,
+            collection.present_commits,
+            collection.new_commits,
+            collection.new_blobs,
+            collection.new_bytes,
+        );
+        for (encoding, unknown) in &collection.unknown {
+            let attributes: Vec<String> = unknown
+                .attributes
+                .iter()
+                .map(|attribute| format!("{attribute:X}"))
+                .collect();
+            println!(
+                "  unknown encoding {encoding:X} archives={} commits={} attributes={}",
+                unknown.archives,
+                unknown.commits,
+                attributes.join(","),
+            );
+        }
+        for (attribute, archives) in &collection.bare_attributes {
+            println!("  attribute without value_encoding {attribute:X} archives={archives}");
+        }
+    }
+    println!(
+        "total           : new COMMITs {} new blobs {} bytes {} ({verb})",
+        report.new_commits(),
+        report.new_blobs(),
+        report.new_bytes(),
+    );
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let Some(command) = cli.command else {
@@ -201,6 +301,46 @@ fn main() -> Result<()> {
                 let report = collection_policy::publish_path(&cli.pile, key)?;
                 print_plan(&report.plan, handles);
                 println!("appended COMMITs : {}", report.appended_commits);
+            }
+        }
+        Command::EncodingDescriptions {
+            plan,
+            apply,
+            expect_catalog,
+            list,
+        } => {
+            let catalog = Catalog::frozen();
+            if let Some(expected) = &expect_catalog {
+                encoding_descriptions::check_catalog(&catalog, expected)?;
+            }
+            if list {
+                print_catalog(&catalog);
+                for entry in catalog.entries() {
+                    println!("  encoding {:X} {}", entry.id, entry.name);
+                }
+                for (collection, commits) in encoding_descriptions::list_path(&cli.pile)? {
+                    println!(
+                        "collection blake3:{} commits={commits}",
+                        hex::encode(collection.raw)
+                    );
+                }
+                return Ok(());
+            }
+            let key = key.ok_or_else(|| {
+                anyhow!(
+                    "encoding-descriptions re-signs as the original author; pass --key explicitly"
+                )
+            })?;
+            let plan = plan.ok_or_else(|| anyhow!("pass --plan FILE"))?;
+            let text = std::fs::read_to_string(&plan)
+                .map_err(|error| anyhow!("read plan {}: {error}", plan.display()))?;
+            let plan = encoding_descriptions::parse_plan(&text)?;
+            let before = std::fs::metadata(&cli.pile)?.len();
+            let report = encoding_descriptions::run_path(&cli.pile, key, &catalog, &plan, apply)?;
+            print_encoding_report(&report, &catalog);
+            if apply {
+                let after = std::fs::metadata(&cli.pile)?.len();
+                println!("pile growth     : {} bytes (measured)", after - before);
             }
         }
     }

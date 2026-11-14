@@ -660,7 +660,8 @@ mod tests {
             CollectionMerge::sign(
                 &signer,
                 old,
-                [source.data(), missing_data(3)],
+                // MERGE takes exactly MERGE_INPUTS distinct inputs.
+                std::iter::once(source.data()).chain((0x30..0x37).map(missing_data)),
                 source.data(),
             )
             .unwrap(),
