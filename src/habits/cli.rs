@@ -28,7 +28,8 @@ enum Command {
     Add {
         /// Short command-facing name, for example `git-lineage-hygiene`.
         label: String,
-        /// `every <duration>`, `daily at <HH:MM>`, or `when <command>`.
+        /// `every <duration>`, `daily at <HH:MM>`, `when <command>`, or
+        /// `when-result-v1 <command>` for typed JSON success (including Deferred).
         ///
         /// Inside `when`, the word `@script` stands for the executable
         /// attached by `--script`: it expands, on whichever window is
@@ -61,7 +62,8 @@ enum Command {
     List,
     /// Show one immutable definition, including its nudge and predecessors.
     Show { habit: String },
-    /// Print only intentions which are due now.
+    /// Print confirmed due intentions and neutral Deferred notices.
+    /// Success means inspection succeeded, not that every verdict is known.
     Due,
     /// Record completion. The cooldown starts at this occurrence.
     ///

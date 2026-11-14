@@ -179,6 +179,7 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
     let mut text = String::new();
     let mut diagnostics = Vec::new();
     let mut shown = 0usize;
+    let mut deferred = 0usize;
     // An intention is due when any of its readings is, and is announced once.
     let mut announced = std::collections::BTreeSet::new();
     for observed in &report.entries {
@@ -190,6 +191,10 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
                         shown += 1;
                         writeln!(text, "{}: {}", row.label, row.nudge).unwrap();
                     }
+                }
+                Some(State::Deferred(pending)) => {
+                    deferred += 1;
+                    writeln!(text, "{} [{:x}] deferred: {pending}", row.label, row.id).unwrap();
                 }
                 Some(state) => {
                     if let Some(detail) = state_detail(state) {
@@ -241,6 +246,9 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
         if let Some(detail) = observed.state.as_ref().and_then(state_detail) {
             writeln!(text, "{:<22}   {detail}", "").unwrap();
         }
+        if let Some(State::Deferred(pending)) = &observed.state {
+            writeln!(text, "{:<22}   {pending}", "").unwrap();
+        }
         if observed.state.is_none() {
             if let Activation::Forked(heads) = &row.activation {
                 let detail = heads
@@ -253,16 +261,20 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
         }
     }
     if shown == 0 {
-        writeln!(
-            text,
-            "{}",
-            if only_due {
-                "nothing due"
-            } else {
-                "no habits yet"
-            }
-        )
-        .unwrap();
+        if only_due && deferred > 0 {
+            writeln!(text, "no confirmed due; {deferred} deferred reading(s)").unwrap();
+        } else {
+            writeln!(
+                text,
+                "{}",
+                if only_due {
+                    "nothing due"
+                } else {
+                    "no habits yet"
+                }
+            )
+            .unwrap();
+        }
     }
     if !only_due && report.superseded > 0 {
         writeln!(

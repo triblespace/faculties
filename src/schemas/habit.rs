@@ -101,23 +101,33 @@ pub const DAILY_COOLDOWN_SECS: i64 = 23 * 60 * 60;
 pub struct Condition {
     pub cooldown_secs: i64,
     pub command: String,
+    pub protocol: ConditionProtocol,
+}
+
+/// Explicitly authored interpretation of a successful predicate process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionProtocol {
+    ExitStatus,
+    ResultV1,
 }
 
 impl Condition {
-    /// Parse `every <duration>`, `daily at <HH:MM>`, or `when <command>`.
+    /// Parse `every <duration>`, `daily at <HH:MM>`, `when <command>`, or
+    /// `when-result-v1 <command>` (typed JSON on successful exit).
     /// `every` and `daily` also accept a trailing cooldown override.
     pub fn parse(source: &str) -> Result<Self, String> {
         let source = source.trim();
         let (head, cooldown_override) = match source.rfind("cooldown ") {
             // Inside `when`, `cooldown` belongs to the shell source. Treating
             // it as syntax would silently truncate an arbitrary command.
-            Some(at) if !source.starts_with("when ") => {
+            Some(at) if !source.starts_with("when ") && !source.starts_with("when-result-v1 ") => {
                 let secs = parse_duration(source[at + "cooldown ".len()..].trim())?;
                 (source[..at].trim(), Some(secs))
             }
             _ => (source, None),
         };
 
+        let mut protocol = ConditionProtocol::ExitStatus;
         let (command, default_cooldown) = if let Some(rest) = head.strip_prefix("every ") {
             ("true".to_owned(), parse_duration(rest.trim())?)
         } else if let Some(rest) = head.strip_prefix("daily at ") {
@@ -126,6 +136,13 @@ impl Condition {
                 format!("[ \"$(date +%H%M)\" -ge {hour:02}{minute:02} ]"),
                 DAILY_COOLDOWN_SECS,
             )
+        } else if let Some(rest) = head.strip_prefix("when-result-v1 ") {
+            let command = rest.trim();
+            if command.is_empty() {
+                return Err("`when-result-v1` needs a command".into());
+            }
+            protocol = ConditionProtocol::ResultV1;
+            (command.to_owned(), DEFAULT_COOLDOWN_SECS)
         } else if let Some(rest) = head.strip_prefix("when ") {
             let command = rest.trim();
             if command.is_empty() {
@@ -135,13 +152,14 @@ impl Condition {
         } else {
             return Err(format!(
                 "unrecognized condition {source:?} — expected `every <duration>`, \
-                 `daily at <HH:MM>`, or `when <command>`"
+                 `daily at <HH:MM>`, `when <command>`, or `when-result-v1 <command>`"
             ));
         };
 
         Ok(Self {
             cooldown_secs: cooldown_override.unwrap_or(default_cooldown),
             command,
+            protocol,
         })
     }
 
@@ -161,7 +179,7 @@ impl Condition {
 
     /// Whether the predicate delegates to the habit's own carried script.
     /// `every` and `daily at` synthesize other leading command words, so only
-    /// an authored `when @script …` can answer yes.
+    /// an authored `when @script …` or `when-result-v1 @script …` can answer yes.
     pub fn uses_script(&self) -> bool {
         self.script_suffix().is_some()
     }
@@ -221,6 +239,31 @@ fn parse_hhmm(text: &str) -> Result<(u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_results_require_a_separate_shell_form() {
+        let legacy = Condition::parse("when printf 'cooldown 5m'").unwrap();
+        assert_eq!(legacy.protocol, ConditionProtocol::ExitStatus);
+        assert_eq!(legacy.command, "printf 'cooldown 5m'");
+        let typed = Condition::parse("when-result-v1 @script --result 'cooldown 5m'").unwrap();
+        assert_eq!(typed.protocol, ConditionProtocol::ResultV1);
+        assert_eq!(typed.command, "@script --result 'cooldown 5m'");
+        assert_eq!(typed.script_suffix(), Some(" --result 'cooldown 5m'"));
+        assert_eq!(typed.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+        assert_eq!(
+            Condition::parse("every 1h").unwrap().protocol,
+            ConditionProtocol::ExitStatus
+        );
+        assert_eq!(
+            Condition::parse("daily at 09:30").unwrap().protocol,
+            ConditionProtocol::ExitStatus
+        );
+        assert!(Condition::parse("when-result-v1 ").is_err());
+        assert!(Condition::parse("when-result-v2 true").is_err());
+        assert!(!Condition::parse("when-result-v1 @scripture")
+            .unwrap()
+            .uses_script());
+    }
 
     #[test]
     fn every_is_an_always_true_condition_not_an_optional_command() {

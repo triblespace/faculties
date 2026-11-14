@@ -738,6 +738,56 @@ explicit frontend modules live in the library. `habit` uses the `habits`
 Rust module. The GUI family shares `viewer` composition instead of copying
 widget setup or invoking a capture subprocess.
 
+### Habit: explicit unknown predicate results
+
+Ordinary `when <command>` predicates are unchanged: exit 0 is true, 1 is false,
+and every other exit or signal is an evaluation error. Their stdout is opaque.
+`every` and `daily at` retain that contract. Opt in separately with
+`when-result-v1 <command>` (including `when-result-v1 @script <args>` for a
+carried producer). Old readers reject this new syntax; an updated producer and
+an explicitly authored new definition are required. No existing habit is migrated.
+
+In the opted-in mode, exit 0 must produce exactly one UTF-8 JSON object on stdout:
+
+```json
+{"version":1,"result":"true"}
+{"version":1,"result":"false"}
+{"version":1,"result":"deferred","reason":"refresh pending","attempt":"opaque-attempt-token","started_at":1794464810,"expires_at":1794465290}
+```
+
+These are three alternative outputs, not a stream of three objects. Surrounding
+JSON whitespace is allowed; duplicate/unknown fields, additional values and
+unsupported versions/results fail validation. A Deferred reason is nonblank,
+single-line text up to 1024 UTF-8 bytes. Its attempt token is 1–128 visible ASCII
+bytes (no spaces). Times are nonnegative whole **UNIX seconds**, with
+`started_at <= now < expires_at` and `started_at < expires_at`; they are not the
+TAI timestamps used by Habit completion cooldowns. The clock is sampled after
+the command returns. An expired or future-started claim is an error. Exit 1 still
+means false; all other nonzero statuses remain errors regardless of stdout.
+Malformed successful output is an error, never a false verdict.
+
+At most 8192 stdout bytes are accepted by the result decoder. This is a parsing
+bound **after capture**, not hard output/memory/time containment: the existing
+synchronous `Command::output` still waits and captures until completion. Producers
+must return promptly; this feature adds no subprocess timeout or async evaluator.
+
+Deferred means unknown, not false, due, completed, or failed. Evaluated CLI/MCP
+lists and due reports show neutral pending details. A due report with only pending
+readings says `no confirmed due`, not `nothing due`. Successful inspection does
+not assert that every verdict is known. MCP listing remains passive unless
+evaluation is explicitly requested. Evaluated Orient overviews show Deferred,
+but it creates no attention news or Presented receipt and does not hold unrelated
+news. Other readings' true verdicts and genuine failures remain visible. Existing
+periodic reevaluation observes later results; no exact expiry-alert time is promised.
+
+The producer, not the evaluator, must preserve one attempt's fixed deadline
+across polls/crashes and distinguish failed refresh from legitimate pending.
+This slice neither verifies liveness nor detects a producer rolling its deadline
+forward; it persists no attempt catalogue and does not manage locks, retries,
+sidecars or refresh processes. A future cache producer must keep failures visible
+through automatic retries until successful publication. No cache-expiry warning
+is fixed merely by adding this generic protocol.
+
 ### Secrets: replication, publication, and key delivery
 
 Secrets keeps three rights separate: collection READ replicates encrypted

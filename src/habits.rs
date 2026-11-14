@@ -39,8 +39,8 @@ use triblespace_paths::{PathExpr, PathIndex, Step};
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::schemas::habit::{
-    attrs, Condition, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID, KIND_STATE_ID, SCRIPT_TOKEN,
-    STATE_ACTIVE, STATE_PAUSED,
+    attrs, Condition, ConditionProtocol, DEFAULT_SCOPE_ID, KIND_DONE_ID, KIND_HABIT_ID,
+    KIND_STATE_ID, SCRIPT_TOKEN, STATE_ACTIVE, STATE_PAUSED,
 };
 use crate::storage::Storage;
 
@@ -230,6 +230,7 @@ pub enum State {
     Due,
     Cooling,
     Waiting,
+    Deferred(DeferredCondition),
     Paused,
     Forked(Vec<(Id, DeclaredState)>),
     Unparseable(String),
@@ -246,10 +247,122 @@ impl State {
             Self::Due => "DUE",
             Self::Cooling => "cooling",
             Self::Waiting => "waiting",
+            Self::Deferred(_) => "deferred",
             Self::Paused => "paused",
             Self::Forked(_) => "FORKED",
             Self::Unparseable(_) => "BROKEN",
             Self::Failed(_) => "ERROR",
+        }
+    }
+}
+
+/// A producer's explicit unknown verdict, not false and not an error.
+/// Times are whole UNIX seconds, not the TAI seconds used for completion cooldown.
+/// The producer owns stable attempt identity and crash/retry policy; this value
+/// is an observation, not a liveness certificate or a newly created lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredCondition {
+    pub reason: String,
+    pub attempt: String,
+    pub started_at: i64,
+    pub expires_at: i64,
+}
+
+impl std::fmt::Display for DeferredCondition {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            out,
+            "{} (attempt {}; started {}; expires {} UNIX seconds)",
+            self.reason, self.attempt, self.started_at, self.expires_at
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ConditionOutcome {
+    True,
+    False,
+    Deferred(DeferredCondition),
+}
+
+/// These bounds apply to parsing already-captured stdout, not to subprocess
+/// memory, runtime or pipe output: Command::output still captures to completion.
+const CONDITION_RESULT_MAX_BYTES: usize = 8192;
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "result", deny_unknown_fields)]
+enum ConditionResultV1 {
+    #[serde(rename = "true")]
+    True { version: u8 },
+    #[serde(rename = "false")]
+    False { version: u8 },
+    #[serde(rename = "deferred")]
+    Deferred {
+        version: u8,
+        reason: String,
+        attempt: String,
+        started_at: i64,
+        expires_at: i64,
+    },
+}
+
+fn decode_condition_result(bytes: &[u8], unix_now: i64) -> Result<ConditionOutcome, String> {
+    if bytes.len() > CONDITION_RESULT_MAX_BYTES {
+        return Err("condition result exceeds 8192 bytes".into());
+    }
+    let envelope: ConditionResultV1 = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid condition result: {error}"))?;
+    let version = match &envelope {
+        ConditionResultV1::True { version }
+        | ConditionResultV1::False { version }
+        | ConditionResultV1::Deferred { version, .. } => *version,
+    };
+    if version != 1 {
+        return Err(format!("unsupported condition result version {version}"));
+    }
+    match envelope {
+        ConditionResultV1::True { .. } => Ok(ConditionOutcome::True),
+        ConditionResultV1::False { .. } => Ok(ConditionOutcome::False),
+        ConditionResultV1::Deferred {
+            reason,
+            attempt,
+            started_at,
+            expires_at,
+            ..
+        } => {
+            if reason.trim().is_empty()
+                || reason.len() > 1024
+                || reason
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}')
+            {
+                return Err(
+                    "deferred reason must be nonempty single-line text of at most 1024 bytes"
+                        .into(),
+                );
+            }
+            if attempt.is_empty()
+                || attempt.len() > 128
+                || !attempt.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                return Err("deferred attempt must be 1..128 visible ASCII bytes".into());
+            }
+            if started_at < 0 || expires_at <= started_at || started_at > unix_now {
+                return Err(
+                    "deferred timestamps must satisfy 0 <= started_at <= now < expires_at".into(),
+                );
+            }
+            if unix_now >= expires_at {
+                return Err(format!(
+                    "deferred attempt {attempt} expired at {expires_at} UNIX seconds"
+                ));
+            }
+            Ok(ConditionOutcome::Deferred(DeferredCondition {
+                reason,
+                attempt,
+                started_at,
+                expires_at,
+            }))
         }
     }
 }
@@ -1346,6 +1459,18 @@ pub fn resolve_command(
 /// Exit 0 means true, 1 means false; every other status is an evaluation error.
 /// Resolve before changing directory so a relative CLI override stays meaningful.
 pub fn condition_holds(command: &str, pile: &Path) -> std::result::Result<bool, String> {
+    match condition_outcome(command, pile, ConditionProtocol::ExitStatus)? {
+        ConditionOutcome::True => Ok(true),
+        ConditionOutcome::False => Ok(false),
+        ConditionOutcome::Deferred(_) => unreachable!("legacy predicates never decode Deferred"),
+    }
+}
+
+fn condition_outcome(
+    command: &str,
+    pile: &Path,
+    protocol: ConditionProtocol,
+) -> std::result::Result<ConditionOutcome, String> {
     let pile = std::path::absolute(pile)
         .map_err(|error| format!("resolve predicate pile {}: {error}", pile.display()))?;
     // Capture output; errors retain a bounded diagnostic for Habit and Orient.
@@ -1357,8 +1482,19 @@ pub fn condition_holds(command: &str, pile: &Path) -> std::result::Result<bool, 
         .output()
         .map_err(|error| format!("running {command:?}: {error}"))?;
     match output.status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
+        Some(0) if protocol == ConditionProtocol::ResultV1 => {
+            // Sample after command completion. Cooldown's caller-supplied TAI
+            // timestamp is neither UNIX time nor a safe pre-execution expiry check.
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| format!("condition result clock: {error}"))?
+                .as_secs();
+            let unix_now = i64::try_from(unix_now)
+                .map_err(|_| "condition result clock exceeds i64 UNIX seconds".to_owned())?;
+            decode_condition_result(&output.stdout, unix_now)
+        }
+        Some(0) => Ok(ConditionOutcome::True),
+        Some(1) => Ok(ConditionOutcome::False),
         Some(code) => {
             let detail = String::from_utf8_lossy(&output.stderr);
             let mut chars = detail.trim().chars();
@@ -1403,9 +1539,10 @@ pub fn evaluate(row: &HabitRow, now_secs: i64, pile: &Path) -> State {
         Ok(command) => command,
         Err(error) => return State::Failed(error),
     };
-    match condition_holds(&command, pile) {
-        Ok(true) => State::Due,
-        Ok(false) => State::Waiting,
+    match condition_outcome(&command, pile, condition.protocol) {
+        Ok(ConditionOutcome::True) => State::Due,
+        Ok(ConditionOutcome::False) => State::Waiting,
+        Ok(ConditionOutcome::Deferred(pending)) => State::Deferred(pending),
         Err(error) => State::Failed(error),
     }
 }
@@ -2327,6 +2464,166 @@ mod tests {
         assert!(condition_holds("kill -TERM $$", pile).is_err());
         let error = condition_holds("printf '%3000s' x | tr ' ' x >&2; exit 2", pile).unwrap_err();
         assert!(error.len() < 2200);
+    }
+
+    #[test]
+    fn typed_condition_results_validate_payload_and_fixed_expiry() {
+        use serde_json::json;
+        let valid = json!({"version":1,"result":"deferred","reason":"refresh pending",
+            "attempt":"request-a","started_at":90,"expires_at":110});
+        let bytes = serde_json::to_vec(&valid).unwrap();
+        let pending = DeferredCondition {
+            reason: "refresh pending".into(),
+            attempt: "request-a".into(),
+            started_at: 90,
+            expires_at: 110,
+        };
+        assert!(!State::Deferred(pending.clone()).is_due());
+        for now in [90, 100, 109] {
+            assert_eq!(
+                decode_condition_result(&bytes, now).unwrap(),
+                ConditionOutcome::Deferred(pending.clone())
+            );
+        }
+        assert!(decode_condition_result(&bytes, 89).is_err());
+        assert!(decode_condition_result(&bytes, 110)
+            .unwrap_err()
+            .contains("expired"));
+        assert!(decode_condition_result(&bytes, 111).is_err());
+        for (field, value) in [
+            ("version", json!(2)),
+            ("result", json!("unknown")),
+            ("reason", json!(" ")),
+            ("reason", json!("a\nb")),
+            ("reason", json!("a\u{2028}b")),
+            ("reason", json!("x".repeat(1025))),
+            ("attempt", json!("")),
+            ("attempt", json!("a b")),
+            ("attempt", json!("é")),
+            ("attempt", json!("x".repeat(129))),
+            ("started_at", json!(-1)),
+            ("started_at", json!(101)),
+            ("expires_at", json!(90)),
+            ("expires_at", json!(100.5)),
+            ("expires_at", json!(null)),
+        ] {
+            let mut bad = valid.clone();
+            bad[field] = value;
+            assert!(
+                decode_condition_result(&serde_json::to_vec(&bad).unwrap(), 100).is_err(),
+                "{bad}"
+            );
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"not JSON",
+            b"\xff",
+            br#"{"version":1,"result":"deferred"}"#,
+            br#"{"version":1,"version":1,"result":"true"}"#,
+            br#"{"version":1,"result":"true","result":"false"}"#,
+            br#"{"version":1,"result":"true","extra":1}"#,
+            br#"{"version":1,"result":"false","reason":"not allowed"}"#,
+            br#"{"version":1,"result":"true"} {}"#,
+        ] {
+            assert!(decode_condition_result(invalid, 100).is_err());
+        }
+        assert!(decode_condition_result(&vec![b' '; CONDITION_RESULT_MAX_BYTES + 1], 100).is_err());
+        let mut at_limit = br#"{"version":1,"result":"true"}"#.to_vec();
+        at_limit.resize(CONDITION_RESULT_MAX_BYTES, b' ');
+        assert_eq!(
+            decode_condition_result(&at_limit, 100).unwrap(),
+            ConditionOutcome::True
+        );
+        at_limit.push(b' ');
+        assert!(decode_condition_result(&at_limit, 100).is_err());
+        let mut fields_at_limit = valid.clone();
+        fields_at_limit["reason"] = json!("x".repeat(1024));
+        fields_at_limit["attempt"] = json!("x".repeat(128));
+        assert!(
+            decode_condition_result(&serde_json::to_vec(&fields_at_limit).unwrap(), 100).is_ok()
+        );
+        assert_eq!(
+            decode_condition_result(br#"{"version":1,"result":"true"}"#, 100).unwrap(),
+            ConditionOutcome::True
+        );
+        assert_eq!(
+            decode_condition_result(br#"{"version":1,"result":"false"}"#, 100).unwrap(),
+            ConditionOutcome::False
+        );
+    }
+
+    #[test]
+    fn typed_predicates_preserve_nonzero_errors_and_legacy_stdout() {
+        let pile = Path::new("./self.pile");
+        let payload = r#"{"version":1,"result":"deferred","reason":"pending","attempt":"a","started_at":0,"expires_at":4102444800}"#;
+        let command = format!("printf '%s' '{payload}'");
+        assert!(
+            condition_holds(&command, pile).unwrap(),
+            "legacy stdout stays opaque"
+        );
+        assert_eq!(
+            condition_outcome("exit 1", pile, ConditionProtocol::ResultV1).unwrap(),
+            ConditionOutcome::False
+        );
+        for code in [2, 3, 124, 126, 127] {
+            let error = condition_outcome(
+                &format!("{command}; echo unavailable >&2; exit {code}"),
+                pile,
+                ConditionProtocol::ResultV1,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                format!("condition command exited {code}: unavailable")
+            );
+        }
+        assert!(condition_outcome("kill -TERM $$", pile, ConditionProtocol::ResultV1).is_err());
+        assert!(condition_outcome("printf not-json", pile, ConditionProtocol::ResultV1).is_err());
+    }
+
+    #[test]
+    fn typed_evaluation_uses_unix_expiry_and_preserves_pause_cooldown_and_script() {
+        shared_cache();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = format!(
+            r#"{{"version":1,"result":"deferred","reason":"pending","attempt":"a","started_at":0,"expires_at":{}}}"#,
+            now + 3600
+        );
+        let mut pending = row(
+            "when-result-v1 @script",
+            &[],
+            Activation::Active(Vec::new()),
+        );
+        pending.script = Some(script(&format!("#!/bin/sh\nprintf '%s' '{payload}'\n")));
+        // Deliberately unrelated TAI evaluation time: protocol fields are UNIX.
+        assert!(matches!(
+            evaluate(&pending, i64::MAX, Path::new("./self.pile")),
+            State::Deferred(_)
+        ));
+        pending.script = Some(script("#!/bin/sh\nexit 2\n"));
+        pending.activation = Activation::Paused(Vec::new());
+        assert_eq!(
+            evaluate(&pending, 100, Path::new("./self.pile")),
+            State::Paused
+        );
+        pending.activation = Activation::Active(Vec::new());
+        pending.completed_at = vec![99];
+        assert_eq!(
+            evaluate(&pending, 100, Path::new("./self.pile")),
+            State::Cooling
+        );
+        pending.completed_at.clear();
+        assert!(matches!(
+            evaluate(&pending, 100, Path::new("./self.pile")),
+            State::Failed(_)
+        ));
+        pending.script = Some(script("#!/bin/sh\nprintf '%s' '{\"version\":1,\"result\":\"deferred\",\"reason\":\"pending\",\"attempt\":\"a\",\"started_at\":0,\"expires_at\":1}'\n"));
+        assert!(
+            matches!(evaluate(&pending, 0, Path::new("./self.pile")), State::Failed(error) if error.contains("expired"))
+        );
     }
 
     #[test]

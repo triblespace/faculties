@@ -2909,6 +2909,10 @@ struct DueHabit {
 struct HabitObservation {
     due: BTreeMap<Id, DueHabit>,
     attention: BTreeMap<Id, String>,
+    /// Rendered neutral readings for explicit evaluated overviews only. No
+    /// keyed shadow state, alert, receipt or producer lease is retained here.
+    /// String equality observes changes to the displayed values as well.
+    deferred: String,
     /// Intentions addressed to the observing persona.
     targeted: BTreeSet<Id>,
     /// Earliest completion-relative deadline that can change a cooling row.
@@ -3016,6 +3020,15 @@ fn observe_habits(
                     format!("{} [{:x}] {}: {error}", row.label, row.id, state.word()),
                 );
             }
+            habits::State::Deferred(pending) => {
+                use std::fmt::Write as _;
+                writeln!(
+                    observation.deferred,
+                    "- {} [{:x}]: {pending}",
+                    row.label, row.id
+                )
+                .unwrap();
+            }
             habits::State::Waiting | habits::State::Paused => {}
         }
     }
@@ -3072,6 +3085,10 @@ fn render_native_habits(observation: &HabitObservation) -> String {
         for warning in observation.attention.values() {
             writeln!(out, "- {warning}").unwrap();
         }
+    }
+    if !observation.deferred.is_empty() {
+        writeln!(out, "Habits deferred (verdict unknown):").unwrap();
+        out.push_str(&observation.deferred);
     }
     out
 }
@@ -7998,6 +8015,84 @@ mod tests {
         assert!(diagnostic.contains("condition command exited 2: status unavailable"));
         assert!(diagnostic.contains("unreadable"));
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn deferred_habit_is_inspectable_without_attention_or_presentation() {
+        let fixture = TestPile::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let payload = serde_json::json!({"version":1,"result":"deferred",
+            "reason":"refresh pending","attempt":"fixture-attempt",
+            "started_at":0,"expires_at":now + 3600});
+        let row = habits::HabitRow {
+            id: *fucid(),
+            label: "pending".into(),
+            condition: format!("when-result-v1 printf '%s' '{payload}'"),
+            nudge: "confirmed action".into(),
+            script: None,
+            activation: habits::Activation::Active(Vec::new()),
+            completed_at: Vec::new(),
+        };
+        let before = HabitObservation::default();
+        let pending =
+            observe_habits((vec![row.clone()], before.clone()), &fixture.path, 100).unwrap();
+        assert!(pending.due.is_empty() && pending.attention.is_empty());
+        assert!(render_native_habits(&pending).contains("refresh pending"));
+        let presented = archive(&TribleSet::new());
+        assert!(render_habit_transitions(&before, &pending, &presented).is_none());
+        assert!(render_due_habits_unreceipted(&pending, &presented).is_none());
+        let mut changed_detail = pending.clone();
+        changed_detail.deferred.push_str("changed detail\n");
+        assert_ne!(
+            pending, changed_detail,
+            "rendered values participate in equality"
+        );
+        assert!(render_habit_transitions(&pending, &changed_detail, &presented).is_none());
+
+        let mut due_row = row.clone();
+        due_row.condition =
+            "when-result-v1 printf '%s' '{\"version\":1,\"result\":\"true\"}'".into();
+        let mut error_row = row.clone();
+        error_row.condition = "when echo genuine-failure >&2; exit 2".into();
+        // Same identity, multiple readings: a Deferred reading must not erase
+        // another reading's positive verdict or genuine failure.
+        let mixed = observe_habits(
+            (
+                vec![row.clone(), due_row.clone(), error_row.clone()],
+                before.clone(),
+            ),
+            &fixture.path,
+            100,
+        )
+        .unwrap();
+        assert!(mixed.due.contains_key(&row.id));
+        assert!(mixed.attention[&row.id].contains("genuine-failure"));
+        assert!(!mixed.deferred.is_empty());
+        let (report, receipts) = render_habit_transitions(&pending, &mixed, &presented).unwrap();
+        assert!(
+            report.text.contains("confirmed action") && report.text.contains("genuine-failure")
+        );
+        assert!(!report.text.contains("refresh pending"));
+        assert_eq!(receipts, vec![(row.id, 0)]);
+
+        let mut false_row = row.clone();
+        false_row.condition =
+            "when-result-v1 printf '%s' '{\"version\":1,\"result\":\"false\"}'".into();
+        let waiting =
+            observe_habits((vec![false_row], before.clone()), &fixture.path, 100).unwrap();
+        assert!(waiting.deferred.is_empty());
+        assert!(render_habit_transitions(&pending, &waiting, &presented).is_none());
+        let failed = observe_habits((vec![error_row], before.clone()), &fixture.path, 100).unwrap();
+        let (_, receipts) = render_habit_transitions(&pending, &failed, &presented).unwrap();
+        assert!(receipts.is_empty());
+        let due = observe_habits((vec![due_row], before), &fixture.path, 100).unwrap();
+        let (_, receipts) = render_habit_transitions(&pending, &due, &presented).unwrap();
+        assert_eq!(receipts, vec![(row.id, 0)]);
+        let already_presented = presented_habit_due(receipts);
+        assert!(render_habit_transitions(&pending, &due, &already_presented).is_none());
     }
 
     /// Only a complete, understood state assertion supersedes another. A

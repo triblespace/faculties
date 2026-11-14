@@ -542,3 +542,91 @@ fn failed_predicate_is_diagnostic_and_pause_still_short_circuits_it() {
         Some(habits::State::Paused)
     );
 }
+
+#[test]
+fn deferred_is_neutral_in_both_frontends_and_does_not_hide_due_or_errors() {
+    let (_directory, pile, key) = fixture();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let payload = json!({"version":1,"result":"deferred","reason":"refresh pending",
+        "attempt":"fixture-attempt","started_at":0,"expires_at":now + 3600});
+    let mcp = habits::mcp::Habits::new(pile.clone(), Some(key.clone()));
+    call(
+        &mcp,
+        "habit_add",
+        json!({
+            "label":"pending", "when":format!("when-result-v1 printf '%s' '{payload}'"),
+            "nudge":"not confirmed"
+        }),
+    );
+    let passive = call(&mcp, "habit_list", json!({}));
+    assert!(passive.contains("unevaluated"));
+    assert!(!passive.contains("deferred:"));
+    for text in [
+        call(&mcp, "habit_list", json!({"evaluate_conditions":true})),
+        call(&mcp, "habit_due", json!({})),
+        cli(&pile, &key, &["list"]),
+        cli(&pile, &key, &["due"]),
+    ] {
+        assert!(
+            text.contains("deferred") && text.contains("refresh pending"),
+            "{text}"
+        );
+        assert!(!text.contains("nothing due"), "{text}");
+        assert!(!text.contains("ERROR"), "{text}");
+    }
+    let due = call(&mcp, "habit_due", json!({}));
+    assert!(
+        due.contains("no confirmed due; 1 deferred reading(s)"),
+        "{due}"
+    );
+    let operations = Habits::new(pile.clone(), Some(key.clone()));
+    operations
+        .add("confirmed", "when true", "confirmed action", None, &[], &[])
+        .unwrap();
+    operations
+        .add(
+            "broken",
+            "when echo genuine-failure >&2; exit 2",
+            "never announce",
+            None,
+            &[],
+            &[],
+        )
+        .unwrap();
+    let mut text = String::new();
+    let error = mcp
+        .call(
+            "habit_due",
+            b"{}".to_vec().into(),
+            &mut Out::new(&mut |part| {
+                if let Part::Text { text: emitted } = part {
+                    text.push_str(&emitted);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("could not be evaluated"));
+    assert!(text.contains("refresh pending"), "{text}");
+    assert!(text.contains("confirmed action"), "{text}");
+    assert!(text.contains("genuine-failure"), "{text}");
+    assert!(!text.contains("never announce"), "{text}");
+    let result = Command::new(env!("CARGO_BIN_EXE_habit"))
+        .arg("--pile")
+        .arg(&pile)
+        .arg("--key")
+        .arg(&key)
+        .arg("due")
+        .env_remove("PILE")
+        .env_remove("DRIVE_ENDPOINT")
+        .env_remove("DRIVE_KEY")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("refresh pending") && stdout.contains("confirmed action"));
+    assert!(String::from_utf8_lossy(&result.stderr).contains("genuine-failure"));
+}
