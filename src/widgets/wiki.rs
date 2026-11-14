@@ -305,7 +305,11 @@ impl WikiLive {
         let path = tmp_dir.join(&name);
         std::fs::write(&path, &*blob.bytes)
             .map_err(|_| "Cannot write the file preview.".to_owned())?;
-        let opener = if cfg!(target_os = "linux") { "xdg-open" } else { "open" };
+        let opener = if cfg!(target_os = "linux") {
+            "xdg-open"
+        } else {
+            "open"
+        };
         std::process::Command::new(opener)
             .arg(&path)
             .spawn()
@@ -505,7 +509,23 @@ impl WikiGraph {
         let label_color = ui.visuals().text_color();
         let font_id = egui::TextStyle::Small.resolve(ui.style());
 
-        let edge_stroke = egui::Stroke::new(0.5, edge_color);
+        // Detail follows how far apart nodes sit on screen, as in the mesh and
+        // the lattice. Framed whole, a few thousand marks of a fixed symbol
+        // size overlap into one blot and hide the layout's structure; as
+        // small dots with faint links the clusters show (JP, 2026-11-14).
+        // The pitch is the typical spacing: the layout's area per node.
+        let detail = {
+            let [x0, y0, x1, y1] = self.layout.layout().stats().bounds;
+            let area = ((x1 - x0) * (y1 - y0)).max(1.0);
+            let pitch = (area / self.nodes.len().max(1) as f32).sqrt();
+            view.lod(pitch)
+        };
+        let dotted = matches!(detail, graph::Lod::Dots | graph::Lod::Aggregate);
+        let edge_stroke = if dotted {
+            egui::Stroke::new(0.3_f32, edge_color.gamma_multiply(0.35))
+        } else {
+            egui::Stroke::new(0.5_f32, edge_color)
+        };
         for &(a, b) in &self.edges {
             let p1 = to_screen(positions[a]);
             let p2 = to_screen(positions[b]);
@@ -517,7 +537,7 @@ impl WikiGraph {
 
         let mut clicked = None;
         let hover_pos = response.hover_pos();
-        let show_labels = zoom > 0.3;
+        let show_labels = zoom > 0.3 && !dotted;
         // Slightly-translucent background behind each label so text
         // stays readable over crossing edges. Use a dark tint of the
         // panel fill; fall back to near-black when the theme is light.
@@ -553,8 +573,21 @@ impl WikiGraph {
             // The degree comes from the layout's own adjacency rather than
             // from a second count kept here: the solver already builds it, and
             // two counts of the same edges are two chances to disagree.
-            let deg_scale = (1.0 + self.layout.layout().degree(index).ln() * 0.4).min(3.0);
-            let r = node_radius * deg_scale;
+            let degree = self.layout.layout().degree(index);
+            let deg_scale = (1.0 + degree.ln() * 0.4).min(3.0);
+            let r = if dotted {
+                // Unlinked notes a little smaller, so the linked structure
+                // reads first; a search match keeps a visible size.
+                if is_match {
+                    3.0
+                } else if degree <= 1.0 {
+                    1.0
+                } else {
+                    1.5
+                }
+            } else {
+                node_radius * deg_scale
+            };
             // Matching nodes paint in RAL 1003 (signal yellow) — same
             // color GORBIE uses for word-level search underlines, so
             // the graph and the floats highlight in lock-step.
@@ -569,16 +602,20 @@ impl WikiGraph {
             // collection are the same vocabulary rather than three sketches of
             // it. The outline is a second call because the kit takes one
             // colour per mark; the result is the shape `painter.circle` drew.
-            graph::draw_node(
-                &painter,
-                pos,
-                r / graph::MARK,
-                graph::Glyph::Circle,
-                graph::Stroke2::Filled,
-                fill,
-                1,
-            );
-            painter.circle_stroke(pos, r, node_stroke);
+            if dotted {
+                painter.circle_filled(pos, r, fill);
+            } else {
+                graph::draw_node(
+                    &painter,
+                    pos,
+                    r / graph::MARK,
+                    graph::Glyph::Circle,
+                    graph::Stroke2::Filled,
+                    fill,
+                    1,
+                );
+                painter.circle_stroke(pos, r, node_stroke);
+            }
             if show_labels {
                 // Measure the label first so we know whether it fits
                 // on the right. If painting to the right of the node
