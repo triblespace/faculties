@@ -31,26 +31,32 @@ fn resolve_pile_path() -> PathBuf {
 fn main(nb: &mut NotebookCtx) {
     let path = resolve_pile_path();
 
-    let storage = nb.state("storage", StorageState::new(path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        move || StorageState::new(path),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.state(
         "timeline",
-        BranchTimeline::multi(vec![
-            TimelineSource::Compass {
-                key: SourceKey::Compass,
-                label: "goals".to_owned(),
-            },
-            TimelineSource::LocalMessages {
-                key: SourceKey::Messages,
-                label: "local".to_owned(),
-            },
-            TimelineSource::Wiki {
-                key: SourceKey::Wiki,
-                label: "wiki".to_owned(),
-            },
-        ]),
+        || {
+            BranchTimeline::multi(vec![
+                TimelineSource::Compass {
+                    key: SourceKey::Compass,
+                    label: "goals".to_owned(),
+                },
+                TimelineSource::LocalMessages {
+                    key: SourceKey::Messages,
+                    label: "local".to_owned(),
+                },
+                TimelineSource::Wiki {
+                    key: SourceKey::Wiki,
+                    label: "wiki".to_owned(),
+                },
+            ])
+        },
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
             let sources = st.context();
@@ -58,7 +64,7 @@ fn main(nb: &mut NotebookCtx) {
         },
     );
 
-    nb.state("wiki", WikiViewer::default(), move |ctx, wiki| {
+    nb.state("wiki", WikiViewer::default, move |ctx, wiki| {
         let mut st = storage.read_mut(ctx);
         let sources = st.context();
         let Some(view) = sources.dataset(SourceKey::Wiki) else {
@@ -67,7 +73,7 @@ fn main(nb: &mut NotebookCtx) {
         wiki.render(ctx, view, sources.dataset(SourceKey::Files));
     });
 
-    nb.state("compass", CompassBoard::default(), move |ctx, compass| {
+    nb.state("compass", CompassBoard::default, move |ctx, compass| {
         let mut st = storage.read_mut(ctx);
         let Some(view) = st.context().dataset(SourceKey::Compass) else {
             return;
@@ -75,7 +81,7 @@ fn main(nb: &mut NotebookCtx) {
         compass.render(ctx, view);
     });
 
-    nb.state("messages", MessagesPanel::default(), move |ctx, panel| {
+    nb.state("messages", MessagesPanel::default, move |ctx, panel| {
         let mut st = storage.read_mut(ctx);
         let sources = st.context();
         let Some(view) = sources.dataset(SourceKey::Messages) else {

@@ -22,9 +22,13 @@ fn main(nb: &mut NotebookCtx) {
         .or_else(|| std::env::var("PILE").ok())
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into();
-    let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        move || StorageState::new(pile_path),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.view(|ctx| {
         ctx.grid(|g| {
@@ -36,10 +40,12 @@ fn main(nb: &mut NotebookCtx) {
 
     nb.state(
         "timeline",
-        BranchTimeline::multi(vec![TimelineSource::Wiki {
-            key: SourceKey::Wiki,
-            label: "wiki".into(),
-        }]),
+        || {
+            BranchTimeline::multi(vec![TimelineSource::Wiki {
+                key: SourceKey::Wiki,
+                label: "wiki".into(),
+            }])
+        },
         move |ctx, tl| {
             let mut st = storage.read_mut(ctx);
             tl.render(ctx, &st.context());

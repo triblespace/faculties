@@ -22,9 +22,13 @@ fn main(nb: &mut NotebookCtx) {
         .unwrap_or_else(|| "./self.pile".to_owned())
         .into();
 
-    let storage = nb.state("storage", StorageState::new(pile_path), |ctx, st| {
-        st.top_bar(ctx);
-    });
+    let storage = nb.state(
+        "storage",
+        move || StorageState::new(pile_path),
+        |ctx, st| {
+            st.top_bar(ctx);
+        },
+    );
 
     nb.view(|ctx| {
         ctx.grid(|g| {
@@ -34,7 +38,7 @@ fn main(nb: &mut NotebookCtx) {
         });
     });
 
-    nb.state("wiki", WikiViewer::default(), move |ctx, viewer| {
+    nb.state("wiki", WikiViewer::default, move |ctx, viewer| {
         let mut st = storage.read_mut(ctx);
         let sources = st.context();
         let Some(wiki) = sources.dataset(SourceKey::Wiki) else {
