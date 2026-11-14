@@ -13,8 +13,8 @@
 //! independently; those unsigned artifacts are cache exhaust, not
 //! authoritative writes. Most sources are
 //! fixed descriptor-handle collections. Secrets uses the same explicit
-//! collection configuration and is attached only when the pile signer is
-//! admitted to READ it.
+//! collection configuration and preserves local delivered-envelope possession
+//! semantics; collection READ governs replication, not opening a local wrap.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -316,6 +316,7 @@ struct LoadedSecrets {
 }
 
 struct LoadedInputs {
+    unavailable: BTreeSet<SourceKey>,
     datasets: BTreeMap<SourceKey, LoadedDataset>,
     secrets: Option<LoadedSecrets>,
 }
@@ -446,6 +447,8 @@ struct FileStamp {
 
 /// Shared read-only pile state and top-bar path selector.
 pub struct StorageState {
+    workspace_only: bool,
+    unavailable: BTreeSet<SourceKey>,
     datasets: Option<BTreeMap<SourceKey, LoadedDataset>>,
     secrets: Option<LoadedSecrets>,
     sources: BTreeSet<SourceKey>,
@@ -488,6 +491,8 @@ impl StorageState {
         let storage = storage.retained();
         let pile_path_text = storage.path().to_string_lossy().into_owned();
         Self {
+            workspace_only: false,
+            unavailable: BTreeSet::new(),
             datasets: None,
             secrets: None,
             sources: source_closure(sources),
@@ -496,6 +501,28 @@ impl StorageState {
             stamp: None,
             error: None,
         }
+    }
+
+    /// Observe only explicitly routed workspace roles. Missing roles are
+    /// omitted; denied or unavailable roles cannot hide independent views.
+    /// The constructor is I/O-free; refresh belongs on the host's worker.
+    pub fn for_workspace(storage: Storage) -> Result<Self, String> {
+        if storage.collection_routes().is_none() {
+            return Err("Choose a workspace before opening its views.".into());
+        }
+        let mut state = Self::with_storage(storage, SourceKey::ALL);
+        state.workspace_only = true;
+        Ok(state)
+    }
+
+    pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.unavailable.iter().map(|key| {
+            COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|entry| entry.key == *key)
+                .map(|entry| entry.label)
+                .unwrap_or("Secrets")
+        })
     }
 
     /// Select an explicit launcher-owned signing key for lazy observation.
@@ -579,8 +606,16 @@ impl StorageState {
     }
 
     fn reload_current_path(&mut self) {
-        match load_consistent_inputs(&self.storage, &self.sources) {
+        let result = if self.workspace_only {
+            file_stamp(self.storage.path()).and_then(|stamp| {
+                load_inputs_mode(&self.storage, &self.sources, true).map(|inputs| (inputs, stamp))
+            })
+        } else {
+            load_consistent_inputs(&self.storage, &self.sources)
+        };
+        match result {
             Ok((inputs, stamp)) => {
+                self.unavailable = inputs.unavailable;
                 self.datasets = Some(inputs.datasets);
                 self.secrets = inputs.secrets;
                 self.stamp = Some(stamp);
@@ -701,16 +736,86 @@ fn load_consistent_inputs(
 }
 
 fn load_inputs(storage: &Storage, sources: &BTreeSet<SourceKey>) -> Result<LoadedInputs, String> {
+    load_inputs_mode(storage, sources, false)
+}
+
+fn remove_scope(sources: &mut BTreeSet<SourceKey>, scope: Id) -> BTreeSet<SourceKey> {
+    let removed: BTreeSet<_> = COLLECTION_SOURCE_CATALOG
+        .iter()
+        .filter(|entry| entry.scope == scope && sources.contains(&entry.key))
+        .map(|entry| entry.key)
+        .collect();
+    sources.retain(|key| !removed.contains(key));
+    removed
+}
+
+fn load_inputs_mode(
+    storage: &Storage,
+    requested: &BTreeSet<SourceKey>,
+    partial: bool,
+) -> Result<LoadedInputs, String> {
     storage
         .with_store(|store, signer, runtime| {
-            for (scope, _) in collection_scopes(sources) {
-                storage.open_collection_read(store, scope, signer.verifying_key(), runtime)?;
+            let mut sources = requested.clone();
+            let mut unavailable = BTreeSet::new();
+            if partial {
+                let routes = storage
+                    .collection_routes()
+                    .ok_or_else(|| anyhow::anyhow!("workspace routes are required"))?;
+                sources.retain(|key| {
+                    let scope = if *key == SourceKey::Secrets {
+                        crate::secrets::DEFAULT_SCOPE_ID
+                    } else {
+                        COLLECTION_SOURCE_CATALOG
+                            .iter()
+                            .find(|entry| entry.key == *key)
+                            .expect("every source has a role")
+                            .scope
+                    };
+                    routes.contains_key(&scope)
+                });
+            }
+            for (scope, _) in collection_scopes(&sources) {
+                if let Err(error) =
+                    storage.open_collection_read(store, scope, signer.verifying_key(), runtime)
+                {
+                    if !partial {
+                        return Err(error);
+                    }
+                    unavailable.extend(remove_scope(&mut sources, scope));
+                }
             }
             if sources.contains(&SourceKey::Secrets) {
-                storage.open_secrets_collection(store, signer.verifying_key(), runtime, false)?;
+                let admission = (|| {
+                    // Secrets READ governs replication. Opening an already
+                    // delivered local envelope keeps Secrets' possession rules.
+                    // The explicit workspace route is still required above.
+                    storage.open_secrets_collection(
+                        store,
+                        signer.verifying_key(),
+                        runtime,
+                        false,
+                    )?;
+                    Ok::<_, anyhow::Error>(())
+                })();
+                if let Err(error) = admission {
+                    if !partial {
+                        return Err(error);
+                    }
+                    sources.remove(&SourceKey::Secrets);
+                    unavailable.insert(SourceKey::Secrets);
+                }
             }
-            load_inputs_from_store(storage, store, signer, sources, runtime)
-                .map_err(anyhow::Error::msg)
+            load_inputs_from_store_mode(
+                storage,
+                store,
+                signer,
+                &sources,
+                runtime,
+                partial,
+                unavailable,
+            )
+            .map_err(anyhow::Error::msg)
         })
         .map_err(|error| format!("load viewer storage: {error:#}"))
 }
@@ -742,200 +847,183 @@ fn load_inputs_from_store(
     sources: &BTreeSet<SourceKey>,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
 ) -> Result<LoadedInputs, String> {
-    let loaded = (|| {
-        let mut by_scope = BTreeMap::<Id, Collection<Rank9AcceleratedSuccinctArchiveBlob>>::new();
-        let mut lww_by_scope = BTreeMap::<Id, BTreeMap<(Id, Id), LwwQuery>>::new();
-        let mut latest_by_scope = BTreeMap::<Id, BTreeMap<Id, LatestIndex>>::new();
+    load_inputs_from_store_mode(
+        storage,
+        pile,
+        signer,
+        sources,
+        runtime,
+        false,
+        BTreeSet::new(),
+    )
+}
 
-        let mut collections = Vec::new();
-        for (scope, label) in collection_scopes(sources) {
+fn load_inputs_from_store_mode(
+    storage: &Storage,
+    pile: &mut FacultyStore,
+    signer: &ed25519_dalek::SigningKey,
+    requested: &BTreeSet<SourceKey>,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    partial: bool,
+    mut unavailable: BTreeSet<SourceKey>,
+) -> Result<LoadedInputs, String> {
+    let mut sources = requested.clone();
+    let mut collections = Vec::new();
+    let mut compass_register = None;
+    let mut wiki_latest = None;
+    for (scope, label) in collection_scopes(&sources) {
+        let registration = (|| {
             let source = storage
                 .open_collection_local(pile, scope, signer.verifying_key())
-                .map_err(|error| format!("register {label} collection: {error:#}"))?;
+                .map_err(|error| format!("open {label}: {error:#}"))?;
             let succinct = pile
                 .attach::<SuccinctArchiveBlob>(source, ())
-                .map_err(|error| format!("register Succinct {label} collection: {error:#}"))?;
+                .map_err(|error| format!("attach {label}: {error:#}"))?;
             let rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-                .map_err(|error| format!("register Rank9 {label} collection: {error:#}"))?;
-            collections.push((scope, label, source, succinct, rank9));
+                .map_err(|error| format!("attach {label}: {error:#}"))?;
+            if scope == COMPASS_SCOPE_ID {
+                compass_register = Some(
+                    crate::compass::status_register_for_source(pile, source)
+                        .map_err(|error| format!("attach Compass status: {error:#}"))?,
+                );
+            }
+            if scope == WIKI_SCOPE_ID {
+                wiki_latest = Some(
+                    crate::wiki::latest_for_source(pile, source)
+                        .map_err(|error| format!("attach Wiki supersession: {error:#}"))?,
+                );
+            }
+            Ok::<_, String>(rank9)
+        })();
+        match registration {
+            Ok(rank9) => collections.push((scope, label, rank9)),
+            Err(error) if !partial => return Err(error),
+            Err(_) => unavailable.extend(remove_scope(&mut sources, scope)),
         }
+    }
 
-        let compass_register = sources
-            .contains(&SourceKey::Compass)
-            .then(|| {
-                let source = storage
-                    .open_collection_local(
-                        pile,
-                        crate::schemas::compass::DEFAULT_SCOPE_ID,
-                        signer.verifying_key(),
-                    )
-                    .map_err(|error| format!("open Compass source: {error:#}"))?;
-                crate::compass::status_register_for_source(pile, source)
-                    .map_err(|error| format!("register Compass status collection: {error:#}"))
-            })
-            .transpose()?;
-        let wiki_latest = sources
-            .contains(&SourceKey::Wiki)
-            .then(|| {
-                let source = storage
-                    .open_collection_local(
-                        pile,
-                        crate::schemas::wiki::DEFAULT_SCOPE_ID,
-                        signer.verifying_key(),
-                    )
-                    .map_err(|error| format!("open Wiki source: {error:#}"))?;
-                crate::wiki::latest_for_source(pile, source)
-                    .map_err(|error| format!("register Wiki observation collection: {error:#}"))
-            })
-            .transpose()?;
-
-        let secrets_collection = sources
-            .contains(&SourceKey::Secrets)
-            .then(|| {
-                storage
-                    .open_secrets_collection(pile, signer.verifying_key(), runtime, false)
-                    .map_err(|error| format!("open configured Secrets collection: {error:#}"))
-            })
-            .transpose()?;
-
-        // The viewer reads what the maintenance worker has carried and never
-        // maintains. Positive indexes are independently maintained query
-        // relations: their support need not equal fact support to admit only
-        // known winners.
-        for (scope, _, _, _, rank9) in collections {
-            by_scope.insert(scope, rank9);
-        }
-
-        let secrets = if let Some(collection) = secrets_collection {
+    let secrets = if sources.contains(&SourceKey::Secrets) {
+        let observed = (|| {
+            let collection = storage
+                .open_secrets_collection(pile, signer.verifying_key(), runtime, false)
+                .map_err(|error| format!("open Secrets: {error:#}"))?;
             let snapshot = runtime
                 .block_on(secret_storage::ensure_and_snapshot(
                     pile, collection, signer,
                 ))
-                .map_err(|error| format!("observe configured Secrets collection: {error:#}"))?;
-            Some(snapshot)
-        } else {
-            None
-        };
-
-        // Secrets discovery already owns the final immutable snapshot when it
-        // participates. Reuse it so all facts, attachments, and credentials
-        // inhabit literally one known-prefix observation. A viewer without
-        // Secrets freezes the same boundary itself.
-        let store_snapshot = match secrets.as_ref() {
-            Some(secrets) => secrets.store_snapshot().clone(),
-            None => pile
-                .snapshot()
-                .map_err(|error| format!("freeze maintained viewer snapshot: {error}"))?,
-        };
-        let store_snapshot = AcquiringReader::new(store_snapshot, runtime.clone());
-        let secrets = secrets_collection
-            .map(|collection| {
-                secret_storage::snapshot_acquiring(store_snapshot.clone(), collection)
-                    .map(LoadedSecrets::new)
-                    .map_err(|error| format!("read configured Secrets collection: {error:#}"))
-            })
-            .transpose()?;
-
-        let mut facts_by_scope = BTreeMap::new();
-        let mut revisions_by_scope = BTreeMap::new();
-        for (scope, rank9) in &by_scope {
-            let label = COLLECTION_SOURCE_CATALOG
-                .iter()
-                .find(|source| source.scope == *scope)
-                .expect("every maintained viewer scope has a source label")
-                .label;
-            let (facts, revision) = attached_facts_and_revision(&store_snapshot, *rank9)
-                .map_err(|error| format!("read maintained {label} collection: {error:#}"))?;
-            revisions_by_scope.insert(*scope, revision);
-            facts_by_scope.insert(*scope, facts);
-        }
-
-        if let Some(target) = compass_register {
-            let collection = store_snapshot
-                .attached_acquiring(target)
-                .map_err(|error| format!("attach Compass status register: {error}"))?;
-            let (index, unread) = collection
-                .read_acquiring::<LwwIndex>()
-                .map_err(|error| format!("read Compass status register: {error}"))?
-                .into_parts();
-            if !unread.is_empty() {
-                return Err(format!(
-                    "Compass status register has {} unread foundations",
-                    unread.len()
-                ));
+                .map_err(|error| format!("observe Secrets: {error:#}"))?;
+            Ok::<_, String>((collection, snapshot))
+        })();
+        match observed {
+            Ok(value) => Some(value),
+            Err(error) if !partial => return Err(error),
+            Err(_) => {
+                unavailable.insert(SourceKey::Secrets);
+                None
             }
-            let index = index
-                .query()
-                .map_err(|error| format!("prepare Compass status register query: {error}"))?;
-            revisions_by_scope
-                .get_mut(&COMPASS_SCOPE_ID)
-                .expect("Compass facts were attached")
-                .include_attached(&collection, &unread);
-            lww_by_scope.entry(COMPASS_SCOPE_ID).or_default().insert(
-                (
-                    crate::schemas::compass::board::status_of.id(),
-                    triblespace::core::metadata::created_at.id(),
-                ),
-                index,
-            );
         }
+    } else {
+        None
+    };
 
-        if let Some(target) = wiki_latest {
-            let collection = store_snapshot
-                .attached_acquiring(target)
-                .map_err(|error| format!("attach Wiki supersession index: {error}"))?;
-            let (index, unread) = collection
-                .read_acquiring::<LatestIndex>()
-                .map_err(|error| format!("read Wiki supersession index: {error}"))?
-                .into_parts();
-            if !unread.is_empty() {
-                return Err(format!(
-                    "Wiki latest index has {} unread foundations",
-                    unread.len()
-                ));
+    // One final native observation serves every admitted dataset and index.
+    // Failure of an optional role never causes another view to select again.
+    let snapshot = match &secrets {
+        Some((_, secrets)) => secrets.store_snapshot().clone(),
+        None => pile
+            .snapshot()
+            .map_err(|error| format!("freeze viewer observation: {error}"))?,
+    };
+    let snapshot = AcquiringReader::new(snapshot, runtime.clone());
+    let secrets = match secrets {
+        Some((collection, _)) => {
+            match secret_storage::snapshot_acquiring(snapshot.clone(), collection) {
+                Ok(snapshot) => Some(LoadedSecrets::new(snapshot)),
+                Err(error) if !partial => return Err(format!("read Secrets: {error:#}")),
+                Err(_) => {
+                    unavailable.insert(SourceKey::Secrets);
+                    None
+                }
             }
-            revisions_by_scope
-                .get_mut(&WIKI_SCOPE_ID)
-                .expect("Wiki facts were attached")
-                .include_attached(&collection, &unread);
-            latest_by_scope
-                .entry(WIKI_SCOPE_ID)
-                .or_default()
-                .insert(triblespace::core::metadata::supersedes.id(), index);
         }
+        None => None,
+    };
 
-        let datasets = COLLECTION_SOURCE_CATALOG
-            .iter()
-            .filter(|source| sources.contains(&source.key))
-            .map(|source| {
-                let revision = revisions_by_scope
-                    .get(&source.scope)
-                    .expect("every fixed viewer scope was maintained");
-                let facts = facts_by_scope
-                    .get(&source.scope)
-                    .expect("every maintained viewer scope was attached");
-                let lww_registers = lww_by_scope.get(&source.scope).cloned().unwrap_or_default();
-                let latest_indexes = latest_by_scope
-                    .get(&source.scope)
-                    .cloned()
-                    .unwrap_or_default();
-                (
-                    source.key,
-                    LoadedDataset::new(
-                        facts.clone(),
-                        *revision,
-                        store_snapshot.clone(),
-                        lww_registers,
-                        latest_indexes,
-                    ),
-                )
-            })
-            .collect();
-        Ok(LoadedInputs { datasets, secrets })
-    })();
-
-    loaded
+    let mut datasets = BTreeMap::new();
+    for (scope, label, rank9) in collections {
+        let read = (|| {
+            let (facts, mut revision) = attached_facts_and_revision(&snapshot, rank9)
+                .map_err(|error| format!("read {label}: {error:#}"))?;
+            let mut lww = BTreeMap::new();
+            let mut latest = BTreeMap::new();
+            if scope == COMPASS_SCOPE_ID {
+                if let Some(target) = compass_register {
+                    let collection = snapshot
+                        .attached_acquiring(target)
+                        .map_err(|e| e.to_string())?;
+                    let (index, unread) = collection
+                        .read_acquiring::<LwwIndex>()
+                        .map_err(|e| e.to_string())?
+                        .into_parts();
+                    if !unread.is_empty() {
+                        return Err("Compass status is unavailable.".into());
+                    }
+                    revision.include_attached(&collection, &unread);
+                    lww.insert(
+                        (
+                            crate::schemas::compass::board::status_of.id(),
+                            triblespace::core::metadata::created_at.id(),
+                        ),
+                        index.query().map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            if scope == WIKI_SCOPE_ID {
+                if let Some(target) = wiki_latest {
+                    let collection = snapshot
+                        .attached_acquiring(target)
+                        .map_err(|e| e.to_string())?;
+                    let (index, unread) = collection
+                        .read_acquiring::<LatestIndex>()
+                        .map_err(|e| e.to_string())?
+                        .into_parts();
+                    if !unread.is_empty() {
+                        return Err("Wiki supersession is unavailable.".into());
+                    }
+                    revision.include_attached(&collection, &unread);
+                    latest.insert(triblespace::core::metadata::supersedes.id(), index);
+                }
+            }
+            Ok::<_, String>((facts, revision, lww, latest))
+        })();
+        match read {
+            Ok((facts, revision, lww, latest)) => {
+                for source in COLLECTION_SOURCE_CATALOG
+                    .iter()
+                    .filter(|entry| entry.scope == scope && sources.contains(&entry.key))
+                {
+                    datasets.insert(
+                        source.key,
+                        LoadedDataset::new(
+                            facts.clone(),
+                            revision,
+                            snapshot.clone(),
+                            lww.clone(),
+                            latest.clone(),
+                        ),
+                    );
+                }
+            }
+            Err(error) if !partial => return Err(error),
+            Err(_) => unavailable.extend(remove_scope(&mut sources, scope)),
+        }
+    }
+    Ok(LoadedInputs {
+        datasets,
+        secrets,
+        unavailable,
+    })
 }
 
 fn render_banner(ctx: &mut CardCtx<'_>, icon: &str, message: &str, color: egui::Color32) {
@@ -1037,6 +1125,158 @@ mod tests {
             .into_iter()
             .filter(|key| context.contains(*key))
             .collect()
+    }
+
+    fn workspace_fixture() -> (tempfile::TempDir, Storage) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("views.pile");
+        let key = directory.path().join("views.key");
+        File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, Some(&key)).unwrap();
+        let storage =
+            Storage::shared_local(path, Some(key)).with_expected_signer(signer.verifying_key());
+        (directory, storage)
+    }
+
+    #[test]
+    fn workspace_views_require_explicit_routes_without_opening_a_default_pile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.pile");
+        assert!(StorageState::for_workspace(Storage::shared_local(path.clone(), None)).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn workspace_views_omit_missing_roles_and_keep_readable_data_when_another_role_is_denied() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let (_directory, storage) = workspace_fixture();
+        let other = SigningKey::from_bytes(&[31; 32]).verifying_key();
+        let routes = storage
+            .with_store(|store, signer, _| {
+                let teams = store.collection(
+                    "teams",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::Open,
+                        AdmissionPolicy::direct(signer.verifying_key()),
+                    ),
+                )?;
+                let files = store.collection(
+                    "files",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::direct(other),
+                        AdmissionPolicy::direct(signer.verifying_key()),
+                    ),
+                )?;
+                // A readable same-name alternative exists. It must never be used
+                // when the workspace's exact Files root refuses READ.
+                let _other_files = store.collection(
+                    "files",
+                    CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+                )?;
+                Ok(BTreeMap::from([
+                    (TEAMS_SCOPE_ID, teams.handle()),
+                    (FILES_SCOPE_ID, files.handle()),
+                ]))
+            })
+            .unwrap();
+        let mut views =
+            StorageState::for_workspace(storage.clone().with_collections(routes)).unwrap();
+        views.refresh();
+        assert!(views.error().is_none(), "{:?}", views.error());
+        assert_eq!(
+            visible_keys(views.loaded_context()),
+            BTreeSet::from([SourceKey::Teams])
+        );
+        assert_eq!(
+            views.unavailable_labels().collect::<Vec<_>>(),
+            vec!["Files"]
+        );
+        assert!(!views.loaded_context().contains(SourceKey::Wiki));
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn workspace_secrets_keep_delivered_wrap_possession_without_collection_read() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let (_directory, storage) = workspace_fixture();
+        let replication_owner = SigningKey::from_bytes(&[29; 32]).verifying_key();
+        let (handle, secret, signer) = storage
+            .with_store(|store, signer, _| {
+                let source = store.collection(
+                    "secrets",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::direct(replication_owner),
+                        AdmissionPolicy::direct(signer.verifying_key()),
+                    ),
+                )?;
+                let time = Epoch::from_unix_seconds(100.0);
+                let sealed = crate::secrets::seal_version(
+                    "delivered",
+                    b"local envelope",
+                    [signer.verifying_key()],
+                    (time, time)
+                        .try_to_inline()
+                        .expect("equal fixture endpoints form a valid interval"),
+                )?;
+                let secret = sealed.secret;
+                store.commit(source, signer, sealed.fragment)?;
+                Ok((source.handle(), secret, signer.clone()))
+            })
+            .unwrap();
+        let selected = storage
+            .clone()
+            .with_collections(BTreeMap::from([(crate::secrets::DEFAULT_SCOPE_ID, handle)]));
+        assert!(
+            selected
+                .with_store(|store, signer, runtime| {
+                    selected.open_collection_read(
+                        store,
+                        crate::secrets::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )
+                })
+                .is_err(),
+            "the fixture must really deny collection READ"
+        );
+        let mut views = StorageState::for_workspace(selected).unwrap();
+        views.refresh();
+        assert!(views.error().is_none(), "{:?}", views.error());
+        let secret_view = views.loaded_context().secrets().unwrap();
+        assert_eq!(
+            secret_view.snapshot.open(secret, &signer).unwrap(),
+            b"local envelope"
+        );
+        assert!(views.unavailable_labels().next().is_none());
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn workspace_views_share_one_observation_and_do_not_require_optional_relations() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let (_directory, storage) = workspace_fixture();
+        let routes = storage
+            .with_store(|store, _, _| {
+                let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+                let messages = store.collection("message", policy.clone())?;
+                let teams = store.collection("teams", policy)?;
+                Ok(BTreeMap::from([
+                    (MESSAGES_SCOPE_ID, messages.handle()),
+                    (TEAMS_SCOPE_ID, teams.handle()),
+                ]))
+            })
+            .unwrap();
+        let mut views =
+            StorageState::for_workspace(storage.clone().with_collections(routes)).unwrap();
+        views.refresh();
+        assert!(views.error().is_none(), "{:?}", views.error());
+        let context = views.loaded_context();
+        let messages = context.dataset(SourceKey::Messages).unwrap();
+        let teams = context.dataset(SourceKey::Teams).unwrap();
+        assert!(context.dataset(SourceKey::Relations).is_none());
+        assert!(messages.reader.changes_since(teams.reader).is_empty());
+        assert!(teams.reader.changes_since(messages.reader).is_empty());
+        storage.close().unwrap();
     }
 
     #[test]

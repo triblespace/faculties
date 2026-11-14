@@ -294,28 +294,56 @@ impl WikiLive {
         let blob: Blob<RawBytes> = files.reader.get(handle).map_err(|_| {
             "This file is not available on this device yet. Wait for sync, then Refresh.".to_owned()
         })?;
-        // Admit the side effect only after reading the clicked observation's
-        // exact bytes. Same leaf names with different content cannot collide.
-        before_export()?;
-        let tmp_dir = std::env::temp_dir()
-            .join("faculties-files")
-            .join(crate::files::content_hash_hex(handle));
-        std::fs::create_dir_all(&tmp_dir)
-            .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
-        let path = tmp_dir.join(&name);
-        std::fs::write(&path, &*blob.bytes)
-            .map_err(|_| "Cannot write the file preview.".to_owned())?;
-        let opener = if cfg!(target_os = "linux") {
-            "xdg-open"
-        } else {
-            "open"
-        };
-        std::process::Command::new(opener)
-            .arg(&path)
-            .spawn()
-            .map_err(|_| "Cannot open this file with the system viewer.".to_owned())?;
-        Ok(())
+        // Exact bytes are already resolved. The worker revalidates again
+        // after the write and immediately before launching the preview.
+        preview_file(
+            &blob.bytes,
+            &name,
+            &std::env::temp_dir().join("faculties-files"),
+            &mut before_export,
+            |path| {
+                let opener = if cfg!(target_os = "linux") {
+                    "xdg-open"
+                } else {
+                    "open"
+                };
+                std::process::Command::new(opener)
+                    .arg(path)
+                    .spawn()
+                    .map_err(|_| "Cannot open this file with the system viewer.".to_owned())?;
+                Ok(())
+            },
+        )
     }
+}
+
+// One action owns its output until launch succeeds. Neither cancellation nor
+// an unrelated workspace can reuse, overwrite or remove an earlier preview.
+fn preview_file(
+    bytes: &[u8],
+    name: &str,
+    parent: &std::path::Path,
+    before_export: &mut impl FnMut() -> Result<(), String>,
+    launch: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    before_export()?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
+    let owned = parent.join(format!("{:X}", triblespace::prelude::genid().id));
+    before_export()?;
+    std::fs::create_dir(&owned)
+        .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
+    let result = (|| {
+        let path = owned.join(name);
+        before_export()?;
+        std::fs::write(&path, bytes).map_err(|_| "Cannot write the file preview.".to_owned())?;
+        before_export()?;
+        launch(&path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(owned);
+    }
+    result
 }
 
 // ── force-directed graph ──────────────────────────────────────────────
@@ -1336,6 +1364,57 @@ mod tests {
         .unwrap();
         *output += fragment;
         revision
+    }
+
+    #[test]
+    fn cancellation_after_writing_a_wiki_file_never_launches_or_removes_an_older_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("exports");
+        let previous = parent.join("previous");
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(previous.join("old"), b"keep").unwrap();
+        let mut checks = 0;
+        let result = preview_file(
+            b"new file",
+            "file.txt",
+            &parent,
+            &mut || {
+                checks += 1;
+                if checks == 4 {
+                    let owned = std::fs::read_dir(&parent)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| *path != previous)
+                        .unwrap();
+                    assert_eq!(std::fs::read(owned.join("file.txt")).unwrap(), b"new file");
+                    return Err("workspace changed during write".into());
+                }
+                Ok(())
+            },
+            |_| panic!("a cancelled preview must not launch"),
+        );
+        assert!(result.is_err());
+        assert_eq!(checks, 4);
+        assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 1);
+        assert_eq!(std::fs::read(previous.join("old")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn successful_wiki_preview_keeps_its_owned_bytes_for_the_external_viewer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut launched = None;
+        preview_file(
+            b"retained",
+            "file.txt",
+            directory.path(),
+            &mut || Ok(()),
+            |path| {
+                launched = Some(path.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(launched.unwrap()).unwrap(), b"retained");
     }
 
     #[test]

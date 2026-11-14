@@ -276,11 +276,15 @@ fn age_label(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
 
 pub struct FilesViewer {
     live: Option<FilesLive>,
+    file_error: Option<String>,
 }
 
 impl Default for FilesViewer {
     fn default() -> Self {
-        Self { live: None }
+        Self {
+            live: None,
+            file_error: None,
+        }
     }
 }
 
@@ -290,6 +294,18 @@ impl FilesViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
+        self.render_with_file_action(ctx, dataset, |entity| {
+            Self::open_entity_with(dataset, entity, || Ok(()))
+        });
+    }
+
+    /// Hosts can queue the action without extracting files during a draw.
+    pub fn render_with_file_action(
+        &mut self,
+        ctx: &mut CardCtx<'_>,
+        dataset: DatasetView<'_>,
+        mut open: impl FnMut(Id) -> Result<(), String>,
+    ) {
         let need_refresh = match self.live.as_ref() {
             None => true,
             Some(l) => l.cached_revision != dataset.revision,
@@ -373,28 +389,67 @@ impl FilesViewer {
         });
 
         if let Some(root) = open_root {
-            open_entity(dataset, root);
+            self.file_error = open(root).err();
         }
+        if let Some(error) = &self.file_error {
+            ctx.label(error);
+        }
+    }
+
+    /// Materialize the clicked immutable tree on a worker. Revalidate before
+    /// each filesystem effect and immediately before launching the preview.
+    pub fn open_entity_with(
+        dataset: DatasetView<'_>,
+        entity: Id,
+        mut before_export: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let parent = std::env::temp_dir().join("faculties-files");
+        let (owned, path) = prepare_export(dataset, entity, &parent, &mut before_export)?;
+        let opened = (|| {
+            before_export()?;
+            let opener = if cfg!(target_os = "linux") {
+                "xdg-open"
+            } else {
+                "open"
+            };
+            std::process::Command::new(opener)
+                .arg(path)
+                .spawn()
+                .map_err(|_| "Cannot open this file with the system viewer.".to_owned())?;
+            Ok(())
+        })();
+        // Only this action owns this fresh root. Keep successful exports for
+        // the external viewer; cancelled/failed exports never leave partial
+        // trees behind or remove a previous preview's files.
+        if opened.is_err() {
+            let _ = std::fs::remove_dir_all(owned);
+        }
+        opened
     }
 }
 
-/// Extract `entity_id` (a file or directory) from the pile into
-/// `$TMPDIR/faculties-files/` and fire the platform `open` command on the
-/// result — same flow the wiki widget uses for `files:` links, but
-/// extended to handle directory roots by recursing through
-/// `file::children`. Best-effort: errors log to stderr.
-fn open_entity(dataset: DatasetView<'_>, entity_id: Id) {
-    let tmp_dir = std::env::temp_dir().join("faculties-files");
-    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-        eprintln!("[files] mkdir {}: {e}", tmp_dir.display());
-        return;
-    }
-    match extract_tree(dataset, entity_id, &tmp_dir, 0) {
-        Ok(path) => {
-            eprintln!("[files] opening: {}", path.display());
-            let _ = std::process::Command::new("open").arg(&path).spawn();
+fn prepare_export(
+    dataset: DatasetView<'_>,
+    entity: Id,
+    parent: &std::path::Path,
+    before_export: &mut impl FnMut() -> Result<(), String>,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    before_export()?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
+    // Entity ids and filenames can occur in multiple workspace observations.
+    // A fresh action root keeps their directory trees completely separate.
+    let owned = parent.join(format!("{:X}", genid().id));
+    before_export()?;
+    std::fs::create_dir(&owned)
+        .map_err(|_| "Cannot prepare the file preview folder.".to_owned())?;
+    match extract_tree(dataset, entity, &owned, 0, before_export) {
+        Ok(path) => Ok((owned, path)),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&owned);
+            eprintln!("[files] preview: {error}");
+            Err("This file preview is unavailable. Refresh the workspace and try again.".into())
         }
-        Err(e) => eprintln!("[files] extract: {e}"),
     }
 }
 
@@ -409,6 +464,7 @@ fn extract_tree(
     entity_id: Id,
     dest: &std::path::Path,
     depth: u32,
+    before_export: &mut impl FnMut() -> Result<(), String>,
 ) -> Result<std::path::PathBuf, String> {
     if depth > 32 {
         return Err(format!("max depth exceeded at {}", id_hex(entity_id)));
@@ -444,6 +500,7 @@ fn extract_tree(
                 .map_err(|error| format!("get blob for {}: {error:?}", name.as_ref()))?;
             let name = crate::files::leaf_name(name.as_ref());
             let path = dest.join(&name);
+            before_export()?;
             std::fs::write(&path, &*blob.bytes)
                 .map_err(|error| format!("write {name}: {error}"))?;
             Ok(path)
@@ -455,6 +512,7 @@ fn extract_tree(
                 .map_err(|error| format!("get name for {}: {error:?}", id_hex(entity_id)))?;
             let name = crate::files::leaf_name(name.as_ref());
             let dir = dest.join(&name);
+            before_export()?;
             std::fs::create_dir_all(&dir).map_err(|error| format!("mkdir {name}: {error}"))?;
             let children = find!(
                 child: Id,
@@ -462,9 +520,7 @@ fn extract_tree(
             )
             .collect::<BTreeSet<_>>();
             for child in children {
-                if let Err(e) = extract_tree(dataset, child, &dir, depth + 1) {
-                    eprintln!("[files] skipping child: {e}");
-                }
+                extract_tree(dataset, child, &dir, depth + 1, before_export)?;
             }
             Ok(dir)
         }
@@ -648,4 +704,172 @@ fn render_tag_chip(ui: &mut egui::Ui, label: &str) {
                     .color(text),
             );
         });
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::storage::Storage;
+    use crate::widgets::{SourceKey, StorageState};
+    use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        storage: Storage,
+        a: StorageState,
+        b: StorageState,
+        root: Id,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let pile = directory.path().join("views.pile");
+            let key = directory.path().join("views.key");
+            std::fs::File::create(&pile).unwrap();
+            crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+            let storage = Storage::shared_local(pile, Some(key));
+            let root = genid();
+            let (a, b) = storage
+                .with_store(|store, signer, _| {
+                    let a = store.collection(
+                        "files",
+                        CollectionPolicy::new(
+                            AdmissionPolicy::Open,
+                            AdmissionPolicy::direct(signer.verifying_key()),
+                        ),
+                    )?;
+                    let b = store.collection(
+                        "files",
+                        CollectionPolicy::new(
+                            AdmissionPolicy::direct(signer.verifying_key()),
+                            AdmissionPolicy::direct(signer.verifying_key()),
+                        ),
+                    )?;
+                    for (source, private_child) in [(a, true), (b, false)] {
+                        let mut children = crate::files::stage(b"X".to_vec(), "X", "text/plain")?;
+                        if private_child {
+                            children += crate::files::stage(
+                                b"private Y".to_vec(),
+                                "privateY",
+                                "text/plain",
+                            )?;
+                        }
+                        let mut tree = Fragment::empty();
+                        let name: NameHandle = tree.put("folder".to_owned());
+                        tree += entity! { &root @
+                            metadata::tag: &KIND_DIRECTORY,
+                            file::name: name,
+                            file::children*: children,
+                        };
+                        store.commit(source, signer, tree)?;
+                    }
+                    Ok((a.handle(), b.handle()))
+                })
+                .unwrap();
+            let mut views = |handle| {
+                let selected = storage
+                    .clone()
+                    .with_collections(std::collections::BTreeMap::from([(
+                        crate::schemas::files::DEFAULT_SCOPE_ID,
+                        handle,
+                    )]));
+                let mut data = StorageState::for_workspace(selected).unwrap();
+                data.refresh();
+                assert!(data.error().is_none(), "{:?}", data.error());
+                assert!(data.loaded_context().contains(SourceKey::Files));
+                data
+            };
+            let a = views(a);
+            let b = views(b);
+            Self {
+                directory,
+                storage,
+                a,
+                b,
+                root: root.id,
+            }
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.storage.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn same_entity_in_two_workspaces_never_reuses_the_previous_directory_tree() {
+        let fixture = Fixture::new();
+        let parent = fixture.directory.path().join("exports");
+        let (owned_a, path_a) = prepare_export(
+            fixture
+                .a
+                .loaded_context()
+                .dataset(SourceKey::Files)
+                .unwrap(),
+            fixture.root,
+            &parent,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let (owned_b, path_b) = prepare_export(
+            fixture
+                .b
+                .loaded_context()
+                .dataset(SourceKey::Files)
+                .unwrap(),
+            fixture.root,
+            &parent,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_ne!(owned_a, owned_b);
+        assert_eq!(
+            std::fs::read(path_a.join("privateY")).unwrap(),
+            b"private Y"
+        );
+        assert_eq!(std::fs::read(path_b.join("X")).unwrap(), b"X");
+        assert!(!path_b.join("privateY").exists());
+        assert_eq!(std::fs::read_dir(path_b).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn cancellation_after_the_first_child_removes_only_the_owned_partial_export() {
+        let fixture = Fixture::new();
+        let parent = fixture.directory.path().join("exports");
+        let (kept, _) = prepare_export(
+            fixture
+                .b
+                .loaded_context()
+                .dataset(SourceKey::Files)
+                .unwrap(),
+            fixture.root,
+            &parent,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        let mut checks = 0;
+        assert!(prepare_export(
+            fixture
+                .a
+                .loaded_context()
+                .dataset(SourceKey::Files)
+                .unwrap(),
+            fixture.root,
+            &parent,
+            &mut || {
+                checks += 1;
+                if checks == 5 {
+                    Err("cancelled".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .is_err());
+        assert_eq!(checks, 5);
+        assert!(kept.exists());
+        assert_eq!(std::fs::read_dir(parent).unwrap().count(), 1);
+    }
 }
