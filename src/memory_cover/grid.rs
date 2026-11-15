@@ -123,6 +123,39 @@ pub fn select_grid_recollection_cut(
     eligible: &[bool],
     budget: usize,
 ) -> RecollectionCut {
+    select_grid_recollection_cut_with(spans, costs, eligible, budget, LevelOneRule::Divide).0
+}
+
+/// How level [`GRID_HEAD_LEVEL`] (tiles of 3.0 days, whose young end is the
+/// sealed head's end) sizes its tiles. EXPERIMENTAL (lane
+/// cover-underfill-20261115): only [`LevelOneRule::Divide`] is the grid.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LevelOneRule {
+    /// The grid as settled (b110455f): the level's allowance re-divided over
+    /// the tiles the level holds now, oldest first, unspent passing on.
+    #[default]
+    Divide,
+}
+
+/// What [`select_grid_recollection_cut_with`] reports beside the cut.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GridDetail {
+    /// Allowance a rule deliberately left unused by the cover. Always zero
+    /// for [`LevelOneRule::Divide`].
+    pub withheld: usize,
+}
+
+/// [`select_grid_recollection_cut`] under an explicit level-1 rule. With
+/// [`LevelOneRule::Divide`] it is exactly the grid.
+pub fn select_grid_recollection_cut_with(
+    spans: &[(i128, i128, Id)],
+    costs: &[usize],
+    eligible: &[bool],
+    budget: usize,
+    rule: LevelOneRule,
+) -> (RecollectionCut, GridDetail) {
+    let detail = GridDetail::default();
+    let LevelOneRule::Divide = rule;
     assert_eq!(spans.len(), costs.len());
     assert_eq!(spans.len(), eligible.len());
     let mut out = RecollectionCut {
@@ -134,10 +167,10 @@ pub fn select_grid_recollection_cut(
         spans.iter().map(|span| span.0).min(),
         spans.iter().map(|span| span.1).max(),
     ) else {
-        return out;
+        return (out, detail);
     };
     if budget == 0 {
-        return out;
+        return (out, detail);
     }
     let unit = GRID_UNIT_NS;
     let n = latest.div_euclid(unit);
@@ -211,7 +244,7 @@ pub fn select_grid_recollection_cut(
     }
     out.cover.extend_from_slice(&members[cut..]);
     out.used += kept;
-    out
+    (out, detail)
 }
 
 #[cfg(test)]
@@ -576,5 +609,146 @@ mod tests {
         let cut = select_grid_recollection_cut(&spans, &costs, &vec![true; spans.len()], 7_000);
         assert_eq!(cut.cover, PROTOTYPE);
         assert_eq!(cut.used, 6_804);
+    }
+
+    /// faculties b110455f's `select_grid_recollection_cut`, verbatim but for
+    /// its name: the rule-parameterised function must reproduce it exactly
+    /// under [`LevelOneRule::Divide`].
+    #[allow(clippy::all)]
+    fn b110455f_select(
+        spans: &[(i128, i128, Id)],
+        costs: &[usize],
+        eligible: &[bool],
+        budget: usize,
+    ) -> RecollectionCut {
+        assert_eq!(spans.len(), costs.len());
+        assert_eq!(spans.len(), eligible.len());
+        let mut out = RecollectionCut {
+            cover: Vec::new(),
+            used: 0,
+            head: 0,
+        };
+        let (Some(earliest), Some(latest)) = (
+            spans.iter().map(|span| span.0).min(),
+            spans.iter().map(|span| span.1).max(),
+        ) else {
+            return out;
+        };
+        if budget == 0 {
+            return out;
+        }
+        let unit = GRID_UNIT_NS;
+        let n = latest.div_euclid(unit);
+        let first = earliest.div_euclid(unit);
+        let mut top = 0u32;
+        while top < GRID_MAX_LEVEL && block(n, top + 1) > first {
+            top += 1;
+        }
+        let apex = block(n, top + 1) > first;
+        let regions = top as f64 + 1.0 + if apex { 1.0 } else { 0.0 };
+        let share = ((1.0 - GRID_OPEN_RESERVE) * budget as f64 / regions).floor() as usize;
+        let mut selected = vec![false; spans.len()];
+        let mut carry = 0usize;
+        if apex {
+            let allowance = share.min(budget - out.used);
+            let (ta, tb) = (first * unit, block(n, top + 1) * unit);
+            let spent = walk_tile(
+                spans,
+                costs,
+                eligible,
+                &mut selected,
+                &mut out.cover,
+                earliest,
+                ta,
+                tb,
+                allowance,
+            );
+            out.used += spent;
+            carry = allowance - spent;
+            out.head = out.cover.len();
+        }
+        for level in (0..=top).rev() {
+            let width = 4i128.pow(level);
+            let (lo, hi) = (block(n, level + 1), block(n, level));
+            let tiles = ((hi - lo) / width) as usize;
+            let allowance = share.saturating_add(carry).min(budget - out.used);
+            let mut spent = 0usize;
+            for t in 0..tiles {
+                let ta = (lo + t as i128 * width) * unit;
+                let tb = ta + width * unit;
+                let tile_space = (allowance - spent) / (tiles - t);
+                spent += walk_tile(
+                    spans,
+                    costs,
+                    eligible,
+                    &mut selected,
+                    &mut out.cover,
+                    earliest,
+                    ta,
+                    tb,
+                    tile_space,
+                );
+            }
+            out.used += spent;
+            carry = allowance - spent;
+            if level >= GRID_HEAD_LEVEL {
+                out.head = out.cover.len();
+            }
+        }
+        let room = budget - out.used;
+        let origin = n * unit;
+        let mut members: Vec<usize> = (0..spans.len())
+            .filter(|&i| eligible[i] && costs[i] > 0 && spans[i].0 >= origin)
+            .collect();
+        range_time_sort(&mut members, spans);
+        let mut kept: usize = members.iter().map(|&i| costs[i]).sum();
+        let mut cut = 0usize;
+        while kept > room {
+            kept -= costs[members[cut]];
+            cut += 1;
+        }
+        out.cover.extend_from_slice(&members[cut..]);
+        out.used += kept;
+        out
+    }
+
+    /// EXPERIMENTAL lane cover-underfill-20261115: CURRENT is bit-for-bit
+    /// b110455f on every journal shape and budget tried.
+    #[test]
+    fn divide_rule_is_b110455f_exactly() {
+        let (proto, proto_costs) = proto_journal();
+        let mut cases: Vec<(Vec<(i128, i128, Id)>, Vec<usize>)> =
+            vec![(proto.clone(), proto_costs)];
+        for hours in [3, 30, 24 * 5, 24 * 13, 24 * 40 + 7, 24 * 61 + 19] {
+            let spans = journal(hours, hours / 24);
+            let c = costs(&spans);
+            cases.push((spans, c));
+        }
+        let mut compared = 0;
+        for (spans, c) in &cases {
+            for budget in [0, 1, 500, 7_000, 30_000, 120_000, 1_000_000] {
+                for mask in 0..3usize {
+                    let eligible: Vec<bool> = (0..spans.len())
+                        .map(|i| mask == 0 || i % (mask + 2) != 0)
+                        .collect();
+                    let want = b110455f_select(spans, c, &eligible, budget);
+                    let (got, detail) = select_grid_recollection_cut_with(
+                        spans,
+                        c,
+                        &eligible,
+                        budget,
+                        LevelOneRule::Divide,
+                    );
+                    assert_eq!(got, want, "budget {budget} mask {mask}");
+                    assert_eq!(detail.withheld, 0);
+                    assert_eq!(
+                        select_grid_recollection_cut(spans, c, &eligible, budget),
+                        want
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 7 * 7 * 3);
     }
 }

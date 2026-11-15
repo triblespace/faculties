@@ -661,6 +661,9 @@ pub fn select_recollection_cut(
 
 mod grid;
 pub use grid::{select_grid_recollection_cut, GRID_HEAD_LEVEL, GRID_OPEN_RESERVE, GRID_UNIT_NS};
+pub use grid::{select_grid_recollection_cut_with, GridDetail, LevelOneRule};
+/// EXPERIMENTAL (lane cover-underfill-20261115): the sealed-head replay.
+pub mod replay_grid;
 
 /// Gaps longer than one quarter of the currently available life which no
 /// selected memory overlaps.

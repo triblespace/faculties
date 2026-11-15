@@ -236,6 +236,22 @@ impl Memory {
             .ok_or_else(|| anyhow!("churn diagnostic time span is too large"))?;
         self.with_operation(|storage| churn(storage, options, out))
     }
+    /// EXPERIMENTAL (lane cover-underfill-20261115): replay the grid's
+    /// sealed head over the pile's own history, READ-ONLY. The pile is opened
+    /// with `Pile::open_prefix` at its current length, whose descriptor has
+    /// no write access, and no faculty store, signer, peer or maintenance is
+    /// involved.
+    pub fn churn_tiled(
+        &self,
+        options: &ChurnOptions,
+        until: i128,
+        out: &mut Out<'_>,
+    ) -> Result<()> {
+        if options.step_units <= 0 {
+            bail!("churn step_units must be positive");
+        }
+        churn_tiled(self.storage.path(), options, until, out)
+    }
     pub fn respan_instants(&self, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| respan_instants(storage, dry_run, out))
     }
@@ -1809,6 +1825,212 @@ fn list(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -> R
         }
     }
     Ok(())
+}
+
+/// EXPERIMENTAL (lane cover-underfill-20261115): `memory churn-tiled`.
+///
+/// READ-ONLY by construction: the pile is opened with `Pile::open_prefix`,
+/// whose file descriptor carries no write access (any append fails in the
+/// operating system) and which never takes the exclusive lock. The Memory
+/// root is read straight from that snapshot through `read_fact_collection`;
+/// nothing is attached, maintained, acquired or signed. The prefix length is
+/// the snapshot identity: reopening the same prefix reads the same bytes.
+fn churn_tiled(
+    path: &std::path::Path,
+    opts: &ChurnOptions,
+    until: i128,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    use crate::memory_cover::replay_grid::{
+        input_digest, replay_members, replay_points, run_backend, Backend, BackendStep, StepCover,
+    };
+    use crate::memory_cover::{key_to_epoch, LevelOneRule, REPLAY_QUANTUM_NS};
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::SnapshotSource;
+
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+    let (mut pile, prefix) = loop {
+        let length = std::fs::metadata(path)
+            .with_context(|| format!("stat pile {}", path.display()))?
+            .len();
+        match Pile::open_prefix(path, length) {
+            Ok(pile) => break (pile, length),
+            // A writer mid-append: the length is not a record boundary yet.
+            Err(error) if attempt < 5 => {
+                eprintln!("open_prefix at {length} refused ({error}); taking the length again");
+                attempt += 1;
+            }
+            Err(error) => return Err(anyhow!("open pile prefix: {error}")),
+        }
+    };
+    let result = (|| -> Result<()> {
+        let snapshot = pile.snapshot().context("snapshot pile prefix")?;
+        let handle = crate::collection_names::configured_handle(MEMORY_SCOPE_ID)?
+            .ok_or_else(|| anyhow!("no configured Memory collection (TRIBLESPACE_COLLECTION_*)"))?;
+        let collection = crate::collection_names::open_workspace_in(&snapshot, handle)?;
+        let (facts, support) = crate::storage::read_fact_collection(collection, &snapshot)?;
+        let mut frontier: Vec<[u8; 32]> = support.members().map(|h| h.raw).collect();
+        frontier.sort_unstable();
+        let mut fh = blake3::Hasher::new();
+        for raw in &frontier {
+            fh.update(raw);
+        }
+        let (members, unreadable) = replay_members(&facts, &snapshot)?;
+        let opened = started.elapsed();
+
+        let step_ns = opts.step_units * REPLAY_QUANTUM_NS;
+        let points: Vec<i128> = (0..=opts.steps as i128)
+            .rev()
+            .map(|k| until - k * step_ns)
+            .collect();
+        let budget = opts.budget_chars;
+        let rules = [("CURRENT", LevelOneRule::Divide)];
+        let renders = replay_points(&members, &points, budget, &rules.map(|r| r.1));
+
+        out.line("== identity".to_string())?;
+        out.line(format!(
+            "pile {} prefix_bytes {prefix} (Pile::open_prefix, read-only descriptor)",
+            path.display()
+        ))?;
+        out.line(format!(
+            "memory collection handle {}",
+            hex::encode(handle.raw)
+        ))?;
+        out.line(format!(
+            "collection support {} foundation(s), blake3 over sorted handles {}",
+            frontier.len(),
+            fh.finalize().to_hex()
+        ))?;
+        out.line(format!(
+            "facts {} tribles; members {} (unreadable summaries left out {}, created_at fallback {}, respanned {})",
+            facts.len(),
+            members.len(),
+            unreadable,
+            members.iter().filter(|m| m.observed_fallback).count(),
+            members.iter().filter(|m| m.hidden_from.is_some()).count(),
+        ))?;
+        out.line(format!(
+            "input digest (blake3 over sorted id,start,end,observed,hidden_from,chars,text-digest) {}",
+            hex::encode(input_digest(&members))
+        ))?;
+        out.line(format!(
+            "points {} every {} s, first {} (key {}), last {} (key {}); budget {budget} chars; opened+read in {:.1} s",
+            points.len(),
+            step_ns / 1_000_000_000,
+            key_to_epoch(points[0]),
+            points[0],
+            key_to_epoch(*points.last().unwrap()),
+            points.last().unwrap(),
+            opened.as_secs_f64(),
+        ))?;
+        out.line(format!(
+            "members observed after the last point (excluded) {}",
+            members.iter().filter(|m| m.observed > until).count()
+        ))?;
+
+        for (r, (name, _)) in rules.iter().enumerate() {
+            let covers: Vec<&StepCover> = renders[r].iter().collect();
+            let ro = run_backend(&covers, Backend::RestoreOnly);
+            let ex = run_backend(&covers, Backend::Extend);
+            out.line(String::new())?;
+            out.line(format!("== steps {name} (budget {budget})"))?;
+            out.line(
+                "k\tpoint_utc\tused\tchars\tentries\thead_entries\thead_chars\tunused\twithheld\thead_changed\thead_extends_prev\tro_reseal\tro_recomputed\tex_reseal\tex_extended\tex_recomputed"
+                    .to_string(),
+            )?;
+            let mut head_changes = 0usize;
+            let mut head_extends = 0usize;
+            for (k, c) in covers.iter().enumerate() {
+                let (changed, extends) = if k == 0 {
+                    (false, false)
+                } else {
+                    let prev = &covers[k - 1].entries[..covers[k - 1].head];
+                    let head = &c.entries[..c.head];
+                    (head != prev, head != prev && head.starts_with(prev))
+                };
+                head_changes += changed as usize;
+                head_extends += extends as usize;
+                out.line(format!(
+                    "{k}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    key_to_epoch(c.point),
+                    c.used,
+                    c.chars(),
+                    c.entries.len(),
+                    c.head,
+                    c.head_chars(),
+                    budget - c.used,
+                    c.withheld,
+                    changed as u8,
+                    extends as u8,
+                    ro[k].reseal as u8,
+                    ro[k].recomputed,
+                    ex[k].reseal as u8,
+                    ex[k].extended as u8,
+                    ex[k].recomputed,
+                ))?;
+            }
+            let n = covers.len().max(1) as f64;
+            let sum = |f: &dyn Fn(&StepCover) -> usize| covers.iter().map(|c| f(c)).sum::<usize>();
+            let tally = |steps: &[BackendStep]| {
+                (
+                    steps.iter().filter(|s| s.reseal).count(),
+                    steps.iter().filter(|s| s.extended).count(),
+                    steps.iter().map(|s| s.recomputed).sum::<usize>(),
+                    steps.iter().map(|s| s.reused).sum::<usize>(),
+                )
+            };
+            let (ro_r, _, ro_c, ro_u) = tally(&ro);
+            let (ex_r, ex_e, ex_c, ex_u) = tally(&ex);
+            out.line(format!(
+                "== summary {name} budget {budget}: {} renders; selected charge mean {:.0} (min {}, max {}); rendered chars mean {:.0}; head chars mean {:.0}; unused allowance mean {:.0}; withheld (level 1 left unused) mean {:.0}, max {}",
+                covers.len(),
+                sum(&|c| c.used) as f64 / n,
+                covers.iter().map(|c| c.used).min().unwrap_or(0),
+                covers.iter().map(|c| c.used).max().unwrap_or(0),
+                sum(&|c| c.chars()) as f64 / n,
+                sum(&|c| c.head_chars()) as f64 / n,
+                sum(&|c| budget - c.used) as f64 / n,
+                sum(&|c| c.withheld) as f64 / n,
+                covers.iter().map(|c| c.withheld).max().unwrap_or(0),
+            ))?;
+            out.line(format!(
+                "   head identity changes {head_changes} of {} transitions ({head_extends} of them strict extensions of the previous head)",
+                covers.len().saturating_sub(1)
+            ))?;
+            out.line(format!(
+                "   RESTORE-ONLY (raw, one evaluation per replay point): full reseals {ro_r}; recomputed chars total {ro_c} (mean {:.0}/eval, incl. the first full render {}); reused total {ro_u}",
+                ro_c as f64 / n,
+                covers.first().map_or(0, |c| c.chars()),
+            ))?;
+            out.line(format!(
+                "   HYPOTHETICAL-EXTEND (raw, one evaluation per replay point): full reseals {ex_r}; extensions {ex_e}; recomputed chars total {ex_c} (mean {:.0}/eval); reused total {ex_u}",
+                ex_c as f64 / n
+            ))?;
+            // MODEL: one wake per UTC day, at the first replay point of the day.
+            let mut daily: Vec<&StepCover> = Vec::new();
+            let mut last_day = None;
+            for c in &covers {
+                let (y, m, d, ..) = key_to_epoch(c.point).to_gregorian_utc();
+                if last_day != Some((y, m, d)) {
+                    last_day = Some((y, m, d));
+                    daily.push(c);
+                }
+            }
+            let (dro_r, _, dro_c, _) = tally(&run_backend(&daily, Backend::RestoreOnly));
+            let (dex_r, dex_e, dex_c, _) = tally(&run_backend(&daily, Backend::Extend));
+            out.line(format!(
+                "   MODEL 1 wake/UTC day (first point of each day, {} wakes): RESTORE-ONLY reseals {dro_r}, recomputed {dro_c}; EXTEND reseals {dex_r}, extensions {dex_e}, recomputed {dex_c}",
+                daily.len()
+            ))?;
+        }
+        Ok(())
+    })();
+    let closed = pile
+        .close()
+        .map_err(|error| anyhow!("close pile: {error:?}"));
+    result?;
+    closed
 }
 
 /// `memory churn` replays density-shaped recollection over the journal's

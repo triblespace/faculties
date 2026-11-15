@@ -131,6 +131,35 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         "check" => memory.check(one("usage: memory check <grain>")?, out),
         "density" => memory.density(args.first().map(String::as_str), out),
         "churn" => memory.churn(&churn_options(args)?, out),
+        "churn-tiled" => {
+            // EXPERIMENTAL (lane cover-underfill-20261115): `--until-utc
+            // YYYY-MM-DD` caps the replay at that date's UTC midnight; the
+            // rest are churn's flags.
+            let mut rest = Vec::new();
+            let mut until = None;
+            let mut i = 0;
+            while i < args.len() {
+                if args[i] == "--until-utc" {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| anyhow!("--until-utc needs YYYY-MM-DD"))?;
+                    let parts: Vec<&str> = v.split('-').collect();
+                    anyhow::ensure!(parts.len() == 3, "--until-utc needs YYYY-MM-DD");
+                    let epoch = Epoch::from_gregorian_utc_at_midnight(
+                        parts[0].parse().context("year")?,
+                        parts[1].parse().context("month")?,
+                        parts[2].parse().context("day")?,
+                    );
+                    until = Some(epoch.to_tai_duration().total_nanoseconds());
+                    i += 2;
+                } else {
+                    rest.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            let until = until.ok_or_else(|| anyhow!("churn-tiled needs --until-utc YYYY-MM-DD"))?;
+            memory.churn_tiled(&churn_options(&rest)?, until, out)
+        }
         _ => memory.show_many(&cli.ids, out),
     }?;
     Ok(0)
