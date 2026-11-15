@@ -168,6 +168,9 @@ pub struct CaptureSummary {
 #[derive(Clone, Debug)]
 pub struct Viewer {
     pub(crate) storage: crate::storage::Storage,
+    /// Authorship claim for writes the standalone host performs (a Relations
+    /// label or id), never inferred inside a widget.
+    pub(crate) persona: Option<String>,
 }
 impl Viewer {
     pub fn new(pile: impl Into<PathBuf>, key: Option<PathBuf>) -> Self {
@@ -175,7 +178,16 @@ impl Viewer {
     }
 
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            persona: None,
+        }
+    }
+
+    /// Attribute host-performed writes, such as priority-game answers.
+    pub fn with_persona(mut self, persona: Option<String>) -> Self {
+        self.persona = persona;
+        self
     }
 
     pub fn capture(

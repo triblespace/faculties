@@ -11,5 +11,5 @@ pub mod mcp;
 mod operations;
 
 #[cfg(feature = "widgets")]
-pub use composition::{compose, compose_hosted, FileAction, Host};
+pub use composition::{compose, compose_hosted, Host, HostAction};
 pub use operations::{CaptureOptions, CapturePage, CaptureSummary, Target, Viewer};

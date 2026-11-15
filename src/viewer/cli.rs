@@ -93,6 +93,7 @@ pub fn configuration_from_env() -> super::Viewer {
         crate::widgets::resolve_pile_path(std::env::args().skip(1), std::env::var("PILE").ok()),
         None,
     )
+    .with_persona(std::env::var("PERSONA").ok())
 }
 
 #[cfg(test)]

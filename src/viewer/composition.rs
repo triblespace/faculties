@@ -1,12 +1,15 @@
 //! One shared composition for the dashboard, focused CLI wrappers and MCP.
 
 use super::{Target, Viewer};
+use crate::compass::Compass;
+use crate::storage::Storage;
 use crate::widgets::{
     AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    RelationsViewer, SourceKey, StorageState, TeamsViewer, TimelineSource, TriageViewer,
-    WidgetContext, WikiViewer,
+    PriorityGame, RelationsViewer, SourceKey, StorageState, TeamsViewer, TimelineSource,
+    TriageViewer, WidgetContext, WikiViewer,
 };
+use std::sync::Arc;
 use triblespace::prelude::Id;
 use GORBIE::prelude::*;
 use GORBIE::state::StateId;
@@ -44,18 +47,33 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
         },
     );
 
-    compose_hosted(nb, target, Standalone(storage));
+    compose_hosted(
+        nb,
+        target,
+        Standalone {
+            storage,
+            persona: viewer.persona.as_deref().map(Arc::from),
+        },
+    );
 }
 
-/// A file action resolved by the host against the exact clicked observation.
+/// An action a widget asks its host to perform. File actions resolve against
+/// the exact clicked observation; a priority answer is an ordinary Compass
+/// write the host performs with its own storage and identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FileAction {
+pub enum HostAction {
     WikiLink(String),
     Entity(Id),
+    /// Rank `higher` over `lower`, as `Compass::prioritize` does. `Err` is a
+    /// refused write (a cycle, or a child ranked under its parent).
+    Prioritize {
+        higher: Id,
+        lower: Id,
+    },
 }
 
 /// Supplies one frozen render boundary and its selection generation. App hosts
-/// perform storage observation and file actions on their own worker. This
+/// perform storage observation and actions on their own worker. This
 /// interface never chooses a pile, workspace, identity or service.
 pub trait Host: Clone + 'static {
     fn with_context(
@@ -65,13 +83,16 @@ pub trait Host: Clone + 'static {
             &mut CardCtx<'_>,
             WidgetContext<'_>,
             u64,
-            &mut dyn FnMut(FileAction) -> Result<(), String>,
+            &mut dyn FnMut(HostAction) -> Result<(), String>,
         ),
     );
 }
 
-#[derive(Clone, Copy)]
-struct Standalone(StateId<StorageState>);
+#[derive(Clone)]
+struct Standalone {
+    storage: StateId<StorageState>,
+    persona: Option<Arc<str>>,
+}
 
 impl Host for Standalone {
     fn with_context(
@@ -81,25 +102,40 @@ impl Host for Standalone {
             &mut CardCtx<'_>,
             WidgetContext<'_>,
             u64,
-            &mut dyn FnMut(FileAction) -> Result<(), String>,
+            &mut dyn FnMut(HostAction) -> Result<(), String>,
         ),
     ) {
-        let mut storage = self.0.read_mut(ctx);
-        let sources = storage.context();
-        let mut open = |action| {
-            let files = sources
-                .dataset(SourceKey::Files)
-                .ok_or_else(|| "Files are unavailable.".to_owned())?;
-            match action {
-                FileAction::WikiLink(selector) => {
-                    WikiViewer::open_file_with(files, &selector, || Ok(()))
-                }
-                FileAction::Entity(entity) => {
-                    FilesViewer::open_entity_with(files, entity, || Ok(()))
-                }
-            }
-        };
-        render(ctx, sources, 0, &mut open);
+        let mut state = self.storage.read_mut(ctx);
+        let storage = state.storage().clone();
+        let sources = state.context();
+        let persona = self.persona.as_deref();
+        let mut perform = |action| perform(&storage, persona, sources, action);
+        render(ctx, sources, 0, &mut perform);
+    }
+}
+
+/// Perform one action for the standalone host, synchronously. A priority
+/// write moves the pile stamp, so the next render observes it.
+fn perform(
+    storage: &Storage,
+    persona: Option<&str>,
+    sources: WidgetContext<'_>,
+    action: HostAction,
+) -> Result<(), String> {
+    let files = || {
+        sources
+            .dataset(SourceKey::Files)
+            .ok_or_else(|| "Files are unavailable.".to_owned())
+    };
+    match action {
+        HostAction::WikiLink(selector) => {
+            WikiViewer::open_file_with(files()?, &selector, || Ok(()))
+        }
+        HostAction::Entity(entity) => FilesViewer::open_entity_with(files()?, entity, || Ok(())),
+        HostAction::Prioritize { higher, lower } => Compass::with_storage(storage.clone())
+            .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), persona)
+            .map(drop)
+            .map_err(|error| format!("{error:#}")),
     }
 }
 
@@ -127,7 +163,7 @@ where
             &mut CardCtx<'_>,
             &mut T,
             WidgetContext<'_>,
-            &mut dyn FnMut(FileAction) -> Result<(), String>,
+            &mut dyn FnMut(HostAction) -> Result<(), String>,
         ) + 'static,
 {
     nb.state(
@@ -229,7 +265,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                     ctx,
                     view,
                     sources.dataset(SourceKey::Files),
-                    |selector| open(FileAction::WikiLink(selector.to_owned())),
+                    |selector| open(HostAction::WikiLink(selector.to_owned())),
                 );
             },
         );
@@ -246,6 +282,23 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                     return;
                 };
                 compass.render(ctx, view);
+            },
+        );
+    }
+
+    if target == Target::Dashboard {
+        card(
+            nb,
+            host.clone(),
+            "priority-game",
+            PriorityGame::default,
+            move |ctx, game, sources, act| {
+                let Some(view) = sources.dataset(SourceKey::Compass) else {
+                    return;
+                };
+                game.render(ctx, view, |higher, lower| {
+                    act(HostAction::Prioritize { higher, lower })
+                });
             },
         );
     }
@@ -380,7 +433,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                 let Some(view) = sources.dataset(SourceKey::Files) else {
                     return;
                 };
-                panel.render_with_file_action(ctx, view, |entity| open(FileAction::Entity(entity)));
+                panel.render_with_file_action(ctx, view, |entity| open(HostAction::Entity(entity)));
             },
         );
     }
@@ -443,6 +496,68 @@ mod tests {
         assert!(selected.for_generation(2, Vec::new).is_empty());
         selected.value.push(20);
         assert!(selected.for_generation(3, Vec::new).is_empty());
+    }
+
+    /// The standalone host performs a priority answer as an ordinary Compass
+    /// write; the next observation reads the edge, and a refused write comes
+    /// back as the error the game shows.
+    #[test]
+    fn standalone_prioritize_writes_an_edge_the_next_view_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("game.pile");
+        let key = directory.path().join("game.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = Storage::new(pile, Some(key));
+        let compass = Compass::with_storage(storage.clone());
+        let alpha = compass.add("alpha", Default::default()).unwrap().goal;
+        let beta = compass.add("beta", Default::default()).unwrap().goal;
+        let parent = format!("{alpha:x}");
+        let child = compass
+            .add(
+                "child",
+                crate::compass::AddOptions {
+                    parent: Some(&parent),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .goal;
+
+        let mut state = StorageState::with_storage(storage, [SourceKey::Compass]);
+        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        assert!(crate::compass::active_priority_edges(view.facts).is_empty());
+
+        perform(
+            state.storage(),
+            None,
+            state.loaded_context(),
+            HostAction::Prioritize {
+                higher: alpha,
+                lower: beta,
+            },
+        )
+        .unwrap();
+        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        assert_eq!(
+            crate::compass::active_priority_edges(view.facts),
+            std::collections::BTreeSet::from([(alpha, beta)])
+        );
+
+        let refused = perform(
+            state.storage(),
+            None,
+            state.loaded_context(),
+            HostAction::Prioritize {
+                higher: alpha,
+                lower: child,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("children are implicitly prioritized"),
+            "{refused}"
+        );
     }
 
     #[test]

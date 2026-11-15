@@ -627,6 +627,12 @@ impl StorageState {
         }
     }
 
+    /// The store this state observes, for host-performed writes. A write
+    /// through it moves the pile stamp, so the next `context()` reloads.
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     /// Current pile load/reload error, if any.
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
