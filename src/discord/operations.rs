@@ -550,13 +550,7 @@ impl Discord {
         attachments: &[SendAttachment],
         reply_to: Option<&str>,
     ) -> Result<SendReceipt> {
-        self.send_using(
-            channel_id,
-            text,
-            attachments,
-            reply_to,
-            post_message_attachments,
-        )
+        self.send_through(channel_id, text, attachments, None, reply_to, &mut Https)
     }
     /// [`Self::send`] with an explicit mention policy: only what `mentions`
     /// allows can ping, whatever the text contains. Additive: `send` keeps
@@ -567,16 +561,7 @@ impl Discord {
         text: &str,
         mentions: &AllowedMentions,
     ) -> Result<SendReceipt> {
-        mentions.validate()?;
-        self.send_using(
-            channel_id,
-            text,
-            &[],
-            None,
-            |token, channel, text, attachments, reply_to| {
-                post_message_with(token, channel, text, attachments, Some(mentions), reply_to)
-            },
-        )
+        self.send_through(channel_id, text, &[], Some(mentions), None, &mut Https)
     }
     /// Send text and/or files through the same authentication and observation path.
     /// Never retry automatically: an uncertain response or failed retention can
@@ -589,6 +574,52 @@ impl Discord {
     ) -> Result<SendReceipt> {
         self.send_reply(channel_id, text, attachments, None)
     }
+    /// The one send path every other send method is: validate, prove
+    /// collection WRITE admission, refuse a reply target this channel does not
+    /// store, post through `transport`, then store what Discord returned
+    /// (downloading its attachment bytes through the same transport) as an
+    /// ordinary observation. `mentions` is the message's mention policy, or
+    /// Discord's default when `None` ([`AllowedMentions`]).
+    ///
+    /// Callers outside this module (another faculty posting its own bytes)
+    /// pass [`Https`]; tests pass a fake, so no test needs the network and
+    /// every caller shares this exact path rather than a second client.
+    pub fn send_through(
+        &self,
+        channel_id: &str,
+        text: &str,
+        attachments: &[SendAttachment],
+        mentions: Option<&AllowedMentions>,
+        reply_to: Option<&str>,
+        transport: &mut dyn SendTransport,
+    ) -> Result<SendReceipt> {
+        if let Some(mentions) = mentions {
+            mentions.validate()?;
+        }
+        validate_send(channel_id, text, attachments)?;
+        validate_reply_to(reply_to)?;
+        self.preflight_write()?;
+        // `send_with` posts once and only then downloads, so these two
+        // borrows never overlap.
+        let transport = std::cell::RefCell::new(transport);
+        send_with(
+            self.storage(),
+            &self.token()?,
+            channel_id,
+            text,
+            attachments,
+            reply_to,
+            |token, channel, text, attachments, reply_to| {
+                transport
+                    .borrow_mut()
+                    .post(token, channel, text, attachments, mentions, reply_to)
+            },
+            |url, limit| transport.borrow_mut().attachment(url, limit),
+        )
+    }
+    /// [`Self::send_through`] with a bare post closure and real attachment
+    /// downloads, for the tests that predate the transport.
+    #[cfg(test)]
     fn send_using(
         &self,
         channel_id: &str,
@@ -597,18 +628,39 @@ impl Discord {
         reply_to: Option<&str>,
         post: impl FnOnce(&str, &str, &str, &[SendAttachment], Option<&str>) -> Result<JsonValue>,
     ) -> Result<SendReceipt> {
-        validate_send(channel_id, text, attachments)?;
-        validate_reply_to(reply_to)?;
-        self.preflight_write()?;
-        send_with(
-            self.storage(),
-            &self.token()?,
+        struct Once<F>(Option<F>);
+        impl<F> SendTransport for Once<F>
+        where
+            F: FnOnce(&str, &str, &str, &[SendAttachment], Option<&str>) -> Result<JsonValue>,
+        {
+            fn post(
+                &mut self,
+                token: &str,
+                channel_id: &str,
+                text: &str,
+                attachments: &[SendAttachment],
+                _: Option<&AllowedMentions>,
+                reply_to: Option<&str>,
+            ) -> Result<JsonValue> {
+                (self.0.take().expect("one post per send"))(
+                    token,
+                    channel_id,
+                    text,
+                    attachments,
+                    reply_to,
+                )
+            }
+            fn attachment(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
+                fetch_attachment_bytes(url, limit)
+            }
+        }
+        self.send_through(
             channel_id,
             text,
             attachments,
+            None,
             reply_to,
-            post,
-            fetch_attachment_bytes,
+            &mut Once(Some(post)),
         )
     }
     /// Observe the resident collection; this never lists guilds, fetches messages, or opens credentials.
@@ -1250,7 +1302,7 @@ fn send_with(
 }
 
 pub(crate) fn post_message(token: &str, channel_id: &str, text: &str) -> Result<JsonValue> {
-    post_message_attachments(token, channel_id, text, &[], None)
+    post_message_with(token, channel_id, text, &[], None, None)
 }
 
 /// Which mentions in a message Discord may turn into pings: its
@@ -1373,16 +1425,6 @@ fn message_request(
     Ok(request.multipart(form))
 }
 
-fn post_message_attachments(
-    token: &str,
-    channel_id: &str,
-    text: &str,
-    attachments: &[SendAttachment],
-    reply_to: Option<&str>,
-) -> Result<JsonValue> {
-    post_message_with(token, channel_id, text, attachments, None, reply_to)
-}
-
 fn post_message_with(
     token: &str,
     channel_id: &str,
@@ -1414,6 +1456,43 @@ fn post_message_with(
     response.json().with_context(|| format!(
         "Discord accepted the send in channel {channel_id}, but its response could not be decoded; retention failed; do not resend"
     ))
+}
+
+/// How one send reaches Discord ([`Discord::send_through`]): the post, and
+/// the download of the attachment bytes Discord's returned message names,
+/// which ordinary intake stores with the observation.
+pub trait SendTransport {
+    fn post(
+        &mut self,
+        token: &str,
+        channel_id: &str,
+        text: &str,
+        attachments: &[SendAttachment],
+        mentions: Option<&AllowedMentions>,
+        reply_to: Option<&str>,
+    ) -> Result<JsonValue>;
+    fn attachment(&mut self, url: &str, limit: u64) -> Result<Vec<u8>>;
+}
+
+/// Discord's HTTPS API: the transport every real send uses.
+pub struct Https;
+
+impl SendTransport for Https {
+    fn post(
+        &mut self,
+        token: &str,
+        channel_id: &str,
+        text: &str,
+        attachments: &[SendAttachment],
+        mentions: Option<&AllowedMentions>,
+        reply_to: Option<&str>,
+    ) -> Result<JsonValue> {
+        post_message_with(token, channel_id, text, attachments, mentions, reply_to)
+    }
+
+    fn attachment(&mut self, url: &str, limit: u64) -> Result<Vec<u8>> {
+        fetch_attachment_bytes(url, limit)
+    }
 }
 
 #[derive(Debug, Clone)]

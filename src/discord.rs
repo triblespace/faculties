@@ -35,9 +35,9 @@ pub mod voice_message;
 
 pub use operations::{
     message_body, AllowedMentions, Channel, ChannelListing, ChannelPull, ChannelReceipt, Discord,
-    GuildChannels, History, ObservedMessage, PageRequest, PresenceChange, PullOptions, PullReport,
-    ReadOptions, ReplyQuote, ReplyRelation, ReplyTarget, Rest, SendReceipt, Sentence, Source,
-    UnreadableReply, Utterance,
+    GuildChannels, History, Https, ObservedMessage, PageRequest, PresenceChange, PullOptions,
+    PullReport, ReadOptions, ReplyQuote, ReplyRelation, ReplyTarget, Rest, SendAttachment,
+    SendReceipt, SendTransport, Sentence, Source, UnreadableReply, Utterance,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
