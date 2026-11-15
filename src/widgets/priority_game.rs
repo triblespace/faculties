@@ -38,6 +38,8 @@ const OPEN_STATUSES: [&str; 3] = ["todo", "doing", "blocked"];
 pub struct PriorityGame {
     rng: u64,
     revision: Option<DatasetRevision>,
+    /// Open goals of the observed revision, recomputed only when it changes.
+    open: BTreeSet<Id>,
     /// The pair on screen, in display order.
     pair: Option<(Id, Id)>,
     /// Pairs answered, refused or skipped this session, smaller id first.
@@ -61,6 +63,7 @@ impl PriorityGame {
         Self {
             rng: seed,
             revision: None,
+            open: BTreeSet::new(),
             pair: None,
             seen: HashSet::new(),
             message: None,
@@ -75,9 +78,10 @@ impl PriorityGame {
         dataset: DatasetView<'_>,
         mut prioritize: impl FnMut(Id, Id) -> Result<(), String>,
     ) {
-        let open = open_goals(dataset);
         if self.revision != Some(dataset.revision) {
             self.revision = Some(dataset.revision);
+            self.open = open_goals(dataset);
+            let open = &self.open;
             let still_open = self.pair.is_some_and(|(a, b)| {
                 open.contains(&a)
                     && open.contains(&b)
@@ -88,7 +92,7 @@ impl PriorityGame {
             }
         }
         if self.pair.is_none() {
-            self.pair = choose_pair(dataset.facts, &open, &self.seen, &mut self.rng);
+            self.pair = choose_pair(dataset.facts, &self.open, &self.seen, &mut self.rng);
         }
 
         let mut answer: Option<Option<(Id, Id)>> = None;
@@ -129,7 +133,7 @@ impl PriorityGame {
                 Err(error) => format!("Not recorded: {error}"),
             }),
         };
-        self.pair = choose_pair(dataset.facts, &open, &self.seen, &mut self.rng);
+        self.pair = choose_pair(dataset.facts, &self.open, &self.seen, &mut self.rng);
     }
 }
 
