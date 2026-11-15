@@ -64,6 +64,7 @@ pub mod ingest;
 pub mod mcp;
 pub mod operations;
 pub mod render;
+pub mod share;
 
 use anybytes::Bytes;
 use triblespace::core::blob::Blob;
@@ -449,6 +450,19 @@ where
         content: BytesHandle,
         pattern!(facts, [{ unit @ crate::schemas::files::file::content: ?content }])
     )
+    .collect()
+}
+
+/// A unit's languages, skipping a name this build does not know.
+pub fn unit_languages<P>(facts: &P, unit: Id) -> Vec<Language>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        language: TextHandle,
+        pattern!(facts, [{ unit @ attrs::language: ?language }])
+    )
+    .filter_map(Language::from_text)
     .collect()
 }
 

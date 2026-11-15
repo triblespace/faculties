@@ -15,11 +15,13 @@ use serde::Deserialize;
 use super::index::Tier;
 use super::operations::{Code as Operations, Filter, IngestOptions, Revision};
 use super::render;
-use crate::mcp::{decode_arguments, Faculty, Tool};
+use super::share::{LineRange, ShareRequest};
+use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 
 pub struct Code {
     operations: Operations,
+    discord: crate::discord::Discord,
 }
 
 impl Code {
@@ -29,6 +31,7 @@ impl Code {
 
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
+            discord: crate::discord::Discord::with_storage(storage.clone()),
             operations: Operations::with_storage(storage),
         }
     }
@@ -54,6 +57,11 @@ const TOOLS: &[Tool] = &[
         name: "code_show",
         description: "Everything the catalogue holds about one declaration, selected by item id prefix or by name, including every location it is placed in. Byte-identical code in two files is ONE item with two placements.",
         input_schema: r#"{"type":"object","properties":{"selector":{"type":"string"},"source":{"type":"boolean","description":"Include the declaration's source lines."}},"required":["selector"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "code_share",
+        description: "Post one declaration's exact source, as the catalogue holds it, to a Discord channel as the workspace's Secrets-backed bot, so the source never passes through the caller: pass a reference (selector, optional at/repo/file/kind and line range), never the text. The header names the path, the line range and the exact revision. Up to Discord's 2000 characters it is a fenced code block, longer (or containing a fence) it is an attachment of the exact bytes; nothing is truncated and nobody is pinged. An unknown selector, more than one matching placement (listed), or lines outside the declaration refuse before anything is sent. The message is stored as an ordinary Discord observation. An uncertain send must not be retried automatically.",
+        input_schema: r#"{"type":"object","properties":{"selector":{"type":"string","description":"Item id prefix (at least 4 hex digits) or exact declaration name."},"channel_id":{"type":"string","pattern":"^[1-9][0-9]{0,19}$","description":"Discord channel id."},"lines":{"type":"string","pattern":"^[0-9]+(-[0-9]+)?$","description":"Optional file lines A-B (or A), inside the declaration's span."},"reply_to":{"type":"string","pattern":"^[1-9][0-9]{0,19}$","description":"Optional Discord message id to reply to, stored in this channel (as discord_read shows it)."},"note":{"type":"string","maxLength":1000,"description":"Optional literal prose posted above the code."},"file":{"type":"string","description":"Only a placement in exactly this repo-relative file, as code_find prints it (not a path on any host)."},"kind":{"type":"string"},"repo":{"type":"string"},"at":{"type":"string"},"dry_run":{"type":"boolean","description":"Resolve and report what would be posted, without the bytes; send nothing."}},"required":["selector","channel_id"],"additionalProperties":false}"#,
     },
     Tool {
         name: "code_dup",
@@ -129,6 +137,29 @@ struct Show {
     selector: String,
     #[serde(default)]
     source: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Share {
+    selector: String,
+    channel_id: String,
+    #[serde(default)]
+    lines: Option<String>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    file: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +303,37 @@ impl Faculty for Code {
                 let request: Show = decode_arguments(arguments)?;
                 let detail = self.operations.show(&request.selector, request.source)?;
                 render::detail(&detail, out)
+            }
+            "code_share" => {
+                let request: Share = decode_arguments(arguments)?;
+                let share = ShareRequest {
+                    selector: request.selector,
+                    filter: filter(request.kind, request.repo, request.at),
+                    path: request.file,
+                    lines: request
+                        .lines
+                        .as_deref()
+                        .map(LineRange::parse)
+                        .transpose()
+                        .map_err(invalid_arguments)?,
+                    note: request.note,
+                };
+                if request.dry_run {
+                    crate::discord::validate_snowflake(&request.channel_id)
+                        .map_err(invalid_arguments)?;
+                    crate::discord::operations::validate_reply_to(request.reply_to.as_deref())
+                        .map_err(invalid_arguments)?;
+                    return render::share_plan(&self.operations.share_plan(&share)?, out);
+                }
+                render::shared(
+                    &self.operations.share(
+                        &share,
+                        &request.channel_id,
+                        request.reply_to.as_deref(),
+                        &self.discord,
+                    )?,
+                    out,
+                )
             }
             "code_dup" => {
                 let request: Dup = decode_arguments(arguments)?;

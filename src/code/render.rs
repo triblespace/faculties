@@ -420,3 +420,45 @@ mod tests {
         assert_eq!(first_line("abcdef", 3), "abc…");
     }
 }
+
+fn share_span(plan: &crate::code::share::SharePlan) -> String {
+    let what = match (&plan.kind, &plan.name) {
+        (Some(kind), Some(name)) => format!("{kind} {name}"),
+        (None, Some(name)) => name.clone(),
+        (Some(kind), None) => kind.clone(),
+        (None, None) => "declaration".to_owned(),
+    };
+    format!(
+        "{}/{} lines {}-{} at {}@{} ({what}, item {:x})",
+        plan.repo, plan.path, plan.lines.start, plan.lines.end, plan.repo, plan.commit, plan.item,
+    )
+}
+
+fn share_delivery(plan: &crate::code::share::SharePlan) -> String {
+    use crate::code::share::Delivery;
+    match &plan.delivery {
+        Delivery::Block => format!(
+            "  as a code block: {} byte(s), message {} character(s)",
+            plan.bytes.len(),
+            plan.text.chars().count()
+        ),
+        Delivery::Attachment { filename, reason } => format!(
+            "  as attachment {filename}: {} byte(s), because {reason}",
+            plan.bytes.len()
+        ),
+    }
+}
+
+/// What a `--dry-run` would post: the reference and the delivery, never the
+/// bytes, which are the thing this verb keeps out of the caller's context.
+pub fn share_plan(plan: &crate::code::share::SharePlan, out: &mut Out<'_>) -> Result<()> {
+    out.line(format!("Would share {}", share_span(plan)))?;
+    out.line(share_delivery(plan))?;
+    out.line("  nothing was sent (dry run)")
+}
+
+pub fn shared(receipt: &crate::code::share::ShareReceipt, out: &mut Out<'_>) -> Result<()> {
+    out.line(format!("Shared {}", share_span(&receipt.plan)))?;
+    out.line(share_delivery(&receipt.plan))?;
+    crate::discord::render::sent(&receipt.sent, out)
+}

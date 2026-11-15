@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `code share <SELECTOR> --channel <CHANNEL_ID>` and the `code_share` MCP
+  tool post one declaration's exact source, as the catalogue holds it, to a
+  Discord channel, so a caller passes a reference (selector, `--at`,
+  `--repo`, `--file`, `--kind`, `--lines A-B`) and never the text. The bytes
+  come from the scanned unit, not the working tree. The header names the
+  path, the line range and the revision (12 hex digits of the commit, or the
+  worktree digest marked uncommitted). Up to Discord's 2000 characters the
+  span is a fenced code block with the language's tag; longer, or holding a
+  fence, or not UTF-8, it is an attachment of the exact bytes with a short
+  header; nothing is truncated. More than one matching placement refuses
+  with the candidates listed, as do an unknown selector and lines outside
+  the declaration, all before anything is sent. `--reply-to` and `--note`
+  are accepted, nobody is pinged, and `--dry-run` reports the reference and
+  delivery without the bytes. The send is `discord send`'s own path, now
+  exposed as `Discord::send_through` over a `SendTransport` (HTTPS in
+  production, a fake in tests), so the post is stored as an ordinary Discord
+  observation.
 - Discord replies, both ways. `discord send --reply-to <MESSAGE_ID>` and
   `discord_send`'s `reply_to` post as a Discord reply (`message_reference`,
   with `fail_if_not_exists`) to a message stored in that channel; a target

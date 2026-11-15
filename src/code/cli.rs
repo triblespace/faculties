@@ -15,6 +15,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use super::index::Tier;
 use super::operations::{Code, Filter, IngestOptions, Revision};
 use super::render;
+use super::share::{LineRange, ShareRequest};
 use crate::out::Out;
 
 #[derive(Parser)]
@@ -75,6 +76,40 @@ enum Command {
         /// Print the declaration's source lines.
         #[arg(long)]
         source: bool,
+    },
+    /// Post one declaration's exact catalogued source to a Discord channel,
+    /// so a caller passes a reference and never the text. The bytes come from
+    /// the pile, not the working tree; the header names path, lines and
+    /// revision. Up to Discord's 2000 characters it is a code block, longer it
+    /// is an attachment, never truncated. Nobody is pinged.
+    Share {
+        /// An item id prefix, or a declaration name. More than one matching
+        /// placement refuses with the candidates, and nothing is sent.
+        selector: String,
+        /// Discord channel id (global snowflake).
+        #[arg(long, value_name = "CHANNEL_ID")]
+        channel: String,
+        /// Only these file lines of the declaration: `A-B`, or `A`. They must
+        /// lie inside its span.
+        #[arg(long, value_name = "A-B")]
+        lines: Option<String>,
+        /// Post as a reply to this stored message (its id as `discord read`
+        /// shows it).
+        #[arg(long, value_name = "MESSAGE_ID")]
+        reply_to: Option<String>,
+        /// A line of prose above the code. Use @path or @- to read it.
+        #[arg(long)]
+        note: Option<String>,
+        /// Only a placement in exactly this repo-relative file, as `code find`
+        /// prints it.
+        #[arg(long = "file", value_name = "REPO_RELATIVE_PATH")]
+        path: Option<String>,
+        /// Resolve and report what would be posted, without the bytes, and
+        /// send nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
     },
     /// Code that exists in more than one place.
     Dup {
@@ -231,6 +266,37 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             let detail = code.show(&selector, source)?;
             render::detail(&detail, out)
         }
+        Command::Share {
+            selector,
+            channel,
+            lines,
+            reply_to,
+            note,
+            path,
+            dry_run,
+            filter,
+        } => {
+            let request = ShareRequest {
+                selector,
+                filter: filter.into(),
+                path,
+                lines: lines.as_deref().map(LineRange::parse).transpose()?,
+                note: note
+                    .as_deref()
+                    .map(|note| crate::text_arg(note, "share note"))
+                    .transpose()?,
+            };
+            if dry_run {
+                crate::discord::validate_snowflake(&channel)?;
+                crate::discord::operations::validate_reply_to(reply_to.as_deref())?;
+                return render::share_plan(&code.share_plan(&request)?, out);
+            }
+            let discord = crate::discord::Discord::with_storage(storage.clone());
+            render::shared(
+                &code.share(&request, &channel, reply_to.as_deref(), &discord)?,
+                out,
+            )
+        }
         Command::Dup {
             min_lines,
             cross_repo,
@@ -299,6 +365,7 @@ mod tests {
                 "find",
                 "uses",
                 "show",
+                "share",
                 "dup",
                 "stats",
                 "index",

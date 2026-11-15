@@ -260,6 +260,24 @@ impl Language {
         }
     }
 
+    /// Every language this build names.
+    pub const ALL: [Self; 6] = [
+        Self::Rust,
+        Self::Toml,
+        Self::Markdown,
+        Self::Shell,
+        Self::Typst,
+        Self::Text,
+    ];
+
+    /// The language whose name has this text handle; `None` for a word this
+    /// build does not know.
+    pub fn from_text(text: TextHandle) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|language| language.name().to_owned().to_blob().get_handle() == text)
+    }
+
     /// The language of one repo-relative path, or `None` when this build has
     /// nothing to say about it.
     pub fn of_path(path: &str) -> Option<Self> {
