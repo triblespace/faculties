@@ -446,7 +446,10 @@ def manifest_for(
             "lockfile_sha256": sha256(lock_path),
         },
         "build_recipe": build_recipe_from_environment(),
-        "rustc": run("rustc", "--version", "--verbose").rstrip(),
+        # From the source checkout, so rustup applies its rust-toolchain.toml
+        # pin; from the caller's cwd this recorded whatever toolchain applied
+        # there (1.97.1 against a 1.98.0 build in the 2026-11-15 cohort).
+        "rustc": run("rustc", "--version", "--verbose", cwd=source_dir).rstrip(),
         "sources": repositories,
         "binaries": [
             {
