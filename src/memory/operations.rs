@@ -1885,7 +1885,10 @@ fn churn_tiled(
             .map(|k| until - k * step_ns)
             .collect();
         let budget = opts.budget_chars;
-        let rules = [("CURRENT", LevelOneRule::Divide)];
+        let rules = [
+            ("CURRENT", LevelOneRule::Divide),
+            ("UNDERFILL", LevelOneRule::Underfill),
+        ];
         let renders = replay_points(&members, &points, budget, &rules.map(|r| r.1));
 
         out.line("== identity".to_string())?;

@@ -135,6 +135,14 @@ pub enum LevelOneRule {
     /// the tiles the level holds now, oldest first, unspent passing on.
     #[default]
     Divide,
+    /// EXPERIMENTAL UNDERFILL: tile `t` of this level has a FIXED space of
+    /// `share / 3` plus a carry -- what coarser levels left unspent for tile
+    /// 0, what tile `t - 1` left of its own space after that -- so a tile's
+    /// space never depends on how many tiles the level holds yet. Whatever
+    /// the level leaves unspent (including the `share / 3` of each tile not
+    /// yet present) is left unused by the cover: it passes neither to level
+    /// 0 nor to the open unit. Other levels keep [`Self::Divide`].
+    Underfill,
 }
 
 /// What [`select_grid_recollection_cut_with`] reports beside the cut.
@@ -154,8 +162,7 @@ pub fn select_grid_recollection_cut_with(
     budget: usize,
     rule: LevelOneRule,
 ) -> (RecollectionCut, GridDetail) {
-    let detail = GridDetail::default();
-    let LevelOneRule::Divide = rule;
+    let mut detail = GridDetail::default();
     assert_eq!(spans.len(), costs.len());
     assert_eq!(spans.len(), eligible.len());
     let mut out = RecollectionCut {
@@ -207,12 +214,18 @@ pub fn select_grid_recollection_cut_with(
         let (lo, hi) = (block(n, level + 1), block(n, level));
         let tiles = ((hi - lo) / width) as usize;
         let allowance = share.saturating_add(carry).min(budget - out.used);
+        let underfill = rule == LevelOneRule::Underfill && level == GRID_HEAD_LEVEL;
+        let mut pool = carry;
         let mut spent = 0usize;
         for t in 0..tiles {
             let ta = (lo + t as i128 * width) * unit;
             let tb = ta + width * unit;
-            let tile_space = (allowance - spent) / (tiles - t);
-            spent += walk_tile(
+            let tile_space = if underfill {
+                (share / 3).saturating_add(pool).min(allowance - spent)
+            } else {
+                (allowance - spent) / (tiles - t)
+            };
+            let got = walk_tile(
                 spans,
                 costs,
                 eligible,
@@ -223,14 +236,20 @@ pub fn select_grid_recollection_cut_with(
                 tb,
                 tile_space,
             );
+            spent += got;
+            pool = tile_space - got;
         }
         out.used += spent;
         carry = allowance - spent;
+        if underfill {
+            detail.withheld = carry;
+            carry = 0;
+        }
         if level >= GRID_HEAD_LEVEL {
             out.head = out.cover.len();
         }
     }
-    let room = budget - out.used;
+    let room = (budget - out.used).saturating_sub(detail.withheld);
     let origin = n * unit;
     let mut members: Vec<usize> = (0..spans.len())
         .filter(|&i| eligible[i] && costs[i] > 0 && spans[i].0 >= origin)
@@ -750,5 +769,199 @@ mod tests {
             }
         }
         assert_eq!(compared, 7 * 7 * 3);
+    }
+
+    // ---- EXPERIMENTAL lane cover-underfill-20261115: synthetic traces ----
+
+    const RULES: [(&str, LevelOneRule); 2] = [
+        ("CURRENT", LevelOneRule::Divide),
+        ("UNDERFILL", LevelOneRule::Underfill),
+    ];
+    const TRACE_BUDGET: usize = 60_000;
+
+    fn cut_with(spans: &[(i128, i128, Id)], rule: LevelOneRule) -> RecollectionCut {
+        select_grid_recollection_cut_with(
+            spans,
+            &costs(spans),
+            &vec![true; spans.len()],
+            TRACE_BUDGET,
+            rule,
+        )
+        .0
+    }
+
+    /// Rendered bytes of the cover's entries `[..upto]`, each exactly as the
+    /// render writes one entry, with a synthetic body per memory.
+    fn bytes(spans: &[(i128, i128, Id)], cover: &[usize]) -> Vec<u8> {
+        cover
+            .iter()
+            .flat_map(|&i| {
+                let (s, e, id) = spans[i];
+                crate::memory_cover::replay_grid::entry_text(s, e, Some(&format!("memory {id:x}")))
+                    .into_bytes()
+            })
+            .collect()
+    }
+
+    /// `(old head bytes, new head bytes, first differing byte or None,
+    /// new head starts with the old head)`.
+    fn head_change(
+        before: &[(i128, i128, Id)],
+        after: &[(i128, i128, Id)],
+        rule: LevelOneRule,
+    ) -> (usize, usize, Option<usize>, bool) {
+        let (a, b) = (cut_with(before, rule), cut_with(after, rule));
+        let (ha, hb) = (
+            bytes(before, &a.cover[..a.head]),
+            bytes(after, &b.cover[..b.head]),
+        );
+        let first = ha
+            .iter()
+            .zip(&hb)
+            .position(|(x, y)| x != y)
+            .or(if ha.len() == hb.len() {
+                None
+            } else {
+                Some(ha.len().min(hb.len()))
+            });
+        (ha.len(), hb.len(), first, hb.starts_with(&ha))
+    }
+
+    /// With UNDERFILL a new 3-day tile EXTENDS the head; the saved prefix
+    /// survives. With CURRENT the same step re-divides the level and the
+    /// older 3-day tiles are re-chosen.
+    #[test]
+    fn underfill_a_new_three_day_tile_extends_the_head() {
+        let mut current_broke = 0;
+        let mut digit_one_steps = 0;
+        for hours in 40 * 24..90 * 24 {
+            let (before, after) = (journal(hours, 35), journal(hours + 1, 35));
+            let (was, now) = (newest_unit(&before), newest_unit(&after));
+            if was.div_euclid(16) != now.div_euclid(16) || was.div_euclid(4) == now.div_euclid(4) {
+                continue;
+            }
+            digit_one_steps += 1;
+            let (_, _, _, under_ok) = head_change(&before, &after, LevelOneRule::Underfill);
+            assert!(under_ok, "UNDERFILL head not extended at hour {hours}");
+            let (old, new, first, current_ok) = head_change(&before, &after, LevelOneRule::Divide);
+            if !current_ok {
+                current_broke += 1;
+            }
+            eprintln!(
+                "TRACE new-3day-tile hour {hours}: CURRENT head {old}->{new} bytes, first change at {first:?}, extends {current_ok}; UNDERFILL extends {under_ok}"
+            );
+        }
+        assert!(digit_one_steps >= 5, "{digit_one_steps}");
+        assert!(
+            current_broke > 0,
+            "CURRENT never broke on {digit_one_steps} steps"
+        );
+    }
+
+    /// An append in the open unit changes no head byte under either rule.
+    #[test]
+    fn an_append_in_the_open_unit_changes_no_head_byte() {
+        let base = journal(55 * 24 + 3, 45);
+        let n = newest_unit(&base);
+        let origin = n * GRID_UNIT_NS;
+        let mut after = base.clone();
+        let end = base.iter().map(|s| s.1).max().unwrap();
+        after.push(((end - H / 2).max(origin), end, id(7_000_001)));
+        for (name, rule) in RULES {
+            let (old, new, first, extends) = head_change(&base, &after, rule);
+            let (a, b) = (cut_with(&base, rule), cut_with(&after, rule));
+            eprintln!(
+                "TRACE open-append {name}: head {old}->{new} bytes, first change {first:?}; cover extends {}",
+                b.cover.starts_with(&a.cover)
+            );
+            assert_eq!(first, None);
+            assert!(extends);
+            assert!(b.cover.starts_with(&a.cover));
+        }
+    }
+
+    /// A retrospective summary of an older span lands in the tile its start
+    /// falls in. Bytes before that tile stay; under both rules the head
+    /// changes from that tile on.
+    #[test]
+    fn a_retrospective_summary_changes_the_head_from_its_own_tile() {
+        let base = journal(62 * 24 + 5, 45);
+        let n = newest_unit(&base);
+        for (label, days_back) in [("level-1 tile", 4i128), ("level-2+ tile", 20)] {
+            let end = base.iter().map(|s| s.1).max().unwrap();
+            let start = (end - days_back * DAY).div_euclid(H) * H;
+            let level = level_of(n, start).expect("closed level");
+            let mut after = base.clone();
+            after.push((start, start + 2 * DAY, id(8_000_000 + days_back as u128)));
+            assert_eq!(newest_unit(&after), n);
+            for (name, rule) in RULES {
+                let (a, b) = (cut_with(&base, rule), cut_with(&after, rule));
+                // Head entries from levels coarser than the summary's.
+                let coarser = |c: &RecollectionCut, spans: &[(i128, i128, Id)]| {
+                    c.cover[..c.head]
+                        .iter()
+                        .take_while(|&&i| level_of(n, spans[i].0).is_some_and(|l| l > level))
+                        .map(|&i| spans[i].2)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(coarser(&a, &base), coarser(&b, &after), "{name} {label}");
+                let (old, new, first, extends) = head_change(&base, &after, rule);
+                let picked = b
+                    .cover
+                    .iter()
+                    .any(|&i| after[i].2 == id(8_000_000 + days_back as u128));
+                eprintln!(
+                    "TRACE retrospective {label} (level {level}) {name}: head {old}->{new} bytes, first change {first:?}, extends {extends}, summary selected {picked}; coarser levels unchanged"
+                );
+            }
+        }
+    }
+
+    /// A late memory with an older authored time, in both arrival orders:
+    /// the two histories converge to the same render, and each arrival
+    /// changes the head only from the tile it starts in.
+    #[test]
+    fn a_late_older_memory_converges_in_both_arrival_orders() {
+        let base = journal(58 * 24 + 11, 45);
+        let n = newest_unit(&base);
+        let end = base.iter().map(|s| s.1).max().unwrap();
+        let recent = ((end - H / 3).max(n * GRID_UNIT_NS), end, id(9_000_001));
+        let start = (end - 5 * DAY).div_euclid(H) * H;
+        let late = (start, start + 3 * H, id(9_000_002));
+        let level = level_of(n, late.0);
+        for (name, rule) in RULES {
+            let with = |extra: &[(i128, i128, Id)]| {
+                let mut s = base.clone();
+                s.extend_from_slice(extra);
+                s
+            };
+            let (ab, ba) = (with(&[recent, late]), with(&[late, recent]));
+            let (x, y) = (cut_with(&ab, rule), cut_with(&ba, rule));
+            let ids = |c: &RecollectionCut, s: &[(i128, i128, Id)]| {
+                c.cover.iter().map(|&i| s[i].2).collect::<Vec<_>>()
+            };
+            assert_eq!(ids(&x, &ab), ids(&y, &ba), "{name}");
+            assert_eq!(bytes(&ab, &x.cover), bytes(&ba, &y.cover), "{name}");
+            assert_eq!((x.used, x.head), (y.used, y.head));
+            for (order, first, second) in [
+                ("recent-then-late", recent, late),
+                ("late-then-recent", late, recent),
+            ] {
+                let one = with(&[first]);
+                let two = with(&[first, second]);
+                let a = head_change(&base, &one, rule);
+                let b = head_change(&one, &two, rule);
+                eprintln!(
+                    "TRACE late-arrival {name} {order} (late memory at level {level:?}): first arrival head {}->{} first change {:?}; second arrival head {}->{} first change {:?}",
+                    a.0, a.1, a.2, b.0, b.1, b.2
+                );
+                // The recent memory alone never touches the head.
+                if first == recent {
+                    assert_eq!(a.2, None, "{name}");
+                } else {
+                    assert_eq!(b.2, None, "{name}");
+                }
+            }
+        }
     }
 }
