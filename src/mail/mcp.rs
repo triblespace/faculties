@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use triblespace::prelude::Id;
 
 const TOOLS: &[Tool] = &[
-    Tool { name: "mail_account_set", description: "Publish a full-state mail-account configuration, or reconcile every current fork. Accept only exact existing encrypted Secrets versions; omit credential_version only to inherit one settled current credential. No password or host-path input.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"address":{"type":"string"},"display_name":{"type":"string"},"pop_endpoint":{"type":"string","description":"Implicit-TLS POP endpoint as host:port."},"smtp_endpoint":{"type":"string","description":"Implicit-TLS SMTP endpoint as host:port."},"username":{"type":"string"},"credential_version":{"type":"string"},"disabled":{"type":"boolean","default":false}},"required":["address","display_name","pop_endpoint","smtp_endpoint"],"additionalProperties":false}"# },
+    Tool { name: "mail_account_set", description: "Publish a full-state mail-account configuration, or reconcile every current fork. Accept only exact existing encrypted Secrets versions; omit credential_version only to inherit one settled current credential. No password or host-path input.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"address":{"type":"string"},"display_name":{"type":"string"},"imap_endpoint":{"type":"string","description":"Implicit-TLS IMAP endpoint as host:port, normally port 993."},"smtp_endpoint":{"type":"string","description":"Implicit-TLS SMTP endpoint as host:port."},"username":{"type":"string"},"credential_version":{"type":"string"},"disabled":{"type":"boolean","default":false}},"required":["address","display_name","imap_endpoint","smtp_endpoint"],"additionalProperties":false}"# },
     Tool { name: "mail_account_list", description: "List resident account identities, configuration heads and disabled/forked state without opening credential plaintext.", input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"# },
-    Tool { name: "mail_fetch", description: "Drain every enabled account through UIDL-safe POP. This is an explicit network/remote-deletion action: persist Files and Mail evidence before DELE, then QUIT. A failed QUIT can leave remote deletion uncertain.", input_schema: r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"# },
+    Tool { name: "mail_fetch", description: "Observe every enabled account read-only over IMAP: EXAMINE each selected mailbox (default INBOX), UID SEARCH it, and fetch with BODY.PEEK[] only the UIDs not yet observed under its current UIDVALIDITY. Nothing on the server is flagged, moved or deleted. Optional criteria are ANDed IMAP SEARCH keys; dates are YYYY-MM-DD or D-Mon-YYYY and compare against the server's received date.", input_schema: r#"{"type":"object","properties":{"mailboxes":{"type":"array","items":{"type":"string"},"default":[],"description":"Exact server mailbox names; empty means INBOX."},"all_mailboxes":{"type":"boolean","default":false,"description":"Examine every selectable mailbox the server lists; excludes mailboxes."},"from":{"type":"string","description":"IMAP SEARCH FROM substring."},"subject":{"type":"string","description":"IMAP SEARCH SUBJECT substring."},"since":{"type":"string","description":"IMAP SEARCH SINCE date."},"before":{"type":"string","description":"IMAP SEARCH BEFORE date."}},"required":[],"additionalProperties":false}"# },
     Tool { name: "mail_draft", description: "Create one immutable draft and its deterministic Decide authorization proposal. Text is literal. Attach stored files by exact Files entity or single-file import ID (file_ids), and/or host files by absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none (attachments). A folder import is refused. Does not send mail.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"to":{"type":"array","items":{"type":"string"},"default":[]},"cc":{"type":"array","items":{"type":"string"},"default":[]},"bcc":{"type":"array","items":{"type":"string"},"default":[]},"subject":{"type":"string"},"body":{"type":"string"},"file_ids":{"type":"array","items":{"type":"string"},"default":[],"description":"Exact 32-hex Files entity IDs or single-file import IDs."},"attachments":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"mime":{"type":"string"},"path":{"type":"string","description":"Absolute path of the attachment on the MCP server's host."}},"required":["name","mime","path"],"additionalProperties":false},"default":[]}},"required":["account","subject","body"],"additionalProperties":false,"anyOf":[{"required":["to"],"properties":{"to":{"minItems":1}}},{"required":["cc"],"properties":{"cc":{"minItems":1}}},{"required":["bcc"],"properties":{"bcc":{"minItems":1}}}]}"# },
     Tool { name: "mail_reply", description: "Create a reply draft using one unambiguous existing wire message and explicit sending account. Body is literal, including @-; does not send mail.", input_schema: r#"{"type":"object","properties":{"account":{"type":"string"},"message":{"type":"string"},"body":{"type":"string"}},"required":["account","message","body"],"additionalProperties":false}"# },
     Tool { name: "mail_send", description: "Submit one Decide-authorized immutable draft under host-serialized per-account execution. Persist its send attempt before SMTP and acceptance afterward. Never automatically retry an uncertain attempt; host must serialize other processes/replicas too.", input_schema: r#"{"type":"object","properties":{"draft":{"type":"string"}},"required":["draft"],"additionalProperties":false}"# },
@@ -30,12 +30,24 @@ struct AccountSet {
     account: Option<String>,
     address: String,
     display_name: String,
-    pop_endpoint: String,
+    imap_endpoint: String,
     smtp_endpoint: String,
     username: Option<String>,
     credential_version: Option<String>,
     #[serde(default)]
     disabled: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Fetch {
+    #[serde(default)]
+    mailboxes: Vec<String>,
+    #[serde(default)]
+    all_mailboxes: bool,
+    from: Option<String>,
+    subject: Option<String>,
+    since: Option<String>,
+    before: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +134,53 @@ fn exact_id(value: &str) -> Result<Id> {
         .ok_or_else(|| invalid_arguments("expected one exact nonzero 32-digit hexadecimal id"))
 }
 
+fn line_text(value: &str, field: &str) -> Result<()> {
+    nonempty(value, field)?;
+    if value.contains(['\r', '\n']) {
+        return Err(invalid_arguments(format!("{field} must be one line")));
+    }
+    Ok(())
+}
+fn fetch_request(args: Fetch) -> Result<FetchRequest> {
+    if args.all_mailboxes && !args.mailboxes.is_empty() {
+        return Err(invalid_arguments(
+            "all_mailboxes and mailboxes are mutually exclusive",
+        ));
+    }
+    for mailbox in &args.mailboxes {
+        line_text(mailbox, "mailboxes")?;
+    }
+    for (field, value) in [("from", &args.from), ("subject", &args.subject)] {
+        if let Some(value) = value {
+            line_text(value, field)?;
+        }
+    }
+    let date = |field: &str, value: Option<String>| -> Result<Option<super::SearchDate>> {
+        value
+            .map(|value| {
+                super::SearchDate::parse(&value).ok_or_else(|| {
+                    invalid_arguments(format!("{field} must be YYYY-MM-DD or D-Mon-YYYY"))
+                })
+            })
+            .transpose()
+    };
+    Ok(FetchRequest {
+        mailboxes: if args.all_mailboxes {
+            super::MailboxSelection::All
+        } else if args.mailboxes.is_empty() {
+            super::MailboxSelection::Inbox
+        } else {
+            super::MailboxSelection::Named(args.mailboxes)
+        },
+        criteria: super::SearchCriteria {
+            from: args.from,
+            subject: args.subject,
+            since: date("since", args.since)?,
+            before: date("before", args.before)?,
+        },
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Mail {
     operations: super::operations::Mail,
@@ -149,7 +208,7 @@ impl Faculty for Mail {
                 for (field, value) in [
                     ("address", &args.address),
                     ("display_name", &args.display_name),
-                    ("pop_endpoint", &args.pop_endpoint),
+                    ("imap_endpoint", &args.imap_endpoint),
                     ("smtp_endpoint", &args.smtp_endpoint),
                 ] {
                     nonempty(value, field)?;
@@ -174,7 +233,7 @@ impl Faculty for Mail {
                     account: args.account,
                     address: args.address,
                     display_name: args.display_name,
-                    pop_endpoint: args.pop_endpoint,
+                    imap_endpoint: args.imap_endpoint,
                     smtp_endpoint: args.smtp_endpoint,
                     username: args.username,
                     credential_version,
@@ -190,8 +249,8 @@ impl Faculty for Mail {
                 render::accounts(&self.operations.account_list()?, out)
             }
             "mail_fetch" => {
-                let _: Empty = decode_arguments(arguments)?;
-                render::fetched(&self.operations.fetch()?, out)
+                let args: Fetch = decode_arguments(arguments)?;
+                render::fetched(&self.operations.fetch(fetch_request(args)?)?, out)
             }
             "mail_draft" => {
                 let args: Draft = decode_arguments(arguments)?;

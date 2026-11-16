@@ -367,9 +367,10 @@ MCP resident reads do not imply a fresh external sync. `teams_read` and
 `discord_read` inspect the archive; their `*_pull` tools explicitly contact
 the service, unlike the CLI read commands' sync-first UX. `linkedin_import`
 takes resident connection rows, while `linkedin_pull` fetches a finite DMA
-export before importing. `mail_fetch` explicitly drains configured POP
-accounts with the existing archive-before-delete/QUIT boundary; `mail_send`
-requires its existing Decide authorization and records uncertain delivery.
+export before importing. `mail_fetch` explicitly observes configured IMAP
+accounts read-only (EXAMINE, UID SEARCH, `BODY.PEEK[]`; nothing on the server
+is flagged, moved or deleted); `mail_send` requires its existing Decide
+authorization and records uncertain delivery.
 
 Some useful capabilities deliberately remain host interfaces:
 
@@ -714,7 +715,7 @@ schemas describe exact arguments and effects.
 | `home` | Hue lights, live from the bridge: rooms, lights, scenes, on/off/dim, with each change recorded |
 | `imagine` | Local image generation and optional memory publication |
 | `linkedin` | Conservative connection imports and Relations identity review |
-| `mail` | Account state, POP evidence, drafts, authorization and delivery receipts |
+| `mail` | Account state, IMAP evidence, drafts, authorization and delivery receipts |
 | `memory` | Journaled time ranges, lossy recollection, search and replay |
 | `message` | Direct messages and explicit per-reader acknowledgements |
 | `orient` | Situation awareness and directed news; CLI background waits |

@@ -1,4 +1,4 @@
-//! Mail native/CLI/MCP contracts on temporary resident piles; no POP or SMTP network calls.
+//! Mail native/CLI/MCP contracts on temporary resident piles; no IMAP or SMTP network calls.
 use anybytes::Bytes;
 use anyhow::{bail, Result};
 use faculties::mail::{self, AccountOptions, DraftAttachment, DraftRequest, Mail};
@@ -41,7 +41,7 @@ impl Fixture {
                     account: None,
                     address: "me@example.test".into(),
                     display_name: "Me".into(),
-                    pop_endpoint: "pop.example.test:995".into(),
+                    imap_endpoint: "imap.example.test:993".into(),
                     smtp_endpoint: "smtp.example.test:465".into(),
                     username: None,
                     credential_version: None,
@@ -70,7 +70,7 @@ impl Fixture {
             account: Some(format!("{:x}", self.account)),
             address: "me@example.test".into(),
             display_name: "Me".into(),
-            pop_endpoint: "pop.example.test:995".into(),
+            imap_endpoint: "imap.example.test:993".into(),
             smtp_endpoint: "smtp.example.test:465".into(),
             username: None,
             credential_version: Some(self.credential),
@@ -90,9 +90,23 @@ impl Fixture {
             .unwrap()
             .person
     }
-    fn incoming(&self, uid: &str, body: &str) -> Id {
-        let raw=format!("From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <inbound@example.test>\r\nSubject: Hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}");
-        let value = mail::pop_publication(self.account, self.config, uid, raw.as_bytes()).unwrap();
+    fn incoming(&self, uid: u32, body: &str) -> Id {
+        let raw = Self::inbound(body);
+        let value =
+            mail::imap_publication(self.account, self.config, "INBOX", 1, uid, raw.as_bytes())
+                .unwrap();
+        self.publish_source(value)
+    }
+    /// Evidence recorded before IMAP replaced POP stays readable.
+    fn legacy_pop(&self, uidl: &str, body: &str) -> Id {
+        let raw = Self::inbound(body);
+        let value = mail::pop_publication(self.account, self.config, uidl, raw.as_bytes()).unwrap();
+        self.publish_source(value)
+    }
+    fn inbound(body: &str) -> String {
+        format!("From: Sender <sender@example.test>\r\nTo: me@example.test\r\nMessage-ID: <inbound@example.test>\r\nSubject: Hello\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}")
+    }
+    fn publish_source(&self, value: mail::SourcePublication) -> Id {
         if !value.files.facts().is_empty() {
             publish_fragment(
                 &self.pile,
@@ -207,7 +221,7 @@ fn explicit_persona_seen_receipts_do_not_change_show_or_other_readers() {
     let fixture = Fixture::new();
     let first = fixture.reader("First");
     let second = fixture.reader("Second");
-    let wire = fixture.incoming("uid-one", "@- resident message");
+    let wire = fixture.incoming(1, "@- resident message");
     let message = format!("{wire:x}");
     let shown = fixture.operations().show(&message).unwrap();
     assert_eq!(shown[0].body, "@- resident message");
@@ -377,7 +391,7 @@ fn cli_expands_body_and_attachment_files_but_native_body_stays_literal() {
 #[test]
 fn reply_uses_literal_body_and_refuses_conflicting_wire_projections() {
     let fixture = Fixture::new();
-    let wire = fixture.incoming("uid-first", "first source body");
+    let wire = fixture.incoming(2, "first source body");
     let before = fixture.operations().show(&format!("{wire:x}")).unwrap();
     call(&fixture.mcp(),"mail_reply",json!({"account":format!("{:x}",fixture.account),"message":format!("{wire:x}"),"body":"@-"})).unwrap();
     let outbox = fixture.operations().outbox().unwrap();
@@ -386,7 +400,7 @@ fn reply_uses_literal_body_and_refuses_conflicting_wire_projections() {
     assert_eq!(reply.subject, "Re: Hello");
     assert_eq!(reply.to, ["Sender <sender@example.test>"]);
     assert_eq!(reply.in_reply_to, ["inbound@example.test"]);
-    fixture.incoming("uid-other", "different body with same claimed Message-ID");
+    fixture.legacy_pop("uid-other", "different body with same claimed Message-ID");
     assert_eq!(before[0].body, "first source body");
     let error=call(&fixture.mcp(),"mail_reply",json!({"account":format!("{:x}",fixture.account),"message":format!("{wire:x}"),"body":"must not choose"})).unwrap_err();
     assert!(error.to_string().contains("conflicting parser projections"));
@@ -407,9 +421,20 @@ fn account_exact_version_replay_and_disabled_fetch_are_credential_safe() {
     assert!(!text.contains("synthetic-mail-password"));
     call(&fixture.mcp(),"mail_account_set",json!({
         "account":format!("{:x}",fixture.account),"address":"me@example.test","display_name":"Me",
-        "pop_endpoint":"pop.example.test:995","smtp_endpoint":"smtp.example.test:465","credential_version":format!("{:x}",fixture.credential),"disabled":true,
+        "imap_endpoint":"imap.example.test:993","smtp_endpoint":"smtp.example.test:465","credential_version":format!("{:x}",fixture.credential),"disabled":true,
     })).unwrap();
-    assert!(fixture.operations().fetch().unwrap().is_empty());
+    assert!(fixture
+        .operations()
+        .fetch(Default::default())
+        .unwrap()
+        .is_empty());
+    assert!(call(
+        &fixture.mcp(),
+        "mail_fetch",
+        json!({"all_mailboxes":true,"from":"anthropic","since":"2024-01-01","before":"1-Jan-2025"})
+    )
+    .unwrap()
+    .is_empty());
     assert!(call(&fixture.mcp(), "mail_fetch", json!({}))
         .unwrap()
         .is_empty());
@@ -465,18 +490,32 @@ fn independent_decoders_reject_nested_input_errors_and_credentials_without_stora
     for (tool, raw) in [
         (
             "mail_account_set",
-            r#"{"address":"a","display_name":"n","pop_endpoint":"p","smtp_endpoint":"s","password":"do-not-output-this"}"#,
+            r#"{"address":"a","display_name":"n","imap_endpoint":"p","smtp_endpoint":"s","password":"do-not-output-this"}"#,
         ),
         (
             "mail_account_set",
-            r#"{"address":"a","display_name":"n","pop_endpoint":"p","smtp_endpoint":"s","credential_version":"@-"}"#,
+            r#"{"address":"a","display_name":"n","imap_endpoint":"p","smtp_endpoint":"s","credential_version":"@-"}"#,
         ),
         (
             "mail_account_set",
-            r#"{"address":"a","display_name":"n","pop_endpoint":"p","smtp_endpoint":"s"}"#,
+            r#"{"address":"a","display_name":"n","imap_endpoint":"p","smtp_endpoint":"s"}"#,
         ),
         ("mail_account_list", r#"{"key":"credential"}"#),
         ("mail_fetch", r#"{"account":"not-supported"}"#),
+        (
+            "mail_account_set",
+            r#"{"address":"a","display_name":"n","pop_endpoint":"p","smtp_endpoint":"s","credential_version":"00000000000000000000000000000001"}"#,
+        ),
+        (
+            "mail_fetch",
+            r#"{"mailboxes":["INBOX"],"all_mailboxes":true}"#,
+        ),
+        ("mail_fetch", r#"{"mailboxes":"INBOX"}"#),
+        ("mail_fetch", r#"{"since":"last tuesday"}"#),
+        ("mail_fetch", r#"{"before":"2024-02-30"}"#),
+        ("mail_fetch", r#"{"from":"a\r\nA1 DELETE INBOX"}"#),
+        ("mail_fetch", r#"{"subject":""}"#),
+        ("mail_fetch", r#"{"expunge":true}"#),
         (
             "mail_draft",
             r#"{"account":"a","to":[],"subject":"s","body":"b"}"#,

@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Mail receives over read-only IMAP instead of POP, so that no mailbox can be
+  configured to be drained. `src/mail_pop.rs`, its DELE/QUIT drain and its
+  tests are gone; `src/mail_imap.rs` is a small synchronous IMAP4rev1 client
+  over the existing implicit-TLS rustls stack whose closed command set is
+  CAPABILITY, LOGIN, LIST, EXAMINE, UID SEARCH, UID FETCH (`RFC822.SIZE`,
+  `BODY.PEEK[]`) and LOGOUT, pinned by a test. `mail fetch` / `mail_fetch`
+  examine INBOX by default, `--mailbox` (repeatable) or `--all-mailboxes`,
+  take optional `--from`, `--subject`, `--since`, `--before` SEARCH keys, and
+  fetch only UIDs not yet observed under the mailbox's current UIDVALIDITY.
+  Each message is a new `KIND_IMAP_OBSERVATION` carrying `mailbox`,
+  `uidvalidity` and `uid`; accounts take `imap_endpoint` in place of
+  `pop_endpoint`. POP observations and POP-era configurations stay readable;
+  such an account refuses to fetch until it is re-set with an IMAP endpoint.
+  Messages above 64 MiB are reported and left on the server.
 - `code share <SELECTOR> --channel <CHANNEL_ID>` and the `code_share` MCP
   tool post one declaration's exact source, as the catalogue holds it, to a
   Discord channel, so a caller passes a reference (selector, `--at`,
