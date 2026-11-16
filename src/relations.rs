@@ -16,7 +16,8 @@ pub mod render;
 pub use operations::{
     AddedGroup, AddedOrganisation, AddedPerson, AddedTie, EndedTie, GroupAddition,
     GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange, PeopleFilter,
-    ProfileField, ProfilePatch, ProfileReconciliation, ProfileUpdate, Relations, TieRequest,
+    PersonState, ProfileField, ProfilePatch, ProfileReconciliation, ProfileUpdate, Relations,
+    TieRequest,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

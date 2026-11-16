@@ -289,6 +289,12 @@ pub struct AddedPerson {
     pub profile: Id,
     pub lifecycle: Id,
 }
+/// A person's anchor and lifecycle verdict, as [`Relations::person_state`] read it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersonState {
+    pub person: Id,
+    pub retired: bool,
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileUpdate {
     pub person: Id,
@@ -1307,6 +1313,25 @@ impl Relations {
     pub fn show(&self, entry: &str) -> Result<String> {
         self.with_relations(true, |storage| {
             show_entry(storage, entry.to_owned(), &EntryKind::ALL)
+        })
+    }
+    /// One person's anchor and whether it is retired, by label, alias or id.
+    /// `None` when nothing matches; ambiguity and forks are errors, as for
+    /// any selector that must name one anchor. Retired people are included.
+    pub fn person_state(&self, person: &str) -> Result<Option<PersonState>> {
+        self.with_relations(true, |storage| {
+            storage.with_view(|facts, reader| {
+                match relations::resolve_person(reader, facts, person, true)? {
+                    SelectorOutcome::Missing => Ok(None),
+                    outcome => {
+                        let id = outcome.require_unique("person", person)?;
+                        Ok(Some(PersonState {
+                            person: id,
+                            retired: relations::person_is_retired(facts, id)?,
+                        }))
+                    }
+                }
+            })
         })
     }
     pub fn retire(&self, person: &str) -> Result<LifecycleChange> {

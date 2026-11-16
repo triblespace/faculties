@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- New faculty `spawn` (compass 9a9e2c95) replaces `worker-unit.sh` and
+  `worker-wait.sh`. `spawn run --brief <path|-> --workdir <dir>` starts a task
+  zooid: a headless Claude session in user unit `spawn-<name>`, which
+  outlives the window. The brief fixes the zooid: its name is
+  the first 32 bits of the brief's blob hash as two proquints, it tints the
+  memory tail the zooid wakes into, and it is the prompt. The zooid gets a
+  Relations persona (affinity `zooid`); while that persona is live a second
+  launch of the same brief refuses. The prompt is the wake (beliefs and a
+  200k-character cover), a 40k-character tail chosen `--about` the brief, a
+  short preamble, and the brief. `spawn settle`, the unit's ExecStopPost step,
+  records the end, exit and report on the run, messages the spawner as the
+  zooid, and retires the persona. `spawn list`, `show` and `wait` read the
+  records; MCP adds `spawn_run`, `spawn_list` and `spawn_show`.
+  `relations` gains `Relations::person_state`.
+
 - `secrets find <TERM>... [--role title|username|url]...` and the
   `secrets_find` MCP tool find structured items by case-insensitive substring
   over the public label and the USERNAME and URL fields, every term required.
