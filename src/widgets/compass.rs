@@ -276,6 +276,32 @@ fn order_rows(lane_ids: Vec<Id>, space: &FactArchive) -> Vec<(Id, usize)> {
     ordered
 }
 
+/// A goal's titles as one line, the way `compass list` shows them: every
+/// distinct readable title, sorted, joined by " / ". The schema cannot express
+/// cardinality, so two writers may each have given the goal a title; none is
+/// chosen over another. `None` when no title is readable yet.
+fn goal_title(space: &FactArchive, dataset: DatasetView<'_>, goal_id: Id) -> Option<String> {
+    let mut titles: Vec<String> = find!(
+        (t: TextHandle),
+        pattern!(space, [{
+            goal_id @
+            metadata::tag: &KIND_GOAL_ID,
+            compass::title: ?t,
+        }])
+    )
+    .filter_map(|(handle,)| {
+        dataset
+            .reader
+            .get::<View<str>, UTF8String>(handle)
+            .ok()
+            .map(|title| title.as_ref().to_owned())
+    })
+    .collect();
+    titles.sort();
+    titles.dedup();
+    (!titles.is_empty()).then(|| titles.join(" / "))
+}
+
 /// True if the goal matches the (lowercased) search needle in any of:
 /// its full hex id, its title body, or any of its tags. Substring match;
 /// case-insensitive (caller lowercases). Each piece is a per-goal query
@@ -289,21 +315,10 @@ fn goal_matches_search(
     if fmt_id_full(goal_id).contains(needle) {
         return true;
     }
-    if let Some((handle,)) = find!(
-        (t: TextHandle),
-        pattern!(space, [{
-            goal_id @
-            metadata::tag: &KIND_GOAL_ID,
-            compass::title: ?t,
-        }])
-    )
-    .next()
+    if goal_title(space, dataset, goal_id)
+        .is_some_and(|title| title.to_lowercase().contains(needle))
     {
-        if let Ok(v) = dataset.reader.get::<View<str>, UTF8String>(handle) {
-            if v.as_ref().to_lowercase().contains(needle) {
-                return true;
-            }
-        }
+        return true;
     }
     for (tag,) in find!(
         (tag: Inline<Handle<UTF8String>>),
@@ -490,7 +505,9 @@ impl CompassBoard {
             let (status, sort_at) = latest_status_event(space, status_register, gid)
                 .and_then(|(_, status, at)| {
                     let status = dataset.reader.get::<View<str>, UTF8String>(status).ok()?;
-                    Some((status.to_string(), interval_key(at)))
+                    // A status time that does not decode still says the
+                    // status; only its sort position falls back to creation.
+                    Some((status.to_string(), interval_key(at).unwrap_or(created.0)))
                 })
                 .unwrap_or_else(|| ("todo".to_string(), created.0));
             goals.push((gid, status, sort_at));
@@ -776,25 +793,14 @@ fn render_goal_card(
                     }
                 }
 
-                if let Some((handle,)) = find!(
-                    (t: TextHandle),
-                    pattern!(space, [{
-                        goal_id @
-                        metadata::tag: &KIND_GOAL_ID,
-                        compass::title: ?t,
-                    }])
-                )
-                .next()
-                {
-                    if let Ok(v) = dataset.reader.get::<View<str>, UTF8String>(handle) {
-                        let base = egui::TextFormat {
-                            font_id: egui::TextStyle::Monospace.resolve(ui.style()),
-                            color: ui.visuals().text_color(),
-                            ..Default::default()
-                        };
-                        let job = GORBIE::search::highlight_match(v.as_ref(), search_needle, base);
-                        ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
-                    }
+                if let Some(title) = goal_title(space, dataset, goal_id) {
+                    let base = egui::TextFormat {
+                        font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                        color: ui.visuals().text_color(),
+                        ..Default::default()
+                    };
+                    let job = GORBIE::search::highlight_match(&title, search_needle, base);
+                    ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Wrap));
                 }
             });
 
@@ -851,18 +857,9 @@ fn render_goal_card(
                     .filter(|(higher, _)| *higher == goal_id)
                 {
                     let lower_id = *lower;
-                    let target_label = find!(
-                        (t: TextHandle),
-                        pattern!(space, [{
-                            lower_id @
-                            metadata::tag: &KIND_GOAL_ID,
-                            compass::title: ?t,
-                        }])
-                    )
-                    .next()
-                    .and_then(|(h,)| dataset.reader.get::<View<str>, UTF8String>(h).ok())
-                    .map(|v| truncate_inline(v.as_ref(), 16))
-                    .unwrap_or_else(|| fmt_id_full(lower_id));
+                    let target_label = goal_title(space, dataset, lower_id)
+                        .map(|title| truncate_inline(&title, 16))
+                        .unwrap_or_else(|| fmt_id_full(lower_id));
                     render_chip(
                         ui,
                         &format!("▲ {target_label}"),

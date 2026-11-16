@@ -23,15 +23,14 @@ use std::time::SystemTime;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::latest::LatestIndex;
-use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery};
+use triblespace::core::collection::latest::{LatestBlob, LatestIndex};
+use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
     CollectionStoreExt, Cover, Support,
 };
-#[cfg(test)]
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::SnapshotSource;
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
@@ -53,12 +52,12 @@ use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 use crate::storage::{
-    open_secrets_collection_read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore,
+    open_secrets_collection_read, AcquiringReader, CollectionRoutes, FactArchive, FacultyStore,
     Storage,
 };
 
-/// Frozen widget data with exact-body acquisition through its owning state.
-pub type WidgetReader = AcquiringReader<FacultySnapshot>;
+mod reader;
+pub use reader::WidgetReader;
 type PileSnapshot = WidgetReader;
 
 /// Stable logical input requested by a widget.
@@ -319,6 +318,68 @@ struct LoadedInputs {
     unavailable: BTreeSet<SourceKey>,
     datasets: BTreeMap<SourceKey, LoadedDataset>,
     secrets: Option<LoadedSecrets>,
+}
+
+/// A host-owned frozen observation. It owns native views, never a pile, peer,
+/// path-based Storage, or a second catalogue of faculty entities.
+pub struct WorkspaceObservation(LoadedInputs);
+
+impl WorkspaceObservation {
+    pub fn loaded_context(&self) -> WidgetContext<'_> {
+        WidgetContext { datasets: Some(&self.0.datasets), secrets: self.0.secrets.as_ref() }
+    }
+
+    pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.unavailable.iter().map(|key| {
+            COLLECTION_SOURCE_CATALOG.iter().find(|entry| entry.key == *key)
+                .map(|entry| entry.label).unwrap_or("Secrets")
+        })
+    }
+
+    /// Borrow the host's existing pile for one explicit workspace observation.
+    /// The caller owns synchronization, cancellation and workspace revalidation.
+    /// No path is accepted and no storage owner or transport is constructed.
+    pub async fn observe(
+        pile: &mut Pile,
+        signer: &ed25519_dalek::SigningKey,
+        routes: &CollectionRoutes,
+    ) -> Result<Self, String> {
+        let mut sources = source_closure(SourceKey::ALL);
+        retain_routed_sources(&mut sources, routes);
+        let mut unavailable = BTreeSet::new();
+        let admitted = pile.snapshot().map_err(|error| error.to_string())?;
+        for (scope, _) in collection_scopes(&sources) {
+            if crate::collection_names::open_workspace_read_in(
+                &admitted, signer.verifying_key(), routes[&scope],
+            ).is_err() {
+                unavailable.extend(remove_scope(&mut sources, scope));
+            }
+        }
+        let prepared = prepare_inputs(pile, &sources, true, unavailable, |pile, scope| {
+            crate::collection_names::open_workspace_in(&pile.snapshot()?, routes[&scope])
+        })?;
+        let secrets = if sources.contains(&SourceKey::Secrets) {
+            let observed = async {
+                // READ controls replication, not possession of delivered wraps.
+                let source = crate::collection_names::open_workspace_in(
+                    &pile.snapshot()?, routes[&crate::secrets::DEFAULT_SCOPE_ID],
+                )?;
+                let collection = secret_storage::SecretsCollection::from_source(pile, source)?;
+                let snapshot = secret_storage::ensure_and_snapshot(pile, collection, signer).await?;
+                Ok::<_, anyhow::Error>((collection, snapshot))
+            }.await;
+            Some(observed)
+        } else { None };
+        let mut prepared = prepared;
+        let (snapshot, secrets) = match secrets {
+            Some(Ok((collection, secrets))) => (secrets.store_snapshot().clone(), Some(collection)),
+            other => {
+                if other.is_some() { prepared.unavailable.insert(SourceKey::Secrets); }
+                (pile.snapshot().map_err(|error| error.to_string())?, None)
+            }
+        };
+        read_inputs(WidgetReader::Resident(snapshot), secrets, prepared, true).map(Self)
+    }
 }
 
 impl LoadedSecrets {
@@ -755,6 +816,18 @@ fn remove_scope(sources: &mut BTreeSet<SourceKey>, scope: Id) -> BTreeSet<Source
     removed
 }
 
+fn retain_routed_sources(sources: &mut BTreeSet<SourceKey>, routes: &CollectionRoutes) {
+    sources.retain(|key| {
+        let scope = if *key == SourceKey::Secrets {
+            crate::secrets::DEFAULT_SCOPE_ID
+        } else {
+            COLLECTION_SOURCE_CATALOG.iter().find(|entry| entry.key == *key)
+                .expect("every source has a role").scope
+        };
+        routes.contains_key(&scope)
+    });
+}
+
 fn load_inputs_mode(
     storage: &Storage,
     requested: &BTreeSet<SourceKey>,
@@ -768,18 +841,7 @@ fn load_inputs_mode(
                 let routes = storage
                     .collection_routes()
                     .ok_or_else(|| anyhow::anyhow!("workspace routes are required"))?;
-                sources.retain(|key| {
-                    let scope = if *key == SourceKey::Secrets {
-                        crate::secrets::DEFAULT_SCOPE_ID
-                    } else {
-                        COLLECTION_SOURCE_CATALOG
-                            .iter()
-                            .find(|entry| entry.key == *key)
-                            .expect("every source has a role")
-                            .scope
-                    };
-                    routes.contains_key(&scope)
-                });
+                retain_routed_sources(&mut sources, routes);
             }
             for (scope, _) in collection_scopes(&sources) {
                 if let Err(error) =
@@ -871,16 +933,76 @@ fn load_inputs_from_store_mode(
     requested: &BTreeSet<SourceKey>,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
     partial: bool,
-    mut unavailable: BTreeSet<SourceKey>,
+    unavailable: BTreeSet<SourceKey>,
 ) -> Result<LoadedInputs, String> {
+    let mut prepared = prepare_inputs(pile, requested, partial, unavailable, |pile, scope| {
+        storage.open_collection_local(pile, scope, signer.verifying_key())
+    })?;
+
+    let secrets = if prepared.sources.contains(&SourceKey::Secrets) {
+        let observed = (|| {
+            let collection = storage
+                .open_secrets_collection(pile, signer.verifying_key(), runtime, false)
+                .map_err(|error| format!("open Secrets: {error:#}"))?;
+            let snapshot = runtime
+                .block_on(secret_storage::ensure_and_snapshot(
+                    pile, collection, signer,
+                ))
+                .map_err(|error| format!("observe Secrets: {error:#}"))?;
+            Ok::<_, String>((collection, snapshot))
+        })();
+        match observed {
+            Ok(value) => Some(value),
+            Err(error) if !partial => return Err(error),
+            Err(_) => {
+                prepared.unavailable.insert(SourceKey::Secrets);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // One final native observation serves every admitted dataset and index.
+    // Failure of an optional role never causes another view to select again.
+    let snapshot = match &secrets {
+        Some((_, secrets)) => secrets.store_snapshot().clone(),
+        None => pile
+            .snapshot()
+            .map_err(|error| format!("freeze viewer observation: {error}"))?,
+    };
+    let snapshot = WidgetReader::Acquiring(AcquiringReader::new(snapshot, runtime.clone()));
+    read_inputs(snapshot, secrets.map(|(collection, _)| collection), prepared, partial)
+}
+
+// Operation-local descriptor setup only; consumed before returning an observation.
+// The BTree sets below are scratch for this single load, not a retained catalogue.
+struct PreparedInputs {
+    sources: BTreeSet<SourceKey>,
+    unavailable: BTreeSet<SourceKey>,
+    collections: Vec<(Id, &'static str, Collection<Rank9AcceleratedSuccinctArchiveBlob>)>,
+    compass_register: Option<Collection<LwwRegisterBlob>>,
+    wiki_latest: Option<Collection<LatestBlob>>,
+}
+
+fn prepare_inputs<S>(
+    pile: &mut S,
+    requested: &BTreeSet<SourceKey>,
+    partial: bool,
+    mut unavailable: BTreeSet<SourceKey>,
+    mut open_source: impl FnMut(&mut S, Id) -> anyhow::Result<Collection<triblespace::prelude::blobencodings::SimpleArchive>>,
+) -> Result<PreparedInputs, String>
+where
+    S: CollectionStoreExt + SnapshotSource,
+    S::Snapshot: BlobStoreGet + CapabilityProofRead,
+{
     let mut sources = requested.clone();
     let mut collections = Vec::new();
     let mut compass_register = None;
     let mut wiki_latest = None;
     for (scope, label) in collection_scopes(&sources) {
         let registration = (|| {
-            let source = storage
-                .open_collection_local(pile, scope, signer.verifying_key())
+            let source = open_source(pile, scope)
                 .map_err(|error| format!("open {label}: {error:#}"))?;
             let succinct = pile
                 .attach::<SuccinctArchiveBlob>(source, ())
@@ -909,41 +1031,18 @@ fn load_inputs_from_store_mode(
         }
     }
 
-    let secrets = if sources.contains(&SourceKey::Secrets) {
-        let observed = (|| {
-            let collection = storage
-                .open_secrets_collection(pile, signer.verifying_key(), runtime, false)
-                .map_err(|error| format!("open Secrets: {error:#}"))?;
-            let snapshot = runtime
-                .block_on(secret_storage::ensure_and_snapshot(
-                    pile, collection, signer,
-                ))
-                .map_err(|error| format!("observe Secrets: {error:#}"))?;
-            Ok::<_, String>((collection, snapshot))
-        })();
-        match observed {
-            Ok(value) => Some(value),
-            Err(error) if !partial => return Err(error),
-            Err(_) => {
-                unavailable.insert(SourceKey::Secrets);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    Ok(PreparedInputs { sources, unavailable, collections, compass_register, wiki_latest })
+}
 
-    // One final native observation serves every admitted dataset and index.
-    // Failure of an optional role never causes another view to select again.
-    let snapshot = match &secrets {
-        Some((_, secrets)) => secrets.store_snapshot().clone(),
-        None => pile
-            .snapshot()
-            .map_err(|error| format!("freeze viewer observation: {error}"))?,
-    };
-    let snapshot = AcquiringReader::new(snapshot, runtime.clone());
+fn read_inputs(
+    snapshot: WidgetReader,
+    secrets: Option<secret_storage::SecretsCollection>,
+    prepared: PreparedInputs,
+    partial: bool,
+) -> Result<LoadedInputs, String> {
+    let PreparedInputs { mut sources, mut unavailable, collections, compass_register, wiki_latest } = prepared;
     let secrets = match secrets {
-        Some((collection, _)) => {
+        Some(collection) => {
             match secret_storage::snapshot_acquiring(snapshot.clone(), collection) {
                 Ok(snapshot) => Some(LoadedSecrets::new(snapshot)),
                 Err(error) if !partial => return Err(format!("read Secrets: {error:#}")),
@@ -1076,6 +1175,68 @@ mod tests {
 
     use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
     use crate::test_support::initialize_open_collection_fixture;
+
+    #[test]
+    fn resident_workspace_observes_one_live_owner_and_keeps_frozen_views() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[17; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let open = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let teams = pile.collection("team fixture", open.clone()).unwrap();
+        let messages = pile.collection("message fixture", open).unwrap();
+        let denied = pile.collection("files fixture", CollectionPolicy::new(
+            AdmissionPolicy::direct(SigningKey::from_bytes(&[18; 32]).verifying_key()),
+            AdmissionPolicy::Open,
+        )).unwrap();
+        let routes = CollectionRoutes::from([
+            (TEAMS_SCOPE_ID, teams.handle()), (MESSAGES_SCOPE_ID, messages.handle()),
+            (FILES_SCOPE_ID, denied.handle()),
+        ]);
+        pile.commit(teams, &signer, entity! { metadata::name: "before" }).unwrap();
+        let first = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        let first_context = first.loaded_context();
+        let before = first_context.dataset(SourceKey::Teams).unwrap();
+        let peer = first_context.dataset(SourceKey::Messages).unwrap();
+        assert!(matches!(before.reader, WidgetReader::Resident(_)));
+        assert!(before.reader.changes_since(peer.reader).is_empty());
+        assert_eq!(first.unavailable_labels().collect::<Vec<_>>(), vec!["Files"]);
+        assert!(!first_context.contains(SourceKey::Wiki));
+        pile.commit(teams, &signer, entity! { metadata::name: "after" }).unwrap();
+        let second = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        assert_ne!(before.revision, second.loaded_context().dataset(SourceKey::Teams).unwrap().revision);
+        assert_eq!(find!(name: Inline<_>, pattern!(before.facts, [{ metadata::name: ?name }])).count(), 1);
+        drop(first);
+        drop(second);
+        // Closing every viewer observation leaves the same mutable owner usable.
+        pile.commit(teams, &signer, entity! { metadata::name: "after close" }).unwrap();
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn resident_workspace_preserves_delivered_secrets_without_read_authority() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[19; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let source = pile.collection("secret fixture", CollectionPolicy::new(
+            AdmissionPolicy::direct(SigningKey::from_bytes(&[20; 32]).verifying_key()),
+            AdmissionPolicy::direct(signer.verifying_key()),
+        )).unwrap();
+        let at = Epoch::from_unix_seconds(100.0);
+        let sealed = crate::secrets::seal_version("fixture", b"fixture only",
+            [signer.verifying_key()], (at, at).try_to_inline().unwrap()).unwrap();
+        let secret = sealed.secret;
+        pile.commit(source, &signer, sealed.fragment).unwrap();
+        assert!(crate::collection_names::open_workspace_read_in(
+            &pile.snapshot().unwrap(), signer.verifying_key(), source.handle(),
+        ).is_err());
+        let routes = CollectionRoutes::from([(crate::secrets::DEFAULT_SCOPE_ID, source.handle())]);
+        let observed = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        assert_eq!(observed.loaded_context().secrets().unwrap().snapshot.open(secret, &signer).unwrap(), b"fixture only");
+        drop(observed);
+        pile.close().unwrap();
+    }
 
     fn create_pile(path: &Path) {
         File::create(path).unwrap();

@@ -101,11 +101,15 @@ pub mod board {
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
-pub fn interval_key(interval: IntervalValue) -> i128 {
-    let (lower, _): (i128, i128) = interval
-        .try_from_inline()
-        .expect("NsTAIInterval inline values have a lower bound");
-    lower
+/// The lower bound of an interval in TAI nanoseconds, if the value decodes.
+///
+/// Queries are types: a stored value that does not decode as an interval (an
+/// inverted pair) is not a time this reader can order by, so every caller
+/// skips the row that carries it instead of panicking. A wider interval is
+/// read at its lower bound, the earliest moment it admits.
+pub fn interval_key(interval: IntervalValue) -> Option<i128> {
+    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
+    Some(lower)
 }
 
 /// The content handle of `value` as text, which is how a status or tag word

@@ -6,8 +6,8 @@
 #[cfg(test)]
 use crate::collection_names::{open_configured, open_exact_in};
 use crate::schemas::compass::{
-    board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
-    KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
+    board, interval_key, latest_status_event, IntervalValue, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID,
+    DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 #[cfg(test)]
@@ -303,19 +303,6 @@ impl Compass {
 
 /// Query helpers that operate directly on one immutable fact view + workspace.
 
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
-/// The lower bound of an interval in TAI nanoseconds, if the value decodes.
-///
-/// Queries are types: a stored value that does not decode as an interval (an
-/// inverted pair) is not a time this reader can order by, so every caller
-/// skips the row that carries it instead of panicking. A wider interval is
-/// read at its lower bound, the earliest moment it admits.
-fn interval_key(interval: IntervalValue) -> Option<i128> {
-    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
-    Some(lower)
-}
-
 /// The lower bound of an interval as text, if the value decodes.
 fn format_interval(interval: IntervalValue) -> Option<String> {
     let (lower, _): (Epoch, Epoch) = interval.try_from_inline().ok()?;
@@ -560,18 +547,7 @@ impl CompassStorage<'_> {
                     "compass list",
                     runtime,
                 )?;
-                pile.commit(compass_source, signer, fragment)
-                    .context("commit Compass collection fragment")?;
-                let status = compass::status_register_for_source(pile, compass_source)?;
-                runtime
-                    .block_on(async {
-                        storage::seed_attached(pile, status, signer).await?;
-                        storage::ensure_downstream(pile, compass_source, signer).await?;
-                        Ok::<_, anyhow::Error>(())
-                    })
-                    .context(
-                        "Compass fragment was committed, but ensuring its derived views failed",
-                    )?;
+                runtime.block_on(publish_compass(pile, compass_source, signer, fragment))?;
             }
             Ok(value)
         })
@@ -1510,66 +1486,130 @@ fn prioritize(
     lower_input: String,
     persona: Option<&str>,
 ) -> Result<PriorityChange> {
-    storage.update(
-        persona,
-        &[],
-        |space, reader, by_id, _| {
-            let higher_id = resolve_task_id(&higher_input, space)?;
-            let lower_id = resolve_task_id(&lower_input, space)?;
+    storage.update(persona, &[], |space, reader, by_id, _| {
+        prepare_priority(space, reader, &higher_input, &lower_input, by_id)
+    }, author_prepared_priority)
+}
 
-            if higher_id == lower_id {
-                bail!("cannot prioritize a goal over itself");
-            }
+// Operation-local plan, consumed exactly once by the author.
+type PreparedPriority = (Id, Id, String, String, PriorityPlan, Option<Id>);
 
-            // The order as it would read after this write, child before
-            // parent included. Ranking B over A while A > B is a flip: B's
-            // new snapshot reaches A's current one, so A's claim over B's
-            // replaced snapshot lapses and no cycle is left. A write is
-            // refused only when a cycle through the higher goal would remain:
-            // a parent ranked over its own descendant, or a cycle closed
-            // through a claim the new snapshot does not reach.
-            let plan = priority_plan(space, higher_id, Some(lower_id), None);
-            let edges =
-                compass::goal_priority_edges_after(space, higher_id, plan.over.keys().copied());
-            let on_cycle = edges.iter().any(|&(from, to)| {
-                from == higher_id && compass::would_create_priority_cycle(&edges, higher_id, to)
-            });
-            if on_cycle {
-                let paths = parent_paths(space)?;
-                if is_ancestor(&paths, higher_id, lower_id)
-                    || is_ancestor(&paths, lower_id, higher_id)
-                {
-                    bail!("children are implicitly prioritized over their parents");
-                }
-                bail!("would create a priority cycle");
-            }
+fn prepare_priority(
+    space: &FactArchive,
+    reader: &impl BlobStoreGet,
+    higher_input: &str,
+    lower_input: &str,
+    by_id: Option<Id>,
+) -> Result<PreparedPriority> {
+    let higher_id = resolve_task_id(&higher_input, space)?;
+    let lower_id = resolve_task_id(&lower_input, space)?;
 
-            Ok((
-                higher_id,
-                lower_id,
-                task_title(reader, space, higher_id)?,
-                task_title(reader, space, lower_id)?,
-                plan,
-                by_id,
-            ))
+    if higher_id == lower_id {
+        bail!("cannot prioritize a goal over itself");
+    }
+
+    // The order as it would read after this write, child before
+    // parent included. Ranking B over A while A > B is a flip: B's
+    // new snapshot reaches A's current one, so A's claim over B's
+    // replaced snapshot lapses and no cycle is left. A write is
+    // refused only when a cycle through the higher goal would remain:
+    // a parent ranked over its own descendant, or a cycle closed
+    // through a claim the new snapshot does not reach.
+    let plan = priority_plan(space, higher_id, Some(lower_id), None);
+    let edges =
+        compass::goal_priority_edges_after(space, higher_id, plan.over.keys().copied());
+    let on_cycle = edges.iter().any(|&(from, to)| {
+        from == higher_id && compass::would_create_priority_cycle(&edges, higher_id, to)
+    });
+    if on_cycle {
+        let paths = parent_paths(space)?;
+        if is_ancestor(&paths, higher_id, lower_id)
+            || is_ancestor(&paths, lower_id, higher_id)
+        {
+            bail!("children are implicitly prioritized over their parents");
+        }
+        bail!("would create a priority cycle");
+    }
+
+    Ok((
+        higher_id,
+        lower_id,
+        task_title(reader, space, higher_id)?,
+        task_title(reader, space, lower_id)?,
+        plan,
+        by_id,
+    ))
+}
+
+fn author_prepared_priority(
+    (higher_id, lower_id, higher_title, lower_title, plan, by_id): PreparedPriority,
+) -> Result<(Option<Fragment>, PriorityChange)> {
+    let mut change = compass::kind_catalog_fragment();
+    let (record, event) = author_priority(plan, higher_id, clock::point_now()?, by_id);
+    change += record;
+    Ok((
+        Some(change),
+        PriorityChange {
+            higher: higher_id,
+            lower: lower_id,
+            event,
+            active: true,
+            higher_title,
+            lower_title,
         },
-        |(higher_id, lower_id, higher_title, lower_title, plan, by_id)| {
-            let mut change = compass::kind_catalog_fragment();
-            let (record, event) = author_priority(plan, higher_id, clock::point_now()?, by_id);
-            change += record;
-            Ok((
-                Some(change),
-                PriorityChange {
-                    higher: higher_id,
-                    lower: lower_id,
-                    event,
-                    active: true,
-                    higher_title,
-                    lower_title,
-                },
-            ))
-        },
-    )
+    ))
+}
+
+/// The same priority operation over a host's borrowed native pile and exact route.
+/// No storage is opened and no persona is inferred. The host revalidates its
+/// workspace before entry and cancels stale intent at the final publication gate.
+pub async fn prioritize_in(
+    pile: &mut triblespace::core::repo::pile::Pile,
+    signer: &ed25519_dalek::SigningKey,
+    collection: triblespace::core::collection::CollectionHandle,
+    higher: Id,
+    lower: Id,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<PriorityChange> {
+    let snapshot = pile.snapshot()?;
+    let source = crate::collection_names::open_workspace_read_in(
+        &snapshot, signer.verifying_key(), collection,
+    )?;
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+    let reader = pile.snapshot()?;
+    let facts = storage::acquire_facts(&reader, rank9)?;
+    let prepared = prepare_priority(&facts, &reader, &fmt_id(higher), &fmt_id(lower), None)?;
+    let (fragment, value) = author_prepared_priority(prepared)?;
+    if let Some(fragment) = fragment {
+        crate::collection_names::open_workspace_write_in(
+            &pile.snapshot()?, signer.verifying_key(), collection,
+        )?;
+        before_commit()?;
+        publish_compass(pile, source, signer, fragment).await?;
+    }
+    Ok(value)
+}
+
+async fn publish_compass<S>(
+    pile: &mut S,
+    source: triblespace::core::collection::Collection<blobencodings::SimpleArchive>,
+    signer: &ed25519_dalek::SigningKey,
+    fragment: Fragment,
+) -> Result<()>
+where
+    S: triblespace::core::repo::Store
+        + triblespace::core::collection::CollectionStoreExt
+        + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
+        + Send,
+{
+    pile.commit(source, signer, fragment).context("commit Compass collection fragment")?;
+    async {
+        let status = compass::status_register_for_source(pile, source)?;
+        storage::seed_attached(pile, status, signer).await?;
+        storage::ensure_downstream(pile, source, signer).await?;
+        Ok::<_, anyhow::Error>(())
+    }.await.context("Compass fragment was committed, but ensuring its derived views failed")
 }
 
 /// What one priority write says about `goal`: the goals its new snapshot
@@ -1706,6 +1746,41 @@ mod tests {
     use triblespace::core::repo::MissingBlob;
 
     type BlobHandle = Inline<inlineencodings::Handle<UnknownBlob>>;
+
+    #[test]
+    fn borrowed_priority_uses_the_shared_plan_and_cancels_before_publication() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::pile::Pile;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[22; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let source = pile.collection("priority fixture", CollectionPolicy::new(
+            AdmissionPolicy::Open, AdmissionPolicy::direct(signer.verifying_key()),
+        )).unwrap();
+        let mut fragment = Fragment::empty();
+        let higher = plain_goal(&mut fragment, "higher", 1.0);
+        let lower = plain_goal(&mut fragment, "lower", 1.0);
+        pile.commit(source, &signer, fragment).unwrap();
+        let count = |pile: &mut Pile| {
+            pile.snapshot().unwrap().records().unwrap().map(|record| record.unwrap())
+                .filter(|record| matches!(record, triblespace::core::collection::CollectionRecord::Commit(_)))
+                .count()
+        };
+        let before = count(&mut pile);
+        assert!(pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, lower,
+            || bail!("cancelled fixture"))).is_err());
+        assert_eq!(count(&mut pile), before);
+        let change = pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, lower, || Ok(()))).unwrap();
+        assert_eq!((change.higher, change.lower, change.active), (higher, lower, true));
+        assert_eq!(count(&mut pile), before + 1);
+        assert!(pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, higher,
+            || panic!("self-priority reached publication"))).is_err());
+        let denied = SigningKey::from_bytes(&[23; 32]);
+        assert!(pollster::block_on(prioritize_in(&mut pile, &denied, source.handle(), lower, higher,
+            || panic!("denied writer reached publication"))).is_err());
+        assert_eq!(count(&mut pile), before + 1);
+        pile.close().unwrap();
+    }
 
     /// A real resident-only pile with an exact-handle remote byte fixture.
     struct AcquiringPile {
