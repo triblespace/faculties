@@ -31,9 +31,8 @@ pub use operations::{ChurnOptions, CreatedMemory, Memory, RespanReceipt};
 
 use std::collections::BTreeSet;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use triblespace::core::metadata;
-use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
@@ -77,16 +76,12 @@ pub struct ChunkDraft {
     pub aliases: BTreeSet<Id>,
 }
 
-fn point_bounds(entity: Option<Id>, field: &str, value: IntervalValue) -> Result<i128> {
-    let (lower, upper): (i128, i128) = value.try_from_inline().map_err(|error| match entity {
-        Some(entity) => anyhow!("decode {field} on Memory entity {entity:x}: {error:?}"),
-        None => anyhow!("decode {field}: {error:?}"),
-    })?;
+fn point_bounds(field: &str, value: IntervalValue) -> Result<i128> {
+    let (lower, upper): (i128, i128) = value
+        .try_from_inline()
+        .map_err(|error| anyhow!("decode {field}: {error:?}"))?;
     if lower != upper {
-        match entity {
-            Some(entity) => bail!("{field} on Memory entity {entity:x} must be a point interval"),
-            None => bail!("{field} must be a point interval"),
-        }
+        bail!("{field} must be a point interval");
     }
     Ok(lower)
 }
@@ -168,13 +163,13 @@ pub fn respan_edge(newer: Id, older: Id) -> Fragment {
 }
 
 pub fn chunk_fragment(draft: ChunkDraft) -> Result<(Fragment, Id)> {
-    let start = point_bounds(None, "chunk start", draft.start_at)?;
-    let end = point_bounds(None, "chunk end", draft.end_at)?;
+    let start = point_bounds("chunk start", draft.start_at)?;
+    let end = point_bounds("chunk end", draft.end_at)?;
     if end < start {
         bail!("chunk end precedes its start");
     }
     for at in &draft.observed_at {
-        point_bounds(None, "chunk observation time", *at)?;
+        point_bounds("chunk observation time", *at)?;
     }
 
     let mut fragment = Fragment::empty();
@@ -217,86 +212,6 @@ pub fn read_text<B: BlobStoreGet>(reader: &B, handle: TextHandle) -> Result<Stri
 
 pub fn read_image<B: BlobStoreGet>(reader: &B, handle: ImageHandle) -> Result<anybytes::Bytes> {
     reader.get(handle).map_err(Into::into)
-}
-
-/// Explicit boundary validation for the Memory values this version knows.
-///
-/// This is intentionally not an ordinary read path. It neither constructs a
-/// shadow catalog nor validates opaque entity ids, closed-world cardinality,
-/// or contextual-reference closure. Every typed value that can be projected
-/// is checked independently; unknown and incomplete records remain inert.
-pub fn validate_catalog<B, P>(reader: &B, facts: &P) -> Result<()>
-where
-    B: BlobStoreGet,
-    P: TriblePattern,
-{
-    for (id, handle) in find!(
-        (id: Id, handle: TextHandle),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            ctx::summary: ?handle,
-        }])
-    ) {
-        let summary = read_text(reader, handle)
-            .with_context(|| format!("read Memory chunk {id:x} summary"))?;
-        if summary.is_empty() {
-            bail!("Memory chunk {id:x} has an empty summary");
-        }
-    }
-    for (id, handle) in find!(
-        (id: Id, handle: ImageHandle),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            ctx::image: ?handle,
-        }])
-    ) {
-        let image = read_image(reader, handle)
-            .with_context(|| format!("read Memory chunk {id:x} image"))?;
-        if image.is_empty() {
-            bail!("Memory chunk {id:x} has an empty image");
-        }
-    }
-    for (id, handle) in find!(
-        (id: Id, handle: TextHandle),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            ctx::lens: ?handle,
-        }])
-    ) {
-        let lens =
-            read_text(reader, handle).with_context(|| format!("read Memory chunk {id:x} lens"))?;
-        if lens.is_empty() {
-            bail!("Memory chunk {id:x} has an empty lens");
-        }
-    }
-    for (id, value) in find!(
-        (id: Id, value: IntervalValue),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            ctx::start_at: ?value,
-        }])
-    ) {
-        point_bounds(Some(id), "chunk start", value)?;
-    }
-    for (id, value) in find!(
-        (id: Id, value: IntervalValue),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            ctx::end_at: ?value,
-        }])
-    ) {
-        point_bounds(Some(id), "chunk end", value)?;
-    }
-    for (id, value) in find!(
-        (id: Id, value: IntervalValue),
-        pattern!(facts, [{
-            ?id @ metadata::tag: &KIND_CHUNK_ID,
-            metadata::created_at: ?value,
-        }])
-    ) {
-        point_bounds(Some(id), "chunk observation time", value)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -535,31 +450,5 @@ mod tests {
         )
         .collect();
         assert_eq!(ids, BTreeSet::from([legacy_chunk]));
-    }
-
-    #[test]
-    fn explicit_validation_checks_known_payloads_for_opaque_ids() {
-        let missing = "not resident".to_owned().to_blob().get_handle();
-        let legacy = Id::new([0x58; 16]).unwrap();
-        let rows = entity! { ExclusiveId::force_ref(&legacy) @
-            metadata::tag: &KIND_CHUNK_ID,
-            ctx::summary: missing,
-            ctx::start_at: point(10.0),
-            ctx::end_at: point(20.0),
-            metadata::created_at: point(30.0),
-        };
-        let mut empty = Fragment::empty();
-        let reader = empty.blobs_mut().snapshot().unwrap();
-        let error = validate_catalog(&reader, rows.facts()).unwrap_err();
-        assert!(error.to_string().contains("summary"));
-    }
-
-    #[test]
-    fn explicit_validation_accepts_repeated_resident_values() {
-        let (mut fragment, id) = chunk_fragment(draft("one")).unwrap();
-        let other = fragment.put("two".to_owned());
-        fragment += entity! { ExclusiveId::force_ref(&id) @ ctx::summary: other };
-        let reader = fragment.blobs_mut().snapshot().unwrap();
-        validate_catalog(&reader, fragment.facts()).unwrap();
     }
 }

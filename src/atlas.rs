@@ -3,8 +3,7 @@
 //! Atlas facts are schema evidence rather than mutable scalar state. Multiple
 //! names or descriptions therefore remain visible variants; a reader must not
 //! let query iteration order manufacture one winning label. Ordinary readers
-//! ask for the projection they need directly; the strict whole-value validator
-//! at the bottom of this module is reserved for explicit migration/tests.
+//! ask for the projection they need directly.
 
 pub mod cli;
 pub mod mcp;
@@ -16,11 +15,10 @@ pub use store::Store;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Result};
-use triblespace::core::blob::Blob;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
-use triblespace::prelude::blobencodings::{UTF8String, WasmCode};
+use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
@@ -68,40 +66,6 @@ fn read_text_variants<R: BlobStoreGet>(
         .map(|handle| read_text(reader, handle, field, id))
         .collect::<Result<BTreeSet<_>>>()
         .map(|values| values.into_iter().collect())
-}
-
-/// Strictly read every Atlas attachment whose encoding is known here.
-pub fn validate_known_payloads<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<()> {
-    let text_attributes = [
-        metadata::name.id(),
-        metadata::description.id(),
-        metadata::iri.id(),
-        metadata::source.id(),
-        metadata::source_module.id(),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-
-    for fact in facts {
-        if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<Handle<UTF8String>>();
-            let _: anybytes::View<str> = reader.get(handle).map_err(|error| {
-                anyhow!(
-                    "read Atlas text payload {}: {error:?}",
-                    hex::encode_upper(handle.raw)
-                )
-            })?;
-        } else if fact.a() == &metadata::value_formatter.id() {
-            let handle = *fact.v::<Handle<WasmCode>>();
-            let _: Blob<WasmCode> = reader.get(handle).map_err(|error| {
-                anyhow!(
-                    "read Atlas value formatter {}: {error:?}",
-                    hex::encode_upper(handle.raw)
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 /// Project every named Atlas entity needed by a list-style consumer.
@@ -248,18 +212,10 @@ where
     }))
 }
 
-/// Validate one explicit stopped-world Atlas candidate.
-///
-/// Normal readers must use [`named_entries`] or [`named_entry`] instead: this
-/// full scan exists only for migration and adversarial-boundary tests.
-pub fn validate_catalog<R: BlobStoreGet>(reader: &R, facts: &TribleSet) -> Result<()> {
-    validate_known_payloads(reader, facts)?;
-    named_entries(reader, facts).map(drop)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace::prelude::blobencodings::WasmCode;
 
     #[test]
     fn projection_preserves_every_name_and_description_variant() {
@@ -315,6 +271,5 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, named);
-        assert!(validate_catalog(&reader, fragment.facts()).is_err());
     }
 }

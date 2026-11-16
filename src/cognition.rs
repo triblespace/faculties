@@ -199,42 +199,10 @@ pub fn validate_fragment(fragment: &Fragment) -> Result<()> {
     Ok(())
 }
 
-/// Validate the directly typed attachments of a complete Cognition value.
-/// Unknown facts remain legal: Cognition is intentionally a shared event
-/// ledger, and independent producers may extend its ontology. A field with
-/// several values is legal too; readers choose among them deterministically.
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    validate_payloads(reader, None::<&PileSnapshot>, facts.iter().copied())
-}
-
 /// Explicitly validate a maintained Cognition archive without flattening its
 /// physical shards into a second fact store.
 pub fn validate_archive(reader: &impl BlobStoreGet, facts: &FactArchive) -> Result<()> {
     validate_payloads(reader, None::<&PileSnapshot>, facts.iter())
-}
-
-/// Validate the union which a publication would create, including payloads
-/// carried only by the staged fragment.
-pub fn validate_candidate(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<()> {
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .context("snapshot staged Cognition attachments")?;
-    validate_payloads(reader, Some(&overlay), union.iter().copied())
-}
-
-/// Strict payload validation used while projecting each frozen legacy delta.
-/// This is crate-visible so the stopped-world migration can fail on a missing
-/// typed attachment rather than silently relying on conservative reachability.
-pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    validate_payloads(reader, None::<&PileSnapshot>, facts.iter().copied())
 }
 
 /// Exec results whose completion point lies in the inclusive interval,

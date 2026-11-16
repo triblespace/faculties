@@ -196,7 +196,6 @@ mod tests {
         let reader = pile.snapshot().unwrap();
         let (facts, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
         assert_eq!(facts, expected.into_facts());
-        cognition::validate_catalog(&reader, &facts).unwrap();
 
         let (text, command, found_turn, found_worker) = find!(
             (text: TextHandle, command: TextHandle, turn: Id, worker: Id),

@@ -1238,77 +1238,6 @@ where
     })
 }
 
-/// Strictly validate one materialized import value.
-///
-/// Ordinary reads deliberately use the direct current-state queries instead:
-/// derived ids are opaque, and unknown additive facts are legal in the
-/// open-world model. This exact reconstruction remains only for explicit
-/// untrusted migration and import boundaries where the historical format
-/// itself is what is being checked.
-fn parse_catalog_strict<Overlay>(
-    reader: &PileSnapshot,
-    overlay: Option<&Overlay>,
-    facts: &TribleSet,
-) -> Result<Catalog>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    let facts = active_facts(facts);
-    let catalog = project_catalog(reader, overlay, &facts)?;
-    let mut expected = TribleSet::new();
-    for &anchor in catalog.profiles.keys() {
-        expected += profile_anchor_fragment(anchor);
-    }
-    for (&id, snapshot) in &catalog.profile_snapshots {
-        let (canonical, canonical_id) =
-            profile_snapshot_fragment(&snapshot.value, &snapshot.predecessors)?;
-        if id != canonical_id {
-            bail!("profile snapshot {id:x} does not match intrinsic root {canonical_id:x}");
-        }
-        expected += canonical.into_facts();
-    }
-    for (&id, snapshot) in &catalog.config_snapshots {
-        let (canonical, canonical_id) =
-            config_snapshot_fragment(&snapshot.value, &snapshot.predecessors)?;
-        if id != canonical_id {
-            bail!("config snapshot {id:x} does not match intrinsic root {canonical_id:x}");
-        }
-        expected += canonical.into_facts();
-    }
-    if expected != facts {
-        let missing = expected.difference(&facts).len();
-        let unexpected = facts.difference(&expected).len();
-        bail!(
-            "Headspace import is not an exact canonical ontology ({missing} missing, {unexpected} unexpected facts)"
-        );
-    }
-    Ok(catalog)
-}
-
-/// Validate one exact materialized Headspace collection. Forks are valid;
-/// malformed records, wrong-track lineage, cycles, and missing payloads are
-/// not.
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    parse_catalog_strict(reader, None::<&PileSnapshot>, facts).map(drop)
-}
-
-/// Preflight the exact set union publication would create, including staged
-/// text payloads, without writing pile bytes.
-pub fn validate_catalog_union(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<Catalog> {
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("MemoryBlobStore reader creation is infallible");
-    parse_catalog_strict(reader, Some(&overlay), &union)
-}
-
 /// Project complete retained history, representing structural or payload
 /// failure as `Resolution::Invalid` rather than choosing an implicit winner.
 pub fn project<P>(reader: &impl BlobStoreGet, facts: &P) -> Catalog
@@ -1428,43 +1357,6 @@ pub fn open_active_secrets<R: BlobStoreGet>(
         )?,
         exa_api_key: open_utf8_secret(secrets, config.exa_secret_version, signing_key, "Exa")?,
     })
-}
-
-/// Strictly load direct legacy Headspace text attachments.
-///
-/// Generic migration additionally carries the complete resident closure, so
-/// unknown future payloads remain preserved rather than filtered out.
-pub fn validate_known_payloads(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    let text_attributes = [
-        metadata::name.id(),
-        metadata::description.id(),
-        playground_config::system_prompt.id(),
-        playground_config::branch.id(),
-        playground_config::author.id(),
-        playground_config::author_role.id(),
-        playground_config::model_name.id(),
-        playground_config::model_base_url.id(),
-        playground_config::model_api_key.id(),
-        playground_config::tavily_api_key.id(),
-        playground_config::exa_api_key.id(),
-        playground_config::model_reasoning_effort.id(),
-        playground_config::exec_default_cwd.id(),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-
-    for fact in facts {
-        if text_attributes.contains(fact.a()) {
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let _: View<str> = reader.get(handle).with_context(|| {
-                format!(
-                    "read frozen Headspace text payload {}",
-                    hex::encode_upper(handle.raw)
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 fn resolve_track<T: Clone + Eq>(
@@ -1816,13 +1708,6 @@ mod tests {
         let catalog = project_result(&reader, &facts).unwrap();
         assert!(matches!(catalog.config, Resolution::Missing));
         assert!(catalog.profiles.is_empty());
-
-        let graft = entity! { legacy_id @ metadata::tag: &KIND_LIVE_RECORD };
-        let error = validate_catalog_union(&reader, &materialized, &graft).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("expected exactly one")
-                || format!("{error:#}").contains("exact canonical ontology")
-        );
         pile.close().unwrap();
     }
 }
