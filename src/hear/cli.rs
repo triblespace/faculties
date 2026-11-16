@@ -30,6 +30,34 @@ enum Command {
     /// Read the tone of recorded WAV clips: pitch, loudness, breathiness
     /// (HNR, alpha ratio), rate and pauses. No model; works in every build.
     Prosody(ProsodyArgs),
+    /// Compare whose voice WAV clips sound like: the cosine distance between
+    /// speaker embeddings (Qwen3-TTS's ECAPA x-vector) of each clip and each
+    /// reference. Needs a build with the voice feature and a CUDA device.
+    Timbre(TimbreArgs),
+}
+
+#[derive(Args, Debug)]
+struct TimbreArgs {
+    /// 24 kHz WAV clips to measure: host paths, or `files:<selector>`.
+    #[arg(required = true)]
+    clips: Vec<String>,
+    /// Reference clips each clip is compared against (repeatable).
+    #[arg(long = "against", required = true)]
+    against: Vec<String>,
+    /// Also report each clip's two halves against each other: the same voice
+    /// with different words, the noise floor of the measure on that clip.
+    #[arg(long)]
+    halves: bool,
+    /// The Qwen3-TTS model pile; defaults to the voice's (QWEN3TTS_PILE, else
+    /// qwen3tts.pile in the model directory).
+    #[arg(long, env = "QWEN3TTS_PILE")]
+    model_pile: Option<PathBuf>,
+    /// The pile `files:` clips are read from.
+    #[arg(long, env = "PILE")]
+    pile: Option<PathBuf>,
+    /// Print one JSON object per clip instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -217,16 +245,10 @@ fn cmd_once(args: OnceArgs, out: &mut Out<'_>) -> Result<()> {
         args.shared.out.display()
     ))
 }
-fn cmd_prosody(args: ProsodyArgs, out: &mut Out<'_>) -> Result<()> {
-    use super::prosody::{analyze, decode_wav, Settings};
-    let settings = Settings {
-        f0_min_hz: args.f0_min,
-        f0_max_hz: args.f0_max,
-    };
-    settings.validate()?;
-    // Parse every selector before reading anything.
-    let sources = args
-        .clips
+/// Read WAV clips given as host paths or `files:<selector>`, parsing every
+/// selector before reading anything.
+fn read_clips(clips: &[String], pile: Option<&Path>) -> Result<Vec<Vec<u8>>> {
+    let sources = clips
         .iter()
         .map(|clip| match clip.strip_prefix("files:") {
             Some(selector) => crate::files::normalize_selector(selector).map(Some),
@@ -235,28 +257,38 @@ fn cmd_prosody(args: ProsodyArgs, out: &mut Out<'_>) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let files = match sources.iter().any(Option::is_some) {
         true => {
-            let pile = args
-                .pile
-                .clone()
-                .context("files: clips need a pile: pass --pile or set PILE")?;
+            let pile = pile.context("files: clips need a pile: pass --pile or set PILE")?;
             Some(crate::files::operations::Files::with_storage(
-                crate::storage::Storage::new(pile, None),
+                crate::storage::Storage::new(pile.to_path_buf(), None),
             ))
         }
         false => None,
     };
-    for (clip, selector) in args.clips.iter().zip(&sources) {
-        let bytes: Vec<u8> = match selector {
-            Some(selector) => files
+    clips
+        .iter()
+        .zip(&sources)
+        .map(|(clip, selector)| match selector {
+            Some(selector) => Ok(files
                 .as_ref()
                 .expect("a Files reader exists for a files: clip")
                 .get(selector)
                 .with_context(|| format!("read {clip}"))?
                 .bytes
                 .as_ref()
-                .to_vec(),
-            None => std::fs::read(clip).with_context(|| format!("read {clip}"))?,
-        };
+                .to_vec()),
+            None => std::fs::read(clip).with_context(|| format!("read {clip}")),
+        })
+        .collect()
+}
+fn cmd_prosody(args: ProsodyArgs, out: &mut Out<'_>) -> Result<()> {
+    use super::prosody::{analyze, decode_wav, Settings};
+    let settings = Settings {
+        f0_min_hz: args.f0_min,
+        f0_max_hz: args.f0_max,
+    };
+    settings.validate()?;
+    let clips = read_clips(&args.clips, args.pile.as_deref())?;
+    for (clip, bytes) in args.clips.iter().zip(clips) {
         let prosody = decode_wav(&bytes)
             .and_then(|wave| analyze(&wave, &settings))
             .with_context(|| format!("prosody of {clip}"))?;
@@ -270,6 +302,104 @@ fn cmd_prosody(args: ProsodyArgs, out: &mut Out<'_>) -> Result<()> {
                 prosody.rate_hz,
                 prosody.text()
             ))?;
+        }
+    }
+    Ok(())
+}
+/// Decode clips to the encoder's rate, refusing any other rate.
+fn timbre_samples(names: &[String], clips: Vec<Vec<u8>>) -> Result<Vec<Vec<f32>>> {
+    use super::timbre::RATE;
+    names
+        .iter()
+        .zip(clips)
+        .map(|(name, bytes)| {
+            let clip =
+                super::prosody::decode_wav(&bytes).with_context(|| format!("decode {name}"))?;
+            anyhow::ensure!(
+                clip.rate == RATE,
+                "{name} is {} Hz; the speaker encoder takes {RATE} Hz and timbre does not resample",
+                clip.rate
+            );
+            Ok(clip.samples)
+        })
+        .collect()
+}
+#[cfg(not(feature = "voice"))]
+fn cmd_timbre(_args: TimbreArgs, _out: &mut Out<'_>) -> Result<()> {
+    bail!("hear timbre needs the voice's speaker encoder: rebuild with --features voice")
+}
+#[cfg(feature = "voice")]
+fn cmd_timbre(args: TimbreArgs, out: &mut Out<'_>) -> Result<()> {
+    use super::timbre::{cosine_distance, halves, Encoder};
+    // Read and decode everything before the model loads.
+    let clips = timbre_samples(&args.clips, read_clips(&args.clips, args.pile.as_deref())?)?;
+    let against = timbre_samples(
+        &args.against,
+        read_clips(&args.against, args.pile.as_deref())?,
+    )?;
+    let model_pile = args
+        .model_pile
+        .clone()
+        .unwrap_or_else(|| crate::model_dir().join("qwen3tts.pile"));
+    let encoder = Encoder::open(&model_pile)
+        .with_context(|| format!("open the speaker encoder in {}", model_pile.display()))?;
+    let references = args
+        .against
+        .iter()
+        .zip(&against)
+        .map(|(name, samples)| {
+            encoder
+                .embed(samples)
+                .with_context(|| format!("embed {name}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (clip, samples) in args.clips.iter().zip(&clips) {
+        let vector = encoder
+            .embed(samples)
+            .with_context(|| format!("embed {clip}"))?;
+        let distances = args
+            .against
+            .iter()
+            .zip(&references)
+            .map(|(name, reference)| Ok((name, cosine_distance(&vector, reference)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let floor = match args.halves {
+            true => {
+                let (a, b) = halves(samples);
+                let (a, b) = (
+                    encoder
+                        .embed(a)
+                        .with_context(|| format!("embed the first half of {clip}"))?,
+                    encoder
+                        .embed(b)
+                        .with_context(|| format!("embed the second half of {clip}"))?,
+                );
+                Some(cosine_distance(&a, &b)?)
+            }
+            false => None,
+        };
+        if args.json {
+            let mut record = serde_json::json!({
+                "clip": clip,
+                "seconds": samples.len() as f64 / f64::from(super::timbre::RATE),
+                "distances": distances
+                    .iter()
+                    .map(|(name, d)| serde_json::json!({"against": name, "cosine_distance": d}))
+                    .collect::<Vec<_>>(),
+            });
+            if let Some(floor) = floor {
+                record["halves_cosine_distance"] = serde_json::json!(floor);
+            }
+            out.line(record.to_string())?;
+        } else {
+            let mut line = format!("{clip}");
+            for (name, d) in &distances {
+                line.push_str(&format!("\n  {d:.4}  {name}"));
+            }
+            if let Some(floor) = floor {
+                line.push_str(&format!("\n  {floor:.4}  (its own two halves)"));
+            }
+            out.line(line)?;
         }
     }
     Ok(())
@@ -397,6 +527,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Some(Command::Listen(args)) => cmd_listen(args, out),
         Some(Command::Once(args)) => cmd_once(args, out),
         Some(Command::Prosody(args)) => cmd_prosody(args, out),
+        Some(Command::Timbre(args)) => cmd_timbre(args, out),
         None => out.line(Cli::command().render_help().to_string()),
     }
 }
@@ -453,7 +584,10 @@ mod tests {
         assert!(names.contains(&"listen".to_owned()));
         assert!(names.contains(&"once".to_owned()));
         assert!(names.contains(&"prosody".to_owned()));
+        assert!(names.contains(&"timbre".to_owned()));
         assert!(Cli::try_parse_from(["hear", "prosody"]).is_err());
+        assert!(Cli::try_parse_from(["hear", "timbre", "a.wav"]).is_err());
+        assert!(Cli::try_parse_from(["hear", "timbre", "a.wav", "--against", "b.wav"]).is_ok());
         assert!(Cli::try_parse_from(["hear", "once"]).is_err());
         let cli = Cli::try_parse_from([
             "hear",
