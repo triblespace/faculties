@@ -187,10 +187,6 @@ pub mod source_projection {
         "1CE3ACF6B860D6009BA4CB622FBE1DC9" unsafe as pub semantic_predecessor_support: GenId;
         /// NONIDENTITY. Genuine source timestamp claim, when decodable.
         "A6892FD4C7FEB9445C3C5F8E96FC9E6A" unsafe as pub source_timestamp: NsTAIInterval;
-        /// NONIDENTITY. Stable Relations entity that produced the occurrence.
-        /// This intentionally reuses Archive's already-published generic
-        /// author relation id.
-        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as pub author: GenId;
         /// NONIDENTITY. Stable Relations entity whose stream observed/produced
         /// the occurrence.
         "EBE88D7DDF43CCC594A695504B599AA5" unsafe as pub experiencer: GenId;
@@ -217,6 +213,10 @@ pub mod source_projection {
         /// Minted with `trible genid` on 2026-10-26.
         "E7B5625D9C7A534EC2FF566AF2F9C439" as pub generated_by: GenId;
     }
+
+    /// NONIDENTITY. Stable Relations entity that produced the occurrence:
+    /// the archive schema's generic author relation, declared once there.
+    pub use crate::schemas::archive::archive::author;
 
     /// Nonidentity kind marker attached after intrinsic receipt construction.
     pub const KIND: Id = id_hex!("F93BD1665DCC2A8EA75054986A2EA148");

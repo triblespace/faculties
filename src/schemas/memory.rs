@@ -59,14 +59,6 @@ pub mod search_index {
     }
 }
 
-pub mod archive_schema {
-    use super::*;
-    attributes! {
-        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: GenId;
-        "E63EE961ABDB1D1BEC0789FDAFFB9501" unsafe as author_name: Handle<UTF8String>;
-    }
-}
-
 pub mod archive_import_schema {
     use super::*;
     attributes! {

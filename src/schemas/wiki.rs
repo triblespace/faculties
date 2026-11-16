@@ -51,11 +51,6 @@ pub mod attrs {
         // `metadata::supersedes` already means exactly this. Wiki revisions
         // use it as lineage; Memory's episodic journal deliberately does not.
         //
-        // `author` REUSES the shared relation already declared by memory,
-        // archive and blockdag. It is an existing relation with rows under it,
-        // so it is PINNED — it must resolve to the same id those already write,
-        // and the derived form would not.
-        //
         // `revision` is genuinely new with no rows under it, so it takes the
         // anchored form: the literal is a minted ANCHOR and the id derives from
         // (anchor, value_encoding). That coupling is the point — re-typing it
@@ -63,7 +58,6 @@ pub mod attrs {
         // rows written under the old type. Anchor minted 2026-08-09 with
         // `trible genid`.
         "FF2DD2D2E71E8CD4AC45C0667FECAF4A" as revision: inlineencodings::GenId;
-        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: inlineencodings::GenId;
         "EBFC56D50B748E38A14F5FC768F1B9C1" unsafe as fragment: inlineencodings::GenId;
         "6DBBE746B7DD7A4793CA098AB882F553" unsafe as content: inlineencodings::Handle<blobencodings::UTF8String>;
         "78BABEF1792531A2E51A372D96FE5F3E" unsafe as title: inlineencodings::Handle<blobencodings::UTF8String>;
@@ -73,6 +67,10 @@ pub mod attrs {
         // File-entity reference: `files:<32-char-id>` points to a file entity with metadata.
         "C98FE0EF9151F196D8F7D816ABBBCC49" unsafe as references_file: inlineencodings::GenId;
     }
+
+    /// The shared author relation (a Relations person id), declared once in
+    /// the archive schema.
+    pub use crate::schemas::archive::archive::author;
 }
 
 // ── the revision DAG ───────────────────────────────────────────────────────

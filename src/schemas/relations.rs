@@ -156,11 +156,11 @@ pub mod tie {
         /// The role the subject holds in this tie ("Geschäftsführerin").
         /// Anchor minted with `trible genid` on 2026-11-16.
         "A2EC40FBF0E4278A68D424B327E0D50A" as role: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The shared author attribute (a Relations person id) that wiki,
-        /// memory, archive and blockdag already write; pinned to its published
-        /// id. Cooperative attribution only.
-        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: inlineencodings::GenId;
     }
+
+    /// The shared author relation (a Relations person id), declared once in
+    /// the archive schema. Cooperative attribution only.
+    pub use crate::schemas::archive::archive::author;
 }
 
 /// Attributes of an intrinsic person lifecycle snapshot.

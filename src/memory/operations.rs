@@ -421,11 +421,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::schemas::archive::archive as legacy_archive_schema;
 use crate::schemas::memory::KIND_CHUNK_ID;
-use crate::schemas::memory::{
-    archive_schema as legacy_archive_schema, ctx, DEFAULT_COMB_SCOPE_ID,
-    DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID,
-};
+use crate::schemas::memory::{ctx, DEFAULT_COMB_SCOPE_ID, DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID};
 use crate::schemas::{blockdag as archive_schema, cognition as cognition_schema};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};

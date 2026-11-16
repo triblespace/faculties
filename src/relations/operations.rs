@@ -132,6 +132,20 @@ fn resolve_entry_anchor(
     Ok((id, kind))
 }
 
+/// Resolve one end of a tie. A live entry wins; only when no live entry
+/// matches may the selector name a retired one, because a tie is an
+/// observation about history and the people and organisations in history
+/// include retired ones. The first error is kept so a selector that matches
+/// nothing still reports the live-only reason.
+fn resolve_tie_end(reader: &RelationsReader, facts: &FactArchive, selector: &str) -> Result<Id> {
+    match resolve_entry_anchor(reader, facts, selector, false, &EntryKind::ALL) {
+        Ok((id, _)) => Ok(id),
+        Err(live) => resolve_entry_anchor(reader, facts, selector, true, &EntryKind::ALL)
+            .map(|(id, _)| id)
+            .map_err(|_| live),
+    }
+}
+
 fn resolve_group_anchor(
     reader: &RelationsReader,
     facts: &FactArchive,
@@ -440,10 +454,8 @@ fn add_tie(storage: &mut RelationsStorage<'_>, request: TieRequest) -> Result<Ad
         .transpose()?;
     let now = now_observation()?;
     storage.update(|facts, reader| {
-        let (subject, _) =
-            resolve_entry_anchor(reader, facts, &request.subject, false, &EntryKind::ALL)?;
-        let (object, _) =
-            resolve_entry_anchor(reader, facts, &request.object, false, &EntryKind::ALL)?;
+        let subject = resolve_tie_end(reader, facts, &request.subject)?;
+        let object = resolve_tie_end(reader, facts, &request.object)?;
         let author = resolve_author(reader, facts, request.persona.as_deref())?;
         let mut fragment =
             relations::tie_fragment(subject, request.relation, object, request.role)?;
@@ -2058,5 +2070,44 @@ mod tests {
         assert!(listed.contains("until: 2024-06-30"));
         assert!(listed.contains("source: note: programme moved"));
         assert!(faculty.tie_end("zz", "2024", &[], None).is_err());
+    }
+
+    #[test]
+    fn a_tie_may_name_a_retired_entry_but_a_live_one_wins() {
+        let directory = tempfile::tempdir().unwrap();
+        let faculty = scratch_relations(&directory);
+        let bank = faculty
+            .org_add(organisation("Bremer Aufbau-Bank", &["BAB"]), &[])
+            .unwrap()
+            .organisation;
+        let gone = faculty
+            .org_add(organisation("Bremer Innovations-Agentur", &["BIA"]), &[])
+            .unwrap()
+            .organisation;
+        faculty.org_retire("BIA").unwrap();
+
+        // History keeps the retired agency addressable as a tie end.
+        let added = faculty
+            .tie_add(tie_request("BIA", "was merged into", "BAB"))
+            .unwrap();
+        assert_eq!((added.subject, added.object), (gone, bank));
+        assert!(faculty
+            .ties("BAB")
+            .unwrap()
+            .contains("Bremer Innovations-Agentur"));
+
+        // A live entry with the same name is preferred over the retired one.
+        let retired = faculty.add(profile("Ada"), None, &[]).unwrap().person;
+        faculty.retire(&format!("{retired:x}")).unwrap();
+        let live = faculty.add(profile("Ada"), None, &[]).unwrap().person;
+        let second = faculty
+            .tie_add(tie_request("Ada", "works at", "BAB"))
+            .unwrap();
+        assert_eq!(second.subject, live);
+
+        // A name that matches nothing still fails.
+        assert!(faculty
+            .tie_add(tie_request("Nobody", "knows", "BAB"))
+            .is_err());
     }
 }

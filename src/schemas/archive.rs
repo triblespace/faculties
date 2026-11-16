@@ -39,6 +39,8 @@ pub mod archive {
     attributes! {
 
         "0D9195A7B1B20DE312A08ECE39168079" unsafe as pub reply_to: GenId;
+        /// The generic author relation: a Relations entity id. This is its
+        /// one declaration; wiki, memory, blockdag and relations re-export it.
         "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as pub author: GenId;
         /// Wall-clock interval at which the message was last
         /// edited. Absent on unedited messages. Protocol-agnostic
