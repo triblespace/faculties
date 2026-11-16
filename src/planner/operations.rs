@@ -986,10 +986,9 @@ fn stage_import_event(
     uid: &str,
     fragment: Fragment,
 ) -> Result<bool> {
-    let candidate = planner_model::load_catalog(fragment.facts())?
-        .events
-        .into_values()
-        .next()
+    let candidate = fragment
+        .root()
+        .and_then(|id| planner_model::event(fragment.facts(), id))
         .ok_or_else(|| anyhow!("constructed iCalendar event has no readable projection"))?;
     let existing = planner_model::events_with_uid(&loaded.facts, candidate.uid);
     if !existing.is_empty() {
@@ -1004,10 +1003,9 @@ fn stage_import_event(
         );
     }
     if let Some(previous) = staged.get(&candidate.uid) {
-        let previous = planner_model::load_catalog(previous.facts())?
-            .events
-            .into_values()
-            .next()
+        let previous = previous
+            .root()
+            .and_then(|id| planner_model::event(previous.facts(), id))
             .ok_or_else(|| anyhow!("staged iCalendar event has no readable projection"))?;
         if same_event_definition(&previous, &candidate) {
             return Ok(false);

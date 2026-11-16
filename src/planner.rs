@@ -9,7 +9,7 @@
 //! Ordinary readers query the maintained fact archive directly and skip rows
 //! they cannot decode.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 pub mod cli;
 pub mod mcp;
@@ -82,38 +82,6 @@ pub struct NoteRow {
     pub event: Id,
     pub text: TextHandle,
     pub created_at: IntervalValue,
-}
-
-/// One intrinsic monotone cancellation assertion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CancellationRow {
-    pub id: Id,
-    pub event: Id,
-}
-
-/// Semantic projection of the Planner facts understood by this reader.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct PlannerCatalog {
-    pub events: BTreeMap<Id, EventRow>,
-    pub notes: BTreeMap<Id, NoteRow>,
-    pub cancellations: BTreeMap<Id, CancellationRow>,
-}
-
-impl PlannerCatalog {
-    /// Baseline RFC cancellation or any monotone local cancellation assertion.
-    pub fn is_cancelled(&self, event: Id) -> bool {
-        self.events
-            .get(&event)
-            .is_some_and(|row| row.status == text_handle(STATUS_CANCELLED))
-            || self
-                .cancellations
-                .values()
-                .any(|assertion| assertion.event == event)
-    }
-
-    pub fn notes_for(&self, event: Id) -> impl Iterator<Item = &NoteRow> {
-        self.notes.values().filter(move |row| row.event == event)
-    }
 }
 
 fn validate_label(field: &str, value: &str) -> Result<()> {
@@ -513,61 +481,6 @@ where
     }]))
 }
 
-/// Decode a bounded Planner fragment into its convenient import-time model.
-///
-/// Ordinary collection readers query their typed projections directly. This
-/// bulk model remains for locally constructed or staged import fragments,
-/// where its input is bounded independently of collection history. A record
-/// participates only when it inhabits the corresponding typed projection;
-/// incomplete or undecodable records are skipped.
-pub fn load_catalog<P>(space: &P) -> Result<PlannerCatalog>
-where
-    P: TriblePattern + ?Sized,
-{
-    let mut catalog = PlannerCatalog::default();
-    for id in event_ids(space) {
-        if let Some(row) = event(space, id) {
-            catalog.events.insert(id, row);
-        }
-    }
-    for (id, event, text, created_at) in find!(
-        (
-            id: Id,
-            event: Id,
-            text: TextHandle,
-            created_at: IntervalValue,
-        ),
-        pattern!(space, [{ ?id @
-            metadata::tag: &KIND_NOTE_ID,
-            metadata::created_at: ?created_at,
-            note::note_about: ?event,
-            note::note_text: ?text,
-        }])
-    ) {
-        if validate_point("note creation time", created_at).is_ok() {
-            catalog.notes.entry(id).or_insert(NoteRow {
-                id,
-                event,
-                text,
-                created_at,
-            });
-        }
-    }
-    for (id, event) in find!(
-        (id: Id, event: Id),
-        pattern!(space, [{ ?id @
-            metadata::tag: &KIND_CANCELLATION_ID,
-            cancellation::event: ?event,
-        }])
-    ) {
-        catalog
-            .cancellations
-            .entry(id)
-            .or_insert(CancellationRow { id, event });
-    }
-    Ok(catalog)
-}
-
 /// Strictly read a UTF8String attachment.
 pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
@@ -628,8 +541,7 @@ mod tests {
         let mut facts = event.into_facts();
         facts += cancellation.clone().into_facts();
 
-        let catalog = load_catalog(&facts).unwrap();
-        assert!(catalog.is_cancelled(event_id));
+        assert!(event_is_cancelled(&facts, event_id));
         assert_eq!(cancellation_fragment(event_id), cancellation);
     }
 
@@ -639,31 +551,32 @@ mod tests {
         input.status = STATUS_CANCELLED.to_owned();
         let event = event_fragment(&input).unwrap();
         let event_id = event.root().unwrap();
-        let catalog = load_catalog(event.facts()).unwrap();
 
-        assert!(catalog.is_cancelled(event_id));
-        assert!(catalog.cancellations.is_empty());
+        assert!(event_is_cancelled(event.facts(), event_id));
+        assert!(!exists!(pattern!(event.facts(), [{ _?assertion @
+            metadata::tag: &KIND_CANCELLATION_ID,
+        }])));
     }
 
     #[test]
     fn ordinary_projection_survives_extra_values() {
-        let event = event_fragment(&draft("fork@example", "meeting")).unwrap();
-        let event_id = event.root().unwrap();
-        let mut facts = event.into_facts();
+        let fragment = event_fragment(&draft("fork@example", "meeting")).unwrap();
+        let event_id = fragment.root().unwrap();
+        let mut facts = fragment.into_facts();
         facts += entity! { ExclusiveId::force_ref(&event_id) @
             event::summary: "other",
         };
 
-        assert!(load_catalog(&facts).unwrap().events.contains_key(&event_id));
+        assert!(event(&facts, event_id).is_some());
     }
 
     #[test]
     fn ordinary_projection_skips_an_event_lacking_a_required_field() {
-        let event = event_fragment(&draft("bare@example", "meeting")).unwrap();
-        let event_id = event.root().unwrap();
+        let fragment = event_fragment(&draft("bare@example", "meeting")).unwrap();
+        let event_id = fragment.root().unwrap();
         let uid = find!(
             value: TextHandle,
-            pattern!(event.facts(), [{ event_id @ event::ical_uid: ?value }])
+            pattern!(fragment.facts(), [{ event_id @ event::ical_uid: ?value }])
         )
         .next()
         .unwrap();
@@ -672,9 +585,8 @@ mod tests {
             .unwrap()
             .into_facts();
 
-        let catalog = load_catalog(&facts).unwrap();
-        assert_eq!(catalog.events.len(), 1);
-        assert!(!catalog.events.contains_key(&event_id));
+        assert_eq!(event_ids(&facts).len(), 1);
+        assert!(event(&facts, event_id).is_none());
     }
 
     #[test]
@@ -682,12 +594,12 @@ mod tests {
         let mut input = draft("sets@example", "meeting");
         input.attendees = BTreeSet::from([id(1), id(2)]);
         input.rdates = BTreeSet::from([interval(30, 40), interval(50, 60)]);
-        let event = event_fragment(&input).unwrap();
-        let event_id = event.root().unwrap();
-        let catalog = load_catalog(event.facts()).unwrap();
+        let fragment = event_fragment(&input).unwrap();
+        let event_id = fragment.root().unwrap();
+        let row = event(fragment.facts(), event_id).unwrap();
 
-        assert_eq!(catalog.events[&event_id].attendees, input.attendees);
-        assert_eq!(catalog.events[&event_id].rdates, input.rdates);
+        assert_eq!(row.attendees, input.attendees);
+        assert_eq!(row.rdates, input.rdates);
     }
 
     #[test]
@@ -714,12 +626,10 @@ mod tests {
         };
         facts += entity! { ExclusiveId::force_ref(&KIND_EVENT_ID) @ metadata::tag: &id(11) };
 
-        let catalog = load_catalog(&facts).unwrap();
-        assert_eq!(
-            catalog.events.keys().copied().collect::<Vec<_>>(),
-            vec![event_id]
-        );
-        assert!(catalog.notes.is_empty());
-        assert!(catalog.cancellations.is_empty());
+        assert_eq!(event_ids(&facts), vec![event_id]);
+        assert!(notes_for_event(&facts, legacy_event).is_empty());
+        assert!(!exists!(pattern!(&facts, [{ _?assertion @
+            metadata::tag: &KIND_CANCELLATION_ID,
+        }])));
     }
 }
