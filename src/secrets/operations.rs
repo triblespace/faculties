@@ -79,6 +79,23 @@ pub struct FindMatch {
     pub name: Option<String>,
     pub roles: Vec<FindRole>,
 }
+/// One ordinary version this key cannot open. Public facts only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnopenableItem {
+    pub id: Id,
+    pub body: secrets::item::ItemBody,
+    /// None explicitly means the public label bytes are unavailable/undecodable.
+    pub name: Option<String>,
+    pub created_at: secrets::IntervalValue,
+    /// Recipient keys holding an envelope for this version id.
+    pub recipients: Vec<secrets::RecipientPublicKey>,
+    pub own_envelope: bool,
+    pub body_resident: bool,
+    /// This key opens the body as a general Secrets record (one without the
+    /// password-item tag, such as a Care observation): it is not undelivered,
+    /// only not an item.
+    pub opens_as_record: bool,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FindReport {
     pub matches: Vec<FindMatch>,
@@ -90,6 +107,10 @@ pub struct FindReport {
     /// Ordinary versions this key could not open (no envelope delivered to
     /// it, or ciphertext not resident); only their public labels were searched.
     pub unopenable: usize,
+    /// Versions this key opens as a general Secrets record that is not a
+    /// password item (a Care observation shares the version kind); only their
+    /// public labels were searched. Delivered, so not counted as unopenable.
+    pub records: usize,
     /// Selected USERNAME/URL children that could not be opened or are not UTF-8.
     pub unreadable_values: usize,
 }
@@ -455,6 +476,55 @@ impl Secrets {
                 .collect())
         })
     }
+    /// Every ordinary structured version this key cannot open, with the public
+    /// recipients that do hold an envelope for it. Only the item archive is
+    /// tried, as `find` does; no field value is opened. Each row says whether
+    /// this key has any envelope and whether the ciphertext body is resident,
+    /// which separates "never delivered here" from "delivered but unusable".
+    /// User-protected versions are not ordinary deliveries and are skipped.
+    pub fn unopenable_items(&self) -> Result<Vec<UnopenableItem>> {
+        self.storage().with_store(|pile, signer, runtime| {
+            use secrets::schema::*;
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                false,
+            )?;
+            let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
+            let Some(facts) = snapshot.facts() else {
+                return Ok(Vec::new());
+            };
+            let reader = snapshot.store_snapshot();
+            let own = signer.verifying_key().to_bytes();
+            let mut seen = std::collections::BTreeSet::new();
+            let mut rows = Vec::new();
+            for row in secrets::item::rows(facts) {
+                let (id, body) = (row.id, row.body);
+                if !seen.insert((id, body))
+                    || exists!(pattern!(facts, [{ id @ protected_envelope: _?envelope }]))
+                    || secrets::item::open_exact(reader.clone(), facts, id, body, signer).is_ok()
+                {
+                    continue;
+                }
+                let recipients = secrets::wrap_recipients(facts, id);
+                rows.push(UnopenableItem {
+                    id,
+                    body,
+                    name: secrets::read_text(reader, row.name).ok(),
+                    created_at: row.created_at,
+                    own_envelope: recipients.contains(&own),
+                    body_resident: reader
+                        .get::<Blob<secrets::encrypted::Encrypted<blobencodings::SimpleArchive>>, _>(body)
+                        .is_ok(),
+                    recipients: recipients.into_iter().collect(),
+                    opens_as_record: secrets::record::open(reader.clone(), facts, id, signer)
+                        .is_ok_and(|records| records.iter().any(|record| record.body() == body)),
+                });
+            }
+            Ok(rows)
+        })
+    }
     /// Disclose every decryptable exact body alternative, without choosing one.
     pub fn open_item(&self, secret: Id) -> Result<Vec<secrets::item::ItemBody>> {
         self.storage().with_store(|pile, signer, runtime| {
@@ -689,6 +759,14 @@ impl Secrets {
                         report.protected += 1;
                     } else {
                         match secrets::item::open_exact(reader.clone(), facts, id, body, signer) {
+                            Err(_)
+                                if secrets::record::open(reader.clone(), facts, id, signer)
+                                    .is_ok_and(|records| {
+                                        records.iter().any(|record| record.body() == body)
+                                    }) =>
+                            {
+                                report.records += 1
+                            }
                             Err(_) => report.unopenable += 1,
                             Ok(item) => {
                                 for &role in &roles {
@@ -925,12 +1003,14 @@ pub(crate) fn write_find(report: &FindReport, out: &mut crate::out::Out<'_>) -> 
         ))?;
     }
     out.line(format!(
-        "{} match(es) in {} version(s); {} protected and {} not openable by this key \
-         (public label searched only); {} unreadable value(s)",
+        "{} match(es) in {} version(s); {} protected and {} not openable by this key, \
+         {} general record(s) that are not items (public label searched only); \
+         {} unreadable value(s)",
         report.matches.len(),
         report.searched,
         report.protected,
         report.unopenable,
+        report.records,
         report.unreadable_values
     ))
 }
@@ -1737,6 +1817,40 @@ mod tests {
         ];
         expected.sort();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn find_counts_a_general_record_apart_from_unopenable_versions() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("find-record.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Secrets::new(path.clone(), None);
+        // A record without the item tag, delivered to this key: the shape of
+        // a Care observation. It opens, it is just not a password item.
+        let instant = hifitime::Epoch::from_unix_seconds(0.0);
+        let created: secrets::IntervalValue = (instant, instant).try_to_inline().unwrap();
+        let sealed = secrets::record::seal(
+            &signer,
+            "synthetic record",
+            created,
+            secrets::record::Delivery::Own,
+            |_| Ok(TribleSet::new()),
+        )
+        .unwrap();
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        pile.commit(collection.source(), &signer, sealed.fragment)
+            .unwrap();
+        pile.close().unwrap();
+        let report = operations.find_items(&["synthetic"], &[]).unwrap();
+        assert_eq!(report.searched, 1);
+        assert_eq!((report.records, report.unopenable), (1, 0));
+        assert_eq!(report.matches.len(), 1);
+        assert_eq!(report.matches[0].roles, vec![FindRole::Title]);
+        let rows = operations.unopenable_items().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].opens_as_record && rows[0].own_envelope && rows[0].body_resident);
     }
 
     #[test]

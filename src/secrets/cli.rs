@@ -68,7 +68,14 @@ enum Command {
         attachment: Vec<PathBuf>,
     },
     /// List structured versions using public labels only.
-    Items,
+    Items {
+        /// List only ordinary versions this key cannot open as items, with
+        /// the recipient keys that hold an envelope for each and whether the
+        /// body opens as a general record instead (e.g. a Care observation).
+        /// No field value is opened.
+        #[arg(long)]
+        unopenable: bool,
+    },
     /// Find structured versions whose public label, USERNAME or URL contains
     /// every term (case-insensitive substring). Prints ids, body handles,
     /// public labels and the matched role names, never a field value.
@@ -533,7 +540,40 @@ pub fn run() -> Result<()> {
                 )?;
                 out.line(format!("item {secret:x}  {label}"))
             }
-            Command::Items => {
+            Command::Items { unopenable: true } => {
+                let rows = operations.unopenable_items()?;
+                for row in &rows {
+                    let (created, _): (hifitime::Epoch, hifitime::Epoch) = row
+                        .created_at
+                        .try_from_inline()
+                        .map_err(|_| anyhow::anyhow!("invalid item creation time"))?;
+                    let recipients = row
+                        .recipients
+                        .iter()
+                        .map(|key| hex::encode(&key[..4]).to_uppercase())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    out.line(format!(
+                        "{:x} body blake3:{} created {created} recipients [{recipients}] own-envelope {} body-resident {} opens-as-record {} {}",
+                        row.id,
+                        hex::encode(row.body.raw),
+                        row.own_envelope,
+                        row.body_resident,
+                        row.opens_as_record,
+                        match &row.name {
+                            Some(name) => format!("public-name {name}"),
+                            None => "public-name-unavailable".to_owned(),
+                        }
+                    ))?;
+                }
+                out.line(format!(
+                    "{} version(s) not openable as items by this key; {} of them open as general records",
+                    rows.len(),
+                    rows.iter().filter(|row| row.opens_as_record).count()
+                ))?;
+                Ok(())
+            }
+            Command::Items { unopenable: false } => {
                 let rows = operations.list_items()?;
                 if rows.is_empty() {
                     out.line("(no structured items)")?;
