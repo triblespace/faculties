@@ -161,3 +161,48 @@ pub fn search(values: &[super::ProjectionView], out: &mut Out<'_>) -> Result<()>
     }
     Ok(())
 }
+pub fn attachments(
+    values: &[AttachmentListing],
+    saved: Option<&[super::cli::Saved]>,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    if values.is_empty() {
+        return out.line("No attachments.");
+    }
+    for (index, value) in values.iter().enumerate() {
+        let ordinal = value
+            .ordinal
+            .map_or_else(|| "?".to_owned(), |ordinal| ordinal.to_string());
+        let mut line = match &value.state {
+            AttachmentState::Resident {
+                filename,
+                media_type,
+                content,
+                bytes,
+            } => format!(
+                "{ordinal}  {filename:?}  {media_type}  {} bytes  blake3:{}  occurrence {:x}",
+                bytes.len(),
+                hex::encode(content),
+                value.occurrence
+            ),
+            AttachmentState::NotResident(what) => format!(
+                "{ordinal}  not resident ({what})  occurrence {:x}",
+                value.occurrence
+            ),
+        };
+        match saved.and_then(|saved| saved.get(index)) {
+            Some(super::cli::Saved::Written(path)) => {
+                line.push_str(&format!("  saved {}", path.display()))
+            }
+            Some(super::cli::Saved::Present(path)) => {
+                line.push_str(&format!("  already saved {}", path.display()))
+            }
+            Some(super::cli::Saved::Refused(reason)) => {
+                line.push_str(&format!("  NOT SAVED: {reason}"))
+            }
+            Some(super::cli::Saved::Skipped) | None => {}
+        }
+        out.line(line)?;
+    }
+    Ok(())
+}

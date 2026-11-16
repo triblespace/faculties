@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `mail attachments <wire>` lists an inbound message's attachments, one line
+  per attachment occurrence: ordinal, original filename, media type, size,
+  BLAKE3 content handle and occurrence id. With `--save <dir>` it writes each
+  attachment's exact bytes to `<dir>/<filename>`, with path separators and
+  control characters replaced by `_`; a name already holding other bytes gets
+  `-<ordinal>` before its extension. An existing file is never overwritten,
+  and one holding exactly these bytes counts as saved, so a second save is a
+  no-op. An occurrence whose Files record or blobs are not resident is listed
+  as not resident. MCP `mail_attachments` lists only and returns no bytes.
+  Both are pure reads: no faculty write, no read evidence.
+
 - Mail accounts can be quiet: `mail account set ... --quiet` (MCP
   `mail_account_set` `quiet`) stores the mailbox's inbound mail as usual but
   never makes it attention, for an archive fetched for bookkeeping. The flag

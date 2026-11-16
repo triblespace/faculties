@@ -19,6 +19,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "mail_list", description: "List resident inbound projections for an explicit active Relations persona. This is not a fetch and does not mark messages read.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"unread":{"type":"boolean","default":false},"spam":{"type":"boolean","default":false}},"required":["persona"],"additionalProperties":false}"# },
     Tool { name: "mail_read", description: "Publish intrinsic read/seen evidence for an explicit active Relations persona and wire message. This marks read; use mail_show to display contents.", input_schema: r#"{"type":"object","properties":{"persona":{"type":"string"},"message":{"type":"string"}},"required":["persona","message"],"additionalProperties":false}"# },
     Tool { name: "mail_show", description: "Display every resident parser projection for one wire message, without marking it read or fetching mail.", input_schema: r#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"# },
+    Tool { name: "mail_attachments", description: "List the attachments of one wire message: ordinal, original filename, media type, size, BLAKE3 content handle and occurrence id, or what is not resident. Returns no bytes and records nothing; the host CLI `mail attachments --save <dir>` writes the files.", input_schema: r#"{"type":"object","properties":{"message":{"type":"string"}},"required":["message"],"additionalProperties":false}"# },
     Tool { name: "mail_search", description: "Search resident projected subjects/bodies by case-insensitive literal substring; does not fetch or mark read.", input_schema: r#"{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}"# },
 ];
 #[derive(Deserialize)]
@@ -343,6 +344,11 @@ impl Faculty for Mail {
                 let args: Show = decode_arguments(arguments)?;
                 nonempty(&args.message, "message")?;
                 render::show(&self.operations.show(&args.message)?, out)
+            }
+            "mail_attachments" => {
+                let args: Show = decode_arguments(arguments)?;
+                nonempty(&args.message, "message")?;
+                render::attachments(&self.operations.attachments(&args.message)?, None, out)
             }
             "mail_search" => {
                 let args: Search = decode_arguments(arguments)?;

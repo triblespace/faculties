@@ -137,6 +137,27 @@ pub struct ReadReceipt {
     pub observation: Id,
     pub reader: Id,
 }
+/// One inbound attachment occurrence of a wire message, read without
+/// publishing anything.
+#[derive(Clone, Debug)]
+pub struct AttachmentListing {
+    pub occurrence: Id,
+    pub ordinal: Option<u64>,
+    pub file: Option<Id>,
+    pub state: AttachmentState,
+}
+#[derive(Clone, Debug)]
+pub enum AttachmentState {
+    /// The exact bytes and the name and media type the Files record carries.
+    Resident {
+        filename: String,
+        media_type: String,
+        content: [u8; 32],
+        bytes: anybytes::Bytes,
+    },
+    /// What is not resident here (the occurrence, its Files record, or a blob).
+    NotResident(String),
+}
 #[derive(Clone, Debug)]
 pub struct AccountFetched {
     pub account: Id,
@@ -251,6 +272,11 @@ impl Mail {
     }
     pub fn show(&self, message: &str) -> Result<Vec<mail::ProjectionView>> {
         self.with_operation(|storage| cmd_show(storage, message))
+    }
+    /// List every attachment occurrence of one wire message with its exact
+    /// bytes. A pure read: publishes nothing, records no read evidence.
+    pub fn attachments(&self, message: &str) -> Result<Vec<AttachmentListing>> {
+        self.with_operation(|storage| cmd_attachments(storage, message))
     }
     pub fn search(&self, query: &str) -> Result<Vec<mail::ProjectionView>> {
         self.with_operation(|storage| cmd_search(storage, query))
@@ -1139,8 +1165,8 @@ fn cmd_read(storage: &Storage, selector: &str, persona: &str) -> Result<ReadRece
     })
 }
 
-fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionView>> {
-    let views = storage.views()?;
+/// Every parser projection of the wire message `selector` names.
+fn wire_projections(views: &Views, selector: &str) -> Result<BTreeSet<Id>> {
     let wire = resolve_wire(&views.mail.facts, selector)?;
     let projections: BTreeSet<Id> = find!(
         id: Id,
@@ -1153,10 +1179,63 @@ fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionVie
     if projections.is_empty() {
         bail!("wire message {wire:x} has no parser projection");
     }
-    projections
+    Ok(projections)
+}
+
+fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionView>> {
+    let views = storage.views()?;
+    wire_projections(&views, selector)?
         .into_iter()
         .map(|id| mail::projection_view(&views.mail.reader, &views.mail.facts, id))
         .collect()
+}
+
+fn cmd_attachments(storage: &Storage, selector: &str) -> Result<Vec<AttachmentListing>> {
+    let views = storage.views()?;
+    let reader = &views.files.reader;
+    let mut result = Vec::new();
+    for projection in wire_projections(&views, selector)? {
+        for row in
+            mail::projection_attachment_rows(&views.mail.facts, &views.files.facts, projection)
+        {
+            let state = match (row.named_file, row.file) {
+                (None, _) => AttachmentState::NotResident("occurrence facts".into()),
+                (Some(file), None) => {
+                    AttachmentState::NotResident(format!("Files record {file:x}"))
+                }
+                (Some(_), Some(file)) => resident_attachment(reader, file),
+            };
+            result.push(AttachmentListing {
+                occurrence: row.occurrence,
+                ordinal: row.ordinal,
+                file: row.named_file,
+                state,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn resident_attachment(reader: &PileSnapshot, file: mail::OccurrenceFile) -> AttachmentState {
+    let content = file.content.raw;
+    let Ok(bytes) = reader.get::<anybytes::Bytes, _>(file.content) else {
+        return AttachmentState::NotResident(format!("content blob {}", hex::encode(content)));
+    };
+    let Ok(filename) = reader.get::<anybytes::View<str>, _>(file.name) else {
+        return AttachmentState::NotResident(format!("name blob {}", hex::encode(file.name.raw)));
+    };
+    let Ok(media_type) = reader.get::<anybytes::View<str>, _>(file.media_type) else {
+        return AttachmentState::NotResident(format!(
+            "media type blob {}",
+            hex::encode(file.media_type.raw)
+        ));
+    };
+    AttachmentState::Resident {
+        filename: filename.to_string(),
+        media_type: media_type.to_string(),
+        content,
+        bytes,
+    }
 }
 
 fn cmd_search(storage: &Storage, query: &str) -> Result<Vec<mail::ProjectionView>> {

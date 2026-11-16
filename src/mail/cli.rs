@@ -54,6 +54,14 @@ enum Command {
     Show { message: String },
     /// Case-insensitive substring search over projected subject and body.
     Search { query: String },
+    /// List one wire message's attachments; with --save, write their exact
+    /// bytes into a directory. Never overwrites a file and records nothing.
+    Attachments {
+        message: String,
+        /// Directory to write each attachment into, by its original name.
+        #[arg(long)]
+        save: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,7 +274,123 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
         Command::Read { message } => render::read(&operations.read(&persona()?, &message)?, out),
         Command::Show { message } => render::show(&operations.show(&message)?, out),
         Command::Search { query } => render::search(&operations.search(&query)?, out),
+        Command::Attachments { message, save } => {
+            let listings = operations.attachments(&message)?;
+            let Some(directory) = save else {
+                return render::attachments(&listings, None, out);
+            };
+            let saved = save_attachments(&directory, &listings)?;
+            render::attachments(&listings, Some(&saved), out)?;
+            let failed = saved
+                .iter()
+                .filter(|value| matches!(value, Saved::Refused(_)))
+                .count();
+            if failed > 0 {
+                anyhow::bail!("{failed} attachment(s) were not saved; no file was overwritten");
+            }
+            Ok(())
+        }
     }
+}
+
+/// Where one listed attachment's bytes went under `mail attachments --save`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Saved {
+    /// Written now, to a file that did not exist.
+    Written(PathBuf),
+    /// A file with exactly these bytes was already there.
+    Present(PathBuf),
+    /// Not resident, so nothing to write.
+    Skipped,
+    /// Every candidate name held different bytes; nothing was written.
+    Refused(String),
+}
+
+/// A filesystem-safe leaf name: path separators and control characters
+/// become `_`, and an empty (or dot-only) name becomes `attachment-<ordinal>.bin`.
+pub(super) fn sanitize_filename(name: &str, ordinal: u64) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        format!("attachment-{ordinal}.bin")
+    } else {
+        cleaned
+    }
+}
+
+/// `name` with `-<ordinal>` before its extension (`a.pdf` becomes `a-1.pdf`).
+fn suffixed(name: &str, ordinal: u64) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => format!("{stem}-{ordinal}.{extension}"),
+        _ => format!("{name}-{ordinal}"),
+    }
+}
+
+/// Write each resident attachment to `directory/<sanitized name>`, or to
+/// `<stem>-<ordinal>.<ext>` when that name holds other bytes. An existing file
+/// is never overwritten; one holding exactly these bytes counts as saved.
+pub(super) fn save_attachments(
+    directory: &Path,
+    listings: &[AttachmentListing],
+) -> Result<Vec<Saved>> {
+    fs::create_dir_all(directory)
+        .with_context(|| format!("create attachment directory {}", directory.display()))?;
+    listings
+        .iter()
+        .map(|listing| {
+            let AttachmentState::Resident {
+                filename, bytes, ..
+            } = &listing.state
+            else {
+                return Ok(Saved::Skipped);
+            };
+            let ordinal = listing.ordinal.unwrap_or_default();
+            let name = sanitize_filename(filename, ordinal);
+            for candidate in [name.clone(), suffixed(&name, ordinal)] {
+                let path = directory.join(&candidate);
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(mut file) => {
+                        use std::io::Write;
+                        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                            drop(file);
+                            let _ = fs::remove_file(&path);
+                            return Err(error)
+                                .with_context(|| format!("write attachment {}", path.display()));
+                        }
+                        return Ok(Saved::Written(path));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let same = fs::metadata(&path)
+                            .is_ok_and(|meta| meta.is_file() && meta.len() == bytes.len() as u64)
+                            && fs::read(&path).is_ok_and(|held| held == bytes.as_ref());
+                        if same {
+                            return Ok(Saved::Present(path));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("create attachment {}", path.display()))
+                    }
+                }
+            }
+            Ok(Saved::Refused(format!(
+                "{name} and {} already hold other bytes",
+                suffixed(&name, ordinal)
+            )))
+        })
+        .collect()
 }
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -316,6 +440,18 @@ mod tests {
             "mail-test",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn saved_attachment_names_stay_inside_the_directory() {
+        assert_eq!(sanitize_filename("invoice.pdf", 0), "invoice.pdf");
+        assert_eq!(sanitize_filename("../a/b\\c\u{7}.pdf", 2), ".._a_b_c_.pdf");
+        assert_eq!(sanitize_filename("", 3), "attachment-3.bin");
+        assert_eq!(sanitize_filename("..", 4), "attachment-4.bin");
+        assert_eq!(suffixed("invoice.pdf", 1), "invoice-1.pdf");
+        assert_eq!(suffixed("archive.tar.gz", 1), "archive.tar-1.gz");
+        assert_eq!(suffixed(".hidden", 2), ".hidden-2");
+        assert_eq!(suffixed("README", 5), "README-5");
     }
 
     #[test]

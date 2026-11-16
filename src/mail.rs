@@ -13,8 +13,9 @@ pub mod render;
 
 pub use operations::{
     AccountFetched, AccountOptions, AccountSetReceipt, AccountState, AccountSummary,
-    DraftAttachment, DraftDelivery, DraftReceipt, DraftRequest, DraftStatus, FetchRequest,
-    InboxMessage, Mail, ReadReceipt, ReplyRequest, SendReceipt, SendStatus,
+    AttachmentListing, AttachmentState, DraftAttachment, DraftDelivery, DraftReceipt, DraftRequest,
+    DraftStatus, FetchRequest, InboxMessage, Mail, ReadReceipt, ReplyRequest, SendReceipt,
+    SendStatus,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1740,6 +1741,107 @@ where
         name,
         media_type,
     })
+}
+
+/// One Files record an inbound attachment occurrence names, with the
+/// handles of its blobs. Selecting it reads no blob.
+#[derive(Clone, Copy, Debug)]
+pub struct OccurrenceFile {
+    pub content: BytesHandle,
+    pub name: TextHandle,
+    pub media_type: TextHandle,
+}
+
+/// One attachment occurrence of a parser projection, as resident facts say.
+/// `named_file` is the Files entity the occurrence names; `file` is `None`
+/// when no Files record for that entity is resident.
+#[derive(Clone, Copy, Debug)]
+pub struct OccurrenceRow {
+    pub occurrence: Id,
+    pub ordinal: Option<u64>,
+    pub named_file: Option<Id>,
+    pub file: Option<OccurrenceFile>,
+}
+
+/// The attachment occurrences of one parser projection, ordered by ordinal.
+///
+/// Open world: every (ordinal, file) pair and every Files record the facts
+/// hold yields its own row, and an occurrence whose facts or Files record
+/// are not resident yields one row without them, never an error. Reads no
+/// blob.
+pub fn projection_attachment_rows<M, F>(
+    mail_facts: &M,
+    files_facts: &F,
+    projection_id: Id,
+) -> Vec<OccurrenceRow>
+where
+    M: TriblePattern,
+    F: TriblePattern,
+{
+    let mut rows = Vec::new();
+    let occurrences = sorted_ids(find!(
+        v: Id,
+        pattern!(mail_facts, [{ projection_id @ projection::attachment: ?v }])
+    ));
+    for occurrence in occurrences {
+        let named: BTreeSet<(u64, Id)> = find!(
+            (ordinal: u64, file: Id),
+            pattern!(mail_facts, [{ occurrence @
+                metadata::tag: &KIND_ATTACHMENT_OCCURRENCE,
+                attachment_occurrence::ordinal: ?ordinal,
+                attachment_occurrence::file: ?file,
+            }])
+        )
+        .collect();
+        if named.is_empty() {
+            rows.push(OccurrenceRow {
+                occurrence,
+                ordinal: None,
+                named_file: None,
+                file: None,
+            });
+        }
+        for (ordinal, file) in named {
+            let records: BTreeSet<(BytesHandle, TextHandle, TextHandle)> = find!(
+                (content: BytesHandle, name: TextHandle, media: TextHandle),
+                pattern!(files_facts, [
+                    { file @
+                        metadata::tag: &KIND_FILE,
+                        file_schema::content: ?content,
+                        file_schema::name: ?name,
+                        file_schema::media_type: _?media_type,
+                    },
+                    { _?media_type @
+                        metadata::tag: &KIND_MEDIA_TYPE,
+                        metadata::name: ?media,
+                    },
+                ])
+            )
+            .collect();
+            if records.is_empty() {
+                rows.push(OccurrenceRow {
+                    occurrence,
+                    ordinal: Some(ordinal),
+                    named_file: Some(file),
+                    file: None,
+                });
+            }
+            for (content, name, media_type) in records {
+                rows.push(OccurrenceRow {
+                    occurrence,
+                    ordinal: Some(ordinal),
+                    named_file: Some(file),
+                    file: Some(OccurrenceFile {
+                        content,
+                        name,
+                        media_type,
+                    }),
+                });
+            }
+        }
+    }
+    rows.sort_by_key(|row| (row.ordinal.is_none(), row.ordinal, row.occurrence));
+    rows
 }
 
 fn validate_source_text_payloads<Overlay: BlobStoreGet>(

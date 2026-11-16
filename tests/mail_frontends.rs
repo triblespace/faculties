@@ -550,6 +550,7 @@ fn independent_decoders_reject_nested_input_errors_and_credentials_without_stora
             "mail_list",
             "mail_read",
             "mail_show",
+            "mail_attachments",
             "mail_search",
         ]
     );
@@ -620,6 +621,8 @@ fn independent_decoders_reject_nested_input_errors_and_credentials_without_stora
         ("mail_list", r#"{"persona":"p","unread":"true"}"#),
         ("mail_read", r#"{"message":"m"}"#),
         ("mail_show", r#"{"message":0}"#),
+        ("mail_attachments", r#"{"message":0}"#),
+        ("mail_attachments", r#"{"message":"m","save":"/tmp"}"#),
         ("mail_search", r#"{"query":[]}"#),
     ] {
         let error = collect(|out| faculty.call(tool, Bytes::from(raw.as_bytes().to_vec()), out))
@@ -670,4 +673,163 @@ fn mcp_persona_is_explicit_even_in_a_persona_configured_process() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// One inbound message with two attachments named alike, one name the
+/// filesystem cannot take as is, and a `text/plain` body.
+fn multipart_with_attachments() -> String {
+    let part = |disposition: &str, data: &[u8]| {
+        use base64::Engine as _;
+        format!(
+            "--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; {disposition}\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(data)
+        )
+    };
+    format!(
+        "From: Billing <billing@example.test>\r\nTo: me@example.test\r\nMessage-ID: <invoice@example.test>\r\nSubject: Your invoice\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nattached\r\n{}{}{}--b--\r\n",
+        part("filename=invoice.pdf", b"%PDF first"),
+        part("filename=invoice.pdf", b"%PDF second"),
+        part("filename*=utf-8''tab%09name.txt", b"third"),
+    )
+}
+
+#[test]
+fn attachments_list_and_save_exact_bytes_without_writing_the_pile() {
+    let fixture = Fixture::new();
+    fixture.reader("Agent");
+    let publication = mail::imap_publication(
+        fixture.account,
+        fixture.config,
+        "INBOX",
+        1,
+        7,
+        multipart_with_attachments().as_bytes(),
+    )
+    .unwrap();
+    let wire = format!("{:x}", fixture.publish_source(publication));
+
+    let listings = fixture.operations().attachments(&wire).unwrap();
+    let expected: [(&str, &[u8]); 3] = [
+        ("invoice.pdf", b"%PDF first"),
+        ("invoice.pdf", b"%PDF second"),
+        ("tab\tname.txt", b"third"),
+    ];
+    assert_eq!(listings.len(), 3);
+    for (index, (listing, (name, data))) in listings.iter().zip(expected).enumerate() {
+        assert_eq!(listing.ordinal, Some(index as u64));
+        match &listing.state {
+            mail::AttachmentState::Resident {
+                filename,
+                media_type,
+                content,
+                bytes,
+            } => {
+                assert_eq!(filename, name);
+                assert_eq!(media_type, "application/octet-stream");
+                assert_eq!(bytes.as_ref(), data);
+                assert_eq!(content, blake3::hash(data).as_bytes());
+            }
+            other => panic!("attachment {index} is not resident: {other:?}"),
+        }
+    }
+
+    let listed = success(fixture.cli(None, &["attachments", &wire]));
+    assert_eq!(
+        listed,
+        call(&fixture.mcp(), "mail_attachments", json!({"message": wire})).unwrap()
+    );
+    assert!(listed.contains(&format!("blake3:{}", blake3::hash(b"third").to_hex())));
+    assert!(listed.contains("10 bytes"), "{listed}");
+
+    let directory = fixture.directory.path().join("saved");
+    let directory_arg = directory.display().to_string();
+    let saved = success(fixture.cli(None, &["attachments", &wire, "--save", &directory_arg]));
+    assert_eq!(
+        fs::read(directory.join("invoice.pdf")).unwrap(),
+        b"%PDF first"
+    );
+    assert_eq!(
+        fs::read(directory.join("invoice-1.pdf")).unwrap(),
+        b"%PDF second"
+    );
+    assert_eq!(fs::read(directory.join("tab_name.txt")).unwrap(), b"third");
+    assert_eq!(saved.matches("  saved ").count(), 3, "{saved}");
+
+    // A second save finds exactly these bytes and writes nothing new.
+    let again = success(fixture.cli(None, &["attachments", &wire, "--save", &directory_arg]));
+    assert_eq!(again.matches("already saved").count(), 3, "{again}");
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+
+    // Other bytes under both candidate names are never overwritten.
+    let occupied = fixture.directory.path().join("occupied");
+    fs::create_dir(&occupied).unwrap();
+    fs::write(occupied.join("invoice.pdf"), b"someone else's").unwrap();
+    fs::write(occupied.join("invoice-0.pdf"), b"and another").unwrap();
+    let output = fixture.cli(
+        None,
+        &[
+            "attachments",
+            &wire,
+            "--save",
+            &occupied.display().to_string(),
+        ],
+    );
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("NOT SAVED"), "{stdout}");
+    assert_eq!(
+        fs::read(occupied.join("invoice.pdf")).unwrap(),
+        b"someone else's"
+    );
+    assert_eq!(
+        fs::read(occupied.join("invoice-0.pdf")).unwrap(),
+        b"and another"
+    );
+    assert_eq!(
+        fs::read(occupied.join("invoice-1.pdf")).unwrap(),
+        b"%PDF second"
+    );
+
+    // Listing and saving recorded nothing: the message is still unread.
+    assert!(fixture.operations().list("Agent", true, false).unwrap()[0].unread);
+}
+
+#[test]
+fn an_attachment_whose_files_record_is_absent_is_listed_not_resident() {
+    let fixture = Fixture::new();
+    let publication = mail::imap_publication(
+        fixture.account,
+        fixture.config,
+        "INBOX",
+        1,
+        8,
+        multipart_with_attachments().as_bytes(),
+    )
+    .unwrap();
+    let wire = format!("{:x}", publication.wire);
+    // Publish the Mail evidence only; its Files records never arrive here.
+    publish_fragment(
+        &fixture.pile,
+        Some(&fixture.key),
+        faculties::schemas::mail::DEFAULT_SCOPE_ID,
+        publication.mail,
+    )
+    .unwrap();
+    let listings = fixture.operations().attachments(&wire).unwrap();
+    assert_eq!(listings.len(), 3);
+    assert!(listings
+        .iter()
+        .all(|listing| matches!(listing.state, mail::AttachmentState::NotResident(_))));
+    let directory = fixture.directory.path().join("absent");
+    let listed = success(fixture.cli(
+        None,
+        &[
+            "attachments",
+            &wire,
+            "--save",
+            &directory.display().to_string(),
+        ],
+    ));
+    assert_eq!(listed.matches("not resident").count(), 3, "{listed}");
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
 }
