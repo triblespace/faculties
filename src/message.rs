@@ -393,7 +393,6 @@ mod tests {
         fragment += relations::group_create_fragment(group, "shared").unwrap().0;
         let facts = fragment.facts().clone();
         let reader = fragment.blobs_mut().snapshot().unwrap();
-        relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert_eq!(
             resolve_recipient(&reader, &facts, "shared").unwrap(),
             RecipientOutcome::Ambiguous(sorted_ids([person, group]))
@@ -435,7 +434,6 @@ mod tests {
 
         let facts = fragment.facts().clone();
         let reader = fragment.blobs_mut().snapshot().unwrap();
-        relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
         assert!(matches!(
             relations::profile_head(&facts, legacy).unwrap(),
             relations::Head::Forked(_)
@@ -484,7 +482,6 @@ mod tests {
 
         let facts = fragment.facts().clone();
         let reader = fragment.blobs_mut().snapshot().unwrap();
-        relations::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
 
         assert_eq!(
             resolve_recipient(&reader, &facts, "crew").unwrap(),

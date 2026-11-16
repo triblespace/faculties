@@ -20,7 +20,7 @@ pub use operations::{
     TieRequest,
 };
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
@@ -28,7 +28,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
@@ -338,10 +338,6 @@ fn anchor_fragment(anchor: Id, kind: Id) -> Fragment {
     entity! { ExclusiveId::force_ref(&anchor) @ metadata::tag: &kind }
 }
 
-fn profile_record(snapshot: &ProfileSnapshot) -> Fragment {
-    profile_record_of(EntryKind::Person, snapshot)
-}
-
 fn profile_record_of(kind: EntryKind, snapshot: &ProfileSnapshot) -> Fragment {
     let tag = kind.profile_tag();
     entity! {
@@ -362,10 +358,6 @@ fn profile_record_of(kind: EntryKind, snapshot: &ProfileSnapshot) -> Fragment {
         profile::profile_url*: snapshot.profile_urls.iter(),
         metadata::supersedes*: snapshot.predecessors.iter(),
     }
-}
-
-fn lifecycle_record(snapshot: &LifecycleSnapshot) -> Fragment {
-    lifecycle_record_of(EntryKind::Person, snapshot)
 }
 
 fn lifecycle_record_of(kind: EntryKind, snapshot: &LifecycleSnapshot) -> Fragment {
@@ -891,33 +883,6 @@ fn head_from(ids: BTreeSet<Id>, superseded: BTreeSet<Id>) -> Head {
     }
 }
 
-fn validate_track_head(
-    ids: BTreeSet<Id>,
-    predecessors: impl Fn(Id) -> Result<Vec<Id>>,
-    label: &str,
-) -> Result<Head> {
-    if ids.is_empty() {
-        return Ok(Head::Missing);
-    }
-    let mut superseded = BTreeSet::new();
-    for &id in &ids {
-        for predecessor in predecessors(id)? {
-            if !ids.contains(&predecessor) {
-                bail!(
-                    "{label} snapshot {id:x} supersedes missing or wrong-track predecessor {predecessor:x}"
-                );
-            }
-            superseded.insert(predecessor);
-        }
-    }
-    let heads: Vec<Id> = ids.difference(&superseded).copied().collect();
-    match heads.as_slice() {
-        [] => bail!("{label} snapshot track has no head"),
-        [head] => Ok(Head::Unique(*head)),
-        _ => Ok(Head::Forked(heads)),
-    }
-}
-
 pub fn profile_head<P>(facts: &P, person: Id) -> Result<Head>
 where
     P: TriblePattern,
@@ -1052,276 +1017,6 @@ where
     Ok(head_from(ids, superseded))
 }
 
-fn ensure_intrinsic(id: Id, record: Fragment, label: &str) -> Result<TribleSet> {
-    let expected = record
-        .root()
-        .ok_or_else(|| anyhow!("{label} record has no unique intrinsic root"))?;
-    if id != expected {
-        bail!("{label} {id:x} does not match intrinsic root {expected:x}");
-    }
-    Ok(record.into_facts())
-}
-
-fn entity_facts(facts: &TribleSet, id: Id) -> TribleSet {
-    facts
-        .iter()
-        .filter(|fact| fact.e() == &id)
-        .copied()
-        .collect()
-}
-
-fn require_exact_native_entity(
-    facts: &TribleSet,
-    id: Id,
-    expected: &TribleSet,
-    label: &str,
-) -> Result<()> {
-    let actual = entity_facts(facts, id);
-    if actual != *expected {
-        let missing = expected.difference(&actual).len();
-        let unexpected = actual.difference(expected).len();
-        bail!(
-            "canonical Relations {label} {id:x} is not exact ({missing} missing, {unexpected} unexpected facts)"
-        );
-    }
-    Ok(())
-}
-
-fn validate_profile_snapshot(facts: &TribleSet, id: Id) -> Result<ProfileSnapshot> {
-    let snapshot = profile_snapshot(facts, id)?;
-    let expected = ensure_intrinsic(id, profile_record(&snapshot), "profile")?;
-    require_exact_native_entity(facts, id, &expected, "profile")?;
-    Ok(snapshot)
-}
-
-fn validate_lifecycle_snapshot(facts: &TribleSet, id: Id) -> Result<LifecycleSnapshot> {
-    let snapshot = lifecycle_snapshot(facts, id)?;
-    let expected = ensure_intrinsic(id, lifecycle_record(&snapshot), "lifecycle")?;
-    require_exact_native_entity(facts, id, &expected, "lifecycle")?;
-    Ok(snapshot)
-}
-
-fn validate_group_snapshot(facts: &TribleSet, id: Id) -> Result<GroupSnapshot> {
-    let snapshot = group_snapshot(facts, id)?;
-    let expected = ensure_intrinsic(id, group_record(&snapshot), "group snapshot")?;
-    require_exact_native_entity(facts, id, &expected, "group snapshot")?;
-    Ok(snapshot)
-}
-
-fn validate_identity_verdict(facts: &TribleSet, id: Id) -> Result<IdentityVerdict> {
-    let snapshot = identity_verdict(facts, id)?;
-    let expected = ensure_intrinsic(id, identity_record(&snapshot), "identity verdict")?;
-    require_exact_native_entity(facts, id, &expected, "identity verdict")?;
-    Ok(snapshot)
-}
-
-fn validate_profile_head(facts: &TribleSet, person: Id) -> Result<Head> {
-    let ids = find!(
-        id: Id,
-        pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_PERSON_PROFILE,
-            profile::of: person,
-        }])
-    )
-    .collect();
-    validate_track_head(
-        ids,
-        |id| Ok(validate_profile_snapshot(facts, id)?.predecessors),
-        "profile",
-    )
-}
-
-fn validate_lifecycle_head(facts: &TribleSet, person: Id) -> Result<Head> {
-    let ids = find!(
-        id: Id,
-        pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_PERSON_LIFECYCLE,
-            lifecycle::of: person,
-        }])
-    )
-    .collect();
-    validate_track_head(
-        ids,
-        |id| Ok(validate_lifecycle_snapshot(facts, id)?.predecessors),
-        "lifecycle",
-    )
-}
-
-fn validate_group_head(facts: &TribleSet, group_id: Id) -> Result<Head> {
-    let ids = find!(
-        id: Id,
-        pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_GROUP_SNAPSHOT,
-            group::snapshot_of: group_id,
-        }])
-    )
-    .collect();
-    validate_track_head(
-        ids,
-        |id| Ok(validate_group_snapshot(facts, id)?.predecessors),
-        "group",
-    )
-}
-
-fn validate_identity_head(facts: &TribleSet, first: Id, second: Id) -> Result<Head> {
-    let (low, high) = pair(first, second)?;
-    let ids = find!(
-        id: Id,
-        pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_IDENTITY_VERDICT,
-            identity::low: low,
-            identity::high: high,
-        }])
-    )
-    .collect();
-    validate_track_head(
-        ids,
-        |id| Ok(validate_identity_verdict(facts, id)?.predecessors),
-        "identity verdict",
-    )
-}
-
-fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, bool)>> {
-    let people = person_anchors(facts);
-    let groups = group_anchors(facts);
-    if let Some(id) = people.intersection(&groups).next() {
-        bail!("Relations anchor {id:x} is both a person and a group");
-    }
-
-    let profile_ids = ids_of_kind(facts, KIND_PERSON_PROFILE);
-    let lifecycle_ids = ids_of_kind(facts, KIND_PERSON_LIFECYCLE);
-    let group_ids = ids_of_kind(facts, KIND_GROUP_SNAPSHOT);
-    let verdict_ids = ids_of_kind(facts, KIND_IDENTITY_VERDICT);
-
-    let mut text_handles = Vec::new();
-    for &id in &profile_ids {
-        let snapshot = validate_profile_snapshot(facts, id)?;
-        if !people.contains(&snapshot.person) {
-            bail!(
-                "profile {id:x} names undeclared person {:x}",
-                snapshot.person
-            );
-        }
-        text_handles.push((snapshot.label, true));
-        text_handles.extend(
-            snapshot
-                .aliases
-                .iter()
-                .copied()
-                .map(|handle| (handle, true)),
-        );
-        text_handles.extend(
-            snapshot
-                .affinities
-                .iter()
-                .copied()
-                .map(|handle| (handle, true)),
-        );
-        text_handles.extend(snapshot.first_name.into_iter().map(|handle| (handle, true)));
-        text_handles.extend(snapshot.last_name.into_iter().map(|handle| (handle, true)));
-        text_handles.extend(
-            snapshot
-                .display_name
-                .into_iter()
-                .map(|handle| (handle, true)),
-        );
-        text_handles.extend(snapshot.note.into_iter().map(|handle| (handle, false)));
-        text_handles.extend(
-            snapshot
-                .teams_user_ids
-                .iter()
-                .copied()
-                .map(|handle| (handle, true)),
-        );
-        text_handles.extend(snapshot.emails.iter().copied().map(|handle| (handle, true)));
-        text_handles.extend(snapshot.phones.iter().copied().map(|handle| (handle, true)));
-        text_handles.extend(snapshot.company.into_iter().map(|handle| (handle, true)));
-        text_handles.extend(snapshot.position.into_iter().map(|handle| (handle, true)));
-        text_handles.extend(
-            snapshot
-                .profile_urls
-                .iter()
-                .copied()
-                .map(|handle| (handle, true)),
-        );
-    }
-    for &id in &lifecycle_ids {
-        let snapshot = validate_lifecycle_snapshot(facts, id)?;
-        if !people.contains(&snapshot.person) {
-            bail!(
-                "lifecycle {id:x} names undeclared person {:x}",
-                snapshot.person
-            );
-        }
-    }
-    for &id in &group_ids {
-        let snapshot = validate_group_snapshot(facts, id)?;
-        if !groups.contains(&snapshot.group) {
-            bail!(
-                "group snapshot {id:x} names undeclared group {:x}",
-                snapshot.group
-            );
-        }
-        for member in &snapshot.members {
-            if !people.contains(member) {
-                bail!("group snapshot {id:x} names undeclared person {member:x}");
-            }
-        }
-        if snapshot.predecessors.len() > 1 {
-            let mut inherited_members = BTreeSet::new();
-            for predecessor in &snapshot.predecessors {
-                let parent = validate_group_snapshot(facts, *predecessor).with_context(|| {
-                    format!("read group reconciliation predecessor {predecessor:x}")
-                })?;
-                if parent.group != snapshot.group {
-                    bail!(
-                        "group snapshot {id:x} reconciles predecessor {predecessor:x} from another group"
-                    );
-                }
-                inherited_members.extend(parent.members);
-            }
-            let actual_members: BTreeSet<_> = snapshot.members.iter().copied().collect();
-            if actual_members != inherited_members {
-                bail!(
-                    "group reconciliation {id:x} has {} members; the predecessor union has {}",
-                    actual_members.len(),
-                    inherited_members.len()
-                );
-            }
-        }
-        text_handles.push((snapshot.name, true));
-    }
-    for &id in &verdict_ids {
-        let snapshot = validate_identity_verdict(facts, id)?;
-        if snapshot.low >= snapshot.high {
-            bail!("identity verdict {id:x} does not use canonical ordered endpoints");
-        }
-        if !people.contains(&snapshot.low) || !people.contains(&snapshot.high) {
-            bail!("identity verdict {id:x} names an undeclared person");
-        }
-    }
-
-    for &person in &people {
-        if matches!(validate_profile_head(facts, person)?, Head::Missing) {
-            bail!("person {person:x} has no profile snapshot");
-        }
-        if matches!(validate_lifecycle_head(facts, person)?, Head::Missing) {
-            bail!("person {person:x} has no lifecycle snapshot");
-        }
-    }
-    for &group_id in &groups {
-        if matches!(validate_group_head(facts, group_id)?, Head::Missing) {
-            bail!("group {group_id:x} has no group snapshot");
-        }
-    }
-    for &id in &verdict_ids {
-        let verdict = validate_identity_verdict(facts, id)?;
-        let _ = validate_identity_head(facts, verdict.low, verdict.high)?;
-    }
-
-    Ok(text_handles)
-}
-
 fn load_text_from<Store>(reader: &Store, handle: TextHandle) -> Result<String>
 where
     Store: BlobStoreGet + ?Sized,
@@ -1330,90 +1025,6 @@ where
         .get(handle)
         .with_context(|| format!("read Relations text payload {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
-}
-
-fn load_text_overlay<Store, Overlay>(
-    reader: &Store,
-    overlay: &Overlay,
-    handle: TextHandle,
-) -> Result<String>
-where
-    Store: BlobStoreGet + ?Sized,
-    Overlay: BlobStoreGet + BlobStoreList,
-{
-    if overlay
-        .contains_blob(handle)
-        .context("inspect staged Relations text payloads")?
-    {
-        let view: View<str> = overlay.get(handle).with_context(|| {
-            format!(
-                "read staged Relations text payload {}",
-                hex::encode(handle.raw)
-            )
-        })?;
-        return Ok(view.to_string());
-    }
-    load_text_from(reader, handle)
-}
-
-fn validate_texts(
-    handles: Vec<(TextHandle, bool)>,
-    mut load: impl FnMut(TextHandle) -> Result<String>,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    for (handle, trimmed) in handles {
-        if !seen.insert(handle.raw) {
-            continue;
-        }
-        let value = load(handle)?;
-        if value.bytes().any(|byte| byte == 0) {
-            bail!("Relations text payload contains a NUL byte");
-        }
-        if trimmed && (value.is_empty() || value.trim() != value) {
-            bail!("Relations canonical text payload is empty or has surrounding whitespace");
-        }
-    }
-    Ok(())
-}
-
-/// Validate the native Relations view inside a complete materialized
-/// collection. Structural forks remain valid; malformed intrinsic records and
-/// their missing attachments do not. Retained legacy facts outside intrinsic
-/// snapshot entities remain inert.
-pub fn validate_catalog<Store>(reader: &Store, facts: &TribleSet) -> Result<()>
-where
-    Store: BlobStoreGet + ?Sized,
-{
-    let handles = validate_structure(facts)?;
-    validate_texts(handles, |handle| load_text_from(reader, handle))
-}
-
-/// Preflight the native Relations view of the exact generic union that would
-/// result from publishing `fragment`. Staged native attachments are read from
-/// the fragment overlay; no pile bytes are written by this function.
-pub fn validate_catalog_union<Store>(
-    reader: &Store,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<TribleSet>
-where
-    Store: BlobStoreGet + ?Sized,
-{
-    let mut expected = current.clone();
-    expected += fragment.facts().clone();
-    let handles = validate_structure(&expected)?;
-    // `SnapshotSource::snapshot` freezes an observation through `&mut self`. Cloning a
-    // Fragment is O(1) over its PATCH-backed stores, so preflight can do that
-    // without mutating the caller's candidate.
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("MemoryBlobStore reader creation is infallible");
-    validate_texts(handles, |handle| {
-        load_text_overlay(reader, &overlay, handle)
-    })?;
-    Ok(expected)
 }
 
 pub fn read_text<Store>(reader: &Store, handle: TextHandle) -> Result<String>
@@ -2675,7 +2286,6 @@ mod tests {
         fixture.publish(group_provenance_fragment(group, &[observed_at(10)]));
 
         let after = fixture.view();
-        validate_catalog(&after.reader, &after.facts).unwrap();
         assert_eq!(profile_head(&after.facts, person).unwrap(), profile_before);
         assert_eq!(
             lifecycle_head(&after.facts, person).unwrap(),
@@ -2727,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_accepts_forks_but_rejects_extra_snapshot_facts() {
+    fn profile_forks_remain_visible() {
         let fixture = Fixture::new();
         let person = genid().id;
         publish_person(&fixture, person, "Ada");
@@ -2739,7 +2349,6 @@ mod tests {
         fixture.publish(profile_fragment(person, profile("Ada One"), &[first_head]).unwrap());
         fixture.publish(profile_fragment(person, profile("Ada Two"), &[first_head]).unwrap());
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             profile_head(&view.facts, person).unwrap(),
             Head::Forked(_)
@@ -2748,16 +2357,6 @@ mod tests {
             person_profile_views(&view.reader, &view.facts).as_slice(),
             [(id, ProfileView::Forked(heads))] if *id == person && heads.len() == 2
         ));
-
-        let fork_head = match profile_head(&view.facts, person).unwrap() {
-            Head::Forked(heads) => heads[0],
-            _ => unreachable!(),
-        };
-        let mut malformed = view.facts.clone();
-        let existing_handle = profile_snapshot(&view.facts, fork_head).unwrap().label;
-        malformed +=
-            entity! { ExclusiveId::force_ref(&fork_head) @ profile::email: existing_handle };
-        assert!(validate_catalog(&view.reader, &malformed).is_err());
     }
 
     #[test]
@@ -2804,7 +2403,6 @@ mod tests {
         fixture.publish(legacy);
 
         let after = fixture.view();
-        validate_catalog(&after.reader, &after.facts).unwrap();
         assert_eq!(profile_head(&after.facts, person).unwrap(), profile_before);
         assert_eq!(
             lifecycle_head(&after.facts, person).unwrap(),
@@ -2835,21 +2433,6 @@ mod tests {
     }
 
     #[test]
-    fn preflight_reads_staged_payloads_without_writing() {
-        let fixture = Fixture::new();
-        let view = fixture.view();
-        let person = genid().id;
-        let mut input = profile("Ada");
-        input.emails =
-            vec!["a-very-long-address-that-exceeds-thirty-two-bytes@example.test".into()];
-        input.teams_user_ids = vec!["00000000-0000-0000-0000-000000000000".into()];
-        let (fragment, _, _) = person_fragment(person, input).unwrap();
-        let expected = validate_catalog_union(&view.reader, &view.facts, &fragment).unwrap();
-        assert!(person_anchors(&expected).contains(&person));
-        assert!(person_anchors(&view.facts).is_empty());
-    }
-
-    #[test]
     fn lookup_is_computed_and_ambiguity_is_visible() {
         let fixture = Fixture::new();
         let ada = genid().id;
@@ -2860,7 +2443,6 @@ mod tests {
         fixture.publish(fragment);
         publish_person(&fixture, other, "Other");
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert_eq!(
             resolve_person(&view.reader, &view.facts, "  COUNTESS ", false).unwrap(),
             SelectorOutcome::Unique(ada)
@@ -2929,7 +2511,6 @@ mod tests {
 
         publish_person(&fixture, live, "shared");
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             profile_head(&view.facts, legacy).unwrap(),
             Head::Forked(_)
@@ -2968,7 +2549,6 @@ mod tests {
         publish_person(&fixture, settled_person, "countess");
 
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         let outcome = resolve_person(&view.reader, &view.facts, "countess", false).unwrap();
         assert_eq!(
             outcome,
@@ -3029,7 +2609,6 @@ mod tests {
         fixture.publish(lifecycle_fragment(person, false, &[active]));
         let (says_retired, says_active) = split(&fixture);
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             resolve(&view).unwrap(),
             SelectorOutcome::Forked { .. }
@@ -3038,7 +2617,6 @@ mod tests {
         // Still two heads, but now both say active: Ada is addressable.
         fixture.publish(lifecycle_fragment(person, false, &says_retired));
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             lifecycle_head(&view.facts, person).unwrap(),
             Head::Forked(_)
@@ -3048,7 +2626,6 @@ mod tests {
         // Disagreement returns: indeterminate again.
         fixture.publish(lifecycle_fragment(person, true, &says_active));
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             resolve(&view).unwrap(),
             SelectorOutcome::Forked { .. }
@@ -3059,7 +2636,6 @@ mod tests {
         let (_, still_active) = split(&fixture);
         fixture.publish(lifecycle_fragment(person, true, &still_active));
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             lifecycle_head(&view.facts, person).unwrap(),
             Head::Forked(_)
@@ -3090,7 +2666,6 @@ mod tests {
         fixture.publish(lifecycle_fragment(person, true, &[initial]));
         fixture.publish(lifecycle_fragment(person, false, &[initial]));
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             lifecycle_head(&view.facts, person).unwrap(),
             Head::Forked(_)
@@ -3099,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn group_reconciliation_is_exactly_the_predecessor_member_union() {
+    fn group_reconciliation_carries_the_predecessor_member_union() {
         let fixture = Fixture::new();
         let first = genid().id;
         let second = genid().id;
@@ -3122,12 +2697,10 @@ mod tests {
             Head::Forked(_)
         ));
 
-        let lossy = group_snapshot_fragment(group, "crew", &[], &[left_id, right_id]).unwrap();
-        assert!(validate_catalog_union(&fork.reader, &fork.facts, &lossy).is_err());
-
         let reconciled =
             reconcile_group_fragment(&fork.facts, group, "crew", &[right_id, left_id]).unwrap();
-        let settled = validate_catalog_union(&fork.reader, &fork.facts, &reconciled).unwrap();
+        let mut settled = fork.facts.clone();
+        settled += reconciled.facts().clone();
         let head = match group_head(&settled, group).unwrap() {
             Head::Unique(head) => head,
             other => panic!("expected reconciled group head, got {other:?}"),
@@ -3160,7 +2733,6 @@ mod tests {
             identity_verdict_fragment(configured_persona, equivalent_anchor, true, &[]).unwrap(),
         );
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         let identities = IdentityComponents::from_facts(&view.facts).unwrap();
         assert!(identities
             .equivalent(configured_persona, equivalent_anchor)
@@ -3247,7 +2819,6 @@ mod tests {
         fixture.publish(identity_verdict_fragment(b, c, true, &[]).unwrap());
         fixture.publish(identity_verdict_fragment(a, c, false, &[]).unwrap());
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         let identities = IdentityComponents::from_facts(&view.facts).unwrap();
         assert!(identities.equivalent(a, c).is_err());
         assert!(identities.equivalent(a, a).is_err());
@@ -3271,7 +2842,6 @@ mod tests {
         fixture.publish(identity_verdict_fragment(a, c, false, &[]).unwrap());
 
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         let identities = IdentityComponents::from_facts(&view.facts).unwrap();
         let pair = if a < c { (a, c) } else { (c, a) };
         assert!(identities.mixed_forked_pairs().contains(&pair));
