@@ -1231,7 +1231,7 @@ mod tests {
         pile.put::<blobencodings::UTF8String, _>("unrelated payload").unwrap();
         let unrelated = pile.snapshot().unwrap();
         assert_eq!(unrelated.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
-        pile.put(body).unwrap();
+        pile.put::<blobencodings::UTF8String, _>(body).unwrap();
         let arrived = pile.snapshot().unwrap();
         assert_eq!(arrived.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
         // UI reads occur after observe returned, through cloned resident readers.
