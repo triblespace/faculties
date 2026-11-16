@@ -1045,6 +1045,61 @@ pub fn parse_rfc5322(raw: &[u8]) -> Result<ParsedMessage> {
     })
 }
 
+/// The Reply-To field values of exact raw message bytes, one per field.
+///
+/// The `RECIPE_RFC5322_V1` projection does not carry Reply-To, and a recipe
+/// never changes its output in place, so a reply reads it from the source
+/// evidence at the point of use.
+pub fn reply_to_claims(raw: &[u8]) -> Result<Vec<String>> {
+    let (headers, _) = mailparse::parse_headers(raw).context("parse RFC 5322 headers")?;
+    Ok(headers
+        .iter()
+        .filter(|header| header.get_key().eq_ignore_ascii_case("Reply-To"))
+        .map(|header| header.get_value())
+        .collect())
+}
+
+/// One mailbox of a mailbox-list claim: `rendered` is a single mailbox that
+/// draft rendering parses back, `address` the bare address, for comparison.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplyMailbox {
+    pub rendered: String,
+    pub address: String,
+}
+
+/// Split mailbox-list claims (`a@x, B <b@y>`, groups) into single mailboxes,
+/// in claim order.
+pub fn reply_mailboxes(values: impl IntoIterator<Item = String>) -> Result<Vec<ReplyMailbox>> {
+    let mut out = Vec::new();
+    for value in values {
+        let parsed = mailparse::addrparse(&value)
+            .with_context(|| format!("parse mailbox claim {value:?}"))?;
+        for address in parsed.iter() {
+            let singles = match address {
+                mailparse::MailAddr::Single(single) => std::slice::from_ref(single),
+                mailparse::MailAddr::Group(group) => group.addrs.as_slice(),
+            };
+            for single in singles {
+                let addr: lettre::Address = single
+                    .addr
+                    .parse()
+                    .with_context(|| format!("parse mailbox address {:?}", single.addr))?;
+                let name = single
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned);
+                out.push(ReplyMailbox {
+                    rendered: Mailbox::new(name, addr).to_string(),
+                    address: single.addr.clone(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn claimed_wire_record(message_id: TextHandle) -> Fragment {
     entity! { metadata::tag: &KIND_WIRE_MESSAGE, wire::claimed_message_id: message_id }
 }

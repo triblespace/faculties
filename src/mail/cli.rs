@@ -166,6 +166,10 @@ struct ReplyArgs {
     message: String,
     #[arg(long)]
     account: String,
+    /// Also reply to the parent's To and Cc, minus this account's own
+    /// addresses. Without it the reply goes to Reply-To, or else From.
+    #[arg(long)]
+    all: bool,
     /// Literal text, `@path`, or `@-`.
     body: String,
 }
@@ -263,6 +267,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 message: args.message,
                 account: args.account,
                 body: crate::text_arg(&args.body, "reply body")?,
+                all: args.all,
             })?,
             out,
         ),
