@@ -18,7 +18,7 @@ pub use operations::{
     SendStatus,
 };
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,7 +35,6 @@ use triblespace::prelude::*;
 use crate::decide::{self, Resolution};
 use crate::files;
 use crate::relations::IdentityComponents;
-use crate::schemas::decide::KIND_DECISION;
 use crate::schemas::files::{file as file_schema, KIND_FILE, KIND_MEDIA_TYPE};
 use crate::schemas::mail::{
     acceptance, account, attachment_occurrence, attempt, draft, imported, imported_legacy,
@@ -46,7 +45,6 @@ use crate::schemas::mail::{
     KIND_SMTP_ACCEPTANCE, KIND_WIRE_MESSAGE, LEGACY_KIND_MESSAGE, LEGACY_KIND_SPAM,
     RECIPE_RFC5322_V1,
 };
-use crate::schemas::message::local as legacy_read;
 use crate::secrets::SecretsSnapshot;
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
@@ -484,24 +482,6 @@ where
     P: TriblePattern,
 {
     ids_of_kind(facts, KIND_DRAFT_INTENT).into_iter().collect()
-}
-
-fn entity_facts(facts: &TribleSet, entity: Id) -> TribleSet {
-    facts
-        .iter()
-        .filter(|fact| fact.e() == &entity)
-        .copied()
-        .collect()
-}
-
-fn ensure_intrinsic(id: Id, fragment: Fragment, label: &str) -> Result<Fragment> {
-    let expected = fragment
-        .root()
-        .ok_or_else(|| anyhow!("{label} does not export exactly one root"))?;
-    if id != expected {
-        bail!("{label} {id:x} does not match intrinsic core {expected:x}");
-    }
-    Ok(fragment)
 }
 
 fn imported_payload_record(record: &ImportedPayloadRecord) -> Fragment {
@@ -1673,78 +1653,6 @@ fn bytes_union<Overlay: BlobStoreGet>(
     bail!("missing Mail byte blob {}", hex::encode(handle.raw))
 }
 
-fn archive_union<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    handle: ArchiveHandle,
-) -> Result<TribleSet> {
-    if let Ok(value) = reader.get::<TribleSet, _>(handle) {
-        return Ok(value);
-    }
-    if let Some(overlay) = overlay {
-        return overlay
-            .get(handle)
-            .with_context(|| format!("read staged Mail archive {}", hex::encode(handle.raw)));
-    }
-    bail!("missing Mail archive blob {}", hex::encode(handle.raw))
-}
-
-/// Decode and prove one exact canonical Files record through the same blob
-/// overlay used for an unpublished cross-collection candidate.
-fn file_attachment_union<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    facts: &TribleSet,
-    file: Id,
-) -> Result<AttachmentData> {
-    if !exists!(pattern!(facts, [{ file @ metadata::tag: &KIND_FILE }])) {
-        bail!("{file:x} is not tagged as a canonical file");
-    }
-    let content = required(
-        find!(value: BytesHandle, pattern!(facts, [{ file @ file_schema::content: ?value }]))
-            .collect(),
-        "file content",
-    )?;
-    let name = required(
-        find!(value: TextHandle, pattern!(facts, [{ file @ file_schema::name: ?value }])).collect(),
-        "file name",
-    )?;
-    let media_type = required(
-        find!(value: Id, pattern!(facts, [{ file @ file_schema::media_type: ?value }])).collect(),
-        "file media type",
-    )?;
-    if !exists!(pattern!(facts, [{ media_type @ metadata::tag: &KIND_MEDIA_TYPE }])) {
-        bail!("file {file:x} names untyped media entity {media_type:x}");
-    }
-    let media_name = required(
-        find!(value: TextHandle, pattern!(facts, [{ media_type @ metadata::name: ?value }]))
-            .collect(),
-        "media type name",
-    )?;
-
-    let bytes = bytes_union(reader, overlay, content)?;
-    let filename = text_union(reader, overlay, name)?;
-    let media_type_name = text_union(reader, overlay, media_name)?;
-    let canonical = files::stage(bytes.clone(), filename.clone(), &media_type_name)?;
-    if canonical.root() != Some(file) {
-        bail!("file {file:x} does not match its canonical content/name/media identity");
-    }
-    let canonical_file = entity_facts(canonical.facts(), file);
-    if entity_facts(facts, file) != canonical_file {
-        bail!("file {file:x} is not one exact canonical file record");
-    }
-    for fact in canonical.facts() {
-        if fact.e() == &media_type && !facts.contains(fact) {
-            bail!("file {file:x} is missing canonical media-type evidence");
-        }
-    }
-    Ok(AttachmentData {
-        filename,
-        media_type: media_type_name,
-        bytes,
-    })
-}
-
 /// The blobs of one attachment, selected by an ordinary typed read.
 struct AttachmentHandles {
     content: BytesHandle,
@@ -1897,31 +1805,6 @@ where
     }
     rows.sort_by_key(|row| (row.ordinal.is_none(), row.ordinal, row.occurrence));
     rows
-}
-
-fn validate_source_text_payloads<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    source_facts: &TribleSet,
-) -> Result<()> {
-    let attributes = BTreeSet::from([
-        wire::claimed_message_id.id(),
-        projection::from.id(),
-        projection::to.id(),
-        projection::cc.id(),
-        projection::bcc.id(),
-        projection::subject.id(),
-        projection::body.id(),
-    ]);
-    let handles: BTreeSet<TextHandle> = source_facts
-        .iter()
-        .filter(|fact| attributes.contains(fact.a()))
-        .map(|fact| *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>())
-        .collect();
-    for handle in handles {
-        text_union(reader, overlay, handle)?;
-    }
-    Ok(())
 }
 
 fn draft_from_facts<P>(facts: &P, id: Id) -> Result<DraftRecord>
@@ -2134,64 +2017,6 @@ where
     })
 }
 
-fn config_owner_map(facts: &TribleSet) -> Result<HashMap<Id, AccountConfigRecord>> {
-    ids_of_kind(facts, KIND_ACCOUNT_CONFIG)
-        .into_iter()
-        .map(|id| account_config(facts, id).map(|record| (id, record)))
-        .collect()
-}
-
-fn validate_send_heads<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    decide_facts: &TribleSet,
-    decision: Id,
-    heads: &[Id],
-) -> Result<()> {
-    if heads.is_empty() {
-        bail!("send attempt records no decision frontier");
-    }
-    let selected: BTreeSet<Id> = heads.iter().copied().collect();
-    let mut forced = BTreeSet::new();
-    for &head in heads {
-        let snapshot = decide::resolution_snapshot(decide_facts, head)?;
-        if snapshot.decision != decision {
-            bail!("resolution {head:x} belongs to another decision");
-        }
-        if text_union(reader, overlay, snapshot.outcome)? != "send" {
-            bail!("resolution {head:x} does not carry exact outcome \"send\"");
-        }
-        forced.insert(snapshot.forced);
-    }
-    if forced.len() != 1 {
-        bail!("stored send frontier does not have Agreed semantics");
-    }
-
-    // A genuine frontier is an antichain. Completeness at the historical
-    // executor snapshot is an attestation, but an ancestor and descendant can
-    // never both have been heads of the same resolution DAG.
-    for &head in heads {
-        let mut stack = decide::resolution_snapshot(decide_facts, head)?.predecessors;
-        let mut visited = BTreeSet::new();
-        while let Some(ancestor) = stack.pop() {
-            if !visited.insert(ancestor) {
-                continue;
-            }
-            if selected.contains(&ancestor) {
-                bail!(
-                    "stored send frontier contains both resolution {ancestor:x} and a descendant"
-                );
-            }
-            let snapshot = decide::resolution_snapshot(decide_facts, ancestor)?;
-            if snapshot.decision != decision {
-                bail!("resolution {ancestor:x} belongs to another decision");
-            }
-            stack.extend(snapshot.predecessors);
-        }
-    }
-    Ok(())
-}
-
 fn normalized_mailboxes(
     values: impl IntoIterator<Item = String>,
 ) -> Result<Vec<(Option<String>, String)>> {
@@ -2218,863 +2043,6 @@ fn normalized_mailboxes(
     out.sort();
     out.dedup();
     Ok(out)
-}
-
-fn validate_attempt_rendering(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&impl BlobStoreGet>,
-    mail_facts: &TribleSet,
-    files_facts: &TribleSet,
-    attempt: &SendAttemptRecord,
-    draft: &DraftRecord,
-    config: &AccountConfigRecord,
-) -> Result<()> {
-    let raw = bytes_union(reader, overlay, attempt.raw)?;
-    let parsed = parse_rfc5322(&raw).context("parse frozen send-attempt bytes")?;
-    let materialized = materialize_draft_union(reader, overlay, mail_facts, files_facts, draft.id)?;
-
-    let expected_message_id = format!("mail-{}@triblespace", draft.id);
-    if parsed.identity != WireIdentity::Claimed(expected_message_id.clone()) {
-        bail!(
-            "attempt Message-ID {:?} does not match deterministic draft id {:?}",
-            parsed.identity,
-            expected_message_id
-        );
-    }
-    if parsed.subject != materialized.subject || parsed.body != materialized.body {
-        bail!("attempt wire subject/body does not equal the authorized DraftIntent");
-    }
-    if parsed.attachments != materialized.attachments {
-        bail!("attempt wire attachments do not equal the authorized DraftIntent");
-    }
-    if parsed.spam {
-        bail!("locally rendered attempt unexpectedly claims spam status");
-    }
-    if !parsed.bcc.is_empty() {
-        bail!("attempt wire leaks Bcc headers; Bcc is envelope-only");
-    }
-
-    let expected_from = normalized_mailboxes([format!(
-        "{} <{}>",
-        text_union(reader, overlay, config.display_name)?,
-        materialized.envelope_from
-    )])?;
-    let actual_from = normalized_mailboxes(parsed.from)?;
-    if actual_from != expected_from {
-        bail!("attempt wire From does not equal the frozen account/draft sender");
-    }
-    if normalized_mailboxes(parsed.to)? != normalized_mailboxes(materialized.to.clone())?
-        || normalized_mailboxes(parsed.cc)? != normalized_mailboxes(materialized.cc.clone())?
-    {
-        bail!("attempt wire recipients do not equal the authorized DraftIntent");
-    }
-    let expected_reply = sorted_ids(
-        materialized
-            .in_reply_to
-            .iter()
-            .map(|value| wire_id_for(value))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    let expected_references = sorted_ids(
-        materialized
-            .references
-            .iter()
-            .map(|value| wire_id_for(value))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    let actual_reply = sorted_ids(
-        parsed
-            .in_reply_to
-            .iter()
-            .map(|value| wire_id_for(value))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    let actual_references = sorted_ids(
-        parsed
-            .references
-            .iter()
-            .map(|value| wire_id_for(value))
-            .collect::<Result<Vec<_>>>()?,
-    );
-    if actual_reply != expected_reply || actual_references != expected_references {
-        bail!("attempt wire thread headers do not equal the authorized DraftIntent");
-    }
-    let expected_date: (Epoch, Epoch) = draft
-        .created_at
-        .try_from_inline()
-        .map_err(|error| anyhow!("decode draft creation time: {error:?}"))?;
-    let actual_date = parsed
-        .claimed_date
-        .ok_or_else(|| anyhow!("attempt wire has no Date header"))?;
-    let actual_date: (Epoch, Epoch) = actual_date
-        .try_from_inline()
-        .map_err(|error| anyhow!("decode attempt Date: {error:?}"))?;
-    if actual_date.0.to_unix_seconds().trunc() as i64
-        != expected_date.0.to_unix_seconds().trunc() as i64
-    {
-        bail!("attempt wire Date does not equal the draft creation second");
-    }
-    Ok(())
-}
-
-/// Exact structural and cross-collection validation for one Mail materialization.
-pub fn validate_catalog<R>(
-    reader: &impl BlobStoreGet,
-    facts: &TribleSet,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &SecretsSnapshot<R>,
-) -> Result<()> {
-    validate_catalog_inner(
-        reader,
-        None::<&PileSnapshot>,
-        facts,
-        files_facts,
-        decide_facts,
-        relations_facts,
-        true,
-    )?;
-    validate_secret_references(facts, secrets)
-}
-
-/// Validate only Mail's exact immutable references into configured Secrets.
-pub fn validate_secret_references<R>(
-    facts: &TribleSet,
-    secrets: &SecretsSnapshot<R>,
-) -> Result<()> {
-    for (id, record) in config_owner_map(facts)? {
-        if !secrets.contains(record.credential) {
-            bail!(
-                "account config {id:x} names unknown Secrets version {:x}",
-                record.credential
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Exact local Mail reconstruction without resolving cross-collection edges.
-/// The stopped-world cutover uses this while each target collection is being
-/// materialized independently; [`validate_catalog`] remains the required
-/// final candidate predicate once Files, Decide, and Relations are available.
-pub fn validate_local_catalog(reader: &impl BlobStoreGet, facts: &TribleSet) -> Result<()> {
-    validate_catalog_inner(
-        reader,
-        None::<&PileSnapshot>,
-        facts,
-        &TribleSet::new(),
-        &TribleSet::new(),
-        &TribleSet::new(),
-        false,
-    )
-}
-
-/// Local preflight counterpart of [`validate_catalog_union`], used by the
-/// cutover planner before cross-collection candidate materialization exists.
-pub fn validate_local_catalog_union(
-    reader: &impl BlobStoreGet,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<TribleSet> {
-    let mut expected = current.clone();
-    expected += fragment.facts().clone();
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("memory blob reader creation is infallible");
-    validate_catalog_inner(
-        reader,
-        Some(&overlay),
-        &expected,
-        &TribleSet::new(),
-        &TribleSet::new(),
-        &TribleSet::new(),
-        false,
-    )?;
-    Ok(expected)
-}
-
-/// Preflight the exact set union a Mail publication would create, including
-/// the new fragment's in-memory blobs, without writing pile bytes.
-pub fn validate_catalog_union<R>(
-    reader: &impl BlobStoreGet,
-    current: &TribleSet,
-    fragment: &Fragment,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &SecretsSnapshot<R>,
-) -> Result<TribleSet> {
-    validate_catalog_union_with_blobs(
-        reader,
-        current,
-        fragment,
-        fragment,
-        files_facts,
-        decide_facts,
-        relations_facts,
-        secrets,
-    )
-}
-
-/// Preflight one Mail delta while resolving attachments from a larger staged
-/// cross-collection publication. Only `mail_fragment` contributes Mail facts;
-/// `blob_overlay` is an ownership carrier for any Mail, Files, or Decide blobs
-/// that have not reached the pile yet.
-#[allow(clippy::too_many_arguments)]
-pub fn validate_catalog_union_with_blobs<R>(
-    reader: &impl BlobStoreGet,
-    current: &TribleSet,
-    mail_fragment: &Fragment,
-    blob_overlay: &Fragment,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    secrets: &SecretsSnapshot<R>,
-) -> Result<TribleSet> {
-    let mut expected = current.clone();
-    expected += mail_fragment.facts().clone();
-    let mut staged = blob_overlay.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("memory blob reader creation is infallible");
-    validate_catalog_inner(
-        reader,
-        Some(&overlay),
-        &expected,
-        files_facts,
-        decide_facts,
-        relations_facts,
-        true,
-    )?;
-    validate_secret_references(&expected, secrets)?;
-    Ok(expected)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn validate_catalog_inner<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    facts: &TribleSet,
-    files_facts: &TribleSet,
-    decide_facts: &TribleSet,
-    relations_facts: &TribleSet,
-    validate_cross_collection: bool,
-) -> Result<()> {
-    let accounts = account_anchors(facts);
-    let configs = config_owner_map(facts)?;
-    let wires: BTreeSet<_> = ids_of_kind(facts, KIND_WIRE_MESSAGE);
-    let drafts: BTreeSet<_> = ids_of_kind(facts, KIND_DRAFT_INTENT);
-    let attempts: BTreeSet<_> = ids_of_kind(facts, KIND_SEND_ATTEMPT);
-    let acceptances: BTreeSet<_> = ids_of_kind(facts, KIND_SMTP_ACCEPTANCE);
-    let reads: BTreeSet<_> = ids_of_kind(facts, KIND_READ_OBSERVATION);
-    let pop_observations: BTreeSet<_> = ids_of_kind(facts, KIND_POP_OBSERVATION);
-    let imap_observations: BTreeSet<_> = ids_of_kind(facts, KIND_IMAP_OBSERVATION);
-    let outgoing_observations: BTreeSet<_> = ids_of_kind(facts, KIND_OUTGOING_OBSERVATION);
-    let imported_observations: BTreeSet<_> = ids_of_kind(facts, KIND_IMPORTED_OBSERVATION);
-    let mut expected = validate_legacy_evidence(reader, overlay, facts)?;
-
-    for &anchor in &accounts {
-        expected += account_anchor_record(anchor);
-    }
-    for (&id, record) in &configs {
-        if !accounts.contains(&record.account) {
-            bail!(
-                "account config {id:x} names unknown account {:x}",
-                record.account
-            );
-        }
-        for handle in [
-            Some(record.address),
-            Some(record.display_name),
-            record.pop_endpoint,
-            record.imap_endpoint,
-            Some(record.smtp_endpoint),
-            Some(record.username),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            canonical_nonempty(text_union(reader, overlay, handle)?, "account config text")?;
-        }
-        expected += ensure_intrinsic(id, account_config_record(record), "account config")?;
-    }
-    for &anchor in &accounts {
-        if matches!(account_head(facts, anchor)?, Head::Missing) {
-            bail!("mail account {anchor:x} has no configuration");
-        }
-    }
-
-    for &wire_id in &wires {
-        wire_claimed_message_id_union(reader, overlay, facts, wire_id)?;
-    }
-
-    for &id in &drafts {
-        let record = draft_from_facts(facts, id)?;
-        point_interval(record.created_at, "draft creation time")?;
-        if !accounts.contains(&record.account) {
-            bail!("draft {id:x} names unknown account {:x}", record.account);
-        }
-        if record.to.is_empty() && record.cc.is_empty() && record.bcc.is_empty() {
-            bail!("draft {id:x} has no recipients");
-        }
-        if validate_cross_collection {
-            for attachment in &record.attachments {
-                file_attachment_union(reader, overlay, files_facts, *attachment).with_context(
-                    || format!("draft {id:x} names invalid file attachment {attachment:x}"),
-                )?;
-            }
-        }
-        for wire_id in record.in_reply_to.iter().chain(&record.references) {
-            if !wires.contains(wire_id) {
-                bail!("draft {id:x} names non-resident thread wire {wire_id:x}");
-            }
-            if wire_claimed_message_id_union(reader, overlay, facts, *wire_id)?.is_none() {
-                bail!("draft {id:x} names digest-only thread wire {wire_id:x}");
-            }
-        }
-        for handle in record
-            .to
-            .iter()
-            .chain(&record.cc)
-            .chain(&record.bcc)
-            .chain([&record.envelope_from])
-        {
-            canonical_nonempty(
-                text_union(reader, overlay, *handle)?,
-                "draft envelope address",
-            )?;
-        }
-        exact_text(
-            text_union(reader, overlay, record.subject)?,
-            "draft subject",
-        )?;
-        exact_text(text_union(reader, overlay, record.body)?, "draft body")?;
-        expected += ensure_intrinsic(id, draft_record(&record), "draft intent")?;
-
-        if validate_cross_collection {
-            let decision = draft_decision_id(id);
-            if !exists!(pattern!(decide_facts, [{ decision @ metadata::tag: &KIND_DECISION }])) {
-                bail!("draft {id:x} has no deterministic Decide anchor {decision:x}");
-            }
-            let genesis = decide::genesis_for_decision(decide_facts, decision)?
-                .ok_or_else(|| anyhow!("draft decision {decision:x} has no genesis"))?;
-            if genesis.about != Some(id) {
-                bail!("draft decision {decision:x} does not concern draft {id:x}");
-            }
-        }
-    }
-
-    for &id in &attempts {
-        let record = attempt_from_facts(facts, id)?;
-        let draft = draft_from_facts(facts, record.draft)
-            .with_context(|| format!("attempt {id:x} names invalid draft"))?;
-        let config = configs
-            .get(&record.config)
-            .ok_or_else(|| anyhow!("attempt {id:x} names unknown config {:x}", record.config))?;
-        if config.account != draft.account {
-            bail!("attempt {id:x} config and draft belong to different accounts");
-        }
-        if !config.enabled {
-            bail!("attempt {id:x} cites a disabled account configuration");
-        }
-        if config.address != draft.envelope_from {
-            bail!("attempt {id:x} draft sender differs from its account configuration");
-        }
-        if record.decision != draft_decision_id(record.draft) {
-            bail!("attempt {id:x} names the wrong deterministic decision");
-        }
-        if validate_cross_collection {
-            validate_send_heads(
-                reader,
-                overlay,
-                decide_facts,
-                record.decision,
-                &record.decision_heads,
-            )?;
-        }
-        if record.envelope_from != draft.envelope_from
-            || record.to != draft.to
-            || record.cc != draft.cc
-            || record.bcc != draft.bcc
-        {
-            bail!("attempt {id:x} does not preserve the draft's exact envelope");
-        }
-        if validate_cross_collection {
-            validate_attempt_rendering(
-                reader,
-                overlay,
-                facts,
-                files_facts,
-                &record,
-                &draft,
-                config,
-            )?;
-        }
-        expected += ensure_intrinsic(id, attempt_record(&record), "send attempt")?;
-    }
-    for &draft_id in &drafts {
-        let draft_attempts = attempts_for_draft(facts, draft_id);
-        if draft_attempts.len() > 1 {
-            bail!("draft {draft_id:x} has multiple send attempts; uncertain attempts are never retried");
-        }
-    }
-
-    for &id in &acceptances {
-        let attempt_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ acceptance::attempt: ?v }])).collect(),
-            "SMTP acceptance attempt",
-        )?;
-        if !attempts.contains(&attempt_id) {
-            bail!("SMTP acceptance {id:x} names unknown attempt {attempt_id:x}");
-        }
-        let response = required(
-            find!(v: TextHandle, pattern!(facts, [{ id @ acceptance::response: ?v }])).collect(),
-            "SMTP acceptance response",
-        )?;
-        canonical_nonempty(text_union(reader, overlay, response)?, "SMTP response")?;
-        let code = required(
-            find!(v: CountValue, pattern!(facts, [{ id @ acceptance::response_code: ?v }]))
-                .collect(),
-            "SMTP acceptance response code",
-        )?;
-        let numeric_code = u64::try_from_inline(&code)
-            .map_err(|_| anyhow!("SMTP acceptance {id:x} response code exceeds u64"))?;
-        if !(200..=299).contains(&numeric_code) {
-            bail!("SMTP acceptance {id:x} has non-positive reply code {numeric_code}");
-        }
-        let outgoing: BTreeSet<Id> = find!(
-            source: Id,
-            pattern!(facts, [{ ?source @
-                metadata::tag: &KIND_OUTGOING_OBSERVATION,
-                observation::attempt: &attempt_id,
-            }])
-        )
-        .collect();
-        if outgoing.len() != 1 {
-            bail!(
-                "SMTP acceptance {id:x} must have exactly one outgoing observation, found {}",
-                outgoing.len()
-            );
-        }
-        expected += ensure_intrinsic(
-            id,
-            entity! {
-                metadata::tag: &KIND_SMTP_ACCEPTANCE,
-                acceptance::attempt: &attempt_id,
-                acceptance::response_code: code,
-                acceptance::response: response,
-            },
-            "SMTP acceptance",
-        )?;
-    }
-    for &attempt_id in &attempts {
-        let receipts = acceptances_for_attempt(facts, attempt_id);
-        if receipts.len() > 1 {
-            bail!("send attempt {attempt_id:x} has multiple SMTP acceptance receipts");
-        }
-        let outgoing: BTreeSet<Id> = find!(
-            source: Id,
-            pattern!(facts, [{ ?source @
-                metadata::tag: &KIND_OUTGOING_OBSERVATION,
-                observation::attempt: &attempt_id,
-            }])
-        )
-        .collect();
-        if outgoing.len() > 1 {
-            bail!("send attempt {attempt_id:x} has multiple outgoing observations");
-        }
-    }
-
-    let mut pop_uidls = BTreeMap::<(Id, String), (BytesHandle, Id)>::new();
-    for &id in &pop_observations {
-        let account_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::account: ?v }])).collect(),
-            "POP observation account",
-        )?;
-        if !accounts.contains(&account_id) {
-            bail!("POP observation {id:x} names unknown account {account_id:x}");
-        }
-        let config_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::config: ?v }])).collect(),
-            "POP observation config",
-        )?;
-        let config = configs
-            .get(&config_id)
-            .ok_or_else(|| anyhow!("POP observation {id:x} names unknown config {config_id:x}"))?;
-        if config.account != account_id {
-            bail!("POP observation {id:x} config belongs to another account");
-        }
-        if !config.enabled {
-            bail!("POP observation {id:x} cites a disabled account configuration");
-        }
-        let uidl = required(
-            find!(v: TextHandle, pattern!(facts, [{ id @ observation::uidl: ?v }])).collect(),
-            "POP UIDL",
-        )?;
-        let raw_handle = required(
-            find!(v: BytesHandle, pattern!(facts, [{ id @ observation::raw: ?v }])).collect(),
-            "POP raw message",
-        )?;
-        let uidl = text_union(reader, overlay, uidl)?;
-        if let Some((previous_raw, previous_id)) =
-            pop_uidls.insert((account_id, uidl.clone()), (raw_handle, id))
-        {
-            if previous_raw != raw_handle {
-                bail!(
-                    "POP account {account_id:x} UIDL {uidl:?} names different raw messages in observations {previous_id:x} and {id:x}"
-                );
-            }
-        }
-        let raw = bytes_union(reader, overlay, raw_handle)?;
-        let publication = pop_publication(account_id, config_id, &uidl, &raw)?;
-        if publication.observation != id {
-            bail!("POP observation {id:x} does not match exact source evidence");
-        }
-        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
-        if validate_cross_collection {
-            for fact in publication.files.facts() {
-                if !files_facts.contains(fact) {
-                    bail!("POP observation {id:x} has unpublished Files attachment evidence");
-                }
-            }
-        }
-        expected += publication.mail.into_facts();
-    }
-
-    for &id in &imap_observations {
-        let account_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::account: ?v }])).collect(),
-            "IMAP observation account",
-        )?;
-        if !accounts.contains(&account_id) {
-            bail!("IMAP observation {id:x} names unknown account {account_id:x}");
-        }
-        let config_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::config: ?v }])).collect(),
-            "IMAP observation config",
-        )?;
-        let config = configs
-            .get(&config_id)
-            .ok_or_else(|| anyhow!("IMAP observation {id:x} names unknown config {config_id:x}"))?;
-        if config.account != account_id {
-            bail!("IMAP observation {id:x} config belongs to another account");
-        }
-        let mailbox = required(
-            find!(v: TextHandle, pattern!(facts, [{ id @ observation::mailbox: ?v }])).collect(),
-            "IMAP mailbox",
-        )?;
-        let uidvalidity = required(
-            find!(v: u32, pattern!(facts, [{ id @ observation::uidvalidity: ?v }])).collect(),
-            "IMAP UIDVALIDITY",
-        )?;
-        let uid = required(
-            find!(v: u32, pattern!(facts, [{ id @ observation::uid: ?v }])).collect(),
-            "IMAP UID",
-        )?;
-        let raw_handle = required(
-            find!(v: BytesHandle, pattern!(facts, [{ id @ observation::raw: ?v }])).collect(),
-            "IMAP raw message",
-        )?;
-        let mailbox = text_union(reader, overlay, mailbox)?;
-        let raw = bytes_union(reader, overlay, raw_handle)?;
-        let publication =
-            imap_publication(account_id, config_id, &mailbox, uidvalidity, uid, &raw)?;
-        if publication.observation != id {
-            bail!("IMAP observation {id:x} does not match exact source evidence");
-        }
-        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
-        if validate_cross_collection {
-            for fact in publication.files.facts() {
-                if !files_facts.contains(fact) {
-                    bail!("IMAP observation {id:x} has unpublished Files attachment evidence");
-                }
-            }
-        }
-        expected += publication.mail.into_facts();
-    }
-
-    for &id in &outgoing_observations {
-        let attempt_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::attempt: ?v }])).collect(),
-            "outgoing observation attempt",
-        )?;
-        if acceptances_for_attempt(facts, attempt_id).is_empty() {
-            bail!("outgoing observation {id:x} has no SMTP acceptance");
-        }
-        let raw = required(
-            find!(v: BytesHandle, pattern!(facts, [{ id @ observation::raw: ?v }])).collect(),
-            "outgoing raw message",
-        )?;
-        let attempt_raw = attempt_from_facts(facts, attempt_id)?.raw;
-        if raw != attempt_raw {
-            bail!("outgoing observation {id:x} bytes differ from its frozen send attempt");
-        }
-        let raw = bytes_union(reader, overlay, raw)?;
-        let publication = outgoing_publication(attempt_id, &raw)?;
-        if publication.observation != id {
-            bail!("outgoing observation {id:x} does not match accepted bytes");
-        }
-        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
-        if validate_cross_collection {
-            for fact in publication.files.facts() {
-                if !files_facts.contains(fact) {
-                    bail!("outgoing observation {id:x} has unpublished Files attachment evidence");
-                }
-            }
-        }
-        expected += publication.mail.into_facts();
-    }
-
-    let identities = IdentityComponents::from_facts(relations_facts)?;
-    let mut imported_by_legacy = BTreeMap::new();
-    for &id in &imported_observations {
-        let legacy_entity = required(
-            find!(v: Id, pattern!(facts, [{ id @ imported::legacy_entity: ?v }])).collect(),
-            "imported legacy Mail entity",
-        )?;
-        if let Some(other) = imported_by_legacy.insert(legacy_entity, id) {
-            bail!(
-                "legacy Mail entity {legacy_entity:x} has two imported observations {other:x} and {id:x}"
-            );
-        }
-        let direction = required(
-            find!(v: Id, pattern!(facts, [{ id @ imported::direction: ?v }])).collect(),
-            "imported Mail direction",
-        )?;
-        let payload_handle = required(
-            find!(v: ArchiveHandle, pattern!(facts, [{ id @ imported::payload: ?v }])).collect(),
-            "imported Mail payload",
-        )?;
-        let payload = archive_union(reader, overlay, payload_handle)?;
-        let record = imported_payload_union(reader, overlay, &payload, legacy_entity)
-            .with_context(|| format!("validate imported Mail payload {legacy_entity:x}"))?;
-        if record.direction != direction {
-            bail!(
-                "imported Mail observation {id:x} direction differs from its exact legacy payload"
-            );
-        }
-        let wire_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ observation::wire: ?v }])).collect(),
-            "imported Mail wire",
-        )?;
-        let outer_raw = one(
-            find!(v: BytesHandle, pattern!(facts, [{ id @ observation::raw: ?v }])).collect(),
-            "imported raw message",
-        )?;
-        if outer_raw != record.raw {
-            bail!("imported Mail observation {id:x} does not preserve its payload raw handle");
-        }
-        let message_id = text_union(reader, overlay, record.message_id)?;
-        let raw = record
-            .raw
-            .map(|handle| bytes_union(reader, overlay, handle))
-            .transpose()?;
-        let publication = imported_publication(
-            legacy_entity,
-            direction,
-            payload_handle,
-            &message_id,
-            raw.as_deref(),
-        )?;
-        if publication.observation != id || publication.wire != wire_id {
-            bail!("imported Mail observation {id:x} does not match its exact source evidence");
-        }
-        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
-
-        if !publication.files.facts().is_empty() {
-            bail!("imported Mail observation {id:x} unexpectedly minted modern Files identities");
-        }
-        if validate_cross_collection {
-            for attachment in &record.attachments {
-                let attachment_id = *attachment;
-                if !exists!(pattern!(files_facts, [{ attachment_id @ metadata::tag: &KIND_FILE }]))
-                {
-                    bail!(
-                        "imported Mail observation {id:x} names missing legacy Files attachment {attachment:x}"
-                    );
-                }
-            }
-            for relation in record
-                .from
-                .iter()
-                .chain(&record.to)
-                .chain(&record.cc)
-                .chain(&record.bcc)
-            {
-                identities.component(*relation).with_context(|| {
-                    format!(
-                        "imported Mail observation {id:x} names missing Relations anchor {relation:x}"
-                    )
-                })?;
-            }
-        }
-        expected += publication.mail.into_facts();
-    }
-
-    // Read evidence records that a persona opened a resident message; it is
-    // not itself an inbox-membership assertion. Historical `mail read` and
-    // auto-read-on-show applied equally to received, sent, and draft values.
-    // Inbox projection below still considers only inbound sources when it
-    // computes unread state.
-    let mut resident_wires: BTreeSet<Id> = find!(
-        wire_id: Id,
-        pattern!(facts, [{ _?source @ metadata::tag: &KIND_POP_OBSERVATION, observation::wire: ?wire_id }])
-    )
-    .collect();
-    resident_wires.extend(find!(
-        wire_id: Id,
-        pattern!(facts, [{ _?source @ metadata::tag: &KIND_IMAP_OBSERVATION, observation::wire: ?wire_id }])
-    ));
-    resident_wires.extend(find!(
-        wire_id: Id,
-        pattern!(facts, [{ _?source @ metadata::tag: &KIND_OUTGOING_OBSERVATION, observation::wire: ?wire_id }])
-    ));
-    resident_wires.extend(find!(
-        wire_id: Id,
-        pattern!(facts, [{ _?source @
-            metadata::tag: &KIND_IMPORTED_OBSERVATION,
-            observation::wire: ?wire_id,
-        }])
-    ));
-    for &id in &reads {
-        let wire_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ read::wire: ?v }])).collect(),
-            "read wire",
-        )?;
-        let reader_id = required(
-            find!(v: Id, pattern!(facts, [{ id @ read::reader: ?v }])).collect(),
-            "read persona",
-        )?;
-        if !resident_wires.contains(&wire_id) {
-            bail!("read observation {id:x} does not name a resident wire message");
-        }
-        if validate_cross_collection {
-            identities.component(reader_id)?;
-        }
-        expected += ensure_intrinsic(
-            id,
-            read_observation_fragment(wire_id, reader_id).0,
-            "read observation",
-        )?;
-        let read_times: BTreeSet<IntervalValue> = find!(
-            value: IntervalValue,
-            pattern!(facts, [{ id @ legacy_read::read_at: ?value }])
-        )
-        .collect();
-        let created_times: BTreeSet<IntervalValue> = find!(
-            value: IntervalValue,
-            pattern!(facts, [{ id @ metadata::created_at: ?value }])
-        )
-        .collect();
-        for value in read_times.iter().chain(&created_times) {
-            point_interval(*value, "Mail read-observation time")?;
-        }
-        expected += entity! { ExclusiveId::force_ref(&id) @
-            legacy_read::read_at*: read_times.iter(),
-            metadata::created_at*: created_times.iter(),
-        }
-        .into_facts();
-    }
-
-    if expected != *facts {
-        let unexpected = facts.iter().filter(|fact| !expected.contains(fact)).count();
-        let missing = expected.iter().filter(|fact| !facts.contains(fact)).count();
-        bail!("Mail catalog is not its exact canonical reconstruction ({unexpected} unexpected facts, {missing} missing facts)");
-    }
-    Ok(())
-}
-
-/// Admit only the exact historical records preserved by the additive Mail
-/// cutover. They remain inert evidence: native commands never create or query
-/// these kinds, while their canonical shadows use the current ontology.
-fn validate_legacy_evidence<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    facts: &TribleSet,
-) -> Result<TribleSet> {
-    let mut expected = TribleSet::new();
-    let messages: BTreeSet<Id> = facts
-        .iter()
-        .filter(|fact| fact.a() == &imported_legacy::message_id.id())
-        .map(|fact| *fact.e())
-        .collect();
-    for message in messages {
-        let record = entity_facts(facts, message);
-        imported_payload_union(reader, overlay, &record, message)
-            .with_context(|| format!("validate preserved legacy Mail record {message:x}"))?;
-        expected += record;
-    }
-
-    for read_id in ids_of_kind(facts, crate::schemas::message::KIND_READ_ID) {
-        let record = entity_facts(facts, read_id);
-        let tags: BTreeSet<Id> = find!(
-            tag: Id,
-            pattern!(&record, [{ read_id @ metadata::tag: ?tag }])
-        )
-        .collect();
-        if tags != BTreeSet::from([crate::schemas::message::KIND_READ_ID]) {
-            bail!("legacy Mail read receipt {read_id:x} has an invalid kind set");
-        }
-        let about = required(
-            find!(v: Id, pattern!(&record, [{ read_id @ legacy_read::about_message: ?v }]))
-                .collect(),
-            "legacy read subject",
-        )?;
-        let reader_id = required(
-            find!(v: Id, pattern!(&record, [{ read_id @ legacy_read::reader: ?v }])).collect(),
-            "legacy read reader",
-        )?;
-        let read_at = required(
-            find!(v: IntervalValue, pattern!(&record, [{ read_id @ legacy_read::read_at: ?v }]))
-                .collect(),
-            "legacy read time",
-        )?;
-        let created_at = required(
-            find!(v: IntervalValue, pattern!(&record, [{ read_id @ metadata::created_at: ?v }]))
-                .collect(),
-            "legacy read creation time",
-        )?;
-        point_interval(read_at, "legacy read time")?;
-        point_interval(created_at, "legacy read creation time")?;
-        let exact = entity! { ExclusiveId::force_ref(&read_id) @
-            metadata::tag: &crate::schemas::message::KIND_READ_ID,
-            legacy_read::about_message: &about,
-            legacy_read::reader: &reader_id,
-            legacy_read::read_at: read_at,
-            metadata::created_at: created_at,
-        };
-        if exact.facts() != &record {
-            bail!("legacy Mail read receipt {read_id:x} is not an exact supported record");
-        }
-        expected += record;
-    }
-
-    for vocabulary in [
-        LEGACY_KIND_MESSAGE,
-        LEGACY_KIND_SPAM,
-        IMPORT_DRAFT,
-        IMPORT_RECEIVED,
-        IMPORT_SENT,
-        crate::schemas::message::KIND_READ_ID,
-    ] {
-        let record = entity_facts(facts, vocabulary);
-        for fact in &record {
-            if fact.a() != &metadata::name.id() {
-                bail!(
-                    "legacy Mail vocabulary entity {vocabulary:x} has unsupported attribute {:x}",
-                    fact.a()
-                );
-            }
-            let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
-            let _: String = text_union(reader, overlay, handle)?;
-        }
-        expected += record;
-    }
-    Ok(expected)
 }
 
 /// Project every inbound parser result and its read state for one exact
@@ -3291,31 +2259,6 @@ where
     })
 }
 
-fn wire_claimed_message_id_union<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    facts: &TribleSet,
-    wire_id: Id,
-) -> Result<Option<String>> {
-    let claimed = one(
-        find!(v: TextHandle, pattern!(facts, [{ wire_id @ wire::claimed_message_id: ?v }]))
-            .collect(),
-        "wire claimed Message-ID",
-    )?;
-    let digest = one(
-        find!(v: DigestValue, pattern!(facts, [{ wire_id @ wire::raw_digest: ?v }])).collect(),
-        "wire raw digest",
-    )?;
-    match (claimed, digest) {
-        (Some(handle), None) => Ok(Some(canonical_message_id_value(&text_union(
-            reader, overlay, handle,
-        )?)?)),
-        (None, Some(_)) => Ok(None),
-        (Some(_), Some(_)) => bail!("wire {wire_id:x} mixes claimed and raw-digest identity"),
-        (None, None) => bail!("wire {wire_id:x} has no identity"),
-    }
-}
-
 pub fn wire_claimed_message_id<P>(
     reader: &impl BlobStoreGet,
     facts: &P,
@@ -3462,66 +2405,6 @@ where
             .references
             .iter()
             .map(|&wire| resolve_wire(wire, "References"))
-            .collect::<Result<_>>()?,
-        created_at: record.created_at,
-    })
-}
-
-fn materialize_draft_union<Overlay: BlobStoreGet>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    mail_facts: &TribleSet,
-    files_facts: &TribleSet,
-    id: Id,
-) -> Result<MaterializedDraft> {
-    let record = draft_value(mail_facts, id)?;
-    let read_all = |handles: &[TextHandle]| -> Result<Vec<String>> {
-        handles
-            .iter()
-            .map(|&handle| text_union(reader, overlay, handle))
-            .collect()
-    };
-    let mut attachments = Vec::new();
-    for file_id in &record.attachments {
-        attachments.push(file_attachment_union(
-            reader,
-            overlay,
-            files_facts,
-            *file_id,
-        )?);
-    }
-    let wires = ids_of_kind(mail_facts, KIND_WIRE_MESSAGE);
-    Ok(MaterializedDraft {
-        id,
-        account: record.account,
-        envelope_from: text_union(reader, overlay, record.envelope_from)?,
-        to: read_all(&record.to)?,
-        cc: read_all(&record.cc)?,
-        bcc: read_all(&record.bcc)?,
-        subject: text_union(reader, overlay, record.subject)?,
-        body: text_union(reader, overlay, record.body)?,
-        attachments,
-        in_reply_to: record
-            .in_reply_to
-            .iter()
-            .map(|&wire| {
-                if !wires.contains(&wire) {
-                    bail!("unknown wire message {wire:x}");
-                }
-                wire_claimed_message_id_union(reader, overlay, mail_facts, wire)?
-                    .ok_or_else(|| anyhow!("draft names digest-only In-Reply-To wire {wire:x}"))
-            })
-            .collect::<Result<_>>()?,
-        references: record
-            .references
-            .iter()
-            .map(|&wire| {
-                if !wires.contains(&wire) {
-                    bail!("unknown wire message {wire:x}");
-                }
-                wire_claimed_message_id_union(reader, overlay, mail_facts, wire)?
-                    .ok_or_else(|| anyhow!("draft names digest-only References wire {wire:x}"))
-            })
             .collect::<Result<_>>()?,
         created_at: record.created_at,
     })
@@ -4022,7 +2905,7 @@ mod tests {
         publish_fragment,
     };
     use crate::test_support::initialize_open_collection_fixture;
-    use triblespace::core::repo::pile::{Pile, PileSnapshot};
+    use triblespace::core::repo::pile::PileSnapshot;
 
     fn id(byte: u8) -> Id {
         Id::new([byte; 16]).unwrap()
@@ -4031,16 +2914,6 @@ mod tests {
     fn at(second: u8) -> IntervalValue {
         let epoch = Epoch::from_gregorian_utc(2026, 8, 8, 0, 0, second, 0);
         (epoch, epoch).try_to_inline().unwrap()
-    }
-
-    fn empty_reader() -> (tempfile::TempDir, PileSnapshot) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("empty.pile");
-        File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        pile.close().unwrap();
-        (directory, reader)
     }
 
     struct Fixture {
@@ -4168,7 +3041,6 @@ mod tests {
 
     fn add_account(fixture: &Fixture, account_id: Id) -> (Id, Id) {
         let credential_id = fixture.add_secret("mail/test", b"smtp-secret", at(3));
-        let views = fixture.views();
         let mut fragment = Fragment::empty();
         let (config, config_id) = account_config_fragment(
             account_id,
@@ -4186,92 +3058,8 @@ mod tests {
         )
         .unwrap();
         fragment += config;
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &fragment,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment);
         (config_id, credential_id)
-    }
-
-    #[test]
-    fn send_head_validation_reads_a_staged_decide_outcome() {
-        let (_directory, reader) = empty_reader();
-        let decision = id(70);
-        let (mut resolution, head) =
-            decide::resolution_fragment(decision, "send", None, true, &[], &[], at(1)).unwrap();
-        let facts = resolution.facts().clone();
-        let snapshot = decide::resolution_snapshot(&facts, head).unwrap();
-        assert!(decide::read_text(&reader, snapshot.outcome).is_err());
-
-        let overlay = resolution.blobs_mut().snapshot().unwrap();
-        validate_send_heads(&reader, Some(&overlay), &facts, decision, &[head]).unwrap();
-    }
-
-    #[test]
-    fn draft_materialization_reads_staged_mail_and_file_payloads() {
-        let (_directory, reader) = empty_reader();
-        let file = files::stage(b"staged attachment".to_vec(), "note.txt", "text/plain").unwrap();
-        let file_id = file.root().unwrap();
-        let mut staged_mail = Fragment::empty();
-        let thread = add_claimed_wire(&mut staged_mail, "parent@example.test").unwrap();
-        let draft = draft_publication(DraftInput {
-            nonce: id(71),
-            account: id(72),
-            envelope_from: "sender@example.test".into(),
-            to: vec!["reader@example.test".into()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Staged subject".into(),
-            body: "Staged body".into(),
-            attachments: vec![file_id],
-            in_reply_to: vec![thread],
-            references: Vec::new(),
-            created_at: at(2),
-        })
-        .unwrap();
-        staged_mail += draft.mail;
-        let mail_facts = staged_mail.facts().clone();
-        let files_facts = file.facts().clone();
-        assert!(materialize_draft(
-            &reader,
-            &mail_facts,
-            &files_facts,
-            draft.draft,
-            MAX_DRAFT_ATTACHMENT_BYTES
-        )
-        .is_err());
-
-        let mut staged = staged_mail;
-        staged += file;
-        let overlay = staged.blobs_mut().snapshot().unwrap();
-        let materialized = materialize_draft_union(
-            &reader,
-            Some(&overlay),
-            &mail_facts,
-            &files_facts,
-            draft.draft,
-        )
-        .unwrap();
-        assert_eq!(materialized.envelope_from, "sender@example.test");
-        assert_eq!(materialized.to, ["reader@example.test"]);
-        assert_eq!(materialized.subject, "Staged subject");
-        assert_eq!(materialized.body, "Staged body");
-        assert_eq!(materialized.in_reply_to, ["parent@example.test"]);
-        assert_eq!(
-            materialized.attachments,
-            [AttachmentData {
-                filename: "note.txt".into(),
-                media_type: "text/plain".into(),
-                bytes: b"staged attachment".to_vec(),
-            }]
-        );
     }
 
     const RAW_INBOUND: &[u8] = b"From: Alice <alice@example.test>\r\nTo: sender@example.test\r\nSubject: Hello\r\nDate: Sat, 8 Aug 2026 00:00:01 +0000\r\nMessage-ID: <CaseSensitive@Example.TEST>\r\nContent-Type: multipart/mixed; boundary=demo\r\n\r\n--demo\r\nContent-Type: text/plain\r\n\r\nhello body\r\n--demo\r\nContent-Type: application/octet-stream; name=note.bin\r\nContent-Disposition: attachment; filename=note.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--demo--\r\n";
@@ -4310,112 +3098,7 @@ mod tests {
     }
 
     #[test]
-    fn source_validation_requires_every_recomputed_projection_blob_to_be_resident() {
-        let fixture = Fixture::new();
-        let account = id(97);
-        let config = add_account(&fixture, account).0;
-        let publication = pop_publication(
-            account,
-            config,
-            "missing-subject",
-            b"From: sender@example.test\r\nTo: receiver@example.test\r\nMessage-ID: <missing-payload@example.test>\r\nSubject: uniquely absent projection text\r\n\r\nbody",
-        )
-        .unwrap();
-        let subject = required(
-            find!(v: TextHandle, pattern!(publication.mail.facts(), [{ _?projection @ projection::subject: ?v }])).collect(),
-            "test projection subject",
-        )
-        .unwrap();
-        let SourcePublication { mail, files, .. } = publication;
-        let (facts, mut blobs) = mail.into_facts_and_blobs();
-        let survivors: Vec<_> = blobs
-            .snapshot()
-            .unwrap()
-            .into_iter()
-            .map(|(handle, _)| handle)
-            .filter(|handle| handle.raw != subject.raw)
-            .collect();
-        blobs.keep(survivors);
-        let broken = Fragment::from_facts_and_blobs(facts, blobs);
-        let views = fixture.views();
-        let mut files_union = views.files.facts.clone();
-        files_union += files.facts().clone();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &broken,
-            &files_union,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("read staged Mail text"), "{error}");
-    }
-
-    #[test]
-    fn account_scoped_uidl_replay_requires_the_same_raw_message() {
-        let fixture = Fixture::new();
-        let account = id(98);
-        let config = add_account(&fixture, account).0;
-        let first = pop_publication(
-            account,
-            config,
-            "stable-uidl",
-            b"From: a@example.test\r\nTo: sender@example.test\r\nMessage-ID: <first@example.test>\r\nSubject: first\r\n\r\none",
-        )
-        .unwrap();
-        let views = fixture.views();
-        let mut first_files = views.files.facts.clone();
-        first_files += first.files.facts().clone();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &first.mail,
-            &first_files,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
-        fixture.publish(files_schema::DEFAULT_SCOPE_ID, first.files.clone());
-        fixture.publish(mail_schema::DEFAULT_SCOPE_ID, first.mail.clone());
-
-        let views = fixture.views();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &first.mail,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .expect("an exact account/UIDL/raw replay is idempotent");
-
-        let conflicting = pop_publication(
-            account,
-            config,
-            "stable-uidl",
-            b"From: a@example.test\r\nTo: sender@example.test\r\nMessage-ID: <second@example.test>\r\nSubject: second\r\n\r\ntwo",
-        )
-        .unwrap();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &conflicting.mail,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("UIDL \"stable-uidl\" names different raw messages"));
-    }
-
-    #[test]
-    fn imap_evidence_validates_and_held_uids_are_scoped_to_their_namespace() {
+    fn imap_held_uids_are_scoped_to_their_namespace() {
         let fixture = Fixture::new();
         let account = id(97);
         let config = add_account(&fixture, account).0;
@@ -4424,16 +3107,6 @@ mod tests {
         let views = fixture.views();
         let mut files = views.files.facts.clone();
         files += first.files.facts().clone();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &first.mail,
-            &files,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(files_schema::DEFAULT_SCOPE_ID, first.files.clone());
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, first.mail.clone());
 
@@ -4466,16 +3139,6 @@ mod tests {
         let again = imap_publication(account, config, "INBOX", 42, 1, raw).unwrap();
         assert_eq!(again.wire, first.wire);
         assert_ne!(again.observation, first.observation);
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &again.mail,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -4502,17 +3165,6 @@ mod tests {
         let config_id = config.root().unwrap();
         fragment += account_anchor_record(account);
         fragment += config;
-        let views = fixture.views();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &fragment,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment);
 
         let views = fixture.views();
@@ -4842,47 +3494,9 @@ mod tests {
     }
 
     #[test]
-    fn operational_account_requires_an_exact_secrets_version() {
-        let fixture = Fixture::new();
-        let views = fixture.views();
-        let missing_secret = id(84);
-        let (fragment, _) = account_config_fragment(
-            id(83),
-            AccountConfigInput {
-                address: "me@example.test".into(),
-                display_name: "Me".into(),
-                imap_endpoint: "imap.example.test:993".into(),
-                smtp_endpoint: "smtp.example.test:465".into(),
-                username: "me@example.test".into(),
-                credential: missing_secret,
-                enabled: true,
-                quiet: false,
-                predecessors: Vec::new(),
-            },
-        )
-        .unwrap();
-
-        // The local reconstruction used by stopped-world cutover can prove
-        // Mail's own shape without conflating collections.
-        validate_local_catalog_union(&views.mail.reader, &views.mail.facts, &fragment).unwrap();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &fragment,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("unknown Secrets version"));
-    }
-
-    #[test]
     fn opening_an_account_requires_utf8_mailbox_secret_bytes() {
         let fixture = Fixture::new();
         let secret = fixture.add_secret("mail/non-utf8", &[0xff, 0xfe], at(4));
-        let views = fixture.views();
         let account = id(85);
         let (config, _) = account_config_fragment(
             account,
@@ -4897,16 +3511,6 @@ mod tests {
                 quiet: false,
                 predecessors: Vec::new(),
             },
-        )
-        .unwrap();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &config,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
         )
         .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, config);
@@ -4968,134 +3572,17 @@ mod tests {
         let persona = id(1);
         let account_id = id(2);
         add_person(&fixture, persona);
-        let (account_config, credential_id) = add_account(&fixture, account_id);
+        let (account_config, _) = add_account(&fixture, account_id);
 
-        let missing_thread = draft_publication(DraftInput {
-            nonce: id(93),
-            account: account_id,
-            envelope_from: "sender@example.test".into(),
-            to: vec!["receiver@example.test".into()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Missing thread anchor".into(),
-            body: "must not materialize later and fail".into(),
-            attachments: Vec::new(),
-            in_reply_to: vec![id(94)],
-            references: Vec::new(),
-            created_at: at(5),
-        })
-        .unwrap();
-        let views = fixture.views();
-        let decide_union = decide::validate_catalog_union(
-            &views.decide.reader,
-            &views.decide.facts,
-            &missing_thread.decide,
-        )
-        .unwrap();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &missing_thread.mail,
-            &views.files.facts,
-            &decide_union,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("non-resident thread wire"));
-
-        let digest_source = pop_publication(
-            account_id,
-            account_config,
-            "digest-parent",
-            b"From: parent@example.test\r\nTo: sender@example.test\r\nSubject: no id\r\n\r\nbody",
-        )
-        .unwrap();
-        let digest_thread = draft_publication(DraftInput {
-            nonce: id(96),
-            account: account_id,
-            envelope_from: "sender@example.test".into(),
-            to: vec!["parent@example.test".into()],
-            cc: Vec::new(),
-            bcc: Vec::new(),
-            subject: "Re: no id".into(),
-            body: "a digest is local identity, not an RFC thread id".into(),
-            attachments: Vec::new(),
-            in_reply_to: vec![digest_source.wire],
-            references: Vec::new(),
-            created_at: at(6),
-        })
-        .unwrap();
-        let views = fixture.views();
-        let decide_union = decide::validate_catalog_union(
-            &views.decide.reader,
-            &views.decide.facts,
-            &digest_thread.decide,
-        )
-        .unwrap();
-        let mut digest_mail = digest_source.mail;
-        digest_mail += digest_thread.mail;
-        let mut digest_files = views.files.facts.clone();
-        digest_files += digest_source.files.facts().clone();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &digest_mail,
-            &digest_files,
-            &decide_union,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("digest-only thread wire"));
-
-        let views = fixture.views();
-        let wrong_config =
-            pop_publication(account_id, id(95), "wrong-config", RAW_INBOUND).unwrap();
-        let mut wrong_files = views.files.facts.clone();
-        wrong_files += wrong_config.files.facts().clone();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &wrong_config.mail,
-            &wrong_files,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("unknown config"));
-
-        // POP evidence is precomputed, Files is published before Mail, and one
-        // immutable multi-scope snapshot is sufficient for preflight.
         let views = fixture.views();
         let incoming =
             pop_publication(account_id, account_config, "UidL-CaSe", RAW_INBOUND).unwrap();
         let mut files_union = views.files.facts.clone();
         files_union += incoming.files.facts().clone();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &incoming.mail,
-            &files_union,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(files_schema::DEFAULT_SCOPE_ID, incoming.files.clone());
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, incoming.mail.clone());
 
         let views = fixture.views();
-        validate_catalog(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         let inbox = inbox_projection(&views.mail.facts, &views.relations.facts, persona).unwrap();
         assert_eq!(inbox.len(), 1);
         assert!(inbox[0].unread);
@@ -5109,32 +3596,11 @@ mod tests {
         );
 
         let (read_fragment, _) = read_observation_fragment(incoming.wire, persona);
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &read_fragment,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, read_fragment);
 
         // A new source observation of the same wire message does not reopen it.
-        let views = fixture.views();
         let replay =
             pop_publication(account_id, account_config, "second-uidl", RAW_INBOUND).unwrap();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &replay.mail,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, replay.mail);
         let views = fixture.views();
         assert!(
@@ -5145,7 +3611,7 @@ mod tests {
         );
 
         // Draft and its deterministic Decide genesis are independent signed
-        // roots; Decide lands first, then Mail validates against that union.
+        // roots; Decide lands first.
         let draft = draft_publication(DraftInput {
             nonce: id(4),
             account: account_id,
@@ -5161,32 +3627,12 @@ mod tests {
             created_at: at(2),
         })
         .unwrap();
-        let views = fixture.views();
-        let decide_union = decide::validate_catalog_union(
-            &views.decide.reader,
-            &views.decide.facts,
-            &draft.decide,
-        )
-        .unwrap();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &draft.mail,
-            &views.files.facts,
-            &decide_union,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
 
-        let views = fixture.views();
         let (resolution, resolution_id) =
             decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3))
                 .unwrap();
-        decide::validate_catalog_union(&views.decide.reader, &views.decide.facts, &resolution)
-            .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, resolution);
 
         let views = fixture.views();
@@ -5222,46 +3668,6 @@ mod tests {
             cc: materialized.cc.clone(),
             bcc: materialized.bcc.clone(),
         };
-
-        // A frozen attempt must cite an enabled config whose sender is the
-        // draft sender, even if the config itself is otherwise canonical.
-        for (address, enabled, needle) in [
-            ("sender@example.test", false, "disabled"),
-            ("other@example.test", true, "sender differs"),
-        ] {
-            let (mut config_fragment, config_id) = account_config_fragment(
-                account_id,
-                AccountConfigInput {
-                    address: address.into(),
-                    display_name: "Sender".into(),
-                    imap_endpoint: "imap.example.test:993".into(),
-                    smtp_endpoint: "smtp.example.test:465".into(),
-                    username: "sender@example.test".into(),
-                    credential: credential_id,
-                    enabled,
-                    quiet: false,
-                    predecessors: vec![account.config],
-                },
-            )
-            .unwrap();
-            let (attempt, _) = send_attempt_fragment(SendAttemptInput {
-                config: config_id,
-                ..base_attempt.clone()
-            })
-            .unwrap();
-            config_fragment += attempt;
-            let error = validate_catalog_union(
-                &views.mail.reader,
-                &views.mail.facts,
-                &config_fragment,
-                &views.files.facts,
-                &views.decide.facts,
-                &views.relations.facts,
-                &views.secrets,
-            )
-            .unwrap_err();
-            assert!(format!("{error:#}").contains(needle));
-        }
 
         // Substituting the body while preserving the envelope and authorization
         // is rejected before a byte is published or SMTP is touched.
@@ -5307,44 +3713,6 @@ mod tests {
             events: events.clone(),
             fail: false,
         };
-        let mut after_attempt = views.mail.facts.clone();
-        after_attempt += prepared.attempt_fragment().facts().clone();
-
-        // Acceptance is inseparable from exact outgoing evidence.
-        let (receipt_only, _) =
-            smtp_acceptance_fragment(attempt_id, 250, "queued without evidence").unwrap();
-        let mut malformed_post_effect = prepared.attempt_fragment().clone();
-        malformed_post_effect += receipt_only;
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &malformed_post_effect,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("exactly one outgoing observation"),
-            "{error}"
-        );
-
-        let mut outgoing_only = prepared.attempt_fragment().clone();
-        outgoing_only += prepared.outgoing.mail.clone();
-        let error = validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &outgoing_only,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap_err();
-        let error = format!("{error:#}");
-        assert!(error.contains("has no SMTP acceptance"), "{error}");
 
         submit_once(
             &mut smtp,
@@ -5356,15 +3724,6 @@ mod tests {
             },
             |fragment| {
                 events.borrow_mut().push("publish-post-effect");
-                validate_catalog_union(
-                    &views.mail.reader,
-                    &after_attempt,
-                    fragment,
-                    &views.files.facts,
-                    &views.decide.facts,
-                    &views.relations.facts,
-                    &views.secrets,
-                )?;
                 fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment.clone());
                 Ok(())
             },
@@ -5375,15 +3734,6 @@ mod tests {
             ["publish-attempt", "smtp", "publish-post-effect"]
         );
         let views = fixture.views();
-        validate_catalog(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
         assert_eq!(
             acceptances_for_attempt(&views.mail.facts, attempt_id).len(),
             1
@@ -5410,23 +3760,6 @@ mod tests {
             references: Vec::new(),
             created_at: at(1),
         })
-        .unwrap();
-        let views = fixture.views();
-        let decide_union = decide::validate_catalog_union(
-            &views.decide.reader,
-            &views.decide.facts,
-            &draft.decide,
-        )
-        .unwrap();
-        validate_catalog_union(
-            &views.mail.reader,
-            &views.mail.facts,
-            &draft.mail,
-            &views.files.facts,
-            &decide_union,
-            &views.relations.facts,
-            &views.secrets,
-        )
         .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
@@ -5494,15 +3827,6 @@ mod tests {
             authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
         )
         .contains("divergent heads"));
-        validate_catalog(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
 
         // Joining that fork as a rejection likewise governs only future
         // effects. The final union cannot reconstruct whether the executor's
@@ -5525,15 +3849,6 @@ mod tests {
             authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
         )
         .contains("not exact outcome \"send\""));
-        validate_catalog(
-            &views.mail.reader,
-            &views.mail.facts,
-            &views.files.facts,
-            &views.decide.facts,
-            &views.relations.facts,
-            &views.secrets,
-        )
-        .unwrap();
     }
 
     struct FakeSmtp {

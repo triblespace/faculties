@@ -6,7 +6,7 @@
 //! only merge operation: concurrent outcomes remain visible and no timestamp
 //! or iteration order chooses a winner.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
 pub mod mcp;
@@ -17,8 +17,7 @@ pub use operations::*;
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use triblespace::core::metadata;
-use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
+use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{entity, exists, find, pattern};
 use triblespace::prelude::*;
 
@@ -272,34 +271,6 @@ where
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_DECISION }])).collect()
 }
 
-fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
-where
-    P: TriblePattern,
-{
-    find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
-}
-
-/// Canonical factors carry the occurrence coordinate introduced by the
-/// native ontology. Legacy random-id pro/con rows deliberately do not; an
-/// additive cutover can therefore retain them as provenance without making
-/// them part of the live Decide view.
-fn canonical_factor_ids<P>(facts: &P) -> BTreeSet<Id>
-where
-    P: TriblePattern,
-{
-    find!(
-        id: Id,
-        and!(
-            or!(
-                pattern!(facts, [{ ?id @ metadata::tag: &KIND_PRO }]),
-                pattern!(facts, [{ ?id @ metadata::tag: &KIND_CON }]),
-            ),
-            pattern!(facts, [{ ?id @ factor::occurrence: _?occurrence }]),
-        )
-    )
-    .collect()
-}
-
 /// Read one decodable genesis projection.
 ///
 /// Extra open-world facts do not invalidate the entity. If foreign additive
@@ -476,32 +447,6 @@ where
     })
 }
 
-fn ensure_intrinsic(id: Id, record: Fragment, label: &str) -> Result<TribleSet> {
-    let expected = record
-        .root()
-        .ok_or_else(|| anyhow!("{label} record has no unique intrinsic root"))?;
-    if id != expected {
-        bail!("{label} {id:x} does not match intrinsic root {expected:x}");
-    }
-    Ok(record.into_facts())
-}
-
-fn validate_factor_intrinsic(facts: &TribleSet, id: Id) -> Result<FactorRecord> {
-    let record = validate_factor_semantics(facts, id)?;
-    ensure_intrinsic(
-        id,
-        factor_record_fragment(
-            record.occurrence,
-            record.decision,
-            record.side,
-            record.text,
-            record.created_at,
-        ),
-        "factor",
-    )?;
-    Ok(record)
-}
-
 fn validate_factor_semantics<P>(facts: &P, id: Id) -> Result<FactorRecord>
 where
     P: TriblePattern,
@@ -519,24 +464,10 @@ where
     Ok(record)
 }
 
-/// Validate one resolution in isolation from head selection. This keeps the
-/// fork-visible resolver honest even when a caller has not first run whole-
-/// catalog validation.
-fn validate_resolution_snapshot_intrinsic(facts: &TribleSet, id: Id) -> Result<ResolutionSnapshot> {
-    let snapshot = validate_resolution_snapshot_semantics(facts, id)?;
-    ensure_intrinsic(
-        id,
-        resolution_record_fragment(&snapshot),
-        "resolution snapshot",
-    )?;
-    Ok(snapshot)
-}
-
 /// Validate only the relations which affect the observable resolution state.
 ///
 /// This deliberately does not recompute an intrinsic id or compare an entity's
-/// complete fact set. Those checks belong to explicit migration/test
-/// validation; ordinary readers consume the decodable open-world projection.
+/// complete fact set; readers consume the decodable open-world projection.
 fn validate_resolution_snapshot_semantics<P>(facts: &P, id: Id) -> Result<ResolutionSnapshot>
 where
     P: TriblePattern,
@@ -681,212 +612,11 @@ where
         .unwrap_or_else(|error| Resolution::Invalid(format!("{error:#}")))
 }
 
-#[derive(Clone, Copy)]
-enum TextRule {
-    RequiredCanonical,
-}
-
-fn validate_structure(facts: &TribleSet) -> Result<Vec<(TextHandle, TextRule)>> {
-    let decisions = decision_anchors(facts);
-    let genesis_ids = ids_of_kind(facts, KIND_DECISION_GENESIS);
-    let factor_ids = canonical_factor_ids(facts);
-    let resolution_ids = ids_of_kind(facts, KIND_RESOLUTION_SNAPSHOT);
-
-    let pro_ids = ids_of_kind(facts, KIND_PRO);
-    let con_ids = ids_of_kind(facts, KIND_CON);
-    if let Some(id) = factor_ids
-        .iter()
-        .find(|id| pro_ids.contains(*id) && con_ids.contains(*id))
-    {
-        bail!("factor {id:x} has both pro and con side markers");
-    }
-
-    let mut expected = TribleSet::new();
-    let mut texts = Vec::new();
-    for &decision_id in &decisions {
-        expected += decision_anchor_record(decision_id);
-    }
-
-    let mut genesis_by_decision: BTreeMap<Id, Vec<Id>> = BTreeMap::new();
-    for id in genesis_ids {
-        let genesis = decision_genesis(facts, id)?;
-        if !decisions.contains(&genesis.decision) {
-            bail!(
-                "decision genesis {id:x} names undeclared decision {:x}",
-                genesis.decision
-            );
-        }
-        point_interval(genesis.created_at, "decision creation time")?;
-        texts.push((genesis.title, TextRule::RequiredCanonical));
-        if let Some(context) = genesis.context {
-            texts.push((context, TextRule::RequiredCanonical));
-        }
-        expected += ensure_intrinsic(
-            id,
-            genesis_record(
-                genesis.decision,
-                genesis.title,
-                genesis.context,
-                genesis.about,
-                genesis.created_at,
-            ),
-            "decision genesis",
-        )?;
-        genesis_by_decision
-            .entry(genesis.decision)
-            .or_default()
-            .push(id);
-    }
-    for &decision_id in &decisions {
-        match genesis_by_decision.get(&decision_id).map(Vec::len) {
-            Some(1) => {}
-            Some(count) => bail!("decision {decision_id:x} has {count} genesis records"),
-            None => bail!("decision {decision_id:x} has no genesis record"),
-        }
-    }
-
-    for &id in &factor_ids {
-        let record = validate_factor_intrinsic(facts, id)?;
-        texts.push((record.text, TextRule::RequiredCanonical));
-        expected += ensure_intrinsic(
-            id,
-            factor_record_fragment(
-                record.occurrence,
-                record.decision,
-                record.side,
-                record.text,
-                record.created_at,
-            ),
-            "factor",
-        )?;
-    }
-
-    let mut graphs: BTreeMap<Id, BTreeMap<Id, Vec<Id>>> = BTreeMap::new();
-    for id in resolution_ids {
-        let snapshot = validate_resolution_snapshot_intrinsic(facts, id)?;
-        texts.push((snapshot.outcome, TextRule::RequiredCanonical));
-
-        expected += ensure_intrinsic(
-            id,
-            resolution_record_fragment(&snapshot),
-            "resolution snapshot",
-        )?;
-        graphs
-            .entry(snapshot.decision)
-            .or_default()
-            .insert(id, snapshot.predecessors);
-    }
-    for (decision_id, graph) in &graphs {
-        let _ = dag_heads(
-            graph,
-            &format!("resolution track for decision {decision_id:x}"),
-        )?;
-    }
-
-    let mut native_entities = genesis_by_decision
-        .values()
-        .flatten()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    native_entities.extend(factor_ids);
-    native_entities.extend(graphs.values().flat_map(|graph| graph.keys().copied()));
-    let observed: TribleSet = facts
-        .iter()
-        .filter(|fact| native_entities.contains(fact.e()) || expected.contains(fact))
-        .copied()
-        .collect();
-    if expected != observed {
-        let missing = expected.difference(&observed).len();
-        let unexpected = observed.difference(&expected).len();
-        bail!(
-            "Decide catalog is not an exact canonical ontology ({missing} missing, {unexpected} unexpected facts)"
-        );
-    }
-    Ok(texts)
-}
-
-fn load_text_from(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
+pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
         .with_context(|| format!("read Decide text payload {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
-}
-
-fn load_text_overlay<Overlay>(
-    reader: &PileSnapshot,
-    overlay: Option<&Overlay>,
-    handle: TextHandle,
-) -> Result<String>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    if let Some(overlay) = overlay {
-        if overlay
-            .metadata(handle)
-            .expect("memory metadata lookup is infallible")
-            .is_some()
-        {
-            let view: View<str> = overlay.get(handle).with_context(|| {
-                format!(
-                    "read staged Decide text payload {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(view.to_string());
-        }
-    }
-    load_text_from(reader, handle)
-}
-
-fn validate_texts<Overlay>(
-    reader: &PileSnapshot,
-    overlay: Option<&Overlay>,
-    handles: Vec<(TextHandle, TextRule)>,
-) -> Result<()>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    let mut seen = HashMap::new();
-    for (handle, rule) in handles {
-        seen.insert(handle.raw, rule);
-    }
-    for (raw, _) in seen {
-        let value = load_text_overlay(reader, overlay, Inline::new(raw))?;
-        if value.is_empty() || value.trim() != value || value.bytes().any(|byte| byte == 0) {
-            bail!("Decide canonical text payload is empty, contains NUL, or has surrounding whitespace");
-        }
-    }
-    Ok(())
-}
-
-/// Validate one complete materialized authored Decide collection. Forks and
-/// uncited concurrent late factors are valid; malformed records are not.
-pub fn validate_catalog(reader: &PileSnapshot, facts: &TribleSet) -> Result<()> {
-    let texts = validate_structure(facts)?;
-    validate_texts(reader, None::<&PileSnapshot>, texts)
-}
-
-/// Preflight the exact set union publication would create, including staged
-/// attachments, without writing any pile bytes.
-pub fn validate_catalog_union(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<TribleSet> {
-    let mut expected = current.clone();
-    expected += fragment.facts().clone();
-    let texts = validate_structure(&expected)?;
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("MemoryBlobStore reader creation is infallible");
-    validate_texts(reader, Some(&overlay), texts)?;
-    Ok(expected)
-}
-
-pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
-    load_text_from(reader, handle)
 }
 
 #[cfg(test)]
@@ -914,7 +644,6 @@ mod tests {
 
     struct TestView {
         facts: TribleSet,
-        reader: PileSnapshot,
     }
 
     impl Fixture {
@@ -943,7 +672,7 @@ mod tests {
             let reader = pile.snapshot().unwrap();
             let (facts, _) = crate::storage::read_fact_collection(collection, &reader).unwrap();
             pile.close().unwrap();
-            TestView { facts, reader }
+            TestView { facts }
         }
     }
 
@@ -995,7 +724,6 @@ mod tests {
                 .0,
         );
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             resolution(&view.facts, decision),
             Resolution::Unique(ResolutionSnapshot { forced: false, .. })
@@ -1013,7 +741,6 @@ mod tests {
                 .0,
         );
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert!(matches!(
             resolution(&view.facts, forced),
             Resolution::Unique(ResolutionSnapshot { forced: true, .. })
@@ -1033,7 +760,6 @@ mod tests {
         );
         add_factor(&fixture, decision, FactorSide::Pro, "late concurrent", 3);
         let view = fixture.view();
-        validate_catalog(&view.reader, &view.facts).unwrap();
         assert_eq!(
             factors_for_decision(&view.facts, decision).unwrap().len(),
             3
@@ -1177,25 +903,5 @@ mod tests {
             resolution(&view.facts, decision),
             Resolution::Unique(ResolutionSnapshot { predecessors, .. }) if predecessors == heads
         ));
-    }
-
-    #[test]
-    fn exact_union_preflight_reads_staged_attachments_and_rejects_extra_facts() {
-        let fixture = Fixture::new();
-        let view = fixture.view();
-        let decision = genid().id;
-        let (fragment, genesis) = decision_fragment(
-            decision,
-            "A title whose payload is staged",
-            Some("Staged context".into()),
-            None,
-            at(0),
-        )
-        .unwrap();
-        validate_catalog_union(&view.reader, &view.facts, &fragment).unwrap();
-
-        let mut malformed = fragment;
-        malformed += entity! { ExclusiveId::force_ref(&genesis) @ metadata::description: "extra" };
-        assert!(validate_catalog_union(&view.reader, &view.facts, &malformed).is_err());
     }
 }
