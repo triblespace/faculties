@@ -13,9 +13,9 @@
 //! secret labels remain discovery/display conveniences and never participate
 //! in runtime selection. Historical plaintext facts coexist in the same
 //! collection after migration, but lack the live marker and are semantically
-//! inert. Ordinary consumers query current typed frontiers directly. The
-//! complete historical catalog remains only for reconciliation and strict
-//! migration boundaries.
+//! inert. Every reader, reconciliation included, queries the typed snapshots
+//! it needs at its point of use; nothing loads the collection's history into
+//! a catalog first.
 
 pub mod cli;
 pub mod mcp;
@@ -104,13 +104,12 @@ pub enum Resolution<T> {
     Unique(Snapshot<T>),
     Agreed(Vec<Snapshot<T>>),
     Forked(Vec<Snapshot<T>>),
-    Invalid(String),
 }
 
 impl<T> Resolution<T> {
     pub fn head_ids(&self) -> Vec<Id> {
         match self {
-            Self::Missing | Self::Invalid(_) => Vec::new(),
+            Self::Missing => Vec::new(),
             Self::Unique(snapshot) => vec![snapshot.id],
             Self::Agreed(snapshots) | Self::Forked(snapshots) => {
                 snapshots.iter().map(|snapshot| snapshot.id).collect()
@@ -122,7 +121,7 @@ impl<T> Resolution<T> {
         match self {
             Self::Unique(snapshot) => std::slice::from_ref(snapshot),
             Self::Agreed(snapshots) | Self::Forked(snapshots) => snapshots,
-            Self::Missing | Self::Invalid(_) => &[],
+            Self::Missing => &[],
         }
     }
 
@@ -135,21 +134,8 @@ impl<T> Resolution<T> {
                 "{label} is forked across heads {}",
                 format_ids(snapshots.iter().map(|snapshot| snapshot.id))
             ),
-            Self::Invalid(error) => bail!("{label} is invalid: {error}"),
         }
     }
-}
-
-/// Complete retained Headspace history for reconciliation and migration.
-///
-/// Ordinary readers should use [`current_config`], [`current_profile`], or
-/// [`current_profiles`] instead of materializing this historical domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Catalog {
-    pub config: Resolution<ConfigValue>,
-    pub profiles: BTreeMap<Id, Resolution<ProfileValue>>,
-    config_snapshots: BTreeMap<Id, Snapshot<ConfigValue>>,
-    profile_snapshots: BTreeMap<Id, Snapshot<ProfileValue>>,
 }
 
 /// Decrypted credentials for one already-resolved Headspace state.
@@ -161,59 +147,6 @@ pub struct OpenedSecrets {
     pub model_api_key: Option<String>,
     pub tavily_api_key: Option<String>,
     pub exa_api_key: Option<String>,
-}
-
-impl Catalog {
-    fn invalid(error: anyhow::Error) -> Self {
-        Self {
-            config: Resolution::Invalid(format!("{error:#}")),
-            profiles: BTreeMap::new(),
-            config_snapshots: BTreeMap::new(),
-            profile_snapshots: BTreeMap::new(),
-        }
-    }
-
-    pub fn config_snapshot(&self, id: Id) -> Option<&Snapshot<ConfigValue>> {
-        self.config_snapshots.get(&id)
-    }
-
-    pub fn profile_snapshot(&self, id: Id) -> Option<&Snapshot<ProfileValue>> {
-        self.profile_snapshots.get(&id)
-    }
-
-    pub fn snapshot_ids(&self) -> BTreeSet<Id> {
-        self.config_snapshots
-            .keys()
-            .chain(self.profile_snapshots.keys())
-            .copied()
-            .collect()
-    }
-
-    /// Re-express an existing complete snapshot as the intended value while
-    /// superseding every currently live head on its track.
-    ///
-    /// A single head already carrying the intended value is a no-op. Multiple
-    /// equal-value heads still need an explicit join so the DAG itself is
-    /// reconciled rather than merely semantically agreed.
-    pub fn reconcile_fragment(&self, chosen: Id) -> Result<Option<(Fragment, Id)>> {
-        if let Some(snapshot) = self.config_snapshots.get(&chosen) {
-            if resolution_is_unique_value(&self.config, &snapshot.value) {
-                return Ok(None);
-            }
-            return config_snapshot_fragment(&snapshot.value, &self.config.head_ids()).map(Some);
-        }
-        if let Some(snapshot) = self.profile_snapshots.get(&chosen) {
-            let resolution = self
-                .profiles
-                .get(&snapshot.value.anchor)
-                .ok_or_else(|| anyhow!("profile {:x} has no track", snapshot.value.anchor))?;
-            if resolution_is_unique_value(resolution, &snapshot.value) {
-                return Ok(None);
-            }
-            return profile_snapshot_fragment(&snapshot.value, &resolution.head_ids()).map(Some);
-        }
-        bail!("unknown Headspace snapshot {chosen:x}")
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -372,53 +305,70 @@ where
 {
     let rows = current_profile_rows(facts, anchor);
     let candidates = rows.iter().map(|row| row.id).collect::<BTreeSet<_>>();
-    let heads = typed_frontier(facts, &candidates);
     let mut snapshots = Vec::new();
-
-    for id in heads {
-        let predecessors = direct_predecessors(facts, id);
-        let model_secrets = optional_variants(find!(
-            value: Id,
-            pattern!(facts, [{ id @ playground_config::model_secret_version: ?value }])
-        ));
-        let reasoning_efforts = optional_variants(find!(
-            value: TextHandle,
-            pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?value }])
-        ));
-        for row in rows.iter().filter(|row| row.id == id) {
-            let name = load_text_from(reader, row.name)?;
-            let model = load_text_from(reader, row.model)?;
-            let base_url = load_text_from(reader, row.base_url)?;
-            for model_secret_version in &model_secrets {
-                for reasoning_effort in &reasoning_efforts {
-                    let value = ProfileValue {
-                        anchor: row.anchor,
-                        name: name.clone(),
-                        model: model.clone(),
-                        base_url: base_url.clone(),
-                        model_secret_version: *model_secret_version,
-                        reasoning_effort: reasoning_effort
-                            .map(|handle| load_text_from(reader, handle))
-                            .transpose()?,
-                        stream: row.stream == 1,
-                        context_window_tokens: row.context_window_tokens,
-                        max_output_tokens: row.max_output_tokens,
-                        context_safety_margin_tokens: row.context_safety_margin_tokens,
-                        chars_per_token: row.chars_per_token,
-                    };
-                    let snapshot = Snapshot {
-                        id,
-                        value,
-                        predecessors: predecessors.clone(),
-                    };
-                    if !snapshots.contains(&snapshot) {
-                        snapshots.push(snapshot);
-                    }
-                }
+    for id in typed_frontier(facts, &candidates) {
+        for snapshot in profile_readings(reader, facts, &rows, id)? {
+            if !snapshots.contains(&snapshot) {
+                snapshots.push(snapshot);
             }
         }
     }
     Ok(resolve_variants(snapshots))
+}
+
+/// Every complete reading of one typed profile snapshot on one track.
+fn profile_readings<P>(
+    reader: &impl BlobStoreGet,
+    facts: &P,
+    rows: &BTreeSet<CurrentProfileRow>,
+    id: Id,
+) -> Result<Vec<Snapshot<ProfileValue>>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut snapshots = Vec::new();
+    let predecessors = direct_predecessors(facts, id);
+    let model_secrets = optional_variants(find!(
+        value: Id,
+        pattern!(facts, [{ id @ playground_config::model_secret_version: ?value }])
+    ));
+    let reasoning_efforts = optional_variants(find!(
+        value: TextHandle,
+        pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?value }])
+    ));
+    for row in rows.iter().filter(|row| row.id == id) {
+        let name = load_text_from(reader, row.name)?;
+        let model = load_text_from(reader, row.model)?;
+        let base_url = load_text_from(reader, row.base_url)?;
+        for model_secret_version in &model_secrets {
+            for reasoning_effort in &reasoning_efforts {
+                let value = ProfileValue {
+                    anchor: row.anchor,
+                    name: name.clone(),
+                    model: model.clone(),
+                    base_url: base_url.clone(),
+                    model_secret_version: *model_secret_version,
+                    reasoning_effort: reasoning_effort
+                        .map(|handle| load_text_from(reader, handle))
+                        .transpose()?,
+                    stream: row.stream == 1,
+                    context_window_tokens: row.context_window_tokens,
+                    max_output_tokens: row.max_output_tokens,
+                    context_safety_margin_tokens: row.context_safety_margin_tokens,
+                    chars_per_token: row.chars_per_token,
+                };
+                let snapshot = Snapshot {
+                    id,
+                    value,
+                    predecessors: predecessors.clone(),
+                };
+                if !snapshots.contains(&snapshot) {
+                    snapshots.push(snapshot);
+                }
+            }
+        }
+    }
+    Ok(snapshots)
 }
 
 /// Project every declared or typed profile track independently at its current
@@ -506,63 +456,80 @@ where
 {
     let rows = current_config_rows(facts);
     let candidates = rows.iter().map(|row| row.id).collect::<BTreeSet<_>>();
-    let heads = typed_frontier(facts, &candidates);
     let mut snapshots = Vec::new();
+    for id in typed_frontier(facts, &candidates) {
+        for snapshot in config_readings(reader, facts, &rows, id)? {
+            if !snapshots.contains(&snapshot) {
+                snapshots.push(snapshot);
+            }
+        }
+    }
+    Ok(resolve_variants(snapshots))
+}
 
-    for id in heads {
-        let predecessors = direct_predecessors(facts, id);
-        let personas = optional_variants(find!(
-            value: Id,
-            pattern!(facts, [{ id @ playground_config::persona_id: ?value }])
-        ));
-        let tavily_secrets = optional_variants(find!(
-            value: Id,
-            pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?value }])
-        ));
-        let exa_secrets = optional_variants(find!(
-            value: Id,
-            pattern!(facts, [{ id @ playground_config::exa_secret_version: ?value }])
-        ));
-        let exec_cwds = optional_variants(find!(
-            value: TextHandle,
-            pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?value }])
-        ));
-        let sandbox_profiles = optional_variants(find!(
-            value: Id,
-            pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?value }])
-        ));
-        for row in rows.iter().filter(|row| row.id == id) {
-            let system_prompt = load_text_from(reader, row.system_prompt)?;
-            let author = load_text_from(reader, row.author)?;
-            let author_role = load_text_from(reader, row.author_role)?;
-            for persona in &personas {
-                for tavily_secret_version in &tavily_secrets {
-                    for exa_secret_version in &exa_secrets {
-                        for exec_cwd in &exec_cwds {
-                            for exec_sandbox_profile in &sandbox_profiles {
-                                let value = ConfigValue {
-                                    active_profile: row.active_profile,
-                                    system_prompt: system_prompt.clone(),
-                                    cognition_scope: row.cognition_scope,
-                                    author: author.clone(),
-                                    author_role: author_role.clone(),
-                                    persona: *persona,
-                                    poll_ms: row.poll_ms,
-                                    tavily_secret_version: *tavily_secret_version,
-                                    exa_secret_version: *exa_secret_version,
-                                    exec_default_cwd: exec_cwd
-                                        .map(|handle| load_text_from(reader, handle))
-                                        .transpose()?,
-                                    exec_sandbox_profile: *exec_sandbox_profile,
-                                };
-                                let snapshot = Snapshot {
-                                    id,
-                                    value,
-                                    predecessors: predecessors.clone(),
-                                };
-                                if !snapshots.contains(&snapshot) {
-                                    snapshots.push(snapshot);
-                                }
+/// Every complete reading of one typed config snapshot.
+fn config_readings<P>(
+    reader: &impl BlobStoreGet,
+    facts: &P,
+    rows: &BTreeSet<CurrentConfigRow>,
+    id: Id,
+) -> Result<Vec<Snapshot<ConfigValue>>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut snapshots = Vec::new();
+    let predecessors = direct_predecessors(facts, id);
+    let personas = optional_variants(find!(
+        value: Id,
+        pattern!(facts, [{ id @ playground_config::persona_id: ?value }])
+    ));
+    let tavily_secrets = optional_variants(find!(
+        value: Id,
+        pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?value }])
+    ));
+    let exa_secrets = optional_variants(find!(
+        value: Id,
+        pattern!(facts, [{ id @ playground_config::exa_secret_version: ?value }])
+    ));
+    let exec_cwds = optional_variants(find!(
+        value: TextHandle,
+        pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?value }])
+    ));
+    let sandbox_profiles = optional_variants(find!(
+        value: Id,
+        pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?value }])
+    ));
+    for row in rows.iter().filter(|row| row.id == id) {
+        let system_prompt = load_text_from(reader, row.system_prompt)?;
+        let author = load_text_from(reader, row.author)?;
+        let author_role = load_text_from(reader, row.author_role)?;
+        for persona in &personas {
+            for tavily_secret_version in &tavily_secrets {
+                for exa_secret_version in &exa_secrets {
+                    for exec_cwd in &exec_cwds {
+                        for exec_sandbox_profile in &sandbox_profiles {
+                            let value = ConfigValue {
+                                active_profile: row.active_profile,
+                                system_prompt: system_prompt.clone(),
+                                cognition_scope: row.cognition_scope,
+                                author: author.clone(),
+                                author_role: author_role.clone(),
+                                persona: *persona,
+                                poll_ms: row.poll_ms,
+                                tavily_secret_version: *tavily_secret_version,
+                                exa_secret_version: *exa_secret_version,
+                                exec_default_cwd: exec_cwd
+                                    .map(|handle| load_text_from(reader, handle))
+                                    .transpose()?,
+                                exec_sandbox_profile: *exec_sandbox_profile,
+                            };
+                            let snapshot = Snapshot {
+                                id,
+                                value,
+                                predecessors: predecessors.clone(),
+                            };
+                            if !snapshots.contains(&snapshot) {
+                                snapshots.push(snapshot);
                             }
                         }
                     }
@@ -570,7 +537,7 @@ where
             }
         }
     }
-    Ok(resolve_variants(snapshots))
+    Ok(snapshots)
 }
 
 /// Validate only exact Secrets references visible at selected current
@@ -608,6 +575,98 @@ pub fn validate_current_secret_references<'a, R>(
         }
     }
     Ok(())
+}
+
+/// Every complete typed snapshot id on any track, current or historical,
+/// for resolving an explicitly named snapshot.
+pub fn snapshot_ids<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    let anchors = find!(
+        anchor: Id,
+        pattern!(facts, [{
+            _?snapshot @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_MODEL_PROFILE_ID,
+                playground_config::model_profile_id: ?anchor,
+        }])
+    )
+    .collect::<BTreeSet<_>>();
+    let mut ids = current_config_rows(facts)
+        .into_iter()
+        .map(|row| row.id)
+        .collect::<BTreeSet<_>>();
+    for anchor in anchors {
+        ids.extend(
+            current_profile_rows(facts, anchor)
+                .into_iter()
+                .map(|row| row.id),
+        );
+    }
+    ids
+}
+
+/// Re-express one explicitly chosen complete snapshot as the intended value
+/// while superseding every current head on its track.
+///
+/// Only the chosen snapshot and its track's current frontier are read. A
+/// single head already carrying the intended value is a no-op. Several
+/// equal-value heads still need an explicit join so the DAG itself is
+/// reconciled rather than merely semantically agreed. A chosen id with
+/// several readings (several values for one field, or several tracks) names
+/// no single value, so the choice is refused rather than given a hidden
+/// winner.
+pub fn reconcile_fragment<P>(
+    reader: &impl BlobStoreGet,
+    facts: &P,
+    chosen: Id,
+) -> Result<Option<(Fragment, Id)>>
+where
+    P: TriblePattern + ?Sized,
+{
+    let config_rows = current_config_rows(facts);
+    let configs = if config_rows.iter().any(|row| row.id == chosen) {
+        config_readings(reader, facts, &config_rows, chosen)?
+    } else {
+        Vec::new()
+    };
+    let mut profiles = Vec::new();
+    for anchor in find!(
+        anchor: Id,
+        pattern!(facts, [{
+            chosen @
+                metadata::tag: KIND_LIVE_RECORD,
+                metadata::tag: KIND_MODEL_PROFILE_ID,
+                playground_config::model_profile_id: ?anchor,
+        }])
+    )
+    .collect::<BTreeSet<_>>()
+    {
+        let rows = current_profile_rows(facts, anchor);
+        profiles.extend(profile_readings(reader, facts, &rows, chosen)?);
+    }
+    match (configs.as_slice(), profiles.as_slice()) {
+        ([], []) => bail!("unknown Headspace snapshot {chosen:x}"),
+        ([snapshot], []) => {
+            let current = current_config(reader, facts)?;
+            if resolution_is_unique_value(&current, &snapshot.value) {
+                return Ok(None);
+            }
+            config_snapshot_fragment(&snapshot.value, &current.head_ids()).map(Some)
+        }
+        ([], [snapshot]) => {
+            let current = current_profile(reader, facts, snapshot.value.anchor)?;
+            if resolution_is_unique_value(&current, &snapshot.value) {
+                return Ok(None);
+            }
+            profile_snapshot_fragment(&snapshot.value, &current.head_ids()).map(Some)
+        }
+        _ => bail!(
+            "Headspace snapshot {chosen:x} has {} readings; choose a snapshot with one complete value",
+            configs.len() + profiles.len()
+        ),
+    }
 }
 
 fn resolution_is_unique_value<T: Eq>(resolution: &Resolution<T>, intended: &T) -> bool {
@@ -747,56 +806,8 @@ pub fn add_profile_fragment(
     Ok((fragment, profile_id, config_id))
 }
 
-struct RawProfileSnapshot {
-    anchor: Id,
-    name: TextHandle,
-    model: TextHandle,
-    base_url: TextHandle,
-    model_secret_version: Option<Id>,
-    reasoning_effort: Option<TextHandle>,
-    stream: CountValue,
-    context_window_tokens: CountValue,
-    max_output_tokens: CountValue,
-    context_safety_margin_tokens: CountValue,
-    chars_per_token: CountValue,
-    predecessors: Vec<Id>,
-}
-
-struct RawConfigSnapshot {
-    active_profile: Id,
-    system_prompt: TextHandle,
-    cognition_scope: Id,
-    author: TextHandle,
-    author_role: TextHandle,
-    persona: Option<Id>,
-    poll_ms: CountValue,
-    tavily_secret_version: Option<Id>,
-    exa_secret_version: Option<Id>,
-    exec_default_cwd: Option<TextHandle>,
-    exec_sandbox_profile: Option<Id>,
-    predecessors: Vec<Id>,
-}
-
-#[derive(Default)]
-struct RawCatalog {
-    config: BTreeMap<Id, RawConfigSnapshot>,
-    profiles: BTreeMap<Id, RawProfileSnapshot>,
-    config_heads: Vec<Id>,
-    profile_heads: BTreeMap<Id, Vec<Id>>,
-}
-
 fn bool_count(value: bool) -> CountValue {
     if value { 1u64 } else { 0u64 }.to_inline()
-}
-
-fn count_u64(value: CountValue, entity: Id, field: &str) -> Result<u64> {
-    if value.raw[..24].iter().any(|byte| *byte != 0) {
-        bail!("Headspace entity {entity:x} has non-u64 value for {field}");
-    }
-    let bytes: [u8; 8] = value.raw[24..32]
-        .try_into()
-        .expect("fixed U256BE lower word");
-    Ok(u64::from_be_bytes(bytes))
 }
 
 fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
@@ -804,269 +815,6 @@ fn sorted_ids(values: impl IntoIterator<Item = Id>) -> Vec<Id> {
     values.sort_unstable();
     values.dedup();
     values
-}
-
-fn ids_of_kind<P>(facts: &P, kind: Id) -> BTreeSet<Id>
-where
-    P: TriblePattern + ?Sized,
-{
-    find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: kind }])).collect()
-}
-
-/// Project the only facts that carry live Headspace meaning.
-///
-/// Exact legacy facts may coexist in the same collection, but migration never
-/// adds this marker to them. A record becomes active as a whole entity so an
-/// attempted marker graft cannot smuggle unaccounted fields past validation.
-pub fn active_facts(facts: &TribleSet) -> TribleSet {
-    let active = ids_of_kind(facts, KIND_LIVE_RECORD);
-    facts
-        .iter()
-        .filter(|fact| active.contains(fact.e()))
-        .copied()
-        .collect()
-}
-
-/// Read one profile snapshot open-world: a snapshot lacking a required field
-/// is not one, and a field with several values yields the byte-smallest one
-/// (the smallest tuple for the required fields).
-fn raw_profile<P>(facts: &P, id: Id) -> Option<RawProfileSnapshot>
-where
-    P: TriblePattern + ?Sized,
-{
-    let (
-        anchor,
-        name,
-        model,
-        base_url,
-        stream,
-        context_window_tokens,
-        max_output_tokens,
-        context_safety_margin_tokens,
-        chars_per_token,
-    ) = find!(
-        (
-            anchor: Id,
-            name: TextHandle,
-            model: TextHandle,
-            base_url: TextHandle,
-            stream: CountValue,
-            context_window_tokens: CountValue,
-            max_output_tokens: CountValue,
-            context_safety_margin_tokens: CountValue,
-            chars_per_token: CountValue,
-        ),
-        pattern!(facts, [{ id @
-            playground_config::model_profile_id: ?anchor,
-            metadata::name: ?name,
-            playground_config::model_name: ?model,
-            playground_config::model_base_url: ?base_url,
-            playground_config::model_stream: ?stream,
-            playground_config::model_context_window_tokens: ?context_window_tokens,
-            playground_config::model_max_output_tokens: ?max_output_tokens,
-            playground_config::model_context_safety_margin_tokens: ?context_safety_margin_tokens,
-            playground_config::model_chars_per_token: ?chars_per_token,
-        }])
-    )
-    .min()?;
-    Some(RawProfileSnapshot {
-        anchor,
-        name,
-        model,
-        base_url,
-        model_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::model_secret_version: ?v }])).min(),
-        reasoning_effort: find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::model_reasoning_effort: ?v }])).min(),
-        stream,
-        context_window_tokens,
-        max_output_tokens,
-        context_safety_margin_tokens,
-        chars_per_token,
-        predecessors: sorted_ids(find!(v: Id, pattern!(facts, [{ id @ metadata::supersedes: ?v }]))),
-    })
-}
-
-/// Read one config snapshot with the same open-world reading as
-/// [`raw_profile`].
-fn raw_config<P>(facts: &P, id: Id) -> Option<RawConfigSnapshot>
-where
-    P: TriblePattern + ?Sized,
-{
-    let (active_profile, system_prompt, cognition_scope, author, author_role, poll_ms) = find!(
-        (
-            active_profile: Id,
-            system_prompt: TextHandle,
-            cognition_scope: Id,
-            author: TextHandle,
-            author_role: TextHandle,
-            poll_ms: CountValue,
-        ),
-        pattern!(facts, [{ id @
-            playground_config::active_model_profile_id: ?active_profile,
-            playground_config::system_prompt: ?system_prompt,
-            playground_config::cognition_scope: ?cognition_scope,
-            playground_config::author: ?author,
-            playground_config::author_role: ?author_role,
-            playground_config::poll_ms: ?poll_ms,
-        }])
-    )
-    .min()?;
-    Some(RawConfigSnapshot {
-        active_profile,
-        system_prompt,
-        cognition_scope,
-        author,
-        author_role,
-        persona: find!(v: Id, pattern!(facts, [{ id @ playground_config::persona_id: ?v }])).min(),
-        poll_ms,
-        tavily_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::tavily_secret_version: ?v }])).min(),
-        exa_secret_version: find!(v: Id, pattern!(facts, [{ id @ playground_config::exa_secret_version: ?v }])).min(),
-        exec_default_cwd: find!(v: TextHandle, pattern!(facts, [{ id @ playground_config::exec_default_cwd: ?v }])).min(),
-        exec_sandbox_profile: find!(v: Id, pattern!(facts, [{ id @ playground_config::exec_sandbox_profile: ?v }])).min(),
-        predecessors: sorted_ids(find!(v: Id, pattern!(facts, [{ id @ metadata::supersedes: ?v }]))),
-    })
-}
-
-fn dag_heads(nodes: &BTreeMap<Id, Vec<Id>>, label: &str) -> Result<Vec<Id>> {
-    for (&node, predecessors) in nodes {
-        for predecessor in predecessors {
-            if !nodes.contains_key(predecessor) {
-                bail!("{label} snapshot {node:x} names missing or wrong-track predecessor {predecessor:x}");
-            }
-        }
-    }
-
-    fn visit(
-        node: Id,
-        nodes: &BTreeMap<Id, Vec<Id>>,
-        visiting: &mut BTreeSet<Id>,
-        done: &mut BTreeSet<Id>,
-        label: &str,
-    ) -> Result<()> {
-        if done.contains(&node) {
-            return Ok(());
-        }
-        if !visiting.insert(node) {
-            bail!("{label} predecessor graph contains a cycle at {node:x}");
-        }
-        for predecessor in &nodes[&node] {
-            visit(*predecessor, nodes, visiting, done, label)?;
-        }
-        visiting.remove(&node);
-        done.insert(node);
-        Ok(())
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut done = BTreeSet::new();
-    for &node in nodes.keys() {
-        visit(node, nodes, &mut visiting, &mut done, label)?;
-    }
-
-    fn reaches(start: Id, target: Id, nodes: &BTreeMap<Id, Vec<Id>>) -> bool {
-        nodes[&start]
-            .iter()
-            .any(|predecessor| *predecessor == target || reaches(*predecessor, target, nodes))
-    }
-    for (&node, predecessors) in nodes {
-        for (index, predecessor) in predecessors.iter().enumerate() {
-            if predecessors.iter().enumerate().any(|(other_index, other)| {
-                index != other_index && reaches(*other, *predecessor, nodes)
-            }) {
-                bail!(
-                    "{label} snapshot {node:x} has non-antichain predecessors; {:x} is already an ancestor of another direct predecessor",
-                    predecessor
-                );
-            }
-        }
-    }
-
-    let superseded: BTreeSet<_> = nodes
-        .values()
-        .flat_map(|predecessors| predecessors.iter().copied())
-        .collect();
-    let heads: Vec<_> = nodes
-        .keys()
-        .filter(|id| !superseded.contains(*id))
-        .copied()
-        .collect();
-    if !nodes.is_empty() && heads.is_empty() {
-        bail!("{label} has no live head");
-    }
-    Ok(heads)
-}
-
-fn project_structure<P>(facts: &P) -> Result<RawCatalog>
-where
-    P: TriblePattern + ?Sized,
-{
-    let live = ids_of_kind(facts, KIND_LIVE_RECORD);
-    let anchors = ids_of_kind(facts, KIND_PROFILE_ANCHOR_ID)
-        .intersection(&live)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let profile_ids = ids_of_kind(facts, KIND_MODEL_PROFILE_ID)
-        .intersection(&live)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let config_ids = ids_of_kind(facts, KIND_CONFIG_ID)
-        .intersection(&live)
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if let Some(id) = anchors.intersection(&profile_ids).next() {
-        bail!("Headspace entity {id:x} is both an anchor and profile snapshot");
-    }
-    if let Some(id) = anchors.intersection(&config_ids).next() {
-        bail!("Headspace entity {id:x} is both an anchor and config snapshot");
-    }
-    if let Some(id) = profile_ids.intersection(&config_ids).next() {
-        bail!("Headspace entity {id:x} is both a profile and config snapshot");
-    }
-
-    let mut raw = RawCatalog::default();
-    let mut profile_graphs: BTreeMap<Id, BTreeMap<Id, Vec<Id>>> = BTreeMap::new();
-    for id in profile_ids {
-        let Some(snapshot) = raw_profile(facts, id) else {
-            continue;
-        };
-        if !anchors.contains(&snapshot.anchor) {
-            bail!(
-                "profile snapshot {id:x} names undeclared anchor {:x}",
-                snapshot.anchor
-            );
-        }
-        profile_graphs
-            .entry(snapshot.anchor)
-            .or_default()
-            .insert(id, snapshot.predecessors.clone());
-        raw.profiles.insert(id, snapshot);
-    }
-    for &anchor in &anchors {
-        let Some(graph) = profile_graphs.get(&anchor) else {
-            bail!("profile anchor {anchor:x} has no profile snapshot");
-        };
-        raw.profile_heads.insert(
-            anchor,
-            dag_heads(graph, &format!("profile track {anchor:x}"))?,
-        );
-    }
-
-    let mut config_graph = BTreeMap::new();
-    for id in config_ids {
-        let Some(snapshot) = raw_config(facts, id) else {
-            continue;
-        };
-        if !anchors.contains(&snapshot.active_profile) {
-            bail!(
-                "config snapshot {id:x} names undeclared active profile {:x}",
-                snapshot.active_profile
-            );
-        }
-        config_graph.insert(id, snapshot.predecessors.clone());
-        raw.config.insert(id, snapshot);
-    }
-    raw.config_heads = dag_heads(&config_graph, "config track")?;
-
-    Ok(raw)
 }
 
 fn required_trimmed(value: &str, field: &str) -> Result<()> {
@@ -1108,276 +856,6 @@ fn load_text_from(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<Stri
         .get(handle)
         .with_context(|| format!("read Headspace text payload {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
-}
-
-fn load_text_overlay<Overlay>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    handle: TextHandle,
-) -> Result<String>
-where
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    if let Some(overlay) = overlay {
-        if overlay
-            .metadata(handle)
-            .expect("memory metadata lookup is infallible")
-            .is_some()
-        {
-            let view: View<str> = overlay.get(handle).with_context(|| {
-                format!(
-                    "read staged Headspace text payload {}",
-                    hex::encode(handle.raw)
-                )
-            })?;
-            return Ok(view.to_string());
-        }
-    }
-    load_text_from(reader, handle)
-}
-
-fn project_catalog<P, Overlay>(
-    reader: &impl BlobStoreGet,
-    overlay: Option<&Overlay>,
-    facts: &P,
-) -> Result<Catalog>
-where
-    P: TriblePattern + ?Sized,
-    Overlay: BlobStoreGet + BlobStoreMeta,
-{
-    let raw = project_structure(facts)?;
-    let mut profile_snapshots = BTreeMap::new();
-    let mut profiles_by_anchor: BTreeMap<Id, BTreeMap<Id, Snapshot<ProfileValue>>> =
-        BTreeMap::new();
-    for (&id, snapshot) in &raw.profiles {
-        let stream = count_u64(snapshot.stream, id, "model_stream")?;
-        if stream > 1 {
-            bail!("Headspace profile {id:x} has model_stream {stream}; expected 0 or 1");
-        }
-        let value = ProfileValue {
-            anchor: snapshot.anchor,
-            name: load_text_overlay(reader, overlay, snapshot.name)?,
-            model: load_text_overlay(reader, overlay, snapshot.model)?,
-            base_url: load_text_overlay(reader, overlay, snapshot.base_url)?,
-            model_secret_version: snapshot.model_secret_version,
-            reasoning_effort: snapshot
-                .reasoning_effort
-                .map(|handle| load_text_overlay(reader, overlay, handle))
-                .transpose()?,
-            stream: stream == 1,
-            context_window_tokens: count_u64(
-                snapshot.context_window_tokens,
-                id,
-                "model_context_window_tokens",
-            )?,
-            max_output_tokens: count_u64(
-                snapshot.max_output_tokens,
-                id,
-                "model_max_output_tokens",
-            )?,
-            context_safety_margin_tokens: count_u64(
-                snapshot.context_safety_margin_tokens,
-                id,
-                "model_context_safety_margin_tokens",
-            )?,
-            chars_per_token: count_u64(snapshot.chars_per_token, id, "model_chars_per_token")?,
-        };
-        let snapshot = Snapshot {
-            id,
-            value,
-            predecessors: snapshot.predecessors.clone(),
-        };
-        profiles_by_anchor
-            .entry(snapshot.value.anchor)
-            .or_default()
-            .insert(id, snapshot.clone());
-        profile_snapshots.insert(id, snapshot);
-    }
-
-    let mut config_snapshots = BTreeMap::new();
-    for (&id, snapshot) in &raw.config {
-        let value = ConfigValue {
-            active_profile: snapshot.active_profile,
-            system_prompt: load_text_overlay(reader, overlay, snapshot.system_prompt)?,
-            cognition_scope: snapshot.cognition_scope,
-            author: load_text_overlay(reader, overlay, snapshot.author)?,
-            author_role: load_text_overlay(reader, overlay, snapshot.author_role)?,
-            persona: snapshot.persona,
-            poll_ms: count_u64(snapshot.poll_ms, id, "poll_ms")?,
-            tavily_secret_version: snapshot.tavily_secret_version,
-            exa_secret_version: snapshot.exa_secret_version,
-            exec_default_cwd: snapshot
-                .exec_default_cwd
-                .map(|handle| load_text_overlay(reader, overlay, handle))
-                .transpose()?,
-            exec_sandbox_profile: snapshot.exec_sandbox_profile,
-        };
-        config_snapshots.insert(
-            id,
-            Snapshot {
-                id,
-                value,
-                predecessors: snapshot.predecessors.clone(),
-            },
-        );
-    }
-
-    let config = resolve_track(&config_snapshots, &raw.config_heads);
-    let profiles = profiles_by_anchor
-        .into_iter()
-        .map(|(anchor, snapshots)| {
-            let resolution = resolve_track(&snapshots, &raw.profile_heads[&anchor]);
-            (anchor, resolution)
-        })
-        .collect();
-    Ok(Catalog {
-        config,
-        profiles,
-        config_snapshots,
-        profile_snapshots,
-    })
-}
-
-/// Project complete retained history, representing structural or payload
-/// failure as `Resolution::Invalid` rather than choosing an implicit winner.
-pub fn project<P>(reader: &impl BlobStoreGet, facts: &P) -> Catalog
-where
-    P: TriblePattern + ?Sized,
-{
-    project_result(reader, facts).unwrap_or_else(Catalog::invalid)
-}
-
-/// Project complete retained history for an explicit historical operation.
-pub fn project_result<P>(reader: &impl BlobStoreGet, facts: &P) -> Result<Catalog>
-where
-    P: TriblePattern + ?Sized,
-{
-    project_catalog(reader, None::<&PileSnapshot>, facts)
-}
-
-/// Require every exact credential reference in every native snapshot to name
-/// one extant immutable Secrets version.
-///
-/// Labels and timestamps are intentionally irrelevant: Headspace stores and
-/// validates the exact version ids it will later open.
-fn validate_secret_references_by(
-    catalog: &Catalog,
-    mut contains: impl FnMut(Id) -> bool,
-) -> Result<()> {
-    let mut references = Vec::new();
-    for snapshot in catalog.profile_snapshots.values() {
-        if let Some(secret) = snapshot.value.model_secret_version {
-            references.push((snapshot.id, "model", secret));
-        }
-    }
-    for snapshot in catalog.config_snapshots.values() {
-        if let Some(secret) = snapshot.value.tavily_secret_version {
-            references.push((snapshot.id, "Tavily", secret));
-        }
-        if let Some(secret) = snapshot.value.exa_secret_version {
-            references.push((snapshot.id, "Exa", secret));
-        }
-    }
-    for (snapshot, role, secret) in references {
-        if !contains(secret) {
-            bail!(
-                "Headspace snapshot {snapshot:x} references missing exact {role} Secrets version {secret:x}"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Validate exact references against the aggregate configured Secrets view.
-pub fn validate_secret_references<R>(
-    catalog: &Catalog,
-    secrets: &SecretsSnapshot<R>,
-) -> Result<()> {
-    validate_secret_references_by(catalog, |secret| secrets.contains(secret))
-}
-
-/// Resolve the one active config and its one settled profile.
-///
-/// Missing state and forks are visible failures rather than defaults or
-/// timestamp arbitration. A caller wishing to bootstrap state must author a
-/// profile/config genesis explicitly.
-pub fn settled_active(catalog: &Catalog) -> Result<(&ConfigValue, &ProfileValue)> {
-    let config = catalog
-        .config
-        .settled_value("Headspace config")?
-        .ok_or_else(|| anyhow!("Headspace has no active configuration; add a profile first"))?;
-    let profile = catalog
-        .profiles
-        .get(&config.active_profile)
-        .ok_or_else(|| anyhow!("active profile {:x} is missing", config.active_profile))?
-        .settled_value(&format!("profile {:x}", config.active_profile))?
-        .ok_or_else(|| anyhow!("active profile {:x} has no snapshot", config.active_profile))?;
-    Ok((config, profile))
-}
-
-fn open_utf8_secret<R: BlobStoreGet>(
-    secrets: &SecretsSnapshot<R>,
-    secret: Option<Id>,
-    signing_key: &SigningKey,
-    role: &str,
-) -> Result<Option<String>> {
-    let Some(secret) = secret else {
-        return Ok(None);
-    };
-    let plaintext = secrets
-        .open(secret, signing_key)
-        .with_context(|| format!("open exact {role} Secrets version {secret:x}"))?;
-    String::from_utf8(plaintext)
-        .with_context(|| format!("exact {role} Secrets version {secret:x} is not UTF-8"))
-        .map(Some)
-}
-
-/// Open the credentials referenced by the resolved active Headspace.
-///
-/// Each lookup is by the exact immutable version id stored in the snapshot;
-/// this function never invokes Secrets' label-based latest-version helper.
-pub fn open_active_secrets<R: BlobStoreGet>(
-    headspace: &Catalog,
-    secrets: &SecretsSnapshot<R>,
-    signing_key: &SigningKey,
-) -> Result<OpenedSecrets> {
-    let (config, profile) = settled_active(headspace)?;
-    Ok(OpenedSecrets {
-        model_api_key: open_utf8_secret(
-            secrets,
-            profile.model_secret_version,
-            signing_key,
-            "model",
-        )?,
-        tavily_api_key: open_utf8_secret(
-            secrets,
-            config.tavily_secret_version,
-            signing_key,
-            "Tavily",
-        )?,
-        exa_api_key: open_utf8_secret(secrets, config.exa_secret_version, signing_key, "Exa")?,
-    })
-}
-
-fn resolve_track<T: Clone + Eq>(
-    snapshots: &BTreeMap<Id, Snapshot<T>>,
-    heads: &[Id],
-) -> Resolution<T> {
-    if snapshots.is_empty() {
-        return Resolution::Missing;
-    }
-    let heads: Vec<_> = heads.iter().map(|id| snapshots[id].clone()).collect();
-    match heads.as_slice() {
-        [] => unreachable!("validated non-empty track has a head"),
-        [snapshot] => Resolution::Unique(snapshot.clone()),
-        _ if heads
-            .iter()
-            .all(|snapshot| snapshot.value == heads[0].value) =>
-        {
-            Resolution::Agreed(heads)
-        }
-        _ => Resolution::Forked(heads),
-    }
 }
 
 fn format_ids(ids: impl IntoIterator<Item = Id>) -> String {
@@ -1475,9 +953,8 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, right_fragment);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let catalog = project_result(&reader, &facts).unwrap();
         assert!(matches!(
-            catalog.profiles[&anchor],
+            current_profile(&reader, &facts, anchor).unwrap(),
             Resolution::Forked(ref heads) if heads.len() == 2
         ));
 
@@ -1487,9 +964,8 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, right_join);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let catalog = project_result(&reader, &facts).unwrap();
         assert!(matches!(
-            catalog.profiles[&anchor],
+            current_profile(&reader, &facts, anchor).unwrap(),
             Resolution::Agreed(ref heads)
                 if heads.iter().map(|head| head.id).collect::<BTreeSet<_>>()
                     == BTreeSet::from([left_join_id, right_join_id])
@@ -1498,7 +974,82 @@ mod tests {
     }
 
     #[test]
-    fn snapshots_lacking_a_field_are_skipped_and_repeated_fields_do_not_fail() {
+    fn reconcile_joins_every_head_and_is_a_no_op_on_one_equal_head() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("headspace.pile");
+        let signer = SigningKey::from_bytes(&[0x27; 32]);
+        let mut pile = test_pile(&path, &signer);
+        let anchor = test_id(0x28);
+        let profile = default_profile(anchor, "default");
+        let config = default_config(anchor);
+        let (genesis, profile_head, config_head) =
+            add_profile_fragment(&profile, &config, &[]).unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, genesis);
+
+        // One head already carrying the chosen value: nothing to write.
+        let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
+        assert!(reconcile_fragment(&reader, &facts, profile_head)
+            .unwrap()
+            .is_none());
+        assert!(reconcile_fragment(&reader, &facts, config_head)
+            .unwrap()
+            .is_none());
+        assert!(reconcile_fragment(&reader, &facts, test_id(0x29)).is_err());
+
+        let mut left = profile.clone();
+        left.model = "left".to_owned();
+        let mut right = profile.clone();
+        right.model = "right".to_owned();
+        let (left_fragment, left_id) = profile_snapshot_fragment(&left, &[profile_head]).unwrap();
+        let (right_fragment, right_id) =
+            profile_snapshot_fragment(&right, &[profile_head]).unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, left_fragment);
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, right_fragment);
+
+        // Choosing a historical snapshot re-expresses its value over both heads.
+        let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
+        assert_eq!(
+            snapshot_ids(&facts),
+            BTreeSet::from([profile_head, config_head, left_id, right_id])
+        );
+        let (join, join_id) = reconcile_fragment(&reader, &facts, profile_head)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            join,
+            profile_snapshot_fragment(&profile, &[left_id, right_id])
+                .unwrap()
+                .0
+        );
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, join);
+        let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
+        assert!(matches!(
+            current_profile(&reader, &facts, anchor).unwrap(),
+            Resolution::Unique(ref head) if head.id == join_id && head.value == profile
+        ));
+
+        // Two heads with equal values still need one explicit join.
+        let (other, other_id) = profile_snapshot_fragment(&profile, &[left_id]).unwrap();
+        commit(&mut pile, DEFAULT_SCOPE_ID, &signer, other);
+        let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
+        assert!(matches!(
+            current_profile(&reader, &facts, anchor).unwrap(),
+            Resolution::Agreed(ref heads) if heads.len() == 2
+        ));
+        let (join, _) = reconcile_fragment(&reader, &facts, join_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            join,
+            profile_snapshot_fragment(&profile, &[join_id, other_id])
+                .unwrap()
+                .0
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn snapshots_lacking_a_field_are_skipped_and_repeated_fields_are_each_read() {
         let anchor = test_id(0x24);
         let (mut fragment, profile_id, config_id) = add_profile_fragment(
             &default_profile(anchor, "open-world"),
@@ -1512,12 +1063,6 @@ mod tests {
             metadata::tag: &KIND_CONFIG_ID,
             playground_config::active_model_profile_id: &anchor,
         };
-        let default_model = find!(
-            v: TextHandle,
-            pattern!(fragment.facts(), [{ profile_id @ playground_config::model_name: ?v }])
-        )
-        .next()
-        .unwrap();
         let other: TextHandle = fragment.put("other".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&profile_id) @
             playground_config::model_name: other,
@@ -1525,19 +1070,27 @@ mod tests {
         let facts = fragment.facts().clone();
         let reader = fragment.blobs_mut().snapshot().unwrap();
 
-        let catalog = project_result(&reader, &facts).unwrap();
-        assert!(matches!(catalog.config, Resolution::Unique(ref head) if head.id == config_id));
-        assert!(!catalog.snapshot_ids().contains(&missing));
-        let Resolution::Unique(ref profile) = catalog.profiles[&anchor] else {
-            panic!("one profile head");
+        assert!(matches!(
+            current_config(&reader, &facts).unwrap(),
+            Resolution::Unique(ref head) if head.id == config_id
+        ));
+        assert!(!snapshot_ids(&facts).contains(&missing));
+        assert!(snapshot_ids(&facts).contains(&profile_id));
+        // Several values for one field are each a reading of the one head.
+        let Resolution::Forked(readings) = current_profile(&reader, &facts, anchor).unwrap() else {
+            panic!("one head with two readings");
         };
-        // Several values select the byte-smallest model handle.
-        let expected = if other < default_model {
-            "other"
-        } else {
-            DEFAULT_MODEL
-        };
-        assert_eq!(profile.value.model, expected);
+        assert!(readings.iter().all(|reading| reading.id == profile_id));
+        assert_eq!(
+            readings
+                .iter()
+                .map(|reading| reading.value.model.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["other", DEFAULT_MODEL])
+        );
+        // An explicit choice of that head names no single value.
+        let error = reconcile_fragment(&reader, &facts, profile_id).unwrap_err();
+        assert!(format!("{error:#}").contains("2 readings"));
     }
 
     #[test]
@@ -1553,10 +1106,9 @@ mod tests {
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, profile_only);
 
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let catalog = project_result(&reader, &facts).unwrap();
-        assert!(matches!(catalog.config, Resolution::Missing));
-        assert!(format!("{:#}", settled_active(&catalog).unwrap_err())
-            .contains("no active configuration"));
+        let config = current_config(&reader, &facts).unwrap();
+        assert!(matches!(config, Resolution::Missing));
+        assert!(config.settled_value("Headspace config").unwrap().is_none());
 
         let first = default_config(anchor);
         let mut second = first.clone();
@@ -1574,9 +1126,13 @@ mod tests {
             config_snapshot_fragment(&second, &[]).unwrap().0,
         );
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let catalog = project_result(&reader, &facts).unwrap();
-        assert!(matches!(catalog.config, Resolution::Forked(ref heads) if heads.len() == 2));
-        assert!(format!("{:#}", settled_active(&catalog).unwrap_err()).contains("forked"));
+        let config = current_config(&reader, &facts).unwrap();
+        assert!(matches!(config, Resolution::Forked(ref heads) if heads.len() == 2));
+        assert!(format!(
+            "{:#}",
+            config.settled_value("Headspace config").unwrap_err()
+        )
+        .contains("forked"));
         pile.close().unwrap();
     }
 
@@ -1650,10 +1206,15 @@ mod tests {
         );
 
         let (headspace_facts, headspace_reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let headspace = project_result(&headspace_reader, &headspace_facts).unwrap();
-        validate_secret_references(&headspace, &secrets).unwrap();
-        let opened = open_active_secrets(&headspace, &secrets, &signer).unwrap();
-        assert_eq!(opened.model_api_key.as_deref(), Some("first"));
+        let config = current_config(&headspace_reader, &headspace_facts).unwrap();
+        let profile = current_profile(&headspace_reader, &headspace_facts, anchor).unwrap();
+        validate_current_secret_references(&config, [&profile], &secrets).unwrap();
+        let Resolution::Unique(ref profile) = profile else {
+            panic!("one profile head");
+        };
+        let secret = profile.value.model_secret_version.unwrap();
+        assert_eq!(secret, first_id);
+        assert_eq!(secrets.open(secret, &signer).unwrap(), b"first");
         pile.close().unwrap();
     }
 
@@ -1671,13 +1232,14 @@ mod tests {
         let mut pile = test_pile(&path, &signer);
         commit(&mut pile, DEFAULT_SCOPE_ID, &signer, fragment);
         let (facts, reader) = materialize(&mut pile, DEFAULT_SCOPE_ID, &signer);
-        let catalog = project_result(&reader, &facts).unwrap();
+        let config = current_config(&reader, &facts).unwrap();
+        let profile = current_profile(&reader, &facts, anchor).unwrap();
         let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
         let secrets = pollster::block_on(secrets::storage::ensure_and_snapshot(
             &mut pile, collection, &signer,
         ))
         .unwrap();
-        let error = validate_secret_references(&catalog, &secrets).unwrap_err();
+        let error = validate_current_secret_references(&config, [&profile], &secrets).unwrap_err();
         assert!(format!("{error:#}").contains("missing exact model"));
         pile.close().unwrap();
     }
@@ -1692,7 +1254,6 @@ mod tests {
             metadata::tag: &KIND_MODEL_PROFILE_ID,
             playground_config::model_api_key: plaintext,
         };
-        assert!(active_facts(legacy.facts()).is_empty());
 
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("headspace.pile");
@@ -1705,9 +1266,12 @@ mod tests {
             .facts()
             .iter()
             .all(|fact| materialized.contains(fact)));
-        let catalog = project_result(&reader, &facts).unwrap();
-        assert!(matches!(catalog.config, Resolution::Missing));
-        assert!(catalog.profiles.is_empty());
+        assert!(matches!(
+            current_config(&reader, &facts).unwrap(),
+            Resolution::Missing
+        ));
+        assert!(current_profiles(&reader, &facts).unwrap().is_empty());
+        assert!(snapshot_ids(&facts).is_empty());
         pile.close().unwrap();
     }
 }

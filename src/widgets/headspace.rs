@@ -172,10 +172,6 @@ fn load_active_config(config: &Resolution<ConfigValue>) -> ActiveConfig {
             resolution: Some(format!("CONFIG FORK · {} HEADS", snapshots.len())),
             ..ActiveConfig::default()
         },
-        Resolution::Invalid(error) => ActiveConfig {
-            resolution: Some(format!("INVALID CONFIG · {error}")),
-            ..ActiveConfig::default()
-        },
     }
 }
 
@@ -203,12 +199,6 @@ fn load_profiles(profiles: &BTreeMap<Id, Resolution<ProfileValue>>) -> HashMap<I
                 let mut profile = ModelProfile::empty(*anchor);
                 profile.name = format!("missing-{}", short_hex(*anchor));
                 profile.resolution = Some("MISSING".to_owned());
-                profile
-            }
-            Resolution::Invalid(error) => {
-                let mut profile = ModelProfile::empty(*anchor);
-                profile.name = format!("invalid-{}", short_hex(*anchor));
-                profile.resolution = Some(format!("INVALID · {error}"));
                 profile
             }
         };

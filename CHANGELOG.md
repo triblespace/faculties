@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `headspace reconcile` (MCP `headspace_reconcile`) reads only what it needs:
+  the chosen snapshot and its track's current heads, as typed queries over
+  one snapshot of the collection. It used to load the whole history into a
+  `Catalog` first and refused to run when anything anywhere in it surprised
+  that catalog: a profile naming an anchor not yet declared, a predecessor
+  not yet arrived, an entity carrying two Headspace kinds, redundant
+  predecessors, a non-u64 count or an unreadable text. It also picked the
+  byte-smallest value when a field had several. Now unrelated history cannot
+  block a reconcile, and a chosen snapshot with several readings is refused
+  as ambiguous rather than given a hidden winner. Removed from the library:
+  `Catalog`, `project`, `project_result`, `settled_active`,
+  `open_active_secrets`, `validate_secret_references`, `active_facts` and the
+  `Resolution::Invalid` variant only the catalog produced; added
+  `snapshot_ids` and `reconcile_fragment(reader, facts, chosen)`.
+
 - `hear prosody <clip>...` and the MCP tool `hear_prosody` read the tone of
   a recorded WAV clip apart from its words: pitch (YIN; median, range and
   spread in semitones), loudness (active-speech RMS, range, peak),

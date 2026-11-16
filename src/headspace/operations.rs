@@ -324,7 +324,7 @@ fn resolve_profile_selector(views: &Views, raw: &str) -> Result<Id> {
             Resolution::Agreed(snapshots) => {
                 snapshots.first().map(|snapshot| snapshot.value.clone())
             }
-            Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+            Resolution::Missing | Resolution::Forked(_) => None,
         };
         if profile.is_some_and(|profile| profile.name.to_ascii_lowercase() == needle) {
             matches.push(anchor);
@@ -586,12 +586,10 @@ fn role_name(role: SecretRole) -> &'static str {
 
 fn reconcile(storage: &Storage, raw: &str, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
-    // Reconciliation alone explicitly projects arbitrary retained history;
-    // every ordinary read above asks only for its current typed frontier.
-    let history = headspace::project_result(&views.headspace.reader, &views.headspace.facts)
-        .context("project complete Headspace history for reconcile")?;
-    let chosen = crate::resolve_id_prefix(raw, history.snapshot_ids())?;
-    let Some((fragment, _)) = history.reconcile_fragment(chosen)? else {
+    let chosen = crate::resolve_id_prefix(raw, headspace::snapshot_ids(&views.headspace.facts))?;
+    let Some((fragment, _)) =
+        headspace::reconcile_fragment(&views.headspace.reader, &views.headspace.facts, chosen)?
+    else {
         return print_headspace(&views, None, out);
     };
     publish_headspace(storage, fragment, "headspace: reconcile snapshot track")?;
@@ -769,7 +767,7 @@ fn print_profile_resolutions(
         Resolution::Agreed(snapshots) => snapshots
             .first()
             .map(|snapshot| snapshot.value.active_profile),
-        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+        Resolution::Missing | Resolution::Forked(_) => None,
     };
     match config {
         Resolution::Missing => out.line(format!("config\t<missing>"))?,
@@ -795,7 +793,6 @@ fn print_profile_resolutions(
                 ))?;
             }
         }
-        Resolution::Invalid(error) => out.line(format!("config\t<invalid>\t{error}"))?,
     }
 
     let mut rows = Vec::new();
@@ -837,9 +834,6 @@ fn print_profile_resolutions(
                 ));
             }
             Resolution::Missing => rows.push((String::new(), format!("! <missing>\t{anchor:x}"))),
-            Resolution::Invalid(error) => {
-                rows.push((String::new(), format!("! <invalid>\t{anchor:x}\t{error}")))
-            }
         }
     }
     rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
@@ -1071,11 +1065,7 @@ mod tests {
         ))
         .unwrap();
         let (storage, before) = views(&pile, &key);
-        let snapshots =
-            headspace::project_result(&before.headspace.reader, &before.headspace.facts)
-                .unwrap()
-                .snapshot_ids()
-                .len();
+        let snapshots = headspace::snapshot_ids(&before.headspace.facts).len();
         storage.close().unwrap();
 
         run(cli(
@@ -1089,10 +1079,7 @@ mod tests {
         .unwrap();
         let (storage, after) = views(&pile, &key);
         assert_eq!(
-            headspace::project_result(&after.headspace.reader, &after.headspace.facts)
-                .unwrap()
-                .snapshot_ids()
-                .len(),
+            headspace::snapshot_ids(&after.headspace.facts).len(),
             snapshots
         );
         storage.close().unwrap();
