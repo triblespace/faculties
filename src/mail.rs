@@ -64,6 +64,8 @@ pub struct AccountConfigInput {
     pub username: String,
     pub credential: Id,
     pub enabled: bool,
+    /// Inbound mail is stored but never becomes attention.
+    pub quiet: bool,
     pub predecessors: Vec<Id>,
 }
 
@@ -97,6 +99,8 @@ pub struct AccountConfigRecord {
     pub username: TextHandle,
     pub credential: Id,
     pub enabled: bool,
+    /// False on every configuration without `account::quiet: true`.
+    pub quiet: bool,
     pub predecessors: Vec<Id>,
 }
 
@@ -730,6 +734,7 @@ fn account_config_record(record: &AccountConfigRecord) -> Fragment {
         account::username: record.username,
         account::credential: &record.credential,
         account::enabled: record.enabled,
+        account::quiet?: record.quiet.then_some(true),
         metadata::supersedes*: record.predecessors.iter(),
     }
 }
@@ -749,6 +754,7 @@ pub fn account_config_fragment(anchor: Id, input: AccountConfigInput) -> Result<
         username: fragment.put(input.username),
         credential: input.credential,
         enabled: input.enabled,
+        quiet: input.quiet,
         predecessors: input.predecessors,
     };
     let config = account_config_record(&record);
@@ -809,6 +815,7 @@ where
             find!(v: bool, pattern!(facts, [{ id @ account::enabled: ?v }])).collect(),
             "account enabled flag",
         )?,
+        quiet: exists!(pattern!(facts, [{ id @ account::quiet: true }])),
         predecessors: sorted_ids(
             find!(v: Id, pattern!(facts, [{ id @ metadata::supersedes: ?v }])),
         ),
@@ -4016,6 +4023,7 @@ mod tests {
                 username: "sender@example.test".into(),
                 credential: credential_id,
                 enabled: true,
+                quiet: false,
                 predecessors: Vec::new(),
             },
         )
@@ -4330,6 +4338,7 @@ mod tests {
             username: fragment.put("old@example.test".to_owned()),
             credential,
             enabled: true,
+            quiet: false,
             predecessors: Vec::new(),
         };
         let config = account_config_record(&record);
@@ -4650,6 +4659,7 @@ mod tests {
             username: "me@example.test".into(),
             credential,
             enabled: true,
+            quiet: false,
             predecessors,
         };
         let (first, first_id) =
@@ -4689,6 +4699,7 @@ mod tests {
                 username: "me@example.test".into(),
                 credential: missing_secret,
                 enabled: true,
+                quiet: false,
                 predecessors: Vec::new(),
             },
         )
@@ -4726,6 +4737,7 @@ mod tests {
                 username: "me@example.test".into(),
                 credential: secret,
                 enabled: true,
+                quiet: false,
                 predecessors: Vec::new(),
             },
         )
@@ -5070,6 +5082,7 @@ mod tests {
                     username: "sender@example.test".into(),
                     credential: credential_id,
                     enabled,
+                    quiet: false,
                     predecessors: vec![account.config],
                 },
             )

@@ -46,6 +46,7 @@ impl Fixture {
                     username: None,
                     credential_version: None,
                     disabled: false,
+                    quiet: false,
                 },
                 "synthetic-mail-password".into(),
             )
@@ -75,6 +76,7 @@ impl Fixture {
             username: None,
             credential_version: Some(self.credential),
             disabled,
+            quiet: false,
         }
     }
     fn reader(&self, label: &str) -> Id {
@@ -438,6 +440,70 @@ fn account_exact_version_replay_and_disabled_fetch_are_credential_safe() {
     assert!(call(&fixture.mcp(), "mail_fetch", json!({}))
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn quiet_account_is_a_full_state_choice_shown_by_list() {
+    let fixture = Fixture::new();
+    let account = format!("{:x}", fixture.account);
+    let credential = format!("{:x}", fixture.credential);
+    let set = |extra: &[&str]| {
+        let mut args = vec![
+            "account",
+            "set",
+            "--account",
+            &account,
+            "--address",
+            "me@example.test",
+            "--display-name",
+            "Me",
+            "--imap-endpoint",
+            "imap.example.test:993",
+            "--smtp-endpoint",
+            "smtp.example.test:465",
+            "--credential-version",
+            &credential,
+        ];
+        args.extend_from_slice(extra);
+        success(fixture.cli(None, &args))
+    };
+    let listed = |cli: bool| {
+        if cli {
+            success(fixture.cli(None, &["account", "list"]))
+        } else {
+            call(&fixture.mcp(), "mail_account_list", json!({})).unwrap()
+        }
+    };
+    assert!(!listed(true).contains("quiet"));
+
+    set(&["--quiet"]);
+    let quiet = listed(true);
+    assert!(quiet.contains("enabled  quiet  config="), "{quiet}");
+    assert_eq!(quiet, listed(false));
+    let quiet_config = fixture.operations().account_list().unwrap();
+    // Replaying the same quiet snapshot is not a new configuration.
+    let mut options = fixture.account_options(false);
+    options.quiet = true;
+    assert!(!fixture.operations().account_set(options).unwrap().changed);
+
+    // Absence of the flag is a full-state successor that makes it an inbox again.
+    call(&fixture.mcp(),"mail_account_set",json!({
+        "account":account,"address":"me@example.test","display_name":"Me",
+        "imap_endpoint":"imap.example.test:993","smtp_endpoint":"smtp.example.test:465","credential_version":credential,"quiet":false,
+    })).unwrap();
+    let loud = listed(true);
+    assert!(!loud.contains("quiet"), "{loud}");
+    let configs = |summary: &[mail::AccountSummary]| match &summary[0].state {
+        mail::AccountState::Configured { config, .. } => *config,
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(
+        configs(&quiet_config),
+        configs(&fixture.operations().account_list().unwrap())
+    );
+    // The loud successor of a quiet snapshot is a new config, never the
+    // original one: identity follows the full state, history is kept.
+    assert_ne!(configs(&quiet_config), fixture.config);
 }
 
 #[test]

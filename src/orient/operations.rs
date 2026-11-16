@@ -372,9 +372,10 @@ use crate::schemas::habit::attrs as habit_attrs;
 use crate::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::mail::{
-    imported as imported_mail, observation as mail_observation, projection as mail_projection,
-    read as mail_read, IMPORT_RECEIVED, KIND_IMAP_OBSERVATION, KIND_IMPORTED_OBSERVATION,
-    KIND_PARSED_PROJECTION, KIND_POP_OBSERVATION, KIND_READ_OBSERVATION, RECIPE_RFC5322_V1,
+    account as mail_account, imported as imported_mail, observation as mail_observation,
+    projection as mail_projection, read as mail_read, IMPORT_RECEIVED, KIND_ACCOUNT_CONFIG,
+    KIND_IMAP_OBSERVATION, KIND_IMPORTED_OBSERVATION, KIND_PARSED_PROJECTION, KIND_POP_OBSERVATION,
+    KIND_READ_OBSERVATION, RECIPE_RFC5322_V1,
 };
 use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::{
@@ -1868,6 +1869,12 @@ struct MailSummary {
 /// One attention item per unread, non-spam inbound wire message. Re-observing
 /// the same wire through another source is idempotent when its presentation
 /// agrees; conflicting parser projections are not silently arbitrated.
+///
+/// Mail observed through a quiet account (an archive fetched for
+/// bookkeeping) is nobody's attention. Quietness is read from the account's
+/// current configuration, so a successor that drops it makes the account's
+/// old mail attention again. Imported legacy observations name no account
+/// and stay attention.
 fn native_unread_mail(query: &OrientQuery<'_>, persona: Id) -> Result<BTreeMap<Id, MailSummary>> {
     // A raw exact anchor is a valid observer before its Relations profile
     // arrives. Until then it has no identity component and therefore no
@@ -1886,6 +1893,32 @@ fn native_unread_mail(query: &OrientQuery<'_>, persona: Id) -> Result<BTreeMap<I
     )
     .filter_map(|(wire, reader)| component.contains(&reader).then_some(wire))
     .collect();
+
+    // An account is quiet when it has current configuration heads and every
+    // one of them says so: a fork in which any head is an inbox stays loud.
+    let mut all_heads_quiet: HashMap<Id, bool> = HashMap::new();
+    for (config, account) in find!(
+        (config: Id, account: Id),
+        pattern!(query.mail, [{ ?config @
+            metadata::tag: &KIND_ACCOUNT_CONFIG,
+            mail_account::of: ?account,
+        }])
+    ) {
+        let superseded = exists!(pattern!(query.mail, [{ _?successor @
+            metadata::tag: &KIND_ACCOUNT_CONFIG,
+            mail_account::of: &account,
+            metadata::supersedes: &config,
+        }]));
+        if superseded {
+            continue;
+        }
+        let quiet = exists!(pattern!(query.mail, [{ config @ mail_account::quiet: true }]));
+        *all_heads_quiet.entry(account).or_insert(true) &= quiet;
+    }
+    let quiet_accounts: HashSet<Id> = all_heads_quiet
+        .into_iter()
+        .filter_map(|(account, quiet)| quiet.then_some(account))
+        .collect();
 
     let mut sources: BTreeSet<(Id, Id)> = find!(
         (source: Id, wire: Id),
@@ -1914,6 +1947,13 @@ fn native_unread_mail(query: &OrientQuery<'_>, persona: Id) -> Result<BTreeMap<I
     let mut by_wire = BTreeMap::new();
     for (source, wire) in sources {
         if read_wires.contains(&wire) {
+            continue;
+        }
+        let quiet = exists!((account: Id), and!(
+            quiet_accounts.has(account),
+            pattern!(query.mail, [{ source @ mail_observation::account: ?account }])
+        ));
+        if quiet {
             continue;
         }
         let projections: BTreeSet<Id> = find!(
@@ -6795,6 +6835,120 @@ mod tests {
             let view =
                 load_attention_view(&observation.query(&observation.snapshot), persona).unwrap();
             assert_eq!(view.ids().collect::<BTreeSet<_>>(), expected);
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
+    fn quiet_account_mail_is_stored_but_is_not_attention() {
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let persona = id(200);
+            let people = relations::person_fragment(
+                persona,
+                relations::ProfileInput {
+                    label: "observer".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0;
+            pile.commit(sources.relations.source, &fixture.signer, people)
+                .unwrap();
+
+            let config = |quiet: bool, predecessors: Vec<Id>| mail_model::AccountConfigInput {
+                address: "box@example.test".into(),
+                display_name: "Box".into(),
+                imap_endpoint: "imap.example.test:993".into(),
+                smtp_endpoint: "smtp.example.test:465".into(),
+                username: "box@example.test".into(),
+                credential: id(90),
+                enabled: true,
+                quiet,
+                predecessors,
+            };
+            let incoming = |account: Id, config: Id, uid: u32| {
+                let raw = format!(
+                    "Message-ID: <{uid}@example.test>\r\nFrom: sender@example.test\r\n\
+                     To: box@example.test\r\nSubject: notice {uid}\r\n\r\nbody\r\n"
+                );
+                mail_model::imap_publication(account, config, "INBOX", 1, uid, raw.as_bytes())
+                    .unwrap()
+            };
+            let mut facts = Fragment::empty();
+            // An archive, an ordinary inbox configured as every config was
+            // before quietness existed, and a fork split between the two.
+            let (archive, inbox, forked) = (id(81), id(82), id(83));
+            let (fragment, archive_config) =
+                mail_model::account_config_fragment(archive, config(true, vec![])).unwrap();
+            facts += fragment;
+            let (fragment, inbox_config) =
+                mail_model::account_config_fragment(inbox, config(false, vec![])).unwrap();
+            assert!(
+                find!(v: bool, pattern!(fragment.facts(), [{ _?c @ mail_account::quiet: ?v }]))
+                    .next()
+                    .is_none(),
+                "an attention config carries no quiet fact, exactly like an old one"
+            );
+            facts += fragment;
+            let (fragment, fork_base) =
+                mail_model::account_config_fragment(forked, config(true, vec![])).unwrap();
+            facts += fragment;
+            let mut fork_head = |quiet: bool, display_name: &str| {
+                let mut input = config(quiet, vec![fork_base]);
+                input.display_name = display_name.into();
+                let (fragment, head) = mail_model::account_config_fragment(forked, input).unwrap();
+                facts += fragment;
+                head
+            };
+            let fork_quiet = fork_head(true, "Quiet head");
+            fork_head(false, "Inbox head");
+            let archived = incoming(archive, archive_config, 1);
+            let delivered = incoming(inbox, inbox_config, 2);
+            let fork_mail = incoming(forked, fork_quiet, 3);
+            let (archived_wire, delivered_wire, fork_wire) =
+                (archived.wire, delivered.wire, fork_mail.wire);
+            facts += archived.mail;
+            facts += delivered.mail;
+            facts += fork_mail.mail;
+            pile.commit(sources.mail.source, &fixture.signer, facts)
+                .unwrap();
+
+            macro_rules! attention {
+                () => {{
+                    maintain_sources(&mut pile, &fixture.signer, &sources)
+                        .await
+                        .unwrap();
+                    let observation = observe_current_sources(&mut pile, &sources).unwrap();
+                    let query = observation.query(&observation.snapshot);
+                    let shown = native_unread_mail(&query, persona).unwrap();
+                    let view = load_attention_view(&query, persona).unwrap();
+                    assert_eq!(
+                        shown.keys().copied().collect::<BTreeSet<_>>(),
+                        view.ids().collect::<BTreeSet<_>>()
+                    );
+                    view.ids().collect::<BTreeSet<_>>()
+                }};
+            }
+            // The archive's mail is resident, but only the inbox and the
+            // fork with one inbox head are attention.
+            assert_eq!(attention!(), BTreeSet::from([delivered_wire, fork_wire]));
+
+            // A successor that drops quietness makes the archive's mail
+            // attention again; the observation still cites the old config.
+            let (fragment, _) =
+                mail_model::account_config_fragment(archive, config(false, vec![archive_config]))
+                    .unwrap();
+            pile.commit(sources.mail.source, &fixture.signer, fragment)
+                .unwrap();
+            assert_eq!(
+                attention!(),
+                BTreeSet::from([archived_wire, delivered_wire, fork_wire])
+            );
             pile.close().unwrap();
         });
     }

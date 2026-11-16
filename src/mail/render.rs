@@ -27,11 +27,13 @@ pub fn accounts(values: &[AccountSummary], out: &mut Out<'_>) -> Result<()> {
                 config,
                 address,
                 enabled,
+                quiet,
             } => out.line(format!(
-                "{:x}  {}  {}  config={:x}",
+                "{:x}  {}  {}{}  config={:x}",
                 value.account,
                 address,
                 if *enabled { "enabled" } else { "disabled" },
+                if *quiet { "  quiet" } else { "" },
                 config
             ))?,
         }

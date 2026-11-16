@@ -84,6 +84,10 @@ enum AccountCommand {
         credential_version: Option<Id>,
         #[arg(long)]
         disabled: bool,
+        /// Store this mailbox's inbound mail without waking anyone: an
+        /// archive fetched for bookkeeping, not an inbox to answer.
+        #[arg(long)]
+        quiet: bool,
     },
     List,
 }
@@ -201,6 +205,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 password,
                 credential_version,
                 disabled,
+                quiet,
             } => {
                 let input = AccountOptions {
                     account,
@@ -211,6 +216,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                     username,
                     credential_version,
                     disabled,
+                    quiet,
                 };
                 let value = match password {
                     Some(password) => operations.account_set_with_password(input, password)?,

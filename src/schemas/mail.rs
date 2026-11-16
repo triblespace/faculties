@@ -73,6 +73,12 @@ pub mod account {
         /// EXAMINE and `BODY.PEEK[]`.
         /// Minted with `trible genid` on 2026-11-16.
         "F38E634BA0CACEA83F1B8C2C4B299336" as imap_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The mailbox's inbound mail is stored but is not attention for
+        /// anyone (an archive fetched for bookkeeping). Written only as
+        /// `true`; a configuration without it is an ordinary inbox, which
+        /// keeps every earlier snapshot and its identity unchanged.
+        /// Minted with `trible genid` on 2026-11-16.
+        "67737EC47501CDA5458B4403B3F9A24C" as quiet: inlineencodings::Boolean;
     }
 }
 

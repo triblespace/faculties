@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Mail accounts can be quiet: `mail account set ... --quiet` (MCP
+  `mail_account_set` `quiet`) stores the mailbox's inbound mail as usual but
+  never makes it attention, for an archive fetched for bookkeeping. The flag
+  is `account::quiet` (`67737EC47501CDA5458B4403B3F9A24C`, Boolean) on the
+  full-state configuration, written only as `true`, so a configuration
+  without it, including every earlier one, is an ordinary inbox with an
+  unchanged id. Orient's unread mail skips POP and IMAP observations whose
+  account's current configuration heads are all quiet; a fork with one
+  inbox head stays attention, and a successor that drops the flag makes the
+  old mail attention again. `mail account list` shows `quiet`.
+
 - New faculty `spawn` (compass 9a9e2c95) replaces `worker-unit.sh` and
   `worker-wait.sh`. `spawn run --brief <path|-> --workdir <dir>` starts a task
   zooid: a headless Claude session in user unit `spawn-<name>`, which

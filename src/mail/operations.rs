@@ -49,6 +49,8 @@ pub struct AccountOptions {
     pub username: Option<String>,
     pub credential_version: Option<Id>,
     pub disabled: bool,
+    /// Store this mailbox's inbound mail without making it attention.
+    pub quiet: bool,
 }
 #[derive(Clone, Debug)]
 pub struct AccountSetReceipt {
@@ -66,6 +68,7 @@ pub enum AccountState {
         config: Id,
         address: String,
         enabled: bool,
+        quiet: bool,
     },
 }
 #[derive(Clone, Debug)]
@@ -211,6 +214,7 @@ impl Mail {
                 password,
                 input.credential_version,
                 input.disabled,
+                input.quiet,
             )
         })
     }
@@ -548,6 +552,7 @@ fn account_set(
     password: Option<String>,
     credential_version: Option<Id>,
     disabled: bool,
+    quiet: bool,
 ) -> Result<AccountSetReceipt> {
     let mut views = storage.views()?;
     let (anchor, predecessors, old_credential, replacing_fork) =
@@ -585,6 +590,7 @@ fn account_set(
         username,
         credential: credential_version.or(old_credential).unwrap_or(anchor),
         enabled: !disabled,
+        quiet,
         predecessors,
     }
     .canonicalized()?;
@@ -628,7 +634,8 @@ fn account_set(
             && mail::read_text(&views.mail.reader, previous.smtp_endpoint)? == input.smtp_endpoint
             && mail::read_text(&views.mail.reader, previous.username)? == input.username
             && previous.credential == input.credential
-            && previous.enabled == input.enabled;
+            && previous.enabled == input.enabled
+            && previous.quiet == input.quiet;
         if same {
             return Ok(AccountSetReceipt {
                 account: anchor,
@@ -670,6 +677,7 @@ fn account_list(storage: &Storage) -> Result<Vec<AccountSummary>> {
                     config: id,
                     address: mail::read_text(&views.mail.reader, config.address)?,
                     enabled: config.enabled,
+                    quiet: config.quiet,
                 }
             }
         };
@@ -1379,6 +1387,7 @@ mod tests {
                     username: "me@example.test".into(),
                     credential: credential_id,
                     enabled: true,
+                    quiet: false,
                     predecessors: Vec::new(),
                 },
             )
@@ -1535,6 +1544,7 @@ mod tests {
             None,
             None,
             false,
+            false,
         )
         .unwrap();
 
@@ -1570,6 +1580,7 @@ mod tests {
             None,
             Some("mailbox password".into()),
             None,
+            false,
             false,
         )
         .unwrap();
@@ -1615,6 +1626,7 @@ mod tests {
             None,
             Some(credential),
             false,
+            false,
         )
         .unwrap();
 
@@ -1642,6 +1654,7 @@ mod tests {
             None,
             None,
             Some(credential),
+            false,
             false,
         )
         .unwrap();
@@ -1676,6 +1689,7 @@ mod tests {
             Some("replacement password".into()),
             None,
             false,
+            false,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("account address"));
@@ -1697,6 +1711,7 @@ mod tests {
             None,
             Some("new password".into()),
             None,
+            false,
             false,
         )
         .unwrap();
@@ -1730,6 +1745,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .unwrap();
 
@@ -1775,6 +1791,7 @@ mod tests {
             None,
             None,
             true,
+            false,
         )
         .unwrap();
         let error = cmd_send(&storage, &format!("{:x}", drafts[0])).unwrap_err();
