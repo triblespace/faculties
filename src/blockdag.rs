@@ -19,11 +19,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 use triblespace::core::blob::encodings::UnknownBlob;
-use triblespace::core::blob::MemoryBlobStoreSnapshot;
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
-use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreList, SnapshotSource};
+use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
 use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
@@ -71,26 +69,6 @@ pub struct ProjectionAnnotations {
     pub source_locator: Option<String>,
     /// Canonical JSON of provider metadata about that conversation.
     pub source_detail: Option<String>,
-}
-
-type TextHandle = Inline<Handle<UTF8String>>;
-type RawHandle = Inline<Handle<RawBytes>>;
-type OverlayReader = MemoryBlobStoreSnapshot;
-
-/// Whether the bytes an Archive catalog names are resident.
-///
-/// This is a residency check and nothing else. The schema is open world, so
-/// it refuses no fact: it does not check shapes, cardinalities, closure,
-/// vocabularies or derived ids, and a fact it does not model is no concern
-/// of it. `Pending` names the hashes still to arrive; every asserted handle
-/// already fixes them, so they may arrive without changing the catalog.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CatalogValidation {
-    /// Every blob the catalog names under an Archive byte attribute is
-    /// resident.
-    Accepted,
-    /// These content hashes are not resident yet.
-    Pending { missing: BTreeSet<[u8; 32]> },
 }
 
 fn rooted(fragment: &Fragment, what: &str) -> Result<Id> {
@@ -691,137 +669,11 @@ pub fn annotate_generated_projection(
     Ok(projection)
 }
 
-/// The blobs the catalog names under the attributes Archive reads bytes
-/// from, on any entity: every value counts, and none is refused.
-fn named_attachments<P>(facts: &P) -> (BTreeSet<TextHandle>, BTreeSet<RawHandle>)
-where
-    P: TriblePattern,
-{
-    let mut texts: BTreeSet<TextHandle> = find!(
-        value: TextHandle,
-        pattern!(facts, [{ _?entity @ metadata::name: ?value }])
-    )
-    .collect();
-    for attribute in [
-        &*schema::content_fact::payload,
-        &*schema::content_fact::asset_pointer,
-        &*schema::source_projection::source_locator,
-        &*schema::source_projection::raw_author,
-        &*schema::source_projection::raw_role,
-        &*schema::source_projection::raw_model,
-        &*schema::source_projection::source_detail,
-    ] {
-        texts.extend(find!(
-            value: TextHandle,
-            pattern!(facts, [{ _?entity @ attribute: ?value }])
-        ));
-    }
-    let mut raws = BTreeSet::new();
-    for attribute in [
-        &*schema::content_fact::blob,
-        &*schema::content_fact::resolved_to,
-        &*schema::source_projection::raw_record,
-        &*schema::source_projection::resolution,
-    ] {
-        raws.extend(find!(
-            value: RawHandle,
-            pattern!(facts, [{ _?entity @ attribute: ?value }])
-        ));
-    }
-    (texts, raws)
-}
-
-fn resident<S>(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    handle: Inline<Handle<S>>,
-) -> Result<bool>
-where
-    S: BlobEncoding + 'static,
-    Handle<S>: InlineEncoding,
-{
-    if let Some(overlay) = overlay {
-        if overlay
-            .contains_blob(handle)
-            .map_err(|error| anyhow!("inspect a staged Archive attachment: {error}"))?
-        {
-            return Ok(true);
-        }
-    }
-    reader
-        .contains_blob(handle)
-        .map_err(|error| anyhow!("inspect a resident Archive attachment: {error}"))
-}
-
-fn validate_catalog_with_overlay<P>(
-    reader: &PileSnapshot,
-    overlay: Option<&OverlayReader>,
-    facts: &P,
-) -> Result<CatalogValidation>
-where
-    P: TriblePattern,
-{
-    let (texts, raws) = named_attachments(facts);
-    let mut missing = BTreeSet::new();
-    for handle in texts {
-        if !resident(reader, overlay, handle)? {
-            missing.insert(handle.raw);
-        }
-    }
-    for handle in raws {
-        if !resident(reader, overlay, handle)? {
-            missing.insert(handle.raw);
-        }
-    }
-    Ok(if missing.is_empty() {
-        CatalogValidation::Accepted
-    } else {
-        CatalogValidation::Pending { missing }
-    })
-}
-
-/// Check that the bytes one Archive catalog names are resident in `reader`.
-///
-/// A pointer fact with no `resolved_to` edge is an unresolved external
-/// asset, which names no bytes here.
-pub fn validate_catalog<P>(reader: &PileSnapshot, facts: &P) -> Result<CatalogValidation>
-where
-    P: TriblePattern,
-{
-    validate_catalog_with_overlay(reader, None, facts)
-}
-
-/// [`validate_catalog`] over the staged union, without writing anything.
-///
-/// Existing handles resolve through `reader`; blobs carried by `fragment`
-/// resolve through its in-memory overlay. The returned facts are the union
-/// that was checked.
-pub fn validate_catalog_union(
-    reader: &PileSnapshot,
-    current: &TribleSet,
-    fragment: &Fragment,
-) -> Result<(TribleSet, CatalogValidation)> {
-    let mut union = current.clone();
-    union += fragment.facts().clone();
-    let mut staged = fragment.clone();
-    let overlay = staged
-        .blobs_mut()
-        .snapshot()
-        .expect("MemoryBlobStore reader creation is infallible");
-    let validation = validate_catalog_with_overlay(reader, Some(&overlay), &union)?;
-    Ok((union, validation))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::schemas::files as files_schema;
     use hifitime::Epoch;
-    use std::fs::File;
-    use triblespace::core::blob::encodings::succinctarchive::{
-        OrderedUniverse, SuccinctArchive, UnionArchive,
-    };
-    use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStoreGet;
     use triblespace::prelude::inlineencodings::Handle;
 
@@ -855,28 +707,6 @@ mod tests {
             block([], None, parts).unwrap(),
         )
         .unwrap()
-    }
-
-    fn empty_reader() -> (tempfile::TempDir, PileSnapshot) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("empty.pile");
-        File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        pile.close().unwrap();
-        (directory, reader)
-    }
-
-    fn validate_fragment(fragment: &Fragment) -> CatalogValidation {
-        let (_directory, reader) = empty_reader();
-        validate_catalog_union(&reader, &TribleSet::new(), fragment)
-            .unwrap()
-            .1
-    }
-
-    fn without_blobs(fragment: Fragment) -> Fragment {
-        let (_, facts, metafacts, _) = fragment.into_parts();
-        Fragment::from_parts(facts, metafacts, Default::default())
     }
 
     fn said(direction: Id, value: &str) -> Fragment {
@@ -974,7 +804,6 @@ mod tests {
             Fragment::rooted(result_id, linked.facts().clone()),
         )
         .unwrap();
-        let (_directory, reader) = empty_reader();
         let mut catalog = receipt;
         catalog += source_projection(
             schema::source_projection::SOURCE_CLAUDE_CODE,
@@ -983,14 +812,6 @@ mod tests {
             block([], None, text("call")).unwrap(),
         )
         .unwrap();
-        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &catalog).unwrap();
-        assert!(
-            matches!(
-                validation,
-                CatalogValidation::Accepted | CatalogValidation::Pending { .. }
-            ),
-            "{validation:?}"
-        );
     }
 
     #[test]
@@ -1009,10 +830,6 @@ mod tests {
         assert!(!exists!(pattern!(&receipt, [{
             block @ schema::block::holds: _?fact
         }])));
-
-        let (_directory, reader) = empty_reader();
-        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &receipt).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
@@ -1035,7 +852,7 @@ mod tests {
             metadata::name: alias,
         };
         let names: BTreeSet<_> = find!(
-            value: TextHandle,
+            value: Inline<Handle<UTF8String>>,
             pattern!(&vocabulary, [{
                 text @ metadata::tag: &metadata::KIND_TAG,
                 metadata::name: ?value,
@@ -1055,11 +872,6 @@ mod tests {
             values,
             BTreeSet::from(["text".to_owned(), "written text".to_owned()])
         );
-
-        let (_directory, reader) = empty_reader();
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &vocabulary).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
@@ -1083,7 +895,12 @@ mod tests {
             observed_twice,
         )
         .unwrap();
-        assert_eq!(validate_fragment(&projected), CatalogValidation::Accepted);
+        let timestamps: BTreeSet<_> = find!(
+            timestamp: Inline<NsTAIInterval>,
+            pattern!(&projected, [{ root @ schema::block::timestamp: ?timestamp }])
+        )
+        .collect();
+        assert_eq!(timestamps, BTreeSet::from([instant(42.0), instant(43.0)]));
     }
 
     #[test]
@@ -1205,10 +1022,6 @@ mod tests {
         let mut fragment = parent_receipt;
         fragment += unrelated_receipt;
         fragment += child_receipt;
-        let (_directory, reader) = empty_reader();
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
@@ -1256,10 +1069,7 @@ mod tests {
         let mut catalog = bottom;
         catalog += predecessor;
         catalog += receipt;
-        let (_directory, reader) = empty_reader();
-        let (_, validation) = validate_catalog_union(&reader, &TribleSet::new(), &catalog).unwrap();
         // Another writer's content-free child is read all the same.
-        assert_eq!(validation, CatalogValidation::Accepted);
         assert!(exists!(pattern!(&catalog, [{
             invalid_id @ schema::block::previous: &predecessor_id
         }])));
@@ -1341,68 +1151,10 @@ mod tests {
             schema::source_projection::resolution: body,
         };
         assert_eq!(selected.root(), Some(root));
-        let (_directory, reader) = empty_reader();
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &selected).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
     }
 
     #[test]
-    fn staged_complete_projection_is_accepted_without_writing() {
-        let (_directory, reader) = empty_reader();
-        let fragment = projection(one_part("hello from the staged overlay"));
-        let (union, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert_eq!(union, fragment.facts().clone());
-        assert_eq!(validation, CatalogValidation::Accepted);
-    }
-
-    #[test]
-    fn complete_graph_without_attachments_is_pending() {
-        let (_directory, reader) = empty_reader();
-        let fragment = projection(one_part("hello without resident bytes"));
-        let validation = validate_catalog(&reader, fragment.facts()).unwrap();
-        let CatalogValidation::Pending { missing } = validation else {
-            panic!("complete graph with absent blobs should be pending");
-        };
-        assert_eq!(missing.len(), 3, "payload, locator, and raw source record");
-    }
-
-    #[test]
-    fn a_succinct_cover_names_the_same_attachments() {
-        let (_directory, reader) = empty_reader();
-        let fragment = projection(one_part("hello from a succinct cover"));
-        let segment = SuccinctArchive::<OrderedUniverse>::from(fragment.facts());
-        let cover = UnionArchive::new(vec![segment.clone(), segment]);
-
-        let validation = validate_catalog(&reader, &cover).unwrap();
-        let CatalogValidation::Pending { missing } = validation else {
-            panic!("complete succinct graph with absent blobs should be pending");
-        };
-        assert_eq!(missing.len(), 3, "payload, locator, and raw source record");
-    }
-
-    #[test]
-    fn a_dangling_response_leaves_only_missing_attachments() {
-        let (_directory, reader) = empty_reader();
-        let mut dangling = projection(one_part("dangling response"));
-        let node = find!(
-            node: Id,
-            pattern!(&dangling, [{ _?receipt @ schema::source_projection::projects_to: ?node }])
-        )
-        .next()
-        .unwrap();
-        dangling += responds_to(node, id(99));
-        let validation = validate_catalog(&reader, dangling.facts()).unwrap();
-        let CatalogValidation::Pending { missing } = validation else {
-            panic!("a response to an absent node is read; only its bytes are missing");
-        };
-        assert_eq!(missing.len(), 3, "payload, locator, and raw source record");
-    }
-
-    #[test]
-    fn unresolved_and_ambiguously_resolved_pointers_are_valid() {
-        let (_directory, reader) = empty_reader();
+    fn unresolved_and_ambiguously_resolved_pointers_are_constructed() {
         let unresolved = asset_pointer_fact(
             schema::content_fact::modality::IMAGE,
             schema::content_fact::direction::IN,
@@ -1413,9 +1165,9 @@ mod tests {
         )
         .unwrap();
         let unresolved = projection(unresolved);
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &unresolved).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
+        assert!(!exists!(pattern!(&unresolved, [{
+            _?fact @ schema::content_fact::resolved_to: _?bytes
+        }])));
 
         let resolved = asset_pointer_fact(
             schema::content_fact::modality::IMAGE,
@@ -1429,14 +1181,16 @@ mod tests {
         .and_then(|fact| resolve_pointer_fact(fact, b"second".as_slice()))
         .unwrap();
         let resolved = projection(resolved);
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &resolved).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
+        let bytes: BTreeSet<_> = find!(
+            bytes: Inline<Handle<RawBytes>>,
+            pattern!(&resolved, [{ _?fact @ schema::content_fact::resolved_to: ?bytes }])
+        )
+        .collect();
+        assert_eq!(bytes.len(), 2);
     }
 
     #[test]
     fn locators_are_additive_occurrence_annotations() {
-        let (_directory, reader) = empty_reader();
         let projection = block_source_projection(
             schema::source_projection::SOURCE_CHATGPT,
             block([], None, one_part("moved export")).unwrap(),
@@ -1461,90 +1215,5 @@ mod tests {
         })
         .unwrap();
         assert_eq!(projection.root(), Some(root));
-        let (_, validation) =
-            validate_catalog_union(&reader, &TribleSet::new(), &projection).unwrap();
-        assert_eq!(validation, CatalogValidation::Accepted);
-    }
-
-    /// The open world, as this reader meets it: a catalog holding facts it
-    /// does not model is read, never refused. Each case is staged with the
-    /// bytes it names, so everything it names is resident.
-    fn assert_read(fragment: &Fragment) {
-        let validation = validate_fragment(fragment);
-        assert_eq!(validation, CatalogValidation::Accepted, "{validation:?}");
-    }
-
-    fn receipt_of(block: Fragment) -> Fragment {
-        source_projection(
-            schema::source_projection::SOURCE_CLAUDE_CODE,
-            "session:open-world",
-            br#"{"type":"test"}"#.as_slice(),
-            block,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn a_fact_with_an_unknown_modality_or_direction_is_read() {
-        let modality = text_fact(id(12), schema::content_fact::direction::IN, "new modality");
-        assert_read(&projection(modality.unwrap()));
-        let direction = text_fact(
-            schema::content_fact::modality::TEXT,
-            id(14),
-            "new direction",
-        );
-        assert_read(&projection(direction.unwrap()));
-    }
-
-    #[test]
-    fn a_text_fact_with_unmodelled_attributes_is_read() {
-        let mut fact = text("annotated by someone else");
-        let fact_id = fact.root().unwrap();
-        fact += entity! { ExclusiveId::force_ref(&fact_id) @
-            metadata::name: "a name no Archive reader models on a fact",
-            schema::content_fact::media_type: &id(13),
-        };
-        assert_read(&projection(fact));
-    }
-
-    #[test]
-    fn a_fact_with_two_payloads_is_read() {
-        let mut fact = text("first payload");
-        let fact_id = fact.root().unwrap();
-        fact += entity! { ExclusiveId::force_ref(&fact_id) @
-            schema::content_fact::payload: "second payload",
-        };
-        assert_read(&projection(fact));
-    }
-
-    #[test]
-    fn entities_whose_ids_do_not_re_derive_are_read() {
-        let fact = fucid();
-        let fact = entity! { &fact @
-            metadata::tag: &schema::content_fact::KIND,
-            schema::content_fact::modality: &schema::content_fact::modality::TEXT,
-            schema::content_fact::direction: &schema::content_fact::direction::IN,
-            schema::content_fact::payload: "held under a fresh id",
-        };
-        let node = fucid();
-        let node = entity! { &node @
-            metadata::tag: &schema::block::KIND,
-            schema::block::holds*: fact,
-        };
-        assert_read(&receipt_of(node));
-    }
-
-    #[test]
-    fn a_node_naming_entities_this_catalog_lacks_is_read() {
-        let node = fucid();
-        let node = entity! { &node @
-            metadata::tag: &schema::block::KIND,
-            schema::block::previous: &id(97),
-            schema::block::holds: &id(98),
-            schema::block::responds_to: &id(99),
-        };
-        let mut catalog = receipt_of(node);
-        catalog += text("a fact no node holds");
-        assert_read(&catalog);
     }
 }

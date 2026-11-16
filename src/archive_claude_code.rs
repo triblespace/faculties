@@ -2740,9 +2740,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::io::Cursor;
 
-    use tempfile::TempDir;
     use triblespace::core::metadata;
-    use triblespace::core::repo::pile::{Pile, PileSnapshot};
     use triblespace::core::repo::BlobStoreGet;
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
     use triblespace::prelude::inlineencodings::Handle;
@@ -2816,9 +2814,6 @@ mod tests {
             assert!(!exists!(pattern!(&projected.fragment, [{
                 receipt @ schema::source_projection::generated_by: _?model
             }])));
-            let (_directory, reader) = empty_reader();
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &projected.fragment)
-                .unwrap();
             variants.push((block, receipt, projected.fragment));
         }
         assert_eq!(
@@ -2875,18 +2870,6 @@ mod tests {
             ids_with_tag(&projected.fragment, schema::vendor_model::KIND),
             BTreeSet::from([opus])
         );
-        let (_directory, reader) = empty_reader();
-        blockdag::validate_catalog_union(&reader, &TribleSet::new(), &projected.fragment).unwrap();
-    }
-
-    fn empty_reader() -> (TempDir, PileSnapshot) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("empty.pile");
-        File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        pile.close().unwrap();
-        (directory, reader)
     }
 
     fn ids_with_tag(fragment: &Fragment, tag: Id) -> BTreeSet<Id> {
@@ -3575,12 +3558,6 @@ mod tests {
         assert_eq!(projected.stats.unresolved_tool_results, 0);
         assert_eq!(projected.stats.undecodable_images, 0);
 
-        let (_directory, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &projected.fragment)
-                .unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
-
         let without_time = block_with_payload(&projected.fragment, "screenshot below");
         assert!(!exists!(pattern!(&projected.fragment, [{
             without_time @ schema::block::timestamp: _?timestamp
@@ -4060,10 +4037,6 @@ mod tests {
         assert!(exists!(pattern!(&error.fragment, [{
             error_block @ schema::block::previous: error_status
         }])));
-        let (_empty, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &ok.fragment).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
 
         let linked = project_text(
             concat!(
@@ -4265,10 +4238,6 @@ mod tests {
         assert!(exists!(pattern!(&union, [{
             child_id @ schema::block::previous: &parent_id
         }])));
-        let (_empty, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
     }
 
     #[test]
@@ -4343,10 +4312,6 @@ mod tests {
             { system @ schema::block::previous: &attachment },
             { child @ schema::block::previous: &system },
         ])));
-        let (_empty, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
     }
 
     #[test]
@@ -4454,11 +4419,6 @@ mod tests {
         assert!(exists!(pattern!(&union, [{
             child_block @ schema::block::previous: &parent
         }])));
-
-        let (_empty, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
     }
 
     #[test]

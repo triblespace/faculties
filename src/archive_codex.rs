@@ -1659,7 +1659,6 @@ mod tests {
 
     use tempfile::TempDir;
     use triblespace::core::metadata;
-    use triblespace::core::repo::pile::{Pile, PileSnapshot};
     use triblespace::core::repo::BlobStoreGet;
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
@@ -1700,16 +1699,6 @@ mod tests {
         })
         .unwrap();
         (directory, summary, fragment)
-    }
-
-    fn empty_reader() -> (TempDir, PileSnapshot) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("empty.pile");
-        File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
-        let reader = pile.snapshot().unwrap();
-        pile.close().unwrap();
-        (directory, reader)
     }
 
     fn ids_with_tag(fragment: &Fragment, tag: Id) -> BTreeSet<Id> {
@@ -1758,11 +1747,6 @@ mod tests {
         assert!(!exists!(pattern!(fragment.facts(), [{
             _?receipt @ schema::source_projection::raw_record: _?raw
         }])));
-
-        let (_directory, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
 
         assert_eq!(
             find!(
@@ -2019,10 +2003,6 @@ mod tests {
                 schema::block::responds_to: call },
             { _?answer @ schema::block::previous: _?output },
         ])));
-        let (_reader_directory, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
     }
 
     #[test]
@@ -2170,11 +2150,6 @@ mod tests {
         );
         assert_eq!(ids_with_tag(&fragment, schema::block::KIND).len(), 5);
         assert_eq!(root_blocks(&fragment).len(), 1, "one chain");
-
-        let (_reader_directory, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &fragment).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
 
         use schema::content_fact::{direction, modality};
         assert_eq!(
@@ -2455,10 +2430,6 @@ mod tests {
             })
             .count();
         assert_eq!(timed, 5, "the parent's three and the fork's own two");
-        let (_reader_directory, reader) = empty_reader();
-        let (_, validation) =
-            blockdag::validate_catalog_union(&reader, &TribleSet::new(), &union).unwrap();
-        assert_eq!(validation, blockdag::CatalogValidation::Accepted);
 
         // Through a real writer cutting one piece per node: the fork's
         // replayed nodes are the parent's own intrinsic COMMITs, byte for
