@@ -28,9 +28,10 @@ use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegiste
 use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
     CollectionStoreExt, Cover, Support,
+    observed_store::DependencyTracker,
 };
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, ObservedStore, SnapshotSource};
 use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
@@ -325,6 +326,21 @@ struct LoadedInputs {
 pub struct WorkspaceObservation(LoadedInputs);
 
 impl WorkspaceObservation {
+    /// A local presentation-cache token, never a stored id or authorization
+    /// generation. Payload-only arrivals can change a rendered answer without
+    /// changing its collection cover; keep navigation while replacing caches.
+    pub fn with_presentation_revision(mut self, serial: u64) -> Self {
+        let advance = |revision: &mut DatasetRevision| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&revision.0);
+            hasher.update(&serial.to_le_bytes());
+            *revision = DatasetRevision(*hasher.finalize().as_bytes());
+        };
+        for dataset in self.0.datasets.values_mut() { advance(&mut dataset.revision); }
+        if let Some(secrets) = &mut self.0.secrets { advance(&mut secrets.revision); }
+        self
+    }
+
     pub fn loaded_context(&self) -> WidgetContext<'_> {
         WidgetContext { datasets: Some(&self.0.datasets), secrets: self.0.secrets.as_ref() }
     }
@@ -344,6 +360,19 @@ impl WorkspaceObservation {
         signer: &ed25519_dalek::SigningKey,
         routes: &CollectionRoutes,
     ) -> Result<Self, String> {
+        Self::observe_tracked(pile, signer, routes, Default::default()).await
+    }
+
+    /// The same raw read-set follows preparation and lazy widget reads, including
+    /// misses. The host compares it against a fixed native snapshot baseline.
+    pub async fn observe_tracked(
+        pile: &mut Pile,
+        signer: &ed25519_dalek::SigningKey,
+        routes: &CollectionRoutes,
+        tracker: DependencyTracker,
+    ) -> Result<Self, String> {
+        let mut observed = ObservedStore::with_tracker(pile, tracker);
+        let pile = &mut observed;
         let mut sources = source_closure(SourceKey::ALL);
         retain_routed_sources(&mut sources, routes);
         let mut unavailable = BTreeSet::new();
@@ -1175,6 +1204,59 @@ mod tests {
 
     use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
     use crate::test_support::initialize_open_collection_fixture;
+
+    #[test]
+    fn resident_workspace_tracks_late_payload_reads_and_invalidates_payload_caches() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::{BlobStorePut, StoreChanges};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[17; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let teams = pile.collection("live widget fixture", CollectionPolicy::new(
+            AdmissionPolicy::Open, AdmissionPolicy::Open,
+        )).unwrap();
+        let routes = CollectionRoutes::from([(TEAMS_SCOPE_ID, teams.handle())]);
+        let tracker = DependencyTracker::default();
+        // Settle derived covers first; subsequent payload writes have no facts.
+        drop(pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap());
+        let baseline = pile.snapshot().unwrap();
+        let first = pollster::block_on(WorkspaceObservation::observe_tracked(
+            &mut pile, &signer, &routes, tracker.clone(),
+        )).unwrap().with_presentation_revision(1);
+        let context = first.loaded_context();
+        let dataset = context.dataset(SourceKey::Teams).unwrap();
+        let clone = dataset.reader.clone();
+        let body: Blob<blobencodings::UTF8String> = "late name or body".to_blob();
+        let handle = body.get_handle();
+        pile.put::<blobencodings::UTF8String, _>("unrelated payload").unwrap();
+        let unrelated = pile.snapshot().unwrap();
+        assert_eq!(unrelated.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        pile.put(body).unwrap();
+        let arrived = pile.snapshot().unwrap();
+        assert_eq!(arrived.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        // UI reads occur after observe returned, through cloned resident readers.
+        assert!(clone.get::<Blob<blobencodings::UTF8String>, _>(handle).is_err());
+        assert_ne!(arrived.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        let second = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes))
+            .unwrap().with_presentation_revision(2);
+        let context = second.loaded_context();
+        let fresh = context.dataset(SourceKey::Teams).unwrap();
+        assert!(fresh.reader.get::<Blob<blobencodings::UTF8String>, _>(handle).is_ok());
+        assert_ne!(dataset.revision, fresh.revision, "payload-only arrivals invalidate presentation caches");
+        assert_eq!(
+            find!(name: Inline<_>, pattern!(dataset.facts, [{ metadata::name: ?name }])).count(),
+            find!(name: Inline<_>, pattern!(fresh.facts, [{ metadata::name: ?name }])).count(),
+            "no relation edit was needed",
+        );
+        let tracker = DependencyTracker::default();
+        let baseline = pile.snapshot().unwrap();
+        let _stable = pollster::block_on(WorkspaceObservation::observe_tracked(
+            &mut pile, &signer, &routes, tracker.clone(),
+        )).unwrap();
+        pile.commit(teams, &signer, entity! { metadata::name: "external relation change" }).unwrap();
+        assert_ne!(pile.snapshot().unwrap().changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        pile.close().unwrap();
+    }
 
     #[test]
     fn resident_workspace_observes_one_live_owner_and_keeps_frozen_views() {

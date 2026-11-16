@@ -17,7 +17,7 @@ use triblespace::core::inline::encodings::hash::Handle;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{
     BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList, BlobStoreMeta,
-    CapabilityProofRead, StoreChanges, StoreDependencies,
+    CapabilityProofRead, ObservedStore, StoreChanges, StoreDependencies,
     StoreSnapshot, WantRead, WantRequest,
 };
 use crate::storage::{AcquiringReader, FacultySnapshot};
@@ -38,7 +38,7 @@ impl std::error::Error for WidgetReadError {
 /// Frozen evidence used by every faculty widget, independent of store ownership.
 #[derive(Clone)]
 pub enum WidgetReader {
-    Resident(PileSnapshot),
+    Resident(ObservedStore<PileSnapshot>),
     Acquiring(AcquiringReader<FacultySnapshot>),
 }
 
