@@ -69,5 +69,32 @@ pub mod spawn {
         "17CFAFF638D79C65700F04D24EE60411" as signal: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The zooid's final reply: claude's stdout.
         "B7536194BBE4B9F40322AE7DB2107528" as report: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The message settlement sent the spawner, once it was sent. A run
+        /// that has one is not messaged again by a repeated settlement.
+        /// Minted 2026-11-16.
+        "3DAD42A1E496E14BC3DE946F835C0144" as message: inlineencodings::GenId;
+        /// Why a settlement step failed (messaging the spawner, retiring the
+        /// persona). The persona stays live while messaging has not succeeded.
+        /// Minted 2026-11-16.
+        "77A6F5D7FEFB8A3E81816D9405C73AC3" as settle_failure: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Why the run's recollection is not tinted by its topic: the topic
+        /// query failed and the untinted memory tail was used instead.
+        /// Minted 2026-11-16.
+        "B5BD0429EB1C43D6F4135BA6BEECF09D" as untinted: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The Compass goal a spawn's brief was rendered from (`spawn goal`).
+        /// Minted 2026-11-16.
+        "FD3241C45361C64F87ED5A597F772BFF" as goal: inlineencodings::GenId;
+        /// A Compass note or status event the brief was rendered from: with
+        /// [`goal`], the exact goal revision. Minted 2026-11-16.
+        "06295B697E2572E5FBEF9EC4C6A51EA1" as goal_revision: inlineencodings::GenId;
+        /// The Compass note the zooid added to its goal when the run launched.
+        /// Minted 2026-11-16.
+        "719C02B24197877361926DEA741AE59C" as goal_note: inlineencodings::GenId;
+        /// Which agent ran the zooid (`claude`, `codex`). Never part of the name.
+        /// Minted 2026-11-16.
+        "793766C6AE1354A9EBD0036458FD06D2" as provider: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Why that provider was chosen: the quota readings that decided an
+        /// `auto` choice, or that it was asked for. Minted 2026-11-16.
+        "055AE3D781937D52DAA5E9EF2E1B3770" as provider_reason: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }

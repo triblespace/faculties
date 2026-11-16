@@ -15,6 +15,9 @@ All notable changes to this project will be documented in this file.
   inbox head stays attention, and a successor that drops the flag makes the
   old mail attention again. `mail account list` shows `quiet`.
 
+- `files fetch` refusing an oversized response now says how to fetch it anyway
+  (`--max-bytes`, MCP `max_bytes`) and reports the server-declared size
+  instead of the limit plus one it had read. The 8 MiB default stays.
 - New faculty `spawn` (compass 9a9e2c95) replaces `worker-unit.sh` and
   `worker-wait.sh`. `spawn run --brief <path|-> --workdir <dir>` starts a task
   zooid: a headless Claude session in user unit `spawn-<name>`, which

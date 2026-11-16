@@ -852,6 +852,7 @@ fn cmd_fetch(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
+    let declared_length = response.content_length();
     use std::io::Read;
     let read_limit = u64::try_from(max_bytes)?
         .checked_add(1)
@@ -862,10 +863,13 @@ fn cmd_fetch(
         .read_to_end(&mut bytes)
         .context("read response body")?;
     if bytes.len() > max_bytes {
+        // Only limit + 1 bytes were read, so that count is not the size.
+        let size = declared_length
+            .map(|n| format!("{n} bytes declared"))
+            .unwrap_or_else(|| "size not declared".to_owned());
         bail!(
-            "response too large: {} bytes (limit {})",
-            bytes.len(),
-            max_bytes
+            "response is larger than the {max_bytes}-byte limit ({size}); \
+             pass a larger --max-bytes (MCP: max_bytes) to fetch it"
         );
     }
 

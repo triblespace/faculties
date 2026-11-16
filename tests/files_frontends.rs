@@ -1025,10 +1025,12 @@ fn download_budget_rejects_oversized_content_without_publication() {
         )
         .unwrap_err();
     worker.join().unwrap();
+    let message = format!("{error:#}");
     assert!(
-        format!("{error:#}").contains("response too large"),
-        "{error:#}"
+        message.contains("larger than the 4-byte limit"),
+        "{message}"
     );
+    assert!(message.contains("--max-bytes"), "{message}");
     assert_eq!(fixture.files().imports().unwrap(), "(no imports)\n");
 }
 

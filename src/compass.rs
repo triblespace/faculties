@@ -24,8 +24,8 @@ pub mod operations;
 mod render;
 
 pub use operations::{
-    AddOptions, AddedGoal, AddedNote, Board, Compass, ListOptions, MovedGoal, NoteOptions,
-    PriorityChange,
+    AddOptions, AddedGoal, AddedNote, Board, Compass, GoalNote, GoalReading, ListOptions,
+    MovedGoal, NoteOptions, PriorityChange,
 };
 
 use crate::storage::FactRead;
