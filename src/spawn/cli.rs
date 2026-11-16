@@ -8,7 +8,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_show};
-use super::{Exit, LaunchConfig, RunRequest, SettleRequest, Spawn};
+use super::{
+    Exit, GoalRequest, LaunchConfig, Launched, Provider, RunRequest, SettleRequest, Spawn,
+};
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +51,35 @@ enum Command {
         /// The spawning persona, messaged when the zooid ends. Defaults to $PERSONA.
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
+        /// The agent: claude, codex, auto (most quota headroom) or local.
+        #[arg(long, default_value = "claude")]
+        provider: String,
+    },
+    /// Launch a zooid for a Compass goal: the brief is rendered from the
+    /// goal's title, its parent chain and its latest notes, plus the zooid's
+    /// authority to note, move and check off the goal itself.
+    ///
+    /// The spawn records the goal revision, and the zooid notes its launch
+    /// on the goal. Nothing moves the goal when the zooid exits.
+    Goal {
+        /// The goal id, or a unique prefix of it.
+        goal: String,
+        /// Directory the zooid starts in.
+        #[arg(long, value_name = "DIR")]
+        workdir: PathBuf,
+        /// Your own instructions, appended to the rendered brief: a file, or
+        /// `-` for stdin.
+        #[arg(long, value_name = "PATH")]
+        extra: Option<String>,
+        /// Effort: low, medium, high, xhigh or max.
+        #[arg(long, default_value = "high")]
+        effort: String,
+        /// The spawning persona, messaged when the zooid ends. Defaults to $PERSONA.
+        #[arg(long, value_name = "PERSONA")]
+        spawner: Option<String>,
+        /// The agent: claude, codex, auto (most quota headroom) or local.
+        #[arg(long, default_value = "claude")]
+        provider: String,
     },
     /// Every spawn, one line each.
     List,
@@ -68,8 +99,9 @@ enum Command {
         poll: u64,
     },
     /// The unit's stop-post step: record the end, message the spawner as the
-    /// zooid, retire the persona. The flags take systemd's EXIT_CODE,
-    /// EXIT_STATUS and SERVICE_RESULT.
+    /// zooid, then retire the persona. Safe to run again after a failure: an
+    /// end or message already recorded is not repeated. The flags take
+    /// systemd's EXIT_CODE, EXIT_STATUS and SERVICE_RESULT.
     Settle {
         name: String,
         /// The run being settled (hex id), as `spawn run` wrote it into the script.
@@ -88,6 +120,41 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
     },
+}
+
+fn spawner_or_persona(spawner: Option<String>) -> Result<String> {
+    spawner
+        .or_else(|| std::env::var("PERSONA").ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("pass --spawner or set PERSONA"))
+}
+
+fn print_launched(launched: &Launched) -> Result<()> {
+    crate::cli::with_output("spawn", |out| {
+        out.line(&launched.name)?;
+        out.note(format!(
+            "started {} (run {:x}, {} prompt chars, {}: {}); report -> {}, log -> {}; \
+             `spawn wait {}` blocks until it ends",
+            launched.unit,
+            launched.run,
+            launched.prompt_chars,
+            launched.provider.name(),
+            launched.provider_reason,
+            launched.report.display(),
+            launched.log.display(),
+            launched.name
+        ))?;
+        if let Some(note) = launched.goal_note {
+            out.note(format!("noted the launch on the goal: {note:x}"))?;
+        }
+        if let Some(why) = &launched.untinted {
+            out.note(format!("recollection untinted: {why}"))?;
+        }
+        for warning in &launched.warnings {
+            out.note(format!("warning: {warning}"))?;
+        }
+        Ok(())
+    })
 }
 
 fn read_brief(source: &str) -> Result<String> {
@@ -128,30 +195,34 @@ pub fn run() -> Result<()> {
                 workdir,
                 effort,
                 spawner,
+                provider,
             } => {
-                let spawner = spawner
-                    .or_else(|| std::env::var("PERSONA").ok())
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| anyhow!("pass --spawner or set PERSONA"))?;
                 let launched = spawn.run(&RunRequest {
                     brief: read_brief(&brief)?,
                     workdir,
                     effort,
-                    spawner,
+                    spawner: spawner_or_persona(spawner)?,
+                    provider: Provider::parse(&provider)?,
                 })?;
-                crate::cli::with_output("spawn", |out| {
-                    out.line(&launched.name)?;
-                    out.note(format!(
-                        "started {} (run {:x}, {} prompt chars); report -> {}, log -> {}; \
-                         `spawn wait {}` blocks until it ends",
-                        launched.unit,
-                        launched.run,
-                        launched.prompt_chars,
-                        launched.report.display(),
-                        launched.log.display(),
-                        launched.name
-                    ))
-                })
+                print_launched(&launched)
+            }
+            Command::Goal {
+                goal,
+                workdir,
+                extra,
+                effort,
+                spawner,
+                provider,
+            } => {
+                let launched = spawn.goal(&GoalRequest {
+                    goal,
+                    extra: extra.as_deref().map(read_brief).transpose()?,
+                    workdir,
+                    effort,
+                    spawner: spawner_or_persona(spawner)?,
+                    provider: Provider::parse(&provider)?,
+                })?;
+                print_launched(&launched)
             }
             Command::List => {
                 let spawns = spawn.list()?;
@@ -181,13 +252,23 @@ pub fn run() -> Result<()> {
                 })?;
                 crate::cli::with_output("spawn", |out| {
                     out.line(format!(
-                        "settled {name} run {:x}: {}, report {}",
+                        "settled {name} run {:x}: {}{}, report {}{}",
                         settled.run,
                         exit.describe(),
+                        if settled.already_ended {
+                            " (end already recorded)"
+                        } else {
+                            ""
+                        },
                         settled
                             .report
                             .map(super::handle_text)
-                            .unwrap_or_else(|| "none".to_owned())
+                            .unwrap_or_else(|| "none".to_owned()),
+                        if settled.already_messaged {
+                            ", spawner already messaged"
+                        } else {
+                            ""
+                        }
                     ))
                 })
             }

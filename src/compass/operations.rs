@@ -104,6 +104,32 @@ pub struct AddedNote {
     pub unresolved_mentions: Vec<String>,
 }
 
+/// One goal as a structured reading, for a caller that renders its own text
+/// from it (`spawn goal`). Lists hold what the facts hold: the schema does not
+/// constrain cardinality, so a goal may have several titles.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalReading {
+    pub goal: Id,
+    /// Every distinct title, sorted.
+    pub titles: Vec<String>,
+    /// The current status event and its word.
+    pub status: Option<(Id, String)>,
+    /// The parent chain upward, nearest first: each step follows the first
+    /// parent in id order, and stops at a cycle or a parent not in view.
+    pub ancestors: Vec<(Id, String)>,
+    /// The goal's notes that no other note supersedes, oldest first.
+    pub notes: Vec<GoalNote>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalNote {
+    pub id: Id,
+    /// The note's time as Compass prints it.
+    pub at: String,
+    pub by: Vec<Id>,
+    pub text: String,
+}
+
 /// A rendered board and the advisory notes about it.
 ///
 /// `notes` is empty for every board a well-behaved, sequential writer
@@ -272,6 +298,15 @@ impl Compass {
 
     pub fn show(&self, id: &str) -> Result<String> {
         show(self.storage(), id.to_owned())
+    }
+
+    /// One goal's title, status, parent chain and current notes.
+    pub fn reading(&self, id: &str) -> Result<GoalReading> {
+        let id = id.to_owned();
+        self.storage().with_view(|space, reader, status_register| {
+            let goal = resolve_task_id(&id, space)?;
+            goal_reading(reader, space, status_register, goal)
+        })
     }
 
     pub fn prioritize(
@@ -1482,6 +1517,74 @@ fn render_goal<P: TriblePattern>(
         }
     }
     Ok(output)
+}
+
+fn goal_reading<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    status_register: &LwwQuery,
+    goal: Id,
+) -> Result<GoalReading> {
+    let status = latest_status_event(space, status_register, goal)
+        .map(|(event, status, _)| -> Result<_> {
+            Ok((event, word(reader, status, &DEFAULT_STATUSES)?))
+        })
+        .transpose()?;
+    let mut ancestors = Vec::new();
+    let mut seen = HashSet::from([goal]);
+    let mut at = goal;
+    while let Some(parent) = task_parents(space, at).into_iter().next() {
+        if !seen.insert(parent) {
+            break;
+        }
+        let title = task_title(reader, space, parent)?;
+        if title.is_empty() {
+            break;
+        }
+        ancestors.push((parent, title));
+        at = parent;
+    }
+    let superseded: HashSet<Id> = find!(
+        (newer: Id, old: Id),
+        pattern!(space, [{ ?newer @ metadata::supersedes: ?old }])
+    )
+    .map(|(_, old)| old)
+    .collect();
+    let mut notes: Vec<(i128, GoalNote)> = Vec::new();
+    for (note, handle, at) in find!(
+        (note: Id, note_handle: TextHandle, at: IntervalValue),
+        pattern!(space, [{
+            ?note @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            board::note: ?note_handle,
+            metadata::created_at: ?at,
+        }])
+    ) {
+        if superseded.contains(&note) {
+            continue;
+        }
+        let (Some(key), Some(at)) = (interval_key(at), format_interval(at)) else {
+            continue;
+        };
+        notes.push((
+            key,
+            GoalNote {
+                id: note,
+                at,
+                by: event_actors(space, note),
+                text: read_text(reader, handle)?,
+            },
+        ));
+    }
+    notes.sort_by(|(a, x), (b, y)| (a, x.id, &x.text).cmp(&(b, y.id, &y.text)));
+    Ok(GoalReading {
+        goal,
+        titles: task_titles(reader, space, goal)?,
+        status,
+        ancestors,
+        notes: notes.into_iter().map(|(_, note)| note).collect(),
+    })
 }
 
 fn show(storage: CompassStorage<'_>, id: String) -> Result<String> {
