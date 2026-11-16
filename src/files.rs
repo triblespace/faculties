@@ -91,7 +91,7 @@ pub fn content_hash_hex(handle: ContentHandle) -> String {
     inlineencodings::Hash::<inlineencodings::Blake3>::to_hex(&hash).to_ascii_lowercase()
 }
 
-fn normalize_selector(input: &str) -> Result<String> {
+pub(crate) fn normalize_selector(input: &str) -> Result<String> {
     let trimmed = input.trim();
     let raw = trimmed.strip_prefix("files:").unwrap_or(trimmed);
     let selector = raw.to_ascii_lowercase();

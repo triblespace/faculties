@@ -709,15 +709,14 @@ fn warm_hearing(
     sources: &crate::voice::synthesis::ModelSources,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    use crate::voice::synthesis::{BreezeSources, ModelSources};
-    use mary::models::breeze::reference::{read_wav, SAMPLE_RATE};
+    use crate::voice::synthesis::ModelSources;
+    use mary::models::breeze::reference::{decode_wav, read_wav, SAMPLE_RATE};
     let pile = pile.ok_or_else(|| anyhow!("hearing needs a pile (--pile or PILE)"))?;
-    let reference_wav = match sources {
-        ModelSources::Breeze(BreezeSources { reference_wav, .. })
-        | ModelSources::Qwen3Tts { reference_wav, .. } => reference_wav,
+    let clip = match sources {
+        ModelSources::Breeze(source) => decode_wav(&source.read_reference()?.0)?,
+        ModelSources::Qwen3Tts { reference_wav, .. } => read_wav(reference_wav)?,
         ModelSources::Invalid(error) => bail!("invalid speech configuration: {error}"),
     };
-    let clip = read_wav(reference_wav)?;
     super::hearing::warm(pile, &clip, SAMPLE_RATE, out)
 }
 

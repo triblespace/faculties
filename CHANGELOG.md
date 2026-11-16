@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The Breeze voice reference can live in the pile:
+  `FACULTIES_BREEZE_REFERENCE_WAV` and `FACULTIES_BREEZE_REFERENCE_TEXT` each
+  take either a host path, as before, or `files:<selector>` (an entity,
+  single-file import or content hash, as `files get` takes it). A selector is
+  read through Files on the faculty's own pile with the ambient routes and
+  key, so the voice no longer depends on one host's disk. A malformed selector
+  is refused when the configuration is read; one that names no file or more
+  than one fails the voice's load with the selector in the error, never
+  falling back to a path or another voice. The reference-codes cache is keyed
+  by the clip's bytes, so a clip read from the pile and the same bytes read
+  from a path share one cache entry. `discord warm --hear` reads the clip the
+  same way. Needs mary's `BreezeVoiceConfig.reference_wav` as bytes.
+
 - `mail attachments <wire>` lists an inbound message's attachments, one line
   per attachment occurrence: ordinal, original filename, media type, size,
   BLAKE3 content handle and occurrence id. With `--save <dir>` it writes each

@@ -28,19 +28,100 @@ pub struct BreezeSources {
     /// The pile whose model collection (`TRIBLESPACE_COLLECTION_MODELS`)
     /// holds Breeze's `nvfp4` root. Every weight is copied to the device.
     pub pile: PathBuf,
-    pub reference_wav: PathBuf,
-    pub reference_text: PathBuf,
+    pub reference_wav: ReferenceSource,
+    pub reference_text: ReferenceSource,
     /// Where the clip's encoded codes are kept between starts, so a start
     /// reads them back instead of encoding the clip on the CPU again (21 to
     /// 24 s on sky for the live clip). `FACULTIES_BREEZE_REFERENCE_CACHE`
     /// names it; empty disables it; unset means
     /// `$XDG_CACHE_HOME/faculties/breeze-reference` or
     /// `~/.cache/faculties/breeze-reference`, like the other faculty caches.
-    /// The files are keyed by clip, transcript, encoder weights and encoder
-    /// version, so one directory serves every binary and every voice.
+    /// The files are keyed by the clip's bytes, transcript, encoder weights
+    /// and encoder version, never by where the clip was read from, so one
+    /// directory serves every binary, every voice and both kinds of
+    /// [`ReferenceSource`].
     pub reference_cache: Option<PathBuf>,
     pub direction: Option<String>,
     pub cfg_scale: f32,
+}
+
+/// Where a Breeze reference input is read from: a host path, or a Files
+/// selector written `files:<hex>` (an entity, single-file import or content
+/// hash, as `files get` takes it), read from the faculty's own pile so the
+/// voice does not depend on one host's disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceSource {
+    Path(PathBuf),
+    /// The normalized selector, without its `files:` prefix.
+    Files(String),
+}
+
+impl ReferenceSource {
+    /// Parse a launcher value without any I/O. A `files:` value must be a
+    /// well-formed selector; whether it names exactly one file is decided
+    /// when it is read, and a miss is an error, never a fallback.
+    fn parse(value: OsString) -> Result<Self> {
+        match value.to_str().and_then(|text| text.strip_prefix("files:")) {
+            Some(selector) => Ok(Self::Files(crate::files::normalize_selector(selector)?)),
+            None => Ok(Self::Path(PathBuf::from(value))),
+        }
+    }
+}
+
+impl std::fmt::Display for ReferenceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Path(path) => write!(formatter, "{}", path.display()),
+            Self::Files(selector) => write!(formatter, "files:{selector}"),
+        }
+    }
+}
+
+#[cfg(feature = "voice-breeze")]
+impl BreezeSources {
+    /// The reference clip's bytes and its transcript, each read once from
+    /// where it is named. Selectors are resolved through Files on `pile` with
+    /// the ambient routes and key, as every faculty reads its pile.
+    pub(crate) fn read_reference(&self) -> Result<(anybytes::Bytes, String)> {
+        let files = [&self.reference_wav, &self.reference_text]
+            .iter()
+            .any(|source| matches!(source, ReferenceSource::Files(_)))
+            .then(|| {
+                crate::files::operations::Files::with_storage(crate::storage::Storage::shared(
+                    self.pile.clone(),
+                    None,
+                ))
+            });
+        let read = |source: &ReferenceSource, what: &str| -> Result<anybytes::Bytes> {
+            match source {
+                ReferenceSource::Path(path) => {
+                    Ok(mary::models::breeze::reference::read_wav_bytes(path)
+                        .with_context(|| format!("read Breeze reference {what} {source}"))?
+                        .into())
+                }
+                ReferenceSource::Files(selector) => files
+                    .as_ref()
+                    .expect("a Files reader exists for a files: source")
+                    .get(selector)
+                    .map(|export| export.bytes)
+                    .with_context(|| {
+                        format!(
+                            "read Breeze reference {what} {source} from {}",
+                            self.pile.display()
+                        )
+                    }),
+            }
+        };
+        let wav = read(&self.reference_wav, "WAV")?;
+        let text = read(&self.reference_text, "transcript")?;
+        let text = String::from_utf8(text.as_ref().to_vec()).with_context(|| {
+            format!(
+                "Breeze reference transcript {} is not UTF-8",
+                self.reference_text
+            )
+        })?;
+        Ok((wav, text))
+    }
 }
 impl ModelSources {
     /// Capture launcher configuration without opening any file or device.
@@ -81,10 +162,10 @@ impl ModelSources {
                     ensure!(!value.trim().is_empty(), "{name} must not be blank");
                     Ok(value)
                 };
-                let path = |name: &str| -> Result<PathBuf> {
+                let reference = |name: &str| -> Result<ReferenceSource> {
                     let value = get(name).with_context(|| format!("Breeze requires {name}"))?;
                     ensure!(!value.is_empty(), "{name} must not be empty");
-                    Ok(PathBuf::from(value))
+                    ReferenceSource::parse(value).with_context(|| name.to_owned())
                 };
                 let direction = get("FACULTIES_BREEZE_DIRECTION")
                     .map(|_| text("FACULTIES_BREEZE_DIRECTION"))
@@ -120,8 +201,8 @@ impl ModelSources {
                 };
                 Ok(Self::Breeze(BreezeSources {
                     pile,
-                    reference_wav: path("FACULTIES_BREEZE_REFERENCE_WAV")?,
-                    reference_text: path("FACULTIES_BREEZE_REFERENCE_TEXT")?,
+                    reference_wav: reference("FACULTIES_BREEZE_REFERENCE_WAV")?,
+                    reference_text: reference("FACULTIES_BREEZE_REFERENCE_TEXT")?,
                     reference_cache,
                     direction,
                     cfg_scale,
@@ -401,17 +482,17 @@ impl Synthesizer {
     #[cfg(feature = "voice-breeze")]
     fn load_breeze(source: &BreezeSources) -> Result<Resident> {
         use mary::models::breeze::{generator::GenerationOptions, resident::BreezeVoiceConfig};
-        let ref_text = std::fs::read_to_string(&source.reference_text)
-            .context("read configured Breeze reference transcript")?;
+        let (wav, ref_text) = source.read_reference()?;
         // Native FLOAT/PCM16 preflight; never Qwen's PCM16/NPY reference kit.
-        let samples = mary::models::breeze::reference::read_wav(&source.reference_wav)?;
+        let samples = mary::models::breeze::reference::decode_wav(&wav)
+            .with_context(|| format!("decode Breeze reference WAV {}", source.reference_wav))?;
         let reference_seconds = samples.len() as f32 / 24_000.0;
         let reference_chars = ref_text.trim().chars().count();
         drop(samples);
         let config = BreezeVoiceConfig {
             quantization: mary::persist::QUANTIZATION_NVFP4.to_owned(),
             lane: mary::models::breeze::PROMPT_LANE,
-            reference_wav: source.reference_wav.clone(),
+            reference_wav: wav,
             reference_text: ref_text,
             reference_cache: source.reference_cache.clone(),
             direction: source.direction.clone(),
@@ -731,9 +812,12 @@ mod tests {
         assert_eq!(source.pile, Path::new("/explicit/self.pile"));
         assert_eq!(
             source.reference_wav,
-            Path::new("/explicit/preferred-float.wav")
+            ReferenceSource::Path("/explicit/preferred-float.wav".into())
         );
-        assert_eq!(source.reference_text, Path::new("/explicit/known.txt"));
+        assert_eq!(
+            source.reference_text,
+            ReferenceSource::Path("/explicit/known.txt".into())
+        );
         assert_eq!(source.cfg_scale, 1.0);
         assert!(source.direction.is_none());
         assert!(
@@ -818,6 +902,171 @@ mod tests {
             None,
         );
         assert!(without_pile.is_err(), "Breeze without a pile");
+    }
+
+    #[test]
+    fn breeze_references_may_name_files_without_io() {
+        let mut settings = breeze_settings();
+        settings.retain(|(name, _)| !name.starts_with("FACULTIES_BREEZE_REFERENCE_"));
+        settings.push((
+            "FACULTIES_BREEZE_REFERENCE_WAV",
+            "files:BAB38A634A7FFAE95D8DD497D0DD6358".into(),
+        ));
+        settings.push(("FACULTIES_BREEZE_REFERENCE_TEXT", "files:a7b4".into()));
+        let ModelSources::Breeze(source) = parse_settings(&settings).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(
+            source.reference_wav,
+            ReferenceSource::Files("bab38a634a7ffae95d8dd497d0dd6358".into())
+        );
+        assert_eq!(source.reference_text, ReferenceSource::Files("a7b4".into()));
+        assert_eq!(
+            source.reference_wav.to_string(),
+            "files:bab38a634a7ffae95d8dd497d0dd6358"
+        );
+        for bad in ["files:", "files:not-hex", "files:/tmp/voice.wav"] {
+            let mut settings = breeze_settings();
+            settings.retain(|(name, _)| *name != "FACULTIES_BREEZE_REFERENCE_WAV");
+            settings.push(("FACULTIES_BREEZE_REFERENCE_WAV", bad.into()));
+            let error = format!("{:#}", parse_settings(&settings).unwrap_err());
+            assert!(error.contains("FACULTIES_BREEZE_REFERENCE_WAV"), "{error}");
+            assert!(error.contains("invalid file selector"), "{error}");
+        }
+    }
+
+    /// A pile holding the reference clip and transcript in Files, with its
+    /// key beside it where an ordinary faculty finds it.
+    #[cfg(feature = "voice-breeze")]
+    fn reference_pile(
+        wav: &[u8],
+        text: &str,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        triblespace::prelude::Id,
+        triblespace::prelude::Id,
+    ) {
+        crate::test_support::clear_ambient_environment();
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("self.pile");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, None).unwrap();
+        let files = crate::files::operations::Files::new(pile.clone(), None);
+        let wav = files
+            .add_bytes(
+                Bytes::from_source(wav.to_vec()),
+                "voice.wav",
+                "audio/wav",
+                &[],
+            )
+            .unwrap();
+        let text = files
+            .add_bytes(
+                Bytes::from_source(text.as_bytes().to_vec()),
+                "voice.txt",
+                "text/plain",
+                &[],
+            )
+            .unwrap();
+        (directory, pile, wav, text)
+    }
+
+    #[cfg(feature = "voice-breeze")]
+    fn sources(pile: &Path, wav: ReferenceSource, text: ReferenceSource) -> BreezeSources {
+        BreezeSources {
+            pile: pile.to_path_buf(),
+            reference_wav: wav,
+            reference_text: text,
+            reference_cache: None,
+            direction: None,
+            cfg_scale: 1.0,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "voice-breeze")]
+    fn breeze_reference_from_files_is_the_stored_bytes_and_keys_like_a_path() {
+        use mary::models::breeze::reference_cache::ReferenceKey;
+        let clip = AudioClip::from_samples(&[0.0, 0.25, -0.25, 0.5], 24_000).unwrap();
+        let (directory, pile, wav, text) = reference_pile(clip.wav.as_ref(), "Known words.\n");
+        let from_files = sources(
+            &pile,
+            ReferenceSource::Files(format!("{wav:x}")),
+            ReferenceSource::Files(format!("{text:x}")),
+        )
+        .read_reference()
+        .unwrap();
+        assert_eq!(from_files.0.as_ref(), clip.wav.as_ref());
+        assert_eq!(from_files.1, "Known words.\n");
+
+        let wav_path = directory.path().join("voice.wav");
+        let text_path = directory.path().join("voice.txt");
+        std::fs::write(&wav_path, clip.wav.as_ref()).unwrap();
+        std::fs::write(&text_path, "Known words.\n").unwrap();
+        let from_paths = sources(
+            &pile,
+            ReferenceSource::Path(wav_path),
+            ReferenceSource::Path(text_path),
+        )
+        .read_reference()
+        .unwrap();
+        assert_eq!(from_paths.0.as_ref(), from_files.0.as_ref());
+        assert_eq!(from_paths.1, from_files.1);
+        // The reference cache is keyed by what was read, not where from.
+        let codec_root = triblespace::prelude::Id::new([7; 16]).unwrap();
+        assert_eq!(
+            ReferenceKey::new(&from_files.0, from_files.1.trim(), codec_root).to_string(),
+            ReferenceKey::new(&from_paths.0, from_paths.1.trim(), codec_root).to_string(),
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "voice-breeze")]
+    fn breeze_reference_selector_that_names_no_single_file_fails_naming_it() {
+        let clip = AudioClip::from_samples(&[0.0; 4], 24_000).unwrap();
+        let (_directory, pile, wav, text) = reference_pile(clip.wav.as_ref(), "Known words.");
+        let read = |selector: &str| {
+            let error = sources(
+                &pile,
+                ReferenceSource::Files(selector.to_owned()),
+                ReferenceSource::Files(format!("{text:x}")),
+            )
+            .read_reference()
+            .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(error.contains(&format!("files:{selector}")), "{error}");
+            error
+        };
+        // An id no file has.
+        let unknown = format!("{:x}", triblespace::prelude::Id::new([0x5a; 16]).unwrap());
+        read(&unknown);
+        // A prefix two files share: seventeen entity ids must repeat a first
+        // hex digit, whatever the ids turn out to be.
+        let files = crate::files::operations::Files::new(pile.clone(), None);
+        let mut ids = vec![wav, text];
+        for index in 0..15_u8 {
+            ids.push(
+                files
+                    .add_bytes(
+                        Bytes::from_source(vec![index]),
+                        "x.bin",
+                        "application/octet-stream",
+                        &[],
+                    )
+                    .unwrap(),
+            );
+        }
+        let firsts: Vec<char> = ids
+            .iter()
+            .map(|id| format!("{id:x}").chars().next().unwrap())
+            .collect();
+        let shared = firsts
+            .iter()
+            .find(|digit| firsts.iter().filter(|other| other == digit).count() > 1)
+            .unwrap();
+        let error = read(&shared.to_string());
+        assert!(error.contains("ambiguous"), "{error}");
     }
 
     #[test]
