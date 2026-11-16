@@ -4,10 +4,15 @@
 //! persona (refusing while a live one has the name), the opening context is
 //! rendered, the unit is started through a [`Launcher`], and only then is the
 //! spawn and its run published, so a launch that never started leaves no run
-//! behind. Settlement, the unit's stop-post step, records the end on the run,
-//! messages the spawner as the zooid, and retires the persona; each of those
-//! is attempted even when an earlier one failed, because a persona left live
-//! would refuse every relaunch of the brief.
+//! behind. The unit is pinned to every collection route the launch resolved,
+//! so the zooid and its settlement read and write where the run was recorded.
+//!
+//! Settlement, the unit's stop-post step, records the end on the run,
+//! messages the spawner as the zooid, and only then retires the persona: a
+//! persona retired before its message went out could never send it. A failed
+//! step is recorded on the run and the persona stays live, so settlement can
+//! simply be run again. It is idempotent: an end already recorded is not
+//! recorded twice, and a spawner already messaged is not messaged again.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -27,6 +32,7 @@ use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
 use super::{Exit, IntervalValue, RunFacts, ScriptFacts, TextHandle};
+use crate::compass::{Compass, NoteOptions};
 use crate::memory_cover::CoverOpts;
 use crate::out::{Out, Part};
 use crate::relations::{ProfileInput, Relations};
@@ -130,8 +136,8 @@ impl Launcher for SystemdLauncher {
 pub trait Renderer: Send + Sync {
     /// The shared self: beliefs, a memory cover and goals.
     fn wake(&self, storage: &Storage) -> Result<String>;
-    /// Recollection chosen for a topic.
-    fn tail(&self, storage: &Storage, about: &str) -> Result<String>;
+    /// Recollection chosen for a topic, or the untinted tail without one.
+    fn tail(&self, storage: &Storage, about: Option<&str>) -> Result<String>;
 }
 
 /// The wake and tail through the Orient and Memory libraries, on the
@@ -174,10 +180,10 @@ impl Renderer for LibraryRenderer {
         Ok(text)
     }
 
-    fn tail(&self, storage: &Storage, about: &str) -> Result<String> {
+    fn tail(&self, storage: &Storage, about: Option<&str>) -> Result<String> {
         let memory = crate::memory::Memory::with_storage(storage.clone());
         let mut options = CoverOpts::plain(self.tail_chars);
-        options.about = Some(about.to_owned());
+        options.about = about.map(str::to_owned);
         Ok(memory.context(&options)?.text)
     }
 }
@@ -189,7 +195,11 @@ pub struct LaunchConfig {
     pub state_dir: PathBuf,
     pub claude: PathBuf,
     pub model: String,
-    /// Sourced by the unit for the colony's collection routes.
+    /// The codex command, for `--provider codex`.
+    pub codex: PathBuf,
+    /// The colony's routes file. The unit sources it for what the launch
+    /// did not resolve itself, and a launch refuses while it names a route
+    /// the launch lacks.
     pub colony_env: Option<PathBuf>,
     pub path: String,
     pub memory_max: String,
@@ -216,6 +226,7 @@ impl LaunchConfig {
                 PathBuf::from("claude")
             },
             model: "claude-opus-5-5".to_owned(),
+            codex: PathBuf::from("codex"),
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
             memory_max: "24G".to_owned(),
@@ -234,6 +245,103 @@ impl LaunchConfig {
     }
 }
 
+/// Which agent runs a zooid. The provider annotates the run; it is never
+/// part of the brief or the name.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Provider {
+    #[default]
+    Claude,
+    Codex,
+    /// Whichever of claude and codex the latest fresh quota readings show
+    /// with the most headroom.
+    Auto,
+    /// A local model. Not available yet.
+    Local,
+}
+
+impl Provider {
+    pub const NAMES: [&'static str; 4] = ["claude", "codex", "auto", "local"];
+
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            "auto" => Ok(Self::Auto),
+            "local" => Ok(Self::Local),
+            other => bail!(
+                "provider {other:?} is not one of {}",
+                Self::NAMES.join(", ")
+            ),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Auto => "auto",
+            Self::Local => "local",
+        }
+    }
+}
+
+/// The provider `auto` picks from one quota reading: the one with the most
+/// headroom left in its tightest fresh window. A reading older than the quota
+/// faculty's stale age, or whose window has already reset, says nothing about
+/// now: such a provider is unknown, and unknown is never spare. Returns the
+/// provider and the readings that decided it.
+pub fn choose_provider(view: &crate::quota::operations::QuotaView) -> Result<(Provider, String)> {
+    use crate::schemas::quota::{PROVIDER_CLAUDE, PROVIDER_CODEX};
+    let stale_after = i128::from(crate::quota::STALE_AFTER_SECONDS) * 1_000_000_000;
+    let mut known = Vec::new();
+    let mut said = Vec::new();
+    for (provider, id) in [
+        (Provider::Claude, PROVIDER_CLAUDE),
+        (Provider::Codex, PROVIDER_CODEX),
+    ] {
+        let tightest = view
+            .groups
+            .iter()
+            .filter(|group| group.provider == id)
+            .filter(|group| view.now - group.observed <= stale_after)
+            .filter(|group| group.resets_at.iter().any(|at| *at > view.now))
+            .filter_map(|group| {
+                let used = group.used_percent.iter().copied().fold(f64::NAN, f64::max);
+                (!used.is_nan()).then_some((100.0 - used, group))
+            })
+            .min_by(|(a, _), (b, _)| a.total_cmp(b));
+        match tightest {
+            Some((headroom, group)) => {
+                said.push(format!(
+                    "{} {headroom:.1}% left (reading {:x}, {} s window{})",
+                    provider.name(),
+                    group.event,
+                    group.window_secs,
+                    group
+                        .bucket
+                        .as_deref()
+                        .map(|bucket| format!(", bucket {bucket}"))
+                        .unwrap_or_default()
+                ));
+                known.push((headroom, provider));
+            }
+            None => said.push(format!("{} unknown (no fresh reading)", provider.name())),
+        }
+    }
+    let readings = said.join("; ");
+    match known
+        .into_iter()
+        .filter(|(headroom, _)| *headroom > 0.0)
+        .max_by(|(a, _), (b, _)| a.total_cmp(b))
+    {
+        Some((_, provider)) => Ok((provider, format!("auto: {readings}"))),
+        None => bail!(
+            "--provider auto found no provider with known headroom ({readings}); name one with \
+             --provider claude or --provider codex"
+        ),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RunRequest {
     /// The brief, verbatim.
@@ -242,6 +350,28 @@ pub struct RunRequest {
     pub effort: String,
     /// The spawning persona: label, alias or id.
     pub spawner: String,
+    pub provider: Provider,
+}
+
+/// Launch a zooid whose brief is rendered from a Compass goal.
+#[derive(Clone, Debug)]
+pub struct GoalRequest {
+    /// The goal: an id or a unique id prefix.
+    pub goal: String,
+    /// The spawner's own instructions, appended to the rendered brief.
+    pub extra: Option<String>,
+    pub workdir: PathBuf,
+    pub effort: String,
+    pub spawner: String,
+    pub provider: Provider,
+}
+
+/// What one launch runs from: the brief text, the memory tail's topic, and
+/// for `spawn goal`, the goal revision it was rendered from.
+struct Brief {
+    text: String,
+    about: String,
+    goal: Option<(Id, Vec<Id>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -255,6 +385,14 @@ pub struct Launched {
     pub report: PathBuf,
     pub log: PathBuf,
     pub prompt_chars: usize,
+    pub provider: Provider,
+    pub provider_reason: String,
+    /// Why the recollection is untinted, when its topic query failed.
+    pub untinted: Option<String>,
+    /// The goal note the zooid added at launch (`spawn goal`).
+    pub goal_note: Option<Id>,
+    /// What went wrong after the unit had started. The zooid runs anyway.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +409,10 @@ pub struct Settled {
     pub run: Id,
     pub report: Option<TextHandle>,
     pub message: Option<Id>,
+    /// The end was already recorded by an earlier settlement.
+    pub already_ended: bool,
+    /// The spawner was already messaged by an earlier settlement.
+    pub already_messaged: bool,
 }
 
 /// One spawn as this observation holds it.
@@ -280,6 +422,9 @@ pub struct SpawnView {
     pub name: String,
     pub brief: TextHandle,
     pub brief_text: Option<String>,
+    /// The Compass goal the brief was rendered from, and that revision.
+    pub goal: Vec<Id>,
+    pub goal_revision: Vec<Id>,
     /// Oldest first.
     pub runs: Vec<RunView>,
 }
@@ -303,6 +448,12 @@ pub struct RunView {
     pub report: Vec<TextHandle>,
     /// The first report's text, when it is here.
     pub report_text: Option<String>,
+    pub provider: Vec<String>,
+    pub provider_reason: Vec<String>,
+    pub untinted: Vec<String>,
+    pub message: Vec<Id>,
+    pub settle_failure: Vec<String>,
+    pub goal_note: Vec<Id>,
 }
 
 impl RunView {
@@ -342,15 +493,149 @@ impl Spawn {
 
     /// Launch the zooid a brief names. Refuses while its persona is live.
     pub fn run(&self, request: &RunRequest) -> Result<Launched> {
-        if !super::EFFORTS.contains(&request.effort.as_str()) {
+        let brief = Brief {
+            about: super::about(&request.brief).to_owned(),
+            text: request.brief.clone(),
+            goal: None,
+        };
+        self.launch(
+            brief,
+            &request.workdir,
+            &request.effort,
+            &request.spawner,
+            request.provider,
+        )
+    }
+
+    /// Launch the zooid for a Compass goal's current revision. The brief is
+    /// rendered from the goal ([`super::goal_brief`]); the spawn records the
+    /// goal and the revision, and the zooid notes its launch on the goal. The
+    /// goal's status is the zooid's to move: nothing here touches it.
+    pub fn goal(&self, request: &GoalRequest) -> Result<Launched> {
+        let reading = Compass::with_storage(self.storage.clone())
+            .reading(&request.goal)
+            .with_context(|| format!("read goal {}", request.goal))?;
+        let rendered = super::goal_brief(&reading, request.extra.as_deref());
+        let brief = Brief {
+            text: rendered.text,
+            about: rendered.about,
+            goal: Some((reading.goal, rendered.revision)),
+        };
+        self.launch(
+            brief,
+            &request.workdir,
+            &request.effort,
+            &request.spawner,
+            request.provider,
+        )
+    }
+
+    /// Every collection route this launch resolves, as the environment
+    /// variable and value the unit exports.
+    fn pinned_routes(&self) -> Result<Vec<(String, String)>> {
+        let mut routes = Vec::new();
+        for (scope, _) in crate::collection_names::table() {
+            let handle = match self.storage.collection_handle(scope) {
+                Ok(handle) => handle,
+                // A workspace leaves roles it does not use unconfigured.
+                Err(_) if self.storage.collection_routes().is_some() => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(handle) = handle {
+                routes.push((
+                    crate::collection_names::override_env_name(scope),
+                    format!("blake3:{}", hex::encode(handle.raw)),
+                ));
+            }
+        }
+        Ok(routes)
+    }
+
+    /// The concrete provider and why, before anything is touched.
+    fn resolve_provider(&self, provider: Provider) -> Result<(Provider, String)> {
+        match provider {
+            Provider::Claude | Provider::Codex => {
+                Ok((provider, format!("{} was asked for", provider.name())))
+            }
+            Provider::Local => bail!(
+                "the local provider is not available yet: Drive has no API for it. Nothing was \
+                 started; pass --provider claude or --provider codex"
+            ),
+            Provider::Auto => {
+                let view = crate::quota::operations::Quota::with_storage(self.storage.clone())
+                    .show()
+                    .context("--provider auto reads the quota faculty")?;
+                choose_provider(&view)
+            }
+        }
+    }
+
+    /// The agent command line for a provider, and whether its stdout is the
+    /// report.
+    fn agent(
+        &self,
+        provider: Provider,
+        effort: &str,
+        mcp_config: &Path,
+        report: &Path,
+    ) -> (Vec<String>, bool) {
+        let text = |path: &Path| path.display().to_string();
+        match provider {
+            Provider::Codex => {
+                // codex has no `max`; `xhigh` is its highest.
+                let effort = if effort == "max" { "xhigh" } else { effort };
+                (
+                    vec![
+                        text(&self.launch.codex),
+                        "exec".to_owned(),
+                        "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                        "--skip-git-repo-check".to_owned(),
+                        "-c".to_owned(),
+                        format!("model_reasoning_effort={effort}"),
+                        "-o".to_owned(),
+                        text(report),
+                        "-".to_owned(),
+                    ],
+                    false,
+                )
+            }
+            _ => (
+                vec![
+                    text(&self.launch.claude),
+                    "-p".to_owned(),
+                    "--model".to_owned(),
+                    self.launch.model.clone(),
+                    "--effort".to_owned(),
+                    effort.to_owned(),
+                    "--dangerously-skip-permissions".to_owned(),
+                    "--strict-mcp-config".to_owned(),
+                    "--mcp-config".to_owned(),
+                    text(mcp_config),
+                    "--output-format".to_owned(),
+                    "text".to_owned(),
+                ],
+                true,
+            ),
+        }
+    }
+
+    fn launch(
+        &self,
+        brief: Brief,
+        workdir: &Path,
+        effort: &str,
+        spawner_label: &str,
+        provider: Provider,
+    ) -> Result<Launched> {
+        if !super::EFFORTS.contains(&effort) {
             bail!(
                 "effort {:?} is not one of {}",
-                request.effort,
+                effort,
                 super::EFFORTS.join(", ")
             );
         }
-        let workdir = std::fs::canonicalize(&request.workdir)
-            .with_context(|| format!("workdir {}", request.workdir.display()))?;
+        let workdir = std::fs::canonicalize(workdir)
+            .with_context(|| format!("workdir {}", workdir.display()))?;
         if !workdir.is_dir() {
             bail!("workdir {} is not a directory", workdir.display());
         }
@@ -359,7 +644,8 @@ impl Spawn {
             .ok_or_else(|| anyhow!("workdir {} is not UTF-8", workdir.display()))?
             .to_owned();
         super::require_unit_safe("workdir", &workdir_text)?;
-        let (spawn_fragment, spawn, brief, name) = super::spawn_fragment(&request.brief)?;
+        let (provider, provider_reason) = self.resolve_provider(provider)?;
+        let (spawn_fragment, spawn, brief_handle, name) = super::spawn_fragment(&brief.text)?;
         let unit = super::unit_for(&name);
         let launch = &self.launch;
         let files = [
@@ -373,11 +659,23 @@ impl Spawn {
         }
         let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path)] = files;
         let mcp_config = launch.state_dir.join("empty-mcp.json");
+        let routes = self.pinned_routes()?;
         if let Some(env) = &launch.colony_env {
-            if !env.is_file() {
-                bail!(
-                    "colony environment {} is missing; a zooid without it would write to \
+            let text = std::fs::read_to_string(env).with_context(|| {
+                format!(
+                    "colony environment {} is unreadable; a zooid without it would write to \
                      private collections",
+                    env.display()
+                )
+            })?;
+            let missing = super::missing_routes(&text, &routes);
+            if !missing.is_empty() {
+                bail!(
+                    "this launch resolved no route for {}, which {} names: it would record the \
+                     run, and pin the zooid, to signer-private collections nobody else reads. \
+                     Run it from a shell that has the colony routes (set -a; . {}; set +a).",
+                    missing.join(", "),
+                    env.display(),
                     env.display()
                 );
             }
@@ -388,10 +686,10 @@ impl Spawn {
         let key = std::fs::canonicalize(&key).with_context(|| format!("key {}", key.display()))?;
 
         let relations = Relations::with_storage(self.storage.clone());
-        let spawner = match relations.person_state(&request.spawner)? {
+        let spawner = match relations.person_state(spawner_label)? {
             Some(state) if !state.retired => state.person,
-            Some(_) => bail!("spawner {} is retired", request.spawner),
-            None => bail!("no persona matches spawner {}", request.spawner),
+            Some(_) => bail!("spawner {spawner_label} is retired"),
+            None => bail!("no persona matches spawner {spawner_label}"),
         };
         let persona = match relations.person_state(&name)? {
             Some(state) if !state.retired => {
@@ -401,9 +699,11 @@ impl Spawn {
                     .unwrap_or_else(|error| format!("unreadable ({error:#})"));
                 bail!(
                     "{name} is still running: its persona {:x} is live (unit {unit} is \
-                     {unit_state}). Settlement retires it; if the unit is gone without \
-                     settling, `relations retire {name}` first.",
-                    state.person
+                     {unit_state}). Settlement retires it once the spawner is messaged; if the \
+                     unit is gone and its settlement failed, run the settle line of {} again, \
+                     or `relations retire {name}`.",
+                    state.person,
+                    script_path.display()
                 );
             }
             Some(state) => {
@@ -418,7 +718,7 @@ impl Spawn {
                             affinities: vec!["zooid".to_owned()],
                             note: Some(format!(
                                 "Task zooid spawned from brief {}.",
-                                super::handle_text(brief)
+                                super::handle_text(brief_handle)
                             )),
                             ..Default::default()
                         },
@@ -432,11 +732,19 @@ impl Spawn {
         let mut started = false;
         let launched = (|| -> Result<Launched> {
             let wake = self.renderer.wake(&self.storage)?;
-            let tail = self
-                .renderer
-                .tail(&self.storage, super::about(&request.brief))?;
-            let preamble = super::preamble(&name, &request.spawner);
-            let prompt = super::assemble_prompt(&wake, &tail, &preamble, &request.brief);
+            let about = Some(brief.about.as_str()).filter(|about| !about.trim().is_empty());
+            // The tint chooses among equal recollections; it is never worth
+            // a launch. Without it the zooid wakes into the untinted tail.
+            let (tail, untinted) = match self.renderer.tail(&self.storage, about) {
+                Ok(tail) => (tail, None),
+                Err(error) if about.is_some() => (
+                    self.renderer.tail(&self.storage, None)?,
+                    Some(format!("{error:#}")),
+                ),
+                Err(error) => return Err(error),
+            };
+            let preamble = super::preamble(&name, spawner_label);
+            let prompt = super::assemble_prompt(&wake, &tail, &preamble, &brief.text);
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -444,10 +752,14 @@ impl Spawn {
                 spawner,
                 unit: unit.clone(),
                 workdir: workdir_text.clone(),
-                effort: request.effort.clone(),
+                effort: effort.to_owned(),
                 prompt: prompt.clone(),
+                provider: provider.name().to_owned(),
+                provider_reason: provider_reason.clone(),
+                untinted: untinted.clone(),
             });
             let text = |path: &Path| path.display().to_string();
+            let (agent, stdout_is_report) = self.agent(provider, effort, &mcp_config, &report_path);
             let script = super::unit_script(&ScriptFacts {
                 name: &name,
                 run,
@@ -455,10 +767,9 @@ impl Spawn {
                 key: &text(&key),
                 path: &launch.path,
                 colony_env: launch.colony_env.as_deref().map(text).as_deref(),
-                claude: &text(&launch.claude),
-                model: &launch.model,
-                effort: &request.effort,
-                mcp_config: &text(&mcp_config),
+                routes: &routes,
+                agent: &agent,
+                stdout_is_report,
                 prompt: &text(&prompt_path),
                 report: &text(&report_path),
                 spawn: &launch.spawn,
@@ -484,19 +795,65 @@ impl Spawn {
             started = true;
             let mut record = spawn_fragment;
             record += run_fragment;
+            if let Some((goal, revision)) = &brief.goal {
+                record += super::goal_fragment(spawn, *goal, revision);
+            }
             self.publish(record).with_context(|| {
                 format!("{unit} is running, but its spawn record was not published")
             })?;
+            let mut warnings = Vec::new();
+            let mut goal_note = None;
+            if let Some((goal, revision)) = &brief.goal {
+                let note = format!(
+                    "spawned {name} run {run:x} from goal revision {}. `spawn show {name}` reads \
+                     it; the goal's status is {name}'s to move.",
+                    revision
+                        .iter()
+                        .map(|id| format!("{id:x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                match Compass::with_storage(self.storage.clone()).note(
+                    &format!("{goal:x}"),
+                    &note,
+                    NoteOptions {
+                        persona: Some(&name),
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(added) => {
+                        goal_note = Some(added.note);
+                        if let Err(error) =
+                            self.publish(super::run_annotation(run, None, None, Some(added.note)))
+                        {
+                            warnings.push(format!(
+                                "the goal note {:x} was added, but recording it on the run \
+                                 failed: {error:#}",
+                                added.note
+                            ));
+                        }
+                    }
+                    Err(error) => warnings.push(format!(
+                        "{unit} is running, but noting the launch on goal {goal:x} failed: \
+                         {error:#}"
+                    )),
+                }
+            }
             Ok(Launched {
                 name: name.clone(),
                 spawn,
                 run,
                 persona,
-                brief,
+                brief: brief_handle,
                 unit: unit.clone(),
                 report: report_path.clone(),
                 log: log_path.clone(),
                 prompt_chars: prompt.chars().count(),
+                provider,
+                provider_reason: provider_reason.clone(),
+                untinted,
+                goal_note,
+                warnings,
             })
         })();
         if launched.is_err() && !started {
@@ -510,73 +867,133 @@ impl Spawn {
         launched
     }
 
-    /// Record a run's end, tell the spawner, and retire the zooid's persona.
-    /// Every step is attempted; the first failure is returned with the rest.
+    /// Record a run's end, tell the spawner, and then retire the zooid's
+    /// persona. Safe to run again: what an earlier settlement recorded is not
+    /// recorded twice. A step that fails is recorded on the run; while the
+    /// spawner has not been messaged the persona stays live, so a repeated
+    /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
-        let report = match &request.report {
-            Some(path) => match std::fs::read(path) {
-                Ok(bytes) if bytes.is_empty() => None,
-                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(error).with_context(|| format!("read {}", path.display()))
-                }
-            },
-            None => None,
-        };
-        let mut failures = Vec::new();
-        let (fragment, report_handle) = super::settlement_fragment(
-            request.run,
-            crate::clock::point_now()?,
-            &request.exit,
-            report.as_deref(),
-        );
-        if let Err(error) = self.publish(fragment) {
-            failures.push(error.context("record the run's end"));
-        }
         let run = request.run;
-        let spawner = self.observe(|facts, _| {
-            Ok(find!(
-                spawner: Id,
-                pattern!(facts, [{ run @ archive_attrs::author: ?spawner }])
+        let (already_ended, earlier_message) = self.observe(|facts, _| {
+            Ok((
+                find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
+                    .next()
+                    .is_some(),
+                find!(id: Id, pattern!(facts, [{ run @ attrs::message: ?id }])).next(),
+            ))
+        })?;
+        let mut failures = Vec::new();
+        let mut report_handle = None;
+        if !already_ended {
+            let report = match &request.report {
+                Some(path) => match std::fs::read(path) {
+                    Ok(bytes) if bytes.is_empty() => None,
+                    Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("read {}", path.display()))
+                    }
+                },
+                None => None,
+            };
+            let (fragment, handle) = super::settlement_fragment(
+                run,
+                crate::clock::point_now()?,
+                &request.exit,
+                report.as_deref(),
+            );
+            report_handle = handle;
+            if let Err(error) = self.publish(fragment) {
+                failures.push(error.context("record the run's end"));
+            }
+        }
+        // What the pile now says about the run is what the message reports,
+        // so a repeated settlement describes the end that was recorded.
+        let recorded = self.observe(|facts, reader| {
+            let started = find!(
+                at: IntervalValue,
+                pattern!(facts, [{ run @ metadata::started_at: ?at }])
             )
-            .next())
+            .next();
+            Ok(started.map(|started| run_view(facts, reader, run, started)))
         });
-        let mut message = None;
-        match spawner {
-            Ok(Some(spawner)) => {
-                let text = format!(
-                    "{} finished, {}, report {}. `spawn show {}` reads it.",
-                    request.name,
-                    request.exit.describe(),
-                    report_handle
-                        .map(super::handle_text)
-                        .unwrap_or_else(|| "none".to_owned()),
-                    request.name
-                );
-                match crate::message::Message::with_storage(self.storage.clone()).send(
-                    &crate::message::SendOptions {
-                        from: &request.name,
-                        to: &format!("{spawner:x}"),
-                        text: &text,
-                    },
-                ) {
-                    Ok(sent) => message = Some(sent.id),
-                    Err(error) => failures.push(error.context("message the spawner")),
+        let (spawner, end, report) = match &recorded {
+            Ok(Some(view)) => (
+                view.spawner.first().copied(),
+                describe_end(view),
+                view.report.first().copied().or(report_handle),
+            ),
+            Ok(None) => (None, request.exit.describe(), report_handle),
+            Err(error) => {
+                failures.push(anyhow!("read the run back: {error:#}"));
+                (None, request.exit.describe(), report_handle)
+            }
+        };
+        let mut message = earlier_message;
+        if message.is_none() {
+            let sent = match spawner {
+                Some(spawner) => {
+                    let text = format!(
+                        "{} finished, {end}, report {}. `spawn show {}` reads it.",
+                        request.name,
+                        report
+                            .map(super::handle_text)
+                            .unwrap_or_else(|| "none".to_owned()),
+                        request.name
+                    );
+                    crate::message::Message::with_storage(self.storage.clone())
+                        .send(&crate::message::SendOptions {
+                            from: &request.name,
+                            to: &format!("{spawner:x}"),
+                            text: &text,
+                        })
+                        .map(|sent| sent.id)
+                        .context("message the spawner")
+                }
+                None => Err(anyhow!("run {run:x} names no spawner to message")),
+            };
+            match sent {
+                Ok(id) => {
+                    message = Some(id);
+                    if let Err(error) =
+                        self.publish(super::run_annotation(run, Some(id), None, None))
+                    {
+                        failures.push(error.context(format!(
+                            "message {id:x} was sent, but recording it on the run failed"
+                        )));
+                    }
+                }
+                Err(error) => {
+                    let why = format!("{error:#}");
+                    if let Err(record) =
+                        self.publish(super::run_annotation(run, None, Some(&why), None))
+                    {
+                        failures.push(record.context("record the settlement failure"));
+                    }
+                    failures.push(error.context(format!(
+                        "{} stays live so that settling again can message",
+                        request.name
+                    )));
                 }
             }
-            Ok(None) => failures.push(anyhow!("run {run:x} names no spawner to message")),
-            Err(error) => failures.push(error.context("find the run's spawner")),
         }
-        if let Err(error) = Relations::with_storage(self.storage.clone()).retire(&request.name) {
-            failures.push(error.context(format!("retire {}", request.name)));
+        if message.is_some() {
+            if let Err(error) = Relations::with_storage(self.storage.clone()).retire(&request.name)
+            {
+                let why = format!("retire {}: {error:#}", request.name);
+                // Best effort: the failure itself is returned either way.
+                let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
+                failures.push(error.context(format!("retire {}", request.name)));
+            }
         }
         let mut failures = failures.into_iter();
         match failures.next() {
             None => Ok(Settled {
                 run,
-                report: report_handle,
+                report,
                 message,
+                already_ended,
+                already_messaged: earlier_message.is_some(),
             }),
             Some(first) => Err(failures.fold(first, |error, next| {
                 error.context(format!("also: {next:#}"))
@@ -743,6 +1160,9 @@ fn spawn_view(
         name: super::name_for(brief),
         brief,
         brief_text: read_text(reader, brief),
+        goal: find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal: ?id }])).collect(),
+        goal_revision: find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal_revision: ?id }]))
+            .collect(),
         runs,
     })
 }
@@ -803,6 +1223,30 @@ fn run_view(
             .collect(),
         report_text: report.first().and_then(|handle| read_text(reader, *handle)),
         report,
+        provider: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::provider: ?handle }]))
+                .collect(),
+        ),
+        provider_reason: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::provider_reason: ?handle }])
+            )
+            .collect(),
+        ),
+        untinted: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::untinted: ?handle }]))
+                .collect(),
+        ),
+        message: find!(id: Id, pattern!(facts, [{ run @ attrs::message: ?id }])).collect(),
+        settle_failure: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::settle_failure: ?handle }])
+            )
+            .collect(),
+        ),
+        goal_note: find!(id: Id, pattern!(facts, [{ run @ attrs::goal_note: ?id }])).collect(),
     }
 }
 
@@ -885,6 +1329,10 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
     let mut out = String::new();
     writeln!(out, "spawn: {} ({:x})", spawn.name, spawn.id).unwrap();
     writeln!(out, "brief: {}", super::handle_text(spawn.brief)).unwrap();
+    if !spawn.goal.is_empty() {
+        writeln!(out, "goal: {}", ids(&spawn.goal)).unwrap();
+        writeln!(out, "goal revision: {}", ids(&spawn.goal_revision)).unwrap();
+    }
     for run in &spawn.runs {
         writeln!(out, "\nrun {:x}", run.id).unwrap();
         if let Some(started) = run.started {
@@ -908,6 +1356,20 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         writeln!(out, "  unit: {}", join(&run.unit)).unwrap();
         writeln!(out, "  workdir: {}", join(&run.workdir)).unwrap();
         writeln!(out, "  effort: {}", join(&run.effort)).unwrap();
+        writeln!(out, "  provider: {}", join(&run.provider)).unwrap();
+        if !run.provider_reason.is_empty() {
+            writeln!(out, "  provider reason: {}", join(&run.provider_reason)).unwrap();
+        }
+        for why in &run.untinted {
+            writeln!(out, "  untinted recollection: {why}").unwrap();
+        }
+        if !run.goal_note.is_empty() {
+            writeln!(out, "  goal note: {}", ids(&run.goal_note)).unwrap();
+        }
+        writeln!(out, "  message: {}", ids(&run.message)).unwrap();
+        for why in &run.settle_failure {
+            writeln!(out, "  settlement failure: {why}").unwrap();
+        }
         writeln!(out, "  persona: {}", ids(&run.persona)).unwrap();
         writeln!(out, "  spawner: {}", ids(&run.spawner)).unwrap();
         let handles = |values: &[TextHandle]| {
@@ -968,14 +1430,22 @@ mod tests {
         }
     }
 
-    struct StubRenderer;
+    #[derive(Default)]
+    struct StubRenderer {
+        /// Refuse a tinted tail the way WeMM refuses an over-long query.
+        refuse_tint: bool,
+    }
 
     impl Renderer for StubRenderer {
         fn wake(&self, _storage: &Storage) -> Result<String> {
             Ok("STUB-WAKE".to_owned())
         }
-        fn tail(&self, _storage: &Storage, about: &str) -> Result<String> {
-            Ok(format!("STUB-TAIL about {about}"))
+        fn tail(&self, _storage: &Storage, about: Option<&str>) -> Result<String> {
+            match about {
+                Some(_) if self.refuse_tint => bail!("WeMM text preparation: too long"),
+                Some(about) => Ok(format!("STUB-TAIL about {about}")),
+                None => Ok("STUB-TAIL untinted".to_owned()),
+            }
         }
     }
 
@@ -987,6 +1457,14 @@ mod tests {
     }
 
     fn fixture_with(launcher: FakeLauncher) -> Fixture {
+        fixture_full(
+            launcher,
+            StubRenderer::default(),
+            "export TRIBLESPACE_PEERS=none\n",
+        )
+    }
+
+    fn fixture_full(launcher: FakeLauncher, renderer: StubRenderer, colony_env: &str) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let pile = directory.path().join("spawn.pile");
         let key = directory.path().join("spawn.key");
@@ -994,12 +1472,13 @@ mod tests {
         initialize_signer(&pile, Some(&key)).unwrap();
         let storage = Storage::new(pile, Some(key));
         let env = directory.path().join("colony.env");
-        std::fs::write(&env, "export TRIBLESPACE_PEERS=none\n").unwrap();
+        std::fs::write(&env, colony_env).unwrap();
         std::fs::create_dir(directory.path().join("lane")).unwrap();
         let launch = LaunchConfig {
             state_dir: directory.path().join("state"),
             claude: PathBuf::from("/fake/claude"),
             model: "claude-opus-5-5".to_owned(),
+            codex: PathBuf::from("/fake/codex"),
             colony_env: Some(env),
             path: "/usr/bin:/bin".to_owned(),
             memory_max: "24G".to_owned(),
@@ -1008,7 +1487,7 @@ mod tests {
         let launcher = Arc::new(launcher);
         let spawn = Spawn::new(storage.clone(), launch)
             .with_launcher(launcher.clone())
-            .with_renderer(Arc::new(StubRenderer));
+            .with_renderer(Arc::new(renderer));
         Relations::with_storage(storage.clone())
             .add(
                 ProfileInput {
@@ -1039,7 +1518,29 @@ mod tests {
                 workdir: self.directory.path().join("lane"),
                 effort: "high".to_owned(),
                 spawner: "agent-cc".to_owned(),
+                provider: Provider::Claude,
             }
+        }
+        fn settle(&self, name: &str, launched: &Launched) -> Result<Settled> {
+            self.spawn.settle(&SettleRequest {
+                name: name.to_owned(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+            })
+        }
+        fn inbox(&self) -> Vec<crate::message::MessageText> {
+            crate::message::Message::with_storage(self.storage.clone())
+                .list(&crate::message::ListOptions::new("agent-cc"))
+                .unwrap()
+                .entries
+                .into_iter()
+                .filter(|entry| entry.incoming)
+                .map(|entry| entry.body)
+                .collect()
+        }
+        fn script(&self, index: usize) -> String {
+            std::fs::read_to_string(&self.launcher.started.lock().unwrap()[index].script).unwrap()
         }
         fn persona(&self, label: &str) -> Option<crate::relations::PersonState> {
             Relations::with_storage(self.storage.clone())
@@ -1114,6 +1615,7 @@ mod tests {
         assert!(at("spawned by agent-cc") < brief_at);
         assert!(prompt.trim_end().ends_with(brief));
         assert!(prompt.contains("Do not arm a colony watcher"));
+        assert!(launched.untinted.is_none());
         assert_eq!(launched.prompt_chars, prompt.chars().count());
         let recorded = f.spawn.show(&launched.name).unwrap().runs[0].prompt[0];
         assert_eq!(recorded, super::super::text_handle(&prompt));
@@ -1240,5 +1742,330 @@ mod tests {
         assert!(is_running("deactivating"));
         assert!(!is_running("inactive"));
         assert!(!is_running("failed"));
+    }
+
+    #[test]
+    fn a_repeated_settlement_neither_records_the_end_twice_nor_messages_twice() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Settle twice.")).unwrap();
+        std::fs::write(&launched.report, "Report.\n").unwrap();
+        let first = f.settle(&launched.name, &launched).unwrap();
+        assert!(!first.already_ended && !first.already_messaged);
+        let again = f.settle(&launched.name, &launched).unwrap();
+        assert!(again.already_ended && again.already_messaged);
+        assert_eq!(again.message, first.message);
+        assert_eq!(again.report, first.report);
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.finished.len(), 1);
+        assert_eq!(run.exit_code, [0]);
+        assert_eq!(run.message, [first.message.unwrap()]);
+        assert_eq!(f.inbox().len(), 1);
+        assert!(f.persona(&launched.name).unwrap().retired);
+    }
+
+    #[test]
+    fn a_settlement_that_cannot_message_keeps_the_persona_live_for_a_repaired_one() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Message fails first.")).unwrap();
+        std::fs::write(&launched.report, "Report.\n").unwrap();
+        // A sender that does not exist cannot message; that is the failure.
+        let error = f.settle("nobody-here", &launched).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("message the spawner"),
+            "{error:#}"
+        );
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(run.ended());
+        assert!(run.message.is_empty());
+        assert_eq!(run.settle_failure.len(), 1, "{:?}", run.settle_failure);
+        assert!(!f.persona(&launched.name).unwrap().retired);
+        assert!(f.inbox().is_empty());
+        // The relaunch refusal says how to finish it.
+        let refusal = f.spawn.run(&f.request("Message fails first.")).unwrap_err();
+        assert!(
+            format!("{refusal:#}").contains("settle line"),
+            "{refusal:#}"
+        );
+
+        let repaired = f.settle(&launched.name, &launched).unwrap();
+        assert!(repaired.already_ended && !repaired.already_messaged);
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.finished.len(), 1, "the end is not recorded twice");
+        assert_eq!(run.message.len(), 1);
+        assert_eq!(f.inbox().len(), 1);
+        assert!(f.persona(&launched.name).unwrap().retired);
+    }
+
+    #[test]
+    fn a_tint_that_fails_falls_back_to_the_untinted_tail_and_says_so() {
+        let f = fixture_full(
+            FakeLauncher::default(),
+            StubRenderer { refuse_tint: true },
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        let launched = f.spawn.run(&f.request("Tint refused.")).unwrap();
+        let why = launched.untinted.clone().unwrap();
+        assert!(why.contains("WeMM"), "{why}");
+        let prompt = std::fs::read_to_string(
+            f.launcher.started.lock().unwrap()[0]
+                .script
+                .with_extension("prompt"),
+        )
+        .unwrap();
+        assert!(prompt.contains("STUB-TAIL untinted"));
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.untinted, [why]);
+    }
+
+    #[test]
+    fn a_launch_refuses_when_the_colony_file_routes_what_it_did_not_resolve() {
+        let f = fixture_full(
+            FakeLauncher::default(),
+            StubRenderer::default(),
+            &format!(
+                "export TRIBLESPACE_COLLECTION_SPAWN=blake3:{}\n",
+                "0".repeat(64)
+            ),
+        );
+        let error = f.spawn.run(&f.request("Unrouted.")).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("TRIBLESPACE_COLLECTION_SPAWN"), "{text}");
+        assert!(text.contains("signer-private"), "{text}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(f.spawn.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_unit_script_pins_no_route_the_launch_did_not_resolve() {
+        // The fixture has no routes: the script exports none, so its zooid
+        // and settlement open the same private collections the launch did.
+        let f = fixture();
+        f.spawn.run(&f.request("No routes.")).unwrap();
+        let script = f.script(0);
+        assert!(
+            !script.contains("export TRIBLESPACE_COLLECTION_"),
+            "{script}"
+        );
+        assert!(script.contains("--strict-mcp-config"));
+        assert!(script.contains("--output-format text < "));
+    }
+
+    #[test]
+    fn codex_writes_its_own_report_and_local_is_refused() {
+        let f = fixture();
+        let mut request = f.request("Codex task.");
+        request.provider = Provider::Codex;
+        request.effort = "max".to_owned();
+        let launched = f.spawn.run(&request).unwrap();
+        assert_eq!(launched.provider, Provider::Codex);
+        let script = f.script(0);
+        assert!(
+            script.contains(&format!(
+                "exec /fake/codex exec --dangerously-bypass-approvals-and-sandbox \
+             --skip-git-repo-check -c model_reasoning_effort=xhigh -o {} - < ",
+                launched.report.display()
+            )),
+            "{script}"
+        );
+        assert!(!script.contains(&format!("> {}", launched.report.display())));
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.provider, ["codex"]);
+        // The provider is not part of the name.
+        assert_eq!(
+            launched.name,
+            super::super::name_for(super::super::text_handle("Codex task."))
+        );
+
+        let mut request = f.request("Local task.");
+        request.provider = Provider::Local;
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(format!("{error:#}").contains("not available yet"));
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert!(f
+            .persona(&super::super::name_for(super::super::text_handle(
+                "Local task."
+            )))
+            .is_none());
+    }
+
+    fn group(
+        provider: Id,
+        used: f64,
+        observed: i128,
+        resets_at: i128,
+    ) -> crate::quota::operations::QuotaGroup {
+        crate::quota::operations::QuotaGroup {
+            event: Id::new([provider.raw()[0]; 16]).unwrap(),
+            provider,
+            provider_name: None,
+            account: "a".to_owned(),
+            window_secs: 18_000,
+            bucket: None,
+            observed,
+            used_percent: vec![used],
+            resets_at: vec![resets_at],
+            host: vec![],
+        }
+    }
+
+    #[test]
+    fn auto_picks_the_most_headroom_and_treats_stale_readings_as_unknown() {
+        use crate::schemas::quota::{PROVIDER_CLAUDE, PROVIDER_CODEX};
+        let hour = 3_600 * 1_000_000_000_i128;
+        let now = 100 * hour;
+        let view = |groups| crate::quota::operations::QuotaView {
+            now,
+            examined: 0,
+            groups,
+            status_examined: 0,
+            statuses: vec![],
+            status_error: None,
+        };
+        let (chosen, why) = choose_provider(&view(vec![
+            group(PROVIDER_CLAUDE, 80.0, now - hour, now + hour),
+            group(PROVIDER_CLAUDE, 10.0, now - hour, now + hour),
+            group(PROVIDER_CODEX, 30.0, now - hour, now + hour),
+        ]))
+        .unwrap();
+        // claude's tightest window has 20% left, codex's 70%.
+        assert_eq!(chosen, Provider::Codex);
+        assert!(
+            why.contains("codex 70.0% left") && why.contains("claude 20.0% left"),
+            "{why}"
+        );
+
+        // A codex reading older than the stale age is unknown, never spare.
+        let (chosen, why) = choose_provider(&view(vec![
+            group(PROVIDER_CLAUDE, 90.0, now - hour, now + hour),
+            group(PROVIDER_CODEX, 0.0, now - 7 * hour, now + hour),
+        ]))
+        .unwrap();
+        assert_eq!(chosen, Provider::Claude);
+        assert!(why.contains("codex unknown"), "{why}");
+
+        // A window that already reset says nothing about now; nothing known refuses.
+        let error = choose_provider(&view(vec![group(
+            PROVIDER_CLAUDE,
+            5.0,
+            now - hour,
+            now - 1,
+        )]))
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no provider with known headroom"));
+        assert!(choose_provider(&view(vec![])).is_err());
+    }
+
+    #[test]
+    fn spawn_goal_renders_the_brief_records_the_revision_and_notes_the_launch() {
+        let f = fixture();
+        let compass = Compass::with_storage(f.storage.clone());
+        let parent = compass
+            .add("The larger aim", crate::compass::AddOptions::default())
+            .unwrap();
+        let parent_hex = format!("{:x}", parent.goal);
+        let goal = compass
+            .add(
+                "Build the widget",
+                crate::compass::AddOptions {
+                    status: "doing",
+                    parent: Some(&parent_hex),
+                    note: Some("Decided: use the small design."),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let goal_hex = format!("{:x}", goal.goal);
+        let request = GoalRequest {
+            goal: goal_hex.clone(),
+            extra: Some("Work in the lane.".to_owned()),
+            workdir: f.directory.path().join("lane"),
+            effort: "high".to_owned(),
+            spawner: "agent-cc".to_owned(),
+            provider: Provider::Claude,
+        };
+        let launched = f.spawn.goal(&request).unwrap();
+        let view = f.spawn.show(&launched.name).unwrap();
+        let brief = view.brief_text.clone().unwrap();
+        assert!(brief.starts_with("# Goal: Build the widget\n"), "{brief}");
+        assert!(brief.contains("The larger aim"));
+        assert!(brief.contains("Decided: use the small design."));
+        assert!(brief.contains("check off") || brief.contains("move it to `done`"));
+        assert!(brief.trim_end().ends_with("Work in the lane."));
+        assert_eq!(view.goal, [goal.goal]);
+        let mut revision = view.goal_revision.clone();
+        revision.sort();
+        let mut expected = vec![goal.status_event, goal.note.unwrap()];
+        expected.sort();
+        assert_eq!(revision, expected);
+        // The tint is the title and its purpose, not the brief's opening.
+        let prompt = std::fs::read_to_string(
+            f.launcher.started.lock().unwrap()[0]
+                .script
+                .with_extension("prompt"),
+        )
+        .unwrap();
+        assert!(prompt.contains("STUB-TAIL about Build the widget. Serves: The larger aim"));
+
+        // The zooid noted its launch on the goal, as itself.
+        let note = launched.goal_note.expect("a launch note");
+        assert!(launched.warnings.is_empty(), "{:?}", launched.warnings);
+        assert_eq!(view.runs[0].goal_note, [note]);
+        let reading = compass.reading(&goal_hex).unwrap();
+        let launch_note = reading.notes.iter().find(|n| n.id == note).unwrap();
+        assert!(launch_note.text.starts_with(&format!(
+            "spawned {} run {:x} from goal revision",
+            launched.name, launched.run
+        )));
+        assert_eq!(launch_note.by, [launched.persona]);
+
+        // Settling does not move the goal.
+        f.settle(&launched.name, &launched).unwrap();
+        let after = compass.reading(&goal_hex).unwrap();
+        assert_eq!(after.status, Some((goal.status_event, "doing".to_owned())));
+
+        // The launch note is a new revision: the same goal renders a new zooid.
+        let again = f.spawn.goal(&request).unwrap();
+        assert_ne!(again.name, launched.name);
+    }
+
+    #[test]
+    fn the_unit_pins_every_route_the_launch_resolved_and_settles_through_them() {
+        let f = fixture();
+        let routes: crate::storage::CollectionRoutes = f
+            .storage
+            .with_store(|store, signer, _| {
+                crate::collection_names::table()
+                    .into_iter()
+                    .map(|(scope, name)| {
+                        let policy =
+                            crate::collection_names::private_policy(signer.verifying_key());
+                        Ok((scope, store.collection(name, policy)?.handle()))
+                    })
+                    .collect()
+            })
+            .unwrap();
+        let routed = f.storage.clone().with_collections(routes.clone());
+        let spawn = Spawn::new(routed, f.spawn.launch.clone())
+            .with_launcher(f.launcher.clone())
+            .with_renderer(Arc::new(StubRenderer::default()));
+        let launched = spawn.run(&f.request("Routed task.")).unwrap();
+        let script = f.script(0);
+        for (scope, handle) in &routes {
+            let line = format!(
+                "export {}=blake3:{}\n",
+                crate::collection_names::override_env_name(*scope),
+                hex::encode(handle.raw)
+            );
+            assert!(script.contains(&line), "missing {line}");
+        }
+        spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: None,
+            })
+            .unwrap();
+        assert!(spawn.show(&launched.name).unwrap().runs[0].message.len() == 1);
     }
 }

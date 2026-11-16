@@ -4,6 +4,8 @@
 //! spawn (the first 32 bits of the handle as two proquints), it
 //! tints the memory tail the zooid wakes into, and it is the prompt. An
 //! identical brief relaunches the same zooid; a changed brief is a new one.
+//! `spawn goal` renders the brief from a Compass goal's current revision, so
+//! a new note on the goal makes a new zooid.
 //!
 //! This module holds the pure parts: naming, the fragments a launch and a
 //! settlement publish, the opening context, and the unit script. Everything
@@ -14,8 +16,9 @@ pub mod mcp;
 pub mod operations;
 
 pub use operations::{
-    LaunchConfig, Launched, Launcher, LibraryRenderer, Renderer, RunRequest, RunView,
-    SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
+    choose_provider, GoalRequest, LaunchConfig, Launched, Launcher, LibraryRenderer, Provider,
+    Renderer, RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher,
+    UnitSpec,
 };
 
 use anyhow::{bail, Result};
@@ -34,8 +37,12 @@ pub type IntervalValue = Inline<NsTAIInterval>;
 pub const UNIT_PREFIX: &str = "spawn-";
 /// Effort levels `claude --effort` accepts.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-/// Characters of the brief that tint the memory tail.
-pub const ABOUT_CHARS: usize = 2_000;
+/// Bytes of topic text that tint the memory tail. WeMM embeds a query of at
+/// most 256 token ids, framing and its terminal embedding token included, and
+/// refuses a longer one rather than truncating it. Its tokenizer is byte-level
+/// BPE, so no byte sequence costs more than one id per byte: 240 bytes fit
+/// whatever the text is, with 16 ids left for the framing.
+pub const ABOUT_BYTES: usize = 240;
 
 const CONSONANTS: &[u8; 16] = b"bdfghjklmnprstvz";
 const VOWELS: &[u8; 4] = b"aiou";
@@ -98,6 +105,15 @@ pub fn spawn_fragment(brief: &str) -> Result<(Fragment, Id, TextHandle, String)>
     Ok((fragment, id, handle, name))
 }
 
+/// The Compass goal revision a brief was rendered from, annotating the spawn.
+pub fn goal_fragment(spawn: Id, goal: Id, revision: &[Id]) -> Fragment {
+    let revision = revision.to_vec();
+    entity! { ExclusiveId::force_ref(&spawn) @
+        attrs::goal: goal,
+        attrs::goal_revision*: revision,
+    }
+}
+
 /// What one launch knows when it starts.
 #[derive(Clone, Debug)]
 pub struct RunFacts {
@@ -109,6 +125,10 @@ pub struct RunFacts {
     pub workdir: String,
     pub effort: String,
     pub prompt: String,
+    pub provider: String,
+    pub provider_reason: String,
+    /// Why the recollection is untinted, when its topic query failed.
+    pub untinted: Option<String>,
 }
 
 /// A run: the spawn and start time as its intrinsic core, the rest as
@@ -126,6 +146,12 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
     let workdir = fragment.put::<UTF8String, _>(run.workdir.clone());
     let effort = fragment.put::<UTF8String, _>(run.effort.clone());
     let prompt = fragment.put::<UTF8String, _>(run.prompt.clone());
+    let provider = fragment.put::<UTF8String, _>(run.provider.clone());
+    let provider_reason = fragment.put::<UTF8String, _>(run.provider_reason.clone());
+    let untinted = run
+        .untinted
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
     fragment += entity! { ExclusiveId::force_ref(&id) @
         attrs::persona: run.persona,
         archive_attrs::author: run.spawner,
@@ -133,8 +159,29 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::workdir: workdir,
         attrs::effort: effort,
         attrs::prompt: prompt,
+        attrs::provider: provider,
+        attrs::provider_reason: provider_reason,
+        attrs::untinted?: untinted,
     };
     (fragment, id)
+}
+
+/// A note about a run that is not part of its end: the message settlement
+/// sent, why a settlement step failed, the goal note of its launch.
+pub fn run_annotation(
+    run: Id,
+    message: Option<Id>,
+    settle_failure: Option<&str>,
+    goal_note: Option<Id>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let failure = settle_failure.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
+    fragment += entity! { ExclusiveId::force_ref(&run) @
+        attrs::message?: message,
+        attrs::settle_failure?: failure,
+        attrs::goal_note?: goal_note,
+    };
+    fragment
 }
 
 /// How the zooid's main process ended, as systemd reports it to a
@@ -235,11 +282,147 @@ pub fn assemble_prompt(wake: &str, tail: &str, preamble: &str, brief: &str) -> S
     prompt
 }
 
-/// The brief's first [`ABOUT_CHARS`] characters, the memory tail's topic.
-pub fn about(brief: &str) -> &str {
-    match brief.char_indices().nth(ABOUT_CHARS) {
-        Some((end, _)) => &brief[..end],
-        None => brief,
+/// The longest prefix of a topic that fits [`ABOUT_BYTES`], ending on a
+/// character boundary: the memory tail's query.
+pub fn about(topic: &str) -> &str {
+    let topic = topic.trim_start();
+    if topic.len() <= ABOUT_BYTES {
+        return topic;
+    }
+    let mut end = ABOUT_BYTES;
+    while !topic.is_char_boundary(end) {
+        end -= 1;
+    }
+    &topic[..end]
+}
+
+/// The environment variables of collection routes that `colony_env` names
+/// and `resolved` lacks. `resolved` holds the variable names a launch pinned.
+/// Lines are read as `[export ]NAME=...`; anything else is ignored.
+pub fn missing_routes(colony_env: &str, resolved: &[(String, String)]) -> Vec<String> {
+    let known: Vec<String> = crate::collection_names::table()
+        .into_iter()
+        .map(|(scope, _)| crate::collection_names::override_env_name(scope))
+        .collect();
+    let mut missing: Vec<String> = colony_env
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+            let (name, _) = line.split_once('=')?;
+            Some(name.trim().to_owned())
+        })
+        .filter(|name| known.contains(name))
+        .filter(|name| !resolved.iter().any(|(pinned, _)| pinned == name))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+/// At most this many of a goal's latest notes go into its brief.
+pub const GOAL_NOTES: usize = 6;
+/// Notes stop being added once their text reaches this many characters; the
+/// latest note is always included whole.
+pub const GOAL_NOTE_CHARS: usize = 6_000;
+
+/// A brief rendered from one Compass goal revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalBrief {
+    pub text: String,
+    /// The status event and notes it was rendered from.
+    pub revision: Vec<Id>,
+    /// The memory tail's topic: the title and its purpose.
+    pub about: String,
+}
+
+/// The brief for a goal: its title, the purpose its parent chain gives it,
+/// its latest notes as the current decisions, the zooid's authority over
+/// the goal, and the spawner's own instructions last.
+pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) -> GoalBrief {
+    let title = if reading.titles.is_empty() {
+        "(untitled)".to_owned()
+    } else {
+        reading.titles.join(" / ")
+    };
+    let mut text = String::new();
+    let mut revision = Vec::new();
+    text.push_str(&format!(
+        "# Goal: {title}\n\nCompass goal {:x}",
+        reading.goal
+    ));
+    match &reading.status {
+        Some((event, status)) => {
+            text.push_str(&format!(", status {status} (event {event:x}).\n"));
+            revision.push(*event);
+        }
+        None => text.push_str(", no status recorded.\n"),
+    }
+    if !reading.ancestors.is_empty() {
+        text.push_str("\n## Purpose\n\nThis goal serves, nearest first:\n");
+        for (id, ancestor) in &reading.ancestors {
+            text.push_str(&format!("- {ancestor} ({id:x})\n"));
+        }
+    }
+    let mut chosen = Vec::new();
+    let mut chars = 0;
+    for note in reading.notes.iter().rev().take(GOAL_NOTES) {
+        if !chosen.is_empty() && chars + note.text.chars().count() > GOAL_NOTE_CHARS {
+            break;
+        }
+        chars += note.text.chars().count();
+        chosen.push(note);
+    }
+    chosen.reverse();
+    if !chosen.is_empty() {
+        text.push_str(&format!(
+            "\n## Current decisions\n\nThe latest {} of the goal's {} current notes, oldest \
+             first. `compass show {:x}` has every note.\n",
+            chosen.len(),
+            reading.notes.len(),
+            reading.goal
+        ));
+        for note in chosen {
+            revision.push(note.id);
+            text.push_str(&format!("\n### Note {:x}, {}\n\n", note.id, note.at));
+            text.push_str(note.text.trim_end());
+            text.push('\n');
+        }
+    }
+    text.push_str(&format!(
+        "\n## Your authority over this goal\n\n\
+         This goal is assigned to you. You may add notes to it and move it (`compass note {id:x}`, \
+         `compass move {id:x}`); leave other goals' status alone. Your process ending does not \
+         achieve the goal, and nothing moves it for you. End in one of these ways, whichever is \
+         true:\n\
+         - Done: move it to `done` and add an outcome note with the evidence (commit, file, \
+         test result).\n\
+         - Not done: add a note naming the remaining step or the dependency you are waiting on, \
+         and leave its status true.\n\
+         - If you judge it needs another zooid's review, you may ask for one: a note naming the \
+         exact candidate (commit, file), its evidence, and the review question. That is your \
+         choice, never a required step.\n",
+        id = reading.goal
+    ));
+    if let Some(extra) = extra.filter(|extra| !extra.trim().is_empty()) {
+        text.push_str("\n## Instructions from the spawner\n\n");
+        text.push_str(extra.trim_end());
+        text.push('\n');
+    }
+    let purpose = reading
+        .ancestors
+        .iter()
+        .map(|(_, title)| title.as_str())
+        .collect::<Vec<_>>();
+    let about_text = if purpose.is_empty() {
+        title
+    } else {
+        format!("{title}. Serves: {}", purpose.join("; "))
+    };
+    GoalBrief {
+        text,
+        revision,
+        about: about(&about_text).to_owned(),
     }
 }
 
@@ -277,17 +460,22 @@ pub struct ScriptFacts<'a> {
     pub key: &'a str,
     pub path: &'a str,
     pub colony_env: Option<&'a str>,
-    pub claude: &'a str,
-    pub model: &'a str,
-    pub effort: &'a str,
-    pub mcp_config: &'a str,
+    /// `TRIBLESPACE_COLLECTION_*` variable and value for every collection
+    /// route the launch itself resolved. Exported after the colony file, so
+    /// the zooid and its settlement open exactly what the launch recorded in.
+    pub routes: &'a [(String, String)],
+    /// The agent command line, without its input and output redirections.
+    pub agent: &'a [String],
+    /// Whether the agent's stdout is its report. When not, the agent writes
+    /// the report file itself and its stdout goes to the unit's log.
+    pub stdout_is_report: bool,
     pub prompt: &'a str,
     pub report: &'a str,
     pub spawn: &'a str,
 }
 
-/// The unit's script. Run without arguments it is the zooid: claude on the
-/// prompt, its stdout the report. Run as `settle` it is the stop-post step,
+/// The unit's script. Run without arguments it is the zooid: the agent on
+/// the prompt, writing the report. Run as `settle` it is the stop-post step,
 /// which systemd runs however the main process ended.
 pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     let q = |word: &str| shell_word(word);
@@ -298,11 +486,16 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
          # bare as the zooid, and with `settle` as its ExecStopPost step.\n",
         facts.name, facts.run
     ));
-    script.push_str("# The user manager hands over its own environment: drop its routes and\n");
-    script.push_str("# take the colony's, so the zooid reads and writes what its spawner does.\n");
+    script.push_str("# The user manager hands over its own environment: drop its routes. The\n");
+    script.push_str("# colony file supplies what the launch did not resolve (peers, routes this\n");
+    script.push_str("# build does not know); every route the launch did resolve is pinned after\n");
+    script.push_str("# it, so the zooid and its settlement open the collections the run is in.\n");
     script.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT ${!TRIBLESPACE_@}\n");
     if let Some(env) = facts.colony_env {
         script.push_str(&format!("set -a; . {} || exit 78; set +a\n", q(env)));
+    }
+    for (variable, value) in facts.routes {
+        script.push_str(&format!("export {}={}\n", variable, q(value)));
     }
     script.push_str(&format!(
         "export PILE={} TRIBLESPACE_KEY={} PERSONA={} PATH={}\n",
@@ -321,16 +514,21 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         q(facts.report)
     ));
     script.push_str("fi\n");
-    script.push_str(&format!(
-        "exec {} -p --model {} --effort {} --dangerously-skip-permissions --strict-mcp-config \
-         --mcp-config {} --output-format text < {} > {}\n",
-        q(facts.claude),
-        q(facts.model),
-        q(facts.effort),
-        q(facts.mcp_config),
-        q(facts.prompt),
-        q(facts.report)
-    ));
+    let agent = facts
+        .agent
+        .iter()
+        .map(|word| q(word))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if facts.stdout_is_report {
+        script.push_str(&format!(
+            "exec {agent} < {} > {}\n",
+            q(facts.prompt),
+            q(facts.report)
+        ));
+    } else {
+        script.push_str(&format!("exec {agent} < {}\n", q(facts.prompt)));
+    }
     script
 }
 
@@ -417,10 +615,101 @@ mod tests {
     }
 
     #[test]
-    fn about_is_a_char_boundary_prefix() {
-        let brief = "ä".repeat(ABOUT_CHARS + 10);
-        assert_eq!(about(&brief).chars().count(), ABOUT_CHARS);
-        assert_eq!(about("short"), "short");
+    fn about_fits_the_embedding_query_budget_on_a_char_boundary() {
+        let brief = "ä".repeat(ABOUT_BYTES);
+        let topic = about(&brief);
+        assert!(topic.len() <= ABOUT_BYTES);
+        assert_eq!(topic.chars().count(), ABOUT_BYTES / 2);
+        // A three-byte character straddling the limit is left out whole.
+        let brief = format!("{}€tail", "a".repeat(ABOUT_BYTES - 1));
+        assert_eq!(about(&brief), "a".repeat(ABOUT_BYTES - 1));
+        assert_eq!(about("  short"), "short");
+        // The brief that failed a launch on 2026-11-16 was 2000 characters.
+        assert!(about(&"word ".repeat(400)).len() <= ABOUT_BYTES);
+    }
+
+    #[test]
+    fn missing_routes_names_what_the_colony_file_routes_and_the_launch_did_not() {
+        let env = "# comment\n\
+                   export TRIBLESPACE_COLLECTION_SPAWN=blake3:00\n\
+                   TRIBLESPACE_COLLECTION_MESSAGE=blake3:11\n\
+                   export TRIBLESPACE_PEERS=x\n\
+                   export TRIBLESPACE_COLLECTION_NOT_A_FACULTY=blake3:22\n\
+                   export WEMM_ROOT=y\n";
+        let pinned = vec![(
+            "TRIBLESPACE_COLLECTION_MESSAGE".to_owned(),
+            "blake3:11".to_owned(),
+        )];
+        assert_eq!(
+            missing_routes(env, &pinned),
+            ["TRIBLESPACE_COLLECTION_SPAWN"]
+        );
+        let all = vec![
+            ("TRIBLESPACE_COLLECTION_MESSAGE".to_owned(), "a".to_owned()),
+            ("TRIBLESPACE_COLLECTION_SPAWN".to_owned(), "b".to_owned()),
+        ];
+        assert!(missing_routes(env, &all).is_empty());
+    }
+
+    fn reading(notes: usize) -> crate::compass::GoalReading {
+        let id = |byte: u8| Id::new([byte; 16]).unwrap();
+        crate::compass::GoalReading {
+            goal: id(1),
+            titles: vec!["Ship the thing".to_owned()],
+            status: Some((id(2), "doing".to_owned())),
+            ancestors: vec![(id(3), "The bigger thing".to_owned())],
+            notes: (0..notes)
+                .map(|n| crate::compass::GoalNote {
+                    id: id(10 + n as u8),
+                    at: format!("2026-11-16T0{n}:00:00"),
+                    by: vec![],
+                    text: format!("decision {n}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_goal_brief_carries_its_revision_purpose_latest_notes_and_authority() {
+        let brief = goal_brief(&reading(8), Some("Use the lane at /x."));
+        let text = &brief.text;
+        assert!(text.starts_with("# Goal: Ship the thing\n"));
+        assert!(text.contains("The bigger thing"));
+        // The latest six of eight notes, oldest first; the two oldest are out.
+        assert!(!text.contains("decision 0") && !text.contains("decision 1\n"));
+        assert!(text.find("decision 2").unwrap() < text.find("decision 7").unwrap());
+        let id = |byte: u8| Id::new([byte; 16]).unwrap();
+        assert_eq!(
+            brief.revision,
+            [id(2), id(12), id(13), id(14), id(15), id(16), id(17)]
+        );
+        assert!(text.contains("move it to `done` and add an outcome note"));
+        assert!(text.contains("never a required step"));
+        assert!(text.trim_end().ends_with("Use the lane at /x."));
+        assert_eq!(brief.about, "Ship the thing. Serves: The bigger thing");
+        // A new note is a new revision, so a new brief and a new zooid.
+        let later = goal_brief(&reading(9), Some("Use the lane at /x."));
+        assert_ne!(
+            name_for(text_handle(&later.text)),
+            name_for(text_handle(text))
+        );
+        // The same revision renders the same brief.
+        assert_eq!(goal_brief(&reading(8), Some("Use the lane at /x.")), brief);
+    }
+
+    #[test]
+    fn goal_notes_stop_at_the_character_budget_but_keep_the_latest() {
+        let mut long = reading(3);
+        for note in &mut long.notes {
+            note.text = "x".repeat(GOAL_NOTE_CHARS);
+        }
+        let brief = goal_brief(&long, None);
+        assert_eq!(
+            brief.revision.len(),
+            2,
+            "the status and the one latest note"
+        );
+        assert!(!brief.text.contains("Instructions from the spawner"));
     }
 
     #[test]
@@ -444,10 +733,12 @@ mod tests {
             key: "/p/self.key",
             path: "/bin",
             colony_env: Some("/c/colony.env"),
-            claude: "/c/claude",
-            model: "claude-opus-5-5",
-            effort: "high",
-            mcp_config: "/s/empty-mcp.json",
+            routes: &[(
+                "TRIBLESPACE_COLLECTION_SPAWN".to_owned(),
+                "blake3:abcd".to_owned(),
+            )],
+            agent: &["/c/claude".to_owned(), "-p".to_owned()],
+            stdout_is_report: true,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
             spawn: "spawn",
@@ -455,9 +746,37 @@ mod tests {
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
         assert!(script.contains("PERSONA=lusab-babad"));
         assert!(script.contains(&format!("settle lusab-babad --run {run:x}")));
-        assert!(script.contains("< /s/n.prompt > /s/n.report\n"));
+        assert!(script.contains("exec /c/claude -p < /s/n.prompt > /s/n.report\n"));
         let unset = script.find("unset ").unwrap();
-        assert!(unset < script.find(". /c/colony.env").unwrap());
-        assert!(script.find("settle").unwrap() < script.find("exec /c/claude").unwrap());
+        let sourced = script.find(". /c/colony.env").unwrap();
+        let pinned = script
+            .find("export TRIBLESPACE_COLLECTION_SPAWN=blake3:abcd\n")
+            .unwrap();
+        // The launch's own routes win over the colony file, and both come
+        // before either the zooid or its settlement runs.
+        assert!(unset < sourced && sourced < pinned);
+        let settle = script.find("= settle ]").unwrap();
+        assert!(pinned < settle);
+        assert!(settle < script.find("exec /c/claude").unwrap());
+    }
+
+    #[test]
+    fn an_agent_that_writes_its_own_report_keeps_stdout_for_the_log() {
+        let script = unit_script(&ScriptFacts {
+            name: "lusab-babad",
+            run: Id::new([7; 16]).unwrap(),
+            pile: "/p/self.pile",
+            key: "/p/self.key",
+            path: "/bin",
+            colony_env: None,
+            routes: &[],
+            agent: &["codex".to_owned(), "exec".to_owned(), "-".to_owned()],
+            stdout_is_report: false,
+            prompt: "/s/n.prompt",
+            report: "/s/n.report",
+            spawn: "spawn",
+        });
+        assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
+        assert!(!script.contains(". /"));
     }
 }
