@@ -13,7 +13,7 @@ use crate::clock;
 use crate::collection_names::open_configured;
 use crate::files;
 use crate::mail::{self, AccountConfigInput, DraftInput, Head, SendAttemptInput};
-use crate::mail_pop;
+use crate::mail_imap;
 use crate::relations;
 use crate::schemas::{
     decide as decide_schema, files as files_schema, mail as mail_schema,
@@ -43,7 +43,8 @@ pub struct AccountOptions {
     pub account: Option<String>,
     pub address: String,
     pub display_name: String,
-    pub pop_endpoint: String,
+    /// Implicit-TLS IMAP endpoint as `host:port` (normally port 993).
+    pub imap_endpoint: String,
     pub smtp_endpoint: String,
     pub username: Option<String>,
     pub credential_version: Option<Id>,
@@ -138,7 +139,16 @@ pub struct AccountFetched {
     pub account: Id,
     pub config: Id,
     pub address: String,
+    /// Messages newly observed, summed over `mailboxes`.
     pub fetched: usize,
+    pub mailboxes: Vec<mail::MailboxFetched>,
+}
+/// What one read-only fetch looks at. The default is every unseen-by-us
+/// message in `INBOX` of every enabled account.
+#[derive(Clone, Debug, Default)]
+pub struct FetchRequest {
+    pub mailboxes: mail::MailboxSelection,
+    pub criteria: mail::SearchCriteria,
 }
 
 /// Configured direct Mail operations. Each call observes maintained Mail, Files,
@@ -195,7 +205,7 @@ impl Mail {
                 input.account,
                 input.address,
                 input.display_name,
-                input.pop_endpoint,
+                input.imap_endpoint,
                 input.smtp_endpoint,
                 input.username,
                 password,
@@ -207,10 +217,11 @@ impl Mail {
     pub fn account_list(&self) -> Result<Vec<AccountSummary>> {
         self.with_operation(account_list)
     }
-    /// Drain every enabled POP account: publish exact evidence before DELE and QUIT.
-    /// A failed QUIT after DELE leaves remote deletion uncertain and is never hidden.
-    pub fn fetch(&self) -> Result<Vec<AccountFetched>> {
-        self.with_operation(cmd_fetch)
+    /// Observe every enabled account's selected mailboxes read-only over IMAP:
+    /// EXAMINE, UID SEARCH, and BODY.PEEK[] for each UID not yet observed under
+    /// the mailbox's current UIDVALIDITY. Nothing on the server is changed.
+    pub fn fetch(&self, request: FetchRequest) -> Result<Vec<AccountFetched>> {
+        self.with_operation(|storage| cmd_fetch(storage, request))
     }
     pub fn draft(&self, input: DraftRequest) -> Result<DraftReceipt> {
         self.with_operation(|storage| cmd_draft(storage, input))
@@ -531,7 +542,7 @@ fn account_set(
     account_selector: Option<String>,
     address: String,
     display_name: String,
-    pop_endpoint: String,
+    imap_endpoint: String,
     smtp_endpoint: String,
     username: Option<String>,
     password: Option<String>,
@@ -569,7 +580,7 @@ fn account_set(
     let mut input = AccountConfigInput {
         address,
         display_name,
-        pop_endpoint,
+        imap_endpoint,
         smtp_endpoint,
         username,
         credential: credential_version.or(old_credential).unwrap_or(anchor),
@@ -607,7 +618,13 @@ fn account_set(
         let previous = mail::account_config(&views.mail.facts, *predecessor)?;
         let same = mail::read_text(&views.mail.reader, previous.address)? == input.address
             && mail::read_text(&views.mail.reader, previous.display_name)? == input.display_name
-            && mail::read_text(&views.mail.reader, previous.pop_endpoint)? == input.pop_endpoint
+            && previous.pop_endpoint.is_none()
+            && previous
+                .imap_endpoint
+                .map(|handle| mail::read_text(&views.mail.reader, handle))
+                .transpose()?
+                .as_deref()
+                == Some(input.imap_endpoint.as_str())
             && mail::read_text(&views.mail.reader, previous.smtp_endpoint)? == input.smtp_endpoint
             && mail::read_text(&views.mail.reader, previous.username)? == input.username
             && previous.credential == input.credential
@@ -1162,7 +1179,7 @@ fn fragment_is_materialized(facts: &FactArchive, fragment: &Fragment) -> bool {
         .all(|expected| facts.iter().any(|actual| &actual == expected))
 }
 
-fn publish_pop_publication_with<P>(
+fn publish_source_publication_with<P>(
     publication: &mail::SourcePublication,
     scopes: Scopes,
     mut publish: P,
@@ -1178,22 +1195,22 @@ where
         publish(
             scopes.files,
             publication.files.clone(),
-            "mail: POP attachment evidence",
+            "mail: IMAP attachment evidence",
         )?;
     }
 
     publish(
         scopes.mail,
         publication.mail.clone(),
-        "mail: POP source evidence and parser projection",
+        "mail: IMAP source evidence and parser projection",
     )?;
 
     Ok(())
 }
 
-fn cmd_fetch(storage: &Storage) -> Result<Vec<AccountFetched>> {
+fn cmd_fetch(storage: &Storage, request: FetchRequest) -> Result<Vec<AccountFetched>> {
     let views = storage.views()?;
-    let mut enabled_anchors = Vec::new();
+    let mut accounts = Vec::new();
     for anchor in mail::account_anchors(&views.mail.facts) {
         let config_id = match mail::account_head(&views.mail.facts, anchor)? {
             Head::Unique(id) => id,
@@ -1202,16 +1219,16 @@ fn cmd_fetch(storage: &Storage) -> Result<Vec<AccountFetched>> {
                 bail!("mail account {anchor:x} has forked configuration heads: {ids:?}")
             }
         };
-        if mail::account_config(&views.mail.facts, config_id)?.enabled {
-            enabled_anchors.push(anchor);
+        let config = mail::account_config(&views.mail.facts, config_id)?;
+        if !config.enabled {
+            continue;
         }
-    }
-    if enabled_anchors.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut accounts = Vec::new();
-    for anchor in enabled_anchors {
+        let Some(endpoint_handle) = config.imap_endpoint else {
+            let address = mail::read_text(&views.mail.reader, config.address)?;
+            bail!(
+                "mail account {address} ({anchor:x}) has a POP-era configuration {config_id:x} with no IMAP endpoint and cannot fetch. POP was removed so that no mailbox is ever drained; re-set the account with `mail account set --account {anchor:x} --imap-endpoint <host>:993 ...` (MCP: mail_account_set with imap_endpoint)"
+            );
+        };
         let account = mail::open_account(
             &views.mail.reader,
             &views.mail.facts,
@@ -1219,42 +1236,75 @@ fn cmd_fetch(storage: &Storage) -> Result<Vec<AccountFetched>> {
             anchor,
             &storage.signer,
         )
-        .with_context(|| format!("open POP account {anchor:x}"))?;
-        accounts.push(account);
+        .with_context(|| format!("open IMAP account {anchor:x}"))?;
+        accounts.push((account, endpoint_handle, config.username));
     }
     drop(views);
 
     let mut result = Vec::new();
-    for account in accounts {
-        let (host, port) = endpoint(&account.pop_endpoint, "POP")?;
+    for (account, endpoint_handle, username_handle) in accounts {
+        let endpoint_text = account
+            .imap_endpoint
+            .clone()
+            .expect("an account with an IMAP endpoint handle opens with its text");
+        let (host, port) = endpoint(&endpoint_text, "IMAP")?;
         let session =
-            mail_pop::connect_implicit_tls(host, port, &account.username, &account.password)
-                .with_context(|| format!("connect POP account {}", account.address))?;
-        let mut fetched = 0usize;
-        mail::drain_pop(session, account.anchor, account.config, |publication| {
-            publish_pop_publication_with(
-                publication,
-                storage.scopes,
-                |scope, fragment, description| storage.publish(scope, fragment, description),
-            )?;
-            fetched += 1;
-            Ok(())
-        })
-        .with_context(|| {
-            format!(
-                "drain POP account {}; a QUIT failure after DELE is an uncertain remote deletion transaction",
-                account.address
-            )
-        })?;
-        storage
-            .notices
-            .borrow_mut()
-            .push(format!("{}: fetched {fetched} message(s)", account.address));
+            mail_imap::connect_implicit_tls(host, port, &account.username, &account.password)
+                .with_context(|| format!("connect IMAP account {}", account.address))?;
+        let mailboxes = mail::fetch_imap(
+            session,
+            account.anchor,
+            account.config,
+            &request.mailboxes,
+            &request.criteria,
+            |mailbox, uidvalidity| {
+                // Asked once per mailbox at the point of use, so it also sees
+                // what this fetch published in earlier mailboxes.
+                let views = storage.views()?;
+                Ok(mail::imap_held_uids(
+                    &views.mail.facts,
+                    account.anchor,
+                    endpoint_handle,
+                    username_handle,
+                    mailbox,
+                    uidvalidity,
+                ))
+            },
+            |publication| {
+                publish_source_publication_with(
+                    publication,
+                    storage.scopes,
+                    |scope, fragment, description| storage.publish(scope, fragment, description),
+                )
+            },
+        )
+        .with_context(|| format!("fetch IMAP account {}", account.address))?;
+        let fetched = mailboxes.iter().map(|mailbox| mailbox.fetched).sum();
+        {
+            let mut notices = storage.notices.borrow_mut();
+            for mailbox in &mailboxes {
+                for (uid, size) in &mailbox.oversized {
+                    notices.push(format!(
+                        "{} {:?}: UID {uid} is {size} bytes, over the {}-byte cap; left unread on the server",
+                        account.address,
+                        mailbox.mailbox,
+                        mail::MAX_MESSAGE_BYTES
+                    ));
+                }
+                for (uid, reason) in &mailbox.unparsed {
+                    notices.push(format!(
+                        "{} {:?}: UID {uid} was not recorded: {reason}",
+                        account.address, mailbox.mailbox
+                    ));
+                }
+            }
+        }
         result.push(AccountFetched {
             account: account.anchor,
             config: account.config,
             address: account.address,
             fetched,
+            mailboxes,
         });
     }
     Ok(result)
@@ -1266,7 +1316,6 @@ use crate::schemas::mail::{observation, projection};
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::fs::File;
     use std::rc::Rc;
 
@@ -1325,7 +1374,7 @@ mod tests {
                 AccountConfigInput {
                     address: "me@example.test".into(),
                     display_name: "Me".into(),
-                    pop_endpoint: "pop.example.test:995".into(),
+                    imap_endpoint: "imap.example.test:993".into(),
                     smtp_endpoint: "smtp.example.test:465".into(),
                     username: "me@example.test".into(),
                     credential: credential_id,
@@ -1480,7 +1529,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "me@example.test".into(),
             "Renamed".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             None,
@@ -1516,7 +1565,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "me@example.test".into(),
             "Me".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             Some("mailbox password".into()),
@@ -1560,7 +1609,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "  me@example.test  ".into(),
             "  Me  ".into(),
-            "  pop.example.test:995  ".into(),
+            "  imap.example.test:993  ".into(),
             "  smtp.example.test:465  ".into(),
             None,
             None,
@@ -1588,7 +1637,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "  me@example.test  ".into(),
             "  Me  ".into(),
-            "  pop.example.test:995  ".into(),
+            "  imap.example.test:993  ".into(),
             "  smtp.example.test:465  ".into(),
             None,
             None,
@@ -1621,7 +1670,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "   ".into(),
             "Me".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             Some("replacement password".into()),
@@ -1643,7 +1692,7 @@ mod tests {
             None,
             "other@example.test".into(),
             "Other".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             Some("new password".into()),
@@ -1675,7 +1724,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "me@example.test".into(),
             "Me".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             None,
@@ -1686,7 +1735,7 @@ mod tests {
 
         // Disabled accounts do not participate in the all-enabled credential
         // opening preflight.
-        cmd_fetch(&storage).unwrap();
+        cmd_fetch(&storage, FetchRequest::default()).unwrap();
     }
 
     #[test]
@@ -1720,7 +1769,7 @@ mod tests {
             Some(format!("{:x}", fixture.account)),
             "me@example.test".into(),
             "Me".into(),
-            "pop.example.test:995".into(),
+            "imap.example.test:993".into(),
             "smtp.example.test:465".into(),
             None,
             None,
@@ -1894,130 +1943,21 @@ mod tests {
         assert!(matches!(outbox[0].delivery, DraftDelivery::Pending));
     }
 
-    #[derive(Default)]
-    struct PopState {
-        events: Vec<String>,
-        marked: Vec<u32>,
-        committed: Vec<u32>,
-    }
-
-    struct FakePop {
-        state: Rc<RefCell<PopState>>,
-        items: Vec<mail::PopItem>,
-        messages: HashMap<u32, Vec<u8>>,
-        fail_dele: Option<u32>,
-        fail_quit: bool,
-        quit: bool,
-    }
-
-    impl Drop for FakePop {
-        fn drop(&mut self) {
-            if !self.quit {
-                self.state.borrow_mut().events.push("disconnect".into());
-            }
-        }
-    }
-
-    impl mail::PopTxn for FakePop {
-        fn enumerate_uidls(&mut self) -> Result<Vec<mail::PopItem>> {
-            self.state.borrow_mut().events.push("uidl".into());
-            Ok(self.items.clone())
-        }
-
-        fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
-            self.state
-                .borrow_mut()
-                .events
-                .push(format!("retr:{session_seq}"));
-            self.messages
-                .get(&session_seq)
-                .cloned()
-                .ok_or_else(|| anyhow!("missing scripted message {session_seq}"))
-        }
-
-        fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
-            self.state
-                .borrow_mut()
-                .events
-                .push(format!("dele:{session_seq}"));
-            if self.fail_dele == Some(session_seq) {
-                bail!("scripted DELE rejection");
-            }
-            self.state.borrow_mut().marked.push(session_seq);
-            Ok(())
-        }
-
-        fn quit(mut self) -> Result<()> {
-            self.state.borrow_mut().events.push("quit".into());
-            if self.fail_quit {
-                bail!("scripted lost QUIT reply");
-            }
-            let marked = self.state.borrow().marked.clone();
-            self.state.borrow_mut().committed = marked;
-            self.quit = true;
-            Ok(())
-        }
-    }
-
-    fn fake_pop(state: Rc<RefCell<PopState>>, messages: Vec<(u32, &str, Vec<u8>)>) -> FakePop {
-        FakePop {
-            state,
-            items: messages
-                .iter()
-                .map(|(sequence, uidl, _)| mail::PopItem {
-                    session_seq: *sequence,
-                    uidl: (*uidl).to_owned(),
-                })
-                .collect(),
-            messages: messages
-                .into_iter()
-                .map(|(sequence, _, raw)| (sequence, raw))
-                .collect(),
-            fail_dele: None,
-            fail_quit: false,
-            quit: false,
-        }
-    }
-
-    fn publish_recording(
-        storage: &Storage,
-        state: &Rc<RefCell<PopState>>,
-        publication: &mail::SourcePublication,
-        fail_scope: Option<Id>,
-    ) -> Result<()> {
-        publish_pop_publication_with(
-            publication,
-            storage.scopes,
-            |scope, fragment, description| {
-                let label = if scope == storage.scopes.files {
-                    "files"
-                } else if scope == storage.scopes.mail {
-                    "mail"
-                } else {
-                    "unexpected-scope"
-                };
-                state.borrow_mut().events.push(label.into());
-                if fail_scope == Some(scope) {
-                    bail!("scripted {label} publication failure");
-                }
-                storage.publish(scope, fragment, description)
-            },
-        )
-    }
-
     #[test]
     fn reply_to_digest_only_wire_omits_remote_thread_headers() {
         let fixture = Fixture::new();
         let storage = fixture.storage();
-        let publication = mail::pop_publication(
+        let publication = mail::imap_publication(
             fixture.account,
             fixture.config,
-            "no-message-id",
+            "INBOX",
+            1,
+            1,
             b"From: Sender <sender@example.test>\r\nTo: me@example.test\r\nSubject: No remote identity\r\n\r\nbody",
         )
         .unwrap();
         let wire = publication.wire;
-        publish_pop_publication_with(
+        publish_source_publication_with(
             &publication,
             storage.scopes,
             |scope, fragment, description| storage.publish(scope, fragment, description),
@@ -2046,202 +1986,327 @@ mod tests {
         assert!(draft.references.is_empty());
     }
 
-    #[test]
-    fn pop_composition_is_files_then_mail_then_dele_then_quit() {
-        let fixture = Fixture::new();
-        let storage = fixture.storage();
-        let bytes = raw("ordered@example.test");
-        let expected =
-            mail::pop_publication(fixture.account, fixture.config, "uid-1", &bytes).unwrap();
-        let state = Rc::new(RefCell::new(PopState::default()));
-        let transaction = fake_pop(state.clone(), vec![(1, "uid-1", bytes)]);
-
-        mail::drain_pop(
-            transaction,
-            fixture.account,
-            fixture.config,
-            |publication| publish_recording(&storage, &state, publication, None),
-        )
-        .unwrap();
-
-        assert_eq!(
-            state.borrow().events,
-            ["uidl", "retr:1", "files", "mail", "dele:1", "quit"]
-        );
-        assert_eq!(state.borrow().committed, [1]);
-        let views = storage.views().unwrap();
-        assert!(fragment_is_materialized(
-            &views.files.facts,
-            &expected.files
-        ));
-        assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+    /// A scripted read-only IMAP server: mailboxes of (UIDVALIDITY, messages).
+    /// It records every call so tests can see exactly what a fetch asked for.
+    struct FakeImap {
+        events: Rc<RefCell<Vec<String>>>,
+        mailboxes: Vec<(String, u32, Vec<(u32, Vec<u8>)>)>,
+        examined: Option<usize>,
     }
 
-    #[test]
-    fn pop_publication_failures_prevent_dele_and_retry_reuses_durable_files() {
-        let fixture = Fixture::new();
-        let storage = fixture.storage();
+    impl mail::ImapSource for FakeImap {
+        fn mailboxes(&mut self) -> Result<Vec<String>> {
+            self.events.borrow_mut().push("list".into());
+            Ok(self
+                .mailboxes
+                .iter()
+                .map(|(name, ..)| name.clone())
+                .collect())
+        }
 
-        let state = Rc::new(RefCell::new(PopState::default()));
-        let bytes = raw("files-fail@example.test");
-        let transaction = fake_pop(state.clone(), vec![(1, "uid-files", bytes)]);
-        assert!(mail::drain_pop(
-            transaction,
-            fixture.account,
-            fixture.config,
-            |publication| {
-                publish_recording(&storage, &state, publication, Some(storage.scopes.files))
-            }
-        )
-        .is_err());
-        assert_eq!(
-            state.borrow().events,
-            ["uidl", "retr:1", "files", "disconnect"]
-        );
+        fn examine(&mut self, mailbox: &str) -> Result<u32> {
+            self.events.borrow_mut().push(format!("examine:{mailbox}"));
+            let index = self
+                .mailboxes
+                .iter()
+                .position(|(name, ..)| name == mailbox)
+                .ok_or_else(|| anyhow!("scripted NO for {mailbox}"))?;
+            self.examined = Some(index);
+            Ok(self.mailboxes[index].1)
+        }
 
-        let bytes = raw("mail-fail@example.test");
-        let expected =
-            mail::pop_publication(fixture.account, fixture.config, "uid-mail", &bytes).unwrap();
-        let state = Rc::new(RefCell::new(PopState::default()));
-        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes.clone())]);
-        assert!(mail::drain_pop(
-            transaction,
-            fixture.account,
-            fixture.config,
-            |publication| {
-                publish_recording(&storage, &state, publication, Some(storage.scopes.mail))
-            }
-        )
-        .is_err());
-        assert_eq!(
-            state.borrow().events,
-            ["uidl", "retr:2", "files", "mail", "disconnect"]
-        );
-        let views = storage.views().unwrap();
-        assert!(fragment_is_materialized(
-            &views.files.facts,
-            &expected.files
-        ));
-        assert!(!fragment_is_materialized(&views.mail.facts, &expected.mail));
+        fn search(&mut self, _criteria: &mail::SearchCriteria) -> Result<Vec<u32>> {
+            let index = self.examined.expect("search after examine");
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .map(|(uid, _)| *uid)
+                .collect())
+        }
 
-        let state = Rc::new(RefCell::new(PopState::default()));
-        let transaction = fake_pop(state.clone(), vec![(2, "uid-mail", bytes)]);
-        mail::drain_pop(
-            transaction,
-            fixture.account,
-            fixture.config,
-            |publication| publish_recording(&storage, &state, publication, None),
-        )
-        .unwrap();
-        assert_eq!(
-            state.borrow().events,
-            ["uidl", "retr:2", "files", "mail", "dele:2", "quit"]
-        );
-        assert_eq!(state.borrow().committed, [2]);
-    }
+        fn sizes(&mut self, uids: &[u32]) -> Result<Vec<(u32, u64)>> {
+            self.events.borrow_mut().push(format!("sizes:{uids:?}"));
+            let index = self.examined.expect("sizes after examine");
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .filter(|(uid, _)| uids.contains(uid))
+                .map(|(uid, raw)| (*uid, raw.len() as u64))
+                .collect())
+        }
 
-    #[test]
-    fn dele_and_quit_failures_leave_durable_mail_without_claiming_rollback() {
-        for fail_quit in [false, true] {
-            let fixture = Fixture::new();
-            let storage = fixture.storage();
-            let bytes = raw(if fail_quit {
-                "quit-fail@example.test"
-            } else {
-                "dele-fail@example.test"
-            });
-            let uidl = if fail_quit { "uid-quit" } else { "uid-dele" };
-            let expected =
-                mail::pop_publication(fixture.account, fixture.config, uidl, &bytes).unwrap();
-            let state = Rc::new(RefCell::new(PopState::default()));
-            let mut transaction = fake_pop(state.clone(), vec![(1, uidl, bytes)]);
-            transaction.fail_dele = (!fail_quit).then_some(1);
-            transaction.fail_quit = fail_quit;
-            let error = mail::drain_pop(
-                transaction,
-                fixture.account,
-                fixture.config,
-                |publication| publish_recording(&storage, &state, publication, None),
-            )
-            .unwrap_err();
-            let views = storage.views().unwrap();
-            assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
-            assert!(state.borrow().committed.is_empty());
-            if fail_quit {
-                assert!(format!("{error:#}").contains("uncertain"));
-                assert_eq!(
-                    state.borrow().events,
-                    [
-                        "uidl",
-                        "retr:1",
-                        "files",
-                        "mail",
-                        "dele:1",
-                        "quit",
-                        "disconnect"
-                    ]
-                );
-            } else {
-                assert_eq!(
-                    state.borrow().events,
-                    ["uidl", "retr:1", "files", "mail", "dele:1", "disconnect"]
-                );
-            }
+        fn fetch(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
+            self.events.borrow_mut().push(format!("fetch:{uid}"));
+            let index = self.examined.expect("fetch after examine");
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .find(|(candidate, _)| *candidate == uid)
+                .map(|(_, raw)| raw.clone()))
+        }
+
+        fn logout(self) -> Result<()> {
+            self.events.borrow_mut().push("logout".into());
+            Ok(())
         }
     }
 
-    #[test]
-    fn empty_maildrop_quits_and_late_failure_commits_no_earlier_delete() {
-        let state = Rc::new(RefCell::new(PopState::default()));
-        mail::drain_pop(
-            fake_pop(state.clone(), Vec::new()),
-            id(72),
-            id(73),
-            |_| unreachable!(),
-        )
-        .unwrap();
-        assert_eq!(state.borrow().events, ["uidl", "quit"]);
-
-        let fixture = Fixture::new();
-        let storage = fixture.storage();
-        let state = Rc::new(RefCell::new(PopState::default()));
-        let transaction = fake_pop(
-            state.clone(),
-            vec![
-                (1, "uid-first", raw("first@example.test")),
-                (2, "uid-second", raw("second@example.test")),
-            ],
-        );
-        let mut seen = 0usize;
-        let error = mail::drain_pop(
-            transaction,
+    /// One fetch through the real pile-backed `held` query and publisher,
+    /// exactly as `cmd_fetch` composes them, minus the socket.
+    fn fetch_through(
+        storage: &Storage,
+        fixture: &Fixture,
+        mailboxes: Vec<(&str, u32, Vec<(u32, Vec<u8>)>)>,
+        selection: mail::MailboxSelection,
+    ) -> (Vec<mail::MailboxFetched>, Vec<String>) {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source = FakeImap {
+            events: events.clone(),
+            mailboxes: mailboxes
+                .into_iter()
+                .map(|(name, validity, messages)| (name.to_owned(), validity, messages))
+                .collect(),
+            examined: None,
+        };
+        let views = storage.views().unwrap();
+        let config = mail::account_config(&views.mail.facts, fixture.config).unwrap();
+        drop(views);
+        let reports = mail::fetch_imap(
+            source,
             fixture.account,
             fixture.config,
+            &selection,
+            &mail::SearchCriteria::default(),
+            |mailbox, uidvalidity| {
+                let views = storage.views()?;
+                Ok(mail::imap_held_uids(
+                    &views.mail.facts,
+                    fixture.account,
+                    config.imap_endpoint.unwrap(),
+                    config.username,
+                    mailbox,
+                    uidvalidity,
+                ))
+            },
             |publication| {
-                seen += 1;
-                if seen == 2 {
-                    state.borrow_mut().events.push("publish-2-failed".into());
-                    bail!("scripted second-message failure");
-                }
-                publish_recording(&storage, &state, publication, None)
+                publish_source_publication_with(
+                    publication,
+                    storage.scopes,
+                    |scope, fragment, description| storage.publish(scope, fragment, description),
+                )
+            },
+        )
+        .unwrap();
+        let events = events.borrow().clone();
+        (reports, events)
+    }
+
+    #[test]
+    fn a_second_fetch_finds_everything_held_and_fetches_nothing() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let inbox = || {
+            vec![(
+                "INBOX",
+                11,
+                vec![(1, raw("one@example.test")), (2, raw("two@example.test"))],
+            )]
+        };
+        let (reports, events) = fetch_through(&storage, &fixture, inbox(), Default::default());
+        assert_eq!(reports[0].fetched, 2);
+        assert_eq!(
+            events,
+            [
+                "examine:INBOX",
+                "sizes:[1, 2]",
+                "fetch:1",
+                "fetch:2",
+                "logout"
+            ]
+        );
+        let expected = mail::imap_publication(
+            fixture.account,
+            fixture.config,
+            "INBOX",
+            11,
+            2,
+            &raw("two@example.test"),
+        )
+        .unwrap();
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(&views.mail.facts, &expected.mail));
+        assert!(fragment_is_materialized(
+            &views.files.facts,
+            &expected.files
+        ));
+        drop(views);
+
+        let (reports, events) = fetch_through(&storage, &fixture, inbox(), Default::default());
+        assert_eq!(
+            (reports[0].matched, reports[0].held, reports[0].fetched),
+            (2, 2, 0)
+        );
+        assert_eq!(events, ["examine:INBOX", "logout"]);
+
+        // A new message arriving is the only thing the next fetch asks for.
+        let mut grown = inbox();
+        grown[0].2.push((3, raw("three@example.test")));
+        let (reports, events) = fetch_through(&storage, &fixture, grown, Default::default());
+        assert_eq!((reports[0].held, reports[0].fetched), (2, 1));
+        assert_eq!(events, ["examine:INBOX", "sizes:[3]", "fetch:3", "logout"]);
+    }
+
+    #[test]
+    fn a_changed_uidvalidity_refetches_into_a_new_namespace_and_keeps_the_old() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let message = raw("renumbered@example.test");
+        let before =
+            mail::imap_publication(fixture.account, fixture.config, "INBOX", 5, 9, &message)
+                .unwrap();
+        fetch_through(
+            &storage,
+            &fixture,
+            vec![("INBOX", 5, vec![(9, message.clone())])],
+            Default::default(),
+        );
+
+        let (reports, events) = fetch_through(
+            &storage,
+            &fixture,
+            vec![("INBOX", 6, vec![(1, message.clone())])],
+            Default::default(),
+        );
+        assert_eq!((reports[0].uidvalidity, reports[0].fetched), (6, 1));
+        assert_eq!(events, ["examine:INBOX", "sizes:[1]", "fetch:1", "logout"]);
+        let after =
+            mail::imap_publication(fixture.account, fixture.config, "INBOX", 6, 1, &message)
+                .unwrap();
+        assert_eq!(after.wire, before.wire);
+        let views = storage.views().unwrap();
+        assert!(fragment_is_materialized(&views.mail.facts, &before.mail));
+        assert!(fragment_is_materialized(&views.mail.facts, &after.mail));
+        // One wire value, two observations of it: the inbox shows it once
+        // per observation source, both resolving to the same message.
+        let wires: BTreeSet<Id> = find!(
+            wire: Id,
+            pattern!(&views.mail.facts, [{ _?source @
+                metadata::tag: &mail_schema::KIND_IMAP_OBSERVATION,
+                observation::wire: ?wire,
+            }])
+        )
+        .collect();
+        assert_eq!(wires, BTreeSet::from([before.wire]));
+    }
+
+    #[test]
+    fn all_mailboxes_are_listed_and_each_keeps_its_own_namespace() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let mailboxes = || {
+            vec![
+                ("INBOX", 1, vec![(1, raw("inbox@example.test"))]),
+                ("Archive", 1, vec![(1, raw("archive@example.test"))]),
+            ]
+        };
+        let (reports, events) =
+            fetch_through(&storage, &fixture, mailboxes(), mail::MailboxSelection::All);
+        assert_eq!(reports.iter().map(|r| r.fetched).sum::<usize>(), 2);
+        assert_eq!(
+            events,
+            [
+                "list",
+                "examine:INBOX",
+                "sizes:[1]",
+                "fetch:1",
+                "examine:Archive",
+                "sizes:[1]",
+                "fetch:1",
+                "logout"
+            ]
+        );
+        let (reports, _) = fetch_through(
+            &storage,
+            &fixture,
+            mailboxes(),
+            mail::MailboxSelection::Named(vec!["Archive".into()]),
+        );
+        assert_eq!(
+            (reports.len(), reports[0].held, reports[0].fetched),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_failed_mail_publication_is_retried_by_the_next_fetch() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let message = raw("retry@example.test");
+        let source = FakeImap {
+            events: Rc::new(RefCell::new(Vec::new())),
+            mailboxes: vec![("INBOX".into(), 3, vec![(4, message.clone())])],
+            examined: None,
+        };
+        let error = mail::fetch_imap(
+            source,
+            fixture.account,
+            fixture.config,
+            &Default::default(),
+            &mail::SearchCriteria::default(),
+            |_, _| Ok(BTreeSet::new()),
+            |publication| {
+                publish_source_publication_with(
+                    publication,
+                    storage.scopes,
+                    |scope, fragment, description| {
+                        if scope == storage.scopes.mail {
+                            bail!("scripted mail publication failure");
+                        }
+                        storage.publish(scope, fragment, description)
+                    },
+                )
             },
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("second-message"));
-        assert_eq!(state.borrow().marked, [1]);
-        assert!(state.borrow().committed.is_empty());
-        assert_eq!(
-            state.borrow().events,
-            [
-                "uidl",
-                "retr:1",
-                "files",
-                "mail",
-                "dele:1",
-                "retr:2",
-                "publish-2-failed",
-                "disconnect"
-            ]
+        assert!(format!("{error:#}").contains("scripted mail publication failure"));
+
+        let (reports, _) = fetch_through(
+            &storage,
+            &fixture,
+            vec![("INBOX", 3, vec![(4, message)])],
+            Default::default(),
         );
+        assert_eq!((reports[0].held, reports[0].fetched), (0, 1));
+    }
+
+    #[test]
+    fn a_pop_era_account_refuses_to_fetch_with_a_repair_hint() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let views = storage.views().unwrap();
+        let current = mail::account_config(&views.mail.facts, fixture.config).unwrap();
+        drop(views);
+        // A legacy successor: the same snapshot with POP in place of IMAP.
+        let mut fragment = Fragment::empty();
+        let legacy = entity! {
+            metadata::tag: &mail_schema::KIND_ACCOUNT_CONFIG,
+            mail_schema::account::of: &fixture.account,
+            mail_schema::account::address: current.address,
+            mail_schema::account::display_name: current.display_name,
+            mail_schema::account::pop_endpoint: fragment.put("pop.example.test:995".to_owned()),
+            mail_schema::account::smtp_endpoint: current.smtp_endpoint,
+            mail_schema::account::username: current.username,
+            mail_schema::account::credential: &current.credential,
+            mail_schema::account::enabled: true,
+            metadata::supersedes: &fixture.config,
+        };
+        fragment += legacy;
+        storage
+            .publish(storage.scopes.mail, fragment, "legacy config")
+            .unwrap();
+        let error = cmd_fetch(&storage, FetchRequest::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("POP-era configuration"), "{message}");
+        assert!(message.contains("--imap-endpoint"), "{message}");
     }
 }

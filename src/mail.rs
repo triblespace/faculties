@@ -2,8 +2,9 @@
 //!
 //! This module deliberately separates facts from effects.  Constructors
 //! produce self-contained immutable fragments; callers validate the exact
-//! collection union and durably publish those fragments before asking a POP
-//! or SMTP transport to perform an irreversible action.
+//! collection union and durably publish those fragments before asking the
+//! SMTP transport to perform an irreversible action. Receiving is read-only:
+//! the IMAP seam can examine, search and peek, and nothing else.
 
 pub mod cli;
 pub mod mcp;
@@ -12,8 +13,8 @@ pub mod render;
 
 pub use operations::{
     AccountFetched, AccountOptions, AccountSetReceipt, AccountState, AccountSummary,
-    DraftAttachment, DraftDelivery, DraftReceipt, DraftRequest, DraftStatus, InboxMessage, Mail,
-    ReadReceipt, ReplyRequest, SendReceipt, SendStatus,
+    DraftAttachment, DraftDelivery, DraftReceipt, DraftRequest, DraftStatus, FetchRequest,
+    InboxMessage, Mail, ReadReceipt, ReplyRequest, SendReceipt, SendStatus,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -38,10 +39,11 @@ use crate::schemas::files::{file as file_schema, KIND_FILE, KIND_MEDIA_TYPE};
 use crate::schemas::mail::{
     acceptance, account, attachment_occurrence, attempt, draft, imported, imported_legacy,
     observation, projection, read, wire, IMPORT_DRAFT, IMPORT_RECEIVED, IMPORT_SENT,
-    KIND_ACCOUNT_CONFIG, KIND_ATTACHMENT_OCCURRENCE, KIND_DRAFT_INTENT, KIND_IMPORTED_OBSERVATION,
-    KIND_MAIL_ACCOUNT, KIND_OUTGOING_OBSERVATION, KIND_PARSED_PROJECTION, KIND_POP_OBSERVATION,
-    KIND_READ_OBSERVATION, KIND_SEND_ATTEMPT, KIND_SMTP_ACCEPTANCE, KIND_WIRE_MESSAGE,
-    LEGACY_KIND_MESSAGE, LEGACY_KIND_SPAM, RECIPE_RFC5322_V1,
+    KIND_ACCOUNT_CONFIG, KIND_ATTACHMENT_OCCURRENCE, KIND_DRAFT_INTENT, KIND_IMAP_OBSERVATION,
+    KIND_IMPORTED_OBSERVATION, KIND_MAIL_ACCOUNT, KIND_OUTGOING_OBSERVATION,
+    KIND_PARSED_PROJECTION, KIND_POP_OBSERVATION, KIND_READ_OBSERVATION, KIND_SEND_ATTEMPT,
+    KIND_SMTP_ACCEPTANCE, KIND_WIRE_MESSAGE, LEGACY_KIND_MESSAGE, LEGACY_KIND_SPAM,
+    RECIPE_RFC5322_V1,
 };
 use crate::schemas::message::local as legacy_read;
 use crate::secrets::SecretsSnapshot;
@@ -57,7 +59,7 @@ pub type ArchiveHandle = Inline<inlineencodings::Handle<blobencodings::SimpleArc
 pub struct AccountConfigInput {
     pub address: String,
     pub display_name: String,
-    pub pop_endpoint: String,
+    pub imap_endpoint: String,
     pub smtp_endpoint: String,
     pub username: String,
     pub credential: Id,
@@ -71,7 +73,7 @@ impl AccountConfigInput {
     pub fn canonicalized(mut self) -> Result<Self> {
         self.address = canonical_nonempty(self.address, "account address")?;
         self.display_name = canonical_nonempty(self.display_name, "display name")?;
-        self.pop_endpoint = canonical_nonempty(self.pop_endpoint, "POP endpoint")?;
+        self.imap_endpoint = canonical_nonempty(self.imap_endpoint, "IMAP endpoint")?;
         self.smtp_endpoint = canonical_nonempty(self.smtp_endpoint, "SMTP endpoint")?;
         self.username = canonical_nonempty(self.username, "account username")?;
         self.predecessors = sorted_ids(self.predecessors);
@@ -85,7 +87,12 @@ pub struct AccountConfigRecord {
     pub account: Id,
     pub address: TextHandle,
     pub display_name: TextHandle,
-    pub pop_endpoint: TextHandle,
+    /// Present only on configurations written before IMAP replaced POP.
+    /// Kept so those snapshots stay readable; nothing fetches through it.
+    pub pop_endpoint: Option<TextHandle>,
+    /// Absent on legacy POP-era configurations, which cannot fetch until
+    /// a successor configuration names an IMAP endpoint.
+    pub imap_endpoint: Option<TextHandle>,
     pub smtp_endpoint: TextHandle,
     pub username: TextHandle,
     pub credential: Id,
@@ -99,7 +106,7 @@ pub struct OpenAccount {
     pub config: Id,
     pub address: String,
     pub display_name: String,
-    pub pop_endpoint: String,
+    pub imap_endpoint: Option<String>,
     pub smtp_endpoint: String,
     pub username: String,
     pub password: String,
@@ -717,7 +724,8 @@ fn account_config_record(record: &AccountConfigRecord) -> Fragment {
         account::of: &record.account,
         account::address: record.address,
         account::display_name: record.display_name,
-        account::pop_endpoint: record.pop_endpoint,
+        account::pop_endpoint?: record.pop_endpoint,
+        account::imap_endpoint?: record.imap_endpoint,
         account::smtp_endpoint: record.smtp_endpoint,
         account::username: record.username,
         account::credential: &record.credential,
@@ -735,7 +743,8 @@ pub fn account_config_fragment(anchor: Id, input: AccountConfigInput) -> Result<
         account: anchor,
         address: fragment.put(input.address),
         display_name: fragment.put(input.display_name),
-        pop_endpoint: fragment.put(input.pop_endpoint),
+        pop_endpoint: None,
+        imap_endpoint: Some(fragment.put(input.imap_endpoint)),
         smtp_endpoint: fragment.put(input.smtp_endpoint),
         username: fragment.put(input.username),
         credential: input.credential,
@@ -776,9 +785,13 @@ where
             find!(v: TextHandle, pattern!(facts, [{ id @ account::display_name: ?v }])).collect(),
             "account display name",
         )?,
-        pop_endpoint: required(
+        pop_endpoint: one(
             find!(v: TextHandle, pattern!(facts, [{ id @ account::pop_endpoint: ?v }])).collect(),
             "POP endpoint",
+        )?,
+        imap_endpoint: one(
+            find!(v: TextHandle, pattern!(facts, [{ id @ account::imap_endpoint: ?v }])).collect(),
+            "IMAP endpoint",
         )?,
         smtp_endpoint: required(
             find!(v: TextHandle, pattern!(facts, [{ id @ account::smtp_endpoint: ?v }])).collect(),
@@ -1160,13 +1173,27 @@ fn finish_source_projection(
     })
 }
 
-fn source_publication(
-    account_id: Option<Id>,
-    config_id: Option<Id>,
-    uidl: Option<&str>,
-    attempt_id: Option<Id>,
-    raw: &[u8],
-) -> Result<SourcePublication> {
+/// Where one source observation came from.
+enum SourceCoordinates<'a> {
+    /// Legacy POP evidence, only ever rebuilt for validation.
+    Pop {
+        account: Id,
+        config: Id,
+        uidl: &'a str,
+    },
+    Imap {
+        account: Id,
+        config: Id,
+        mailbox: &'a str,
+        uidvalidity: u32,
+        uid: u32,
+    },
+    Outgoing {
+        attempt: Id,
+    },
+}
+
+fn source_publication(coordinates: SourceCoordinates<'_>, raw: &[u8]) -> Result<SourcePublication> {
     let parsed = parse_rfc5322(raw)?;
     let mut mail_fragment = Fragment::empty();
     let wire = match &parsed.identity {
@@ -1179,8 +1206,12 @@ fn source_publication(
         }
     };
     let raw_handle: BytesHandle = mail_fragment.put(raw.to_vec());
-    let observation_fragment = match (account_id, config_id, uidl, attempt_id) {
-        (Some(account_id), Some(config_id), Some(uidl), None) => {
+    let observation_fragment = match coordinates {
+        SourceCoordinates::Pop {
+            account: account_id,
+            config: config_id,
+            uidl,
+        } => {
             let uidl = mail_fragment.put(canonical_nonempty(uidl, "POP UIDL")?);
             entity! {
                 metadata::tag: &KIND_POP_OBSERVATION,
@@ -1191,30 +1222,87 @@ fn source_publication(
                 observation::raw: raw_handle,
             }
         }
-        (None, None, None, Some(attempt_id)) => entity! {
+        SourceCoordinates::Imap {
+            account: account_id,
+            config: config_id,
+            mailbox,
+            uidvalidity,
+            uid,
+        } => {
+            if mailbox.is_empty() {
+                bail!("IMAP mailbox name must not be empty");
+            }
+            if uidvalidity == 0 || uid == 0 {
+                bail!("IMAP UIDVALIDITY and UID must be non-zero");
+            }
+            let mailbox = mail_fragment.put(mailbox.to_owned());
+            entity! {
+                metadata::tag: &KIND_IMAP_OBSERVATION,
+                observation::wire: &wire,
+                observation::account: &account_id,
+                observation::config: &config_id,
+                observation::mailbox: mailbox,
+                observation::uidvalidity: u64::from(uidvalidity),
+                observation::uid: u64::from(uid),
+                observation::raw: raw_handle,
+            }
+        }
+        SourceCoordinates::Outgoing {
+            attempt: attempt_id,
+        } => entity! {
             metadata::tag: &KIND_OUTGOING_OBSERVATION,
             observation::wire: &wire,
             observation::attempt: &attempt_id,
             observation::raw: raw_handle,
         },
-        _ => bail!("source publication requires exactly POP coordinates or a send attempt"),
     };
     let observation = observation_fragment.root().expect("observation root");
     mail_fragment += observation_fragment;
     finish_source_projection(mail_fragment, parsed, wire, observation)
 }
 
+/// Rebuild one legacy POP observation. Mail no longer fetches over POP; this
+/// exists so evidence recorded before the IMAP cutover stays verifiable.
 pub fn pop_publication(
     account: Id,
     config: Id,
     uidl: &str,
     raw: &[u8],
 ) -> Result<SourcePublication> {
-    source_publication(Some(account), Some(config), Some(uidl), None, raw)
+    source_publication(
+        SourceCoordinates::Pop {
+            account,
+            config,
+            uidl,
+        },
+        raw,
+    )
+}
+
+/// One message observed read-only over IMAP at (config, mailbox,
+/// UIDVALIDITY, UID), with its exact raw bytes.
+pub fn imap_publication(
+    account: Id,
+    config: Id,
+    mailbox: &str,
+    uidvalidity: u32,
+    uid: u32,
+    raw: &[u8],
+) -> Result<SourcePublication> {
+    source_publication(
+        SourceCoordinates::Imap {
+            account,
+            config,
+            mailbox,
+            uidvalidity,
+            uid,
+        },
+        raw,
+    )
 }
 
 pub fn outgoing_publication(attempt: Id, raw: &[u8]) -> Result<SourcePublication> {
-    source_publication(None, None, None, Some(attempt), raw)
+    source_publication(SourceCoordinates::Outgoing { attempt }, raw)
 }
 
 /// Rebuild one honest imported observation from an exact historical payload.
@@ -1871,7 +1959,10 @@ where
         config: config_id,
         address: read_text(mail_reader, config.address)?,
         display_name: read_text(mail_reader, config.display_name)?,
-        pop_endpoint: read_text(mail_reader, config.pop_endpoint)?,
+        imap_endpoint: config
+            .imap_endpoint
+            .map(|handle| read_text(mail_reader, handle))
+            .transpose()?,
         smtp_endpoint: read_text(mail_reader, config.smtp_endpoint)?,
         username: read_text(mail_reader, config.username)?,
         password: String::from_utf8(password).context("mailbox password is not UTF-8")?,
@@ -2217,6 +2308,7 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
     let acceptances: BTreeSet<_> = ids_of_kind(facts, KIND_SMTP_ACCEPTANCE);
     let reads: BTreeSet<_> = ids_of_kind(facts, KIND_READ_OBSERVATION);
     let pop_observations: BTreeSet<_> = ids_of_kind(facts, KIND_POP_OBSERVATION);
+    let imap_observations: BTreeSet<_> = ids_of_kind(facts, KIND_IMAP_OBSERVATION);
     let outgoing_observations: BTreeSet<_> = ids_of_kind(facts, KIND_OUTGOING_OBSERVATION);
     let imported_observations: BTreeSet<_> = ids_of_kind(facts, KIND_IMPORTED_OBSERVATION);
     let mut expected = validate_legacy_evidence(reader, overlay, facts)?;
@@ -2232,12 +2324,16 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
             );
         }
         for handle in [
-            record.address,
-            record.display_name,
+            Some(record.address),
+            Some(record.display_name),
             record.pop_endpoint,
-            record.smtp_endpoint,
-            record.username,
-        ] {
+            record.imap_endpoint,
+            Some(record.smtp_endpoint),
+            Some(record.username),
+        ]
+        .into_iter()
+        .flatten()
+        {
             canonical_nonempty(text_union(reader, overlay, handle)?, "account config text")?;
         }
         expected += ensure_intrinsic(id, account_config_record(record), "account config")?;
@@ -2485,6 +2581,58 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         expected += publication.mail.into_facts();
     }
 
+    for &id in &imap_observations {
+        let account_id = required(
+            find!(v: Id, pattern!(facts, [{ id @ observation::account: ?v }])).collect(),
+            "IMAP observation account",
+        )?;
+        if !accounts.contains(&account_id) {
+            bail!("IMAP observation {id:x} names unknown account {account_id:x}");
+        }
+        let config_id = required(
+            find!(v: Id, pattern!(facts, [{ id @ observation::config: ?v }])).collect(),
+            "IMAP observation config",
+        )?;
+        let config = configs
+            .get(&config_id)
+            .ok_or_else(|| anyhow!("IMAP observation {id:x} names unknown config {config_id:x}"))?;
+        if config.account != account_id {
+            bail!("IMAP observation {id:x} config belongs to another account");
+        }
+        let mailbox = required(
+            find!(v: TextHandle, pattern!(facts, [{ id @ observation::mailbox: ?v }])).collect(),
+            "IMAP mailbox",
+        )?;
+        let uidvalidity = required(
+            find!(v: u32, pattern!(facts, [{ id @ observation::uidvalidity: ?v }])).collect(),
+            "IMAP UIDVALIDITY",
+        )?;
+        let uid = required(
+            find!(v: u32, pattern!(facts, [{ id @ observation::uid: ?v }])).collect(),
+            "IMAP UID",
+        )?;
+        let raw_handle = required(
+            find!(v: BytesHandle, pattern!(facts, [{ id @ observation::raw: ?v }])).collect(),
+            "IMAP raw message",
+        )?;
+        let mailbox = text_union(reader, overlay, mailbox)?;
+        let raw = bytes_union(reader, overlay, raw_handle)?;
+        let publication =
+            imap_publication(account_id, config_id, &mailbox, uidvalidity, uid, &raw)?;
+        if publication.observation != id {
+            bail!("IMAP observation {id:x} does not match exact source evidence");
+        }
+        validate_source_text_payloads(reader, overlay, publication.mail.facts())?;
+        if validate_cross_collection {
+            for fact in publication.files.facts() {
+                if !files_facts.contains(fact) {
+                    bail!("IMAP observation {id:x} has unpublished Files attachment evidence");
+                }
+            }
+        }
+        expected += publication.mail.into_facts();
+    }
+
     for &id in &outgoing_observations {
         let attempt_id = required(
             find!(v: Id, pattern!(facts, [{ id @ observation::attempt: ?v }])).collect(),
@@ -2613,6 +2761,10 @@ fn validate_catalog_inner<Overlay: BlobStoreGet>(
         pattern!(facts, [{ _?source @ metadata::tag: &KIND_POP_OBSERVATION, observation::wire: ?wire_id }])
     )
     .collect();
+    resident_wires.extend(find!(
+        wire_id: Id,
+        pattern!(facts, [{ _?source @ metadata::tag: &KIND_IMAP_OBSERVATION, observation::wire: ?wire_id }])
+    ));
     resident_wires.extend(find!(
         wire_id: Id,
         pattern!(facts, [{ _?source @ metadata::tag: &KIND_OUTGOING_OBSERVATION, observation::wire: ?wire_id }])
@@ -2796,6 +2948,13 @@ where
     sources.extend(find!(
         (source: Id, wire_id: Id),
         pattern!(mail_facts, [{ ?source @
+            metadata::tag: &KIND_IMAP_OBSERVATION,
+            observation::wire: ?wire_id,
+        }])
+    ));
+    sources.extend(find!(
+        (source: Id, wire_id: Id),
+        pattern!(mail_facts, [{ ?source @
             metadata::tag: &KIND_IMPORTED_OBSERVATION,
             imported::direction: &IMPORT_RECEIVED,
             observation::wire: ?wire_id,
@@ -2937,7 +3096,7 @@ where
     let mut candidates = BTreeSet::new();
     let tags = find!(value: Id, pattern!(facts, [{ source @ metadata::tag: ?value }]))
         .collect::<BTreeSet<_>>();
-    if tags.contains(&KIND_POP_OBSERVATION) {
+    if tags.contains(&KIND_POP_OBSERVATION) || tags.contains(&KIND_IMAP_OBSERVATION) {
         candidates.insert(0_u8);
     }
     if tags.contains(&KIND_OUTGOING_OBSERVATION) {
@@ -3303,79 +3462,204 @@ pub fn render_draft(draft: MaterializedDraft, account: &OpenAccount) -> Result<R
 
 // ── irreversible-effect protocol seams ────────────────────────────────────
 
-pub use crate::mail_pop::PopItem;
+pub use crate::mail_imap::{SearchCriteria, SearchDate, MAX_MESSAGE_BYTES};
 
-/// One POP transaction. Implementations must make ordinary Drop disconnect
-/// without issuing QUIT; only explicit `quit` may commit marked deletions.
-pub trait PopTxn {
-    fn enumerate_uidls(&mut self) -> Result<Vec<PopItem>>;
-    fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>>;
-    fn mark_delete(&mut self, session_seq: u32) -> Result<()>;
-    fn quit(self) -> Result<()>;
+/// Which mailboxes one IMAP fetch examines.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum MailboxSelection {
+    /// Only `INBOX`.
+    #[default]
+    Inbox,
+    /// Exactly these server mailbox names, in this order.
+    Named(Vec<String>),
+    /// Every selectable mailbox the server lists.
+    All,
 }
 
-/// Fetch every UIDL exactly under one frozen account configuration, publish
-/// its evidence, then mark it for deletion.
-/// Duplicate or zero session identities are protocol errors and no deletion is
-/// attempted. A failed explicit QUIT is an uncertain remote transaction, not
-/// evidence that already-marked deletions were rolled back.
-pub fn drain_pop<T, F>(
-    mut transaction: T,
+/// One read-only IMAP session. The trait is the whole receive vocabulary:
+/// nothing here can flag, move, delete or expunge a message. Dropping an
+/// implementation disconnects without sending anything.
+pub trait ImapSource {
+    /// Every selectable mailbox (`LIST`).
+    fn mailboxes(&mut self) -> Result<Vec<String>>;
+    /// Open one mailbox read-only (`EXAMINE`) and return its UIDVALIDITY.
+    fn examine(&mut self, mailbox: &str) -> Result<u32>;
+    /// UIDs matching `criteria` in the examined mailbox (`UID SEARCH`).
+    fn search(&mut self, criteria: &SearchCriteria) -> Result<Vec<u32>>;
+    /// Sizes of the named UIDs that still exist (`UID FETCH (RFC822.SIZE)`).
+    fn sizes(&mut self, uids: &[u32]) -> Result<Vec<(u32, u64)>>;
+    /// Exact message bytes without setting `\Seen` (`UID FETCH BODY.PEEK[]`),
+    /// or `None` when the UID vanished.
+    fn fetch(&mut self, uid: u32) -> Result<Option<Vec<u8>>>;
+    /// End the session (`LOGOUT`).
+    fn logout(self) -> Result<()>;
+}
+
+/// What one mailbox contributed to a fetch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MailboxFetched {
+    pub mailbox: String,
+    pub uidvalidity: u32,
+    /// UIDs the search matched.
+    pub matched: usize,
+    /// Of those, already observed under this UIDVALIDITY and skipped.
+    pub held: usize,
+    /// Newly observed and published.
+    pub fetched: usize,
+    /// Matched but gone by the time they were fetched.
+    pub vanished: usize,
+    /// `(uid, size)` of messages over [`MAX_MESSAGE_BYTES`], left unread.
+    pub oversized: Vec<(u32, u64)>,
+    /// `(uid, reason)` of messages whose bytes Mail could not parse into an
+    /// observation. They stay on the server and are retried next fetch.
+    pub unparsed: Vec<(u32, String)>,
+}
+
+/// Observe every not-yet-held message matching `criteria` in the selected
+/// mailboxes, publishing each exact raw message as an IMAP observation under
+/// one frozen account configuration.
+///
+/// `held(mailbox, uidvalidity)` answers which UIDs are already observed in
+/// that namespace; it is asked once per mailbox, after `EXAMINE`, so a changed
+/// UIDVALIDITY simply names a namespace with nothing held yet. Old
+/// observations are never touched, and nothing is ever written to the server.
+pub fn fetch_imap<T, H, F>(
+    mut source: T,
     account_id: Id,
     config_id: Id,
+    selection: &MailboxSelection,
+    criteria: &SearchCriteria,
+    mut held: H,
     mut publish: F,
-) -> Result<()>
+) -> Result<Vec<MailboxFetched>>
 where
-    T: PopTxn,
+    T: ImapSource,
+    H: FnMut(&str, u32) -> Result<BTreeSet<u32>>,
     F: FnMut(&SourcePublication) -> Result<()>,
 {
-    let items = transaction.enumerate_uidls()?;
-    let mut uidls = BTreeSet::new();
-    let mut sequences = BTreeSet::new();
-    for item in &items {
-        if item.session_seq == 0 {
-            bail!("POP server returned zero session sequence");
+    let mailboxes = match selection {
+        MailboxSelection::Inbox => vec!["INBOX".to_owned()],
+        MailboxSelection::Named(names) => names.clone(),
+        MailboxSelection::All => source.mailboxes()?,
+    };
+    let mut reports = Vec::new();
+    for mailbox in mailboxes {
+        let uidvalidity = source
+            .examine(&mailbox)
+            .with_context(|| format!("examine IMAP mailbox {mailbox:?}"))?;
+        let matched = source
+            .search(criteria)
+            .with_context(|| format!("search IMAP mailbox {mailbox:?}"))?;
+        let already = held(&mailbox, uidvalidity)?;
+        let wanted: Vec<u32> = matched
+            .iter()
+            .copied()
+            .filter(|uid| !already.contains(uid))
+            .collect();
+        let mut report = MailboxFetched {
+            mailbox: mailbox.clone(),
+            uidvalidity,
+            matched: matched.len(),
+            held: matched.len() - wanted.len(),
+            ..MailboxFetched::default()
+        };
+        let sizes = if wanted.is_empty() {
+            Vec::new()
+        } else {
+            source.sizes(&wanted)?
+        };
+        report.vanished = wanted.len() - sizes.len();
+        for (uid, size) in sizes {
+            if size > MAX_MESSAGE_BYTES {
+                report.oversized.push((uid, size));
+                continue;
+            }
+            let Some(raw) = source.fetch(uid)? else {
+                report.vanished += 1;
+                continue;
+            };
+            let publication =
+                match imap_publication(account_id, config_id, &mailbox, uidvalidity, uid, &raw) {
+                    Ok(publication) => publication,
+                    Err(error) => {
+                        report.unparsed.push((uid, format!("{error:#}")));
+                        continue;
+                    }
+                };
+            publish(&publication)?;
+            report.fetched += 1;
         }
-        if !sequences.insert(item.session_seq) {
-            bail!(
-                "POP server returned duplicate session sequence {}",
-                item.session_seq
-            );
-        }
-        if !uidls.insert(item.uidl.clone()) {
-            bail!("POP server returned duplicate UIDL {:?}", item.uidl);
-        }
+        reports.push(report);
     }
-    for item in items {
-        let raw = transaction.retrieve_exact(item.session_seq)?;
-        let publication = pop_publication(account_id, config_id, &item.uidl, &raw)?;
-        publish(&publication)?;
-        transaction.mark_delete(item.session_seq)?;
-    }
-    transaction
-        .quit()
-        .context("POP QUIT failed after delete marks; remote deletion commit is uncertain")
+    source
+        .logout()
+        .context("IMAP LOGOUT failed; every published observation is already durable")?;
+    Ok(reports)
 }
 
-impl<S> PopTxn for crate::mail_pop::PopSession<S>
+/// UIDs already observed for one account in (mailbox, UIDVALIDITY) on the
+/// same server login: the observation's config must name this IMAP endpoint
+/// and username, so a re-pointed account never inherits another server's
+/// UID namespace. A query at the point of use, not a cache.
+pub fn imap_held_uids<P>(
+    facts: &P,
+    account_id: Id,
+    endpoint: TextHandle,
+    username: TextHandle,
+    mailbox: &str,
+    uidvalidity: u32,
+) -> BTreeSet<u32>
+where
+    P: TriblePattern,
+{
+    let mailbox: TextHandle = Fragment::empty().put(mailbox.to_owned());
+    let uidvalidity: CountValue = u64::from(uidvalidity).to_inline();
+    find!(
+        uid: u32,
+        pattern!(facts, [
+            { _?observation @
+                metadata::tag: &KIND_IMAP_OBSERVATION,
+                observation::account: &account_id,
+                observation::config: _?config,
+                observation::mailbox: mailbox,
+                observation::uidvalidity: uidvalidity,
+                observation::uid: ?uid,
+            },
+            { _?config @
+                account::imap_endpoint: endpoint,
+                account::username: username,
+            }
+        ])
+    )
+    .collect()
+}
+
+impl<S> ImapSource for crate::mail_imap::ImapSession<S>
 where
     S: std::io::Read + std::io::Write,
 {
-    fn enumerate_uidls(&mut self) -> Result<Vec<PopItem>> {
-        Ok(self.uidl()?)
+    fn mailboxes(&mut self) -> Result<Vec<String>> {
+        Ok(self.list()?)
     }
 
-    fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
-        Ok(self.retr(session_seq)?)
+    fn examine(&mut self, mailbox: &str) -> Result<u32> {
+        Ok(crate::mail_imap::ImapSession::examine(self, mailbox)?.uidvalidity)
     }
 
-    fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
-        self.dele(session_seq)?;
-        Ok(())
+    fn search(&mut self, criteria: &SearchCriteria) -> Result<Vec<u32>> {
+        Ok(self.uid_search(criteria)?)
     }
 
-    fn quit(self) -> Result<()> {
-        crate::mail_pop::PopSession::quit(self)?;
+    fn sizes(&mut self, uids: &[u32]) -> Result<Vec<(u32, u64)>> {
+        Ok(self.uid_sizes(uids)?)
+    }
+
+    fn fetch(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
+        Ok(self.uid_fetch_body(uid)?)
+    }
+
+    fn logout(self) -> Result<()> {
+        crate::mail_imap::ImapSession::logout(self)?;
         Ok(())
     }
 }
@@ -3482,7 +3766,7 @@ where
             config: config.id,
             address: read_text(mail_reader, config.address)?,
             display_name: read_text(mail_reader, config.display_name)?,
-            pop_endpoint: read_text(mail_reader, config.pop_endpoint)?,
+            imap_endpoint: None,
             smtp_endpoint: read_text(mail_reader, config.smtp_endpoint)?,
             username: read_text(mail_reader, config.username)?,
             password: String::new(),
@@ -3727,7 +4011,7 @@ mod tests {
             AccountConfigInput {
                 address: "sender@example.test".into(),
                 display_name: "Sender".into(),
-                pop_endpoint: "pop.example.test:995".into(),
+                imap_endpoint: "imap.example.test:993".into(),
                 smtp_endpoint: "smtp.example.test:465".into(),
                 username: "sender@example.test".into(),
                 credential: credential_id,
@@ -3965,6 +4249,121 @@ mod tests {
         assert!(format!("{error:#}").contains("UIDL \"stable-uidl\" names different raw messages"));
     }
 
+    #[test]
+    fn imap_evidence_validates_and_held_uids_are_scoped_to_their_namespace() {
+        let fixture = Fixture::new();
+        let account = id(97);
+        let config = add_account(&fixture, account).0;
+        let raw: &[u8] = b"From: a@example.test\r\nTo: sender@example.test\r\nMessage-ID: <imap@example.test>\r\nSubject: imap\r\n\r\none";
+        let first = imap_publication(account, config, "INBOX", 41, 7, raw).unwrap();
+        let views = fixture.views();
+        let mut files = views.files.facts.clone();
+        files += first.files.facts().clone();
+        validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &first.mail,
+            &files,
+            &views.decide.facts,
+            &views.relations.facts,
+            &views.secrets,
+        )
+        .unwrap();
+        fixture.publish(files_schema::DEFAULT_SCOPE_ID, first.files.clone());
+        fixture.publish(mail_schema::DEFAULT_SCOPE_ID, first.mail.clone());
+
+        let views = fixture.views();
+        let record = account_config(&views.mail.facts, config).unwrap();
+        let endpoint = record.imap_endpoint.unwrap();
+        let held = |endpoint, mailbox, uidvalidity| {
+            imap_held_uids(
+                &views.mail.facts,
+                account,
+                endpoint,
+                record.username,
+                mailbox,
+                uidvalidity,
+            )
+        };
+        assert_eq!(held(endpoint, "INBOX", 41), BTreeSet::from([7]));
+        // A changed UIDVALIDITY is a fresh namespace with nothing held.
+        assert!(held(endpoint, "INBOX", 42).is_empty());
+        assert!(held(endpoint, "Archive", 41).is_empty());
+        let elsewhere: TextHandle = Fragment::empty().put("imap.elsewhere.test:993".to_owned());
+        assert!(held(elsewhere, "INBOX", 41).is_empty());
+        assert_eq!(
+            projection_direction(&views.mail.facts, first.observation).unwrap(),
+            ProjectionDirection::Received
+        );
+
+        // The same message seen again under a new UIDVALIDITY is a second
+        // observation of the same wire value; nothing old is replaced.
+        let again = imap_publication(account, config, "INBOX", 42, 1, raw).unwrap();
+        assert_eq!(again.wire, first.wire);
+        assert_ne!(again.observation, first.observation);
+        validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &again.mail,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+            &views.secrets,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pop_era_configuration_stays_readable_without_an_imap_endpoint() {
+        let fixture = Fixture::new();
+        let account = id(96);
+        let credential = fixture.add_secret("mail/legacy", b"legacy-secret", at(4));
+        let mut fragment = Fragment::empty();
+        let record = AccountConfigRecord {
+            id: account,
+            account,
+            address: fragment.put("old@example.test".to_owned()),
+            display_name: fragment.put("Old".to_owned()),
+            pop_endpoint: Some(fragment.put("pop.example.test:995".to_owned())),
+            imap_endpoint: None,
+            smtp_endpoint: fragment.put("smtp.example.test:465".to_owned()),
+            username: fragment.put("old@example.test".to_owned()),
+            credential,
+            enabled: true,
+            predecessors: Vec::new(),
+        };
+        let config = account_config_record(&record);
+        let config_id = config.root().unwrap();
+        fragment += account_anchor_record(account);
+        fragment += config;
+        let views = fixture.views();
+        validate_catalog_union(
+            &views.mail.reader,
+            &views.mail.facts,
+            &fragment,
+            &views.files.facts,
+            &views.decide.facts,
+            &views.relations.facts,
+            &views.secrets,
+        )
+        .unwrap();
+        fixture.publish(mail_schema::DEFAULT_SCOPE_ID, fragment);
+
+        let views = fixture.views();
+        let read = account_config(&views.mail.facts, config_id).unwrap();
+        assert!(read.pop_endpoint.is_some());
+        assert!(read.imap_endpoint.is_none());
+        let open = open_account(
+            &views.mail.reader,
+            &views.mail.facts,
+            &views.secrets,
+            account,
+            &fixture.signer(),
+        )
+        .unwrap();
+        assert_eq!(open.imap_endpoint, None);
+    }
+
     /// One fixed draft with two attachments, its Mail and Files facts and
     /// blobs in one fragment, and the account it renders for.
     fn golden_draft_parts() -> (Fragment, Id, OpenAccount) {
@@ -3999,7 +4398,7 @@ mod tests {
             config: id(95),
             address: "sender@example.test".into(),
             display_name: "Sender".into(),
-            pop_endpoint: "pop.example.test:995".into(),
+            imap_endpoint: Some("imap.example.test:993".into()),
             smtp_endpoint: "smtp.example.test:465".into(),
             username: "sender@example.test".into(),
             password: "unused".into(),
@@ -4222,7 +4621,7 @@ mod tests {
             config: id(82),
             address: draft.envelope_from.clone(),
             display_name: "Sender".into(),
-            pop_endpoint: "pop.example.test:995".into(),
+            imap_endpoint: Some("imap.example.test:993".into()),
             smtp_endpoint: "smtp.example.test:465".into(),
             username: "sender@example.test".into(),
             password: "unused".into(),
@@ -4246,7 +4645,7 @@ mod tests {
         let input = |display_name: &str, predecessors: Vec<Id>| AccountConfigInput {
             address: "me@example.test".into(),
             display_name: display_name.into(),
-            pop_endpoint: "pop.example.test:995".into(),
+            imap_endpoint: "imap.example.test:993".into(),
             smtp_endpoint: "smtp.example.test:465".into(),
             username: "me@example.test".into(),
             credential,
@@ -4259,9 +4658,10 @@ mod tests {
             account_config_fragment(anchor, input("Second branch", Vec::new())).unwrap();
         let mut facts = first.into_facts();
         facts += second.into_facts();
+        // Heads come back in id order, which content-derived ids make arbitrary.
         assert_eq!(
             account_head(&facts, anchor).unwrap(),
-            Head::Forked(vec![first_id, second_id])
+            Head::Forked(sorted_ids(vec![first_id, second_id]))
         );
 
         let (joined, joined_id) =
@@ -4284,7 +4684,7 @@ mod tests {
             AccountConfigInput {
                 address: "me@example.test".into(),
                 display_name: "Me".into(),
-                pop_endpoint: "pop.example.test:995".into(),
+                imap_endpoint: "imap.example.test:993".into(),
                 smtp_endpoint: "smtp.example.test:465".into(),
                 username: "me@example.test".into(),
                 credential: missing_secret,
@@ -4321,7 +4721,7 @@ mod tests {
             AccountConfigInput {
                 address: "me@example.test".into(),
                 display_name: "Me".into(),
-                pop_endpoint: "pop.example.test:995".into(),
+                imap_endpoint: "imap.example.test:993".into(),
                 smtp_endpoint: "smtp.example.test:465".into(),
                 username: "me@example.test".into(),
                 credential: secret,
@@ -4665,7 +5065,7 @@ mod tests {
                 AccountConfigInput {
                     address: address.into(),
                     display_name: "Sender".into(),
-                    pop_endpoint: "pop.example.test:995".into(),
+                    imap_endpoint: "imap.example.test:993".into(),
                     smtp_endpoint: "smtp.example.test:465".into(),
                     username: "sender@example.test".into(),
                     credential: credential_id,
@@ -4984,71 +5384,18 @@ mod tests {
         }
     }
 
-    struct FakePop {
-        events: Rc<RefCell<Vec<&'static str>>>,
-        items: Vec<PopItem>,
-        messages: HashMap<u32, Vec<u8>>,
-        deleted: Vec<u32>,
-        quit: bool,
-    }
-
-    impl Drop for FakePop {
-        fn drop(&mut self) {
-            if !self.quit {
-                self.events.borrow_mut().push("disconnect");
-            }
-        }
-    }
-
-    impl PopTxn for FakePop {
-        fn enumerate_uidls(&mut self) -> Result<Vec<PopItem>> {
-            self.events.borrow_mut().push("uidl");
-            Ok(self.items.clone())
-        }
-
-        fn retrieve_exact(&mut self, session_seq: u32) -> Result<Vec<u8>> {
-            self.events.borrow_mut().push("retr");
-            Ok(self.messages[&session_seq].clone())
-        }
-
-        fn mark_delete(&mut self, session_seq: u32) -> Result<()> {
-            self.events.borrow_mut().push("dele");
-            self.deleted.push(session_seq);
-            Ok(())
-        }
-
-        fn quit(mut self) -> Result<()> {
-            self.events.borrow_mut().push("quit");
-            self.quit = true;
-            Ok(())
-        }
-    }
-
-    fn fake_pop(events: Rc<RefCell<Vec<&'static str>>>) -> FakePop {
-        FakePop {
-            events,
-            items: vec![PopItem {
-                session_seq: 7,
-                uidl: "Case-Sensitive".into(),
-            }],
-            messages: HashMap::from([(7, RAW_INBOUND.to_vec())]),
-            deleted: Vec::new(),
-            quit: false,
-        }
-    }
-
-    struct ScriptedPopStream {
+    struct ScriptedImapStream {
         reads: Cursor<Vec<u8>>,
         writes: Rc<RefCell<Vec<u8>>>,
     }
 
-    impl Read for ScriptedPopStream {
+    impl Read for ScriptedImapStream {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
             self.reads.read(buffer)
         }
     }
 
-    impl Write for ScriptedPopStream {
+    impl Write for ScriptedImapStream {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             self.writes.borrow_mut().extend_from_slice(buffer);
             Ok(buffer.len())
@@ -5060,97 +5407,243 @@ mod tests {
     }
 
     #[test]
-    fn real_pop_session_runs_through_transactional_drain() {
-        let mut script =
-            b"+OK ready\r\n+OK listing\r\n1 Uidl-Bridge\r\n.\r\n+OK message follows\r\n".to_vec();
+    fn real_imap_session_examines_searches_peeks_and_logs_out() {
+        let mut script = b"* OK IMAP4rev1 ready\r\n".to_vec();
+        script.extend_from_slice(
+            b"* 2 EXISTS\r\n* OK [UIDVALIDITY 77] ok\r\nA0001 OK [READ-ONLY] done\r\n",
+        );
+        script.extend_from_slice(b"* SEARCH 3 5\r\nA0002 OK\r\n");
+        script.extend_from_slice(b"* 2 FETCH (UID 5 RFC822.SIZE 600)\r\nA0003 OK\r\n");
+        script.extend_from_slice(
+            format!("* 2 FETCH (UID 5 BODY[] {{{}}}\r\n", RAW_INBOUND.len()).as_bytes(),
+        );
         script.extend_from_slice(RAW_INBOUND);
-        script.extend_from_slice(b".\r\n+OK deleted\r\n+OK bye\r\n");
+        script.extend_from_slice(b")\r\nA0004 OK\r\n* BYE bye\r\nA0005 OK\r\n");
         let writes = Rc::new(RefCell::new(Vec::new()));
-        let session = crate::mail_pop::PopSession::new(ScriptedPopStream {
+        let session = crate::mail_imap::ImapSession::new(ScriptedImapStream {
             reads: Cursor::new(script),
             writes: writes.clone(),
         })
         .unwrap();
         let mut published = Vec::new();
+        let criteria = SearchCriteria {
+            from: Some("alice".into()),
+            since: SearchDate::parse("2026-08-01"),
+            ..SearchCriteria::default()
+        };
 
-        drain_pop(session, id(9), id(10), |publication| {
-            published.push((publication.wire, publication.observation));
-            Ok(())
-        })
+        let reports = fetch_imap(
+            session,
+            id(9),
+            id(10),
+            &MailboxSelection::Inbox,
+            &criteria,
+            |mailbox, uidvalidity| {
+                assert_eq!((mailbox, uidvalidity), ("INBOX", 77));
+                Ok(BTreeSet::from([3]))
+            },
+            |publication| {
+                published.push(publication.observation);
+                Ok(())
+            },
+        )
         .unwrap();
 
-        assert_eq!(published.len(), 1);
+        let expected = imap_publication(id(9), id(10), "INBOX", 77, 5, RAW_INBOUND).unwrap();
+        assert_eq!(published, [expected.observation]);
         assert_eq!(
-            writes.borrow().as_slice(),
-            b"UIDL\r\nRETR 1\r\nDELE 1\r\nQUIT\r\n"
+            reports,
+            [MailboxFetched {
+                mailbox: "INBOX".into(),
+                uidvalidity: 77,
+                matched: 2,
+                held: 1,
+                fetched: 1,
+                ..MailboxFetched::default()
+            }]
+        );
+        assert_eq!(
+            String::from_utf8(writes.borrow().clone()).unwrap(),
+            "A0001 EXAMINE \"INBOX\"\r\n\
+             A0002 UID SEARCH FROM \"alice\" SINCE \"1-Aug-2026\"\r\n\
+             A0003 UID FETCH 5 (UID RFC822.SIZE)\r\n\
+             A0004 UID FETCH 5 (UID BODY.PEEK[])\r\n\
+             A0005 LOGOUT\r\n"
+        );
+    }
+
+    struct FakeImap {
+        events: Rc<RefCell<Vec<String>>>,
+        mailboxes: Vec<(&'static str, u32, Vec<(u32, Vec<u8>)>)>,
+        examined: Option<usize>,
+        oversized: Vec<u32>,
+    }
+
+    impl ImapSource for FakeImap {
+        fn mailboxes(&mut self) -> Result<Vec<String>> {
+            self.events.borrow_mut().push("list".into());
+            Ok(self
+                .mailboxes
+                .iter()
+                .map(|(name, ..)| (*name).into())
+                .collect())
+        }
+
+        fn examine(&mut self, mailbox: &str) -> Result<u32> {
+            self.events.borrow_mut().push(format!("examine:{mailbox}"));
+            let index = self
+                .mailboxes
+                .iter()
+                .position(|(name, ..)| *name == mailbox)
+                .ok_or_else(|| anyhow!("no mailbox {mailbox}"))?;
+            self.examined = Some(index);
+            Ok(self.mailboxes[index].1)
+        }
+
+        fn search(&mut self, _criteria: &SearchCriteria) -> Result<Vec<u32>> {
+            let index = self.examined.unwrap();
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .map(|(uid, _)| *uid)
+                .collect())
+        }
+
+        fn sizes(&mut self, uids: &[u32]) -> Result<Vec<(u32, u64)>> {
+            self.events.borrow_mut().push(format!("sizes:{uids:?}"));
+            let index = self.examined.unwrap();
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .filter(|(uid, _)| uids.contains(uid))
+                .map(|(uid, raw)| {
+                    let size = if self.oversized.contains(uid) {
+                        MAX_MESSAGE_BYTES + 1
+                    } else {
+                        raw.len() as u64
+                    };
+                    (*uid, size)
+                })
+                .collect())
+        }
+
+        fn fetch(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
+            self.events.borrow_mut().push(format!("fetch:{uid}"));
+            assert!(
+                !self.oversized.contains(&uid),
+                "an oversized message was fetched"
+            );
+            let index = self.examined.unwrap();
+            Ok(self.mailboxes[index]
+                .2
+                .iter()
+                .find(|(candidate, _)| *candidate == uid)
+                .map(|(_, raw)| raw.clone()))
+        }
+
+        fn logout(self) -> Result<()> {
+            self.events.borrow_mut().push("logout".into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn all_mailboxes_skip_oversized_and_unparsable_messages_without_aborting() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let source = FakeImap {
+            events: events.clone(),
+            mailboxes: vec![
+                (
+                    "INBOX",
+                    1,
+                    vec![
+                        (1, RAW_INBOUND.to_vec()),
+                        (2, b"Subject: a\r\nSubject: b\r\n\r\nx".to_vec()),
+                        (3, b"Subject: big\r\n\r\nbig".to_vec()),
+                    ],
+                ),
+                ("Archive", 9, vec![(1, RAW_INBOUND.to_vec())]),
+            ],
+            examined: None,
+            oversized: vec![3],
+        };
+        let mut published = 0;
+        let reports = fetch_imap(
+            source,
+            id(9),
+            id(10),
+            &MailboxSelection::All,
+            &SearchCriteria::default(),
+            |_, _| Ok(BTreeSet::new()),
+            |_| {
+                published += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(published, 2);
+        assert_eq!(reports[0].fetched, 1);
+        assert_eq!(reports[0].oversized, [(3, MAX_MESSAGE_BYTES + 1)]);
+        assert_eq!(reports[0].unparsed.len(), 1);
+        assert_eq!(reports[0].unparsed[0].0, 2);
+        assert_eq!(
+            (reports[1].mailbox.as_str(), reports[1].fetched),
+            ("Archive", 1)
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "list",
+                "examine:INBOX",
+                "sizes:[1, 2, 3]",
+                "fetch:1",
+                "fetch:2",
+                "examine:Archive",
+                "sizes:[1]",
+                "fetch:1",
+                "logout"
+            ]
         );
     }
 
     #[test]
-    fn pop_publish_precedes_delete_and_failure_disconnects_without_quit() {
+    fn a_failed_publication_stops_the_fetch_and_never_logs_out() {
         let events = Rc::new(RefCell::new(Vec::new()));
-        drain_pop(fake_pop(events.clone()), id(9), id(10), |_| {
-            events.borrow_mut().push("publish");
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(
-            events.borrow().as_slice(),
-            ["uidl", "retr", "publish", "dele", "quit"]
-        );
-
-        let events = Rc::new(RefCell::new(Vec::new()));
-        let error = drain_pop(fake_pop(events.clone()), id(9), id(10), |_| {
-            events.borrow_mut().push("publish-failed");
-            bail!("disk full")
-        })
+        let source = FakeImap {
+            events: events.clone(),
+            mailboxes: vec![("INBOX", 1, vec![(1, RAW_INBOUND.to_vec())])],
+            examined: None,
+            oversized: Vec::new(),
+        };
+        let error = fetch_imap(
+            source,
+            id(9),
+            id(10),
+            &MailboxSelection::Named(vec!["INBOX".into()]),
+            &SearchCriteria::default(),
+            |_, _| Ok(BTreeSet::new()),
+            |_| bail!("disk full"),
+        )
         .unwrap_err();
         assert!(format!("{error:#}").contains("disk full"));
         assert_eq!(
             events.borrow().as_slice(),
-            ["uidl", "retr", "publish-failed", "disconnect"]
+            ["examine:INBOX", "sizes:[1]", "fetch:1"]
         );
     }
 
     #[test]
-    fn pop_rejects_zero_and_duplicate_session_identities_before_retrieval() {
-        let invalid = [
-            vec![PopItem {
-                session_seq: 0,
-                uidl: "zero".into(),
-            }],
-            vec![
-                PopItem {
-                    session_seq: 1,
-                    uidl: "first".into(),
-                },
-                PopItem {
-                    session_seq: 1,
-                    uidl: "second".into(),
-                },
-            ],
-            vec![
-                PopItem {
-                    session_seq: 1,
-                    uidl: "same".into(),
-                },
-                PopItem {
-                    session_seq: 2,
-                    uidl: "same".into(),
-                },
-            ],
-        ];
-        for items in invalid {
-            let events = Rc::new(RefCell::new(Vec::new()));
-            let transaction = FakePop {
-                events: events.clone(),
-                items,
-                messages: HashMap::new(),
-                deleted: Vec::new(),
-                quit: false,
-            };
-            assert!(drain_pop(transaction, id(9), id(10), |_| Ok(())).is_err());
-            assert_eq!(events.borrow().as_slice(), ["uidl", "disconnect"]);
+    fn imap_observation_identity_names_its_whole_coordinate() {
+        let base = imap_publication(id(9), id(10), "INBOX", 7, 1, RAW_INBOUND).unwrap();
+        for other in [
+            imap_publication(id(9), id(10), "Archive", 7, 1, RAW_INBOUND).unwrap(),
+            imap_publication(id(9), id(10), "INBOX", 8, 1, RAW_INBOUND).unwrap(),
+            imap_publication(id(9), id(10), "INBOX", 7, 2, RAW_INBOUND).unwrap(),
+        ] {
+            assert_ne!(other.observation, base.observation);
+            assert_eq!(other.wire, base.wire, "the wire identity is shared");
         }
+        assert!(imap_publication(id(9), id(10), "INBOX", 0, 1, RAW_INBOUND).is_err());
+        assert!(imap_publication(id(9), id(10), "", 7, 1, RAW_INBOUND).is_err());
     }
 }

@@ -23,7 +23,14 @@ pub const DEFAULT_SCOPE_ID: Id = id_hex!("3714E5AF0ABF7E2E283FCF17FEC74D74");
 pub const KIND_MAIL_ACCOUNT: Id = id_hex!("FBDCF480BD02006BE630821FECB29B57");
 pub const KIND_ACCOUNT_CONFIG: Id = id_hex!("0B65E7651DAB02FC7A6FCD5DACA9BE04");
 pub const KIND_WIRE_MESSAGE: Id = id_hex!("6AA70240896503A5417F6053735BD4F5");
+/// Legacy POP maildrop observation. Mail no longer speaks POP; these
+/// observations stay readable evidence and are never produced again.
 pub const KIND_POP_OBSERVATION: Id = id_hex!("446DFC5A803419764F30260D37AF91C7");
+/// One message observed read-only over IMAP: an exact raw RFC 5322 value at
+/// (account config, mailbox, UIDVALIDITY, UID).
+///
+/// Minted with `trible genid` on 2026-11-16.
+pub const KIND_IMAP_OBSERVATION: Id = id_hex!("C3BB25CFD238F3649BF1EF2D47A2D020");
 pub const KIND_OUTGOING_OBSERVATION: Id = id_hex!("DD9127C6BB02CA7DDE916B60C0266A29");
 pub const KIND_PARSED_PROJECTION: Id = id_hex!("2ACE3D2EB81A54C4E80D36A8E65DBCAD");
 pub const KIND_ATTACHMENT_OCCURRENCE: Id = id_hex!("A50DCF5386D9D7198DAAE94C2C462E23");
@@ -53,6 +60,8 @@ pub mod account {
         "320DD00D58ADC89A41419A70C281D234" unsafe as of: inlineencodings::GenId;
         "FB3FD9CE766CB77D20A221740EC4F1E1" unsafe as address: inlineencodings::Handle<blobencodings::UTF8String>;
         "B30AF29D86ADCBA02EA32484F4366A53" unsafe as display_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Legacy POP endpoint. Still read on old configurations; new
+        /// configurations never write it, and nothing fetches through it.
         "B4C2DEFAAF165750556F434DA2A31B99" unsafe as pop_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
         "18CC5707CEBBF42AF2BC5099CC5523C1" unsafe as smtp_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
         "B30A3C09EDE7FD84FBC92BD62E2B27B3" unsafe as username: inlineencodings::Handle<blobencodings::UTF8String>;
@@ -60,6 +69,10 @@ pub mod account {
         /// the mailbox password. Mail never owns or interprets its envelope.
         "2902B62BBC51167E42689D95ED417F87" unsafe as credential: inlineencodings::GenId;
         "486EFCC641A92842DACE180388FE76DA" unsafe as enabled: inlineencodings::Boolean;
+        /// Implicit-TLS IMAP endpoint as `host:port`, read only through
+        /// EXAMINE and `BODY.PEEK[]`.
+        /// Minted with `trible genid` on 2026-11-16.
+        "F38E634BA0CACEA83F1B8C2C4B299336" as imap_endpoint: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -84,6 +97,17 @@ pub mod observation {
         "9AE9A14BA205663A0B85166D6982DC23" unsafe as uidl: inlineencodings::Handle<blobencodings::UTF8String>;
         "C6AA568EBF7BE4D7E98A74C6472710E6" unsafe as raw: inlineencodings::Handle<blobencodings::RawBytes>;
         "BEB35E6ED9637B6FB7EC74C3F604DCBC" unsafe as attempt: inlineencodings::GenId;
+        /// Exact IMAP mailbox name as the server listed it (modified UTF-7
+        /// on the wire, kept verbatim).
+        /// Minted with `trible genid` on 2026-11-16.
+        "A9EDD64DDC92C3F66F726EEA48372128" as mailbox: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// IMAP UIDVALIDITY of `mailbox` when the message was fetched. A new
+        /// value is a new UID namespace; old observations keep theirs.
+        /// Minted with `trible genid` on 2026-11-16.
+        "00D85185E3806A733A05BDEA0F5EC972" as uidvalidity: inlineencodings::U256BE;
+        /// IMAP UID of the message within (`mailbox`, `uidvalidity`).
+        /// Minted with `trible genid` on 2026-11-16.
+        "12EECA2E07D7D8B48BEE87DC5403C025" as uid: inlineencodings::U256BE;
     }
 }
 

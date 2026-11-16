@@ -373,8 +373,8 @@ use crate::schemas::habit::DEFAULT_SCOPE_ID as HABIT_SCOPE_ID;
 use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::mail::{
     imported as imported_mail, observation as mail_observation, projection as mail_projection,
-    read as mail_read, IMPORT_RECEIVED, KIND_IMPORTED_OBSERVATION, KIND_PARSED_PROJECTION,
-    KIND_POP_OBSERVATION, KIND_READ_OBSERVATION, RECIPE_RFC5322_V1,
+    read as mail_read, IMPORT_RECEIVED, KIND_IMAP_OBSERVATION, KIND_IMPORTED_OBSERVATION,
+    KIND_PARSED_PROJECTION, KIND_POP_OBSERVATION, KIND_READ_OBSERVATION, RECIPE_RFC5322_V1,
 };
 use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::{
@@ -1895,6 +1895,13 @@ fn native_unread_mail(query: &OrientQuery<'_>, persona: Id) -> Result<BTreeMap<I
         }])
     )
     .collect();
+    sources.extend(find!(
+        (source: Id, wire: Id),
+        pattern!(query.mail, [{ ?source @
+            metadata::tag: &KIND_IMAP_OBSERVATION,
+            mail_observation::wire: ?wire,
+        }])
+    ));
     sources.extend(find!(
         (source: Id, wire: Id),
         pattern!(query.mail, [{ ?source @

@@ -44,6 +44,30 @@ pub fn fetched(values: &[AccountFetched], out: &mut Out<'_>) -> Result<()> {
             "{}: fetched {} message(s)",
             value.address, value.fetched
         ))?;
+        for mailbox in &value.mailboxes {
+            out.line(format!(
+                "  {:?} uidvalidity={}: {} matched, {} already held, {} fetched{}",
+                mailbox.mailbox,
+                mailbox.uidvalidity,
+                mailbox.matched,
+                mailbox.held,
+                mailbox.fetched,
+                if mailbox.vanished > 0 {
+                    format!(", {} vanished", mailbox.vanished)
+                } else {
+                    String::new()
+                }
+            ))?;
+            for (uid, size) in &mailbox.oversized {
+                out.line(format!(
+                    "    UID {uid}: {size} bytes, over the {}-byte cap; left unread on the server",
+                    crate::mail::MAX_MESSAGE_BYTES
+                ))?;
+            }
+            for (uid, reason) in &mailbox.unparsed {
+                out.line(format!("    UID {uid}: not recorded: {reason}"))?;
+            }
+        }
     }
     Ok(())
 }

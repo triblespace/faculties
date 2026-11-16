@@ -75,7 +75,7 @@ pub mod home;
 pub mod imagine;
 pub mod linkedin;
 pub mod mail;
-pub mod mail_pop;
+pub mod mail_imap;
 pub mod maintenance;
 pub mod mcp;
 pub mod memory;

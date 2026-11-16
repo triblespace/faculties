@@ -30,8 +30,9 @@ enum Command {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// Fetch every enabled account through UIDL-safe POP.
-    Fetch,
+    /// Observe enabled accounts read-only over IMAP (EXAMINE + BODY.PEEK[]).
+    /// Never flags, moves or deletes anything on the server.
+    Fetch(FetchArgs),
     /// Create one immutable draft and its deterministic Decide proposal.
     Draft(DraftArgs),
     /// Create a reply draft from an inbound wire message.
@@ -66,9 +67,9 @@ enum AccountCommand {
         address: String,
         #[arg(long)]
         display_name: String,
-        /// Implicit-TLS endpoint as `host:port`.
+        /// Implicit-TLS IMAP endpoint as `host:port` (normally port 993).
         #[arg(long)]
-        pop_endpoint: String,
+        imap_endpoint: String,
         /// Implicit-TLS endpoint as `host:port`.
         #[arg(long)]
         smtp_endpoint: String,
@@ -85,6 +86,48 @@ enum AccountCommand {
         disabled: bool,
     },
     List,
+}
+
+#[derive(Args)]
+struct FetchArgs {
+    /// Server mailbox name to examine; repeatable. Defaults to INBOX.
+    #[arg(long = "mailbox", conflicts_with = "all_mailboxes")]
+    mailboxes: Vec<String>,
+    /// Examine every selectable mailbox the server lists.
+    #[arg(long)]
+    all_mailboxes: bool,
+    /// IMAP SEARCH FROM: substring of the From header.
+    #[arg(long)]
+    from: Option<String>,
+    /// IMAP SEARCH SUBJECT: substring of the Subject header.
+    #[arg(long)]
+    subject: Option<String>,
+    /// IMAP SEARCH SINCE: received on or after this day (YYYY-MM-DD or 1-Jan-2024).
+    #[arg(long, value_parser = parse_date)]
+    since: Option<super::SearchDate>,
+    /// IMAP SEARCH BEFORE: received before this day (YYYY-MM-DD or 1-Jan-2024).
+    #[arg(long, value_parser = parse_date)]
+    before: Option<super::SearchDate>,
+}
+
+impl FetchArgs {
+    fn request(self) -> FetchRequest {
+        FetchRequest {
+            mailboxes: if self.all_mailboxes {
+                super::MailboxSelection::All
+            } else if self.mailboxes.is_empty() {
+                super::MailboxSelection::Inbox
+            } else {
+                super::MailboxSelection::Named(self.mailboxes)
+            },
+            criteria: super::SearchCriteria {
+                from: self.from,
+                subject: self.subject,
+                since: self.since,
+                before: self.before,
+            },
+        }
+    }
 }
 
 #[derive(Args)]
@@ -152,7 +195,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 account,
                 address,
                 display_name,
-                pop_endpoint,
+                imap_endpoint,
                 smtp_endpoint,
                 username,
                 password,
@@ -163,7 +206,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                     account,
                     address,
                     display_name,
-                    pop_endpoint,
+                    imap_endpoint,
                     smtp_endpoint,
                     username,
                     credential_version,
@@ -180,7 +223,7 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             }
             AccountCommand::List => render::accounts(&operations.account_list()?, out),
         },
-        Command::Fetch => render::fetched(&operations.fetch()?, out),
+        Command::Fetch(args) => render::fetched(&operations.fetch(args.request())?, out),
         Command::Draft(args) => {
             let body = crate::text_arg(&args.body, "draft body")?;
             let attachments = args
@@ -223,6 +266,10 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     crate::cli::with_output("mail", |out| execute_to_exit(cli, out))
 }
+fn parse_date(raw: &str) -> std::result::Result<super::SearchDate, String> {
+    super::SearchDate::parse(raw)
+        .ok_or_else(|| format!("'{raw}' is not a date (YYYY-MM-DD or D-Mon-YYYY)"))
+}
 fn parse_id(raw: &str) -> std::result::Result<Id, String> {
     Id::from_hex(raw.trim())
         .ok_or_else(|| format!("'{raw}' is not one exact nonzero 32-digit hexadecimal id"))
@@ -253,8 +300,8 @@ mod tests {
             "me@example.test",
             "--display-name",
             "Me",
-            "--pop-endpoint",
-            "pop.example.test:995",
+            "--imap-endpoint",
+            "imap.example.test:993",
             "--smtp-endpoint",
             "smtp.example.test:465",
             "--password",
@@ -263,6 +310,45 @@ mod tests {
             "mail-test",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn fetch_flags_become_one_read_only_request() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["mail", "--pile", "/tmp/not-opened-mail-test.pile", "fetch"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).map(|cli| cli.command) {
+                Ok(Command::Fetch(args)) => Ok(args.request()),
+                Ok(_) => panic!("not a fetch"),
+                Err(error) => Err(error),
+            }
+        };
+        let request = parse(&[]).unwrap();
+        assert_eq!(request.mailboxes, super::super::MailboxSelection::Inbox);
+        assert!(request.criteria.is_empty());
+
+        let request = parse(&[
+            "--all-mailboxes",
+            "--from",
+            "anthropic",
+            "--since",
+            "2024-01-01",
+            "--before",
+            "1-Feb-2024",
+        ])
+        .unwrap();
+        assert_eq!(request.mailboxes, super::super::MailboxSelection::All);
+        assert_eq!(request.criteria.from.as_deref(), Some("anthropic"));
+        assert_eq!(request.criteria.since.unwrap().imap_text(), "1-Jan-2024");
+        assert_eq!(request.criteria.before.unwrap().imap_text(), "1-Feb-2024");
+
+        let request = parse(&["--mailbox", "INBOX", "--mailbox", "Archive"]).unwrap();
+        assert_eq!(
+            request.mailboxes,
+            super::super::MailboxSelection::Named(vec!["INBOX".into(), "Archive".into()])
+        );
+        assert!(parse(&["--mailbox", "INBOX", "--all-mailboxes"]).is_err());
+        assert!(parse(&["--since", "last tuesday"]).is_err());
     }
 
     #[test]
@@ -277,14 +363,18 @@ mod tests {
             "me@example.test",
             "--display-name",
             "Me",
-            "--pop-endpoint",
-            "pop.example.test:995",
+            "--imap-endpoint",
+            "imap.example.test:993",
             "--smtp-endpoint",
             "smtp.example.test:465",
             "--password",
             "secret",
         ];
         assert!(Cli::try_parse_from(command).is_ok());
+
+        let mut with_pop = command.to_vec();
+        with_pop[9] = "--pop-endpoint";
+        assert!(Cli::try_parse_from(with_pop).is_err());
 
         let mut with_vault = command.to_vec();
         with_vault.extend(["--vault", "78787878787878787878787878787878"]);
