@@ -6,8 +6,8 @@
 #[cfg(test)]
 use crate::collection_names::{open_configured, open_exact_in};
 use crate::schemas::compass::{
-    board, latest_status_event, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID, DEFAULT_STATUSES,
-    KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
+    board, interval_key, latest_status_event, IntervalValue, DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID,
+    DEFAULT_STATUSES, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 #[cfg(test)]
@@ -302,19 +302,6 @@ impl Compass {
 // of pre-materializing Rust catalogs.
 
 /// Query helpers that operate directly on one immutable fact view + workspace.
-
-type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
-
-/// The lower bound of an interval in TAI nanoseconds, if the value decodes.
-///
-/// Queries are types: a stored value that does not decode as an interval (an
-/// inverted pair) is not a time this reader can order by, so every caller
-/// skips the row that carries it instead of panicking. A wider interval is
-/// read at its lower bound, the earliest moment it admits.
-fn interval_key(interval: IntervalValue) -> Option<i128> {
-    let (lower, _): (i128, i128) = interval.try_from_inline().ok()?;
-    Some(lower)
-}
 
 /// The lower bound of an interval as text, if the value decodes.
 fn format_interval(interval: IntervalValue) -> Option<String> {
