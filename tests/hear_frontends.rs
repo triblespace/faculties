@@ -235,8 +235,9 @@ fn malformed_samples_and_embedding_shapes_fail_before_emission() {
 #[test]
 fn mcp_discovery_never_loads_models_and_caller_cannot_choose_devices() {
     let adapter = mcp::Hear::new(None);
-    assert_eq!(adapter.tools().len(), 1);
+    assert_eq!(adapter.tools().len(), 2);
     assert_eq!(adapter.tools()[0].name, "hear_once");
+    assert_eq!(adapter.tools()[1].name, "hear_prosody");
     Server::new(&[&adapter]).unwrap();
     let host = tempfile::tempdir().unwrap();
     let clip = host.path().join("clip.wav");
@@ -353,4 +354,72 @@ fn catalog_hear_resolves_file_ids_against_its_storage_and_stops_at_the_model() {
     assert!(failed);
     assert!(text.contains("is a directory or folder import"), "{text}");
     catalog.close().unwrap();
+}
+
+fn pcm16_wav(rate: u32, samples: &[f32]) -> Vec<u8> {
+    let data: Vec<u8> = samples
+        .iter()
+        .flat_map(|s| ((s * 32767.0) as i16).to_le_bytes())
+        .collect();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    for field in [16u32, 1 | (1 << 16), rate, rate * 2, 2 | (16 << 16)] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&data);
+    bytes
+}
+
+/// Prosody needs no model: the adapter without any model configuration reads
+/// a host WAV and reports its pitch, as text and as JSON.
+#[test]
+fn mcp_prosody_reads_a_wav_without_a_model() {
+    let adapter = mcp::Hear::new(None);
+    let host = tempfile::tempdir().unwrap();
+    let clip = host.path().join("tone.wav");
+    let rate = 24_000;
+    let samples: Vec<f32> = (0..rate)
+        .map(|i| 0.3 * (i as f32 * 2.0 * std::f32::consts::PI * 210.0 / rate as f32).sin())
+        .collect();
+    std::fs::write(&clip, pcm16_wav(rate as u32, &samples)).unwrap();
+    let call = |args: serde_json::Value| {
+        let mut text = String::new();
+        adapter.call(
+            "hear_prosody",
+            Bytes::from(args.to_string()),
+            &mut Out::new(&mut |part| {
+                if let Part::Text { text: t } = part {
+                    text.push_str(&t);
+                }
+                Ok(())
+            }),
+        )?;
+        anyhow::Ok(text)
+    };
+    let text = call(serde_json::json!({ "path": clip })).unwrap();
+    assert!(text.contains("pitch     median 210 Hz"), "{text}");
+    let json: serde_json::Value =
+        serde_json::from_str(&call(serde_json::json!({ "path": clip, "json": true })).unwrap())
+            .unwrap();
+    assert!((json["f0_median_hz"].as_f64().unwrap() - 210.0).abs() < 1.0);
+    assert_eq!(json["rate_hz"], 24_000);
+    let not_wav = host.path().join("not.wav");
+    std::fs::write(&not_wav, b"OggS....").unwrap();
+    for args in [
+        serde_json::json!({ "path": not_wav }),
+        serde_json::json!({ "path": clip, "f0_min_hz": 300, "f0_max_hz": 100 }),
+        serde_json::json!({ "path": clip, "pile": "/host/pile" }),
+        serde_json::json!({ "path": "relative.wav" }),
+        serde_json::json!({}),
+    ] {
+        let error = call(args.clone()).unwrap_err();
+        assert!(
+            error.downcast_ref::<InvalidArguments>().is_some(),
+            "{args}: {error:#}"
+        );
+    }
 }

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `hear prosody <clip>...` and the MCP tool `hear_prosody` read the tone of
+  a recorded WAV clip apart from its words: pitch (YIN; median, range and
+  spread in semitones), loudness (active-speech RMS, range, peak),
+  breathiness as the harmonics-to-noise ratio, vocal effort as the alpha
+  ratio (energy above 1 kHz over below), syllable-nucleus rate and pauses.
+  Plain signal processing on the CPU, no model, so it works in every build;
+  nothing is written. A clip is a host path or `files:<selector>` read from
+  `--pile`/`PILE` (MCP: `path` or `file_id`). `--json` prints one object per
+  clip. Integer PCM and IEEE float WAVs are read natively; other containers
+  are refused. The first use is the voice's proprioception (compass 1807582a):
+  whether the takes JP judged by ear differ on any of these measures.
+
 - The Breeze voice reference can live in the pile:
   `FACULTIES_BREEZE_REFERENCE_WAV` and `FACULTIES_BREEZE_REFERENCE_TEXT` each
   take either a host path, as before, or `files:<selector>` (an entity,

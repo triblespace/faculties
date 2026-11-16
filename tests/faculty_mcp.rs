@@ -321,6 +321,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "habit_list",
         "headspace_list",
         "hear_once",
+        "hear_prosody",
         "home_rooms",
         "home_on",
         "home_scene",
@@ -363,6 +364,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "body_capture",
         "files_add",
         "hear_once",
+        "hear_prosody",
         "memory_image",
         "secrets_add",
     ];

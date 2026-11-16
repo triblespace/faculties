@@ -47,6 +47,10 @@ const TOOLS:&[Tool]=&[Tool{
     name:"hear_once",
     description:"Run one encoded audio clip through the shared VAD, speech filters and launcher-configured Gemma hearing stack. The clip is a Files file_id or an absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes, and workspace selection authorizes none. Returns ordered metadata and exact raw f32le row-major embedding resources, not audio playback; optional text is diagnostic. Requires the hear build feature and explicit local model/config/tokenizer configuration. No microphone, Soma listener, download, log path or model selection can be requested.",
     input_schema:r#"{"type":"object","properties":{"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the clip."},"path":{"type":"string","description":"Absolute path of the clip on the MCP server's host."},"mime_type":{"type":"string","default":"audio/wav"},"source":{"type":"string","default":"resident"},"transcribe":{"type":"boolean","default":false},"prompt":{"type":"string","default":"Transcribe exactly what is being said."},"tokens":{"type":"integer","minimum":1,"default":64},"min_chars":{"type":"integer","minimum":0,"default":2},"min_dur_s":{"type":"number","minimum":0,"default":0.6}},"oneOf":[{"required":["file_id"]},{"required":["path"]}],"additionalProperties":false}"#
+},Tool{
+    name:"hear_prosody",
+    description:"Read the tone of one recorded WAV clip (integer PCM or float, any rate of at least 11 kHz for every measure), apart from its words: pitch (median Hz, range and spread in semitones), loudness (active-speech RMS, its range, peak), breathiness (harmonics-to-noise ratio) and vocal effort (alpha ratio, energy above 1 kHz over below), syllable-nucleus rate and pauses. Plain signal processing on the CPU, no model, available in every build; nothing is written. The clip is a Files file_id or an absolute path on the host the MCP server runs on, read with the server process's permissions, which are a capability, not authority: pass only paths the user or task authorizes.",
+    input_schema:r#"{"type":"object","properties":{"file_id":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Files entity ID or single-file import ID of the clip."},"path":{"type":"string","description":"Absolute path of the clip on the MCP server's host."},"f0_min_hz":{"type":"number","minimum":20,"default":70},"f0_max_hz":{"type":"number","default":600},"json":{"type":"boolean","default":false,"description":"Return one JSON object instead of text."}},"oneOf":[{"required":["file_id"]},{"required":["path"]}],"additionalProperties":false}"#
 }];
 fn mime() -> String {
     "audio/wav".to_owned()
@@ -86,13 +90,52 @@ struct Once {
     #[serde(default = "min_dur")]
     min_dur_s: f64,
 }
+fn f0_min() -> f64 {
+    super::prosody::Settings::default().f0_min_hz
+}
+fn f0_max() -> f64 {
+    super::prosody::Settings::default().f0_max_hz
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prosody {
+    file_id: Option<String>,
+    path: Option<String>,
+    #[serde(default = "f0_min")]
+    f0_min_hz: f64,
+    #[serde(default = "f0_max")]
+    f0_max_hz: f64,
+    #[serde(default)]
+    json: bool,
+}
+impl Hear {
+    fn prosody(&self, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
+        use super::prosody::{analyze, decode_wav, Settings};
+        let a: Prosody = decode_arguments(arguments)?;
+        let settings = Settings {
+            f0_min_hz: a.f0_min_hz,
+            f0_max_hz: a.f0_max_hz,
+        };
+        settings.validate().map_err(invalid_arguments)?;
+        let bytes = self.clip(a.file_id.as_deref(), a.path.as_deref())?;
+        let wave = decode_wav(bytes.as_ref()).map_err(invalid_arguments)?;
+        let prosody = analyze(&wave, &settings).map_err(invalid_arguments)?;
+        if a.json {
+            out.line(serde_json::to_string(&prosody)?)
+        } else {
+            out.line(format!("clip ({} Hz)\n{}", prosody.rate_hz, prosody.text()))
+        }
+    }
+}
 impl Faculty for Hear {
     fn tools(&self) -> &[Tool] {
         TOOLS
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
-        if name != "hear_once" {
-            bail!("unknown Hear MCP tool {name:?}");
+        match name {
+            "hear_once" => {}
+            "hear_prosody" => return self.prosody(arguments, out),
+            _ => bail!("unknown Hear MCP tool {name:?}"),
         }
         let a: Once = decode_arguments(arguments)?;
         super::operations::mime_hint(&a.mime_type).map_err(invalid_arguments)?;

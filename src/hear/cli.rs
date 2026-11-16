@@ -27,6 +27,29 @@ enum Command {
     /// Run recorded clips through the SAME segmenter and embed path — the
     /// hardware-free gate for everything below the capture seam.
     Once(OnceArgs),
+    /// Read the tone of recorded WAV clips: pitch, loudness, breathiness
+    /// (HNR, alpha ratio), rate and pauses. No model; works in every build.
+    Prosody(ProsodyArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProsodyArgs {
+    /// WAV clips: host paths, or `files:<selector>` (an entity, single-file
+    /// import or content hash, as `files get` takes it) read from `--pile`.
+    #[arg(required = true)]
+    clips: Vec<String>,
+    /// The pile `files:` clips are read from.
+    #[arg(long, env = "PILE")]
+    pile: Option<PathBuf>,
+    /// Lowest pitch searched, Hz.
+    #[arg(long, default_value_t = super::prosody::Settings::default().f0_min_hz)]
+    f0_min: f64,
+    /// Highest pitch searched, Hz.
+    #[arg(long, default_value_t = super::prosody::Settings::default().f0_max_hz)]
+    f0_max: f64,
+    /// Print one JSON object per clip instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -194,6 +217,63 @@ fn cmd_once(args: OnceArgs, out: &mut Out<'_>) -> Result<()> {
         args.shared.out.display()
     ))
 }
+fn cmd_prosody(args: ProsodyArgs, out: &mut Out<'_>) -> Result<()> {
+    use super::prosody::{analyze, decode_wav, Settings};
+    let settings = Settings {
+        f0_min_hz: args.f0_min,
+        f0_max_hz: args.f0_max,
+    };
+    settings.validate()?;
+    // Parse every selector before reading anything.
+    let sources = args
+        .clips
+        .iter()
+        .map(|clip| match clip.strip_prefix("files:") {
+            Some(selector) => crate::files::normalize_selector(selector).map(Some),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let files = match sources.iter().any(Option::is_some) {
+        true => {
+            let pile = args
+                .pile
+                .clone()
+                .context("files: clips need a pile: pass --pile or set PILE")?;
+            Some(crate::files::operations::Files::with_storage(
+                crate::storage::Storage::new(pile, None),
+            ))
+        }
+        false => None,
+    };
+    for (clip, selector) in args.clips.iter().zip(&sources) {
+        let bytes: Vec<u8> = match selector {
+            Some(selector) => files
+                .as_ref()
+                .expect("a Files reader exists for a files: clip")
+                .get(selector)
+                .with_context(|| format!("read {clip}"))?
+                .bytes
+                .as_ref()
+                .to_vec(),
+            None => std::fs::read(clip).with_context(|| format!("read {clip}"))?,
+        };
+        let prosody = decode_wav(&bytes)
+            .and_then(|wave| analyze(&wave, &settings))
+            .with_context(|| format!("prosody of {clip}"))?;
+        if args.json {
+            let mut record = serde_json::to_value(&prosody)?;
+            record["clip"] = serde_json::Value::String(clip.clone());
+            out.line(record.to_string())?;
+        } else {
+            out.line(format!(
+                "{clip} ({} Hz)\n{}",
+                prosody.rate_hz,
+                prosody.text()
+            ))?;
+        }
+    }
+    Ok(())
+}
 fn cmd_listen(args: ListenArgs, out: &mut Out<'_>) -> Result<()> {
     let shared = args.shared;
     let options = shared.options()?;
@@ -316,6 +396,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     match cli.command {
         Some(Command::Listen(args)) => cmd_listen(args, out),
         Some(Command::Once(args)) => cmd_once(args, out),
+        Some(Command::Prosody(args)) => cmd_prosody(args, out),
         None => out.line(Cli::command().render_help().to_string()),
     }
 }
@@ -371,6 +452,8 @@ mod tests {
             .collect();
         assert!(names.contains(&"listen".to_owned()));
         assert!(names.contains(&"once".to_owned()));
+        assert!(names.contains(&"prosody".to_owned()));
+        assert!(Cli::try_parse_from(["hear", "prosody"]).is_err());
         assert!(Cli::try_parse_from(["hear", "once"]).is_err());
         let cli = Cli::try_parse_from([
             "hear",
