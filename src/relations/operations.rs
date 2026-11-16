@@ -18,7 +18,8 @@ use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::relations::{
-    self, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot, SelectorOutcome,
+    self, EntryKind, GroupSnapshot, Head, IdentityComponents, ProfileInput, ProfileSnapshot,
+    SelectorOutcome, TieAnnotation,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
 use crate::storage::{FactArchive, FacultyStore, Storage};
@@ -101,6 +102,34 @@ fn resolve_person_anchor(
         } if forked.len() == 1 && settled.is_empty() => Ok(forked[0]),
         outcome => outcome.require_unique("person", selector),
     }
+}
+
+/// Resolve a selector across the profile-carrying `kinds`, with the same
+/// single-forked-claimant allowance as [`resolve_person_anchor`].
+fn resolve_entry_anchor(
+    reader: &RelationsReader,
+    facts: &FactArchive,
+    selector: &str,
+    include_retired: bool,
+    kinds: &[EntryKind],
+) -> Result<(Id, EntryKind)> {
+    let noun = match kinds {
+        [kind] => kind.noun(),
+        _ => "entry",
+    };
+    let id = match relations::resolve_entry(reader, facts, selector, include_retired, kinds)? {
+        SelectorOutcome::Unique(id) => id,
+        SelectorOutcome::Forked {
+            ref forked,
+            ref settled,
+        } if forked.len() == 1 && settled.is_empty() => forked[0],
+        outcome => outcome.require_unique(noun, selector)?,
+    };
+    let kind = relations::entry_kinds(facts, id)
+        .into_iter()
+        .find(|kind| kinds.contains(kind))
+        .expect("a resolved entry carries one of the requested kinds");
+    Ok((id, kind))
 }
 
 fn resolve_group_anchor(
@@ -305,6 +334,244 @@ pub enum IdentityChange {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddedOrganisation {
+    pub organisation: Id,
+    pub profile: Id,
+    pub lifecycle: Id,
+}
+
+/// One tie publication: the tie id, its endpoints, and whether the view
+/// already held that exact claim (then only annotations were added).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddedTie {
+    pub tie: Id,
+    pub subject: Id,
+    pub object: Id,
+    pub known: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TieRequest {
+    /// Subject entry: person or organisation label, alias, id, or id prefix.
+    pub subject: String,
+    /// Relation label, read from subject to object ("works at").
+    pub relation: String,
+    /// Object entry, resolved like `subject`.
+    pub object: String,
+    pub role: Option<String>,
+    /// Validity start, as [`relations::parse_when`] reads it.
+    pub since: Option<String>,
+    /// Validity end, as [`relations::parse_when`] reads it.
+    pub until: Option<String>,
+    /// Provenance: URLs or notes (repeatable, accumulating).
+    pub sources: Vec<String>,
+    /// Optional active Relations person for cooperative attribution.
+    pub persona: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EndedTie {
+    pub tie: Id,
+    pub until: String,
+}
+
+fn resolve_author(
+    reader: &RelationsReader,
+    facts: &FactArchive,
+    persona: Option<&str>,
+) -> Result<Option<Id>> {
+    persona
+        .map(|persona| {
+            relations::resolve_person(reader, facts, persona, false)?
+                .require_unique("persona", persona)
+        })
+        .transpose()
+}
+
+fn add_organisation(
+    storage: &mut RelationsStorage<'_>,
+    profile: ProfileInput,
+    source: Vec<String>,
+) -> Result<AddedOrganisation> {
+    storage.update(|facts, reader| {
+        // An organisation anchor is extrinsic, so re-running an import would
+        // mint a duplicate; refuse a label or alias that already names one.
+        for key in std::iter::once(&profile.label).chain(profile.aliases.iter()) {
+            match relations::resolve_organisation(reader, facts, key, true)? {
+                SelectorOutcome::Missing | SelectorOutcome::Invalid(_) => {}
+                outcome => bail!(
+                    "organisation '{key}' already exists: {} (use `relations org set`)",
+                    outcome
+                        .candidates()
+                        .into_iter()
+                        .map(fmt_id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }
+        }
+        let organisation = genid().id;
+        let (mut fragment, profile_id, lifecycle_id) =
+            relations::organisation_fragment(organisation, profile)?;
+        fragment +=
+            relations::person_provenance_fragment(organisation, source, &[now_observation()?])?;
+        Ok((
+            Some(fragment),
+            AddedOrganisation {
+                organisation,
+                profile: profile_id,
+                lifecycle: lifecycle_id,
+            },
+        ))
+    })
+}
+
+fn add_tie(storage: &mut RelationsStorage<'_>, request: TieRequest) -> Result<AddedTie> {
+    let since = request
+        .since
+        .as_deref()
+        .map(relations::parse_when)
+        .transpose()?;
+    let until = request
+        .until
+        .as_deref()
+        .map(relations::parse_when)
+        .transpose()?;
+    let now = now_observation()?;
+    storage.update(|facts, reader| {
+        let (subject, _) =
+            resolve_entry_anchor(reader, facts, &request.subject, false, &EntryKind::ALL)?;
+        let (object, _) =
+            resolve_entry_anchor(reader, facts, &request.object, false, &EntryKind::ALL)?;
+        let author = resolve_author(reader, facts, request.persona.as_deref())?;
+        let mut fragment =
+            relations::tie_fragment(subject, request.relation, object, request.role)?;
+        let tie = fragment
+            .root()
+            .expect("tie fragment has one intrinsic root");
+        // Reported, never decisive: the same claim converges on this id.
+        let known = !relations::tie_claims(facts, tie).is_empty();
+        fragment += relations::tie_annotation_fragment(
+            tie,
+            TieAnnotation {
+                sources: request.sources,
+                started_at: since,
+                finished_at: until,
+                created_at: Some(now),
+                author,
+            },
+        )?;
+        Ok((
+            Some(fragment),
+            AddedTie {
+                tie,
+                subject,
+                object,
+                known,
+            },
+        ))
+    })
+}
+
+fn end_tie(
+    storage: &mut RelationsStorage<'_>,
+    selector: String,
+    until: String,
+    sources: Vec<String>,
+    persona: Option<String>,
+) -> Result<EndedTie> {
+    let finished = relations::parse_when(&until)?;
+    storage.update(|facts, reader| {
+        let tie = relations::resolve_tie(facts, &selector).require_unique("tie", &selector)?;
+        let author = resolve_author(reader, facts, persona.as_deref())?;
+        let fragment = relations::tie_annotation_fragment(
+            tie,
+            TieAnnotation {
+                sources,
+                finished_at: Some(finished),
+                author,
+                ..TieAnnotation::default()
+            },
+        )?;
+        Ok((
+            Some(fragment),
+            EndedTie {
+                tie,
+                until: relations::format_when(finished),
+            },
+        ))
+    })
+}
+
+fn print_ties(
+    mut output: &mut String,
+    reader: &RelationsReader,
+    facts: &FactArchive,
+    anchor: Id,
+) -> Result<()> {
+    let claims = relations::ties_touching(facts, anchor);
+    if claims.is_empty() {
+        return Ok(());
+    }
+    writeln!(&mut output, "ties: {}", claims.len())?;
+    for claim in claims {
+        writeln!(
+            &mut output,
+            "- {}: {} ({}) --{}--> {} ({})",
+            fmt_id(claim.id),
+            relations::entry_label(reader, facts, claim.subject),
+            fmt_id(claim.subject),
+            relations::read_text(reader, claim.relation)?,
+            relations::entry_label(reader, facts, claim.object),
+            fmt_id(claim.object),
+        )?;
+        for role in relations::tie_roles(facts, claim.id) {
+            writeln!(
+                &mut output,
+                "  role: {}",
+                relations::read_text(reader, role)?
+            )?;
+        }
+        for since in relations::started_at(facts, claim.id) {
+            writeln!(&mut output, "  since: {}", relations::format_when(since))?;
+        }
+        for until in relations::finished_at(facts, claim.id) {
+            writeln!(&mut output, "  until: {}", relations::format_when(until))?;
+        }
+        for source in relations::sources_of(reader, facts, claim.id)? {
+            writeln!(&mut output, "  source: {source}")?;
+        }
+        for author in relations::tie_authors(facts, claim.id) {
+            writeln!(
+                &mut output,
+                "  by: {}",
+                relations::entry_label(reader, facts, author)
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn list_ties(storage: &mut RelationsStorage<'_>, selector: String) -> Result<String> {
+    let mut output = String::new();
+    storage.with_view(|facts, reader| {
+        let (anchor, kind) = resolve_entry_anchor(reader, facts, &selector, true, &EntryKind::ALL)?;
+        writeln!(
+            &mut output,
+            "{}: {} {}",
+            kind.noun(),
+            fmt_id(anchor),
+            relations::entry_label(reader, facts, anchor)
+        )?;
+        print_ties(&mut output, reader, facts, anchor)?;
+        if relations::ties_touching(facts, anchor).is_empty() {
+            writeln!(&mut output, "No ties.")?;
+        }
+        Ok(output)
+    })
+}
+
 fn add_person(
     storage: &mut RelationsStorage<'_>,
     profile: ProfileInput,
@@ -328,19 +595,23 @@ fn add_person(
 
 fn set_profile(
     storage: &mut RelationsStorage<'_>,
+    kind: EntryKind,
     person: String,
     source: Vec<String>,
     patch: ProfilePatch,
 ) -> Result<ProfileUpdate> {
     storage.update(|facts, reader| {
-        let person = resolve_person_anchor(reader, facts, &person, true)?;
-        let current = relations::current_profile(facts, person)?;
+        let person = match kind {
+            EntryKind::Person => resolve_person_anchor(reader, facts, &person, true)?,
+            _ => resolve_entry_anchor(reader, facts, &person, true, &[kind])?.0,
+        };
+        let current = relations::current_profile_of(facts, person, kind)?;
         let mut value = relations::profile_input(reader, &current)?;
         let changed = apply_profile_patch(&mut value, patch)?;
 
         let mut fragment = Fragment::empty();
         let new = if changed {
-            let profile = relations::profile_fragment(person, value, &[current.id])?;
+            let profile = relations::profile_fragment_of(kind, person, value, &[current.id])?;
             let id = profile.root().expect("profile snapshot root");
             fragment += profile;
             Some(id)
@@ -411,12 +682,16 @@ fn reconcile_profile(
     })
 }
 
-fn lifecycle_state(facts: &FactArchive, person: Id) -> Result<(Vec<Id>, Option<bool>)> {
-    match relations::lifecycle_head(facts, person)? {
-        Head::Missing => bail!("person {} has no lifecycle", fmt_id(person)),
+fn lifecycle_state(
+    facts: &FactArchive,
+    person: Id,
+    kind: EntryKind,
+) -> Result<(Vec<Id>, Option<bool>)> {
+    match relations::lifecycle_head_of(facts, person, kind)? {
+        Head::Missing => bail!("{} {} has no lifecycle", kind.noun(), fmt_id(person)),
         Head::Unique(id) => Ok((
             vec![id],
-            Some(relations::lifecycle_snapshot(facts, id)?.retired),
+            Some(relations::lifecycle_snapshot_of(facts, id, kind)?.retired),
         )),
         Head::Forked(ids) => Ok((ids, None)),
     }
@@ -424,16 +699,20 @@ fn lifecycle_state(facts: &FactArchive, person: Id) -> Result<(Vec<Id>, Option<b
 
 fn set_retired(
     storage: &mut RelationsStorage<'_>,
+    kind: EntryKind,
     selector: String,
     retired: bool,
 ) -> Result<LifecycleChange> {
     storage.update(|facts, reader| {
-        let person = resolve_person_anchor(reader, facts, &selector, true)?;
-        let (heads, current) = lifecycle_state(facts, person)?;
+        let person = match kind {
+            EntryKind::Person => resolve_person_anchor(reader, facts, &selector, true)?,
+            _ => resolve_entry_anchor(reader, facts, &selector, true, &[kind])?.0,
+        };
+        let (heads, current) = lifecycle_state(facts, person, kind)?;
         if current == Some(retired) {
             return Ok((None, LifecycleChange::Unchanged(person)));
         }
-        let fragment = relations::lifecycle_fragment(person, retired, &heads);
+        let fragment = relations::lifecycle_fragment_of(kind, person, retired, &heads);
         let successor = fragment.root().expect("lifecycle snapshot root");
         Ok((
             Some(fragment),
@@ -479,11 +758,17 @@ fn print_profile(mut output: &mut String, id: Id, input: &ProfileInput) -> Resul
     Ok(())
 }
 
-fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<String> {
+/// Show one person or organisation, with its ties: `kinds` are the entry
+/// kinds the selector may name.
+fn show_entry(
+    storage: &mut RelationsStorage<'_>,
+    selector: String,
+    kinds: &[EntryKind],
+) -> Result<String> {
     let mut output = String::new();
     storage.with_view(|facts, reader| {
-        let person = resolve_person_anchor(reader, facts, &selector, true)?;
-        writeln!(&mut output, "person: {}", fmt_id(person))?;
+        let (person, kind) = resolve_entry_anchor(reader, facts, &selector, true, kinds)?;
+        writeln!(&mut output, "{}: {}", kind.noun(), fmt_id(person))?;
         print_values(
             &mut output,
             "source",
@@ -493,10 +778,10 @@ fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<S
         if !observations.is_empty() {
             writeln!(&mut output, "creation_observations: {}", observations.len())?;
         }
-        match relations::profile_head(facts, person)? {
+        match relations::profile_head_of(facts, person, kind)? {
             Head::Missing => writeln!(&mut output, "profile: missing")?,
             Head::Unique(id) => {
-                let snapshot = relations::profile_snapshot(facts, id)?;
+                let snapshot = relations::profile_snapshot_of(facts, id, kind)?;
                 print_profile(
                     &mut output,
                     id,
@@ -506,7 +791,7 @@ fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<S
             Head::Forked(ids) => {
                 writeln!(&mut output, "profile_fork: {} heads", ids.len())?;
                 for id in ids {
-                    let snapshot = relations::profile_snapshot(facts, id)?;
+                    let snapshot = relations::profile_snapshot_of(facts, id, kind)?;
                     print_profile(
                         &mut output,
                         id,
@@ -515,12 +800,12 @@ fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<S
                 }
             }
         }
-        match relations::lifecycle_head(facts, person)? {
+        match relations::lifecycle_head_of(facts, person, kind)? {
             Head::Missing => writeln!(&mut output, "lifecycle: missing")?,
             Head::Unique(id) => writeln!(
                 &mut output,
                 "retired: {}\nlifecycle: {}",
-                relations::lifecycle_snapshot(facts, id)?.retired,
+                relations::lifecycle_snapshot_of(facts, id, kind)?.retired,
                 fmt_id(id)
             )?,
             Head::Forked(ids) => {
@@ -530,11 +815,12 @@ fn show_person(storage: &mut RelationsStorage<'_>, selector: String) -> Result<S
                         &mut output,
                         "- {} retired={}",
                         fmt_id(id),
-                        relations::lifecycle_snapshot(facts, id)?.retired
+                        relations::lifecycle_snapshot_of(facts, id, kind)?.retired
                     )?;
                 }
             }
         }
+        print_ties(&mut output, reader, facts, person)?;
         Ok(output)
     })
 }
@@ -545,13 +831,25 @@ fn list_people(
     all: bool,
     retired_only: bool,
 ) -> Result<String> {
+    list_entries(storage, EntryKind::Person, limit, all, retired_only)
+}
+
+fn list_entries(
+    storage: &mut RelationsStorage<'_>,
+    kind: EntryKind,
+    limit: usize,
+    all: bool,
+    retired_only: bool,
+) -> Result<String> {
     let mut output = String::new();
     storage.with_view(|facts, reader| {
         let mut rows = Vec::new();
-        for person in relations::person_anchors(facts) {
-            let lifecycle = relations::lifecycle_head(facts, person)?;
+        for person in relations::entry_anchors(facts, kind) {
+            let lifecycle = relations::lifecycle_head_of(facts, person, kind)?;
             let retired = match &lifecycle {
-                Head::Unique(id) => Some(relations::lifecycle_snapshot(facts, *id)?.retired),
+                Head::Unique(id) => {
+                    Some(relations::lifecycle_snapshot_of(facts, *id, kind)?.retired)
+                }
                 Head::Missing | Head::Forked(_) => None,
             };
             if retired_only && retired != Some(true) {
@@ -560,10 +858,10 @@ fn list_people(
             if !all && !retired_only && retired == Some(true) {
                 continue;
             }
-            let profile = relations::profile_head(facts, person)?;
+            let profile = relations::profile_head_of(facts, person, kind)?;
             let (label, marker) = match profile {
                 Head::Unique(id) => {
-                    let snapshot = relations::profile_snapshot(facts, id)?;
+                    let snapshot = relations::profile_snapshot_of(facts, id, kind)?;
                     (relations::read_text(reader, snapshot.label)?, String::new())
                 }
                 Head::Forked(ids) => (
@@ -587,7 +885,10 @@ fn list_people(
         }
         rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
         if rows.is_empty() {
-            writeln!(&mut output, "No people.")?;
+            match kind {
+                EntryKind::Person => writeln!(&mut output, "No people.")?,
+                EntryKind::Organisation => writeln!(&mut output, "No organisations.")?,
+            }
         }
         for (_, person, label, marker, lifecycle) in rows.into_iter().take(limit) {
             writeln!(
@@ -961,7 +1262,13 @@ impl Relations {
         sources: &[String],
     ) -> Result<ProfileUpdate> {
         self.with_relations(false, |storage| {
-            set_profile(storage, person.to_owned(), sources.to_vec(), patch)
+            set_profile(
+                storage,
+                EntryKind::Person,
+                person.to_owned(),
+                sources.to_vec(),
+                patch,
+            )
         })
     }
     pub fn reconcile(
@@ -984,18 +1291,102 @@ impl Relations {
             )
         })
     }
-    pub fn show(&self, person: &str) -> Result<String> {
-        self.with_relations(true, |storage| show_person(storage, person.to_owned()))
+    /// Show a person or an organisation, with its ties.
+    pub fn show(&self, entry: &str) -> Result<String> {
+        self.with_relations(true, |storage| {
+            show_entry(storage, entry.to_owned(), &EntryKind::ALL)
+        })
     }
     pub fn retire(&self, person: &str) -> Result<LifecycleChange> {
         self.with_relations(false, |storage| {
-            set_retired(storage, person.to_owned(), true)
+            set_retired(storage, EntryKind::Person, person.to_owned(), true)
         })
     }
     pub fn unretire(&self, person: &str) -> Result<LifecycleChange> {
         self.with_relations(false, |storage| {
-            set_retired(storage, person.to_owned(), false)
+            set_retired(storage, EntryKind::Person, person.to_owned(), false)
         })
+    }
+    pub fn org_add(&self, profile: ProfileInput, sources: &[String]) -> Result<AddedOrganisation> {
+        self.with_relations(false, |storage| {
+            add_organisation(storage, profile, sources.to_vec())
+        })
+    }
+    pub fn org_set(
+        &self,
+        organisation: &str,
+        patch: ProfilePatch,
+        sources: &[String],
+    ) -> Result<ProfileUpdate> {
+        self.with_relations(false, |storage| {
+            set_profile(
+                storage,
+                EntryKind::Organisation,
+                organisation.to_owned(),
+                sources.to_vec(),
+                patch,
+            )
+        })
+    }
+    pub fn org_list(&self, limit: usize, filter: PeopleFilter) -> Result<String> {
+        self.with_relations(true, |storage| {
+            list_entries(
+                storage,
+                EntryKind::Organisation,
+                limit,
+                filter == PeopleFilter::All,
+                filter == PeopleFilter::Retired,
+            )
+        })
+    }
+    pub fn org_show(&self, organisation: &str) -> Result<String> {
+        self.with_relations(true, |storage| {
+            show_entry(storage, organisation.to_owned(), &[EntryKind::Organisation])
+        })
+    }
+    pub fn org_retire(&self, organisation: &str) -> Result<LifecycleChange> {
+        self.with_relations(false, |storage| {
+            set_retired(
+                storage,
+                EntryKind::Organisation,
+                organisation.to_owned(),
+                true,
+            )
+        })
+    }
+    pub fn org_unretire(&self, organisation: &str) -> Result<LifecycleChange> {
+        self.with_relations(false, |storage| {
+            set_retired(
+                storage,
+                EntryKind::Organisation,
+                organisation.to_owned(),
+                false,
+            )
+        })
+    }
+    pub fn tie_add(&self, request: TieRequest) -> Result<AddedTie> {
+        self.with_relations(false, |storage| add_tie(storage, request))
+    }
+    pub fn tie_end(
+        &self,
+        tie: &str,
+        until: &str,
+        sources: &[String],
+        persona: Option<&str>,
+    ) -> Result<EndedTie> {
+        self.with_relations(false, |storage| {
+            end_tie(
+                storage,
+                tie.to_owned(),
+                until.to_owned(),
+                sources.to_vec(),
+                persona.map(str::to_owned),
+            )
+        })
+    }
+    /// Every tie with `entry` as subject or object.
+    pub fn ties(&self, entry: &str) -> Result<String> {
+        self.with_relations(true, |storage| list_ties(storage, entry.to_owned()))
     }
     pub fn group_create(&self, name: &str) -> Result<AddedGroup> {
         self.with_relations(false, |storage| create_group(storage, name.to_owned()))
@@ -1260,7 +1651,7 @@ mod tests {
 
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
         with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
-            assert!(show_person(storage, "Ada".to_owned())?.contains("Ada"));
+            assert!(show_entry(storage, "Ada".to_owned(), &EntryKind::ALL)?.contains("Ada"));
             Ok(())
         })
         .unwrap();
@@ -1475,5 +1866,197 @@ mod tests {
         drop(observed);
         drop(frozen);
         pile.close().unwrap();
+    }
+
+    fn scratch_relations(directory: &tempfile::TempDir) -> Relations {
+        let pile_path = directory.path().join("ties.pile");
+        let key = directory.path().join("ties.key");
+        fs::File::create(&pile_path).unwrap();
+        initialize_signer(&pile_path, Some(&key)).unwrap();
+        Relations::with_storage(Storage::new(pile_path, Some(key)))
+    }
+
+    fn organisation(label: &str, aliases: &[&str]) -> ProfileInput {
+        ProfileInput {
+            label: label.to_owned(),
+            aliases: aliases.iter().map(|alias| (*alias).to_owned()).collect(),
+            profile_urls: vec!["https://example.test/org".to_owned()],
+            ..ProfileInput::default()
+        }
+    }
+
+    fn tie_request(subject: &str, relation: &str, object: &str) -> TieRequest {
+        TieRequest {
+            subject: subject.to_owned(),
+            relation: relation.to_owned(),
+            object: object.to_owned(),
+            ..TieRequest::default()
+        }
+    }
+
+    #[test]
+    fn organisations_are_their_own_addressable_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let faculty = scratch_relations(&directory);
+        let person = faculty.add(profile("Ada"), None, &[]).unwrap().person;
+        let added = faculty
+            .org_add(
+                organisation("Bremer Aufbau-Bank", &["BAB"]),
+                &["https://example.test/source".to_owned()],
+            )
+            .unwrap();
+        assert_ne!(added.organisation, person);
+
+        let shown = faculty.org_show("bab").unwrap();
+        assert!(shown.contains(&format!("organisation: {:x}", added.organisation)));
+        assert!(shown.contains("label: Bremer Aufbau-Bank"));
+        assert!(shown.contains("alias: BAB"));
+        assert!(shown.contains("profile_url: https://example.test/org"));
+        assert!(shown.contains("source: https://example.test/source"));
+        assert!(shown.contains("retired: false"));
+        // `relations show` reaches organisations and persons alike.
+        assert!(faculty
+            .show("Bremer Aufbau-Bank")
+            .unwrap()
+            .contains("organisation: "));
+        assert!(faculty.show("Ada").unwrap().contains("person: "));
+        // Persons and organisations never leak into each other's lists.
+        assert!(faculty
+            .org_list(50, PeopleFilter::Active)
+            .unwrap()
+            .contains("Bremer Aufbau-Bank"));
+        assert!(!faculty
+            .org_list(50, PeopleFilter::Active)
+            .unwrap()
+            .contains("Ada"));
+        assert!(!faculty
+            .list(50, PeopleFilter::Active)
+            .unwrap()
+            .contains("Bremer"));
+        assert!(faculty.org_show("Ada").is_err());
+        // An extrinsic anchor is never minted twice for one name.
+        let error = faculty
+            .org_add(organisation("bab", &[]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+
+        let updated = faculty
+            .org_set(
+                "BAB",
+                ProfilePatch {
+                    note: Some("Förderbank des Landes Bremen".to_owned()),
+                    ..ProfilePatch::default()
+                },
+                &[],
+            )
+            .unwrap();
+        assert!(updated.current.is_some());
+        assert!(faculty
+            .org_show("BAB")
+            .unwrap()
+            .contains("Förderbank des Landes Bremen"));
+        assert!(matches!(
+            faculty.org_retire("BAB").unwrap(),
+            LifecycleChange::Changed { .. }
+        ));
+        assert!(!faculty
+            .org_list(50, PeopleFilter::Active)
+            .unwrap()
+            .contains("Bremer"));
+        assert!(faculty
+            .org_list(50, PeopleFilter::Retired)
+            .unwrap()
+            .contains("Bremer"));
+    }
+
+    #[test]
+    fn a_repeated_tie_converges_with_both_sources_and_shows_from_both_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let faculty = scratch_relations(&directory);
+        let person = faculty.add(profile("Ada"), None, &[]).unwrap().person;
+        let bank = faculty
+            .org_add(organisation("Bremer Aufbau-Bank", &["BAB"]), &[])
+            .unwrap()
+            .organisation;
+
+        let mut request = tie_request("Ada", "works at", "BAB");
+        request.role = Some("Geschäftsführerin".to_owned());
+        request.since = Some("2019".to_owned());
+        request.sources = vec!["https://example.test/a".to_owned()];
+        request.persona = Some("Ada".to_owned());
+        let first = faculty.tie_add(request.clone()).unwrap();
+        assert_eq!((first.subject, first.object), (person, bank));
+        assert!(!first.known);
+
+        request.sources = vec!["https://example.test/b".to_owned()];
+        request.persona = None;
+        let second = faculty.tie_add(request).unwrap();
+        assert_eq!(second.tie, first.tie, "the same claim has one identity");
+        assert!(second.known);
+
+        for end in ["Ada", "BAB"] {
+            let listed = faculty.ties(end).unwrap();
+            assert_eq!(listed.matches(&format!("{:x}:", first.tie)).count(), 1);
+            assert!(listed.contains("ties: 1"), "{listed}");
+            assert!(listed.contains("Ada"));
+            assert!(listed.contains("--works at--> Bremer Aufbau-Bank"));
+            assert!(listed.contains("role: Geschäftsführerin"));
+            assert!(listed.contains("since: 2019"));
+            assert!(listed.contains("source: https://example.test/a"));
+            assert!(listed.contains("source: https://example.test/b"));
+            assert!(listed.contains("by: Ada"));
+        }
+        // `show` carries the same ties.
+        assert!(faculty
+            .show("BAB")
+            .unwrap()
+            .contains("--works at--> Bremer Aufbau-Bank"));
+
+        // A different role is a different claim.
+        let mut other = tie_request("Ada", "works at", "BAB");
+        other.role = Some("Prokuristin".to_owned());
+        assert_ne!(faculty.tie_add(other).unwrap().tie, first.tie);
+        assert!(faculty.ties("Ada").unwrap().contains("ties: 2"));
+        // A tie needs two different entries, and both must exist.
+        assert!(faculty.tie_add(tie_request("Ada", "knows", "Ada")).is_err());
+        assert!(faculty
+            .tie_add(tie_request("Ada", "knows", "Nobody"))
+            .is_err());
+    }
+
+    #[test]
+    fn organisation_to_organisation_ties_and_ending_keeps_the_tie_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let faculty = scratch_relations(&directory);
+        faculty
+            .org_add(
+                organisation("Starthaus Bremen & Bremerhaven", &["Starthaus"]),
+                &[],
+            )
+            .unwrap();
+        faculty
+            .org_add(organisation("Bremer Aufbau-Bank", &["BAB"]), &[])
+            .unwrap();
+        let mut request = tie_request("Starthaus", "is run by", "BAB");
+        request.since = Some("2021-03".to_owned());
+        let tie = faculty.tie_add(request).unwrap().tie;
+        let prefix = format!("{tie:x}")[..10].to_owned();
+        let ended = faculty
+            .tie_end(
+                &prefix,
+                "2024-06-30",
+                &["note: programme moved".to_owned()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(ended.tie, tie);
+        assert_eq!(ended.until, "2024-06-30");
+        let listed = faculty.ties("Starthaus").unwrap();
+        assert!(listed.contains(&format!("{tie:x}:")), "{listed}");
+        assert!(listed.contains("since: 2021-03"));
+        assert!(listed.contains("until: 2024-06-30"));
+        assert!(listed.contains("source: note: programme moved"));
+        assert!(faculty.tie_end("zz", "2024", &[], None).is_err());
     }
 }

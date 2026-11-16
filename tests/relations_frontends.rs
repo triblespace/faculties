@@ -506,7 +506,16 @@ fn discovery_and_typed_nested_argument_errors_do_not_touch_storage() {
             "relations_group_list",
             "relations_group_show",
             "relations_identity_resolve",
-            "relations_identity_list"
+            "relations_identity_list",
+            "relations_org_add",
+            "relations_org_set",
+            "relations_org_list",
+            "relations_org_show",
+            "relations_org_retire",
+            "relations_org_unretire",
+            "relations_tie_add",
+            "relations_tie_end",
+            "relations_ties"
         ]
     );
     for (tool, raw) in [

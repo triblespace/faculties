@@ -38,6 +38,31 @@ pub const KIND_GROUP_SNAPSHOT: Id = id_hex!("A42E379E89D2F3A52EEA7A40771B51BF");
 /// Minted with `trible genid` on 2026-08-08.
 pub const KIND_IDENTITY_VERDICT: Id = id_hex!("4BEAD16C2FDBBDEB7BA37B464594E1CE");
 
+/// An organisation is an addressable Relations entry beside persons and
+/// groups: a company, bank, programme operator, chamber or public body. It is
+/// described by its own intrinsic profile and lifecycle snapshot tracks, which
+/// reuse the person profile and lifecycle attributes where they mean the same
+/// thing. A group is an addressable member set for messaging; an organisation
+/// is a party in the world, so the two kinds stay apart.
+/// Minted with `trible genid` on 2026-11-16.
+pub const KIND_ORGANISATION: Id = id_hex!("05AF2D04B026CCC832B787FE43EB6301");
+/// Intrinsic full-state organisation profile snapshot (`profile::of` names
+/// the organisation anchor).
+/// Minted with `trible genid` on 2026-11-16.
+pub const KIND_ORGANISATION_PROFILE: Id = id_hex!("143316ED50AED8C0B08BE55D86D785FB");
+/// Intrinsic organisation active/retired lifecycle snapshot (`lifecycle::of`
+/// names the organisation anchor).
+/// Minted with `trible genid` on 2026-11-16.
+pub const KIND_ORGANISATION_LIFECYCLE: Id = id_hex!("988C281689D3E96E8CEADBB3C2331BF9");
+/// A tie: one labelled, directed claim that a Relations entry (person or
+/// organisation) stands in a relation to another, such as "works at" or
+/// "is subsidiary of". Its intrinsic identity core is exactly
+/// {KIND_TIE, subject, relation, object, role?}; sources, validity
+/// (`metadata::started_at` / `metadata::finished_at`), `created_at` and
+/// `author` annotate that id and accumulate. See [`tie`].
+/// Minted with `trible genid` on 2026-11-16.
+pub const KIND_TIE: Id = id_hex!("815FFAA5359E559F0BC3D6D34282FA4A");
+
 /// Soft-retirement events. Retiring a relation is monotonic (append-only):
 /// we never delete the person entity — instead we append a small event
 /// entity tagged `KIND_RETIRE_ID` pointing at the person via
@@ -73,7 +98,9 @@ pub mod profile {
     use super::*;
 
     attributes! {
-        /// Stable person anchor described by this snapshot.
+        /// Stable anchor described by this snapshot: a person under
+        /// `KIND_PERSON_PROFILE`, an organisation under
+        /// `KIND_ORGANISATION_PROFILE`.
         /// Minted with `trible genid` on 2026-08-08.
         "6BB0306AA13B62F7E5490AEB255430E3" unsafe as of: inlineencodings::GenId;
 
@@ -104,12 +131,46 @@ pub mod profile {
     }
 }
 
+/// Attributes of a tie between two Relations entries.
+///
+/// The identity core of a tie is `metadata::tag: KIND_TIE` plus `subject`,
+/// `relation`, `object` and the optional `role`: writing the same claim twice
+/// yields the same entity. Everything else annotates the tie id and may
+/// accumulate: `relations::source` (URL or note, repeated),
+/// `metadata::started_at` / `metadata::finished_at` (validity; ending a tie is
+/// a `finished_at` annotation, never a deletion), `metadata::created_at`, and
+/// `author`.
+pub mod tie {
+    use super::*;
+
+    attributes! {
+        /// The entry the claim is about (person or organisation anchor).
+        /// Anchor minted with `trible genid` on 2026-11-16.
+        "D7CA017BA6369F110379E1320B1AA61D" as subject: inlineencodings::GenId;
+        /// The relation label, read from subject to object ("works at").
+        /// Anchor minted with `trible genid` on 2026-11-16.
+        "7278FD19BD137641D5D94FA86C4F6FF7" as relation: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The entry the subject is related to (person or organisation anchor).
+        /// Anchor minted with `trible genid` on 2026-11-16.
+        "40346386D20D0A57678D3DD04D3303F0" as object: inlineencodings::GenId;
+        /// The role the subject holds in this tie ("Geschäftsführerin").
+        /// Anchor minted with `trible genid` on 2026-11-16.
+        "A2EC40FBF0E4278A68D424B327E0D50A" as role: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The shared author attribute (a Relations person id) that wiki,
+        /// memory, archive and blockdag already write; pinned to its published
+        /// id. Cooperative attribution only.
+        "838CC157FFDD37C6AC7CC5A472E43ADB" unsafe as author: inlineencodings::GenId;
+    }
+}
+
 /// Attributes of an intrinsic person lifecycle snapshot.
 pub mod lifecycle {
     use super::*;
 
     attributes! {
-        /// Stable person anchor governed by this lifecycle snapshot.
+        /// Stable anchor governed by this lifecycle snapshot: a person under
+        /// `KIND_PERSON_LIFECYCLE`, an organisation under
+        /// `KIND_ORGANISATION_LIFECYCLE`.
         /// Minted with `trible genid` on 2026-08-08.
         "36E4966DA6704AA84C44A3E4E8DEB70F" unsafe as of: inlineencodings::GenId;
         /// Explicit active/retired state; false means active.

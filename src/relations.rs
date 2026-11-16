@@ -14,9 +14,9 @@ pub mod operations;
 pub mod render;
 
 pub use operations::{
-    AddedGroup, AddedPerson, GroupAddition, GroupReconciliation, GroupRemoval, GroupRename,
-    IdentityChange, LifecycleChange, PeopleFilter, ProfileField, ProfilePatch,
-    ProfileReconciliation, ProfileUpdate, Relations,
+    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, EndedTie, GroupAddition,
+    GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange, PeopleFilter,
+    ProfileField, ProfilePatch, ProfileReconciliation, ProfileUpdate, Relations, TieRequest,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -32,14 +32,63 @@ use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
 use crate::schemas::relations::{
-    group, identity, lifecycle, profile, relations as legacy, KIND_GROUP, KIND_GROUP_SNAPSHOT,
-    KIND_IDENTITY_VERDICT, KIND_PERSON_ID, KIND_PERSON_LIFECYCLE, KIND_PERSON_PROFILE,
+    group, identity, lifecycle, profile, relations as legacy, tie, KIND_GROUP, KIND_GROUP_SNAPSHOT,
+    KIND_IDENTITY_VERDICT, KIND_ORGANISATION, KIND_ORGANISATION_LIFECYCLE,
+    KIND_ORGANISATION_PROFILE, KIND_PERSON_ID, KIND_PERSON_LIFECYCLE, KIND_PERSON_PROFILE,
+    KIND_TIE,
 };
 
 pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 /// One queryable observation of when a stable person or group anchor was
 /// created in a source system.
 pub type ObservedAt = Inline<inlineencodings::NsTAIInterval>;
+
+/// The addressable Relations entries that carry a profile and a lifecycle.
+///
+/// Persons and organisations share the snapshot machinery (the same
+/// attributes, the same head resolution) under distinct kind tags, so a
+/// person query never sees an organisation and the reverse. Groups are a
+/// separate addressable kind with their own member-set snapshots.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum EntryKind {
+    Person,
+    Organisation,
+}
+
+impl EntryKind {
+    pub const ALL: [EntryKind; 2] = [EntryKind::Person, EntryKind::Organisation];
+
+    /// Tag on the stable anchor.
+    pub fn anchor_tag(self) -> Id {
+        match self {
+            Self::Person => KIND_PERSON_ID,
+            Self::Organisation => KIND_ORGANISATION,
+        }
+    }
+
+    /// Tag on the anchor's profile snapshots.
+    pub fn profile_tag(self) -> Id {
+        match self {
+            Self::Person => KIND_PERSON_PROFILE,
+            Self::Organisation => KIND_ORGANISATION_PROFILE,
+        }
+    }
+
+    /// Tag on the anchor's lifecycle snapshots.
+    pub fn lifecycle_tag(self) -> Id {
+        match self {
+            Self::Person => KIND_PERSON_LIFECYCLE,
+            Self::Organisation => KIND_ORGANISATION_LIFECYCLE,
+        }
+    }
+
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Organisation => "organisation",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProfileInput {
@@ -289,8 +338,13 @@ fn anchor_fragment(anchor: Id, kind: Id) -> Fragment {
 }
 
 fn profile_record(snapshot: &ProfileSnapshot) -> Fragment {
+    profile_record_of(EntryKind::Person, snapshot)
+}
+
+fn profile_record_of(kind: EntryKind, snapshot: &ProfileSnapshot) -> Fragment {
+    let tag = kind.profile_tag();
     entity! {
-        metadata::tag: &KIND_PERSON_PROFILE,
+        metadata::tag: &tag,
         profile::of: &snapshot.person,
         metadata::name: snapshot.label,
         profile::alias*: snapshot.aliases.iter(),
@@ -310,8 +364,13 @@ fn profile_record(snapshot: &ProfileSnapshot) -> Fragment {
 }
 
 fn lifecycle_record(snapshot: &LifecycleSnapshot) -> Fragment {
+    lifecycle_record_of(EntryKind::Person, snapshot)
+}
+
+fn lifecycle_record_of(kind: EntryKind, snapshot: &LifecycleSnapshot) -> Fragment {
+    let tag = kind.lifecycle_tag();
     entity! {
-        metadata::tag: &KIND_PERSON_LIFECYCLE,
+        metadata::tag: &tag,
         lifecycle::of: &snapshot.person,
         lifecycle::retired: snapshot.retired,
         metadata::supersedes*: snapshot.predecessors.iter(),
@@ -341,13 +400,29 @@ fn identity_record(snapshot: &IdentityVerdict) -> Fragment {
 /// Build an initial person declaration, full profile, and active lifecycle as
 /// one self-contained publication fragment.
 pub fn person_fragment(person: Id, input: ProfileInput) -> Result<(Fragment, Id, Id)> {
-    let mut fragment = anchor_fragment(person, KIND_PERSON_ID);
-    let profile = profile_fragment(person, input, &[])?;
+    entry_fragment(EntryKind::Person, person, input)
+}
+
+/// Build an initial organisation declaration, full profile, and active
+/// lifecycle as one self-contained publication fragment.
+pub fn organisation_fragment(organisation: Id, input: ProfileInput) -> Result<(Fragment, Id, Id)> {
+    entry_fragment(EntryKind::Organisation, organisation, input)
+}
+
+/// Build an initial anchor declaration, full profile, and active lifecycle
+/// for one addressable entry of `kind`.
+pub fn entry_fragment(
+    kind: EntryKind,
+    anchor: Id,
+    input: ProfileInput,
+) -> Result<(Fragment, Id, Id)> {
+    let mut fragment = anchor_fragment(anchor, kind.anchor_tag());
+    let profile = profile_fragment_of(kind, anchor, input, &[])?;
     let profile_id = profile
         .root()
         .expect("profile fragment has one intrinsic root");
     fragment += profile;
-    let lifecycle = lifecycle_fragment(person, false, &[]);
+    let lifecycle = lifecycle_fragment_of(kind, anchor, false, &[]);
     let lifecycle_id = lifecycle
         .root()
         .expect("lifecycle fragment has one intrinsic root");
@@ -357,6 +432,16 @@ pub fn person_fragment(person: Id, input: ProfileInput) -> Result<(Fragment, Id,
 
 /// Build one exact intrinsic profile successor.
 pub fn profile_fragment(person: Id, input: ProfileInput, predecessors: &[Id]) -> Result<Fragment> {
+    profile_fragment_of(EntryKind::Person, person, input, predecessors)
+}
+
+/// Build one exact intrinsic profile successor for an entry of `kind`.
+pub fn profile_fragment_of(
+    kind: EntryKind,
+    person: Id,
+    input: ProfileInput,
+    predecessors: &[Id],
+) -> Result<Fragment> {
     let label = required_text(input.label, "label")?;
     let aliases = text_set(input.aliases, "alias")?;
     let affinities = text_set(input.affinities, "affinity")?;
@@ -407,17 +492,29 @@ pub fn profile_fragment(person: Id, input: ProfileInput, predecessors: &[Id]) ->
             .collect(),
         predecessors: sorted_ids(predecessors.iter().copied()),
     };
-    fragment += profile_record(&snapshot);
+    fragment += profile_record_of(kind, &snapshot);
     Ok(fragment)
 }
 
 pub fn lifecycle_fragment(person: Id, retired: bool, predecessors: &[Id]) -> Fragment {
-    lifecycle_record(&LifecycleSnapshot {
-        id: person,
-        person,
-        retired,
-        predecessors: sorted_ids(predecessors.iter().copied()),
-    })
+    lifecycle_fragment_of(EntryKind::Person, person, retired, predecessors)
+}
+
+pub fn lifecycle_fragment_of(
+    kind: EntryKind,
+    person: Id,
+    retired: bool,
+    predecessors: &[Id],
+) -> Fragment {
+    lifecycle_record_of(
+        kind,
+        &LifecycleSnapshot {
+            id: person,
+            person,
+            retired,
+            predecessors: sorted_ids(predecessors.iter().copied()),
+        },
+    )
 }
 
 pub fn group_create_fragment(group_id: Id, name: impl Into<String>) -> Result<(Fragment, Id)> {
@@ -521,10 +618,19 @@ pub fn profile_snapshot<P>(facts: &P, id: Id) -> Result<ProfileSnapshot>
 where
     P: TriblePattern,
 {
+    profile_snapshot_of(facts, id, EntryKind::Person)
+}
+
+/// Read one decodable profile projection of an entry of `kind`.
+pub fn profile_snapshot_of<P>(facts: &P, id: Id, kind: EntryKind) -> Result<ProfileSnapshot>
+where
+    P: TriblePattern,
+{
+    let tag = kind.profile_tag();
     let (person, label) = find!(
         (person: Id, label: TextHandle),
         pattern!(facts, [{ id @
-            metadata::tag: &KIND_PERSON_PROFILE,
+            metadata::tag: tag,
             profile::of: ?person,
             metadata::name: ?label,
         }])
@@ -585,10 +691,19 @@ pub fn lifecycle_snapshot<P>(facts: &P, id: Id) -> Result<LifecycleSnapshot>
 where
     P: TriblePattern,
 {
+    lifecycle_snapshot_of(facts, id, EntryKind::Person)
+}
+
+/// Read one decodable lifecycle projection of an entry of `kind`.
+pub fn lifecycle_snapshot_of<P>(facts: &P, id: Id, kind: EntryKind) -> Result<LifecycleSnapshot>
+where
+    P: TriblePattern,
+{
+    let tag = kind.lifecycle_tag();
     let (person, retired) = find!(
         (person: Id, retired: bool),
         pattern!(facts, [{ id @
-            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            metadata::tag: tag,
             lifecycle::of: ?person,
             lifecycle::retired: ?retired,
         }])
@@ -670,6 +785,36 @@ where
     find!(id: Id, pattern!(facts, [{ ?id @ metadata::tag: &KIND_PERSON_ID }])).collect()
 }
 
+/// Every stable organisation anchor.
+pub fn organisation_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
+    ids_of_kind(facts, KIND_ORGANISATION)
+}
+
+/// Every stable anchor of `kind`.
+pub fn entry_anchors<P>(facts: &P, kind: EntryKind) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
+    ids_of_kind(facts, kind.anchor_tag())
+}
+
+/// The profile-carrying kinds an anchor is tagged with, in [`EntryKind`]
+/// order. Usually one; an open-world anchor could carry both tags.
+pub fn entry_kinds<P>(facts: &P, anchor: Id) -> Vec<EntryKind>
+where
+    P: TriblePattern,
+{
+    let tags: BTreeSet<Id> =
+        find!(tag: Id, pattern!(facts, [{ anchor @ metadata::tag: ?tag }])).collect();
+    EntryKind::ALL
+        .into_iter()
+        .filter(|kind| tags.contains(&kind.anchor_tag()))
+        .collect()
+}
+
 pub fn group_anchors<P>(facts: &P) -> BTreeSet<Id>
 where
     P: TriblePattern,
@@ -681,6 +826,16 @@ where
 /// deduplicated. No scalar winner is selected when several systems observed
 /// the same person.
 pub fn person_sources<Store, P>(reader: &Store, facts: &P, person: Id) -> Result<Vec<String>>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    sources_of(reader, facts, person)
+}
+
+/// Every exact `relations::source` text annotating `entity` (a person or
+/// organisation anchor, or a tie), sorted and deduplicated.
+pub fn sources_of<Store, P>(reader: &Store, facts: &P, person: Id) -> Result<Vec<String>>
 where
     Store: BlobStoreGet + ?Sized,
     P: TriblePattern,
@@ -766,10 +921,18 @@ pub fn profile_head<P>(facts: &P, person: Id) -> Result<Head>
 where
     P: TriblePattern,
 {
+    profile_head_of(facts, person, EntryKind::Person)
+}
+
+pub fn profile_head_of<P>(facts: &P, person: Id, kind: EntryKind) -> Result<Head>
+where
+    P: TriblePattern,
+{
+    let tag = kind.profile_tag();
     let ids: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_PERSON_PROFILE,
+            metadata::tag: tag,
             profile::of: person,
             metadata::name: _?label,
         }])
@@ -778,7 +941,7 @@ where
     let superseded = find!(
         predecessor: Id,
         pattern!(facts, [{ _?id @
-            metadata::tag: &KIND_PERSON_PROFILE,
+            metadata::tag: tag,
             profile::of: person,
             metadata::name: _?label,
             metadata::supersedes: ?predecessor,
@@ -792,10 +955,18 @@ pub fn lifecycle_head<P>(facts: &P, person: Id) -> Result<Head>
 where
     P: TriblePattern,
 {
+    lifecycle_head_of(facts, person, EntryKind::Person)
+}
+
+pub fn lifecycle_head_of<P>(facts: &P, person: Id, kind: EntryKind) -> Result<Head>
+where
+    P: TriblePattern,
+{
+    let tag = kind.lifecycle_tag();
     let ids: BTreeSet<Id> = find!(
         id: Id,
         pattern!(facts, [{ ?id @
-            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            metadata::tag: tag,
             lifecycle::of: person,
             lifecycle::retired: _?retired,
         }])
@@ -804,7 +975,7 @@ where
     let superseded = find!(
         predecessor: Id,
         pattern!(facts, [{ _?id @
-            metadata::tag: &KIND_PERSON_LIFECYCLE,
+            metadata::tag: tag,
             lifecycle::of: person,
             lifecycle::retired: _?retired,
             metadata::supersedes: ?predecessor,
@@ -1300,11 +1471,19 @@ pub fn current_profile<P>(facts: &P, person: Id) -> Result<ProfileSnapshot>
 where
     P: TriblePattern,
 {
-    match profile_head(facts, person)? {
-        Head::Unique(id) => profile_snapshot(facts, id),
-        Head::Missing => bail!("person {person:x} has no profile"),
+    current_profile_of(facts, person, EntryKind::Person)
+}
+
+pub fn current_profile_of<P>(facts: &P, person: Id, kind: EntryKind) -> Result<ProfileSnapshot>
+where
+    P: TriblePattern,
+{
+    let noun = kind.noun();
+    match profile_head_of(facts, person, kind)? {
+        Head::Unique(id) => profile_snapshot_of(facts, id, kind),
+        Head::Missing => bail!("{noun} {person:x} has no profile"),
         Head::Forked(heads) => bail!(
-            "person {person:x} profile is forked across {} heads: {}",
+            "{noun} {person:x} profile is forked across {} heads: {}",
             heads.len(),
             heads
                 .iter()
@@ -1424,23 +1603,23 @@ fn selector_outcome(
 /// so the fork cannot change the verdict — the same reasoning
 /// [`IdentityComponents::from_facts`] already applies to agreement-only
 /// verdict forks. `None` means genuinely indeterminate.
-fn retired_verdict<P>(facts: &P, person: Id, state: &Head) -> Result<Option<bool>>
+fn retired_verdict<P>(facts: &P, person: Id, state: &Head, kind: EntryKind) -> Result<Option<bool>>
 where
     P: TriblePattern,
 {
     match state {
-        Head::Unique(id) => Ok(Some(lifecycle_snapshot(facts, *id)?.retired)),
+        Head::Unique(id) => Ok(Some(lifecycle_snapshot_of(facts, *id, kind)?.retired)),
         Head::Forked(heads) => {
             let values: BTreeSet<bool> = heads
                 .iter()
-                .map(|id| Ok(lifecycle_snapshot(facts, *id)?.retired))
+                .map(|id| Ok(lifecycle_snapshot_of(facts, *id, kind)?.retired))
                 .collect::<Result<_>>()?;
             Ok(match values.len() {
                 1 => values.into_iter().next(),
                 _ => None,
             })
         }
-        Head::Missing => bail!("person {person:x} has no lifecycle snapshot"),
+        Head::Missing => bail!("{} {person:x} has no lifecycle snapshot", kind.noun()),
     }
 }
 
@@ -1469,13 +1648,59 @@ where
     Store: BlobStoreGet + ?Sized,
     P: TriblePattern,
 {
+    resolve_entry(reader, facts, input, include_retired, &[EntryKind::Person])
+}
+
+/// Resolve an organisation selector (label, alias, exact id, or id prefix)
+/// under the same rules as [`resolve_person`].
+pub fn resolve_organisation<Store, P>(
+    reader: &Store,
+    facts: &P,
+    input: &str,
+    include_retired: bool,
+) -> Result<SelectorOutcome>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    resolve_entry(
+        reader,
+        facts,
+        input,
+        include_retired,
+        &[EntryKind::Organisation],
+    )
+}
+
+/// Resolve one selector across the profile-carrying entry `kinds` at once,
+/// under the rules of [`resolve_person`]. A label shared by a person and an
+/// organisation is ambiguous, never silently one of them.
+pub fn resolve_entry<Store, P>(
+    reader: &Store,
+    facts: &P,
+    input: &str,
+    include_retired: bool,
+    kinds: &[EntryKind],
+) -> Result<SelectorOutcome>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
     let input = input.trim();
     if input.is_empty() {
         return Ok(SelectorOutcome::Invalid("empty selector".to_owned()));
     }
-    let anchors = person_anchors(facts);
+    let anchors: Vec<(Id, EntryKind)> = kinds
+        .iter()
+        .flat_map(|&kind| {
+            entry_anchors(facts, kind)
+                .into_iter()
+                .map(move |id| (id, kind))
+        })
+        .collect();
+    let all: BTreeSet<Id> = anchors.iter().map(|(id, _)| *id).collect();
     let normalized = input.to_ascii_lowercase();
-    let (exact_id, id_matches) = id_candidates(&normalized, &anchors);
+    let (exact_id, id_matches) = id_candidates(&normalized, &all);
     if exact_id && id_matches.is_empty() {
         return Ok(SelectorOutcome::Missing);
     }
@@ -1484,21 +1709,24 @@ where
     let mut settled = BTreeSet::new();
     let mut forked = BTreeSet::new();
     let mut retired = BTreeSet::new();
-    for person in anchors {
+    for (person, kind) in anchors {
         if exact_id && !id_matches.contains(&person) {
             continue;
         }
-        let profile_state = profile_head(facts, person)?;
+        let noun = kind.noun();
+        let profile_state = profile_head_of(facts, person, kind)?;
         if matches!(profile_state, Head::Missing) {
-            bail!("person {person:x} has no profile snapshot");
+            bail!("{noun} {person:x} has no profile snapshot");
         }
         let label_matches = id_matches.contains(&person)
             || match &profile_state {
-                Head::Unique(id) => profile_matches(reader, &profile_snapshot(facts, *id)?, &key)?,
+                Head::Unique(id) => {
+                    profile_matches(reader, &profile_snapshot_of(facts, *id, kind)?, &key)?
+                }
                 Head::Forked(heads) => {
                     let mut matches = false;
                     for head in heads {
-                        let snapshot = profile_snapshot(facts, *head)?;
+                        let snapshot = profile_snapshot_of(facts, *head, kind)?;
                         if profile_matches(reader, &snapshot, &key)? {
                             matches = true;
                             break;
@@ -1506,7 +1734,7 @@ where
                     }
                     matches
                 }
-                Head::Missing => bail!("person {person:x} has no profile snapshot"),
+                Head::Missing => bail!("{noun} {person:x} has no profile snapshot"),
             };
         if !id_matches.contains(&person) && (exact_id || !label_matches) {
             continue;
@@ -1518,8 +1746,8 @@ where
         // vetoes a live, perfectly settled match that merely shares its name.
         // A retired person carrying a multi-head profile fork must not poison a
         // live group that happens to share its selector.
-        let lifecycle_state = lifecycle_head(facts, person)?;
-        let retired_state = retired_verdict(facts, person, &lifecycle_state)?;
+        let lifecycle_state = lifecycle_head_of(facts, person, kind)?;
+        let retired_state = retired_verdict(facts, person, &lifecycle_state, kind)?;
         if !include_retired && retired_state == Some(true) {
             retired.insert(person);
             continue;
@@ -1993,6 +2221,347 @@ where
         .into_iter()
         .map(|pair| Ok((pair, identity_head(facts, pair.0, pair.1)?)))
         .collect()
+}
+
+// ── ties ────────────────────────────────────────────────────────────────
+//
+// A tie is one claim, "subject <relation> object [as role]", between two
+// Relations entries. Its id derives from exactly that claim, so asserting it
+// twice converges on one entity and each assertion's sources accumulate on
+// it. Validity, sources, observation time and author are annotations on the
+// tie id; ending a tie appends `metadata::finished_at`, never a deletion.
+// Readers query ties at the point of use and display every fact they find:
+// a second `finished_at` or an unknown extra fact is shown or ignored, never
+// refused.
+
+/// Build the intrinsic identity core of one tie. Its root is the tie id.
+pub fn tie_fragment(
+    subject: Id,
+    relation: impl Into<String>,
+    object: Id,
+    role: Option<String>,
+) -> Result<Fragment> {
+    if subject == object {
+        bail!("a tie needs two different entries");
+    }
+    let relation = required_text(relation, "relation")?;
+    let role = optional_text(role, "role")?;
+    let mut fragment = Fragment::empty();
+    let relation = fragment.put(relation);
+    let role = role.map(|role| fragment.put(role));
+    fragment += entity! {
+        metadata::tag: &KIND_TIE,
+        tie::subject: &subject,
+        tie::relation: relation,
+        tie::object: &object,
+        tie::role?: role,
+    };
+    Ok(fragment)
+}
+
+/// Additive annotations on one tie id. Every field accumulates: a second
+/// publication with other sources adds them beside the first.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TieAnnotation {
+    pub sources: Vec<String>,
+    pub started_at: Option<ObservedAt>,
+    pub finished_at: Option<ObservedAt>,
+    pub created_at: Option<ObservedAt>,
+    pub author: Option<Id>,
+}
+
+pub fn tie_annotation_fragment(tie: Id, annotation: TieAnnotation) -> Result<Fragment> {
+    let sources = text_set(annotation.sources, "source")?;
+    Ok(entity! { ExclusiveId::force_ref(&tie) @
+        legacy::source*: sources.iter().map(String::as_str),
+        metadata::started_at?: annotation.started_at,
+        metadata::finished_at?: annotation.finished_at,
+        metadata::created_at?: annotation.created_at,
+        tie::author?: annotation.author.as_ref(),
+    })
+}
+
+/// One decodable tie claim as found in the facts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TieClaim {
+    pub id: Id,
+    pub subject: Id,
+    pub relation: TextHandle,
+    pub object: Id,
+}
+
+/// Every tie claim with `anchor` as subject or object, sorted by id. A tie
+/// entity carrying more than one relation or endpoint (open world) yields one
+/// claim per combination rather than a refusal.
+pub fn ties_touching<P>(facts: &P, anchor: Id) -> Vec<TieClaim>
+where
+    P: TriblePattern,
+{
+    let outgoing = find!(
+        (id: Id, relation: TextHandle, object: Id),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_TIE,
+            tie::subject: anchor,
+            tie::relation: ?relation,
+            tie::object: ?object,
+        }])
+    )
+    .map(|(id, relation, object)| (id, anchor, relation.raw, object, relation));
+    let incoming = find!(
+        (id: Id, subject: Id, relation: TextHandle),
+        pattern!(facts, [{ ?id @
+            metadata::tag: &KIND_TIE,
+            tie::subject: ?subject,
+            tie::relation: ?relation,
+            tie::object: anchor,
+        }])
+    )
+    .map(|(id, subject, relation)| (id, subject, relation.raw, anchor, relation));
+    let claims: BTreeMap<_, TextHandle> = outgoing
+        .chain(incoming)
+        .map(|(id, subject, raw, object, relation)| ((id, subject, raw, object), relation))
+        .collect();
+    claims
+        .into_iter()
+        .map(|((id, subject, _, object), relation)| TieClaim {
+            id,
+            subject,
+            relation,
+            object,
+        })
+        .collect()
+}
+
+/// Every tie claim carried by tie entity `tie`.
+pub fn tie_claims<P>(facts: &P, tie: Id) -> Vec<TieClaim>
+where
+    P: TriblePattern,
+{
+    let mut claims: Vec<TieClaim> = find!(
+        (subject: Id, relation: TextHandle, object: Id),
+        pattern!(facts, [{ tie @
+            metadata::tag: &KIND_TIE,
+            tie::subject: ?subject,
+            tie::relation: ?relation,
+            tie::object: ?object,
+        }])
+    )
+    .map(|(subject, relation, object)| TieClaim {
+        id: tie,
+        subject,
+        relation,
+        object,
+    })
+    .collect();
+    claims.sort_by(|left, right| {
+        (left.subject, left.relation.raw, left.object).cmp(&(
+            right.subject,
+            right.relation.raw,
+            right.object,
+        ))
+    });
+    claims
+}
+
+/// Every role on a tie, sorted (one for an intrinsic tie that has a role).
+pub fn tie_roles<P>(facts: &P, tie: Id) -> Vec<TextHandle>
+where
+    P: TriblePattern,
+{
+    sorted_handles(find!(v: TextHandle, pattern!(facts, [{ tie @ tie::role: ?v }])))
+}
+
+/// Every `metadata::started_at` annotation on `entity`, in order.
+pub fn started_at<P>(facts: &P, entity: Id) -> Vec<ObservedAt>
+where
+    P: TriblePattern,
+{
+    sorted_observations(find!(
+        v: ObservedAt,
+        pattern!(facts, [{ entity @ metadata::started_at: ?v }])
+    ))
+}
+
+/// Every `metadata::finished_at` annotation on `entity`, in order.
+pub fn finished_at<P>(facts: &P, entity: Id) -> Vec<ObservedAt>
+where
+    P: TriblePattern,
+{
+    sorted_observations(find!(
+        v: ObservedAt,
+        pattern!(facts, [{ entity @ metadata::finished_at: ?v }])
+    ))
+}
+
+/// Every author a tie names, in id order.
+pub fn tie_authors<P>(facts: &P, tie: Id) -> Vec<Id>
+where
+    P: TriblePattern,
+{
+    sorted_ids(find!(v: Id, pattern!(facts, [{ tie @ tie::author: ?v }])))
+}
+
+/// Every tie entity id.
+pub fn tie_ids<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
+    ids_of_kind(facts, KIND_TIE)
+}
+
+/// Resolve a tie by exact id or unique id prefix.
+pub fn resolve_tie<P>(facts: &P, input: &str) -> SelectorOutcome
+where
+    P: TriblePattern,
+{
+    let input = input.trim().to_ascii_lowercase();
+    if input.is_empty() {
+        return SelectorOutcome::Invalid("empty selector".to_owned());
+    }
+    if !input.bytes().all(|byte| byte.is_ascii_hexdigit()) || input.len() > 32 {
+        return SelectorOutcome::Invalid("a tie is selected by its id or an id prefix".to_owned());
+    }
+    let (_, matches) = id_candidates(&input, &tie_ids(facts));
+    selector_outcome(matches, BTreeSet::new(), BTreeSet::new())
+}
+
+/// A human label for any Relations anchor: the current profile label of a
+/// person or organisation, a group's current name, or its id when neither is
+/// settled. Display only; never a key.
+pub fn entry_label<Store, P>(reader: &Store, facts: &P, anchor: Id) -> String
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    for kind in entry_kinds(facts, anchor) {
+        if let Ok(profile) = current_profile_of(facts, anchor, kind) {
+            if let Ok(label) = load_text_from(reader, profile.label) {
+                return label;
+            }
+        }
+    }
+    if let Ok(Head::Unique(snapshot)) = group_head(facts, anchor) {
+        if let Ok(snapshot) = group_snapshot(facts, snapshot) {
+            if let Ok(name) = load_text_from(reader, snapshot.name) {
+                return name;
+            }
+        }
+    }
+    format!("{anchor:x}")
+}
+
+// ── calendar values for tie validity ────────────────────────────────────
+
+fn period_start(year: i32, month: u8, day: u8, raw: &str) -> Result<hifitime::Epoch> {
+    hifitime::Epoch::maybe_from_gregorian_utc(year, month, day, 0, 0, 0, 0)
+        .map_err(|_| anyhow!("invalid date {raw:?}"))
+}
+
+/// UTC midnight of the calendar day after the day `midnight` starts. Read
+/// through the calendar, not by adding 86 400 s, so a leap-second day still
+/// ends at the next midnight.
+fn next_midnight(midnight: hifitime::Epoch) -> hifitime::Epoch {
+    let (year, month, day, ..) = (midnight + hifitime::Duration::from_days(1.5)).to_gregorian_utc();
+    hifitime::Epoch::from_gregorian_utc_at_midnight(year, month, day)
+}
+
+fn last_nanosecond_before(next: hifitime::Epoch) -> hifitime::Epoch {
+    next - hifitime::Duration::from_truncated_nanoseconds(1)
+}
+
+/// Parse one calendar value into the interval it denotes: `YYYY` (the whole
+/// year), `YYYY-MM` (the month), `YYYY-MM-DD` (the day), or
+/// `YYYY-MM-DDTHH:MM[:SS][Z]` (an instant, UTC).
+fn parse_period(raw: &str) -> Result<(hifitime::Epoch, hifitime::Epoch)> {
+    let text = raw.trim();
+    let invalid = || {
+        anyhow!("invalid time {raw:?}; expected YYYY, YYYY-MM, YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS] (UTC)")
+    };
+    if text.contains('T') || text.contains(' ') {
+        let interval = crate::care::parse_time(text).map_err(|_| invalid())?;
+        return interval
+            .try_from_inline::<(hifitime::Epoch, hifitime::Epoch)>()
+            .map_err(|_| invalid());
+    }
+    let parts: Vec<&str> = text.split('-').collect();
+    let number = |value: &str| value.parse::<u32>().map_err(|_| invalid());
+    let year = parts
+        .first()
+        .ok_or_else(invalid)?
+        .parse::<i32>()
+        .map_err(|_| invalid())?;
+    match parts.as_slice() {
+        [_] => Ok((
+            period_start(year, 1, 1, raw)?,
+            last_nanosecond_before(period_start(year + 1, 1, 1, raw)?),
+        )),
+        [_, month] => {
+            let month = number(month)?;
+            if !(1..=12).contains(&month) {
+                return Err(invalid());
+            }
+            let (next_year, next_month) = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+            Ok((
+                period_start(year, month as u8, 1, raw)?,
+                last_nanosecond_before(period_start(next_year, next_month as u8, 1, raw)?),
+            ))
+        }
+        [_, month, day] => {
+            let start = period_start(year, number(month)? as u8, number(day)? as u8, raw)?;
+            Ok((start, last_nanosecond_before(next_midnight(start))))
+        }
+        _ => Err(invalid()),
+    }
+}
+
+/// Parse a validity bound: one calendar value (see above) or `A..B`, the
+/// span from the start of `A` to the end of `B`. Coarse values keep their
+/// uncertainty: "since 2019" is the whole of 2019, not its first instant.
+pub fn parse_when(raw: &str) -> Result<ObservedAt> {
+    let (from, to) = match raw.split_once("..") {
+        Some((from, to)) => (parse_period(from)?.0, parse_period(to)?.1),
+        None => parse_period(raw)?,
+    };
+    if to < from {
+        bail!("time {raw:?} ends before it starts");
+    }
+    (from, to)
+        .try_to_inline()
+        .map_err(|error| anyhow!("encode time {raw:?}: {error:?}"))
+}
+
+/// Render a validity value the way [`parse_when`] reads it: a whole year,
+/// month or day as `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, otherwise as UTC.
+pub fn format_when(value: ObservedAt) -> String {
+    let Ok((from, to)) = value.try_from_inline::<(hifitime::Epoch, hifitime::Epoch)>() else {
+        return "?".to_owned();
+    };
+    let (year, month, day, hour, minute, second, nanos) = from.to_gregorian_utc();
+    if (hour, minute, second, nanos) == (0, 0, 0, 0) {
+        let whole = |next: Result<hifitime::Epoch>| {
+            next.map(|next| last_nanosecond_before(next) == to)
+                .unwrap_or(false)
+        };
+        if month == 1 && day == 1 && whole(period_start(year + 1, 1, 1, "")) {
+            return format!("{year:04}");
+        }
+        let (next_year, next_month) = if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        };
+        if day == 1 && whole(period_start(next_year, next_month, 1, "")) {
+            return format!("{year:04}-{month:02}");
+        }
+        if whole(Ok(next_midnight(from))) {
+            return format!("{year:04}-{month:02}-{day:02}");
+        }
+    }
+    crate::care::format_time(value)
 }
 
 #[cfg(test)]
@@ -2755,5 +3324,187 @@ mod tests {
         assert!(identities.forked_pairs().contains(&pair));
         assert!(!identities.mixed_forked_pairs().contains(&pair));
         assert!(identities.equivalent(a, b).unwrap());
+    }
+
+    mod foreign {
+        use triblespace::prelude::*;
+        attributes! {
+            /// A fact some other writer attaches to a tie; this reader does
+            /// not model it. Test-only anchor minted with `trible genid` on
+            /// 2026-11-16.
+            "972362D0D07A446B49A959BEC4088DCE" as rating: inlineencodings::Handle<blobencodings::UTF8String>;
+        }
+    }
+
+    #[test]
+    fn a_tie_is_its_claim_and_annotations_accumulate_beside_it() {
+        let fixture = Fixture::new();
+        let ada = genid().id;
+        let bank = genid().id;
+        publish_person(&fixture, ada, "Ada");
+        let (org, _, _) = organisation_fragment(bank, profile("Bremer Aufbau-Bank")).unwrap();
+        fixture.publish(org);
+
+        let core = tie_fragment(ada, " works at ", bank, Some("CEO".to_owned())).unwrap();
+        let tie = core.root().unwrap();
+        let again = tie_fragment(ada, "works at", bank, Some("CEO".to_owned())).unwrap();
+        assert_eq!(again.root(), Some(tie), "trimmed text is the same claim");
+        assert_ne!(
+            tie_fragment(ada, "works at", bank, None).unwrap().root(),
+            Some(tie)
+        );
+        assert_ne!(
+            tie_fragment(bank, "works at", ada, Some("CEO".to_owned()))
+                .unwrap()
+                .root(),
+            Some(tie),
+            "direction is part of the claim"
+        );
+        assert!(tie_fragment(ada, "knows", ada, None).is_err());
+        assert!(tie_fragment(ada, "  ", bank, None).is_err());
+
+        fixture.publish(core);
+        fixture.publish(again);
+        fixture.publish(
+            tie_annotation_fragment(
+                tie,
+                TieAnnotation {
+                    sources: vec!["a".into()],
+                    finished_at: Some(parse_when("2023").unwrap()),
+                    ..TieAnnotation::default()
+                },
+            )
+            .unwrap(),
+        );
+        // A concurrent second ending, a second role and an unmodelled fact
+        // are all open-world additions: shown or ignored, never refused.
+        fixture.publish(
+            tie_annotation_fragment(
+                tie,
+                TieAnnotation {
+                    sources: vec!["b".into()],
+                    finished_at: Some(parse_when("2024").unwrap()),
+                    ..TieAnnotation::default()
+                },
+            )
+            .unwrap(),
+        );
+        let mut extra = Fragment::empty();
+        let role = extra.put("Chair".to_owned());
+        let rating = extra.put("five stars".to_owned());
+        extra += entity! { ExclusiveId::force_ref(&tie) @
+            tie::role: role,
+            foreign::rating: rating,
+        };
+        fixture.publish(extra);
+
+        let view = fixture.view();
+        let claims = ties_touching(&view.facts, ada);
+        assert_eq!(claims.len(), 1);
+        assert_eq!(ties_touching(&view.facts, bank), claims);
+        assert_eq!(claims[0].id, tie);
+        assert_eq!((claims[0].subject, claims[0].object), (ada, bank));
+        assert_eq!(
+            read_text(&view.reader, claims[0].relation).unwrap(),
+            "works at"
+        );
+        assert_eq!(tie_claims(&view.facts, tie), claims);
+        let roles: Vec<String> = tie_roles(&view.facts, tie)
+            .into_iter()
+            .map(|role| read_text(&view.reader, role).unwrap())
+            .collect();
+        assert_eq!(sorted_strings(roles), vec!["CEO", "Chair"]);
+        assert_eq!(
+            sources_of(&view.reader, &view.facts, tie).unwrap(),
+            vec!["a", "b"]
+        );
+        let ends: Vec<String> = finished_at(&view.facts, tie)
+            .into_iter()
+            .map(format_when)
+            .collect();
+        assert_eq!(ends, vec!["2023", "2024"]);
+        assert_eq!(
+            entry_label(&view.reader, &view.facts, bank),
+            "Bremer Aufbau-Bank"
+        );
+        assert_eq!(
+            entry_kinds(&view.facts, bank),
+            vec![EntryKind::Organisation]
+        );
+        // Organisation snapshots stay out of the person reader and the
+        // legacy person catalogue check.
+        assert_eq!(person_anchors(&view.facts), BTreeSet::from([ada]));
+        assert_eq!(profile_head(&view.facts, bank).unwrap(), Head::Missing);
+        assert!(matches!(
+            resolve_person(&view.reader, &view.facts, "Bremer Aufbau-Bank", true).unwrap(),
+            SelectorOutcome::Missing
+        ));
+        assert_eq!(
+            resolve_entry(
+                &view.reader,
+                &view.facts,
+                "bremer aufbau-bank",
+                false,
+                &EntryKind::ALL
+            )
+            .unwrap(),
+            SelectorOutcome::Unique(bank)
+        );
+        assert_eq!(
+            resolve_tie(&view.facts, &format!("{tie:x}")[..6]),
+            SelectorOutcome::Unique(tie)
+        );
+    }
+
+    #[test]
+    fn a_label_shared_by_a_person_and_an_organisation_is_ambiguous() {
+        let fixture = Fixture::new();
+        let person = genid().id;
+        let organisation = genid().id;
+        publish_person(&fixture, person, "Mercury");
+        fixture.publish(
+            organisation_fragment(organisation, profile("Mercury"))
+                .unwrap()
+                .0,
+        );
+        let view = fixture.view();
+        assert!(matches!(
+            resolve_entry(&view.reader, &view.facts, "mercury", false, &EntryKind::ALL).unwrap(),
+            SelectorOutcome::Ambiguous(ids) if ids.len() == 2
+        ));
+        assert_eq!(
+            resolve_organisation(&view.reader, &view.facts, "mercury", false).unwrap(),
+            SelectorOutcome::Unique(organisation)
+        );
+    }
+
+    #[test]
+    fn calendar_values_keep_their_granularity() {
+        for (raw, shown) in [
+            ("2019", "2019"),
+            ("2019-03", "2019-03"),
+            ("2019-12", "2019-12"),
+            ("2024-02-29", "2024-02-29"),
+            // A leap-second day still reads back as one whole day.
+            ("2016-12-31", "2016-12-31"),
+            ("2019-03-01T12:30", "2019-03-01T12:30Z"),
+        ] {
+            assert_eq!(format_when(parse_when(raw).unwrap()), shown, "{raw}");
+        }
+        let (from, to): (hifitime::Epoch, hifitime::Epoch) = parse_when("2019..2020-06")
+            .unwrap()
+            .try_from_inline()
+            .unwrap();
+        assert_eq!(
+            from,
+            hifitime::Epoch::from_gregorian_utc_at_midnight(2019, 1, 1)
+        );
+        assert_eq!(
+            to + hifitime::Duration::from_truncated_nanoseconds(1),
+            hifitime::Epoch::from_gregorian_utc_at_midnight(2020, 7, 1)
+        );
+        for bad in ["", "19x", "2019-13", "2019-02-30", "2020..2019"] {
+            assert!(parse_when(bad).is_err(), "{bad}");
+        }
     }
 }

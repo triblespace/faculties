@@ -1,7 +1,8 @@
 //! Presentation of typed Relations write receipts.
 use super::{
-    AddedGroup, AddedPerson, GroupAddition, GroupReconciliation, GroupRemoval, GroupRename,
-    IdentityChange, LifecycleChange, ProfileReconciliation, ProfileUpdate,
+    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, EndedTie, GroupAddition,
+    GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange,
+    ProfileReconciliation, ProfileUpdate,
 };
 use crate::out::Out;
 use anyhow::Result;
@@ -97,4 +98,25 @@ pub fn identity(receipt: &IdentityChange, same: bool, output: &mut Out<'_>) -> R
             ))
         }
     }
+}
+pub fn organisation_added(receipt: &AddedOrganisation, output: &mut Out<'_>) -> Result<()> {
+    output.line(format!("organisation: {:x}", receipt.organisation))?;
+    output.line(format!("profile: {:x}", receipt.profile))?;
+    output.line(format!("lifecycle: {:x}", receipt.lifecycle))
+}
+pub fn tie_added(receipt: &AddedTie, output: &mut Out<'_>) -> Result<()> {
+    output.line(format!("tie: {:x}", receipt.tie))?;
+    output.line(format!(
+        "{:x} -> {:x}{}",
+        receipt.subject,
+        receipt.object,
+        if receipt.known {
+            " (claim already recorded; annotations added)"
+        } else {
+            ""
+        }
+    ))
+}
+pub fn tie_ended(receipt: &EndedTie, output: &mut Out<'_>) -> Result<()> {
+    output.line(format!("tie: {:x} until {}", receipt.tie, receipt.until))
 }

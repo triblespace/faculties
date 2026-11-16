@@ -1,7 +1,7 @@
 //! Relations' tailored CLI grammar. Notes and labels retain their existing
 //! literal-string behavior; output delivery is a separate frontend concern.
 
-use super::{render, PeopleFilter, ProfileInput, ProfilePatch, Relations};
+use super::{render, PeopleFilter, ProfileInput, ProfilePatch, Relations, TieRequest};
 use crate::out::Out;
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -12,7 +12,7 @@ use triblespace::prelude::Id;
 #[command(
     version = crate::GIT_VERSION,
     name = "relations",
-    about = "Authored people, groups, and identity verdicts"
+    about = "Authored people, organisations, groups, ties between them, and identity verdicts"
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -74,9 +74,10 @@ enum Command {
         #[arg(long, conflicts_with = "all")]
         retired: bool,
     },
-    /// Show one person, including all heads when a track is forked.
+    /// Show one person or organisation and its ties, including all heads when
+    /// a track is forked.
     Show {
-        /// Person label, alias, exact id, or id prefix.
+        /// Person or organisation label, alias, exact id, or id prefix.
         person: String,
     },
     /// Publish a retired lifecycle successor (also reconciles a lifecycle fork).
@@ -94,6 +95,185 @@ enum Command {
         #[command(subcommand)]
         command: IdentityCommand,
     },
+    /// Manage organisations: companies, banks, programmes, public bodies.
+    Org {
+        #[command(subcommand)]
+        command: OrgCommand,
+    },
+    /// Record labelled, directed ties between people and organisations.
+    Tie {
+        #[command(subcommand)]
+        command: TieCommand,
+    },
+    /// List every tie with an entry as subject or object.
+    Ties {
+        /// Person or organisation label, alias, exact id, or id prefix.
+        entry: String,
+    },
+}
+
+#[derive(Args, Clone, Default)]
+struct OrgProfileArgs {
+    /// Alternative name or abbreviation (repeatable).
+    #[arg(long)]
+    alias: Vec<String>,
+    #[arg(long)]
+    display_name: Option<String>,
+    /// Literal note.
+    #[arg(long)]
+    note: Option<String>,
+    /// Website or profile URL (repeatable).
+    #[arg(long = "url")]
+    url: Vec<String>,
+    #[arg(long)]
+    email: Vec<String>,
+    #[arg(long)]
+    phone: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, ValueEnum)]
+enum OrgField {
+    Aliases,
+    DisplayName,
+    Note,
+    Urls,
+    Emails,
+    Phones,
+}
+
+impl From<OrgField> for super::ProfileField {
+    fn from(value: OrgField) -> Self {
+        match value {
+            OrgField::Aliases => Self::Aliases,
+            OrgField::DisplayName => Self::DisplayName,
+            OrgField::Note => Self::Note,
+            OrgField::Urls => Self::ProfileUrls,
+            OrgField::Emails => Self::Emails,
+            OrgField::Phones => Self::Phones,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum OrgCommand {
+    /// Add an organisation with an initial profile and active lifecycle.
+    Add {
+        /// Canonical name.
+        label: String,
+        /// Additive provenance (repeatable).
+        #[arg(long)]
+        source: Vec<String>,
+        #[command(flatten)]
+        profile: OrgProfileArgs,
+    },
+    /// Replace selected fields of an organisation's current profile.
+    Set {
+        /// Organisation label, alias, exact id, or id prefix.
+        organisation: String,
+        #[arg(long)]
+        label: Option<String>,
+        /// Additive provenance (repeatable; does not alter profile identity).
+        #[arg(long)]
+        source: Vec<String>,
+        /// Present repeated fields replace the complete set.
+        #[command(flatten)]
+        profile: OrgProfileArgs,
+        /// Clear one field. Repeat as needed.
+        #[arg(long, value_enum)]
+        clear: Vec<OrgField>,
+    },
+    /// List organisations.
+    List {
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Include retired organisations.
+        #[arg(long)]
+        all: bool,
+        /// Show only retired organisations.
+        #[arg(long, conflicts_with = "all")]
+        retired: bool,
+    },
+    /// Show one organisation and its ties.
+    Show { organisation: String },
+    /// Mark an organisation retired (defunct, merged away, out of scope).
+    Retire { organisation: String },
+    /// Mark an organisation active again.
+    Unretire { organisation: String },
+}
+
+#[derive(Subcommand)]
+enum TieCommand {
+    /// Record "SUBJECT RELATION OBJECT", e.g. `"Ada" "works at" "BAB"`. The
+    /// same claim recorded again converges on one tie and adds its sources.
+    Add {
+        /// Person or organisation label, alias, exact id, or id prefix.
+        subject: String,
+        /// Relation label, read from subject to object ("works at").
+        relation: String,
+        /// Person or organisation label, alias, exact id, or id prefix.
+        object: String,
+        /// The subject's role in this tie; part of the claim's identity.
+        #[arg(long)]
+        role: Option<String>,
+        /// Valid since: YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH:MM, or A..B.
+        #[arg(long)]
+        since: Option<String>,
+        /// Valid until, same forms as --since.
+        #[arg(long)]
+        until: Option<String>,
+        /// Provenance: URL or note (repeatable, accumulates).
+        #[arg(long)]
+        source: Vec<String>,
+        /// Acting persona (relations label or id) for attribution.
+        #[arg(long, env = "PERSONA")]
+        persona: Option<String>,
+    },
+    /// Record that a tie ended. The tie stays visible with its end.
+    End {
+        /// Tie id or unique id prefix.
+        tie: String,
+        /// When it ended: YYYY, YYYY-MM, YYYY-MM-DD, YYYY-MM-DDTHH:MM, or A..B.
+        #[arg(long)]
+        until: String,
+        /// Provenance for the ending (repeatable).
+        #[arg(long)]
+        source: Vec<String>,
+        /// Acting persona (relations label or id) for attribution.
+        #[arg(long, env = "PERSONA")]
+        persona: Option<String>,
+    },
+}
+
+impl OrgProfileArgs {
+    fn into_profile(self, label: String) -> ProfileInput {
+        ProfileInput {
+            label,
+            aliases: self.alias,
+            display_name: self.display_name,
+            note: self.note,
+            profile_urls: self.url,
+            emails: self.email,
+            phones: self.phone,
+            ..ProfileInput::default()
+        }
+    }
+
+    fn into_patch(self, label: Option<String>, clear: Vec<OrgField>) -> ProfilePatch {
+        fn provided(values: Vec<String>) -> Option<Vec<String>> {
+            (!values.is_empty()).then_some(values)
+        }
+        ProfilePatch {
+            label,
+            aliases: provided(self.alias),
+            display_name: self.display_name,
+            note: self.note,
+            profile_urls: provided(self.url),
+            emails: provided(self.email),
+            phones: provided(self.phone),
+            clear: clear.into_iter().map(Into::into).collect(),
+            ..ProfilePatch::default()
+        }
+    }
 }
 
 #[derive(Args, Clone, Default)]
@@ -377,6 +557,81 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             ),
             IdentityCommand::List => output.text(operations.identity_list()?),
         },
+        Command::Org { command } => match command {
+            OrgCommand::Add {
+                label,
+                source,
+                profile,
+            } => render::organisation_added(
+                &operations.org_add(profile.into_profile(label), &source)?,
+                output,
+            ),
+            OrgCommand::Set {
+                organisation,
+                label,
+                source,
+                profile,
+                clear,
+            } => render::profile_updated(
+                &operations.org_set(&organisation, profile.into_patch(label, clear), &source)?,
+                output,
+            ),
+            OrgCommand::List {
+                limit,
+                all,
+                retired,
+            } => {
+                let filter = if all {
+                    PeopleFilter::All
+                } else if retired {
+                    PeopleFilter::Retired
+                } else {
+                    PeopleFilter::Active
+                };
+                output.text(operations.org_list(limit, filter)?)
+            }
+            OrgCommand::Show { organisation } => output.text(operations.org_show(&organisation)?),
+            OrgCommand::Retire { organisation } => {
+                render::lifecycle(&operations.org_retire(&organisation)?, true, output)
+            }
+            OrgCommand::Unretire { organisation } => {
+                render::lifecycle(&operations.org_unretire(&organisation)?, false, output)
+            }
+        },
+        Command::Tie { command } => match command {
+            TieCommand::Add {
+                subject,
+                relation,
+                object,
+                role,
+                since,
+                until,
+                source,
+                persona,
+            } => render::tie_added(
+                &operations.tie_add(TieRequest {
+                    subject,
+                    relation,
+                    object,
+                    role,
+                    since,
+                    until,
+                    sources: source,
+                    persona,
+                })?,
+                output,
+            ),
+            TieCommand::End {
+                tie,
+                until,
+                source,
+                persona,
+            } => render::tie_ended(
+                &operations.tie_end(&tie, &until, &source, persona.as_deref())?,
+                output,
+            ),
+        },
+        Command::Ties { entry } => output.text(operations.ties(&entry)?),
     }
 }
 
