@@ -839,6 +839,7 @@ umask 077
 secrets add-login --label public-reference --password-file - \
   --username-file ./private-username --attachment ./private-document
 secrets items
+secrets find bultmann.eu --role url --role username
 secrets item-open --secret VERSION_ID
 secrets item-inspect --secret VERSION_ID --body CIPHERTEXT_BODY_HANDLE
 secrets item-open --secret VERSION_ID --body CIPHERTEXT_BODY_HANDLE > private-facts.archive
@@ -856,11 +857,22 @@ SimpleArchive bytes; use the library's `find!`/`pattern!` on `OpenedItem::facts(
 to select typed child handles. Opening one child does not load all fields or
 attachments. A missing unrelated child does not prevent opening the root.
 
-Configured Rust operations are `Secrets::{add_item,list_items,open_item,
+`find` matches each term, case-insensitively as a substring, against a
+version's public label (`title`) and its USERNAME and URL fields; every term
+must occur in one of the selected roles (`--role`, default all three). It
+prints version IDs, body handles, public labels and the matched role names,
+never a value, followed by counts. It opens each ordinary item archive and only
+its USERNAME/URL children, with the node key in one store lease. Passwords,
+notes, custom fields, TOTP seeds, private labels and attachments are never
+decrypted. User-protected versions are never unlocked by a search: they and
+versions this key cannot open are counted, and only their labels are searched.
+Read a matched value with `item-inspect` then `item-export`.
+
+Configured Rust operations are `Secrets::{add_item,list_items,find_items,open_item,
 open_item_body,open_item_child,inspect_item}`. Item metadata includes exact body
 handles and explicit unavailable public labels. Inspection names known roles and
 shows typed ciphertext value/name handles without opening those values. MCP
-offers read-only `secrets_items`, `secrets_item_open`, `secrets_item_inspect`, and
+offers read-only `secrets_items`, `secrets_find`, `secrets_item_open`, `secrets_item_inspect`, and
 `secrets_item_export`; explicit exports are binary resources, not perception.
 No structured MCP value-entry schema, app popup, adoption or deployment is
 included. The standalone API, format and minted marker provenance are in

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `secrets find <TERM>... [--role title|username|url]...` and the
+  `secrets_find` MCP tool find structured items by case-insensitive substring
+  over the public label and the USERNAME and URL fields, every term required.
+  They return version IDs, body handles, public labels and the matched role
+  names, never a value, with counts of versions searched, user-protected
+  versions (never unlocked; label only) and versions the key cannot open. Only
+  each ordinary archive and its USERNAME/URL children are decrypted; passwords,
+  notes, custom fields, TOTP seeds and attachments never are.
 - `code share <SELECTOR> --channel <CHANNEL_ID>` and the `code_share` MCP
   tool post one declaration's exact source, as the catalogue holds it, to a
   Discord channel, so a caller passes a reference (selector, `--at`,

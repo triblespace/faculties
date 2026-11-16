@@ -38,6 +38,61 @@ pub struct DeliveryReport {
     pub added_envelopes: usize,
     pub view_maintenance_pending: bool,
 }
+/// Where a `find` term may occur. Only the public label and the USERNAME and
+/// URL fields are searchable; passwords, notes, custom fields, TOTP seeds and
+/// attachments are never decrypted by a search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FindRole {
+    /// The public item label; matching it decrypts nothing.
+    Title,
+    Username,
+    Url,
+}
+impl FindRole {
+    pub const ALL: [Self; 3] = [Self::Title, Self::Username, Self::Url];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Username => "username",
+            Self::Url => "url",
+        }
+    }
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.name() == raw)
+    }
+    /// The private field role this searches, `None` for the public label.
+    fn field_role(self) -> Option<Id> {
+        match self {
+            Self::Title => None,
+            Self::Username => Some(secrets::schema::ROLE_USERNAME),
+            Self::Url => Some(secrets::schema::ROLE_URL),
+        }
+    }
+}
+/// One matching exact version body. Ids, labels and role names only: the
+/// decrypted values that matched never leave the search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FindMatch {
+    pub id: Id,
+    pub body: secrets::item::ItemBody,
+    /// None explicitly means the public label bytes are unavailable/undecodable.
+    pub name: Option<String>,
+    pub roles: Vec<FindRole>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FindReport {
+    pub matches: Vec<FindMatch>,
+    /// Exact version bodies considered.
+    pub searched: usize,
+    /// User-protected versions: each needs its own local unlock, which a
+    /// search never requests, so only their public labels were searched.
+    pub protected: usize,
+    /// Ordinary versions this key could not open (no envelope delivered to
+    /// it, or ciphertext not resident); only their public labels were searched.
+    pub unopenable: usize,
+    /// Selected USERNAME/URL children that could not be opened or are not UTF-8.
+    pub unreadable_values: usize,
+}
 impl Secrets {
     pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
         Self::with_storage(crate::storage::Storage::new(pile, key))
@@ -557,6 +612,123 @@ impl Secrets {
             Ok(())
         })
     }
+    /// Case-insensitive substring search over every structured version: its
+    /// public label and, when selected, its USERNAME and URL fields. A version
+    /// matches when every term occurs in at least one selected role; the
+    /// roles in which any term occurred are reported. An empty role selection
+    /// means all three. Only the item archive and its USERNAME/URL children
+    /// are decrypted, in one store lease with the node key; user-protected
+    /// versions are never unlocked and are counted instead, as are versions
+    /// this key cannot open. Unknown roles, missing fields and non-UTF-8
+    /// values are simply not matched.
+    pub fn find_items(&self, terms: &[&str], roles: &[FindRole]) -> Result<FindReport> {
+        let needles: Vec<Vec<char>> = terms
+            .iter()
+            .map(|term| term.chars().flat_map(char::to_lowercase).collect())
+            .collect();
+        anyhow::ensure!(
+            !needles.is_empty() && needles.iter().all(|needle| !needle.is_empty()),
+            "find needs at least one non-empty term"
+        );
+        let mut roles = if roles.is_empty() {
+            FindRole::ALL.to_vec()
+        } else {
+            roles.to_vec()
+        };
+        roles.sort();
+        roles.dedup();
+        let private = roles.iter().any(|role| role.field_role().is_some());
+        self.storage().with_store(|pile, signer, runtime| {
+            use secrets::item::PrivateText;
+            use secrets::schema::*;
+            use triblespace::core::metadata;
+            let collection = self.storage.open_secrets_collection(
+                pile,
+                signer.verifying_key(),
+                runtime,
+                false,
+            )?;
+            let snapshot = acquiring_snapshot(pile, collection, signer, runtime, false)?;
+            let mut report = FindReport::default();
+            let Some(facts) = snapshot.facts() else {
+                return Ok(report);
+            };
+            let reader = snapshot.store_snapshot();
+            // Scratch for this one search: each exact body once, with every
+            // public label its version carries.
+            let mut versions = std::collections::BTreeMap::<_, Vec<Option<String>>>::new();
+            for row in secrets::item::rows(facts) {
+                versions
+                    .entry((row.id, row.body))
+                    .or_default()
+                    .push(secrets::read_text(reader, row.name).ok());
+            }
+            report.searched = versions.len();
+            for ((id, body), names) in versions {
+                let mut hit = vec![false; needles.len()];
+                let mut matched: Vec<FindRole> = Vec::new();
+                let mut note = |role: FindRole, text: &str| {
+                    let mut any = false;
+                    for (needle, hit) in needles.iter().zip(hit.iter_mut()) {
+                        if contains_folded(text, needle) {
+                            *hit = true;
+                            any = true;
+                        }
+                    }
+                    if any && !matched.contains(&role) {
+                        matched.push(role);
+                    }
+                };
+                if roles.contains(&FindRole::Title) {
+                    for name in names.iter().flatten() {
+                        note(FindRole::Title, name);
+                    }
+                }
+                if private {
+                    if exists!(pattern!(facts, [{ id @ protected_envelope: _?envelope }])) {
+                        report.protected += 1;
+                    } else {
+                        match secrets::item::open_exact(reader.clone(), facts, id, body, signer) {
+                            Err(_) => report.unopenable += 1,
+                            Ok(item) => {
+                                for &role in &roles {
+                                    let Some(field_role_id) = role.field_role() else {
+                                        continue;
+                                    };
+                                    for text in find!(text: PrivateText, pattern!(item.facts(), [
+                                        { metadata::tag: KIND_ITEM, item_field: _?field },
+                                        { _?field @ field_role: field_role_id, field_text: ?text },
+                                    ])) {
+                                        // The clear blob zeroizes its buffer on drop;
+                                        // matching folds case without copying it.
+                                        match item.open_child(text) {
+                                            Ok(clear) => {
+                                                match std::str::from_utf8(clear.bytes.as_ref()) {
+                                                    Ok(value) => note(role, value),
+                                                    Err(_) => report.unreadable_values += 1,
+                                                }
+                                            }
+                                            Err(_) => report.unreadable_values += 1,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if hit.iter().all(|hit| *hit) {
+                    matched.sort();
+                    report.matches.push(FindMatch {
+                        id,
+                        body,
+                        name: names.into_iter().flatten().next(),
+                        roles: matched,
+                    });
+                }
+            }
+            Ok(report)
+        })
+    }
     /// Explicitly open one exact version. Callers decide how plaintext is used.
     pub fn get(&self, secret: Id) -> Result<Zeroizing<Vec<u8>>> {
         let prepared = self.prepare_protected(secret, None, Purpose::Get)?;
@@ -720,6 +892,47 @@ impl Secrets {
             secrets::resource::grant(pile, signer, &snapshot, target, recipient, limits, delegate)
         })
     }
+}
+
+/// Whether `haystack` contains `needle` (already lowercased), comparing
+/// lowercased characters without building a lowercased copy of `haystack`,
+/// so a decrypted value is never duplicated into an unzeroized buffer.
+fn contains_folded(haystack: &str, needle: &[char]) -> bool {
+    haystack.char_indices().any(|(start, _)| {
+        let mut folded = haystack[start..].chars().flat_map(char::to_lowercase);
+        needle.iter().all(|want| folded.next() == Some(*want))
+    })
+}
+
+/// One native rendering of a search, shared by the CLI and MCP. Ids, exact
+/// body handles, public labels and role names only, then one count line.
+pub(crate) fn write_find(report: &FindReport, out: &mut crate::out::Out<'_>) -> Result<()> {
+    for found in &report.matches {
+        let roles = found
+            .roles
+            .iter()
+            .map(|role| role.name())
+            .collect::<Vec<_>>()
+            .join(",");
+        let label = match &found.name {
+            Some(name) => format!("public-name {name}"),
+            None => "public-name-unavailable".to_owned(),
+        };
+        out.line(format!(
+            "{:x} body blake3:{} matched {roles} {label}",
+            found.id,
+            hex::encode(found.body.raw)
+        ))?;
+    }
+    out.line(format!(
+        "{} match(es) in {} version(s); {} protected and {} not openable by this key \
+         (public label searched only); {} unreadable value(s)",
+        report.matches.len(),
+        report.searched,
+        report.protected,
+        report.unopenable,
+        report.unreadable_values
+    ))
 }
 
 /// One native representation shared by the explicit CLI/MCP disclosure paths.
@@ -1210,6 +1423,320 @@ mod tests {
         assert!(listed
             .iter()
             .any(|row| row.id == missing_id && row.name.is_none()));
+    }
+
+    #[test]
+    fn find_matches_labels_usernames_and_urls_but_never_other_roles_or_values() {
+        use secrets::item::{FieldInput, FieldValue, ItemInput};
+        use secrets::schema::{ROLE_CUSTOM, ROLE_NOTES, ROLE_PASSWORD, ROLE_URL, ROLE_USERNAME};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("find.pile");
+        std::fs::File::create(&path).unwrap();
+        crate::storage::initialize_signer(&path, None).unwrap();
+        let unlocks = Arc::new(AtomicUsize::new(0));
+        let counted = unlocks.clone();
+        let storage = crate::storage::Storage::shared_local(path, None).with_protected_access(
+            Arc::new(move |request| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                request.unlock_password(b"synthetic passphrase")
+            }),
+        );
+        let operations = Secrets::with_storage(storage.clone());
+        fn text(role: Id, value: &str) -> FieldInput<'_> {
+            FieldInput {
+                role,
+                label: None,
+                value: FieldValue::Text(value),
+            }
+        }
+        let mail = operations
+            .add_item(
+                "Synthetic Mail Login",
+                ItemInput {
+                    fields: &[
+                        text(ROLE_USERNAME, "SYNTHETIC-USER@Example-Find.test"),
+                        text(ROLE_URL, "https://SYNTHETIC-mail.other.test"),
+                        text(ROLE_PASSWORD, "SYNTHETIC-PASSWORD-zebra"),
+                    ],
+                    attachments: &[],
+                },
+            )
+            .unwrap();
+        let bank = operations
+            .add_item(
+                "Synthetic Bank",
+                ItemInput {
+                    fields: &[
+                        text(ROLE_URL, "https://SYNTHETIC-bank.example-find.test/login"),
+                        FieldInput {
+                            role: ROLE_USERNAME,
+                            label: None,
+                            value: FieldValue::Integer(7),
+                        },
+                    ],
+                    attachments: &[],
+                },
+            )
+            .unwrap();
+        // Every term sits only in roles find must never decrypt.
+        let hidden = operations
+            .add_item(
+                "Synthetic Hidden",
+                ItemInput {
+                    fields: &[
+                        text(ROLE_PASSWORD, "example-find zebra"),
+                        text(ROLE_NOTES, "example-find zebra"),
+                        FieldInput {
+                            role: ROLE_CUSTOM,
+                            label: Some("example-find"),
+                            value: FieldValue::Text("example-find zebra"),
+                        },
+                        text(genid().id, "example-find zebra"),
+                    ],
+                    attachments: &[secrets::item::AttachmentInput {
+                        filename: "example-find",
+                        bytes: b"example-find zebra",
+                    }],
+                },
+            )
+            .unwrap();
+        let protected = operations
+            .add_item_protected(
+                "Synthetic Protected",
+                ItemInput {
+                    fields: &[text(ROLE_USERNAME, "SYNTHETIC-USER@example-find.test")],
+                    attachments: &[],
+                },
+                Protection {
+                    password: b"synthetic passphrase",
+                    device: None,
+                },
+            )
+            .unwrap();
+        let found = |terms: &[&str], roles: &[FindRole]| {
+            let report = operations.find_items(terms, roles).unwrap();
+            assert_eq!(report.searched, 4);
+            report
+        };
+        let ids = |report: &FindReport| {
+            let mut ids = report.matches.iter().map(|m| m.id).collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let sorted = |mut ids: Vec<Id>| {
+            ids.sort();
+            ids
+        };
+
+        // Username (case-insensitive) and URL; the hidden item never matches,
+        // and the protected one is counted, never unlocked.
+        let report = found(&["EXAMPLE-find"], &[]);
+        assert_eq!(ids(&report), sorted(vec![mail, bank]));
+        assert_eq!(report.protected, 1);
+        assert_eq!(report.unopenable, 0);
+        assert_eq!(report.unreadable_values, 0);
+        let roles_of = |report: &FindReport, id: Id| {
+            report
+                .matches
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap()
+                .roles
+                .clone()
+        };
+        assert_eq!(roles_of(&report, mail), vec![FindRole::Username]);
+        assert_eq!(roles_of(&report, bank), vec![FindRole::Url]);
+        let mail_row = report.matches.iter().find(|m| m.id == mail).unwrap();
+        assert_eq!(mail_row.name.as_deref(), Some("Synthetic Mail Login"));
+        assert_eq!(mail_row.body, operations.open_item(mail).unwrap()[0]);
+
+        // A password containing the term is never searched.
+        assert!(found(&["zebra"], &[]).matches.is_empty());
+
+        // Title only: nothing is opened, so nothing is counted as skipped,
+        // and a protected version is found by its public label.
+        let report = found(&["synthetic"], &[FindRole::Title]);
+        assert_eq!(ids(&report), sorted(vec![mail, bank, hidden, protected]));
+        assert!(report.matches.iter().all(|m| m.roles == [FindRole::Title]));
+        assert_eq!((report.protected, report.unopenable), (0, 0));
+        assert_eq!(ids(&found(&["MAIL login"], &[FindRole::Title])), vec![mail]);
+
+        // Role restriction.
+        assert_eq!(ids(&found(&["example-find"], &[FindRole::Url])), vec![bank]);
+        assert_eq!(
+            ids(&found(&["example-find"], &[FindRole::Username])),
+            vec![mail]
+        );
+
+        // Every term must occur, each in some selected role.
+        let report = found(&["bank", "example-find"], &[]);
+        assert_eq!(ids(&report), vec![bank]);
+        assert_eq!(
+            roles_of(&report, bank),
+            vec![FindRole::Title, FindRole::Url]
+        );
+        assert!(found(&["bank", "example-find"], &[FindRole::Url])
+            .matches
+            .iter()
+            .all(|m| m.id == bank));
+        assert!(found(&["bank", "example-find"], &[FindRole::Title])
+            .matches
+            .is_empty());
+        assert!(operations.find_items(&[], &[]).is_err());
+        assert!(operations.find_items(&[""], &[]).is_err());
+        assert_eq!(unlocks.load(Ordering::SeqCst), 0);
+
+        // The rendering carries ids, labels and role names, never a value.
+        let mut text = String::new();
+        write_find(
+            &found(&["example-find"], &[]),
+            &mut crate::out::Out::new(&mut |part| {
+                let crate::out::Part::Text { text: part } = part else {
+                    panic!("search renders text only");
+                };
+                text.push_str(&part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(text.contains(&format!("{mail:x} body blake3:")));
+        assert!(text.contains("matched username public-name Synthetic Mail Login"));
+        assert!(text.contains("matched url public-name Synthetic Bank"));
+        assert!(text.contains("2 match(es) in 4 version(s); 1 protected and 0 not openable"));
+        for value in [
+            "SYNTHETIC-USER",
+            "SYNTHETIC-mail",
+            "SYNTHETIC-bank",
+            "PASSWORD",
+            "zebra",
+            "https://",
+        ] {
+            assert!(!text.contains(value), "{value} leaked into {text}");
+        }
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn find_reports_its_synthetic_cost_per_opened_version() {
+        use secrets::item::{FieldInput, FieldValue, ItemInput};
+        use secrets::schema::{ROLE_PASSWORD, ROLE_URL, ROLE_USERNAME};
+        const VERSIONS: usize = 32;
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("find-cost.pile");
+        std::fs::File::create(&path).unwrap();
+        crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Secrets::new(path, None);
+        for index in 0..VERSIONS {
+            let username = format!("synthetic-user-{index}@cost.example");
+            let url = format!("https://synthetic-{index}.cost.example");
+            operations
+                .add_item(
+                    &format!("synthetic cost {index}"),
+                    ItemInput {
+                        fields: &[
+                            FieldInput {
+                                role: ROLE_USERNAME,
+                                label: None,
+                                value: FieldValue::Text(&username),
+                            },
+                            FieldInput {
+                                role: ROLE_URL,
+                                label: None,
+                                value: FieldValue::Text(&url),
+                            },
+                            FieldInput {
+                                role: ROLE_PASSWORD,
+                                label: None,
+                                value: FieldValue::Text("synthetic"),
+                            },
+                        ],
+                        attachments: &[],
+                    },
+                )
+                .unwrap();
+        }
+        let started = std::time::Instant::now();
+        let titles = operations
+            .find_items(&["synthetic"], &[FindRole::Title])
+            .unwrap();
+        let titles_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        let private = operations
+            .find_items(&["user-7@"], &[FindRole::Username, FindRole::Url])
+            .unwrap();
+        let private_elapsed = started.elapsed();
+        assert_eq!(titles.matches.len(), VERSIONS);
+        assert_eq!(private.matches.len(), 1);
+        assert_eq!(private.searched, VERSIONS);
+        // Framing: one whole find call over VERSIONS local ordinary versions,
+        // this test profile, local temporary pile; the private search opens
+        // each archive plus its USERNAME and URL children, the title search
+        // opens nothing. Both include the store open and collection ensure.
+        eprintln!(
+            "synthetic find cost: {VERSIONS} versions; titles only {titles_elapsed:?} total; \
+             username+url {private_elapsed:?} total, {:?} per version",
+            private_elapsed / VERSIONS as u32
+        );
+    }
+
+    #[test]
+    fn find_counts_a_version_this_key_cannot_open() {
+        use secrets::item::{FieldInput, FieldValue, ItemInput};
+        use secrets::schema::ROLE_USERNAME;
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("find-unopenable.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Secrets::new(path.clone(), None);
+        let id = operations
+            .add_item(
+                "synthetic openable",
+                ItemInput {
+                    fields: &[FieldInput {
+                        role: ROLE_USERNAME,
+                        label: None,
+                        value: FieldValue::Text("synthetic-user"),
+                    }],
+                    attachments: &[],
+                },
+            )
+            .unwrap();
+        let body = operations.open_item(id).unwrap()[0];
+        // A second version advertising that body under another id has no
+        // envelope for this key: its label is searched, its fields are not.
+        let other = genid().id;
+        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
+        let instant = hifitime::Epoch::from_unix_seconds(0.0);
+        let created: secrets::IntervalValue = (instant, instant).try_to_inline().unwrap();
+        let mut fragment = Fragment::empty();
+        let label = fragment.put::<blobencodings::UTF8String, _>("synthetic unopenable".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&other) @
+            metadata::tag: secrets::schema::KIND_ITEM_VERSION,
+            metadata::name: label, metadata::created_at: created,
+            secrets::schema::structured_body: body,
+        };
+        pile.commit(collection.source(), &signer, fragment).unwrap();
+        pile.close().unwrap();
+        let report = operations.find_items(&["synthetic"], &[]).unwrap();
+        assert_eq!(report.searched, 2);
+        assert_eq!(report.unopenable, 1);
+        let mut found = report
+            .matches
+            .iter()
+            .map(|m| (m.id, m.roles.clone()))
+            .collect::<Vec<_>>();
+        found.sort();
+        let mut expected = vec![
+            (id, vec![FindRole::Title, FindRole::Username]),
+            (other, vec![FindRole::Title]),
+        ];
+        expected.sort();
+        assert_eq!(found, expected);
     }
 
     #[test]

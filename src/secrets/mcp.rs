@@ -65,6 +65,7 @@ const EMPTY: &str = r#"{"type":"object","properties":{},"additionalProperties":f
 const TOOLS: &[Tool] = &[
     Tool {name:"secrets_item_totp", description:"Explicitly generate a current TOTP from one selected encrypted item text field, identified by exact version, body and child ciphertext handles. Returns only a short-lived code, inclusive valid_from_unix/exclusive valid_until_unix and generated_at_unix in Unix seconds, period, digits, algorithm, and normalized issuer/account metadata (null for a bare Base32 seed). The seed and full URI remain inside Secrets. Supports SHA1/SHA256/SHA512, 6/8 digits, positive period; no HOTP, client-supplied time, enrollment or mutation.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"},"child":{"type":"string"}},"required":["secret","body","child"],"additionalProperties":false}"#},
     Tool {name:"secrets_item_inspect", description:"Explicit read-only inspection of one exact private item body: known role names with opaque IDs, typed ciphertext child handles and encrypted label/filename handles. Does not decrypt values, labels or filenames. Repeated/unknown roles remain visible.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"}},"required":["secret","body"],"additionalProperties":false}"#},
+    Tool {name:"secrets_find", description:"Find structured item versions by case-insensitive substring: a version matches when every term occurs in its public label (title), USERNAME or URL field; roles optionally restricts which of the three are searched. Returns version IDs, exact body handles, public labels and the matched role names, then counts of versions searched, user-protected versions (never unlocked; label searched only) and versions this key cannot open. Never decrypts passwords, notes, custom fields, TOTP seeds or attachments, and never returns a field value: use secrets_item_inspect and secrets_item_export on a match to read one.", input_schema:r#"{"type":"object","properties":{"terms":{"type":"array","items":{"type":"string","minLength":1},"minItems":1},"roles":{"type":"array","items":{"type":"string","enum":["title","username","url"]},"default":[]}},"required":["terms"],"additionalProperties":false}"#},
     Tool {name:"secrets_items", description:"List structured encrypted item version IDs and explicit public labels only. Never decrypts values, private labels or filenames.", input_schema:EMPTY},
     Tool {name:"secrets_item_open", description:"Explicitly open a structured item. Without body, disclose body alternatives (advertised ciphertext metadata without unlocking for user-protected versions; decryptable alternatives for ordinary versions). With exact body, export that private native SimpleArchive as a binary resource; its child values remain encrypted handles. User-protected opening requires one local Erlkonig unlock; never supply a password in arguments. Does not read server files.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"}},"required":["secret"],"additionalProperties":false}"#},
     Tool {name:"secrets_item_export", description:"Explicitly decrypt one selected item child as a binary resource. Requires exact version, body and child ciphertext handles and encoding text or bytes. Reveals plaintext to the caller, not perception. No server files or stdin.", input_schema:r#"{"type":"object","properties":{"secret":{"type":"string"},"body":{"type":"string"},"child":{"type":"string"},"encoding":{"type":"string","enum":["text","bytes"]}},"required":["secret","body","child","encoding"],"additionalProperties":false}"#},
@@ -112,6 +113,13 @@ struct ItemTotp {
     secret: String,
     body: String,
     child: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Find {
+    terms: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -198,6 +206,26 @@ impl Faculty for Secrets {
                 let id = item_id(&args.secret)?;
                 let body = ciphertext_handle(&args.body)?;
                 self.operations.inspect_item(id, Inline::new(body), out)
+            }
+            "secrets_find" => {
+                let args: Find = decode_arguments(arguments)?;
+                if args.terms.is_empty() || args.terms.iter().any(|term| term.is_empty()) {
+                    return Err(invalid_arguments(
+                        "terms must hold at least one non-empty term",
+                    ));
+                }
+                let roles = args
+                    .roles
+                    .iter()
+                    .map(|raw| {
+                        super::operations::FindRole::parse(raw).ok_or_else(|| {
+                            invalid_arguments("roles may hold title, username or url")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let terms = args.terms.iter().map(String::as_str).collect::<Vec<_>>();
+                let report = self.operations.find_items(&terms, &roles)?;
+                super::operations::write_find(&report, out)
             }
             "secrets_items" => {
                 let _: Empty = decode_arguments(arguments)?;
@@ -640,6 +668,88 @@ mod tests {
             "body":body,"child":hex::encode(child.raw),"encoding":"bytes"})
         )
         .is_err());
+    }
+
+    #[test]
+    fn find_returns_ids_labels_and_roles_never_values() {
+        use faculties_secrets::schema::{ROLE_URL, ROLE_USERNAME};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-find.pile");
+        std::fs::File::create(&path).unwrap();
+        crate::storage::initialize_signer(&path, None).unwrap();
+        let operations = Operations::new(path.clone(), None);
+        fn field(role: Id, value: &str) -> FieldInput<'_> {
+            FieldInput {
+                role,
+                label: None,
+                value: FieldValue::Text(value),
+            }
+        }
+        let id = operations
+            .add_item(
+                "public MCP find label",
+                ItemInput {
+                    fields: &[
+                        field(ROLE_USERNAME, "SYNTHETIC-MCP-USER@find.example"),
+                        field(ROLE_URL, "https://SYNTHETIC-MCP-URL.find.example"),
+                        field(ROLE_PASSWORD, "SYNTHETIC-MCP-PASSWORD-find.example"),
+                    ],
+                    attachments: &[],
+                },
+            )
+            .unwrap();
+        let adapter = Secrets::new(path, None);
+        let text = |args| {
+            call(&adapter, "secrets_find", args)
+                .unwrap()
+                .into_iter()
+                .map(|part| match part {
+                    Part::Text { text } => text,
+                    _ => panic!("search renders text only"),
+                })
+                .collect::<String>()
+        };
+        let all = text(serde_json::json!({"terms":["FIND.example"]}));
+        assert!(all.contains(&format!("{id:x} body blake3:")));
+        assert!(all.contains("matched username,url public-name public MCP find label"));
+        assert!(all.contains("1 match(es) in 1 version(s)"));
+        assert!(!all.contains("SYNTHETIC-MCP"));
+        let url = text(serde_json::json!({"terms":["synthetic-mcp-url"],"roles":["url"]}));
+        assert!(url.contains("matched url public-name"));
+        let none = text(serde_json::json!({"terms":["SYNTHETIC-MCP-PASSWORD"]}));
+        assert!(none.starts_with("0 match(es) in 1 version(s)"));
+        let title = text(serde_json::json!({"terms":["synthetic-mcp-url"],"roles":["title"]}));
+        assert!(title.starts_with("0 match(es)"));
+    }
+
+    #[test]
+    fn find_invalid_arguments_do_not_open_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("absent.pile");
+        let adapter = Secrets::new(path.clone(), None);
+        for args in [
+            r#"{"terms":[]}"#,
+            r#"{"terms":[""]}"#,
+            r#"{"roles":["url"]}"#,
+            r#"{"terms":["x"],"roles":["password"]}"#,
+            r#"{"terms":["x"],"roles":["notes"]}"#,
+            r#"{"terms":"x"}"#,
+            r#"{"terms":["x"],"path":"/tmp"}"#,
+        ] {
+            assert!(
+                adapter
+                    .call(
+                        "secrets_find",
+                        args.to_owned().into(),
+                        &mut Out::new(&mut |_| panic!("invalid arguments emitted output")),
+                    )
+                    .unwrap_err()
+                    .downcast_ref::<crate::mcp::InvalidArguments>()
+                    .is_some(),
+                "{args}"
+            );
+            assert!(!path.exists());
+        }
     }
 
     /// A reader that keeps producing in small pieces, as a file growing

@@ -69,6 +69,19 @@ enum Command {
     },
     /// List structured versions using public labels only.
     Items,
+    /// Find structured versions whose public label, USERNAME or URL contains
+    /// every term (case-insensitive substring). Prints ids, body handles,
+    /// public labels and the matched role names, never a field value.
+    /// Passwords, notes, custom fields, TOTP and attachments are never
+    /// decrypted; user-protected versions are searched by label only.
+    Find {
+        /// One or more terms; each must occur in some selected role.
+        #[arg(required = true)]
+        terms: Vec<String>,
+        /// Restrict the search to these roles (default: all three).
+        #[arg(long, value_parser = parse_find_role)]
+        role: Vec<super::operations::FindRole>,
+    },
     /// List decryptable body alternatives; --body explicitly exports one native
     /// SimpleArchive. Child handles remain ciphertext, selectable with item-export.
     ItemOpen {
@@ -180,6 +193,10 @@ fn parse_id(raw: &str) -> std::result::Result<Id, String> {
         .ok_or_else(|| format!("'{raw}' is not one exact nonzero 32-digit hexadecimal id"))
 }
 
+fn parse_find_role(raw: &str) -> std::result::Result<super::operations::FindRole, String> {
+    super::operations::FindRole::parse(raw)
+        .ok_or_else(|| "role must be title, username or url".to_owned())
+}
 fn parse_child(raw: &str) -> std::result::Result<[u8; 32], String> {
     hex::decode(raw.strip_prefix("blake3:").unwrap_or(raw))
         .map_err(|_| "child must be a 64-digit ciphertext handle".to_owned())?
@@ -373,6 +390,33 @@ pub fn run() -> Result<()> {
                 }),
             )?;
             stdout.flush().context("flush explicit item inspection")
+        }
+        // Match lines derive from private values, so like inspection they go
+        // to private stdout, never Drive or perception.
+        Command::Find { terms, role } => {
+            let terms = terms.iter().map(String::as_str).collect::<Vec<_>>();
+            let report = operations.find_items(&terms, &role)?;
+            let mut stdout = std::io::stdout().lock();
+            super::operations::write_find(
+                &report,
+                &mut crate::out::Out::new(&mut |part| match part {
+                    crate::out::Part::Text { text } => stdout
+                        .write_all(text.as_bytes())
+                        .context("write item search"),
+                    crate::out::Part::Note { text } => writeln!(
+                        std::io::stderr().lock(),
+                        "{}",
+                        crate::out::labelled_note(&text)
+                    )
+                    .context("write item search note"),
+                    crate::out::Part::Image { .. }
+                    | crate::out::Part::Audio { .. }
+                    | crate::out::Part::Blob { .. } => {
+                        unreachable!("search emits native text only")
+                    }
+                }),
+            )?;
+            stdout.flush().context("flush item search")
         }
         Command::ItemTotp {
             secret,
@@ -629,7 +673,8 @@ pub fn run() -> Result<()> {
             | Command::ItemOpen { .. }
             | Command::ItemExport { .. }
             | Command::ItemTotp { .. }
-            | Command::ItemInspect { .. } => {
+            | Command::ItemInspect { .. }
+            | Command::Find { .. } => {
                 unreachable!()
             }
         }),
@@ -659,6 +704,33 @@ mod tests {
         assert!(Cli::try_parse_from(&args[..8]).is_err());
         for extra in ["--unix-seconds", "--seed", "--value", "--expected-issuer"] {
             assert!(Cli::try_parse_from(args.into_iter().chain([extra, "unsupported"])).is_err());
+        }
+    }
+
+    #[test]
+    fn find_cli_takes_terms_and_only_searchable_roles() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["secrets", "--pile", "unused", "find"].iter().chain(args))
+        };
+        let Command::Find { terms, role } =
+            parse(&["bultmann.eu", "--role", "url", "--role", "username"])
+                .unwrap()
+                .command
+        else {
+            panic!("find expected");
+        };
+        assert_eq!(terms, ["bultmann.eu"]);
+        assert_eq!(
+            role,
+            [
+                super::super::operations::FindRole::Url,
+                super::super::operations::FindRole::Username
+            ]
+        );
+        assert!(parse(&["a", "b", "--role", "title"]).is_ok());
+        assert!(parse(&[]).is_err());
+        for refused in ["password", "notes", "custom", "totp", "attachment"] {
+            assert!(parse(&["x", "--role", refused]).is_err(), "{refused}");
         }
     }
 

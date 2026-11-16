@@ -210,7 +210,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
     assert!(!response.contains("discovery-must-not-"));
     let response: Value = serde_json::from_str(&response).unwrap();
     let tools = response["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 276);
+    assert_eq!(tools.len(), 277);
     for name in [
         "code_candidates",
         "code_share",
@@ -218,6 +218,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
         "quota_record",
         "quota_show",
         "search",
+        "secrets_find",
         "secrets_items",
         "secrets_item_open",
         "secrets_item_inspect",
@@ -446,7 +447,7 @@ mod http_process {
             .json()
             .unwrap();
         let tools = listed["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 276);
+        assert_eq!(tools.len(), 277);
         for name in [
             "code_candidates",
             "code_share",
@@ -454,6 +455,7 @@ mod http_process {
             "quota_record",
             "quota_show",
             "search",
+            "secrets_find",
             "secrets_items",
             "secrets_item_open",
             "secrets_item_inspect",
