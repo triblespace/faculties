@@ -96,11 +96,18 @@ pub struct ReplyRequest {
     pub message: String,
     pub account: String,
     pub body: String,
+    /// Reply to every original recipient (the parent's To and Cc) as well as
+    /// its Reply-To or From, minus the sending account's own addresses.
+    pub all: bool,
 }
 #[derive(Clone, Debug)]
 pub struct DraftReceipt {
     pub draft: Id,
     pub decision: Id,
+    /// The draft's exact recipients, shown before the Decide gate.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub enum SendStatus {
@@ -764,7 +771,7 @@ fn stage_attachments(
 fn create_draft(
     storage: &Storage,
     views: &Views,
-    account_selector: &str,
+    account_id: Id,
     to: Vec<String>,
     cc: Vec<String>,
     bcc: Vec<String>,
@@ -774,7 +781,6 @@ fn create_draft(
     in_reply_to: Vec<Id>,
     references: Vec<Id>,
 ) -> Result<DraftReceipt> {
-    let account_id = resolve_account(views, account_selector)?;
     let account = match mail::account_head(&views.mail.facts, account_id)? {
         Head::Unique(id) => mail::account_config(&views.mail.facts, id)?,
         Head::Missing => bail!("account {account_id:x} has no configuration"),
@@ -789,9 +795,9 @@ fn create_draft(
         nonce: genid().id,
         account: account_id,
         envelope_from,
-        to,
-        cc,
-        bcc,
+        to: to.clone(),
+        cc: cc.clone(),
+        bcc: bcc.clone(),
         subject,
         body,
         attachments: attachment_ids,
@@ -819,15 +825,19 @@ fn create_draft(
     Ok(DraftReceipt {
         draft: draft.draft,
         decision: draft.decision,
+        to,
+        cc,
+        bcc,
     })
 }
 
 fn cmd_draft(storage: &Storage, args: DraftRequest) -> Result<DraftReceipt> {
     let views = storage.views()?;
+    let account_id = resolve_account(&views, &args.account)?;
     create_draft(
         storage,
         &views,
-        &args.account,
+        account_id,
         args.to,
         args.cc,
         args.bcc,
@@ -882,13 +892,97 @@ fn projection_for_wire(views: &Views, wire_id: Id) -> Result<mail::ProjectionVie
     }
 }
 
+/// The Reply-To claims of a wire message, read from the raw bytes of every
+/// observation of it. Observations without raw bytes (legacy imports) carry
+/// no evidence either way; observations that disagree are a real conflict.
+fn reply_to_for_wire(views: &Views, wire_id: Id) -> Result<Vec<String>> {
+    let raws: BTreeSet<mail::BytesHandle> = find!(
+        raw: mail::BytesHandle,
+        pattern!(&views.mail.facts, [{ _?source @ observation::wire: &wire_id, observation::raw: ?raw }])
+    )
+    .collect();
+    let mut claims: Option<Vec<String>> = None;
+    for raw in raws {
+        let bytes: anybytes::Bytes = views
+            .mail
+            .reader
+            .get(raw)
+            .with_context(|| format!("read raw bytes of wire message {wire_id:x}"))?;
+        let these = mail::reply_to_claims(bytes.as_ref())?;
+        match &claims {
+            None => claims = Some(these),
+            Some(chosen) if *chosen == these => {}
+            Some(_) => bail!(
+                "wire message {wire_id:x} has observations with different Reply-To fields; choose an exact source before replying"
+            ),
+        }
+    }
+    Ok(claims.unwrap_or_default())
+}
+
+/// Every address any configuration of the account has claimed for itself,
+/// lowercased: its address and its login name.
+fn own_addresses(views: &Views, account_id: Id) -> Result<BTreeSet<String>> {
+    let facts = &views.mail.facts;
+    find!(
+        value: mail::TextHandle,
+        pattern!(facts, [{ _?config @ mail_schema::account::of: &account_id, mail_schema::account::address: ?value }])
+    )
+    .chain(find!(
+        value: mail::TextHandle,
+        pattern!(facts, [{ _?config @ mail_schema::account::of: &account_id, mail_schema::account::username: ?value }])
+    ))
+    .map(|handle| Ok(mail::read_text(&views.mail.reader, handle)?.trim().to_ascii_lowercase()))
+    .collect()
+}
+
 fn cmd_reply(storage: &Storage, args: ReplyRequest) -> Result<DraftReceipt> {
     let views = storage.views()?;
+    let account_id = resolve_account(&views, &args.account)?;
     let wire_id = resolve_wire(&views.mail.facts, &args.message)?;
     let parent = projection_for_wire(&views, wire_id)?;
-    let recipient = parent
-        .from
-        .ok_or_else(|| anyhow!("parent message has no From mailbox claim"))?;
+    // A Reply-To field names where replies go instead of From (RFC 5322
+    // 3.6.2), which is how a ticket system receives answers.
+    let reply_to = reply_to_for_wire(&views, wire_id)?;
+    let primary = if reply_to.is_empty() {
+        vec![parent
+            .from
+            .clone()
+            .ok_or_else(|| anyhow!("parent message has no From mailbox claim"))?]
+    } else {
+        reply_to
+    };
+    let (to, cc) = if args.all {
+        (
+            mail::reply_mailboxes(primary.into_iter().chain(parent.to.iter().cloned()))?,
+            mail::reply_mailboxes(parent.cc.iter().cloned())?,
+        )
+    } else {
+        (mail::reply_mailboxes(primary)?, Vec::new())
+    };
+    // Each address once, To before Cc; with --all, never the sender itself.
+    let mut seen = if args.all {
+        own_addresses(&views, account_id)?
+    } else {
+        BTreeSet::new()
+    };
+    let mut keep = |mailboxes: Vec<mail::ReplyMailbox>| -> Vec<String> {
+        mailboxes
+            .into_iter()
+            .filter(|mailbox| seen.insert(mailbox.address.to_ascii_lowercase()))
+            .map(|mailbox| mailbox.rendered)
+            .collect()
+    };
+    let to = keep(to);
+    let cc = keep(cc);
+    let (to, cc) = if to.is_empty() {
+        (cc, Vec::new())
+    } else {
+        (to, cc)
+    };
+    if to.is_empty() {
+        bail!("the reply has no recipient besides the sending account itself");
+    }
     let subject = if parent.subject.to_ascii_lowercase().starts_with("re:") {
         parent.subject
     } else {
@@ -907,9 +1001,9 @@ fn cmd_reply(storage: &Storage, args: ReplyRequest) -> Result<DraftReceipt> {
     create_draft(
         storage,
         &views,
-        &args.account,
-        vec![recipient],
-        Vec::new(),
+        account_id,
+        to,
+        cc,
         Vec::new(),
         subject,
         args.body,
@@ -2066,6 +2160,7 @@ mod tests {
                 message: format!("{wire:x}"),
                 account: format!("{:x}", fixture.account),
                 body: "reply without invented Message-ID".into(),
+                all: false,
             },
         )
         .unwrap();
@@ -2080,6 +2175,168 @@ mod tests {
         let draft = mail::draft_value(&views.mail.facts, drafts[0]).unwrap();
         assert!(draft.in_reply_to.is_empty());
         assert!(draft.references.is_empty());
+    }
+
+    /// Observe `raw` as IMAP UID `uid` and return its wire message id.
+    fn observe(storage: &Storage, fixture: &Fixture, uid: u32, raw: &[u8]) -> Id {
+        let publication =
+            mail::imap_publication(fixture.account, fixture.config, "INBOX", 1, uid, raw).unwrap();
+        publish_source_publication_with(
+            &publication,
+            storage.scopes,
+            |scope, fragment, description| storage.publish(scope, fragment, description),
+        )
+        .unwrap();
+        publication.wire
+    }
+
+    fn reply(storage: &Storage, fixture: &Fixture, wire: Id, all: bool) -> Result<DraftReceipt> {
+        cmd_reply(
+            storage,
+            ReplyRequest {
+                message: format!("{wire:x}"),
+                account: format!("{:x}", fixture.account),
+                body: "reply".into(),
+                all,
+            },
+        )
+    }
+
+    /// The stored draft's (To, Cc) claims, read back from the pile.
+    fn draft_recipients(storage: &Storage, draft: Id) -> (Vec<String>, Vec<String>) {
+        let views = storage.views().unwrap();
+        let record = mail::draft_value(&views.mail.facts, draft).unwrap();
+        let read = |handles: &[mail::TextHandle]| -> Vec<String> {
+            let mut values: Vec<String> = handles
+                .iter()
+                .map(|&handle| mail::read_text(&views.mail.reader, handle).unwrap())
+                .collect();
+            values.sort();
+            values
+        };
+        (read(&record.to), read(&record.cc))
+    }
+
+    fn sorted(values: &[String]) -> Vec<String> {
+        let mut values = values.to_vec();
+        values.sort();
+        values
+    }
+
+    // A person's message to a ticket system, copying the agent's mailbox:
+    // the shape of a support-ticket confirmation.
+    const TICKET_COPY: &[u8] = b"Message-ID: <ticket-copy@example.test>\r\nFrom: Owner <owner@example.test>\r\nTo: reply-123@support.example.test\r\nCc: Me <ME@Example.test>, Other <other@example.test>, owner@EXAMPLE.test\r\nSubject: Missing invoices\r\n\r\nbody";
+
+    #[test]
+    fn reply_addresses_reply_to_instead_of_from() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let wire = observe(
+            &storage,
+            &fixture,
+            1,
+            b"Message-ID: <ticket@example.test>\r\nFrom: Support Agent <agent@support.example.test>\r\nReply-To: Ticket 123 <reply-123@support.example.test>\r\nTo: me@example.test\r\nSubject: Your ticket\r\n\r\nbody",
+        );
+        let receipt = reply(&storage, &fixture, wire, false).unwrap();
+        assert_eq!(receipt.to, ["Ticket 123 <reply-123@support.example.test>"]);
+        assert!(receipt.cc.is_empty() && receipt.bcc.is_empty());
+        assert_eq!(
+            draft_recipients(&storage, receipt.draft),
+            (receipt.to.clone(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn plain_reply_addresses_from_only() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let wire = observe(&storage, &fixture, 1, TICKET_COPY);
+        let receipt = reply(&storage, &fixture, wire, false).unwrap();
+        assert_eq!(receipt.to, ["Owner <owner@example.test>"]);
+        assert!(receipt.cc.is_empty());
+    }
+
+    #[test]
+    fn reply_all_reaches_every_recipient_but_the_sending_account() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let wire = observe(&storage, &fixture, 1, TICKET_COPY);
+        let receipt = reply(&storage, &fixture, wire, true).unwrap();
+        // From and To stay To; the account's own mailbox (any case) leaves
+        // Cc, and an address already in To is not repeated in Cc.
+        assert_eq!(
+            receipt.to,
+            [
+                "Owner <owner@example.test>",
+                "reply-123@support.example.test"
+            ]
+        );
+        assert_eq!(receipt.cc, ["Other <other@example.test>"]);
+        assert_eq!(
+            draft_recipients(&storage, receipt.draft),
+            (sorted(&receipt.to), sorted(&receipt.cc))
+        );
+        let mut printed = String::new();
+        crate::mail::render::draft(
+            &receipt,
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    printed.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(
+            printed.contains("To: Owner <owner@example.test>, reply-123@support.example.test\n")
+        );
+        assert!(printed.contains("Cc: Other <other@example.test>\n"));
+    }
+
+    #[test]
+    fn reply_all_with_only_the_account_left_is_refused() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let wire = observe(
+            &storage,
+            &fixture,
+            1,
+            b"Message-ID: <note-to-self@example.test>\r\nFrom: me@example.test\r\nTo: Me <me@example.test>\r\nSubject: Note\r\n\r\nbody",
+        );
+        let error = reply(&storage, &fixture, wire, true).unwrap_err();
+        assert!(format!("{error:#}").contains("no recipient besides the sending account"));
+    }
+
+    #[test]
+    fn reply_refuses_observations_that_disagree_on_reply_to() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let head = "Message-ID: <same@example.test>\r\nFrom: sender@example.test\r\nTo: me@example.test\r\nSubject: Same\r\n";
+        let first = observe(
+            &storage,
+            &fixture,
+            1,
+            format!("{head}Reply-To: one@example.test\r\n\r\nbody").as_bytes(),
+        );
+        let second = observe(
+            &storage,
+            &fixture,
+            2,
+            format!("{head}Reply-To: two@example.test\r\n\r\nbody").as_bytes(),
+        );
+        assert_eq!(first, second);
+        let error = reply(&storage, &fixture, first, false).unwrap_err();
+        assert!(format!("{error:#}").contains("different Reply-To fields"));
+        // Byte-identical re-observation is not a conflict.
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let raw = format!("{head}Reply-To: one@example.test\r\n\r\nbody");
+        let wire = observe(&storage, &fixture, 1, raw.as_bytes());
+        observe(&storage, &fixture, 2, raw.as_bytes());
+        assert_eq!(
+            reply(&storage, &fixture, wire, false).unwrap().to,
+            ["one@example.test"]
+        );
     }
 
     /// A scripted read-only IMAP server: mailboxes of (UIDVALIDITY, messages).

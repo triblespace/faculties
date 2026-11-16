@@ -75,6 +75,11 @@ pub fn fetched(values: &[AccountFetched], out: &mut Out<'_>) -> Result<()> {
 }
 pub fn draft(value: &DraftReceipt, out: &mut Out<'_>) -> Result<()> {
     out.line(format!("Draft {:x}", value.draft))?;
+    for (label, recipients) in [("To", &value.to), ("Cc", &value.cc), ("Bcc", &value.bcc)] {
+        if !recipients.is_empty() {
+            out.line(format!("{label}: {}", recipients.join(", ")))?;
+        }
+    }
     out.line(format!("Decision {:x}", value.decision))
 }
 pub fn sent(value: &SendReceipt, out: &mut Out<'_>) -> Result<()> {
