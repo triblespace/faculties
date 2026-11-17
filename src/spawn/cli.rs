@@ -112,6 +112,8 @@ enum Command {
         #[arg(long, value_name = "RUN")]
         previous: Option<String>,
         /// Text delivered once after the brief: a file, or `-` for stdin.
+        /// This keeper refuses a request that carries one: there is no
+        /// disclosure check yet.
         #[arg(long, value_name = "PATH")]
         handoff: Option<String>,
     },

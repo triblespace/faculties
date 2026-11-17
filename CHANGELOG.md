@@ -18,9 +18,19 @@ All notable changes to this project will be documented in this file.
   accepted, running, refused with its reason, and task-terminal, which
   settlement records when the run ends. A request with a run is never started
   again; a running unit with no run record is not started a second time.
-  `local` is refused ("no local executor on this host"), never served by a
-  hosted model. The handoff is the prompt's last section, once, after the
-  brief. `spawn requests` (MCP `spawn_requests`) lists requests and outcomes.
+  Settlement (`spawn settle --request`) links the run to its request from
+  inside the unit, so a keeper that stopped before publishing the run record
+  still finds it. A request recorded accepted with no run and no running unit
+  is reported uncertain and never started again, since its side effects may
+  have happened; this is not exactly-once, and such a request can stay
+  stranded, visibly, in `spawn requests`. `local` is refused ("no local
+  executor on this host"), never served by a hosted model. A request carrying
+  a handoff is refused ("a handoff needs the disclosure check, which this
+  keeper does not have"), so the keeper's audience is that of a plain
+  `spawn run`; launch still places a handoff as the prompt's last section,
+  once, after the brief. `spawn requests` (MCP `spawn_requests`) lists
+  requests and outcomes. `SPAWN_CODEX_AUTH` overrides the codex login file
+  (default `~/.codex/auth.json`), beside `SPAWN_CODEX_MODEL`.
 - A zooid's faculties MCP server now appends its stderr to the run's log, so
   a server that fails to start says why. Its stdout stays the protocol.
 
