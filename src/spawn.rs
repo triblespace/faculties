@@ -127,6 +127,10 @@ pub struct RunFacts {
     pub prompt: String,
     pub provider: String,
     pub provider_reason: String,
+    /// The model the agent was told to use; `None` when none was configured.
+    pub model: Option<String>,
+    /// Why no model was named, when `model` is `None`.
+    pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
 }
@@ -152,6 +156,14 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         .untinted
         .as_ref()
         .map(|text| fragment.put::<UTF8String, _>(text.clone()));
+    let model = run
+        .model
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
+    let model_unset = run
+        .model_unset
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
     fragment += entity! { ExclusiveId::force_ref(&id) @
         attrs::persona: run.persona,
         archive_attrs::author: run.spawner,
@@ -162,6 +174,8 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::provider: provider,
         attrs::provider_reason: provider_reason,
         attrs::untinted?: untinted,
+        attrs::model?: model,
+        attrs::model_unset?: model_unset,
     };
     (fragment, id)
 }
@@ -259,7 +273,9 @@ pub fn preamble(name: &str, spawner: &str) -> String {
          are attributed to it. Your context ends when the task ends. Your final reply is your \
          report: it is recorded in the pile and {spawner} is messaged when you exit, so make it \
          the answer, not a farewell. Do not arm a colony watcher (no `orient wait`): you are \
-         not a window, and news would fire into a context that ends with this task. The wake \
+         not a window, and news would fire into a context that ends with this task. You have \
+         the faculties MCP tools, served for you alone: their write tools never read PERSONA, \
+         so pass {name} as `from` or `persona` on every write, as the CLI would. The wake \
          above is the shared self; the recollection after it was chosen for this brief.\n"
     )
 }
@@ -476,11 +492,18 @@ pub struct ScriptFacts<'a> {
     pub prompt: &'a str,
     pub report: &'a str,
     pub spawn: &'a str,
+    /// The `faculties` binary, absolute. The script run as `mcp` is the
+    /// zooid's own stdio MCP server, started by the agent from its MCP
+    /// config, in the same environment as the CLI calls and settlement.
+    pub faculties: &'a str,
 }
 
 /// The unit's script. Run without arguments it is the zooid: the agent on
 /// the prompt, writing the report. Run as `settle` it is the stop-post step,
-/// which systemd runs however the main process ended.
+/// which systemd runs however the main process ended. Run as `mcp` it is the
+/// zooid's faculties MCP server: the agent starts it as a child, so it runs
+/// inside the unit and ends with it, and the environment it gets is the one
+/// exported here for the CLI, not a second copy that could drift.
 pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     let q = |word: &str| shell_word(word);
     let mut script = String::new();
@@ -518,6 +541,10 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         q(facts.report)
     ));
     script.push_str("fi\n");
+    script.push_str(&format!(
+        "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp; fi\n",
+        q(facts.faculties)
+    ));
     for (variable, value) in facts.agent_env {
         script.push_str(&format!("export {}={}\n", variable, q(value)));
     }
@@ -754,6 +781,7 @@ mod tests {
             prompt: "/s/n.prompt",
             report: "/s/n.report",
             spawn: "spawn",
+            faculties: "/b/faculties",
         });
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
         assert!(script.contains("PERSONA=lusab-babad"));
@@ -770,6 +798,12 @@ mod tests {
         let settle = script.find("= settle ]").unwrap();
         assert!(pinned < settle);
         assert!(settle < script.find("exec /c/claude").unwrap());
+        // Run as `mcp` the script is the zooid's own MCP server, in the same
+        // environment as settlement and the CLI, and never the agent.
+        let mcp = script
+            .find("if [ \"${1:-}\" = mcp ]; then exec /b/faculties mcp; fi\n")
+            .unwrap();
+        assert!(settle < mcp && mcp < script.find("exec /c/claude").unwrap());
     }
 
     #[test]
@@ -788,12 +822,15 @@ mod tests {
             prompt: "/s/n.prompt",
             report: "/s/n.report",
             spawn: "spawn",
+            faculties: "/b/faculties",
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
         assert!(!script.contains(". /"));
         // The agent's own home is exported for the agent, not for settlement.
         let home = script.find("export CODEX_HOME=/s/n.codex\n").unwrap();
         assert!(script.find("= settle ]").unwrap() < home);
+        // Nor for the MCP server, which needs no codex home.
+        assert!(script.find("= mcp ]").unwrap() < home);
         assert!(home < script.find("exec codex").unwrap());
     }
 }

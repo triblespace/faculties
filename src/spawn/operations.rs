@@ -194,9 +194,14 @@ pub struct LaunchConfig {
     /// Prompt, script, report and log, one set per zooid name.
     pub state_dir: PathBuf,
     pub claude: PathBuf,
+    /// The model claude zooids are told to use.
     pub model: String,
     /// The codex command, for `--provider codex`.
     pub codex: PathBuf,
+    /// The model codex zooids are told to use (`codex -m`). `None` names
+    /// none: codex then picks its own default, and the run records that no
+    /// model was configured rather than a model it cannot know.
+    pub codex_model: Option<String>,
     /// The file codex keeps its login in, outside any run. A codex run gets
     /// its own `CODEX_HOME` holding only a link to it, so it reads none of
     /// the ambient configuration (MCP servers, hook trust, model). `None`
@@ -210,6 +215,10 @@ pub struct LaunchConfig {
     pub memory_max: String,
     /// The command settlement runs, found on `path` inside the unit.
     pub spawn: String,
+    /// The `faculties` binary each zooid's own MCP server runs. A relative
+    /// name is resolved on `path` at launch, so the unit names an absolute
+    /// file.
+    pub faculties: PathBuf,
 }
 
 impl LaunchConfig {
@@ -232,18 +241,78 @@ impl LaunchConfig {
             },
             model: "claude-opus-5-5".to_owned(),
             codex: PathBuf::from("codex"),
+            codex_model: None,
             codex_auth: Some(home.join(".codex/auth.json")),
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
             memory_max: "24G".to_owned(),
             spawn: "spawn".to_owned(),
+            faculties: PathBuf::from("faculties"),
         }
     }
 
-    /// [`Self::under_home`] for `$HOME`, read when a frontend calls this.
+    /// [`Self::under_home`] for `$HOME`, read when a frontend calls this,
+    /// with the codex model from `SPAWN_CODEX_MODEL` when that is set.
     pub fn from_home_env() -> Result<Self> {
         let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-        Ok(Self::under_home(Path::new(&home)))
+        let mut config = Self::under_home(Path::new(&home));
+        config.codex_model = std::env::var("SPAWN_CODEX_MODEL")
+            .ok()
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty());
+        Ok(config)
+    }
+
+    /// The model a provider's zooid is told to use, or why it names none.
+    fn model_for(&self, provider: Provider) -> (Option<String>, Option<String>) {
+        match provider {
+            Provider::Codex => match &self.codex_model {
+                Some(model) => (Some(model.clone()), None),
+                None => (
+                    None,
+                    Some(
+                        "no codex model is configured (SPAWN_CODEX_MODEL), so codex chose its \
+                         own default"
+                            .to_owned(),
+                    ),
+                ),
+            },
+            _ => (Some(self.model.clone()), None),
+        }
+    }
+
+    /// The absolute `faculties` binary: [`Self::faculties`] itself when
+    /// absolute, else the first executable of that name on [`Self::path`].
+    fn faculties_binary(&self) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let executable = |path: &Path| {
+            std::fs::metadata(path)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        };
+        if self.faculties.is_absolute() {
+            if executable(&self.faculties) {
+                return Ok(self.faculties.clone());
+            }
+            bail!(
+                "the faculties binary {} is not an executable file; a zooid would have no MCP \
+                 tools. Nothing was started.",
+                self.faculties.display()
+            );
+        }
+        self.path
+            .split(':')
+            .filter(|dir| dir.starts_with('/'))
+            .map(|dir| Path::new(dir).join(&self.faculties))
+            .find(|candidate| executable(candidate))
+            .ok_or_else(|| {
+                anyhow!(
+                    "no executable {} on the zooid's PATH ({}); a zooid would have no MCP tools. \
+                     Nothing was started.",
+                    self.faculties.display(),
+                    self.path
+                )
+            })
     }
 
     fn file(&self, name: &str, suffix: &str) -> PathBuf {
@@ -251,13 +320,48 @@ impl LaunchConfig {
     }
 }
 
+/// The MCP server every zooid gets, as a claude `--mcp-config` file: its
+/// unit script run as `mcp`, which execs `faculties mcp` in the
+/// environment the script exports for the CLI.
+pub fn claude_mcp_config(script: &Path) -> String {
+    let config = serde_json::json!({
+        "mcpServers": {
+            "faculties": {
+                "type": "stdio",
+                "command": "/bin/bash",
+                "args": [script.display().to_string(), "mcp"],
+            }
+        }
+    });
+    format!("{config}\n")
+}
+
+/// The same server as codex `config.toml`, the whole of it: no model, hook
+/// trust or other server. `script` is unit-safe (no quotes or backslashes),
+/// so a basic TOML string holds it verbatim. codex's defaults would cut a
+/// tool call at 60 s and a cold first call can take longer.
+pub fn codex_mcp_config(script: &Path) -> String {
+    format!(
+        "# Written by `spawn` for this run. Nothing else is configured here.\n\
+         [mcp_servers.faculties]\n\
+         command = \"/bin/bash\"\n\
+         args = [\"{}\", \"mcp\"]\n\
+         startup_timeout_sec = 120\n\
+         tool_timeout_sec = 3600\n",
+        script.display()
+    )
+}
+
 /// Make `home` a codex home holding nothing ambient: whatever an earlier
-/// run of this zooid left there stays (its sessions and logs), and the login
-/// is a link to `auth`, so a token codex refreshes is the one every codex on
-/// this host reads. Writes no config, so no MCP server, hook trust or model
-/// from the ambient `~/.codex/config.toml` applies.
-fn codex_home_for_run(home: &Path, auth: Option<&Path>) -> Result<()> {
+/// run of this zooid left there stays (its sessions and logs), the login is
+/// a link to `auth`, so a token codex refreshes is the one every codex on
+/// this host reads, and `config.toml` is `config`, written fresh, so no MCP
+/// server, hook trust or model from the ambient `~/.codex/config.toml`
+/// applies.
+fn codex_home_for_run(home: &Path, auth: Option<&Path>, config: &str) -> Result<()> {
     std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    let settings = home.join("config.toml");
+    std::fs::write(&settings, config).with_context(|| format!("write {}", settings.display()))?;
     let Some(auth) = auth else {
         return Ok(());
     };
@@ -415,6 +519,9 @@ pub struct Launched {
     pub prompt_chars: usize,
     pub provider: Provider,
     pub provider_reason: String,
+    /// The model the agent was told to use, or why it names none.
+    pub model: Option<String>,
+    pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
     /// The goal note the zooid added at launch (`spawn goal`).
@@ -478,6 +585,8 @@ pub struct RunView {
     pub report_text: Option<String>,
     pub provider: Vec<String>,
     pub provider_reason: Vec<String>,
+    pub model: Vec<String>,
+    pub model_unset: Vec<String>,
     pub untinted: Vec<String>,
     pub message: Vec<Id>,
     pub settle_failure: Vec<String>,
@@ -613,18 +722,24 @@ impl Spawn {
             Provider::Codex => {
                 // codex has no `max`; `xhigh` is its highest.
                 let effort = if effort == "max" { "xhigh" } else { effort };
+                let mut argv = vec![
+                    text(&self.launch.codex),
+                    "exec".to_owned(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                    "--skip-git-repo-check".to_owned(),
+                ];
+                if let Some(model) = &self.launch.codex_model {
+                    argv.extend(["-m".to_owned(), model.clone()]);
+                }
+                argv.extend([
+                    "-c".to_owned(),
+                    format!("model_reasoning_effort={effort}"),
+                    "-o".to_owned(),
+                    text(report),
+                    "-".to_owned(),
+                ]);
                 (
-                    vec![
-                        text(&self.launch.codex),
-                        "exec".to_owned(),
-                        "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                        "--skip-git-repo-check".to_owned(),
-                        "-c".to_owned(),
-                        format!("model_reasoning_effort={effort}"),
-                        "-o".to_owned(),
-                        text(report),
-                        "-".to_owned(),
-                    ],
+                    argv,
                     vec![("CODEX_HOME".to_owned(), text(codex_home))],
                     false,
                 )
@@ -689,9 +804,12 @@ impl Spawn {
             super::require_unit_safe(what, &path.display().to_string())?;
         }
         let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path)] = files;
-        let mcp_config = launch.state_dir.join("empty-mcp.json");
+        let mcp_config = launch.file(&name, "mcp.json");
         let codex_home = launch.file(&name, "codex");
         super::require_unit_safe("codex home", &codex_home.display().to_string())?;
+        let faculties = launch.faculties_binary()?;
+        super::require_unit_safe("faculties binary", &faculties.display().to_string())?;
+        let (model, model_unset) = launch.model_for(provider);
         if provider == Provider::Codex {
             if let Some(auth) = &launch.codex_auth {
                 if !auth.exists() {
@@ -801,6 +919,8 @@ impl Spawn {
                 prompt: prompt.clone(),
                 provider: provider.name().to_owned(),
                 provider_reason: provider_reason.clone(),
+                model: model.clone(),
+                model_unset: model_unset.clone(),
                 untinted: untinted.clone(),
             });
             let text = |path: &Path| path.display().to_string();
@@ -820,12 +940,19 @@ impl Spawn {
                 prompt: &text(&prompt_path),
                 report: &text(&report_path),
                 spawn: &launch.spawn,
+                faculties: &text(&faculties),
             });
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
-            std::fs::write(&mcp_config, "{\"mcpServers\":{}}\n")?;
             if provider == Provider::Codex {
-                codex_home_for_run(&codex_home, launch.codex_auth.as_deref())?;
+                codex_home_for_run(
+                    &codex_home,
+                    launch.codex_auth.as_deref(),
+                    &codex_mcp_config(&script_path),
+                )?;
+            } else {
+                std::fs::write(&mcp_config, claude_mcp_config(&script_path))
+                    .with_context(|| format!("write {}", mcp_config.display()))?;
             }
             std::fs::write(&prompt_path, &prompt)?;
             std::fs::write(&script_path, script)?;
@@ -901,6 +1028,8 @@ impl Spawn {
                 prompt_chars: prompt.chars().count(),
                 provider,
                 provider_reason: provider_reason.clone(),
+                model: model.clone(),
+                model_unset: model_unset.clone(),
                 untinted,
                 goal_note,
                 warnings,
@@ -1288,6 +1417,16 @@ fn run_view(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::untinted: ?handle }]))
                 .collect(),
         ),
+        model: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }])).collect(),
+        ),
+        model_unset: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::model_unset: ?handle }])
+            )
+            .collect(),
+        ),
         message: find!(id: Id, pattern!(facts, [{ run @ attrs::message: ?id }])).collect(),
         settle_failure: texts(
             find!(
@@ -1410,6 +1549,12 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         if !run.provider_reason.is_empty() {
             writeln!(out, "  provider reason: {}", join(&run.provider_reason)).unwrap();
         }
+        if !run.model.is_empty() {
+            writeln!(out, "  model: {}", join(&run.model)).unwrap();
+        }
+        for why in &run.model_unset {
+            writeln!(out, "  model: none named; {why}").unwrap();
+        }
         for why in &run.untinted {
             writeln!(out, "  untinted recollection: {why}").unwrap();
         }
@@ -1526,16 +1671,25 @@ mod tests {
         std::fs::create_dir(directory.path().join("lane")).unwrap();
         let codex_auth = directory.path().join("codex-auth.json");
         std::fs::write(&codex_auth, "fake login\n").unwrap();
+        let faculties = directory.path().join("bin").join("faculties");
+        std::fs::create_dir(directory.path().join("bin")).unwrap();
+        std::fs::write(&faculties, "#!/bin/sh\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&faculties, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let launch = LaunchConfig {
             state_dir: directory.path().join("state"),
             claude: PathBuf::from("/fake/claude"),
             model: "claude-opus-5-5".to_owned(),
             codex: PathBuf::from("/fake/codex"),
+            codex_model: None,
             codex_auth: Some(codex_auth),
             colony_env: Some(env),
-            path: "/usr/bin:/bin".to_owned(),
+            path: format!("/usr/bin:/bin:{}", directory.path().join("bin").display()),
             memory_max: "24G".to_owned(),
             spawn: "spawn".to_owned(),
+            faculties: PathBuf::from("faculties"),
         };
         let launcher = Arc::new(launcher);
         let spawn = Spawn::new(storage.clone(), launch)
@@ -1594,6 +1748,14 @@ mod tests {
         }
         fn script(&self, index: usize) -> String {
             std::fs::read_to_string(&self.launcher.started.lock().unwrap()[index].script).unwrap()
+        }
+        /// The same fixture with its launch configuration changed.
+        fn relaunch(&self, change: impl FnOnce(&mut LaunchConfig)) -> Spawn {
+            let mut launch = self.spawn.launch.clone();
+            change(&mut launch);
+            Spawn::new(self.storage.clone(), launch)
+                .with_launcher(self.launcher.clone())
+                .with_renderer(Arc::new(StubRenderer::default()))
         }
         fn persona(&self, label: &str) -> Option<crate::relations::PersonState> {
             Relations::with_storage(self.storage.clone())
@@ -1904,6 +2066,75 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_zooid_gets_its_own_faculties_server_and_nothing_ambient() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("MCP task.")).unwrap();
+        let script = f.script(0);
+        let unit = f.launcher.started.lock().unwrap()[0].clone();
+        let config = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.mcp.json", launched.name));
+        // The per-run config, under strict mode, so nothing ambient loads.
+        assert!(
+            script.contains(&format!(
+                "--strict-mcp-config --mcp-config {} ",
+                config.display()
+            )),
+            "{script}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"mcpServers": {"faculties": {
+                "type": "stdio",
+                "command": "/bin/bash",
+                "args": [unit.script.display().to_string(), "mcp"],
+            }}})
+        );
+        // The server is the script itself, so it gets the CLI's environment:
+        // the colony file, the pinned routes, PILE, the key and the persona.
+        let faculties = f.directory.path().join("bin").join("faculties");
+        let mcp = script
+            .find(&format!(
+                "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp; fi\n",
+                faculties.display()
+            ))
+            .unwrap_or_else(|| panic!("{script}"));
+        assert!(script.find(&format!("PERSONA={}", launched.name)).unwrap() < mcp);
+        assert!(script.find(". ").unwrap() < mcp);
+        assert!(!f
+            .directory
+            .path()
+            .join("state")
+            .join("empty-mcp.json")
+            .exists());
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.model, ["claude-opus-5-5"]);
+        assert!(run.model_unset.is_empty());
+        assert_eq!(launched.model.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn a_launch_without_a_faculties_binary_starts_nothing() {
+        let f = fixture();
+        let spawn = f.relaunch(|launch| launch.faculties = PathBuf::from("no-such-faculties"));
+        let error = format!("{:#}", spawn.run(&f.request("No server.")).unwrap_err());
+        assert!(error.contains("no executable no-such-faculties"), "{error}");
+        let spawn = f.relaunch(|launch| launch.faculties = PathBuf::from("/nowhere/faculties"));
+        let error = format!("{:#}", spawn.run(&f.request("No server.")).unwrap_err());
+        assert!(error.contains("not an executable file"), "{error}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(f
+            .persona(&super::super::name_for(super::super::text_handle(
+                "No server."
+            )))
+            .is_none());
+    }
+
+    #[test]
     fn codex_writes_its_own_report_and_local_is_refused() {
         let f = fixture();
         let mut request = f.request("Codex task.");
@@ -1935,13 +2166,33 @@ mod tests {
             std::fs::read_link(home.join("auth.json")).unwrap(),
             f.directory.path().join("codex-auth.json")
         );
-        let entries: Vec<_> = std::fs::read_dir(&home)
+        let mut entries: Vec<_> = std::fs::read_dir(&home)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(entries, ["auth.json"]);
+        entries.sort();
+        assert_eq!(entries, ["auth.json", "config.toml"]);
+        // Its config is the faculties server and nothing else.
+        let unit = f.launcher.started.lock().unwrap()[0].clone();
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            codex_mcp_config(&unit.script)
+        );
+        assert!(script.contains("= mcp ]; then exec "), "{script}");
+        // codex writes no claude MCP config.
+        assert!(!f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.mcp.json", launched.name))
+            .exists());
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.provider, ["codex"]);
+        // No codex model is configured: none is passed, and the run says so.
+        assert!(!script.contains(" -m "), "{script}");
+        assert!(run.model.is_empty());
+        assert_eq!(run.model_unset.len(), 1);
+        assert!(run.model_unset[0].contains("SPAWN_CODEX_MODEL"));
         // The provider is not part of the name.
         assert_eq!(
             launched.name,
@@ -1961,11 +2212,26 @@ mod tests {
             )))
             .is_none());
 
+        // A configured codex model is passed and recorded.
+        let spawn = f.relaunch(|launch| launch.codex_model = Some("gpt-test".to_owned()));
+        let mut request = f.request("Codex task with a model.");
+        request.provider = Provider::Codex;
+        std::fs::write(f.directory.path().join("codex-auth.json"), "fake login\n").unwrap();
+        let launched = spawn.run(&request).unwrap();
+        let script = f.script(1);
+        assert!(
+            script.contains("--skip-git-repo-check -m gpt-test -c model_reasoning_effort="),
+            "{script}"
+        );
+        let run = &spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.model, ["gpt-test"]);
+        assert!(run.model_unset.is_empty());
+
         let mut request = f.request("Local task.");
         request.provider = Provider::Local;
         let error = f.spawn.run(&request).unwrap_err();
         assert!(format!("{error:#}").contains("not available yet"));
-        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 2);
         assert!(f
             .persona(&super::super::name_for(super::super::text_handle(
                 "Local task."
@@ -1978,14 +2244,23 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("n.codex");
         let (old, new) = (directory.path().join("old"), directory.path().join("new"));
-        codex_home_for_run(&home, Some(&old)).unwrap();
+        codex_home_for_run(&home, Some(&old), "first\n").unwrap();
         std::fs::write(home.join("history.jsonl"), "earlier run\n").unwrap();
-        codex_home_for_run(&home, Some(&new)).unwrap();
+        codex_home_for_run(&home, Some(&new), "second\n").unwrap();
         assert_eq!(std::fs::read_link(home.join("auth.json")).unwrap(), new);
         assert!(home.join("history.jsonl").exists());
+        // The config is written fresh each run, never kept from an earlier one.
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            "second\n"
+        );
         let bare = directory.path().join("bare.codex");
-        codex_home_for_run(&bare, None).unwrap();
-        assert_eq!(std::fs::read_dir(&bare).unwrap().count(), 0);
+        codex_home_for_run(&bare, None, "only\n").unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&bare)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["config.toml"]);
     }
 
     fn group(

@@ -16,7 +16,8 @@
 //! Times reuse `metadata::started_at` and `metadata::finished_at`; the
 //! spawner reuses the shared author relation `archive::author`.
 //!
-//! Every id below was minted with `trible genid` on 2026-11-16. Attributes use
+//! Every id below was minted with `trible genid` on 2026-11-16, unless its
+//! documentation names a later day. Attributes use
 //! the explicit-anchor form, so each value encoding participates in identity.
 
 use triblespace::macros::id_hex;
@@ -96,5 +97,11 @@ pub mod spawn {
         /// Why that provider was chosen: the quota readings that decided an
         /// `auto` choice, or that it was asked for. Minted 2026-11-16.
         "055AE3D781937D52DAA5E9EF2E1B3770" as provider_reason: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The model the agent was told to use (`claude --model`, `codex -m`).
+        /// Minted 2026-11-17.
+        "8D412C29A201ABB6CD57E13790038526" as model: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Why the run names no [`model`]: none was configured for its
+        /// provider, so the agent chose its own default. Minted 2026-11-17.
+        "2FC5D6F2A0327CC8A9EB4918F74BF65D" as model_unset: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }

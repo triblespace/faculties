@@ -144,6 +144,11 @@ fn print_launched(launched: &Launched) -> Result<()> {
             launched.log.display(),
             launched.name
         ))?;
+        match (&launched.model, &launched.model_unset) {
+            (Some(model), _) => out.note(format!("model: {model}"))?,
+            (None, Some(why)) => out.note(format!("model: none named; {why}"))?,
+            (None, None) => {}
+        }
         if let Some(note) = launched.goal_note {
             out.note(format!("noted the launch on the goal: {note:x}"))?;
         }

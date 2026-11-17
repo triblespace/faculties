@@ -76,6 +76,11 @@ fn launched_line(launched: &Launched) -> String {
         launched.provider.name(),
         launched.provider_reason
     );
+    match (&launched.model, &launched.model_unset) {
+        (Some(model), _) => line.push_str(&format!("\nmodel: {model}")),
+        (None, Some(why)) => line.push_str(&format!("\nmodel: none named; {why}")),
+        (None, None) => {}
+    }
     if let Some(why) = &launched.untinted {
         line.push_str(&format!("\nrecollection untinted: {why}"));
     }
