@@ -1357,12 +1357,13 @@ impl Spawn {
             let sent = match spawner {
                 Some(spawner) => {
                     let text = format!(
-                        "{} finished, {end}, report {}. `spawn show {}` reads it.",
+                        "{} finished, {end}, report {}. `spawn show {}` reads it.{}",
                         request.name,
                         report
                             .map(super::handle_text)
                             .unwrap_or_else(|| "none".to_owned()),
-                        request.name
+                        request.name,
+                        self.unread_note(&request.name)
                     );
                     crate::message::Message::with_storage(self.storage.clone())
                         .send(&crate::message::SendOptions {
@@ -1795,6 +1796,37 @@ impl Spawn {
                 }
                 self.refuse(view, format!("the launch failed: {error:#}"))
             }
+        }
+    }
+
+    /// What the zooid never read: unread messages addressed to it, named in
+    /// its settle message so the spawner sees a missed message instead of
+    /// assuming it arrived. The preamble only asks the zooid to poll; this
+    /// makes a poll that never happened visible. An inbox that cannot be
+    /// read is said to be unread, not reported as empty.
+    fn unread_note(&self, name: &str) -> String {
+        let mut options = crate::message::ListOptions::new(name);
+        options.unread = true;
+        options.limit = 50;
+        match crate::message::Message::with_storage(self.storage.clone()).list(&options) {
+            Ok(list) => {
+                let unread: Vec<String> = list
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.incoming)
+                    .map(|entry| format!("{:x} from {}", entry.id, entry.from_label))
+                    .collect();
+                if unread.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " It never read {} message(s) sent to it: {}.",
+                        unread.len(),
+                        unread.join(", ")
+                    )
+                }
+            }
+            Err(error) => format!(" Its inbox could not be read at settle: {error:#}."),
         }
     }
 
@@ -3160,6 +3192,7 @@ mod tests {
                     )),
                     "{text}"
                 );
+                assert!(!text.contains("never read"), "{text}");
             }
             other => panic!("unexpected body {other:?}"),
         }
@@ -3236,6 +3269,50 @@ mod tests {
         assert!(is_running("deactivating"));
         assert!(!is_running("inactive"));
         assert!(!is_running("failed"));
+    }
+
+    #[test]
+    fn settle_names_the_messages_a_zooid_never_read() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Read your mail.")).unwrap();
+        std::fs::write(&launched.report, "Done.\n").unwrap();
+        let messages = crate::message::Message::with_storage(f.storage.clone());
+        let sent = messages
+            .send(&crate::message::SendOptions {
+                from: "agent-cc",
+                to: &launched.name,
+                text: "One more question for you.",
+            })
+            .unwrap();
+        f.spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+            })
+            .unwrap();
+        let inbox = messages
+            .list(&crate::message::ListOptions::new("agent-cc"))
+            .unwrap();
+        let note = inbox
+            .entries
+            .iter()
+            .find(|entry| entry.incoming && entry.from == launched.persona)
+            .expect("the spawner has the zooid's message");
+        match &note.body {
+            crate::message::MessageText::Text(text) => {
+                assert!(
+                    text.contains(&format!(
+                        "It never read 1 message(s) sent to it: {:x} from agent-cc.",
+                        sent.id
+                    )),
+                    "{text}"
+                );
+            }
+            other => panic!("unexpected body {other:?}"),
+        }
     }
 
     #[test]
