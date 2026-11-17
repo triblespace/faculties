@@ -150,38 +150,6 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// End the wake with a Moment: the newest raw turns the Archive holds
-        /// whose leaf carries this agent name, exactly as the source's own
-        /// session metadata spells it (Claude Code `--name`, Codex
-        /// `agent_nickname`). It is the latest held material for the name,
-        /// not a promised handoff; the heading names its source and time, and
-        /// says so when nothing is held. Never read from a persona.
-        #[arg(long, value_name = "LABEL", conflicts_with_all = ["pairs", "moment_session", "moment_thread"])]
-        moment_of: Option<String>,
-        /// A Moment for an explicit session edge: `session/<id>` (or the bare
-        /// id), the session a launcher knows it retired.
-        #[arg(long, value_name = "SESSION", conflicts_with_all = ["pairs", "moment_thread"])]
-        moment_session: Option<String>,
-        /// A Moment for an explicit provider thread: `thread/<id>` or the bare
-        /// id (a Codex rollout's own thread id).
-        #[arg(long, value_name = "THREAD", conflicts_with = "pairs")]
-        moment_thread: Option<String>,
-        /// Let `--moment-of` and `--moment-session` pick a subagent's
-        /// conversation too (Codex `thread_source` subagent, Claude Code
-        /// subagent transcripts); left out by default.
-        #[arg(long)]
-        moment_subagents: bool,
-        /// CHARACTER budget for the Moment's turns (its heading not counted).
-        #[arg(long, default_value_t = crate::archive::MomentOptions::DEFAULT_CHARS)]
-        moment_chars: usize,
-        /// Nodes the Moment reads at most, whatever their size.
-        #[arg(long, default_value_t = crate::archive::MomentOptions::DEFAULT_MAX_NODES)]
-        moment_nodes: usize,
-        /// The provider whose model reads this wake (`anthropic`, `google` or
-        /// `openai`), as `archive --reader-provider`: what a recorded
-        /// classifier stop withholds from the Moment.
-        #[arg(long, env = "READER_PROVIDER")]
-        reader_provider: Option<String>,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
     /// goals, then every not-done `horizon` goal, longest unmoved first.
@@ -471,7 +439,6 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             pairs: true,
             raw_memory,
             chunk_overhead,
-            ..
         } => {
             // Diagnostics are about the memory selection, not part of any
             // pair, and stdout carries nothing but the pairs.
@@ -499,33 +466,16 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             doing_limit,
             todo_limit,
             pairs: false,
-            moment_of,
-            moment_session,
-            moment_thread,
-            moment_subagents,
-            moment_chars,
-            moment_nodes,
-            reader_provider,
             ..
-        } => {
-            let selector =
-                moment_selector(moment_of, moment_session, moment_thread, moment_subagents)?;
-            orient.wake(
-                cli.persona.as_deref(),
-                &WakeOptions {
-                    chars,
-                    doing_limit,
-                    todo_limit,
-                    moment: selector.map(|selector| crate::archive::MomentOptions {
-                        chars: moment_chars,
-                        max_nodes: moment_nodes,
-                        provider: reader_provider,
-                        ..crate::archive::MomentOptions::new(selector)
-                    }),
-                },
-                out,
-            )
-        }
+        } => orient.wake(
+            cli.persona.as_deref(),
+            &WakeOptions {
+                chars,
+                doing_limit,
+                todo_limit,
+            },
+            out,
+        ),
         Command::Poll { peek } => orient.poll(
             cli.persona.as_deref().ok_or_else(|| {
                 anyhow!("poll requires a persona (pass --persona <label-or-hex> or set $PERSONA)")
@@ -682,45 +632,6 @@ fn prepare_daemon_report(text: &str, prepared: hifitime::Epoch) -> Result<String
         "Orient report prepared at {} UTC; delivery may be delayed.\n\n{text}",
         stamp.format("%Y-%m-%dT%H:%M:%S")
     ))
-}
-
-/// The Moment a wake was asked for, if any. The selector is always what the
-/// caller named; nothing here reads a persona.
-fn moment_selector(
-    of: Option<String>,
-    session: Option<String>,
-    thread: Option<String>,
-    subagents: bool,
-) -> Result<Option<crate::archive::MomentSelector>> {
-    use crate::archive::MomentSelector;
-    let nonempty = |value: String, flag: &str| {
-        if value.trim().is_empty() {
-            bail!("{flag} needs a nonempty value");
-        }
-        Ok(value)
-    };
-    Ok(match (of, session, thread) {
-        (Some(label), None, None) => Some(MomentSelector::Label {
-            label: nonempty(label, "--moment-of")?,
-            subagents,
-        }),
-        (None, Some(session), None) => {
-            let session = nonempty(session, "--moment-session")?;
-            Some(MomentSelector::Session {
-                locator: if session.starts_with("session/") {
-                    session
-                } else {
-                    format!("session/{session}")
-                },
-                subagents,
-            })
-        }
-        (None, None, Some(thread)) => {
-            Some(MomentSelector::Thread(nonempty(thread, "--moment-thread")?))
-        }
-        (None, None, None) => None,
-        _ => bail!("name at most one of --moment-of, --moment-session, --moment-thread"),
-    })
 }
 
 #[cfg(test)]
@@ -1040,74 +951,6 @@ mod tests {
                 "0s",
             ])
             .is_err());
-        }
-    }
-
-    /// A Moment is asked for by naming one explicit selector; none is ever a
-    /// default, and the selector never comes from a persona.
-    #[test]
-    fn a_wake_moment_needs_one_explicit_selector() {
-        use crate::archive::MomentSelector;
-        let parse = |extra: &[&str]| {
-            let mut args = vec![
-                "orient",
-                "--pile",
-                "unused.pile",
-                "--persona",
-                "agent-cc",
-                "wake",
-            ];
-            args.extend_from_slice(extra);
-            Cli::try_parse_from(args)
-        };
-        let selector = |extra: &[&str]| match parse(extra).unwrap().command {
-            Some(Command::Wake {
-                moment_of,
-                moment_session,
-                moment_thread,
-                moment_subagents,
-                ..
-            }) => {
-                moment_selector(moment_of, moment_session, moment_thread, moment_subagents).unwrap()
-            }
-            _ => panic!("a wake"),
-        };
-        // A persona alone asks for no Moment.
-        assert_eq!(selector(&[]), None);
-        assert_eq!(
-            selector(&["--moment-of", "agent-cc"]),
-            Some(MomentSelector::Label {
-                label: "agent-cc".to_owned(),
-                subagents: false
-            })
-        );
-        for session in ["session/04d6", "04d6"] {
-            assert_eq!(
-                selector(&["--moment-session", session, "--moment-subagents"]),
-                Some(MomentSelector::Session {
-                    locator: "session/04d6".to_owned(),
-                    subagents: true
-                })
-            );
-        }
-        assert_eq!(
-            selector(&["--moment-thread", "01a18e2a"]),
-            Some(MomentSelector::Thread("01a18e2a".to_owned()))
-        );
-        assert!(parse(&["--moment-of", "a", "--moment-session", "b"]).is_err());
-        assert!(parse(&["--moment-session", "a", "--moment-thread", "b"]).is_err());
-        assert!(parse(&["--moment-of", "a", "--pairs"]).is_err());
-        assert!(moment_selector(Some(" ".to_owned()), None, None, false).is_err());
-        match parse(&["--moment-of", "a"]).unwrap().command {
-            Some(Command::Wake {
-                moment_chars,
-                moment_nodes,
-                ..
-            }) => {
-                assert_eq!(moment_chars, 30_000);
-                assert_eq!(moment_nodes, 600);
-            }
-            _ => panic!("a wake"),
         }
     }
 

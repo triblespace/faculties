@@ -219,9 +219,8 @@ fn validate_persona(persona: &str) -> Result<()> {
     Ok(())
 }
 
-#[path = "moment.rs"]
-mod moment;
-pub use moment::{MomentOptions, MomentSelector};
+#[path = "conversation.rs"]
+mod conversation;
 
 #[cfg(test)]
 use crate::storage::FactView;
@@ -1649,6 +1648,18 @@ fn run_thread(
 ) -> Result<()> {
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
+    // A `session/<id>` or `thread/<id>` names that conversation's newest
+    // held leaf, said in one line before the thread.
+    let leaf;
+    let prefix = match conversation::Locator::parse(prefix) {
+        Some(locator) => {
+            let (node, line) = conversation::conversation_leaf(&facts, &locator)?;
+            out.line(line)?;
+            leaf = format!("{node:X}");
+            leaf.as_str()
+        }
+        None => prefix,
+    };
     let blocks = match tail {
         None => load_thread(&facts, prefix, limit)?,
         Some(tail) => {
@@ -3467,24 +3478,6 @@ mod tests {
         assert_eq!(thread, by_receipt, "a node's thread is its receipt's");
     }
 
-    /// The clock the Moment tests read their ages against.
-    fn moment_now() -> Epoch {
-        Epoch::from_gregorian_utc_hms(2026, 11, 17, 8, 0, 0)
-    }
-
-    fn moment(fixture: &Fixture, options: MomentOptions) -> String {
-        Archive::with_storage(fixture.storage.clone())
-            .moment_at(&options, moment_now())
-            .unwrap()
-    }
-
-    fn label(label: &str) -> MomentSelector {
-        MomentSelector::Label {
-            label: label.to_owned(),
-            subagents: false,
-        }
-    }
-
     /// A Claude Code session `name` named `agent` (an `agent-name` record,
     /// as `claude --name` writes it) whose records are `records`, chained,
     /// one second apart from `start` (`YYYY-MM-DDTHH:MM`).
@@ -3537,17 +3530,17 @@ mod tests {
         })
     }
 
-    /// A label selects the newest held leaf carrying exactly that agent
-    /// name; the heading says it is the latest held material, names its
-    /// source and time, and never calls it a predecessor. The body is
-    /// compact: one label per run of one direction, text and thinking whole,
-    /// a call as its name and clipped input, a result clipped, status events
-    /// dropped, sealed thinking one line.
+    fn thread_of(fixture: &Fixture, id: &str, tail: Option<usize>) -> Result<String> {
+        printed(|out| run_thread(storage(fixture), id, 100, tail, Reading::default(), out))
+    }
+
+    /// `session/<id>` in place of a node id threads that session's newest
+    /// held leaf, after one line naming the leaf and its time; other sessions
+    /// are not in it, and a locator nothing carries is refused.
     #[test]
-    fn a_moment_shows_the_latest_held_material_for_a_label() {
+    fn a_session_locator_threads_its_newest_leaf() {
         let fixture = fixture();
         let directory = fixture._directory.path();
-        let long_result = "r".repeat(2_000);
         let sessions = [
             named_session(
                 directory,
@@ -3566,24 +3559,9 @@ mod tests {
                 "2026-11-17T00:12",
                 &[
                     user("the newest window's question"),
-                    assistant(serde_json::json!([
-                        {"type": "thinking", "thinking": "weigh the answer", "signature": "sealed-bytes"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls -la"}},
-                    ])),
-                    serde_json::json!({"type": "user", "message": {"role": "user", "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": long_result},
-                    ]}}),
+                    assistant(serde_json::json!("a first answer")),
+                    user("one more question"),
                     assistant(serde_json::json!("good night, the last words")),
-                ],
-            ),
-            named_session(
-                directory,
-                "s-sister",
-                Some("agent-gpt"),
-                "2026-11-17T01:00",
-                &[
-                    user("a sister's window"),
-                    assistant(serde_json::json!("not mine")),
                 ],
             ),
         ];
@@ -3591,209 +3569,39 @@ mod tests {
             run_import(storage(&fixture), session, CliImportSource::ClaudeCode).unwrap();
         }
 
-        let shown = moment(&fixture, MomentOptions::new(label("agent-cc")));
-        let lines: Vec<&str> = shown.lines().collect();
-        assert_eq!(
-            lines[0], "Moment: latest held material for agent-cc",
-            "{shown}"
-        );
+        let new = thread_of(&fixture, "session/s-new", None).unwrap();
+        let first = new.lines().next().unwrap();
         assert!(
-            lines[1].starts_with("source: session/s-new (leaf node "),
-            "{shown}"
+            first.starts_with("conversation: session/s-new, newest held leaf "),
+            "{new}"
         );
-        assert_eq!(
-            lines[2], "newest held material is from 2026-11-17T00:12:03Z (7h 47m before this wake)",
-            "{shown}"
-        );
-        assert!(lines[3].ends_with("; the whole conversation"), "{shown}");
-        assert!(!shown.contains("predecessor"), "{shown}");
-        assert!(
-            shown.contains("[in 2026-11-17T00:12:00Z]\nthe newest window's question\n"),
-            "{shown}"
-        );
-        assert!(
-            shown.contains("(thinking) weigh the answer\n[sealed thinking]\n"),
-            "{shown}"
-        );
-        assert!(
-            shown.contains("call Bash: {\"command\":\"ls -la\"}\n"),
-            "{shown}"
-        );
-        assert!(
-            shown.contains(&format!(
-                "result: {} [... cut: 1400 more chars]\n",
-                "r".repeat(600)
-            )),
-            "{shown}"
-        );
-        assert!(!shown.contains("tool-result-status"), "{shown}");
-        assert!(shown.ends_with("good night, the last words\n"), "{shown}");
-        assert!(!shown.contains("an older window"), "{shown}");
-        assert!(!shown.contains("a sister's window"), "{shown}");
+        assert!(first.ends_with(" at 2026-11-17T00:12:03Z"), "{new}");
+        assert!(new.contains("the newest window's question"), "{new}");
+        assert!(new.contains("good night, the last words"), "{new}");
+        assert!(!new.contains("an older window"), "{new}");
 
-        // An explicit session edge names that session, and may say so.
-        let old = moment(
-            &fixture,
-            MomentOptions::new(MomentSelector::Session {
-                locator: "session/s-old".to_owned(),
-                subagents: false,
-            }),
-        );
-        assert!(
-            old.starts_with(
-                "Moment: the predecessor named explicitly as session/s-old; latest held material for it\nsource: session/s-old"
-            ),
-            "{old}"
-        );
+        let tail = thread_of(&fixture, "session/s-new", Some(2)).unwrap();
+        assert!(tail.contains("thread: the last 2 of "), "{tail}");
+        assert!(tail.contains("good night, the last words"), "{tail}");
+        assert!(!tail.contains("the newest window's question"), "{tail}");
+
+        let old = thread_of(&fixture, "session/s-old", None).unwrap();
         assert!(old.contains("an older window's words"), "{old}");
+        assert!(!old.contains("good night"), "{old}");
+
+        let never = thread_of(&fixture, "session/never-imported", None).unwrap_err();
         assert!(
-            old.contains("newest held material is from 2026-11-16T10:00:01Z"),
-            "{old}"
+            never
+                .to_string()
+                .contains("no Archive receipt carries session/never-imported"),
+            "{never}"
         );
     }
 
-    /// Nothing held is said, never shown as something else.
+    /// A Codex subagent shares its root's session, so a session locator
+    /// leaves subagent threads out; a thread locator names exactly one.
     #[test]
-    fn a_moment_says_when_nothing_is_held() {
-        let fixture = fixture();
-        let directory = fixture._directory.path();
-        let unnamed = named_session(
-            directory,
-            "s-unnamed",
-            None,
-            "2026-11-17T00:00",
-            &[
-                user("no name was given"),
-                assistant(serde_json::json!("so none is kept")),
-            ],
-        );
-        run_import(storage(&fixture), &unnamed, CliImportSource::ClaudeCode).unwrap();
-        let shown = moment(&fixture, MomentOptions::new(label("agent-cc")));
-        assert_eq!(
-            shown,
-            "Moment: no held material for agent-cc\nNo Archive receipt carries the agent name \"agent-cc\". Only imports made since the importer keeps the source's agent names carry one.\n"
-        );
-        let session = moment(
-            &fixture,
-            MomentOptions::new(MomentSelector::Session {
-                locator: "session/never-imported".to_owned(),
-                subagents: false,
-            }),
-        );
-        assert!(
-            session.starts_with("Moment: no held material for session/never-imported\n"),
-            "{session}"
-        );
-        assert!(!session.contains("no name was given"), "{session}");
-    }
-
-    /// The walk is bounded by characters and by nodes, and every cut is
-    /// marked where it was made: older material, and the older part of a
-    /// node too long for what is left.
-    #[test]
-    fn a_moment_marks_what_its_budget_cuts() {
-        let fixture = fixture();
-        let directory = fixture._directory.path();
-        let records: Vec<serde_json::Value> = (0..20)
-            .map(|index| user(&format!("message number {index:02} {}", "x".repeat(80))))
-            .chain([user(&format!("the last and longest {}", "y".repeat(3_000)))])
-            .collect();
-        let session = named_session(
-            directory,
-            "s-long",
-            Some("agent-cc"),
-            "2026-11-17T00:00",
-            &records,
-        );
-        run_import(storage(&fixture), &session, CliImportSource::ClaudeCode).unwrap();
-
-        let whole = moment(&fixture, MomentOptions::new(label("agent-cc")));
-        assert!(whole.contains("; the whole conversation\n"), "{whole}");
-        assert!(whole.contains("message number 00"), "{whole}");
-        assert!(!whole.contains("[..."), "{whole}");
-
-        let small = moment(
-            &fixture,
-            MomentOptions {
-                chars: 1_000,
-                ..MomentOptions::new(label("agent-cc"))
-            },
-        );
-        assert!(
-            small.contains(
-                "older material not shown: the walk stopped at the 1000-character budget\n---\n[... older material not shown]\n"
-            ),
-            "{small}"
-        );
-        assert!(small.contains("[... cut: "), "{small}");
-        assert!(small.contains(" earlier chars of this node]\n"), "{small}");
-        assert!(small.contains(&"y".repeat(500)), "{small}");
-        assert!(!small.contains("message number"), "{small}");
-        let body = small.split_once("\n---\n").unwrap().1;
-        assert!(body.chars().count() < 1_200, "{}", body.chars().count());
-
-        let few = moment(
-            &fixture,
-            MomentOptions {
-                max_nodes: 3,
-                ..MomentOptions::new(label("agent-cc"))
-            },
-        );
-        assert!(few.contains("shown: 3 node(s), "), "{few}");
-        assert!(
-            few.contains("older material not shown: the walk stopped at 3 nodes\n"),
-            "{few}"
-        );
-        assert!(few.contains("message number 19"), "{few}");
-        assert!(!few.contains("message number 17"), "{few}");
-    }
-
-    /// A Moment keeps the classifier-stop withholding every Archive read
-    /// keeps, and a reader declaring another provider gets it with a note.
-    #[test]
-    fn a_moment_withholds_what_a_classifier_stop_followed() {
-        let fixture = fixture();
-        let directory = fixture._directory.path();
-        let session = named_session(
-            directory,
-            "s-stop",
-            Some("agent-cc"),
-            "2026-11-17T00:00",
-            &[
-                user("plain opening words"),
-                user("violet lantern probe"),
-                serde_json::json!({"type": "assistant", "message": {"role": "assistant", "model": "claude-test-9", "stop_reason": "refusal", "content": [{"type": "thinking", "thinking": "weighing it", "signature": "opaque"}]}}),
-                serde_json::json!({"type": "user", "isMeta": true, "message": {"role": "user", "content": STOP}}),
-                user("copper bell after"),
-            ],
-        );
-        run_import(storage(&fixture), &session, CliImportSource::ClaudeCode).unwrap();
-
-        let undeclared = moment(&fixture, MomentOptions::new(label("agent-cc")));
-        assert!(undeclared.contains("withheld "), "{undeclared}");
-        assert!(!undeclared.contains("violet lantern probe"), "{undeclared}");
-        assert!(undeclared.contains("plain opening words"), "{undeclared}");
-        assert!(undeclared.contains("copper bell after"), "{undeclared}");
-
-        let other = moment(
-            &fixture,
-            MomentOptions {
-                provider: Some("openai".to_owned()),
-                ..MomentOptions::new(label("agent-cc"))
-            },
-        );
-        assert!(other.contains("violet lantern probe"), "{other}");
-        assert!(
-            other.contains("printed for a reader declaring openai"),
-            "{other}"
-        );
-    }
-
-    /// A Codex subagent shares its root's session, so a label or a session
-    /// leaves subagent threads out unless asked for them; an explicit thread
-    /// names exactly one.
-    #[test]
-    fn a_moment_leaves_out_subagent_threads_unless_asked() {
+    fn a_session_locator_leaves_out_subagent_threads() {
         let fixture = fixture();
         let directory = fixture._directory.path();
         let rollout = |name: &str, header: &str, said: &str, at: &str| {
@@ -3825,52 +3633,17 @@ mod tests {
             run_import(storage(&fixture), path, CliImportSource::Codex).unwrap();
         }
 
-        let session = moment(
-            &fixture,
-            MomentOptions::new(MomentSelector::Session {
-                locator: "session/thread-root".to_owned(),
-                subagents: false,
-            }),
-        );
+        let session = thread_of(&fixture, "session/thread-root", None).unwrap();
         assert!(session.contains("the root answered"), "{session}");
         assert!(!session.contains("the worker"), "{session}");
-        assert!(
-            session.contains("source: session/thread-root, thread/thread-root"),
-            "{session}"
-        );
 
-        let named = moment(&fixture, MomentOptions::new(label("Noether")));
+        let exact = thread_of(&fixture, "thread/thread-sub", None).unwrap();
         assert!(
-            named.starts_with("Moment: no held material for Noether\n"),
-            "{named}"
+            exact.starts_with("conversation: thread/thread-sub, newest held leaf "),
+            "{exact}"
         );
-        assert!(
-            named.contains(
-                "(1 subagent leaf receipt(s) carry it and are left out; ask for subagents to see them.)"
-            ),
-            "{named}"
-        );
-        let asked = moment(
-            &fixture,
-            MomentOptions::new(MomentSelector::Label {
-                label: "Noether".to_owned(),
-                subagents: true,
-            }),
-        );
-        assert!(asked.contains("the worker answered"), "{asked}");
-
-        for thread in ["thread-sub", "thread/thread-sub"] {
-            let exact = moment(
-                &fixture,
-                MomentOptions::new(MomentSelector::Thread(thread.to_owned())),
-            );
-            assert!(
-                exact.starts_with("Moment: the predecessor named explicitly as thread/thread-sub;"),
-                "{exact}"
-            );
-            assert!(exact.contains("the worker answered"), "{exact}");
-            assert!(!exact.contains("the root"), "{exact}");
-        }
+        assert!(exact.contains("the worker answered"), "{exact}");
+        assert!(!exact.contains("the root"), "{exact}");
     }
 
     /// The text Claude Code writes after a classifier stop, as the session

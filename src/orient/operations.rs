@@ -45,10 +45,6 @@ pub struct WakeOptions {
     pub chars: usize,
     pub doing_limit: usize,
     pub todo_limit: usize,
-    /// The Moment section after Compass: the newest raw turns the Archive
-    /// holds for an explicit selector. `None` renders no Moment; nothing
-    /// before it changes either way.
-    pub moment: Option<crate::archive::MomentOptions>,
 }
 impl Default for WakeOptions {
     fn default() -> Self {
@@ -56,7 +52,6 @@ impl Default for WakeOptions {
             chars: 800_000,
             doing_limit: 5,
             todo_limit: 5,
-            moment: None,
         }
     }
 }
@@ -214,29 +209,18 @@ impl Orient {
         record_presented: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        self.storage.scope(|storage| {
-            // The Moment is read through Archive over the same open store,
-            // before the wake's own store borrow, and never with a persona.
-            let moment = match &options.moment {
-                Some(moment) => {
-                    Some(crate::archive::Archive::with_storage(storage.clone()).moment(moment)?)
-                }
-                None => None,
-            };
-            storage.with_store(|pile, signer, runtime| {
-                runtime.block_on(cmd_wake(
-                    storage,
-                    pile,
-                    signer,
-                    persona,
-                    options.chars,
-                    options.doing_limit,
-                    options.todo_limit,
-                    moment.as_deref(),
-                    record_presented,
-                    out,
-                ))
-            })
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_wake(
+                &self.storage,
+                pile,
+                signer,
+                persona,
+                options.chars,
+                options.doing_limit,
+                options.todo_limit,
+                record_presented,
+                out,
+            ))
         })
     }
     /// `orient wake --pairs`: the plain wake as command/result JSON lines.
@@ -6038,11 +6022,8 @@ async fn wake_selection(
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
 /// cover-tagged wiki beliefs (the ambient always-true set), then the compass
-/// goals, then, when asked for, the Moment. A supplied persona records shown
-/// attention events after output acceptance; previous presentation history
-/// does not filter this overview. The Moment comes last so everything before
-/// it is the same text with or without it.
-#[allow(clippy::too_many_arguments)]
+/// goals. A supplied persona records shown attention events after output
+/// acceptance; previous presentation history does not filter this overview.
 async fn cmd_wake(
     routing: &Storage,
     storage: &mut FacultyStore,
@@ -6051,7 +6032,6 @@ async fn cmd_wake(
     chars: usize,
     doing_limit: usize,
     todo_limit: usize,
-    moment: Option<&str>,
     record_presented: bool,
     output: &mut Out<'_>,
 ) -> Result<()> {
@@ -6094,10 +6074,6 @@ async fn cmd_wake(
     }
     report.push('\n');
     report.push_str(&selection.goals);
-    if let Some(moment) = moment {
-        report.push('\n');
-        report.push_str(moment);
-    }
 
     write_complete_report(output, &report, "Orient wake report", &mut |_| {}).await?;
     if !selection.cover.diagnostics.is_empty() {
@@ -6742,7 +6718,6 @@ mod tests {
                 0,
                 5,
                 5,
-                None,
                 true,
                 &mut Out::new(&mut |part| {
                     let crate::out::Part::Text { text } = part else {
@@ -7498,7 +7473,6 @@ mod tests {
                 0,
                 5,
                 5,
-                None,
                 true,
                 &mut Out::new(&mut |part| {
                     let crate::out::Part::Text { text } = part else {

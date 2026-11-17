@@ -15,21 +15,12 @@ All notable changes to this project will be documented in this file.
   one that has gone longest without a status event or note first, each with
   its other tags and "last moved N days ago" (hours under a day). All are
   shown; with none, nothing is printed.
-- `orient wake --moment-of <LABEL>` ends the wake with a Moment: the newest raw
-  turns the Archive holds whose leaf carries that agent name, after Compass, so
-  everything before it is the same text with or without it.
-  `--moment-session <session/ID>` and `--moment-thread <ID>` name an explicit
-  edge instead. The wake stays persona-free: the selector is only what the
-  caller names, and no Moment is ever a default. The heading says "latest held
-  material for <label>" with its source and time; only an explicit edge is
-  called a predecessor. When nothing is held, it says so. The renderer is
-  compact: one label per run of one direction, text and thinking whole, a tool
-  call as its name and clipped input, results clipped, status events dropped,
-  sealed thinking one line, classifier-stop withholding kept
-  (`--reader-provider`). The walk reads at most `--moment-nodes` (600) nodes
-  and `--moment-chars` (30,000) characters, and marks every cut. Codex and
-  Claude Code subagent conversations are left out unless `--moment-subagents`.
-  Not yet in `--pairs` or the MCP tool.
+- `archive thread` (and MCP `archive_thread`) also takes a conversation's
+  source locator in place of an id: `session/<id>` (subagent threads left
+  out) or `thread/<id>` names that conversation's newest held leaf, said in a
+  first line with its time, and the thread walks back from it (`--tail`
+  applies). A locator nothing carries is refused. This is how a new window
+  reads its retired predecessor's tail, given the session the launcher names.
 - Archive keeps the source's own labels on importer leaves, as annotations
   (node and receipt ids do not change): Claude Code's `agent-name` record as
   `raw_agent_name` (the file's last one); Codex's first `session_meta` `id` as

@@ -197,7 +197,6 @@ impl Faculty for Orient {
                     chars: a.chars,
                     doing_limit: a.doing_limit,
                     todo_limit: a.todo_limit,
-                    moment: None,
                 };
                 if self.native {
                     self.operations
