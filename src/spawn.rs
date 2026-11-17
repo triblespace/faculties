@@ -16,9 +16,10 @@ pub mod mcp;
 pub mod operations;
 
 pub use operations::{
-    choose_provider, GoalRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,
-    LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested, RunRequest, RunView,
-    SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidRef,
+    choose_provider, keep_lock_path, GoalRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig,
+    Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested,
+    RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
+    ZooidRef,
 };
 
 use anyhow::{bail, Result};

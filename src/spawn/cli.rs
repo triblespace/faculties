@@ -9,8 +9,8 @@ use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_pass, render_requests, render_show};
 use super::{
-    Exit, GoalRequest, KeepConfig, LaunchConfig, Launched, Provider, RequestInput, RunRequest,
-    SettleRequest, Spawn, ZooidRef,
+    keep_lock_path, Exit, GoalRequest, KeepConfig, LaunchConfig, Launched, Provider, RequestInput,
+    RunRequest, SettleRequest, Spawn, ZooidRef,
 };
 
 #[derive(Parser)]
@@ -234,7 +234,10 @@ fn keep_config(workdir: Option<PathBuf>) -> Result<KeepConfig> {
         Some(workdir) => workdir,
         None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?),
     };
-    Ok(KeepConfig { workdir })
+    Ok(KeepConfig {
+        workdir,
+        lock: keep_lock_path()?,
+    })
 }
 
 fn read_brief(source: &str) -> Result<String> {

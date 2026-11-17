@@ -872,6 +872,74 @@ impl RequestView {
 pub struct KeepConfig {
     /// The directory every request's run starts in.
     pub workdir: PathBuf,
+    /// This host's keep lock ([`keep_lock_path`]): every pass holds an
+    /// exclusive `flock` on it from before it reads the requests until its
+    /// last launch or outcome is written.
+    pub lock: PathBuf,
+}
+
+/// Where this host's keepers take turns: `$XDG_STATE_HOME/spawn/keep.lock`,
+/// else `$HOME/.local/state/spawn/keep.lock`. One fixed rule with no
+/// fallback beyond that, so every keeper on the host (a `--once` by hand, a
+/// loop, a timer) finds the same file. A relative or empty variable names no
+/// fixed file (each working directory would get its own), so it counts as
+/// unset.
+pub fn keep_lock_path() -> Result<PathBuf> {
+    let absolute = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    if let Some(state) = absolute("XDG_STATE_HOME") {
+        return Ok(state.join("spawn/keep.lock"));
+    }
+    absolute("HOME")
+        .map(|home| home.join(".local/state/spawn/keep.lock"))
+        .ok_or_else(|| anyhow!("neither XDG_STATE_HOME nor HOME is an absolute path"))
+}
+
+/// One keeper pass's turn on this host: an exclusive `flock` on a file that
+/// is never removed, released by the kernel when the value is dropped or
+/// its process dies, however it dies. No pid, staleness rule or clock
+/// decides anything. Unlinking a locked path is what would let two keepers
+/// each lock a different inode of "the same" lock, so nothing unlinks it.
+///
+/// Without it two passes on one host can both read "no accepted, no run, no
+/// unit" and both start the request; and a run that started, exited and was
+/// collected leaves no unit name to refuse the second start (compass
+/// fd6af1f2 notes f36d6992, 9ca71066).
+struct KeepLock {
+    _held: std::fs::File,
+}
+
+impl KeepLock {
+    /// Take the lock, waiting for a pass that holds it to finish.
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .with_context(|| format!("open the keep lock {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => return Ok(Self { _held: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock {}", path.display()))
+            }
+        }
+        eprintln!(
+            "spawn keep: waiting for another keeper pass on this host ({} is held)",
+            path.display()
+        );
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(Self { _held: file })
+    }
 }
 
 /// What one pass did about one request.
@@ -1825,7 +1893,12 @@ impl Spawn {
     /// against its unit and the pile. A request is only ever seen here when
     /// its COMMIT's signer is admitted to write the spawn collection: the
     /// collection read applies that, so no allowlist is kept beside it.
+    ///
+    /// The whole pass holds this host's keep lock ([`KeepLock`]), and reads
+    /// the requests only after taking it: a pass that waited reads what the
+    /// pass before it wrote, so it sees that pass's `accepted`, run and unit.
     pub fn keep_once(&self, config: &KeepConfig) -> Result<KeepPass> {
+        let _turn = KeepLock::acquire(&config.lock)?;
         let host = self.local_host()?;
         let mut steps = Vec::new();
         for view in self.requests(Some(host))? {
@@ -2746,6 +2819,9 @@ mod tests {
         /// Start the unit, then stop the caller the way a crashed keeper
         /// stops: before anything after the start runs.
         crash_after_start: bool,
+        /// The unit ends and systemd forgets it as soon as it starts, so its
+        /// name can refuse nothing afterwards.
+        collected_at_once: bool,
     }
 
     impl Launcher for FakeLauncher {
@@ -2754,7 +2830,11 @@ mod tests {
                 bail!("fake systemd refuses");
             }
             self.started.lock().unwrap().push(unit.clone());
-            *self.state.lock().unwrap() = "active".to_owned();
+            *self.state.lock().unwrap() = if self.collected_at_once {
+                "inactive".to_owned()
+            } else {
+                "active".to_owned()
+            };
             if self.crash_after_start {
                 panic!("the keeper stops after the unit started");
             }
@@ -2936,11 +3016,13 @@ mod tests {
                 .unwrap()
         }
         fn keep(&self) -> KeepPass {
-            self.spawn
-                .keep_once(&KeepConfig {
-                    workdir: self.directory.path().join("lane"),
-                })
-                .unwrap()
+            self.spawn.keep_once(&self.keep_config()).unwrap()
+        }
+        fn keep_config(&self) -> KeepConfig {
+            KeepConfig {
+                workdir: self.directory.path().join("lane"),
+                lock: self.directory.path().join("state/spawn/keep.lock"),
+            }
         }
         fn request_view(&self, id: Id) -> RequestView {
             self.spawn
@@ -3129,6 +3211,113 @@ mod tests {
         assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
         assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
         assert_eq!(f.spawn.show(&asked.name).unwrap().runs.len(), 1);
+    }
+
+    #[test]
+    fn two_keepers_at_once_start_a_request_once() {
+        two_keepers_race(fixture());
+    }
+
+    /// The case only a reread under the lock catches: the first pass's run
+    /// started, ended and was collected before the second pass looks, so
+    /// systemd's state says nothing and only the pile's `accepted` and run
+    /// record stop a second start.
+    #[test]
+    fn two_keepers_at_once_start_a_request_once_even_when_its_unit_is_already_gone() {
+        two_keepers_race(fixture_with(FakeLauncher {
+            collected_at_once: true,
+            ..FakeLauncher::default()
+        }));
+    }
+
+    fn two_keepers_race(f: Fixture) {
+        let asked = f.ask("Raced task.", None, Provider::Claude);
+        let barrier = std::sync::Barrier::new(2);
+        let passes: Vec<KeepPass> = std::thread::scope(|scope| {
+            let keepers: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        f.keep()
+                    })
+                })
+                .collect();
+            keepers.into_iter().map(|k| k.join().unwrap()).collect()
+        });
+        let started = f.launcher.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 1, "{passes:?}");
+        assert_eq!(started[0].unit, format!("spawn-req-{:x}", asked.request));
+        let mut steps: Vec<_> = passes
+            .iter()
+            .flat_map(|pass| pass.steps.iter().map(|(_, step)| step.clone()))
+            .collect();
+        steps.sort_by_key(|step| !matches!(step, KeepStep::Launched { .. }));
+        assert!(
+            matches!(
+                steps.as_slice(),
+                [
+                    KeepStep::Launched { .. },
+                    KeepStep::Running | KeepStep::Waiting(_)
+                ]
+            ),
+            "{steps:?}"
+        );
+        assert_eq!(f.request_view(asked.request).runs.len(), 1);
+    }
+
+    /// A pass that waits for the lock reads the requests after it gets it.
+    /// While this test holds the lock it plays the other keeper: it starts
+    /// the request, and the run ends, is collected and settles, so neither
+    /// systemd nor a live persona is left to refuse a second start. Only the
+    /// waiting pass's fresh read of `accepted`, the run and its end does.
+    #[test]
+    fn keep_waits_while_another_pass_holds_the_host_lock_and_rereads_after_it() {
+        let f = fixture_with(FakeLauncher {
+            collected_at_once: true,
+            ..FakeLauncher::default()
+        });
+        let asked = f.ask("Waiting task.", None, Provider::Claude);
+        let config = f.keep_config();
+        std::fs::create_dir_all(config.lock.parent().unwrap()).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&config.lock)
+            .unwrap();
+        holder.lock().unwrap();
+        std::thread::scope(|scope| {
+            let keeper = scope.spawn(|| f.keep());
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(!keeper.is_finished());
+            assert!(f.launcher.started.lock().unwrap().is_empty());
+            // The other keeper's pass, under the lock this test holds.
+            let view = f.request_view(asked.request);
+            let KeepStep::Launched { run, name, .. } = f.spawn.keep_one(&config, &view).unwrap()
+            else {
+                panic!("the holder's pass did not launch");
+            };
+            f.spawn
+                .settle(&SettleRequest {
+                    name,
+                    run,
+                    request: Some(asked.request),
+                    exit: Exit::from_systemd("exited", "0", "success"),
+                    report: None,
+                    usage: None,
+                })
+                .unwrap();
+            drop(holder);
+            let pass = keeper.join().unwrap();
+            assert!(
+                matches!(pass.steps.as_slice(), [(_, KeepStep::Done)]),
+                "{pass:?}"
+            );
+        });
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        // The lock file stays, for the next pass to lock the same inode.
+        assert!(config.lock.exists());
     }
 
     #[test]
