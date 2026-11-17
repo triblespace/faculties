@@ -36,7 +36,7 @@ use triblespace::core::trible::TribleSet;
 use crate::schemas::{
     alarm, atlas, blockdag, body, code, cognition, compass, config, decide, discord, embeddings,
     files, habit, headspace, home, imagine, mail, memory, message, models, orient, planner,
-    posture, quota, relations, spawn, status, swarm_health, teams, voice, web, wiki,
+    posture, quota, relations, rules, spawn, status, swarm_health, teams, voice, web, wiki,
 };
 use crate::secrets::DEFAULT_SCOPE_ID as SECRETS_SCOPE_ID;
 
@@ -93,6 +93,7 @@ pub fn table() -> Vec<(Id, &'static str)> {
         (posture::DEFAULT_SCAN_SCOPE_ID, "posture-scan"),
         (quota::DEFAULT_SCOPE_ID, "quota"),
         (relations::DEFAULT_SCOPE_ID, "relations"),
+        (rules::DEFAULT_SCOPE_ID, "rules"),
         (SECRETS_SCOPE_ID, "secrets"),
         (spawn::DEFAULT_SCOPE_ID, "spawn"),
         // Historical descriptor name only; no live authored Status faculty.

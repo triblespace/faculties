@@ -121,6 +121,17 @@ pub struct GoalReading {
     pub notes: Vec<GoalNote>,
 }
 
+/// One goal's current status word and tags, for a caller applying its own
+/// predicate (the rules sensors). No title or note text is acquired.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalState {
+    pub goal: Id,
+    /// The canonical current status word, when the goal has one.
+    pub status: Option<String>,
+    /// Every tag, sorted.
+    pub tags: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalNote {
     pub id: Id,
@@ -294,6 +305,21 @@ impl Compass {
             options.supersedes.to_vec(),
             options.persona,
         )
+    }
+
+    /// Every goal's current status and tags, read from one frozen view.
+    pub fn goal_states(&self) -> Result<Vec<GoalState>> {
+        self.storage().with_view(|space, reader, status_register| {
+            all_goal_ids(space)
+                .into_iter()
+                .map(|goal| {
+                    let status = task_latest_status(reader, space, status_register, goal)?
+                        .map(|(status, _)| status);
+                    let tags = task_tags(reader, space, goal, &[])?;
+                    Ok(GoalState { goal, status, tags })
+                })
+                .collect()
+        })
     }
 
     pub fn show(&self, id: &str) -> Result<String> {

@@ -1,0 +1,30 @@
+// This file is the SEED: `rules tick` publishes it only when the pile holds no
+// reading for the environment. A revision id names this exact text forever:
+// changing the rule means minting a new revision id (and clause ids) and
+// publishing a new reading that supersedes the old one, never editing here.
+// Semantics: one enduring request per goal, as ignite.sh ignites a goal once.
+// Re-requesting a goal after a run ended would need a new core component
+// (an attempt marker); v0 has none on purpose.
+// ignite: an eligible goal and a fresh, not-over-pace weekly quota, observed
+// in the same sensor tick, conclude a request to run a zooid on that goal.
+// The request's core is the goal alone, so every tick that sees the same goal
+// eligible names the same request; `requested_in` records which ticks did.
+// Attribute aliases (eligible, quota_ok, run_for, requested_in) are bound by
+// the loader from `attribute.id()`. Ids minted with `trible genid` 2026-11-17.
+alias ignite = id"CD7AE21BC2F0E6D765466116C73DF819";
+alias tick = id"C9098B6CEDCA1D06C182A7D73F74D523";
+alias goal = id"A99FDCF61E8703846EEC3620DBED8E4C";
+alias reading = id"4F63FB759418FBCE8264E1B582DB4968";
+alias request = id"47BE3BE27BCDA271841C1410E08B6ACC";
+alias m_eligible = id"EE4796C4744AE29F4E654B04B5EC444B";
+alias m_quota = id"70881C6851A02004B29D2D2E404EA5B1";
+alias c_run_for = id"222AA893EBB0F3DAC480BDEB0643AB03";
+alias e_requested_in = id"3FF7DC9F3F115E62053C2D13AE3706D4";
+
+rule @ignite {
+  operation POSITIVE;
+  matches @m_eligible (?tick @eligible ?goal);
+  matches @m_quota (?tick @quota_ok ?reading);
+  core @c_run_for (?request @run_for ?goal);
+  emits @e_requested_in (?request @requested_in ?tick);
+}

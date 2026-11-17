@@ -1,0 +1,32 @@
+// This file is the SEED: `rules tick` publishes it only when the pile holds no
+// reading for the environment. A revision id names this exact text forever:
+// changing the rule means minting a new revision id (and clause ids) and
+// publishing a new reading that supersedes the old one, never editing here.
+// Semantics: one aggregate reminder to JP per quiet period, as the ask-jp
+// habit posts one list; the attribute names the recipient and the purpose.
+// ask-jp: open #ask-jp questions and "JP not asked in the last 24 h",
+// observed in the same sensor tick, conclude one nudge request per quiet
+// period. The core is the last asking, so repeated ticks before JP is asked
+// again name the same nudge; asking moves the marker and the next quiet
+// period concludes a new one. Attribute aliases (ask_open, ask_quiet_since,
+// nudge_after, nudge_about, nudge_in) are bound by the loader from
+// `attribute.id()`. Ids minted with `trible genid` 2026-11-17.
+alias ask_jp = id"CDE937E729EEDD5B56BA737AECCC1039";
+alias tick = id"1FE759CA114AF45416893805367FE876";
+alias question = id"1FDC6EDC61D9EA055E179C907410BDC1";
+alias since = id"3EC6E8EAB0100DFFAA1608AEFF325942";
+alias nudge = id"93722E6143225DF4A78B0C6EE3241D8C";
+alias m_open = id"2F1C72E9E75C8E8D18FBB9B63702F819";
+alias m_quiet = id"D6B98A78B9D04B7BD1D28DCC9139C3BE";
+alias c_nudge_after = id"791145110B20830DC026C261C3764D27";
+alias e_nudge_about = id"04E31C8128BE639656A8DF1E36DCA24B";
+alias e_nudge_in = id"619982900519F0B2F5DE66967FC874E3";
+
+rule @ask_jp {
+  operation POSITIVE;
+  matches @m_open (?tick @ask_open ?question);
+  matches @m_quiet (?tick @ask_quiet_since ?since);
+  core @c_nudge_after (?nudge @nudge_after ?since);
+  emits @e_nudge_about (?nudge @nudge_about ?question);
+  emits @e_nudge_in (?nudge @nudge_in ?tick);
+}

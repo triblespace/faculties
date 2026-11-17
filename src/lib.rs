@@ -104,6 +104,7 @@ pub mod posture_policy;
 pub mod quota;
 pub mod reason;
 pub mod relations;
+pub mod rules;
 pub mod schemas;
 pub mod search;
 pub mod spawn;
