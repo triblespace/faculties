@@ -762,7 +762,9 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     }
     for (variable, version) in facts.agent_secrets {
         script.push_str(&format!(
-            "{variable}=$({} get --secret {}) && [ -n \"${variable}\" ] || {{ echo \"spawn:              reading {variable} from Secrets failed\" >&2; exit 77; }}\nexport {variable}\n",
+            "{variable}=$({} get --secret {}) && [ -n \"${variable}\" ] || \
+             {{ echo \"spawn: reading {variable} from Secrets failed\" >&2; exit 77; }}\n\
+             export {variable}\n",
             q(facts.secrets),
             q(version)
         ));

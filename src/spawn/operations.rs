@@ -4132,7 +4132,10 @@ mod tests {
             "{script}"
         );
         assert!(
-            script.contains("exit 77; }\nexport MISTRAL_API_KEY\n"),
+            script.contains(
+                " || { echo \"spawn: reading MISTRAL_API_KEY from Secrets failed\" >&2; \
+                 exit 77; }\nexport MISTRAL_API_KEY\n"
+            ),
             "{script}"
         );
         assert_eq!(script.matches("MISTRAL_API_KEY=").count(), 1, "{script}");
