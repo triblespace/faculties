@@ -952,6 +952,10 @@ fn assert_content_derived(route: &str, facts: &TribleSet) {
         schema::source_projection::generated_by.id(),
         schema::source_projection::source_locator.id(),
         schema::source_projection::source_detail.id(),
+        schema::source_projection::raw_agent_name.id(),
+        schema::source_projection::source_thread.id(),
+        schema::source_projection::raw_thread_source.id(),
+        schema::source_projection::raw_agent_path.id(),
         schema::source_projection::resolution.id(),
     ];
     assert!(!facts.is_empty(), "{route} projected nothing");

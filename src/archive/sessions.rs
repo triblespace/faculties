@@ -1025,6 +1025,10 @@ mod tests {
         let annotation = [
             source_projection::source_locator.id(),
             source_projection::source_detail.id(),
+            source_projection::raw_agent_name.id(),
+            source_projection::source_thread.id(),
+            source_projection::raw_thread_source.id(),
+            source_projection::raw_agent_path.id(),
         ];
         let extra = grown.difference(whole);
         let annotations = extra

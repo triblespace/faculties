@@ -321,6 +321,19 @@ fn attribute_name(attribute: Id) -> String {
         (main::source_projection::raw_model.id(), "raw_model"),
         (main::source_projection::raw_role.id(), "raw_role"),
         (main::source_projection::source_detail.id(), "source_detail"),
+        (
+            main::source_projection::raw_agent_name.id(),
+            "raw_agent_name",
+        ),
+        (main::source_projection::source_thread.id(), "source_thread"),
+        (
+            main::source_projection::raw_thread_source.id(),
+            "raw_thread_source",
+        ),
+        (
+            main::source_projection::raw_agent_path.id(),
+            "raw_agent_path",
+        ),
         (main::source_projection::resolution.id(), "resolution"),
         (v3::witness::pointer.id(), "pointer"),
         (v3::witness::claimed_size.id(), "claimed_size"),
@@ -1172,6 +1185,19 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                     main::source_projection::source_locator.id(),
                 ),
                 ("source_detail", main::source_projection::source_detail.id()),
+                (
+                    "raw_agent_name",
+                    main::source_projection::raw_agent_name.id(),
+                ),
+                ("source_thread", main::source_projection::source_thread.id()),
+                (
+                    "raw_thread_source",
+                    main::source_projection::raw_thread_source.id(),
+                ),
+                (
+                    "raw_agent_path",
+                    main::source_projection::raw_agent_path.id(),
+                ),
                 ("pointer", v3::witness::pointer.id()),
                 ("claimed_title", v3::witness::claimed_title.id()),
                 ("untruncated", v3::witness::untruncated.id()),

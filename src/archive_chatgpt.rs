@@ -166,6 +166,7 @@ fn project_content(
     for conversation in conversations {
         let unit = archive_source::UnitAnnotations {
             source_locator: Some(format!("conversation/{}", conversation.id.as_ref())),
+            ..archive_source::UnitAnnotations::default()
         };
         let (records, attachments_seen, attachments_resolved) =
             conversation.into_records(sidecars)?;

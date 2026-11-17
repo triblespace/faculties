@@ -59,14 +59,22 @@ impl Orient {
     pub fn prepare_next(&self, arguments: Bytes) -> Result<super::Next> {
         let a: NextArguments = decode_arguments(arguments)?;
         if !(1..=300).contains(&a.timeout_secs) {
-            return Err(crate::mcp::invalid_arguments("timeout_secs must be between 1 and 300"));
+            return Err(crate::mcp::invalid_arguments(
+                "timeout_secs must be between 1 and 300",
+            ));
         }
-        self.operations.clone().with_health_max_age(Duration::from_secs(
-            a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
-        )).begin_next(&a.persona, &super::WaitOptions {
-            timeout: Some(Duration::from_secs(a.timeout_secs)),
-            ..Default::default()
-        })
+        self.operations
+            .clone()
+            .with_health_max_age(Duration::from_secs(
+                a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
+            ))
+            .begin_next(
+                &a.persona,
+                &super::WaitOptions {
+                    timeout: Some(Duration::from_secs(a.timeout_secs)),
+                    ..Default::default()
+                },
+            )
     }
 }
 
@@ -90,7 +98,9 @@ fn chars() -> usize {
 fn yes() -> bool {
     true
 }
-fn thirty() -> u64 { 30 }
+fn thirty() -> u64 {
+    30
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NextArguments {
@@ -150,32 +160,51 @@ impl Faculty for Orient {
                 let mut next = self.prepare_next(arguments)?.start()?;
                 loop {
                     if let Some(report) = next.poll()? {
-                        for part in report.parts() { out.emit(part.clone())?; }
+                        for part in report.parts() {
+                            out.emit(part.clone())?;
+                        }
                         return next.acknowledge(report);
                     }
-                    if next.is_settled() { bail!("Orient next ended without a complete result"); }
+                    if next.is_settled() {
+                        bail!("Orient next ended without a complete result");
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
             "orient_show" => {
                 let a: Show = decode_arguments(arguments)?;
-                let operations = self.operations
+                let operations = self
+                    .operations
                     .clone()
                     .with_health_max_age(Duration::from_secs(
                         a.health_max_age_secs.unwrap_or(DEFAULT_MAX_AGE.as_secs()),
                     ));
-                let options = ShowOptions { message_limit: a.message_limit,
-                    doing_limit: a.doing_limit, todo_limit: a.todo_limit,
-                    evaluate_habits: a.evaluate_habits };
-                if self.native { operations.show_unpresented(a.persona.as_deref(), &options, out) }
-                else { operations.show(a.persona.as_deref(), &options, out) }
+                let options = ShowOptions {
+                    message_limit: a.message_limit,
+                    doing_limit: a.doing_limit,
+                    todo_limit: a.todo_limit,
+                    evaluate_habits: a.evaluate_habits,
+                };
+                if self.native {
+                    operations.show_unpresented(a.persona.as_deref(), &options, out)
+                } else {
+                    operations.show(a.persona.as_deref(), &options, out)
+                }
             }
             "orient_wake" => {
                 let a: Wake = decode_arguments(arguments)?;
-                let options = WakeOptions { chars: a.chars, doing_limit: a.doing_limit,
-                    todo_limit: a.todo_limit };
-                if self.native { self.operations.wake_unpresented(a.persona.as_deref(), &options, out) }
-                else { self.operations.wake(a.persona.as_deref(), &options, out) }
+                let options = WakeOptions {
+                    chars: a.chars,
+                    doing_limit: a.doing_limit,
+                    todo_limit: a.todo_limit,
+                    moment: None,
+                };
+                if self.native {
+                    self.operations
+                        .wake_unpresented(a.persona.as_deref(), &options, out)
+                } else {
+                    self.operations.wake(a.persona.as_deref(), &options, out)
+                }
             }
             "orient_poll" => {
                 let a: Poll = decode_arguments(arguments)?;

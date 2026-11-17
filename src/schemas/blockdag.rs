@@ -212,6 +212,28 @@ pub mod source_projection {
         /// what it perceived; `raw_model` stays the raw claim beside it.
         /// Minted with `trible genid` on 2026-10-26.
         "E7B5625D9C7A534EC2FF566AF2F9C439" as pub generated_by: GenId;
+        /// NONIDENTITY. The agent name the source's own session metadata
+        /// gives the conversation a leaf ends, exactly as spelled there:
+        /// Claude Code's `agent-name` record (`agentName`), Codex's
+        /// `agent_nickname`. Never derived from a persona or a binding file.
+        /// On an importer receipt's leaves only, like `source_locator`.
+        /// Minted with `trible genid` on 2026-11-17.
+        "B06EF9D5A8170BE4B85F48953DE6C9B8" as pub raw_agent_name: Handle<UTF8String>;
+        /// NONIDENTITY. The provider thread a leaf ends, as `thread/<id>`,
+        /// where the source tells threads apart inside one session: a Codex
+        /// rollout's own `session_meta.payload.id`, while `source_locator`
+        /// names the root session every subagent thread shares. On an
+        /// importer receipt's leaves only. Minted with `trible genid` on
+        /// 2026-11-17.
+        "460BE9D45EDBBB08AE2EE9FBD247F957" as pub source_thread: Handle<UTF8String>;
+        /// NONIDENTITY. Exact source label of who started that thread: Codex's
+        /// `thread_source` (`user` or `subagent`). On an importer receipt's
+        /// leaves only. Minted with `trible genid` on 2026-11-17.
+        "967322A8F613C8B4DD2CEAEB2A44456D" as pub raw_thread_source: Handle<UTF8String>;
+        /// NONIDENTITY. Exact source agent path of that thread: Codex's
+        /// `agent_path` (`/root/<task>`). On an importer receipt's leaves
+        /// only. Minted with `trible genid` on 2026-11-17.
+        "249B926138B352B764D8464C63E0B4FD" as pub raw_agent_path: Handle<UTF8String>;
     }
 
     /// NONIDENTITY. Stable Relations entity that produced the occurrence:

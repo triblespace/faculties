@@ -41,9 +41,9 @@
 //! before a compaction or a rewind) is one the file has moved on from, and
 //! its open message is complete. A tool result's node
 //! names the node of the call it answers. Each emitted fragment is one node
-//! with its fact and receipt. The session id annotates the receipts of the
-//! file's leaves only; a subagent's `.meta.json` annotates its transcript's
-//! leaves. Titles and the file's path are not kept.
+//! with its fact and receipt. The session id, and the session's name as its
+//! last `agent-name` record spells it, annotate the receipts of the file's
+//! leaves only; a subagent's `.meta.json` annotates its transcript's leaves. Titles and the file's path are not kept.
 //! `history.jsonl` prompts that no transcript beside it holds become nodes
 //! of their own. No source bytes are stored; [`SKIPPED_KINDS`] lists what is
 //! not projected and why.
@@ -67,8 +67,12 @@ pub const SKIPPED_KINDS: &[(&str, &str)] = &[
         "pointers into the local file-history backup directory",
     ),
     (
-        "last-prompt, mode, permission-mode, atis-latch, frame-link, agent-setting, cost-state, agent-name, started, launched, result, continued-in, fork-context-ref, pr-link",
+        "last-prompt, mode, permission-mode, atis-latch, frame-link, agent-setting, cost-state, started, launched, result, continued-in, fork-context-ref, pr-link",
         "UI and session state",
+    ),
+    (
+        "agent-name",
+        "no node: its agentName annotates the file's leaves as raw_agent_name",
     ),
     (
         "ai-title, custom-title",
@@ -1506,6 +1510,9 @@ where
     // Receipts of the nodes this file projects, for the leaf annotation.
     let mut receipts = BTreeMap::<Id, Id>::new();
     let mut session = None::<String>;
+    // The last `agent-name` record's name: the session's name when the file
+    // ends, which is where its leaves are.
+    let mut agent_name = None::<String>;
 
     for_each_jsonl_line(&mut reader, None, |line_number, raw| {
         let mut row_stats = ProjectionStats {
@@ -1522,6 +1529,15 @@ where
         })?;
         if session.is_none() {
             session = record.session_id.clone();
+        }
+        if record.record_type == "agent-name" {
+            if let Some(name) = record
+                .agent_name
+                .as_ref()
+                .filter(|name| !name.trim().is_empty())
+            {
+                agent_name = Some(name.clone());
+            }
         }
         let version = prescan.versions.get(&line_number);
         let fragments = project_record(record, version, raw, plan, &mut receipts, &mut row_stats)
@@ -1546,9 +1562,10 @@ where
         Ok(())
     })?;
 
-    // The session id and a subagent's spawn metadata annotate the leaves the
-    // file projects, never every node. Titles and the file's path are not
-    // kept: they describe the machinery around the session, not the session.
+    // The session id, the session's own name (its last `agent-name` record)
+    // and a subagent's spawn metadata annotate the leaves the file projects,
+    // never every node. Titles and the file's path are not kept: they
+    // describe the machinery around the session, not the session.
     let detail = meta.map(|meta| meta.detail);
     for (node, receipt) in receipts {
         if plan.followed.contains(&node) {
@@ -1559,6 +1576,7 @@ where
             blockdag::ProjectionAnnotations {
                 source_locator: session.as_ref().map(|id| format!("session/{id}")),
                 source_detail: detail.clone(),
+                raw_agent_name: agent_name.clone(),
                 ..blockdag::ProjectionAnnotations::default()
             },
         )?;
@@ -2264,6 +2282,9 @@ struct RawRecord {
     model: Option<String>,
     /// The provider's message id: the records of one message share it.
     message_id: Option<String>,
+    /// An `agent-name` record's `agentName`: the name the session was given
+    /// (`claude --name`).
+    agent_name: Option<String>,
     blocks: Vec<RawBlock>,
 }
 
@@ -2403,6 +2424,7 @@ fn scan_record(bytes: &mut Bytes) -> std::result::Result<RawRecord, sc::ScanErro
             "sessionId" => record.session_id = parse_optional_string(value)?,
             "uuid" => record.uuid = parse_optional_string(value)?,
             "parentUuid" => record.parent_uuid = parse_optional_string(value)?,
+            "agentName" => record.agent_name = parse_optional_string(value)?,
             "attachment" => record.attachment_type = scan_attachment_type(value)?,
             "forkedFrom" => record.forked_from = scan_optional_forked_from(value)?,
             "sourceToolAssistantUUID" => {
@@ -3496,6 +3518,55 @@ mod tests {
         assert_eq!(with.commits.len(), 3, "vocabulary, annotations, identity");
         assert_eq!(with.commits[2], without.commits[2], "the identity COMMIT");
         assert_ne!(with.commits[1], without.commits[1], "the annotation COMMIT");
+    }
+
+    /// The session's own name (its last `agent-name` record, as
+    /// `claude --name` writes it) annotates the file's leaves exactly as
+    /// spelled, and nothing else changes: the same nodes and receipts as the
+    /// file without the record. A field nobody knows yet is still tolerated.
+    #[test]
+    fn the_agent_name_annotates_the_leaves_and_moves_no_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("named.jsonl");
+        let question = r#"{"type":"user","sessionId":"named","uuid":"q","timestamp":"2026-11-17T00:00:01Z","futureField":{"nested":[1,2]},"message":{"role":"user","content":"hello there"}}"#;
+        let answer = r#"{"type":"assistant","sessionId":"named","uuid":"a","parentUuid":"q","timestamp":"2026-11-17T00:00:02Z","message":{"role":"assistant","content":"good night"}}"#;
+        let plain = format!("{question}\n{answer}\n");
+        let named = format!(
+            "{}\n{question}\n{}\n{answer}\n",
+            r#"{"type":"agent-name","agentName":"an-earlier-name","sessionId":"named"}"#,
+            r#"{"type":"agent-name","agentName":"agent-cc","sessionId":"named","notYetKnown":true}"#,
+        );
+        let without = project_text(&plain, &path);
+        let with = project_text(&named, &path);
+
+        let nodes = |fragment: &Fragment| ids_with_tag(fragment, schema::block::KIND);
+        let receipts =
+            |fragment: &Fragment| ids_with_tag(fragment, schema::source_projection::KIND);
+        assert_eq!(nodes(&with.fragment), nodes(&without.fragment));
+        assert_eq!(receipts(&with.fragment), receipts(&without.fragment));
+        let difference = with.fragment.facts().difference(without.fragment.facts());
+        assert!(!difference.is_empty());
+        assert!(difference
+            .iter()
+            .all(|trible| *trible.a() == schema::source_projection::raw_agent_name.id()));
+
+        let leaf = block_with_payload(&with.fragment, "good night");
+        let root = block_with_payload(&with.fragment, "hello there");
+        assert!(exists!(pattern!(&with.fragment, [{
+            _?receipt @ schema::source_projection::projects_to: leaf,
+            schema::source_projection::raw_agent_name: "agent-cc"
+        }])));
+        assert!(!exists!(pattern!(&with.fragment, [{
+            _?receipt @ schema::source_projection::raw_agent_name: "an-earlier-name"
+        }])));
+        assert!(!exists!(pattern!(&with.fragment, [{
+            _?receipt @ schema::source_projection::projects_to: root,
+            schema::source_projection::raw_agent_name: _?name
+        }])));
+        // A transcript with no `agent-name` record carries no name at all.
+        assert!(!exists!(pattern!(&without.fragment, [{
+            _?receipt @ schema::source_projection::raw_agent_name: _?name
+        }])));
     }
 
     #[test]

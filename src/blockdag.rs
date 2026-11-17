@@ -69,6 +69,17 @@ pub struct ProjectionAnnotations {
     pub source_locator: Option<String>,
     /// Canonical JSON of provider metadata about that conversation.
     pub source_detail: Option<String>,
+    /// The agent name the source's own session metadata gives that
+    /// conversation, exactly as spelled there (Claude Code `agent-name`,
+    /// Codex `agent_nickname`). Leaves only; never from a persona.
+    pub raw_agent_name: Option<String>,
+    /// The provider thread the leaf ends, as `thread/<id>`, where one session
+    /// holds several threads (Codex subagents share their root's session).
+    pub source_thread: Option<String>,
+    /// Exact source label of who started that thread (Codex `thread_source`).
+    pub raw_thread_source: Option<String>,
+    /// Exact source agent path of that thread (Codex `agent_path`).
+    pub raw_agent_path: Option<String>,
 }
 
 fn rooted(fragment: &Fragment, what: &str) -> Result<Id> {
@@ -633,6 +644,18 @@ pub fn annotate_source_projection(
     let source_detail = annotations
         .source_detail
         .map(|value| projection.put::<UTF8String, _>(value));
+    let raw_agent_name = annotations
+        .raw_agent_name
+        .map(|value| projection.put::<UTF8String, _>(value));
+    let source_thread = annotations
+        .source_thread
+        .map(|value| projection.put::<UTF8String, _>(value));
+    let raw_thread_source = annotations
+        .raw_thread_source
+        .map(|value| projection.put::<UTF8String, _>(value));
+    let raw_agent_path = annotations
+        .raw_agent_path
+        .map(|value| projection.put::<UTF8String, _>(value));
 
     projection += entity! { ExclusiveId::force_ref(&root) @
         schema::source_projection::semantic_predecessor_support*:
@@ -646,6 +669,10 @@ pub fn annotate_source_projection(
         schema::source_projection::generated_by*: annotations.generated_by.iter(),
         schema::source_projection::source_locator?: source_locator.as_ref(),
         schema::source_projection::source_detail?: source_detail.as_ref(),
+        schema::source_projection::raw_agent_name?: raw_agent_name.as_ref(),
+        schema::source_projection::source_thread?: source_thread.as_ref(),
+        schema::source_projection::raw_thread_source?: raw_thread_source.as_ref(),
+        schema::source_projection::raw_agent_path?: raw_agent_path.as_ref(),
     };
     debug_assert_eq!(projection.root(), Some(root));
     Ok(projection)
@@ -966,10 +993,20 @@ mod tests {
                 generated_by: vec![id(11)],
                 source_locator: Some("conversation/7".into()),
                 source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
+                raw_agent_name: Some("agent-cc".into()),
+                source_thread: Some("thread/t-7".into()),
+                raw_thread_source: Some("subagent".into()),
+                raw_agent_path: Some("/root/task".into()),
             },
         )
         .unwrap();
         assert_eq!(annotated.root(), Some(root));
+        assert!(exists!(pattern!(&annotated, [{
+            root @ schema::source_projection::raw_agent_name: "agent-cc",
+            schema::source_projection::source_thread: "thread/t-7",
+            schema::source_projection::raw_thread_source: "subagent",
+            schema::source_projection::raw_agent_path: "/root/task",
+        }])));
         assert!(exists!(pattern!(&annotated, [{
             root @ schema::source_projection::author: &id(9),
             schema::source_projection::experiencer: &id(10),

@@ -54,7 +54,8 @@
 //! `replacement_history` repeats earlier items plus sealed tokens;
 //! `ghost_snapshot` holds git object references; `session_meta` and
 //! `turn_context` are session state (the session id names the leaf, the model
-//! annotates receipts).
+//! annotates receipts; the first header's `id`, `thread_source`, `agent_path`
+//! and `agent_nickname` annotate the leaves, exactly as spelled).
 //!
 //! A live rollout is planned at its last newline-terminated record; appends
 //! are harmless and mutation of already observed bytes aborts before
@@ -145,10 +146,25 @@ struct PrefixPlan {
     /// Creation time (Unix ms) of a fork that opens by replaying its
     /// parent's records; `None` for a file that replays nothing.
     fork_start_ms: Option<i64>,
+    /// What the rollout's own `session_meta` says about its thread.
+    labels: ThreadLabels,
     observed_bytes: u64,
     complete_bytes: u64,
     trailing_bytes: u64,
     digest: [u8; 32],
+}
+
+/// What a rollout's own (first) `session_meta` says about its thread, each
+/// exactly as spelled there and only when present: `id` (the thread; a
+/// subagent's `session_id` is its root's), `thread_source` (`user` or
+/// `subagent`), `agent_path` and `agent_nickname`. They annotate the leaves;
+/// none is ever derived from anything else.
+#[derive(Clone, Debug, Default)]
+struct ThreadLabels {
+    thread_id: Option<String>,
+    thread_source: Option<String>,
+    agent_path: Option<String>,
+    agent_nickname: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -325,6 +341,14 @@ where
         projector.chain(),
         archive_source::UnitAnnotations {
             source_locator: Some(format!("session/{}", plan.session_id)),
+            raw_agent_name: plan.labels.agent_nickname.clone(),
+            source_thread: plan
+                .labels
+                .thread_id
+                .as_ref()
+                .map(|id| format!("thread/{id}")),
+            raw_thread_source: plan.labels.thread_source.clone(),
+            raw_agent_path: plan.labels.agent_path.clone(),
         },
         |projected| {
             fragments_emitted += 1;
@@ -363,6 +387,8 @@ struct PlanScan {
     /// Headers naming another session than the rollout's own: ancestors a
     /// resume or fork replays.
     ancestor_sessions: usize,
+    /// The first header's thread labels.
+    labels: ThreadLabels,
 }
 
 impl PlanScan {
@@ -381,6 +407,7 @@ impl PlanScan {
                     .and_then(json_str)
                     .filter(|id| !id.as_ref().trim().is_empty())
                     .map(|id| id.as_ref().to_owned());
+                self.labels.thread_id = self.legacy_id.clone();
             }
         }
         if !contains(raw, b"\"session_meta\"") {
@@ -398,14 +425,40 @@ impl PlanScan {
                 .as_deref()
                 .and_then(parse_iso_timestamp)
                 .map(epoch_ms);
-            self.forked = json_document(raw)
-                .ok()
-                .and_then(|value| {
-                    let [payload] = json_members(&value, ["payload"]);
-                    let [forked_from] = json_members(&payload?, ["forked_from_id"]);
-                    json_str(&forked_from?).map(|id| !id.as_ref().trim().is_empty())
-                })
-                .unwrap_or(false);
+            let payload = json_document(raw).ok().and_then(|value| {
+                let [payload] = json_members(&value, ["payload"]);
+                payload
+            });
+            let [forked_from, thread, source, path, nickname] = match &payload {
+                Some(payload) => json_members(
+                    payload,
+                    [
+                        "forked_from_id",
+                        "id",
+                        "thread_source",
+                        "agent_path",
+                        "agent_nickname",
+                    ],
+                ),
+                None => Default::default(),
+            };
+            self.forked = forked_from
+                .as_ref()
+                .and_then(json_str)
+                .is_some_and(|id| !id.as_ref().trim().is_empty());
+            let label = |value: &Option<Bytes>| {
+                value
+                    .as_ref()
+                    .and_then(json_str)
+                    .filter(|value| !value.as_ref().trim().is_empty())
+                    .map(|value| value.as_ref().to_owned())
+            };
+            self.labels = ThreadLabels {
+                thread_id: label(&thread),
+                thread_source: label(&source),
+                agent_path: label(&path),
+                agent_nickname: label(&nickname),
+            };
         }
         let payload = record
             .payload
@@ -428,13 +481,13 @@ impl PlanScan {
 
     /// The session id, whether the file is in the legacy bare format,
     /// whether it carries events, and a replaying fork's creation time.
-    fn finish(self, path: &Path) -> Result<(String, bool, bool, Option<i64>)> {
+    fn finish(self, path: &Path) -> Result<(String, bool, bool, Option<i64>, ThreadLabels)> {
         let fork_start_ms = (self.forked || self.metas >= 2)
             .then_some(self.first_meta_ms)
             .flatten();
         match (self.session_id, self.legacy_id) {
-            (Some(id), _) => Ok((id, false, self.has_events, fork_start_ms)),
-            (None, Some(id)) => Ok((id, true, self.has_events, None)),
+            (Some(id), _) => Ok((id, false, self.has_events, fork_start_ms, self.labels)),
+            (None, Some(id)) => Ok((id, true, self.has_events, None, self.labels)),
             (None, None) => bail!(
                 "Codex rollout {} has no stable session_meta.payload.id/session_id or legacy header id in its complete prefix",
                 path.display()
@@ -453,7 +506,7 @@ where
     let path = Path::new(source_name);
     let mut planned = PlanScan::default();
     let scan = scan_frozen_prefix(&bytes, |_line, raw| planned.observe(raw.as_ref(), path))?;
-    let (session_id, legacy, has_events, fork_start_ms) = planned.finish(path)?;
+    let (session_id, legacy, has_events, fork_start_ms, labels) = planned.finish(path)?;
     let observed_bytes = u64::try_from(bytes.len()).context("resident Codex length exceeds u64")?;
     let digest = *blake3::hash(bytes.as_ref()).as_bytes();
     let plan = PrefixPlan {
@@ -461,6 +514,7 @@ where
         has_events,
         legacy,
         fork_start_ms,
+        labels,
         observed_bytes,
         complete_bytes: scan.complete_bytes,
         trailing_bytes: observed_bytes.saturating_sub(scan.complete_bytes),
@@ -483,12 +537,13 @@ fn plan_prefix(path: &Path) -> Result<PrefixPlan> {
         .len();
     let mut planned = PlanScan::default();
     let (scan, digest) = scan_prefix(path, source_len, |_line, raw| planned.observe(raw, path))?;
-    let (session_id, legacy, has_events, fork_start_ms) = planned.finish(path)?;
+    let (session_id, legacy, has_events, fork_start_ms, labels) = planned.finish(path)?;
     Ok(PrefixPlan {
         session_id,
         has_events,
         legacy,
         fork_start_ms,
+        labels,
         observed_bytes: source_len,
         complete_bytes: scan.complete_bytes,
         trailing_bytes: source_len.saturating_sub(scan.complete_bytes),
@@ -1805,6 +1860,65 @@ mod tests {
         assert!(!exists!(pattern!(fragment.facts(), [{
             _?block @ schema::block::timestamp: _?timestamp
         }])));
+    }
+
+    /// The rollout's own header labels its thread exactly as spelled: the
+    /// thread id, `thread_source`, `agent_path` and `agent_nickname`, on the
+    /// leaf only. A subagent shares its root's `session_id`, so its locator
+    /// is the root's; the thread tells them apart. Nothing else changes, and
+    /// a header field nobody knows yet is tolerated.
+    #[test]
+    fn the_thread_labels_annotate_the_leaf_and_move_no_identity() {
+        let root_header = r#"{"timestamp":"2026-08-16T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-1","session_id":"thread-1"}}"#;
+        let subagent_header = r#"{"timestamp":"2026-08-16T08:00:00.000Z","type":"session_meta","payload":{"id":"thread-sub","session_id":"thread-1","thread_source":"subagent","agent_path":"/root/stars_inventory","agent_nickname":"Noether the 2nd","parent_thread_id":"thread-1","futureField":{"x":[1]}}}"#;
+        let body = ROLLOUT.split_once('\n').unwrap().1;
+        let (_root_dir, _, root) = project_text(ROLLOUT, "root.jsonl");
+        let (_sub_dir, _, sub) = project_text(&format!("{subagent_header}\n{body}"), "sub.jsonl");
+        assert!(ROLLOUT.starts_with(root_header));
+
+        assert_eq!(
+            ids_with_tag(&root, schema::block::KIND),
+            ids_with_tag(&sub, schema::block::KIND)
+        );
+        assert_eq!(
+            ids_with_tag(&root, schema::source_projection::KIND),
+            ids_with_tag(&sub, schema::source_projection::KIND)
+        );
+        let labels = [
+            schema::source_projection::source_thread.id(),
+            schema::source_projection::raw_thread_source.id(),
+            schema::source_projection::raw_agent_path.id(),
+            schema::source_projection::raw_agent_name.id(),
+        ];
+        let difference = sub.facts().difference(root.facts());
+        assert!(!difference.is_empty());
+        assert!(difference.iter().all(|trible| labels.contains(trible.a())));
+
+        assert!(exists!(pattern!(sub.facts(), [{
+            _?receipt @ schema::source_projection::source_locator: "session/thread-1",
+            schema::source_projection::source_thread: "thread/thread-sub",
+            schema::source_projection::raw_thread_source: "subagent",
+            schema::source_projection::raw_agent_path: "/root/stars_inventory",
+            schema::source_projection::raw_agent_name: "Noether the 2nd"
+        }])));
+        assert_eq!(
+            find!(
+                receipt: Id,
+                pattern!(sub.facts(), [{
+                    ?receipt @ schema::source_projection::source_thread: _?thread
+                }])
+            )
+            .count(),
+            1,
+            "the thread names the leaf only"
+        );
+        // The root's own header has a thread id and no subagent labels.
+        assert!(exists!(pattern!(root.facts(), [{
+            _?receipt @ schema::source_projection::source_thread: "thread/thread-1"
+        }])));
+        for attribute in &labels[1..] {
+            assert!(!root.facts().iter().any(|trible| trible.a() == attribute));
+        }
     }
 
     #[test]
@@ -3155,43 +3269,43 @@ mod tests {
     }
 
     const PINNED: &[(&str, &str)] = &[
-        ("items", "1fa349bfec3765dad80d4ca9dc1fba16"),
-        ("events", "20270aeb660780c1897dcb073c6acafd"),
-        ("rollout", "f611e41ec1f0740cf95136cc1144e486"),
-        ("parent", "ff6de39d0c19f6cf54d4ae53208d0ba3"),
-        ("fork", "4d8969b81b197bb935fce676f59ef6ef"),
-        ("grand-2025", "788736ba21385b82898bdd9709bad866"),
-        ("resume-2025", "3a8a082d6adea7449f4d30f18e4e7a0f"),
-        ("legacy", "acae7ba636558b4a7fcdb1c4ae0d02bf"),
-        ("legacy-duplicate-id", "0a2beae84407483a8243d6cb4ff6691c"),
-        ("legacy-escaped-id", "50c82efac9f7e38511247801f0136311"),
+        ("items", "0490d45c2df6adb44288ca501ff65ada"),
+        ("events", "270149f19dc247308c072a8e077f8746"),
+        ("rollout", "f1b89cbc50a3550f5bace1eb3b560707"),
+        ("parent", "d2435260cb6d1b028a65978244aaf3dc"),
+        ("fork", "27ec4ad2ca93c5fde807eef9f3be178a"),
+        ("grand-2025", "bfd100937842e50d3165678b7358c39f"),
+        ("resume-2025", "9ef9338f3072b29c19bdd19616d2317f"),
+        ("legacy", "f07f567dd8a73e0956780cf511f60e45"),
+        ("legacy-duplicate-id", "3103b588b5a06370c269dad94501c69b"),
+        ("legacy-escaped-id", "b1a7c425194578be65a0e7bc5917ebba"),
         (
             "fork-float-start-turn-id",
-            "2e06ce2835e1a43e4a22dc55ffcbfa92",
+            "ca2ef10b880b0cfcfe1e79c63c508d3d",
         ),
-        ("fork-int-start", "b71f36b87d3c706b9a6c151036a374ff"),
+        ("fork-int-start", "43c02a2e611ea0baf8df06ddc014eb9c"),
         (
             "fork-negative-zero-start",
-            "8d687834b71d02b50b10a29ab5bc19f1",
+            "ef8c4a03aa6a0f39fc559c97b2777841",
         ),
-        ("fork-negative-start", "173786c973190705fbb0e34bcab8cd4d"),
-        ("fork-u64-start", "52dd0a5fd82f46ab2b89a506a5f74445"),
-        ("fork-exponent-start", "9e1388504fc2e759af1024136f091da0"),
-        ("fork-string-start", "9e1388504fc2e759af1024136f091da0"),
-        ("fork-duplicate-start", "00659b27539443112cd903f14d46a1d7"),
-        ("fork-unparsable-turn", "5e5b78908d65619dd6598280c6d3b984"),
+        ("fork-negative-start", "20d1166d6740f1445c8aabd48d1dba78"),
+        ("fork-u64-start", "0906107d72723ae8e0833d2ddf25dcb6"),
+        ("fork-exponent-start", "e74435b917469633a90b52458a529262"),
+        ("fork-string-start", "e74435b917469633a90b52458a529262"),
+        ("fork-duplicate-start", "c260ec20ec1aaaea5c3c9d367877c17c"),
+        ("fork-unparsable-turn", "0375bdf1a7476121a6724b016018c0bb"),
         (
             "fork-context-ends-replay",
-            "8e5f4b7c64ac68590c041668a79bbe6e",
+            "a3b827a147ffd3be3278de4e35f436b2",
         ),
-        ("fork-single-meta", "0eda2697a98ae89ed8bbb7559bd4bdc4"),
+        ("fork-single-meta", "9d1dee15104d859cb25263cdcf69c318"),
         ("fork-unparsable-meta", "42d14c47c81e304c3e6f39ddb1dbfe12"),
-        ("fork-blank-forked-from", "b1eec6ed3b1bdb5c7486a34fb4d01a59"),
+        ("fork-blank-forked-from", "593bc6660552d9425de05bd0dc0d0b50"),
         (
             "fork-number-forked-from",
-            "f5436c973d888b39b9c704b9d4f2f70d",
+            "bd54fee6da09b8768df1b9a785b240f3",
         ),
-        ("fork-deep-meta", "e76a4a4c7f4dc1a2582846663cc19208"),
+        ("fork-deep-meta", "218ef3018f2ca4061c04378f7e54fea0"),
         ("fork-too-deep-meta", "e88591c222c2381c0ed0d67ce7a889fb"),
     ];
 

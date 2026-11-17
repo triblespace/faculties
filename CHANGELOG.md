@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `orient wake --moment-of <LABEL>` ends the wake with a Moment: the newest raw
+  turns the Archive holds whose leaf carries that agent name, after Compass, so
+  everything before it is the same text with or without it.
+  `--moment-session <session/ID>` and `--moment-thread <ID>` name an explicit
+  edge instead. The wake stays persona-free: the selector is only what the
+  caller names, and no Moment is ever a default. The heading says "latest held
+  material for <label>" with its source and time; only an explicit edge is
+  called a predecessor. When nothing is held, it says so. The renderer is
+  compact: one label per run of one direction, text and thinking whole, a tool
+  call as its name and clipped input, results clipped, status events dropped,
+  sealed thinking one line, classifier-stop withholding kept
+  (`--reader-provider`). The walk reads at most `--moment-nodes` (600) nodes
+  and `--moment-chars` (30,000) characters, and marks every cut. Codex and
+  Claude Code subagent conversations are left out unless `--moment-subagents`.
+  Not yet in `--pairs` or the MCP tool.
+- Archive keeps the source's own labels on importer leaves, as annotations
+  (node and receipt ids do not change): Claude Code's `agent-name` record as
+  `raw_agent_name` (the file's last one); Codex's first `session_meta` `id` as
+  `source_thread` (`thread/<id>`), `thread_source` as `raw_thread_source`,
+  `agent_path` as `raw_agent_path` and `agent_nickname` as `raw_agent_name`.
+  A Codex subagent shares its root's `session_id`, so the thread is what tells
+  their tails apart. Only imports made after this change carry them.
+
 - `spawn request` (MCP `spawn_request`) writes a run request into the spawn
   collection: a zooid (an existing one by name, or a new brief whose spawn
   record travels with it), one target host by node key with a readable label

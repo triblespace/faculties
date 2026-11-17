@@ -937,6 +937,24 @@ pub struct UnitAnnotations {
     /// The conversation's own id, as its content spells it (conversation or
     /// session id).
     pub source_locator: Option<String>,
+    /// The agent name the source's own metadata gives the conversation.
+    pub raw_agent_name: Option<String>,
+    /// The provider thread, as `thread/<id>`, where a session holds several.
+    pub source_thread: Option<String>,
+    /// Exact source label of who started that thread.
+    pub raw_thread_source: Option<String>,
+    /// Exact source agent path of that thread.
+    pub raw_agent_path: Option<String>,
+}
+
+impl UnitAnnotations {
+    fn is_empty(&self) -> bool {
+        self.source_locator.is_none()
+            && self.raw_agent_name.is_none()
+            && self.source_thread.is_none()
+            && self.raw_thread_source.is_none()
+            && self.raw_agent_path.is_none()
+    }
 }
 
 /// The smallest interval covering every given one.
@@ -1190,12 +1208,12 @@ where
     if emitted != records.len() {
         bail!("source predecessor graph contains a cycle");
     }
-    // The conversation's id lands on the unit's leaves only.
+    // The conversation's id and labels land on the unit's leaves only.
     let mut annotated = BTreeSet::new();
     for (node, receipt) in receipts {
-        let Some(locator) = unit.source_locator.clone() else {
+        if unit.is_empty() {
             break;
-        };
+        }
         if followed.contains(&node) || !annotated.insert(receipt) {
             continue;
         }
@@ -1204,7 +1222,11 @@ where
             fragment: blockdag::source_occurrence(
                 receipt,
                 ProjectionAnnotations {
-                    source_locator: Some(locator),
+                    source_locator: unit.source_locator.clone(),
+                    raw_agent_name: unit.raw_agent_name.clone(),
+                    source_thread: unit.source_thread.clone(),
+                    raw_thread_source: unit.raw_thread_source.clone(),
+                    raw_agent_path: unit.raw_agent_path.clone(),
                     ..ProjectionAnnotations::default()
                 },
             )?,
@@ -1481,6 +1503,7 @@ mod tests {
         ];
         let unit = |id: &str| UnitAnnotations {
             source_locator: Some(id.to_owned()),
+            ..UnitAnnotations::default()
         };
         let (_, a) = project(first, unit("conv-1"));
         let (_, b) = project(renamed, unit("other-id"));
@@ -1515,6 +1538,7 @@ mod tests {
             records,
             UnitAnnotations {
                 source_locator: Some("conv".to_owned()),
+                ..UnitAnnotations::default()
             },
         );
         let annotated: BTreeSet<Id> = find!(
