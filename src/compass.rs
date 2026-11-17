@@ -25,7 +25,7 @@ mod render;
 
 pub use operations::{
     AddOptions, AddedGoal, AddedNote, Board, Compass, GoalNote, GoalReading, GoalState,
-    ListOptions, MovedGoal, NoteOptions, PriorityChange,
+    ListOptions, MovedGoal, NoteOptions, PriorityChange, TaggedGoal,
 };
 
 use crate::storage::FactRead;
@@ -258,6 +258,14 @@ fn goal_fragment_impl(
     let goal = record.root().expect("goal record exports one root");
     fragment += record;
     Ok((fragment, goal))
+}
+
+/// More `board::tag` facts on an existing goal, as an annotation beside its
+/// core. The goal id is whatever its constructor derived; tags asserted later
+/// never enter it, and no reader recomputes it. No time is written, so an
+/// exact retry converges.
+pub fn tag_fragment(goal: Id, tags: &[String]) -> Fragment {
+    entity! { ExclusiveId::force_ref(&goal) @ board::tag*: tags.iter().map(String::as_str) }
 }
 
 /// One intrinsic status event. Exact replay has the same entity id; two

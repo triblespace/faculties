@@ -95,6 +95,16 @@ pub struct MovedGoal {
     pub status: String,
 }
 
+/// The tags one tag operation asserted on a goal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaggedGoal {
+    pub goal: Id,
+    /// The canonical tags this operation newly asserted, sorted.
+    pub added: Vec<String>,
+    /// Requested tags the goal already held; nothing was written for them.
+    pub held: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddedNote {
     pub goal: Id,
@@ -292,6 +302,16 @@ impl Compass {
 
     pub fn move_goal(&self, id: &str, status: &str, persona: Option<&str>) -> Result<MovedGoal> {
         move_goal(self.storage(), id.to_owned(), status.to_owned(), persona)
+    }
+
+    /// Assert more tags on an existing goal. A tag is the same `board::tag`
+    /// fact `add` writes, published later beside the goal's core: an
+    /// open-world addition, never an edit, and there is no way to take one
+    /// back. The fact sits on the goal itself, which has no author slot, so
+    /// the only authorship is the publishing commit's signer. Tags the goal
+    /// already holds are not written again; all held is a genuine no-op.
+    pub fn tag(&self, id: &str, tags: &[String]) -> Result<TaggedGoal> {
+        tag_goal(self.storage(), id.to_owned(), tags.to_vec())
     }
 
     /// The body is literal prose, including any leading `@` characters.
@@ -1311,6 +1331,38 @@ fn move_goal(
                     status: rendered_status,
                 },
             ))
+        },
+    )
+}
+
+fn tag_goal(storage: CompassStorage<'_>, id: String, tags: Vec<String>) -> Result<TaggedGoal> {
+    let tags = compass::canonical_tags(tags)?;
+    if tags.is_empty() {
+        bail!("at least one tag is required");
+    }
+    storage.update(
+        None,
+        &[],
+        |space, _reader, _by, _| {
+            let goal = resolve_task_id(&id, space)?;
+            // A full id resolves without a lookup; a tag must name a goal
+            // this view holds, never mint a stray entity.
+            if !exists!(pattern!(space, [{ goal @ metadata::tag: &KIND_GOAL_ID }])) {
+                bail!("no goal {goal:x} in this view; tags are added to existing goals only");
+            }
+            let (held, added): (Vec<String>, Vec<String>) = tags
+                .iter()
+                .cloned()
+                .partition(|tag| exists!(pattern!(space, [{ goal @ board::tag: tag.as_str() }])));
+            Ok((goal, added, held))
+        },
+        |(goal, added, held)| {
+            let change = (!added.is_empty()).then(|| {
+                let mut change = compass::kind_catalog_fragment();
+                change += compass::tag_fragment(goal, &added);
+                change
+            });
+            Ok((change, TaggedGoal { goal, added, held }))
         },
     )
 }

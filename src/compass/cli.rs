@@ -111,6 +111,14 @@ enum Command {
         id: String,
         status: String,
     },
+    /// Add tags to an existing goal (monotone: a tag cannot be removed)
+    Tag {
+        /// Full 32-char hex id
+        id: String,
+        /// Tags to add (at least one)
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
     /// Add a note to a goal
     Note {
         /// Full 32-char hex id
@@ -221,6 +229,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
         Command::Move { id, status } => {
             render::moved(&compass.move_goal(&id, &status, persona)?, output)
         }
+        Command::Tag { id, tags } => render::tagged(&compass.tag(&id, &tags)?, output),
         Command::Note {
             id,
             note,

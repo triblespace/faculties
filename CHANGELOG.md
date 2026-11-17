@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `compass tag <goal> <tag>...` (MCP `compass_tag`) adds tags to an existing
+  goal: the same `board::tag` fact `compass add --tag` writes, asserted later
+  beside the goal's identity. Tags cannot be removed. Tags the goal already
+  holds are reported and not written again, and an id that names no goal is
+  refused. The fact sits on the goal, which has no author slot, so no persona
+  is recorded.
+- `orient wake` and `orient goals` end their Compass text with a Horizons
+  section: every goal tagged `horizon` whose current status is not done, the
+  one that has gone longest without a status event or note first, each with
+  its other tags and "last moved N days ago" (hours under a day). All are
+  shown; with none, nothing is printed.
 - `orient wake --moment-of <LABEL>` ends the wake with a Moment: the newest raw
   turns the Archive holds whose leaf carries that agent name, after Compass, so
   everything before it is the same text with or without it.

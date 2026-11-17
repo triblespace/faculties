@@ -246,7 +246,7 @@ impl Orient {
             runtime.block_on(cmd_wake_pairs(&self.storage, pile, signer, options, out))
         })
     }
-    /// `orient goals`: the Compass section of the wake, alone.
+    /// `orient goals`: the Compass and Horizons sections of the wake, alone.
     pub fn goals(&self, doing_limit: usize, todo_limit: usize, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_goals(
@@ -2880,40 +2880,7 @@ fn render_native_compass_goals(
             }
         }
     };
-    let row = |task: Id| -> Result<String> {
-        let title = match native_task_title(query, task) {
-            Ok(title) => title,
-            Err(error) => match unreadable(&error) {
-                Some(reason) => format!("(title not readable: {reason})"),
-                None => return Err(error),
-            },
-        };
-        // Each tag is asked about on its own, so every unreadable tag name
-        // surfaces in one pass rather than one per presentable render.
-        let mut tags = Vec::new();
-        let mut unread = Vec::new();
-        for handle in find!(
-            tag: compass::TextHandle,
-            pattern!(query.compass, [{ task @ board::tag: ?tag }])
-        ) {
-            match read_utf8(&query.payloads, handle, "Compass tag") {
-                Ok(tag) => tags.push(tag),
-                Err(error) => match unreadable(&error) {
-                    Some(reason) => unread.push(reason),
-                    None => return Err(error),
-                },
-            }
-        }
-        let mut tags = render_tags(&tags);
-        if !unread.is_empty() {
-            tags.push_str(&format!(
-                " ({} tag(s) not readable: {})",
-                unread.len(),
-                unread.join("; ")
-            ));
-        }
-        Ok(format!("- [{}] {title}{tags}", fmt_id(task)))
-    };
+    let row = |task: Id| goal_row(query, task, unreadable, None);
     writeln!(out, "Compass:").unwrap();
     if doing.is_empty() && todo.is_empty() {
         writeln!(out, "- No goals.").unwrap();
@@ -2954,6 +2921,165 @@ fn render_native_compass_goals(
     }
     not_placed(&mut out);
     Ok((out, shown))
+}
+
+/// One goal's wake row: `- [id] title #tags`. An unreadable title or tag that
+/// `unreadable` accepts is said on the row; any other error fails it. `skip`
+/// leaves one tag out, for a section that already names it.
+fn goal_row(
+    query: &OrientQuery<'_>,
+    task: Id,
+    unreadable: &crate::storage::Unreadable<'_>,
+    skip: Option<&str>,
+) -> Result<String> {
+    let title = match native_task_title(query, task) {
+        Ok(title) => title,
+        Err(error) => match unreadable(&error) {
+            Some(reason) => format!("(title not readable: {reason})"),
+            None => return Err(error),
+        },
+    };
+    // Each tag is asked about on its own, so every unreadable tag name
+    // surfaces in one pass rather than one per presentable render.
+    let mut tags = Vec::new();
+    let mut unread = Vec::new();
+    for handle in find!(
+        tag: compass::TextHandle,
+        pattern!(query.compass, [{ task @ board::tag: ?tag }])
+    ) {
+        match read_utf8(&query.payloads, handle, "Compass tag") {
+            Ok(tag) if Some(tag.as_str()) == skip => {}
+            Ok(tag) => tags.push(tag),
+            Err(error) => match unreadable(&error) {
+                Some(reason) => unread.push(reason),
+                None => return Err(error),
+            },
+        }
+    }
+    let mut tags = render_tags(&tags);
+    if !unread.is_empty() {
+        tags.push_str(&format!(
+            " ({} tag(s) not readable: {})",
+            unread.len(),
+            unread.join("; ")
+        ));
+    }
+    Ok(format!("- [{}] {title}{tags}", fmt_id(task)))
+}
+
+/// The tag that makes a goal a long horizon of the wake's own.
+const HORIZON_TAG: &str = "horizon";
+
+/// When a goal last moved: its newest status event or note, whatever the
+/// event's status word. A goal with neither falls back to its creation time;
+/// `None` when no time on it decodes.
+fn goal_last_moved(query: &OrientQuery<'_>, goal: Id) -> Option<i128> {
+    find!(
+        at: IntervalValue,
+        pattern!(query.compass, [{ _?event @
+            metadata::tag: &KIND_STATUS_ID,
+            board::status_of: &goal,
+            metadata::created_at: ?at,
+        }])
+    )
+    .chain(find!(
+        at: IntervalValue,
+        pattern!(query.compass, [{ _?event @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: &goal,
+            metadata::created_at: ?at,
+        }])
+    ))
+    // Status events written before `status_of` named their goal through
+    // `board::task`; they are still movements.
+    .chain(find!(
+        at: IntervalValue,
+        pattern!(query.compass, [{ _?event @
+            metadata::tag: &KIND_STATUS_ID,
+            board::task: &goal,
+            metadata::created_at: ?at,
+        }])
+    ))
+    .filter_map(interval_key)
+    .max()
+    .or_else(|| {
+        find!(
+            at: IntervalValue,
+            pattern!(query.compass, [{ goal @ metadata::created_at: ?at }])
+        )
+        .filter_map(interval_key)
+        .min()
+    })
+}
+
+/// "last moved N days ago", in hours under a day.
+fn moved_ago(now: i128, at: Option<i128>) -> String {
+    let Some(at) = at else {
+        return "last moved: no readable time".to_owned();
+    };
+    let seconds = (now.saturating_sub(at) / 1_000_000_000).max(0);
+    let (count, unit) = if seconds >= 60 * 60 * 24 {
+        (seconds / (60 * 60 * 24), "day")
+    } else {
+        (seconds / (60 * 60), "hour")
+    };
+    if count == 0 {
+        return "last moved less than an hour ago".to_owned();
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    format!("last moved {count} {unit}{plural} ago")
+}
+
+/// The Horizons section of `orient wake`: every goal tagged `horizon` whose
+/// current status is not done, the one that has gone longest without moving
+/// first, so an idle moment can ask which of them moves today. All of them
+/// are shown. With none, the section is the empty string, not an empty
+/// header. A status that cannot be read is said rather than guessed at.
+fn render_native_horizons(
+    query: &OrientQuery<'_>,
+    unreadable: &crate::storage::Unreadable<'_>,
+) -> Result<String> {
+    use std::fmt::Write as _;
+
+    let mut rows = Vec::<(Option<i128>, Id)>::new();
+    let mut unplaced = Vec::<String>::new();
+    for goal in find!(
+        goal: Id,
+        pattern!(query.compass, [{ ?goal @
+            metadata::tag: &KIND_GOAL_ID,
+            board::tag: HORIZON_TAG,
+        }])
+    )
+    .collect::<BTreeSet<_>>()
+    {
+        match latest_goal_status(query, goal) {
+            Ok(Some((_, status, _))) if status.eq_ignore_ascii_case("done") => continue,
+            Ok(_) => rows.push((goal_last_moved(query, goal), goal)),
+            Err(error) => match unreadable(&error) {
+                Some(reason) => unplaced.push(format!(
+                    "- [{}] status not readable in this snapshot ({reason})",
+                    fmt_id(goal)
+                )),
+                None => return Err(error),
+            },
+        }
+    }
+    let mut out = String::new();
+    if rows.is_empty() && unplaced.is_empty() {
+        return Ok(out);
+    }
+    // Oldest movement first; a goal with no readable time leads.
+    rows.sort();
+    let now = now_key()?;
+    writeln!(out, "Horizons ({}, longest unmoved first):", rows.len()).unwrap();
+    for (at, goal) in rows {
+        let row = goal_row(query, goal, unreadable, Some(HORIZON_TAG))?;
+        writeln!(out, "{row} — {}", moved_ago(now, at)).unwrap();
+    }
+    for line in unplaced {
+        writeln!(out, "{line}").unwrap();
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5881,8 +6007,11 @@ async fn wake_selection(
     let (goals, shown) =
         crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
             let query = observation.query(reader);
-            let (goals, shown) =
+            let (mut goals, shown) =
                 render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?;
+            // Horizons follow Doing and Todo. They are an overview, not
+            // attention events, so nothing here is recorded as presented.
+            goals.push_str(&render_native_horizons(&query, unreadable)?);
             let shown = match persona_id {
                 Some(persona) => {
                     let candidates: BTreeSet<_> =
@@ -6133,8 +6262,8 @@ async fn cmd_wake_pairs(
     Ok(diagnostics)
 }
 
-/// `orient goals`: the Compass section of `orient wake`, alone. Maintains
-/// its inputs like wake does and never records presentation.
+/// `orient goals`: the Compass and Horizons sections of `orient wake`, alone.
+/// Maintains its inputs like wake does and never records presentation.
 async fn cmd_goals(
     routing: &Storage,
     storage: &mut FacultyStore,
@@ -6153,7 +6282,10 @@ async fn cmd_goals(
     let goals =
         crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
             let query = observation.query(reader);
-            Ok(render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?.0)
+            let (mut goals, _) =
+                render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?;
+            goals.push_str(&render_native_horizons(&query, unreadable)?);
+            Ok(goals)
         })
         .await?;
     write_complete_report(output, &goals, "Orient goals", &mut |_| {}).await
@@ -10059,6 +10191,126 @@ mod tests {
             assert_eq!(calls.get(), 3, "{goals}");
             pile.close().unwrap();
         });
+    }
+
+    /// Horizons are the not-done goals tagged `horizon`, the one that has gone
+    /// longest without a status event or note first; the `horizon` tag itself
+    /// is not repeated on the row, and with none the section is empty.
+    #[test]
+    fn horizons_order_by_last_movement_and_omit_done_ones() {
+        test_block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let at = |seconds: f64| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
+            let goal = |title: &str, tags: &[&str], seconds: f64| {
+                compass::goal_fragment(
+                    title,
+                    tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    None,
+                    at(seconds),
+                )
+                .unwrap()
+            };
+            // Nothing tagged yet: no section, not even a header.
+            let (plain, plain_id) = goal("ordinary goal", &["topic"], 1.0);
+            pile.commit(sources.compass.source, &fixture.signer, plain)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
+            let query = observation.query(&observation.snapshot);
+            assert_eq!(render_native_horizons(&query, &|_| None).unwrap(), "");
+
+            // Created first, but a note moved it last.
+            let (noted, noted_id) = goal("noted horizon", &["horizon", "owner-a"], 2.0);
+            let (note, _) = compass::note_fragment(
+                noted_id,
+                "a step".to_owned(),
+                vec![],
+                vec![],
+                vec![],
+                None,
+                at(500.0),
+            )
+            .unwrap();
+            // Created later, moved by a status event in between.
+            let (moved, moved_id) = goal("moved horizon", &["horizon"], 3.0);
+            let moved_status =
+                compass::status_fragment(moved_id, "doing", None, at(100.0)).unwrap();
+            // Finished: never shown, however long ago it moved.
+            let (done, done_id) = goal("done horizon", &["horizon"], 4.0);
+            let done_status = compass::status_fragment(done_id, "done", None, at(50.0)).unwrap();
+            pile.commit(
+                sources.compass.source,
+                &fixture.signer,
+                noted
+                    + note
+                    + compass::status_fragment(noted_id, "todo", None, at(2.0)).unwrap()
+                    + moved
+                    + moved_status
+                    + done
+                    + compass::status_fragment(done_id, "todo", None, at(4.0)).unwrap()
+                    + done_status
+                    + compass::status_fragment(plain_id, "doing", None, at(600.0)).unwrap(),
+            )
+            .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
+            let query = observation.query(&observation.snapshot);
+            let horizons = render_native_horizons(&query, &|_| None).unwrap();
+            let lines: Vec<&str> = horizons.lines().collect();
+            assert_eq!(lines.len(), 3, "{horizons}");
+            assert_eq!(lines[0], "Horizons (2, longest unmoved first):");
+            assert!(
+                lines[1].starts_with(&format!(
+                    "- [{}] moved horizon — last moved ",
+                    fmt_id(moved_id)
+                )),
+                "{horizons}"
+            );
+            assert!(
+                lines[2].starts_with(&format!(
+                    "- [{}] noted horizon #owner-a — last moved ",
+                    fmt_id(noted_id)
+                )),
+                "{horizons}"
+            );
+            assert!(lines[1].ends_with(" days ago"), "{horizons}");
+            assert!(!horizons.contains("done horizon"), "{horizons}");
+            assert!(!horizons.contains("ordinary goal"), "{horizons}");
+            assert!(!horizons.contains("#horizon"), "{horizons}");
+            pile.close().unwrap();
+        });
+    }
+
+    #[test]
+    fn moved_ago_reads_days_then_hours() {
+        let hour = 60 * 60 * 1_000_000_000_i128;
+        let now = 1_000 * 24 * hour;
+        assert_eq!(
+            moved_ago(now, Some(now - 3 * 24 * hour - hour)),
+            "last moved 3 days ago"
+        );
+        assert_eq!(
+            moved_ago(now, Some(now - 24 * hour)),
+            "last moved 1 day ago"
+        );
+        assert_eq!(
+            moved_ago(now, Some(now - 5 * hour)),
+            "last moved 5 hours ago"
+        );
+        assert_eq!(moved_ago(now, Some(now - hour)), "last moved 1 hour ago");
+        assert_eq!(
+            moved_ago(now, Some(now - 1)),
+            "last moved less than an hour ago"
+        );
+        assert_eq!(moved_ago(now, None), "last moved: no readable time");
     }
 
     #[test]

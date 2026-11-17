@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use super::{AddedGoal, AddedNote, Board, MovedGoal, PriorityChange};
+use super::{AddedGoal, AddedNote, Board, MovedGoal, PriorityChange, TaggedGoal};
 use crate::out::Out;
 
 pub(super) fn added(receipt: &AddedGoal, output: &mut Out<'_>) -> Result<()> {
@@ -27,6 +27,24 @@ pub(super) fn moved(receipt: &MovedGoal, output: &mut Out<'_>) -> Result<()> {
         "Moved goal {:x} to {}",
         receipt.goal, receipt.status
     ))
+}
+
+pub(super) fn tagged(receipt: &TaggedGoal, output: &mut Out<'_>) -> Result<()> {
+    if !receipt.added.is_empty() {
+        output.line(format!(
+            "Tagged goal {:x}: {}",
+            receipt.goal,
+            receipt.added.join(", ")
+        ))?;
+    }
+    if !receipt.held.is_empty() {
+        output.line(format!(
+            "Goal {:x} already has: {}",
+            receipt.goal,
+            receipt.held.join(", ")
+        ))?;
+    }
+    Ok(())
 }
 
 pub(super) fn noted(receipt: &AddedNote, output: &mut Out<'_>) -> Result<()> {
