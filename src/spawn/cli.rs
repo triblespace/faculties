@@ -52,7 +52,8 @@ enum Command {
         /// The spawning persona, messaged when the zooid ends. Defaults to $PERSONA.
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
-        /// The agent: claude, codex, auto (most quota headroom) or local.
+        /// The agent: claude, codex, mistral (opt-in; bills money, capped by
+        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local.
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -78,7 +79,8 @@ enum Command {
         /// The spawning persona, messaged when the zooid ends. Defaults to $PERSONA.
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
-        /// The agent: claude, codex, auto (most quota headroom) or local.
+        /// The agent: claude, codex, mistral (opt-in; bills money, capped by
+        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local.
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -99,7 +101,7 @@ enum Command {
         /// --host is omitted.
         #[arg(long)]
         label: Option<String>,
-        /// The agent: claude, codex, auto or local.
+        /// The agent: claude, codex, mistral (opt-in; bills money), auto or local.
         #[arg(long, default_value = "claude")]
         provider: String,
         /// Effort: low, medium, high, xhigh or max.
@@ -180,6 +182,10 @@ enum Command {
         /// File holding claude's stdout.
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
+        /// vibe's export.json, for a mistral run: its usage and cost are
+        /// recorded with the end.
+        #[arg(long, value_name = "PATH")]
+        usage: Option<PathBuf>,
     },
 }
 
@@ -399,6 +405,7 @@ pub fn run() -> Result<()> {
                 status,
                 result,
                 report,
+                usage,
             } => {
                 let run =
                     Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
@@ -415,6 +422,7 @@ pub fn run() -> Result<()> {
                     request,
                     exit: exit.clone(),
                     report,
+                    usage,
                 })?;
                 crate::cli::with_output("spawn", |out| {
                     out.line(format!(

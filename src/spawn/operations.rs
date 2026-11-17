@@ -37,6 +37,7 @@ use crate::memory_cover::CoverOpts;
 use crate::out::{Out, Part};
 use crate::relations::{ProfileInput, Relations};
 use crate::schemas::archive::archive as archive_attrs;
+use crate::schemas::imagine::imagine as imagine_attrs;
 use crate::schemas::spawn::{
     spawn as attrs, DEFAULT_SCOPE_ID, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN,
     OUTCOME_ACCEPTED, OUTCOME_REFUSED, OUTCOME_RUNNING, OUTCOME_TERMINAL,
@@ -210,6 +211,23 @@ pub struct LaunchConfig {
     /// the ambient configuration (MCP servers, hook trust, model). `None`
     /// links nothing, for a codex that authenticates from its environment.
     pub codex_auth: Option<PathBuf>,
+    /// The `vibe` command, for `--provider mistral`.
+    pub vibe: PathBuf,
+    /// The model mistral zooids run. The per-run vibe configuration prices
+    /// it at [`MISTRAL_INPUT_PRICE`] and [`MISTRAL_OUTPUT_PRICE`], which are
+    /// Large 4's, so this is not overridable from the environment.
+    pub mistral_model: String,
+    /// The exact Secrets version holding the Mistral API key. The unit reads
+    /// it with `secrets get` just before vibe starts; it is never written to
+    /// the prompt, a configuration file or a log. `SPAWN_MISTRAL_KEY_SECRET`
+    /// overrides it.
+    pub mistral_key_secret: String,
+    /// The most one mistral run may spend, in US dollars (`vibe --max-price`,
+    /// by vibe's own estimate from the configured prices).
+    /// `SPAWN_MISTRAL_MAX_PRICE` overrides it.
+    pub mistral_max_price: f64,
+    /// The command the unit reads secrets with, found on `path` inside it.
+    pub secrets: String,
     /// The colony's routes file. The unit sources it for what the launch
     /// did not resolve itself, and a launch refuses while it names a route
     /// the launch lacks.
@@ -246,6 +264,11 @@ impl LaunchConfig {
             codex: PathBuf::from("codex"),
             codex_model: None,
             codex_auth: Some(home.join(".codex/auth.json")),
+            vibe: PathBuf::from("vibe"),
+            mistral_model: "mistral-large-4".to_owned(),
+            mistral_key_secret: "c2c7b31676a61315928103941b04d487".to_owned(),
+            mistral_max_price: 2.0,
+            secrets: "secrets".to_owned(),
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
             memory_max: "24G".to_owned(),
@@ -259,13 +282,16 @@ impl LaunchConfig {
     pub fn from_home_env() -> Result<Self> {
         let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
         let mut config = Self::under_home(Path::new(&home));
-        config.override_from(|name| std::env::var(name).ok());
+        config.override_from(|name| std::env::var(name).ok())?;
         Ok(config)
     }
 
-    /// The codex model from `SPAWN_CODEX_MODEL` and the codex login file
-    /// from `SPAWN_CODEX_AUTH`, each when set and not blank.
-    fn override_from(&mut self, var: impl Fn(&str) -> Option<String>) {
+    /// The codex model from `SPAWN_CODEX_MODEL`, the codex login file from
+    /// `SPAWN_CODEX_AUTH`, the vibe command from `SPAWN_VIBE`, the Mistral
+    /// key's Secrets version from `SPAWN_MISTRAL_KEY_SECRET` and a mistral
+    /// run's price cap from `SPAWN_MISTRAL_MAX_PRICE`, each when set and not
+    /// blank. A price cap that is not a positive number is refused.
+    fn override_from(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<()> {
         let set = |name: &str| {
             var(name)
                 .map(|value| value.trim().to_owned())
@@ -275,6 +301,19 @@ impl LaunchConfig {
         if let Some(auth) = set("SPAWN_CODEX_AUTH") {
             self.codex_auth = Some(PathBuf::from(auth));
         }
+        if let Some(vibe) = set("SPAWN_VIBE") {
+            self.vibe = PathBuf::from(vibe);
+        }
+        if let Some(secret) = set("SPAWN_MISTRAL_KEY_SECRET") {
+            self.mistral_key_secret = secret;
+        }
+        if let Some(price) = set("SPAWN_MISTRAL_MAX_PRICE") {
+            self.mistral_max_price = match price.parse::<f64>() {
+                Ok(price) if price.is_finite() && price > 0.0 => price,
+                _ => bail!("SPAWN_MISTRAL_MAX_PRICE {price:?} is not a positive number of dollars"),
+            };
+        }
+        Ok(())
     }
 
     /// The model a provider's zooid is told to use, or why it names none.
@@ -291,6 +330,7 @@ impl LaunchConfig {
                     ),
                 ),
             },
+            Provider::Mistral => (Some(self.mistral_model.clone()), None),
             _ => (Some(self.model.clone()), None),
         }
     }
@@ -366,6 +406,80 @@ pub fn codex_mcp_config(script: &Path) -> String {
     )
 }
 
+/// Why a keeper refuses a request naming mistral.
+pub const MISTRAL_KEEP_REFUSAL: &str =
+    "mistral spends money; only a direct spawn run may choose it until JP agrees to unattended spend";
+
+/// Mistral Large 4's list price, US dollars per million input tokens.
+pub const MISTRAL_INPUT_PRICE: f64 = 0.70;
+/// Mistral Large 4's list price, US dollars per million output tokens.
+pub const MISTRAL_OUTPUT_PRICE: f64 = 2.10;
+
+/// The vibe thinking level for a spawn effort. Large 4 accepts only low,
+/// medium and high and answers 400 to `off`, so the higher efforts are high.
+pub fn vibe_thinking(effort: &str) -> &'static str {
+    match effort {
+        "low" => "low",
+        "medium" => "medium",
+        _ => "high",
+    }
+}
+
+/// A mistral run's vibe `config.toml`, the whole of it: one provider whose
+/// key vibe reads from `MISTRAL_API_KEY`, one model at Large 4's list
+/// prices, telemetry, update checks and subagents off, and one MCP server,
+/// the unit script run as `mcp`. No cached-input price is configured:
+/// Mistral publishes none for Large 4, and vibe then bills cached tokens at
+/// the input price, so its cost estimate and the `--max-price` cap err high.
+/// `script` and `model` are unit-safe, so basic TOML strings hold them.
+pub fn vibe_config(script: &Path, model: &str, thinking: &str) -> String {
+    format!(
+        "# Written by `spawn` for this run. Nothing else is configured here.\n\
+         active_model = \"{model}\"\n\
+         enable_telemetry = false\n\
+         enable_update_checks = false\n\
+         enable_auto_update = false\n\
+         enable_subagents = false\n\
+         enable_notifications = false\n\
+         include_commit_signature = false\n\
+         \n\
+         [[providers]]\n\
+         name = \"mistral\"\n\
+         api_base = \"https://api.mistral.ai/v1\"\n\
+         api_key_env_var = \"MISTRAL_API_KEY\"\n\
+         backend = \"mistral\"\n\
+         \n\
+         [[models]]\n\
+         name = \"{model}\"\n\
+         provider = \"mistral\"\n\
+         alias = \"{model}\"\n\
+         temperature = 1.0\n\
+         input_price = {MISTRAL_INPUT_PRICE:?}\n\
+         output_price = {MISTRAL_OUTPUT_PRICE:?}\n\
+         thinking = \"{thinking}\"\n\
+         thinking_levels = [\"low\", \"medium\", \"high\"]\n\
+         max_context_length = 1048576\n\
+         \n\
+         [[mcp_servers]]\n\
+         name = \"faculties\"\n\
+         transport = \"stdio\"\n\
+         command = \"/bin/bash\"\n\
+         args = [\"{}\", \"mcp\"]\n\
+         startup_timeout_sec = 120\n\
+         tool_timeout_sec = 3600\n",
+        script.display()
+    )
+}
+
+/// Make `home` a vibe home for one run: created if missing, whatever an
+/// earlier run left there kept (its logs, its trusted folders), and
+/// `config.toml` written fresh, so nothing from an ambient `~/.vibe` applies.
+fn vibe_home_for_run(home: &Path, config: &str) -> Result<()> {
+    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    let settings = home.join("config.toml");
+    std::fs::write(&settings, config).with_context(|| format!("write {}", settings.display()))
+}
+
 /// Make `home` a codex home holding nothing ambient: whatever an earlier
 /// run of this zooid left there stays (its sessions and logs), the login is
 /// a link to `auth`, so a token codex refreshes is the one every codex on
@@ -398,20 +512,26 @@ pub enum Provider {
     #[default]
     Claude,
     Codex,
+    /// Mistral Large 4 through Mistral's `vibe` CLI. Opt-in only: Mistral
+    /// bills money per token rather than drawing on a plan quota, so it is
+    /// not in the quota table and `auto` never chooses it. A run is capped
+    /// by [`LaunchConfig::mistral_max_price`].
+    Mistral,
     /// Whichever of claude and codex the latest fresh quota readings show
-    /// with the most headroom.
+    /// with the most headroom. Never mistral.
     Auto,
     /// A local model. Not available yet.
     Local,
 }
 
 impl Provider {
-    pub const NAMES: [&'static str; 4] = ["claude", "codex", "auto", "local"];
+    pub const NAMES: [&'static str; 5] = ["claude", "codex", "mistral", "auto", "local"];
 
     pub fn parse(text: &str) -> Result<Self> {
         match text.trim().to_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "mistral" => Ok(Self::Mistral),
             "auto" => Ok(Self::Auto),
             "local" => Ok(Self::Local),
             other => bail!(
@@ -425,6 +545,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Mistral => "mistral",
             Self::Auto => "auto",
             Self::Local => "local",
         }
@@ -432,7 +553,9 @@ impl Provider {
 }
 
 /// The provider `auto` picks from one quota reading: the one with the most
-/// headroom left in its tightest fresh window. A reading older than the quota
+/// headroom left in its tightest fresh window. Only claude and codex are
+/// candidates: they draw on plan quotas, and mistral, which bills money, is
+/// only ever run when it is named. A reading older than the quota
 /// faculty's stale age, or whose window has already reset, says nothing about
 /// now: such a provider is unknown, and unknown is never spare. Returns the
 /// provider and the readings that decided it.
@@ -553,6 +676,27 @@ pub struct Launched {
     pub warnings: Vec<String>,
 }
 
+/// The files of one run that an agent's command line names.
+struct RunFiles {
+    workdir: PathBuf,
+    prompt: PathBuf,
+    report: PathBuf,
+    mcp_config: PathBuf,
+    codex_home: PathBuf,
+    vibe_home: PathBuf,
+    vibe_out: PathBuf,
+}
+
+/// An agent command line and what the unit gives it.
+struct AgentLine {
+    argv: Vec<String>,
+    /// Exported for the agent only.
+    env: Vec<(String, String)>,
+    /// Variable and Secrets version, read inside the unit for the agent only.
+    secrets: Vec<(String, String)>,
+    stdout_is_report: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct SettleRequest {
     pub name: String,
@@ -564,6 +708,10 @@ pub struct SettleRequest {
     pub exit: Exit,
     /// Claude's stdout. A missing or empty file records no report.
     pub report: Option<PathBuf>,
+    /// vibe's `export.json`, for a mistral run: its usage and cost are
+    /// recorded with the end. A file that is missing or unreadable is a
+    /// settlement failure, recorded on the run.
+    pub usage: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -620,6 +768,12 @@ pub struct RunView {
     pub goal_note: Vec<Id>,
     /// The request the run serves, when a keeper started it.
     pub request: Vec<Id>,
+    /// Usage the agent reported, recorded at settlement (mistral runs).
+    pub input_tokens: Vec<u64>,
+    pub cached_input_tokens: Vec<u64>,
+    pub output_tokens: Vec<u64>,
+    /// The agent's own cost estimate in US dollars, not the provider's bill.
+    pub cost_usd: Vec<f64>,
 }
 
 impl RunView {
@@ -842,7 +996,7 @@ impl Spawn {
     /// The concrete provider and why, before anything is touched.
     fn resolve_provider(&self, provider: Provider) -> Result<(Provider, String)> {
         match provider {
-            Provider::Claude | Provider::Codex => {
+            Provider::Claude | Provider::Codex | Provider::Mistral => {
                 Ok((provider, format!("{} was asked for", provider.name())))
             }
             Provider::Local => bail!(
@@ -859,17 +1013,11 @@ impl Spawn {
     }
 
     /// The agent command line for a provider, the environment it runs in,
-    /// and whether its stdout is the report.
-    fn agent(
-        &self,
-        provider: Provider,
-        effort: &str,
-        mcp_config: &Path,
-        codex_home: &Path,
-        report: &Path,
-    ) -> (Vec<String>, Vec<(String, String)>, bool) {
+    /// and whether its stdout is the report. Every concrete provider has its
+    /// own arm; `auto` and `local` are refused, never sent to claude.
+    fn agent(&self, provider: Provider, effort: &str, files: &RunFiles) -> Result<AgentLine> {
         let text = |path: &Path| path.display().to_string();
-        match provider {
+        Ok(match provider {
             Provider::Codex => {
                 // codex has no `max`; `xhigh` is its highest.
                 let effort = if effort == "max" { "xhigh" } else { effort };
@@ -886,17 +1034,50 @@ impl Spawn {
                     "-c".to_owned(),
                     format!("model_reasoning_effort={effort}"),
                     "-o".to_owned(),
-                    text(report),
+                    text(&files.report),
                     "-".to_owned(),
                 ]);
-                (
+                AgentLine {
                     argv,
-                    vec![("CODEX_HOME".to_owned(), text(codex_home))],
-                    false,
-                )
+                    env: vec![("CODEX_HOME".to_owned(), text(&files.codex_home))],
+                    secrets: Vec::new(),
+                    stdout_is_report: false,
+                }
             }
-            _ => (
-                vec![
+            Provider::Mistral => AgentLine {
+                // The prompt is read from its file and the model's last reply
+                // is stdout; vibe leaves usage and cost in export.json under
+                // the output directory on every exit, for settlement.
+                argv: vec![
+                    text(&self.launch.vibe),
+                    "--workdir".to_owned(),
+                    text(&files.workdir),
+                    "--trust".to_owned(),
+                    "--auto-approve".to_owned(),
+                    "--model".to_owned(),
+                    self.launch.mistral_model.clone(),
+                    "--max-price".to_owned(),
+                    format!("{}", self.launch.mistral_max_price),
+                    "--output".to_owned(),
+                    "text".to_owned(),
+                    "--output-dir".to_owned(),
+                    text(&files.vibe_out),
+                    "--prompt-file".to_owned(),
+                    text(&files.prompt),
+                ],
+                env: vec![("VIBE_HOME".to_owned(), text(&files.vibe_home))],
+                // Known limit: vibe's own bash tool inherits this variable,
+                // so a zooid's shell can read the key, as a codex zooid can
+                // read its linked auth.json. Settlement and the MCP server
+                // never hold it (the script unsets it for every branch).
+                secrets: vec![(
+                    "MISTRAL_API_KEY".to_owned(),
+                    self.launch.mistral_key_secret.clone(),
+                )],
+                stdout_is_report: true,
+            },
+            Provider::Claude => AgentLine {
+                argv: vec![
                     text(&self.launch.claude),
                     "-p".to_owned(),
                     "--model".to_owned(),
@@ -906,14 +1087,19 @@ impl Spawn {
                     "--dangerously-skip-permissions".to_owned(),
                     "--strict-mcp-config".to_owned(),
                     "--mcp-config".to_owned(),
-                    text(mcp_config),
+                    text(&files.mcp_config),
                     "--output-format".to_owned(),
                     "text".to_owned(),
                 ],
-                Vec::new(),
-                true,
+                env: Vec::new(),
+                secrets: Vec::new(),
+                stdout_is_report: true,
+            },
+            Provider::Auto | Provider::Local => bail!(
+                "{} is a policy, not an agent: it is resolved before a command line is built",
+                provider.name()
             ),
-        }
+        })
     }
 
     fn launch(
@@ -962,6 +1148,11 @@ impl Spawn {
         let mcp_config = launch.file(&name, "mcp.json");
         let codex_home = launch.file(&name, "codex");
         super::require_unit_safe("codex home", &codex_home.display().to_string())?;
+        let vibe_home = launch.file(&name, "vibe");
+        let vibe_out = launch.file(&name, "vibe-out");
+        super::require_unit_safe("vibe home", &vibe_home.display().to_string())?;
+        super::require_unit_safe("vibe output", &vibe_out.display().to_string())?;
+        let usage_path = (provider == Provider::Mistral).then(|| vibe_out.join("export.json"));
         let faculties = launch.faculties_binary()?;
         super::require_unit_safe("faculties binary", &faculties.display().to_string())?;
         let (model, model_unset) = launch.model_for(provider);
@@ -1086,8 +1277,19 @@ impl Spawn {
                 request: extras.request,
             });
             let text = |path: &Path| path.display().to_string();
-            let (agent, agent_env, stdout_is_report) =
-                self.agent(provider, effort, &mcp_config, &codex_home, &report_path);
+            let agent = self.agent(
+                provider,
+                effort,
+                &RunFiles {
+                    workdir: workdir.clone(),
+                    prompt: prompt_path.clone(),
+                    report: report_path.clone(),
+                    mcp_config: mcp_config.clone(),
+                    codex_home: codex_home.clone(),
+                    vibe_home: vibe_home.clone(),
+                    vibe_out: vibe_out.clone(),
+                },
+            )?;
             let script = super::unit_script(&ScriptFacts {
                 name: &name,
                 run,
@@ -1097,9 +1299,12 @@ impl Spawn {
                 path: &launch.path,
                 colony_env: launch.colony_env.as_deref().map(text).as_deref(),
                 routes: &routes,
-                agent: &agent,
-                agent_env: &agent_env,
-                stdout_is_report,
+                agent: &agent.argv,
+                agent_env: &agent.env,
+                agent_secrets: &agent.secrets,
+                secrets: &launch.secrets,
+                usage: usage_path.as_deref().map(text).as_deref(),
+                stdout_is_report: agent.stdout_is_report,
                 prompt: &text(&prompt_path),
                 report: &text(&report_path),
                 log: &text(&log_path),
@@ -1108,15 +1313,33 @@ impl Spawn {
             });
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
-            if provider == Provider::Codex {
-                codex_home_for_run(
+            match provider {
+                Provider::Codex => codex_home_for_run(
                     &codex_home,
                     launch.codex_auth.as_deref(),
                     &codex_mcp_config(&script_path),
-                )?;
-            } else {
-                std::fs::write(&mcp_config, claude_mcp_config(&script_path))
-                    .with_context(|| format!("write {}", mcp_config.display()))?;
+                )?,
+                Provider::Mistral => {
+                    vibe_home_for_run(
+                        &vibe_home,
+                        &vibe_config(&script_path, &launch.mistral_model, vibe_thinking(effort)),
+                    )?;
+                    // An earlier run's export must never be read as this
+                    // run's usage.
+                    if let Some(path) = &usage_path {
+                        match std::fs::remove_file(path) {
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                return Err(error).context("remove the previous vibe export");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Provider::Claude => std::fs::write(&mcp_config, claude_mcp_config(&script_path))
+                    .with_context(|| format!("write {}", mcp_config.display()))?,
+                Provider::Auto | Provider::Local => {
+                    bail!("{} reached the launch unresolved", provider.name())
+                }
             }
             std::fs::write(&prompt_path, &prompt)?;
             std::fs::write(&script_path, script)?;
@@ -1259,11 +1482,31 @@ impl Spawn {
                 },
                 None => None,
             };
+            let usage = match &request.usage {
+                Some(path) => match std::fs::read_to_string(path)
+                    .with_context(|| format!("read {}", path.display()))
+                    .and_then(|text| super::vibe_usage(&text))
+                {
+                    Ok(usage) => Some(usage),
+                    Err(error) => {
+                        let why = format!("record the run's usage: {error:#}");
+                        if let Err(record) =
+                            self.publish(super::run_annotation(run, None, Some(&why), None))
+                        {
+                            failures.push(record.context("record the settlement failure"));
+                        }
+                        failures.push(error.context("record the run's usage"));
+                        None
+                    }
+                },
+                None => None,
+            };
             let (fragment, handle) = super::settlement_fragment(
                 run,
                 crate::clock::point_now()?,
                 &request.exit,
                 report.as_deref(),
+                usage.as_ref(),
             );
             report_handle = handle;
             let mut fragment = fragment;
@@ -1717,6 +1960,12 @@ impl Spawn {
         if provider == Provider::Local {
             return self.refuse(view, "no local executor on this host".to_owned());
         }
+        // A request is started unattended, by whatever wrote it (a rule, an
+        // ignite pass). Until JP agrees to unattended spending, money is
+        // only spent by a direct `spawn run --provider mistral`.
+        if provider == Provider::Mistral {
+            return self.refuse(view, MISTRAL_KEEP_REFUSAL.to_owned());
+        }
         let effort = match view.effort.as_slice() {
             [one] if super::EFFORTS.contains(&one.as_str()) => one.clone(),
             [one] => {
@@ -2024,7 +2273,36 @@ fn run_view(
         ),
         goal_note: find!(id: Id, pattern!(facts, [{ run @ attrs::goal_note: ?id }])).collect(),
         request: find!(id: Id, pattern!(facts, [{ run @ attrs::request: ?id }])).collect(),
+        input_tokens: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ imagine_attrs::input_tokens: ?count }])
+            )
+            .collect(),
+        ),
+        cached_input_tokens: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::cached_input_tokens: ?count }])
+            )
+            .collect(),
+        ),
+        output_tokens: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ imagine_attrs::output_tokens: ?count }])
+            )
+            .collect(),
+        ),
+        cost_usd: find!(cost: f64, pattern!(facts, [{ run @ attrs::cost_usd: ?cost }])).collect(),
     }
+}
+
+fn counts(values: Vec<Inline<inlineencodings::U256BE>>) -> Vec<u64> {
+    values
+        .into_iter()
+        .filter_map(|value| value.try_from_inline::<u64>().ok())
+        .collect()
 }
 
 fn has_outcome(facts: &FactArchive, request: Id, kind: Id) -> bool {
@@ -2388,6 +2666,29 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         for why in &run.untinted {
             writeln!(out, "  untinted recollection: {why}").unwrap();
         }
+        if !run.input_tokens.is_empty() || !run.output_tokens.is_empty() {
+            writeln!(
+                out,
+                "  tokens: {} in ({} cached), {} out",
+                join(&run.input_tokens),
+                join(&run.cached_input_tokens),
+                join(&run.output_tokens)
+            )
+            .unwrap();
+        }
+        if !run.cost_usd.is_empty() {
+            let costs = run
+                .cost_usd
+                .iter()
+                .map(|cost| format!("{cost:.4}"))
+                .collect::<Vec<_>>();
+            writeln!(
+                out,
+                "  cost: ${} (the agent's estimate at configured prices, not the bill)",
+                costs.join(", $")
+            )
+            .unwrap();
+        }
         if !run.goal_note.is_empty() {
             writeln!(out, "  goal note: {}", ids(&run.goal_note)).unwrap();
         }
@@ -2524,6 +2825,11 @@ mod tests {
             codex: PathBuf::from("/fake/codex"),
             codex_model: None,
             codex_auth: Some(codex_auth),
+            vibe: PathBuf::from("/fake/vibe"),
+            mistral_model: "mistral-large-4".to_owned(),
+            mistral_key_secret: "c2c7b31676a61315928103941b04d487".to_owned(),
+            mistral_max_price: 2.0,
+            secrets: "secrets".to_owned(),
             colony_env: Some(env),
             path: format!("/usr/bin:/bin:{}", directory.path().join("bin").display()),
             memory_max: "24G".to_owned(),
@@ -2574,6 +2880,7 @@ mod tests {
                 request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: Some(launched.report.clone()),
+                usage: None,
             })
         }
         fn inbox(&self) -> Vec<crate::message::MessageText> {
@@ -2788,6 +3095,7 @@ mod tests {
                 request: Some(asked.request),
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
+                usage: None,
             })
             .unwrap();
         let view = f.request_view(asked.request);
@@ -2807,6 +3115,7 @@ mod tests {
                 request: Some(asked.request),
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
+                usage: None,
             })
             .unwrap();
         let view = f.request_view(asked.request);
@@ -2842,6 +3151,30 @@ mod tests {
         assert!(f.persona(&asked.name).is_none());
         assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
         assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keep_refuses_mistral_because_a_request_would_spend_money_unattended() {
+        let f = fixture();
+        let asked = f.ask("Paid task.", None, Provider::Mistral);
+        assert_eq!(
+            f.keep().steps,
+            [(
+                asked.request,
+                KeepStep::Refused(MISTRAL_KEEP_REFUSAL.to_owned())
+            )]
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["refused"]);
+        assert_eq!(view.outcomes[0].reason, [MISTRAL_KEEP_REFUSAL]);
+        assert!(view.runs.is_empty());
+        assert!(f.persona(&asked.name).is_none());
+        // A direct run may still choose it.
+        let mut request = f.request("Paid task, run directly.");
+        request.provider = Provider::Mistral;
+        f.spawn.run(&request).unwrap();
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -3014,6 +3347,7 @@ mod tests {
                 request,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
+                usage: None,
             })
             .unwrap();
         let view = f.request_view(asked.request);
@@ -3033,6 +3367,7 @@ mod tests {
                 request,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
+                usage: None,
             })
             .unwrap();
         assert_eq!(f.request_view(asked.request).runs, [(run, true)]);
@@ -3158,6 +3493,7 @@ mod tests {
                 request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: Some(launched.report.clone()),
+                usage: None,
             })
             .unwrap();
         assert_eq!(
@@ -3219,6 +3555,7 @@ mod tests {
                 request: None,
                 exit: Exit::from_systemd("killed", "KILL", "signal"),
                 report: Some(launched.report.clone()),
+                usage: None,
             })
             .unwrap();
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
@@ -3291,6 +3628,7 @@ mod tests {
                 request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: Some(launched.report.clone()),
+                usage: None,
             })
             .unwrap();
         let inbox = messages
@@ -3610,20 +3948,303 @@ mod tests {
             }
         };
         let mut config = LaunchConfig::under_home(home);
-        config.override_from(env(&[]));
+        config.override_from(env(&[])).unwrap();
         assert_eq!(config.codex_model, None);
         assert_eq!(config.codex_auth, Some(home.join(".codex/auth.json")));
         let mut config = LaunchConfig::under_home(home);
-        config.override_from(env(&[
-            ("SPAWN_CODEX_MODEL", " gpt-5.2-codex "),
-            ("SPAWN_CODEX_AUTH", " /other/auth.json "),
-        ]));
+        config
+            .override_from(env(&[
+                ("SPAWN_CODEX_MODEL", " gpt-5.2-codex "),
+                ("SPAWN_CODEX_AUTH", " /other/auth.json "),
+            ]))
+            .unwrap();
         assert_eq!(config.codex_model.as_deref(), Some("gpt-5.2-codex"));
         assert_eq!(config.codex_auth, Some(PathBuf::from("/other/auth.json")));
         // Blank is unset: the default login stays.
         let mut config = LaunchConfig::under_home(home);
-        config.override_from(env(&[("SPAWN_CODEX_AUTH", "  ")]));
+        config
+            .override_from(env(&[("SPAWN_CODEX_AUTH", "  ")]))
+            .unwrap();
         assert_eq!(config.codex_auth, Some(home.join(".codex/auth.json")));
+    }
+
+    #[test]
+    fn mistral_settings_come_from_the_environment_and_a_bad_price_is_refused() {
+        let home = Path::new("/h");
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let mut config = LaunchConfig::under_home(home);
+        config.override_from(env(&[])).unwrap();
+        assert_eq!(config.vibe, PathBuf::from("vibe"));
+        assert_eq!(config.mistral_model, "mistral-large-4");
+        assert_eq!(
+            config.mistral_key_secret,
+            "c2c7b31676a61315928103941b04d487"
+        );
+        assert_eq!(config.mistral_max_price, 2.0);
+        config
+            .override_from(env(&[
+                ("SPAWN_VIBE", " /v/bin/vibe "),
+                (
+                    "SPAWN_MISTRAL_KEY_SECRET",
+                    " 00112233445566778899aabbccddeeff ",
+                ),
+                ("SPAWN_MISTRAL_MAX_PRICE", " 0.5 "),
+            ]))
+            .unwrap();
+        assert_eq!(config.vibe, PathBuf::from("/v/bin/vibe"));
+        assert_eq!(
+            config.mistral_key_secret,
+            "00112233445566778899aabbccddeeff"
+        );
+        assert_eq!(config.mistral_max_price, 0.5);
+        for bad in ["0", "-1", "lots", "inf", "NaN"] {
+            let mut config = LaunchConfig::under_home(home);
+            let pairs: &'static [(&'static str, &'static str)] = match bad {
+                "0" => &[("SPAWN_MISTRAL_MAX_PRICE", "0")],
+                "-1" => &[("SPAWN_MISTRAL_MAX_PRICE", "-1")],
+                "lots" => &[("SPAWN_MISTRAL_MAX_PRICE", "lots")],
+                "inf" => &[("SPAWN_MISTRAL_MAX_PRICE", "inf")],
+                _ => &[("SPAWN_MISTRAL_MAX_PRICE", "NaN")],
+            };
+            assert!(config.override_from(env(pairs)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn mistral_parses_and_auto_never_chooses_it() {
+        assert_eq!(Provider::parse(" Mistral ").unwrap(), Provider::Mistral);
+        assert_eq!(Provider::Mistral.name(), "mistral");
+        for name in Provider::NAMES {
+            assert_eq!(Provider::parse(name).unwrap().name(), name);
+        }
+        use crate::schemas::quota::PROVIDER_CLAUDE;
+        let hour = 3_600 * 1_000_000_000_i128;
+        let now = 100 * hour;
+        let view = |groups| crate::quota::operations::QuotaView {
+            now,
+            examined: 0,
+            groups,
+            status_examined: 0,
+            statuses: vec![],
+            status_error: None,
+        };
+        // A provider with all its quota left that is not claude or codex is
+        // never a candidate: auto picks the nearly spent claude.
+        let other = Id::new([9; 16]).unwrap();
+        let (chosen, why) = choose_provider(&view(vec![
+            group(PROVIDER_CLAUDE, 99.0, now - hour, now + hour),
+            group(other, 0.0, now - hour, now + hour),
+        ]))
+        .unwrap();
+        assert_eq!(chosen, Provider::Claude);
+        assert!(!why.contains("mistral"), "{why}");
+        // With nothing known, auto refuses rather than falling to mistral.
+        let error = format!("{:#}", choose_provider(&view(vec![])).unwrap_err());
+        assert!(!error.contains("mistral"), "{error}");
+    }
+
+    #[test]
+    fn a_policy_provider_never_reaches_an_agent_command_line() {
+        let f = fixture();
+        let files = RunFiles {
+            workdir: PathBuf::from("/w"),
+            prompt: PathBuf::from("/s/n.prompt"),
+            report: PathBuf::from("/s/n.report"),
+            mcp_config: PathBuf::from("/s/n.mcp.json"),
+            codex_home: PathBuf::from("/s/n.codex"),
+            vibe_home: PathBuf::from("/s/n.vibe"),
+            vibe_out: PathBuf::from("/s/n.vibe-out"),
+        };
+        for provider in [Provider::Auto, Provider::Local] {
+            assert!(f.spawn.agent(provider, "high", &files).is_err());
+        }
+        let line = f.spawn.agent(Provider::Mistral, "high", &files).unwrap();
+        assert_eq!(line.argv[0], "/fake/vibe");
+        assert!(!line.argv.iter().any(|word| word.contains("claude")));
+        // The key is named by its Secrets version only: no argument and no
+        // exported variable carries a key.
+        assert!(!line
+            .argv
+            .iter()
+            .any(|word| word.contains("MISTRAL_API_KEY")));
+        assert_eq!(line.env, [("VIBE_HOME".to_owned(), "/s/n.vibe".to_owned())]);
+        assert_eq!(
+            line.secrets,
+            [(
+                "MISTRAL_API_KEY".to_owned(),
+                "c2c7b31676a61315928103941b04d487".to_owned()
+            )]
+        );
+        assert!(line.stdout_is_report);
+    }
+
+    #[test]
+    fn a_mistral_zooid_runs_vibe_with_its_own_home_and_the_key_read_in_the_unit() {
+        let f = fixture();
+        let mut request = f.request("Mistral task.");
+        request.provider = Provider::Mistral;
+        let state = f.directory.path().join("state");
+        let name = super::super::name_for(super::super::text_handle("Mistral task."));
+        // A previous run's export must not be read as this run's usage.
+        let out = state.join(format!("{name}.vibe-out"));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("export.json"), "stale").unwrap();
+        let launched = f.spawn.run(&request).unwrap();
+        assert_eq!(launched.provider, Provider::Mistral);
+        assert_eq!(launched.provider_reason, "mistral was asked for");
+        assert!(!out.join("export.json").exists());
+        let script = f.script(0);
+        let home = state.join(format!("{name}.vibe"));
+        let prompt = state.join(format!("{name}.prompt"));
+        let workdir = std::fs::canonicalize(f.directory.path().join("lane")).unwrap();
+        assert!(
+            script.contains(&format!(
+                "exec /fake/vibe --workdir {} --trust --auto-approve --model mistral-large-4 \
+                 --max-price 2 --output text --output-dir {} --prompt-file {} < {} > {}\n",
+                workdir.display(),
+                out.display(),
+                prompt.display(),
+                prompt.display(),
+                launched.report.display()
+            )),
+            "{script}"
+        );
+        // The key: unset for every branch, read from Secrets for the agent
+        // only, after settlement and the MCP server have branched off.
+        let unset = script
+            .find("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT MISTRAL_API_KEY ${!TRIBLESPACE_@}\n")
+            .unwrap();
+        let read = script
+            .find("MISTRAL_API_KEY=$(secrets get --secret c2c7b31676a61315928103941b04d487) && ")
+            .unwrap();
+        let settle = script.find("= settle ]").unwrap();
+        let mcp = script.find("= mcp ]").unwrap();
+        let exec = script.find("exec /fake/vibe").unwrap();
+        assert!(
+            unset < settle && settle < mcp && mcp < read && read < exec,
+            "{script}"
+        );
+        assert!(
+            script.contains("exit 77; }\nexport MISTRAL_API_KEY\n"),
+            "{script}"
+        );
+        assert_eq!(script.matches("MISTRAL_API_KEY=").count(), 1, "{script}");
+        assert!(script.contains(&format!("export VIBE_HOME={}\n", home.display())));
+        // Settlement reads vibe's export for the usage.
+        assert!(
+            script.contains(&format!(" --usage {}\n", out.join("export.json").display())),
+            "{script}"
+        );
+        // The vibe home holds only the configuration spawn wrote.
+        let unit = f.launcher.started.lock().unwrap()[0].clone();
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(config, vibe_config(&unit.script, "mistral-large-4", "high"));
+        assert!(!state.join(format!("{name}.mcp.json")).exists());
+        assert!(!state.join(format!("{name}.codex")).exists());
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.provider, ["mistral"]);
+        assert_eq!(run.model, ["mistral-large-4"]);
+
+        // Settlement records vibe's usage and cost with the end.
+        std::fs::write(
+            out.join("export.json"),
+            r#"{"outcome":"finished","usage":{"input_tokens":520386,"output_tokens":1243,
+               "cached_input_tokens":518144,"total_tokens":521629},"cost_usd":0.0904}"#,
+        )
+        .unwrap();
+        std::fs::write(&launched.report, "done\n").unwrap();
+        f.spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: Some(out.join("export.json")),
+            })
+            .unwrap();
+        let view = f.spawn.show(&launched.name).unwrap();
+        let run = &view.runs[0];
+        assert_eq!(run.input_tokens, [520386]);
+        assert_eq!(run.cached_input_tokens, [518144]);
+        assert_eq!(run.output_tokens, [1243]);
+        assert_eq!(run.cost_usd, [0.0904]);
+        assert!(run.settle_failure.is_empty());
+        let shown = render_show(&view, false);
+        assert!(
+            shown.contains("tokens: 520386 in (518144 cached), 1243 out"),
+            "{shown}"
+        );
+        assert!(shown.contains("cost: $0.0904"), "{shown}");
+    }
+
+    #[test]
+    fn a_mistral_run_without_an_export_says_so_at_settlement() {
+        let f = fixture();
+        let mut request = f.request("Mistral task that never started vibe.");
+        request.provider = Provider::Mistral;
+        let launched = f.spawn.run(&request).unwrap();
+        let missing = f.directory.path().join("state").join("absent.json");
+        let error = f
+            .spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "77", "exit-code"),
+                report: None,
+                usage: Some(missing),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("usage"), "{error:#}");
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        // The end and the message are recorded anyway; the gap is named.
+        assert_eq!(run.exit_code, [77]);
+        assert_eq!(run.message.len(), 1);
+        assert!(run.input_tokens.is_empty() && run.cost_usd.is_empty());
+        assert!(
+            run.settle_failure.iter().any(|why| why.contains("usage")),
+            "{:?}",
+            run.settle_failure
+        );
+    }
+
+    #[test]
+    fn vibe_thinking_is_never_off_and_its_config_is_large_4_at_list_price() {
+        assert_eq!(vibe_thinking("low"), "low");
+        assert_eq!(vibe_thinking("medium"), "medium");
+        for effort in ["high", "xhigh", "max"] {
+            assert_eq!(vibe_thinking(effort), "high");
+        }
+        let config = vibe_config(Path::new("/s/n.sh"), "mistral-large-4", "high");
+        for line in [
+            "active_model = \"mistral-large-4\"\n",
+            "enable_telemetry = false\n",
+            "enable_update_checks = false\n",
+            "enable_auto_update = false\n",
+            "enable_subagents = false\n",
+            "api_key_env_var = \"MISTRAL_API_KEY\"\n",
+            "alias = \"mistral-large-4\"\n",
+            "input_price = 0.7\n",
+            "output_price = 2.1\n",
+            "thinking = \"high\"\n",
+            "transport = \"stdio\"\n",
+            "command = \"/bin/bash\"\n",
+            "args = [\"/s/n.sh\", \"mcp\"]\n",
+        ] {
+            assert!(config.contains(line), "{line:?} in\n{config}");
+        }
+        // No cached price: vibe then bills cached input at the input price.
+        assert!(!config.contains("cached_input_price"));
+        assert_eq!(config.matches("[[mcp_servers]]").count(), 1);
+        assert!(!config.contains("thinking = \"off\""));
     }
 
     #[test]
@@ -3827,6 +4448,7 @@ mod tests {
                 request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
+                usage: None,
             })
             .unwrap();
         assert!(spawn.show(&launched.name).unwrap().runs[0].message.len() == 1);

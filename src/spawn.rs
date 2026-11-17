@@ -28,6 +28,7 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::schemas::archive::archive as archive_attrs;
+use crate::schemas::imagine::imagine as imagine_attrs;
 use crate::schemas::spawn::{spawn as attrs, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN};
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
@@ -357,12 +358,45 @@ impl Exit {
     }
 }
 
+/// What a run's agent reported it used, read at settlement.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub cached_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// The agent's own estimate from the prices in the run's configuration,
+    /// not the provider's bill.
+    pub cost_usd: Option<f64>,
+}
+
+/// The usage in vibe's `export.json` (`--output-dir`): `usage.*` and
+/// `cost_usd`. A field vibe did not write is absent, not zero.
+pub fn vibe_usage(export: &str) -> Result<Usage> {
+    let value: serde_json::Value =
+        serde_json::from_str(export).map_err(|error| anyhow::anyhow!("export.json: {error}"))?;
+    let usage = &value["usage"];
+    let count = |field: &str| usage[field].as_u64();
+    let usage = Usage {
+        input_tokens: count("input_tokens"),
+        cached_input_tokens: count("cached_input_tokens"),
+        output_tokens: count("output_tokens"),
+        total_tokens: count("total_tokens"),
+        cost_usd: value["cost_usd"].as_f64().filter(|cost| cost.is_finite()),
+    };
+    if usage == Usage::default() {
+        bail!("export.json names no usage and no cost");
+    }
+    Ok(usage)
+}
+
 /// The end of a run, annotating the run itself.
 pub fn settlement_fragment(
     run: Id,
     finished_at: IntervalValue,
     exit: &Exit,
     report: Option<&str>,
+    usage: Option<&Usage>,
 ) -> (Fragment, Option<TextHandle>) {
     let mut fragment = Fragment::empty();
     let report = report.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
@@ -381,6 +415,15 @@ pub fn settlement_fragment(
         attrs::signal?: signal,
         attrs::report?: report,
     };
+    if let Some(usage) = usage {
+        fragment += entity! { ExclusiveId::force_ref(&run) @
+            imagine_attrs::input_tokens?: usage.input_tokens,
+            attrs::cached_input_tokens?: usage.cached_input_tokens,
+            imagine_attrs::output_tokens?: usage.output_tokens,
+            imagine_attrs::total_tokens?: usage.total_tokens,
+            attrs::cost_usd?: usage.cost_usd,
+        };
+    }
     (fragment, report)
 }
 
@@ -625,6 +668,17 @@ pub struct ScriptFacts<'a> {
     pub agent: &'a [String],
     /// Variables exported for the agent only, after the settle branch.
     pub agent_env: &'a [(String, String)],
+    /// Variables the agent gets from Secrets: the variable and the exact
+    /// Secrets version. Each is unset for every branch at the top, so
+    /// neither settlement nor the MCP server (which the agent starts with
+    /// its own environment) ever holds it, and read with `secrets get` just
+    /// before the agent starts. The value appears in no file and no log.
+    pub agent_secrets: &'a [(String, String)],
+    /// The `secrets` command, found on `path` inside the unit.
+    pub secrets: &'a str,
+    /// A file in which the agent leaves its usage (vibe's `export.json`),
+    /// for settlement to record on the run.
+    pub usage: Option<&'a str>,
     /// Whether the agent's stdout is its report. When not, the agent writes
     /// the report file itself and its stdout goes to the unit's log.
     pub stdout_is_report: bool,
@@ -659,7 +713,14 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     script.push_str("# colony file supplies what the launch did not resolve (peers, routes this\n");
     script.push_str("# build does not know); every route the launch did resolve is pinned after\n");
     script.push_str("# it, so the zooid and its settlement open the collections the run is in.\n");
-    script.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT ${!TRIBLESPACE_@}\n");
+    let secret_vars = facts
+        .agent_secrets
+        .iter()
+        .map(|(variable, _)| format!(" {variable}"))
+        .collect::<String>();
+    script.push_str(&format!(
+        "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT{secret_vars} ${{!TRIBLESPACE_@}}\n"
+    ));
     if let Some(env) = facts.colony_env {
         script.push_str(&format!("set -a; . {} || exit 78; set +a\n", q(env)));
     }
@@ -680,11 +741,15 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         .unwrap_or_default();
     script.push_str(&format!(
         "  exec {} settle {} --run {:x}{request} --code \"${{EXIT_CODE:-}}\" --status \"${{EXIT_STATUS:-}}\" \
-         --result \"${{SERVICE_RESULT:-}}\" --report {}\n",
+         --result \"${{SERVICE_RESULT:-}}\" --report {}{}\n",
         q(facts.spawn),
         q(facts.name),
         facts.run,
-        q(facts.report)
+        q(facts.report),
+        facts
+            .usage
+            .map(|path| format!(" --usage {}", q(path)))
+            .unwrap_or_default()
     ));
     script.push_str("fi\n");
     script.push_str(&format!(
@@ -694,6 +759,13 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     ));
     for (variable, value) in facts.agent_env {
         script.push_str(&format!("export {}={}\n", variable, q(value)));
+    }
+    for (variable, version) in facts.agent_secrets {
+        script.push_str(&format!(
+            "{variable}=$({} get --secret {}) && [ -n \"${variable}\" ] || {{ echo \"spawn:              reading {variable} from Secrets failed\" >&2; exit 77; }}\nexport {variable}\n",
+            q(facts.secrets),
+            q(version)
+        ));
     }
     let agent = facts
         .agent
@@ -961,6 +1033,31 @@ mod tests {
     }
 
     #[test]
+    fn vibe_usage_reads_the_export_and_refuses_one_without_usage() {
+        let usage = vibe_usage(
+            r#"{"usage":{"input_tokens":10,"output_tokens":2,"cached_input_tokens":8,
+               "total_tokens":12},"cost_usd":0.25,"config":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            usage,
+            Usage {
+                input_tokens: Some(10),
+                cached_input_tokens: Some(8),
+                output_tokens: Some(2),
+                total_tokens: Some(12),
+                cost_usd: Some(0.25),
+            }
+        );
+        // A field vibe left out is absent, not zero.
+        let partial = vibe_usage(r#"{"cost_usd":0.5}"#).unwrap();
+        assert_eq!(partial.input_tokens, None);
+        assert_eq!(partial.cost_usd, Some(0.5));
+        assert!(vibe_usage(r#"{"outcome":"finished"}"#).is_err());
+        assert!(vibe_usage("not json").is_err());
+    }
+
+    #[test]
     fn the_script_runs_claude_bare_and_settle_as_stop_post() {
         let run = Id::new([7; 16]).unwrap();
         let script = unit_script(&ScriptFacts {
@@ -977,6 +1074,9 @@ mod tests {
             )],
             agent: &["/c/claude".to_owned(), "-p".to_owned()],
             agent_env: &[],
+            agent_secrets: &[],
+            secrets: "secrets",
+            usage: None,
             stdout_is_report: true,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
@@ -1020,6 +1120,9 @@ mod tests {
             routes: &[],
             agent: &["codex".to_owned(), "exec".to_owned(), "-".to_owned()],
             agent_env: &[("CODEX_HOME".to_owned(), "/s/n.codex".to_owned())],
+            agent_secrets: &[],
+            secrets: "secrets",
+            usage: None,
             stdout_is_report: false,
             prompt: "/s/n.prompt",
             report: "/s/n.report",

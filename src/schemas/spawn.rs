@@ -153,5 +153,15 @@ pub mod spawn {
         "3C4380BFBC6A0149F6F62618FF1E3CC8" as reason: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The run an outcome refers to. Minted 2026-11-17.
         "3AE1B0C884653F349C65776191733A1E" as outcome_run: inlineencodings::GenId;
+        /// Input tokens the provider served from its prefix cache, out of
+        /// the run's input tokens (`imagine::input_tokens`). Recorded at
+        /// settlement for runs whose agent reports usage (`mistral`).
+        /// Minted with `trible genid` on 2026-11-17.
+        "DF911DB9B6BB40BECDA671498382774F" as cached_input_tokens: inlineencodings::U256BE;
+        /// What the run cost in US dollars, as its agent estimated it from
+        /// the prices in the run's own configuration: an estimate, not the
+        /// provider's bill. Recorded at settlement (`mistral`, from vibe's
+        /// `export.json`). Minted with `trible genid` on 2026-11-17.
+        "26501A21D1CA70A5C8ADE843317A9D22" as cost_usd: inlineencodings::F64;
     }
 }
