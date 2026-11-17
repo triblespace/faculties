@@ -160,27 +160,27 @@ impl GaugeViewer {
     }
 
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        let need_refresh = match self.live.as_ref() {
-            None => self
-                .error
-                .as_ref()
-                .is_none_or(|(revision, _)| *revision != dataset.revision),
-            Some(l) => l.cached_revision != dataset.revision,
-        };
-        if need_refresh {
-            match GaugeLive::refresh(dataset) {
-                Ok(live) => {
-                    self.live = Some(live);
-                    self.error = None;
-                }
-                Err(error) => {
-                    self.live = None;
-                    self.error = Some((dataset.revision, error));
+        ctx.section("Gauge", |ctx| {
+            let need_refresh = match self.live.as_ref() {
+                None => self
+                    .error
+                    .as_ref()
+                    .is_none_or(|(revision, _)| *revision != dataset.revision),
+                Some(l) => l.cached_revision != dataset.revision,
+            };
+            if need_refresh {
+                match GaugeLive::refresh(dataset) {
+                    Ok(live) => {
+                        self.live = Some(live);
+                        self.error = None;
+                    }
+                    Err(error) => {
+                        self.live = None;
+                        self.error = Some((dataset.revision, error));
+                    }
                 }
             }
-        }
 
-        ctx.section("Gauge", |ctx| {
             if let Some((_, error)) = self.error.as_ref() {
                 ctx.grid(|g| {
                     g.full(|ctx| {
@@ -504,4 +504,76 @@ mod tests {
         assert_eq!(live.orphans, 1);
         assert_eq!(live.count(TAG_SPECS[1].1), 2);
     }
+
+    #[test]
+    fn closed_gauge_defers_reads_and_opens_the_current_revision() {
+        use std::{cell::{Cell, RefCell}, rc::Rc};
+        use ed25519_dalek::SigningKey;
+        use crate::storage::CollectionRoutes;
+        use crate::widgets::storage::WorkspaceObservation;
+        use triblespace::core::collection::{
+            AdmissionPolicy, CollectionPolicy, observed_store::DependencyTracker,
+        };
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[17; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let collection = pile.collection("closed gauge fixture", CollectionPolicy::new(
+            AdmissionPolicy::Open, AdmissionPolicy::Open,
+        )).unwrap();
+        let routes = CollectionRoutes::from([(crate::schemas::wiki::DEFAULT_SCOPE_ID, collection.handle())]);
+        let (mut fragment, author) = wiki::author_record(&signer.verifying_key());
+        revision(&mut fragment, author, "first", "first body", &[], &[], 1.0);
+        pile.commit(collection, &signer, fragment).unwrap();
+        let tracker = DependencyTracker::default();
+        let observed = Rc::new(RefCell::new(pollster::block_on(
+            WorkspaceObservation::observe_tracked(&mut pile, &signer, &routes, tracker.clone()),
+        ).unwrap()));
+        let panel = Rc::new(RefCell::new(GaugeViewer::default()));
+        let open = Rc::new(Cell::new(false));
+        let context = egui::Context::default();
+        let (views, gauge, expanded) = (observed.clone(), panel.clone(), open.clone());
+        let mut notebook = GORBIE::NotebookConfig::new("closed gauge regression")
+            .without_editor().embedded(&context, move |nb| {
+                let (views, gauge, expanded) = (views.clone(), gauge.clone(), expanded.clone());
+                nb.view(move |ctx| {
+                    // Exercise the real section body gate, with no headless
+                    // override (capture mode intentionally opens all sections).
+                    ctx.set_default_section_open(false);
+                    let id = ctx.ui_mut().make_persistent_id("Gauge");
+                    ctx.ui_mut().ctx().data_mut(|data| data.insert_persisted(id, expanded.get()));
+                    let view = views.borrow();
+                    gauge.borrow_mut().render(ctx, view.loaded_context().dataset(SourceKey::Wiki).unwrap());
+                });
+            });
+        let frame = |notebook: &mut GORBIE::Notebook| {
+            let _ = context.run_ui(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0))),
+                ..Default::default()
+            }, |ui| notebook.show(ui, None));
+        };
+        *tracker.lock().unwrap() = Default::default();
+        frame(&mut notebook);
+        assert!(panel.borrow().live.is_none(), "closed section must not query its projection");
+        assert!(tracker.lock().unwrap().is_empty(), "closed section must not read bodies or observations");
+
+        let mut fragment = Fragment::empty();
+        revision(&mut fragment, author, "second", "second body", &[], &[], 2.0);
+        pile.commit(collection, &signer, fragment).unwrap();
+        *observed.borrow_mut() = pollster::block_on(WorkspaceObservation::observe_tracked(
+            &mut pile, &signer, &routes, tracker.clone(),
+        )).unwrap();
+        *tracker.lock().unwrap() = Default::default();
+        frame(&mut notebook);
+        assert!(panel.borrow().live.is_none());
+        assert!(tracker.lock().unwrap().is_empty());
+        open.set(true);
+        frame(&mut notebook);
+        let panel = panel.borrow();
+        let live = panel.live.as_ref().expect("opening renders the current dataset");
+        assert_eq!(live.total_entries, 2);
+        assert_eq!(live.cached_revision, observed.borrow().loaded_context().dataset(SourceKey::Wiki).unwrap().revision);
+        assert!(!tracker.lock().unwrap().blobs.is_empty(), "positive control actually reads Wiki bodies");
+        pile.close().unwrap();
+    }
+
 }
