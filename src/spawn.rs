@@ -394,7 +394,10 @@ pub fn preamble(name: &str, spawner: &str) -> String {
          the answer, not a farewell. Do not arm a colony watcher (no `orient wait`): you are \
          not a window, and news would fire into a context that ends with this task. You have \
          the faculties MCP tools, served for you alone: their write tools never read PERSONA, \
-         so pass {name} as `from` or `persona` on every write, as the CLI would. The wake \
+         so pass {name} as `from` or `persona` on every write, as the CLI would. Your name is \
+         also an address: {spawner} or another zooid may message you while you work. On a \
+         longer task, check between steps with `orient_poll` (persona {name}, peek true), answer \
+         with `message_send` from {name}, and `message_ack` what you have handled. The wake \
          above is the shared self; the recollection after it was chosen for this brief.\n"
     )
 }
@@ -833,6 +836,15 @@ mod tests {
         assert!(prompt.find("BRIEF").unwrap() < prompt.find("# Handoff").unwrap());
         assert_eq!(prompt.matches("HANDOFF").count(), 1);
         assert!(prompt.ends_with("HANDOFF\n\n"));
+    }
+
+    #[test]
+    fn the_preamble_names_the_zooid_as_an_address_it_polls() {
+        let text = preamble("lusab-babad", "tutor");
+        // Writes are attributed by name, and the name is also its inbox.
+        assert!(text.contains("pass lusab-babad as `from` or `persona`"));
+        assert!(text.contains("`orient_poll` (persona lusab-babad, peek true)"));
+        assert!(text.contains("tutor or another zooid may message you"));
     }
 
     #[test]
