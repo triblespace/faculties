@@ -802,6 +802,7 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
             "compass_list",
             "compass_priorities",
             "compass_move",
+            "compass_tag",
             "compass_note",
             "compass_show",
             "compass_prioritize",
@@ -813,6 +814,7 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
         ("compass_add", r#"{"title":"first","title":"second"}"#),
         ("compass_add", r#"{"title":"ok","pile":"/elsewhere"}"#),
         ("compass_add", r#"{"title":"ok","persona":true}"#),
+        ("compass_tag", r#"{"id":"abc","tags":["t"],"persona":"x"}"#),
         ("compass_list", r#"{"all":"true"}"#),
         ("compass_list", r#"{"tags":[1]}"#),
         ("compass_priorities", r#"{"tags":[1]}"#),
@@ -1143,4 +1145,69 @@ fn an_unknown_mention_warns_and_still_writes() {
         .contains("Added note"));
     let (facts, _) = fixture.snapshot();
     assert_eq!(compass::note_ids(&facts).len(), 1);
+}
+
+#[test]
+fn tagging_an_existing_goal_adds_the_same_tag_fact_and_never_mints_a_goal() {
+    let fixture = Fixture::new();
+    let operations = fixture.operations();
+    let faculty = fixture.mcp();
+    let goal = operations
+        .add("Tagged later", AddOptions::default())
+        .unwrap();
+    let id = format!("{:x}", goal.goal);
+    let topic = vec!["topic".to_owned()];
+    let listed = |tags: &[String]| {
+        operations
+            .list(ListOptions {
+                tags,
+                ..ListOptions::default()
+            })
+            .unwrap()
+    };
+    assert!(!listed(&topic).contains("Tagged later"));
+
+    let tagged = operations
+        .tag(&id[..12], &[" topic ".to_owned(), "topic".to_owned()])
+        .unwrap();
+    assert_eq!(tagged.goal, goal.goal);
+    assert_eq!(tagged.added, topic);
+    assert!(tagged.held.is_empty());
+    let list = listed(&topic);
+    assert!(list.contains("Tagged later #topic"), "{list}");
+
+    // A held tag is reported and not written again; a new one is added
+    // through each frontend.
+    assert_eq!(
+        fixture.cli(&["tag", &id, "topic", "second"], None),
+        format!("Tagged goal {id}: second\nGoal {id} already has: topic\n")
+    );
+    assert_eq!(
+        call(
+            &faculty,
+            "compass_tag",
+            serde_json::json!({"id": id, "tags": ["third"]})
+        ),
+        format!("Tagged goal {id}: third\n")
+    );
+    let all = operations.list(ListOptions::default()).unwrap();
+    assert!(all.contains("Tagged later #second #third #topic"), "{all}");
+    assert_eq!(
+        operations.tag(&id, &["topic".to_owned()]).unwrap().added,
+        Vec::<String>::new()
+    );
+
+    // An id that names no goal is refused rather than minting one, and an
+    // empty request is refused before anything is read.
+    let absent = "0123456789abcdef0123456789abcdef";
+    assert!(operations.tag(absent, &topic).is_err());
+    assert!(operations.tag(&id, &[]).is_err());
+    let (facts, _) = fixture.snapshot();
+    assert_eq!(compass::goal_ids(&facts).len(), 1);
+    let tags: BTreeSet<_> = find!(
+        tag: Inline<inlineencodings::Handle<blobencodings::UTF8String>>,
+        pattern!(&facts, [{ goal.goal @ board::tag: ?tag }])
+    )
+    .collect();
+    assert_eq!(tags.len(), 3, "{tags:?}");
 }

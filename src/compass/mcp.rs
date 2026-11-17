@@ -33,6 +33,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"persona":{"type":"string","description":"Optional active Relations persona label or full id for cooperative attribution; never read from the server's PERSONA environment."}},"required":["id","status"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "compass_tag",
+        description: "Add tags to an existing goal. A tag is the same fact compass_add writes, asserted later; tags cannot be removed. Tags the goal already holds are reported, not written again. The tag sits on the goal, which has no author slot, so no persona is recorded.",
+        input_schema: r#"{"type":"object","properties":{"id":{"type":"string","description":"Goal id or unique prefix"},"tags":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["id","tags"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "compass_note",
         description: "Append a literal note with optional tags, exact references, and note supersedes links. Superseded notes remain visible. An @label inside the note mentions that Relations persona or every member of that group.",
         input_schema: r#"{"type":"object","properties":{"id":{"type":"string"},"note":{"type":"string"},"tags":{"type":"array","items":{"type":"string"},"default":[]},"references":{"type":"array","items":{"type":"string"},"default":[]},"supersedes":{"type":"array","items":{"type":"string","description":"Existing full 32-character note id"},"default":[]},"persona":{"type":"string","description":"Optional active Relations persona label or full id for cooperative attribution; never read from the server's PERSONA environment."}},"required":["id","note"],"additionalProperties":false}"#,
@@ -107,6 +112,13 @@ struct NoteArguments {
     #[serde(default)]
     supersedes: Vec<String>,
     persona: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TagArguments {
+    id: String,
+    tags: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -196,6 +208,10 @@ impl Faculty for Compass {
                         .move_goal(&args.id, &args.status, args.persona.as_deref())?,
                     output,
                 )
+            }
+            "compass_tag" => {
+                let args: TagArguments = decode_arguments(arguments)?;
+                render::tagged(&self.operations.tag(&args.id, &args.tags)?, output)
             }
             "compass_note" => {
                 let args: NoteArguments = decode_arguments(arguments)?;

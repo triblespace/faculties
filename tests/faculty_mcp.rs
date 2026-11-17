@@ -293,6 +293,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "compass_prioritize",
         "compass_deprioritize",
         "compass_resolve",
+        "compass_tag",
         "message_send",
         "message_list",
         "message_ack",

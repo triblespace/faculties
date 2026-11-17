@@ -69,7 +69,7 @@ pub struct Cli {
 ///   same selection as command/result pairs for a harness that wakes a model
 ///   from commands it could have issued (`memory <range>` or `memory <id>`,
 ///   `wiki show <id>`, `orient goals ...`), never a pasted document.
-/// - `goals` — the Compass section of `wake`, alone.
+/// - `goals` — the Compass and Horizons sections of `wake`, alone.
 /// - `show`  — a general overview mid-session, for "what's up right now".
 ///   **Neither memories nor wiki entries belong here** — it is a situation
 ///   snapshot, not a self. Keeping it cheap is what makes it runnable often.
@@ -184,7 +184,8 @@ enum Command {
         reader_provider: Option<String>,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
-    /// goals. Never records presentation.
+    /// goals, then every not-done `horizon` goal, longest unmoved first.
+    /// Never records presentation.
     Goals {
         /// Max doing goals to show
         #[arg(long, default_value_t = 5)]
