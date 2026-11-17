@@ -16,9 +16,9 @@ pub mod mcp;
 pub mod operations;
 
 pub use operations::{
-    choose_provider, GoalRequest, LaunchConfig, Launched, Launcher, LibraryRenderer, Provider,
-    Renderer, RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher,
-    UnitSpec,
+    choose_provider, GoalRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,
+    LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested, RunRequest, RunView,
+    SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidRef,
 };
 
 use anyhow::{bail, Result};
@@ -28,10 +28,12 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::spawn::{spawn as attrs, KIND_RUN, KIND_SPAWN};
+use crate::schemas::spawn::{spawn as attrs, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN};
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
 pub type IntervalValue = Inline<NsTAIInterval>;
+/// A host, named by its node key as custody and the network name peers.
+pub type HostKey = Inline<inlineencodings::ED25519PublicKey>;
 
 /// Prefix of the unit a zooid runs in, before its name.
 pub const UNIT_PREFIX: &str = "spawn-";
@@ -73,6 +75,27 @@ pub fn name_for(brief: TextHandle) -> String {
 /// The unit a zooid runs in.
 pub fn unit_for(name: &str) -> String {
     format!("{UNIT_PREFIX}{name}")
+}
+
+/// The unit a request's run runs in, derived from the request alone, so
+/// systemd itself refuses a second start of one request while it runs.
+pub fn unit_for_request(request: Id) -> String {
+    format!("{UNIT_PREFIX}req-{request:x}")
+}
+
+/// A host key as 64 hex digits, the way `TRIBLESPACE_PEERS` writes it.
+pub fn host_text(host: HostKey) -> String {
+    hex::encode(host.raw)
+}
+
+/// A host key from 64 hex digits.
+pub fn parse_host(text: &str) -> Result<HostKey> {
+    let bytes = hex::decode(text.trim())
+        .map_err(|_| anyhow::anyhow!("host {text:?} is not a hex node key"))?;
+    let raw: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("host {text:?} is not a 32-byte node key"))?;
+    Ok(Inline::new(raw))
 }
 
 /// `blake3:<hex>` for a handle, as other faculties print one.
@@ -133,6 +156,8 @@ pub struct RunFacts {
     pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
+    /// The request this run serves, when a keeper started it.
+    pub request: Option<Id>,
 }
 
 /// A run: the spawn and start time as its intrinsic core, the rest as
@@ -176,6 +201,89 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::untinted?: untinted,
         attrs::model?: model,
         attrs::model_unset?: model_unset,
+        attrs::request?: run.request,
+    };
+    (fragment, id)
+}
+
+/// What a run request says. It names no workdir, command, tool or budget:
+/// the host that runs it resolves those itself.
+#[derive(Clone, Debug)]
+pub struct RequestFacts {
+    pub zooid: Id,
+    pub host: HostKey,
+    pub host_label: Option<String>,
+    /// The provider policy asked for: `claude`, `codex`, `auto` or `local`.
+    pub provider: String,
+    pub effort: String,
+    pub previous: Option<Id>,
+    pub handoff: Option<String>,
+    pub requested_at: IntervalValue,
+    /// The persona that asked, messaged when the run ends. A reply route,
+    /// not authority: authority is the COMMIT signer's WRITE admission.
+    pub spawner: Id,
+}
+
+/// A request: everything it asks for is its intrinsic core (known when it is
+/// written, the same for every reader), the label and the asker annotate it.
+/// Returns the fragment and the request id.
+pub fn request_fragment(request: &RequestFacts) -> (Fragment, Id) {
+    let mut fragment = Fragment::empty();
+    let provider = fragment.put::<UTF8String, _>(request.provider.clone());
+    let effort = fragment.put::<UTF8String, _>(request.effort.clone());
+    let handoff = request
+        .handoff
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
+    let core = entity! { _ @
+        metadata::tag: KIND_REQUEST,
+        attrs::zooid: request.zooid,
+        attrs::host: request.host,
+        attrs::provider: provider,
+        attrs::effort: effort,
+        attrs::previous?: request.previous,
+        attrs::handoff?: handoff,
+        metadata::created_at: request.requested_at,
+    };
+    let id = core.root().expect("a request has one intrinsic root");
+    fragment += core;
+    let label = request
+        .host_label
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
+    fragment += entity! { ExclusiveId::force_ref(&id) @
+        archive_attrs::author: request.spawner,
+        attrs::host_label?: label,
+    };
+    (fragment, id)
+}
+
+/// One outcome of a request: the request and the outcome kind are its
+/// core, so recording it again names the same entity; when it was observed,
+/// the run, the unit and the reason annotate it.
+pub fn outcome_fragment(
+    request: Id,
+    outcome: Id,
+    at: IntervalValue,
+    run: Option<Id>,
+    unit: Option<&str>,
+    reason: Option<&str>,
+) -> (Fragment, Id) {
+    let core = entity! { _ @
+        metadata::tag: KIND_OUTCOME,
+        attrs::request: request,
+        attrs::outcome: outcome,
+    };
+    let id = core.root().expect("an outcome has one intrinsic root");
+    let mut fragment = Fragment::empty();
+    fragment += core;
+    let unit = unit.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
+    let reason = reason.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
+    fragment += entity! { ExclusiveId::force_ref(&id) @
+        metadata::created_at: at,
+        attrs::outcome_run?: run,
+        attrs::unit?: unit,
+        attrs::reason?: reason,
     };
     (fragment, id)
 }
@@ -280,15 +388,29 @@ pub fn preamble(name: &str, spawner: &str) -> String {
     )
 }
 
-/// The opening context in its fixed order: wake, memory tail, preamble, brief.
-pub fn assemble_prompt(wake: &str, tail: &str, preamble: &str, brief: &str) -> String {
-    let mut prompt = String::with_capacity(wake.len() + tail.len() + preamble.len() + brief.len());
-    for (title, body) in [
-        ("Wake", wake),
-        ("Recollection for this task", tail),
-        ("Who you are", preamble),
-        ("Brief", brief),
-    ] {
+/// The opening context in its fixed order: wake, memory tail, preamble,
+/// brief, and a request's handoff last, once, when there is one.
+pub fn assemble_prompt(
+    wake: &str,
+    tail: &str,
+    preamble: &str,
+    brief: &str,
+    handoff: Option<&str>,
+) -> String {
+    let mut prompt = String::with_capacity(
+        wake.len() + tail.len() + preamble.len() + brief.len() + handoff.map_or(0, str::len),
+    );
+    let sections = [
+        ("Wake", Some(wake)),
+        ("Recollection for this task", Some(tail)),
+        ("Who you are", Some(preamble)),
+        ("Brief", Some(brief)),
+        ("Handoff", handoff),
+    ];
+    for (title, body) in sections
+        .into_iter()
+        .filter_map(|(title, body)| body.map(|body| (title, body)))
+    {
         prompt.push_str("# ");
         prompt.push_str(title);
         prompt.push_str("\n\n");
@@ -491,6 +613,9 @@ pub struct ScriptFacts<'a> {
     pub stdout_is_report: bool,
     pub prompt: &'a str,
     pub report: &'a str,
+    /// The unit's log. The MCP server's stderr is appended to it, so a
+    /// server that fails to start says why; its stdout is the protocol.
+    pub log: &'a str,
     pub spawn: &'a str,
     /// The `faculties` binary, absolute. The script run as `mcp` is the
     /// zooid's own stdio MCP server, started by the agent from its MCP
@@ -542,8 +667,9 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     ));
     script.push_str("fi\n");
     script.push_str(&format!(
-        "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp; fi\n",
-        q(facts.faculties)
+        "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp 2>> {}; fi\n",
+        q(facts.faculties),
+        q(facts.log)
     ));
     for (variable, value) in facts.agent_env {
         script.push_str(&format!("export {}={}\n", variable, q(value)));
@@ -617,6 +743,44 @@ mod tests {
     }
 
     #[test]
+    fn a_request_is_what_it_asks_for_and_an_outcome_is_its_request_and_kind() {
+        let at = |n: u64| -> IntervalValue {
+            crate::clock::point(hifitime::Epoch::from_tai_seconds(n as f64)).unwrap()
+        };
+        let facts = |label: &str, spawner: u8, when: u64| RequestFacts {
+            zooid: Id::new([1; 16]).unwrap(),
+            host: Inline::new([2; 32]),
+            host_label: Some(label.to_owned()),
+            provider: "claude".to_owned(),
+            effort: "high".to_owned(),
+            previous: None,
+            handoff: Some("h".to_owned()),
+            requested_at: at(when),
+            spawner: Id::new([spawner; 16]).unwrap(),
+        };
+        let (_, first) = request_fragment(&facts("sky", 3, 10));
+        // The label and the asker annotate; they are not identity.
+        assert_eq!(request_fragment(&facts("other", 4, 10)).1, first);
+        // A request asked at another time is another request.
+        assert_ne!(request_fragment(&facts("sky", 3, 11)).1, first);
+        let mut different = facts("sky", 3, 10);
+        different.provider = "codex".to_owned();
+        assert_ne!(request_fragment(&different).1, first);
+        let kind = Id::new([9; 16]).unwrap();
+        let (_, a) = outcome_fragment(first, kind, at(1), None, None, Some("x"));
+        let (_, b) = outcome_fragment(first, kind, at(2), Some(first), Some("u"), None);
+        assert_eq!(a, b);
+        assert_ne!(
+            outcome_fragment(first, Id::new([8; 16]).unwrap(), at(1), None, None, None).1,
+            a
+        );
+        assert_eq!(unit_for_request(first), format!("spawn-req-{first:x}"));
+        let host = parse_host(&"ab".repeat(32)).unwrap();
+        assert_eq!(host_text(host), "ab".repeat(32));
+        assert!(parse_host("abcd").is_err() && parse_host(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
     fn systemd_exit_values_map_to_a_code_or_a_signal() {
         assert_eq!(
             Exit::from_systemd("exited", "3", "exit-code"),
@@ -640,12 +804,17 @@ mod tests {
 
     #[test]
     fn prompt_order_is_wake_tail_preamble_brief() {
-        let prompt = assemble_prompt("WAKE", "TAIL", "PREAMBLE", "BRIEF");
+        let prompt = assemble_prompt("WAKE", "TAIL", "PREAMBLE", "BRIEF", None);
         let at = |needle: &str| prompt.find(needle).unwrap();
         assert!(at("WAKE") < at("TAIL"));
         assert!(at("TAIL") < at("PREAMBLE"));
         assert!(at("PREAMBLE") < at("BRIEF"));
         assert!(prompt.ends_with("BRIEF\n\n"));
+        assert!(!prompt.contains("# Handoff"));
+        let prompt = assemble_prompt("WAKE", "TAIL", "PREAMBLE", "BRIEF", Some("HANDOFF"));
+        assert!(prompt.find("BRIEF").unwrap() < prompt.find("# Handoff").unwrap());
+        assert_eq!(prompt.matches("HANDOFF").count(), 1);
+        assert!(prompt.ends_with("HANDOFF\n\n"));
     }
 
     #[test]
@@ -780,6 +949,7 @@ mod tests {
             stdout_is_report: true,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
+            log: "/s/n.log",
             spawn: "spawn",
             faculties: "/b/faculties",
         });
@@ -801,7 +971,7 @@ mod tests {
         // Run as `mcp` the script is the zooid's own MCP server, in the same
         // environment as settlement and the CLI, and never the agent.
         let mcp = script
-            .find("if [ \"${1:-}\" = mcp ]; then exec /b/faculties mcp; fi\n")
+            .find("if [ \"${1:-}\" = mcp ]; then exec /b/faculties mcp 2>> /s/n.log; fi\n")
             .unwrap();
         assert!(settle < mcp && mcp < script.find("exec /c/claude").unwrap());
     }
@@ -821,6 +991,7 @@ mod tests {
             stdout_is_report: false,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
+            log: "/s/n.log",
             spawn: "spawn",
             faculties: "/b/faculties",
         });

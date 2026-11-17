@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `spawn request` (MCP `spawn_request`) writes a run request into the spawn
+  collection: a zooid (an existing one by name, or a new brief whose spawn
+  record travels with it), one target host by node key with a readable label
+  beside it, the provider policy, the effort, an optional previous run and an
+  optional handoff. It names no workdir, command, tool or budget. `spawn keep`
+  is the per-host keeper: `--once` makes one pass, without it the pass repeats
+  every `--poll` seconds (not deployed anywhere yet). It reads only requests
+  addressed to its own signer's key; requests whose COMMIT signer is not
+  admitted to write the collection are not in its view at all. It starts each
+  run through the ordinary launch path in unit `spawn-req-<request>`, from its
+  own `--workdir` (or `SPAWN_KEEP_WORKDIR`, or `$HOME`), and records outcomes:
+  accepted, running, refused with its reason, and task-terminal, which
+  settlement records when the run ends. A request with a run is never started
+  again; a running unit with no run record is not started a second time.
+  `local` is refused ("no local executor on this host"), never served by a
+  hosted model. The handoff is the prompt's last section, once, after the
+  brief. `spawn requests` (MCP `spawn_requests`) lists requests and outcomes.
+- A zooid's faculties MCP server now appends its stderr to the run's log, so
+  a server that fails to start says why. Its stdout stays the protocol.
+
 - `headspace reconcile` (MCP `headspace_reconcile`) reads only what it needs:
   the chosen snapshot and its track's current heads, as typed queries over
   one snapshot of the collection. It used to load the whole history into a

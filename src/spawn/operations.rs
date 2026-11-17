@@ -31,13 +31,16 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
-use super::{Exit, IntervalValue, RunFacts, ScriptFacts, TextHandle};
+use super::{Exit, HostKey, IntervalValue, RequestFacts, RunFacts, ScriptFacts, TextHandle};
 use crate::compass::{Compass, NoteOptions};
 use crate::memory_cover::CoverOpts;
 use crate::out::{Out, Part};
 use crate::relations::{ProfileInput, Relations};
 use crate::schemas::archive::archive as archive_attrs;
-use crate::schemas::spawn::{spawn as attrs, DEFAULT_SCOPE_ID, KIND_RUN, KIND_SPAWN};
+use crate::schemas::spawn::{
+    spawn as attrs, DEFAULT_SCOPE_ID, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN,
+    OUTCOME_ACCEPTED, OUTCOME_REFUSED, OUTCOME_RUNNING, OUTCOME_TERMINAL,
+};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
 
 /// Starts a unit and reports its state. The systemd implementation is
@@ -506,6 +509,15 @@ struct Brief {
     goal: Option<(Id, Vec<Id>)>,
 }
 
+/// What a keeper adds to an ordinary launch: the unit named by the request,
+/// the request the run serves, and the handoff delivered after the brief.
+#[derive(Clone, Debug, Default)]
+struct LaunchExtras {
+    unit: Option<String>,
+    request: Option<Id>,
+    handoff: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Launched {
     pub name: String,
@@ -591,12 +603,130 @@ pub struct RunView {
     pub message: Vec<Id>,
     pub settle_failure: Vec<String>,
     pub goal_note: Vec<Id>,
+    /// The request the run serves, when a keeper started it.
+    pub request: Vec<Id>,
 }
 
 impl RunView {
     pub fn ended(&self) -> bool {
         !self.finished.is_empty()
     }
+}
+
+/// Which zooid a request asks for.
+#[derive(Clone, Debug)]
+pub enum ZooidRef {
+    /// An existing spawn, by name.
+    Name(String),
+    /// A new brief: the request carries the spawn record with it.
+    Brief(String),
+}
+
+/// `spawn request`: ask one host's keeper to start a run there. It names no
+/// workdir, command, tool or budget; the host resolves those itself.
+#[derive(Clone, Debug)]
+pub struct RequestInput {
+    pub zooid: ZooidRef,
+    /// The target host's node key. `None` is this host: the signer's key.
+    pub host: Option<HostKey>,
+    /// A readable name beside the key.
+    pub host_label: Option<String>,
+    pub provider: Provider,
+    pub effort: String,
+    /// The asking persona, messaged when the run ends.
+    pub spawner: String,
+    /// The run this one continues, when it is a move.
+    pub previous: Option<Id>,
+    /// Delivered once, after the brief, in the run's prompt.
+    pub handoff: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Requested {
+    pub request: Id,
+    pub zooid: Id,
+    pub name: String,
+    pub host: HostKey,
+    pub host_label: Option<String>,
+    pub unit: String,
+}
+
+/// One outcome a keeper recorded for a request.
+#[derive(Clone, Debug)]
+pub struct OutcomeView {
+    pub id: Id,
+    pub kind: Id,
+    pub at: Vec<IntervalValue>,
+    pub run: Vec<Id>,
+    pub unit: Vec<String>,
+    pub reason: Vec<String>,
+}
+
+/// One request as this observation holds it. Fields that are lists may
+/// hold none or several values; the keeper decides what it can act on.
+#[derive(Clone, Debug)]
+pub struct RequestView {
+    pub id: Id,
+    pub zooid: Vec<Id>,
+    pub host: Vec<HostKey>,
+    pub host_label: Vec<String>,
+    pub provider: Vec<String>,
+    pub effort: Vec<String>,
+    pub previous: Vec<Id>,
+    pub handoff: Vec<TextHandle>,
+    /// The first handoff's text, when its blob is here.
+    pub handoff_text: Option<String>,
+    pub spawner: Vec<Id>,
+    pub requested_at: Vec<IntervalValue>,
+    /// The zooid's brief handle and text (when here), and its goal revision.
+    pub brief: Option<TextHandle>,
+    pub brief_text: Option<String>,
+    pub goal: Option<(Id, Vec<Id>)>,
+    pub outcomes: Vec<OutcomeView>,
+    /// Runs serving this request, and whether each has a recorded end.
+    pub runs: Vec<(Id, bool)>,
+}
+
+impl RequestView {
+    fn has(&self, kind: Id) -> bool {
+        self.outcomes.iter().any(|outcome| outcome.kind == kind)
+    }
+
+    /// The zooid's name, when its brief is known.
+    pub fn name(&self) -> Option<String> {
+        self.brief.map(super::name_for)
+    }
+}
+
+/// What `spawn keep` resolves on its own host, never from a request.
+#[derive(Clone, Debug)]
+pub struct KeepConfig {
+    /// The directory every request's run starts in.
+    pub workdir: PathBuf,
+}
+
+/// What one pass did about one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeepStep {
+    /// Started its run.
+    Launched { run: Id, unit: String, name: String },
+    /// Recorded a refusal, with its reason.
+    Refused(String),
+    /// Its unit is running; the outcome is recorded.
+    Running,
+    /// Its run ended and settlement recorded the end.
+    Ended,
+    /// Nothing can be done yet; the reason says what it waits for.
+    Waiting(String),
+    /// Already refused or ended: left alone.
+    Done,
+}
+
+/// One keeper pass over the requests addressed to this host.
+#[derive(Clone, Debug)]
+pub struct KeepPass {
+    pub host: HostKey,
+    pub steps: Vec<(Id, KeepStep)>,
 }
 
 /// Configured Spawn operations.
@@ -641,6 +771,7 @@ impl Spawn {
             &request.effort,
             &request.spawner,
             request.provider,
+            LaunchExtras::default(),
         )
     }
 
@@ -664,6 +795,7 @@ impl Spawn {
             &request.effort,
             &request.spawner,
             request.provider,
+            LaunchExtras::default(),
         )
     }
 
@@ -772,6 +904,7 @@ impl Spawn {
         effort: &str,
         spawner_label: &str,
         provider: Provider,
+        extras: LaunchExtras,
     ) -> Result<Launched> {
         if !super::EFFORTS.contains(&effort) {
             bail!(
@@ -792,7 +925,10 @@ impl Spawn {
         super::require_unit_safe("workdir", &workdir_text)?;
         let (provider, provider_reason) = self.resolve_provider(provider)?;
         let (spawn_fragment, spawn, brief_handle, name) = super::spawn_fragment(&brief.text)?;
-        let unit = super::unit_for(&name);
+        let unit = extras
+            .unit
+            .clone()
+            .unwrap_or_else(|| super::unit_for(&name));
         let launch = &self.launch;
         let files = [
             ("prompt", launch.file(&name, "prompt")),
@@ -907,7 +1043,13 @@ impl Spawn {
                 Err(error) => return Err(error),
             };
             let preamble = super::preamble(&name, spawner_label);
-            let prompt = super::assemble_prompt(&wake, &tail, &preamble, &brief.text);
+            let prompt = super::assemble_prompt(
+                &wake,
+                &tail,
+                &preamble,
+                &brief.text,
+                extras.handoff.as_deref(),
+            );
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -922,6 +1064,7 @@ impl Spawn {
                 model: model.clone(),
                 model_unset: model_unset.clone(),
                 untinted: untinted.clone(),
+                request: extras.request,
             });
             let text = |path: &Path| path.display().to_string();
             let (agent, agent_env, stdout_is_report) =
@@ -939,6 +1082,7 @@ impl Spawn {
                 stdout_is_report,
                 prompt: &text(&prompt_path),
                 report: &text(&report_path),
+                log: &text(&log_path),
                 spawn: &launch.spawn,
                 faculties: &text(&faculties),
             });
@@ -1096,6 +1240,36 @@ impl Spawn {
             .next();
             Ok(started.map(|started| run_view(facts, reader, run, started)))
         });
+        // A run a keeper started for a request ends that request's task.
+        if let Ok(Some(view)) = &recorded {
+            let recorded_ends = self
+                .observe(|facts, _| {
+                    Ok(view
+                        .request
+                        .iter()
+                        .map(|request| has_outcome(facts, *request, OUTCOME_TERMINAL))
+                        .collect::<Vec<_>>())
+                })
+                .unwrap_or_else(|_| vec![false; view.request.len()]);
+            for (request, _) in view
+                .request
+                .iter()
+                .zip(recorded_ends)
+                .filter(|(_, recorded)| !recorded)
+            {
+                let (fragment, _) = super::outcome_fragment(
+                    *request,
+                    OUTCOME_TERMINAL,
+                    crate::clock::point_now()?,
+                    Some(run),
+                    view.unit.first().map(String::as_str),
+                    None,
+                );
+                if let Err(error) = self.publish(fragment) {
+                    failures.push(error.context(format!("record the end of request {request:x}")));
+                }
+            }
+        }
         let (spawner, end, report) = match &recorded {
             Ok(Some(view)) => (
                 view.spawner.first().copied(),
@@ -1241,6 +1415,294 @@ impl Spawn {
             std::thread::sleep(poll);
         }
         self.show(name)
+    }
+
+    /// Write one run request into the spawn collection. For a new brief the
+    /// spawn record travels in the same commit, so the request never names
+    /// a zooid its readers lack.
+    pub fn request(&self, input: &RequestInput) -> Result<Requested> {
+        if !super::EFFORTS.contains(&input.effort.as_str()) {
+            bail!(
+                "effort {:?} is not one of {}",
+                input.effort,
+                super::EFFORTS.join(", ")
+            );
+        }
+        let spawner =
+            match Relations::with_storage(self.storage.clone()).person_state(&input.spawner)? {
+                Some(state) if !state.retired => state.person,
+                Some(_) => bail!("spawner {} is retired", input.spawner),
+                None => bail!("no persona matches spawner {}", input.spawner),
+            };
+        let (mut fragment, zooid, name) = match &input.zooid {
+            ZooidRef::Name(name) => {
+                let view = self.show(name)?;
+                (Fragment::empty(), view.id, view.name)
+            }
+            ZooidRef::Brief(brief) => {
+                let (fragment, id, _, name) = super::spawn_fragment(brief)?;
+                (fragment, id, name)
+            }
+        };
+        let host = match input.host {
+            Some(host) => host,
+            None => self.local_host()?,
+        };
+        let (request, id) = super::request_fragment(&RequestFacts {
+            zooid,
+            host,
+            host_label: input.host_label.clone(),
+            provider: input.provider.name().to_owned(),
+            effort: input.effort.clone(),
+            previous: input.previous,
+            handoff: input.handoff.clone(),
+            requested_at: crate::clock::point_now()?,
+            spawner,
+        });
+        fragment += request;
+        self.publish(fragment)?;
+        Ok(Requested {
+            request: id,
+            zooid,
+            name,
+            host,
+            host_label: input.host_label.clone(),
+            unit: super::unit_for_request(id),
+        })
+    }
+
+    /// This host's node key: the key this store signs with.
+    pub fn local_host(&self) -> Result<HostKey> {
+        self.storage
+            .with_store(|_, signer, _| Ok(signer.verifying_key().to_inline()))
+    }
+
+    /// Every request, or only those addressed to `host`, oldest first.
+    pub fn requests(&self, host: Option<HostKey>) -> Result<Vec<RequestView>> {
+        self.observe(|facts, reader| {
+            let mut ids = find!(
+                (request: Id, at: IntervalValue),
+                pattern!(facts, [{ ?request @
+                    metadata::tag: KIND_REQUEST,
+                    metadata::created_at: ?at,
+                }])
+            )
+            .collect::<Vec<_>>();
+            ids.sort_by_key(|(request, at)| {
+                let start = at
+                    .try_from_inline::<(Epoch, Epoch)>()
+                    .map(|(start, _)| start.to_tai_duration().total_nanoseconds())
+                    .unwrap_or(i128::MIN);
+                (start, *request)
+            });
+            // A request with two times sorts by its earliest and is read once.
+            let mut seen = std::collections::HashSet::new();
+            let views = ids
+                .into_iter()
+                .filter(|(request, _)| seen.insert(*request))
+                .map(|(request, _)| request_view(facts, reader, request))
+                .filter(|view| host.map_or(true, |host| view.host.contains(&host)))
+                .collect();
+            Ok(views)
+        })
+    }
+
+    /// One keeper pass: reconcile every request addressed to this host
+    /// against its unit and the pile. A request is only ever seen here when
+    /// its COMMIT's signer is admitted to write the spawn collection: the
+    /// collection read applies that, so no allowlist is kept beside it.
+    pub fn keep_once(&self, config: &KeepConfig) -> Result<KeepPass> {
+        let host = self.local_host()?;
+        let mut steps = Vec::new();
+        for view in self.requests(Some(host))? {
+            let step = match self.keep_one(config, &view) {
+                Ok(step) => step,
+                Err(error) => KeepStep::Waiting(format!("this pass failed: {error:#}")),
+            };
+            steps.push((view.id, step));
+        }
+        Ok(KeepPass { host, steps })
+    }
+
+    /// [`Self::keep_once`] every `poll`, forever. A failed pass is reported
+    /// and the next one runs anyway.
+    pub fn keep(
+        &self,
+        config: &KeepConfig,
+        poll: Duration,
+        mut report: impl FnMut(Result<&KeepPass>),
+    ) -> ! {
+        loop {
+            match self.keep_once(config) {
+                Ok(pass) => report(Ok(&pass)),
+                Err(error) => report(Err(error)),
+            }
+            std::thread::sleep(poll);
+        }
+    }
+
+    fn outcome(
+        &self,
+        view: &RequestView,
+        kind: Id,
+        run: Option<Id>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        if view.has(kind) {
+            return Ok(());
+        }
+        let unit = super::unit_for_request(view.id);
+        let (fragment, _) = super::outcome_fragment(
+            view.id,
+            kind,
+            crate::clock::point_now()?,
+            run,
+            Some(&unit),
+            reason,
+        );
+        self.publish(fragment)
+    }
+
+    fn refuse(&self, view: &RequestView, reason: String) -> Result<KeepStep> {
+        self.outcome(view, OUTCOME_REFUSED, None, Some(&reason))?;
+        Ok(KeepStep::Refused(reason))
+    }
+
+    fn keep_one(&self, config: &KeepConfig, view: &RequestView) -> Result<KeepStep> {
+        if view.has(OUTCOME_REFUSED) || view.has(OUTCOME_TERMINAL) {
+            return Ok(KeepStep::Done);
+        }
+        let unit = super::unit_for_request(view.id);
+        let running = is_running(&self.launcher.state(&unit)?);
+        if let Some(&(run, _)) = view.runs.first() {
+            // A run was started for it: never start another.
+            if running {
+                self.outcome(view, OUTCOME_RUNNING, Some(run), None)?;
+                return Ok(KeepStep::Running);
+            }
+            return match view.runs.iter().find(|(_, ended)| *ended) {
+                Some(&(run, _)) => {
+                    self.outcome(view, OUTCOME_TERMINAL, Some(run), None)?;
+                    Ok(KeepStep::Ended)
+                }
+                None => Ok(KeepStep::Waiting(format!(
+                    "{unit} is not running and run {run:x} has no recorded end: its settlement                      did not finish. Settle it again; this keeper does not restart it."
+                ))),
+            };
+        }
+        if running {
+            // Started by an earlier pass that stopped before the run record
+            // was published. systemd holds the one launch; do not start another.
+            self.outcome(
+                view,
+                OUTCOME_RUNNING,
+                None,
+                Some("the unit is running but its run record is not here yet"),
+            )?;
+            return Ok(KeepStep::Running);
+        }
+        let provider = match view.provider.as_slice() {
+            [one] => match Provider::parse(one) {
+                Ok(provider) => provider,
+                Err(error) => return self.refuse(view, format!("{error:#}")),
+            },
+            [] => return self.refuse(view, "the request names no provider".to_owned()),
+            several => {
+                return self.refuse(
+                    view,
+                    format!(
+                        "the request names {} providers: {}",
+                        several.len(),
+                        several.join(", ")
+                    ),
+                )
+            }
+        };
+        if provider == Provider::Local {
+            return self.refuse(view, "no local executor on this host".to_owned());
+        }
+        let effort = match view.effort.as_slice() {
+            [one] if super::EFFORTS.contains(&one.as_str()) => one.clone(),
+            [one] => {
+                return self.refuse(
+                    view,
+                    format!("effort {one:?} is not one of {}", super::EFFORTS.join(", ")),
+                )
+            }
+            other => {
+                return self.refuse(view, format!("the request names {} efforts", other.len()))
+            }
+        };
+        let spawner = match view.spawner.as_slice() {
+            [one] => *one,
+            other => {
+                return self.refuse(
+                    view,
+                    format!("the request names {} spawners; it needs one", other.len()),
+                )
+            }
+        };
+        if view.zooid.len() != 1 {
+            return self.refuse(
+                view,
+                format!(
+                    "the request names {} zooids; it needs one",
+                    view.zooid.len()
+                ),
+            );
+        }
+        // Absence here is not knowledge: records and blobs may still arrive.
+        let (Some(brief), Some(text)) = (view.brief, view.brief_text.clone()) else {
+            return Ok(KeepStep::Waiting(
+                "the zooid's spawn record or brief is not here yet".to_owned(),
+            ));
+        };
+        if !view.handoff.is_empty() && view.handoff_text.is_none() {
+            return Ok(KeepStep::Waiting("the handoff is not here yet".to_owned()));
+        }
+        let name = super::name_for(brief);
+        if let Some(state) = Relations::with_storage(self.storage.clone()).person_state(&name)? {
+            if !state.retired {
+                return Ok(KeepStep::Waiting(format!(
+                    "{name} is still running elsewhere (its persona is live)"
+                )));
+            }
+        }
+        self.outcome(view, OUTCOME_ACCEPTED, None, None)?;
+        let launched = self.launch(
+            Brief {
+                about: super::about(&text).to_owned(),
+                text,
+                goal: view.goal.clone(),
+            },
+            &config.workdir,
+            &effort,
+            &format!("{spawner:x}"),
+            provider,
+            LaunchExtras {
+                unit: Some(unit.clone()),
+                request: Some(view.id),
+                handoff: view.handoff_text.clone(),
+            },
+        );
+        match launched {
+            Ok(launched) => {
+                self.outcome(view, OUTCOME_RUNNING, Some(launched.run), None)?;
+                Ok(KeepStep::Launched {
+                    run: launched.run,
+                    unit,
+                    name,
+                })
+            }
+            Err(error) => {
+                if is_running(&self.launcher.state(&unit)?) {
+                    // It started; only recording it failed. The next pass
+                    // reconciles; refusing now would hide a live run.
+                    return Err(error);
+                }
+                self.refuse(view, format!("the launch failed: {error:#}"))
+            }
+        }
     }
 
     fn observe<T>(
@@ -1436,7 +1898,238 @@ fn run_view(
             .collect(),
         ),
         goal_note: find!(id: Id, pattern!(facts, [{ run @ attrs::goal_note: ?id }])).collect(),
+        request: find!(id: Id, pattern!(facts, [{ run @ attrs::request: ?id }])).collect(),
     }
+}
+
+fn has_outcome(facts: &FactArchive, request: Id, kind: Id) -> bool {
+    find!(
+        outcome: Id,
+        pattern!(facts, [{ ?outcome @
+            metadata::tag: KIND_OUTCOME,
+            attrs::request: request,
+            attrs::outcome: kind,
+        }])
+    )
+    .next()
+    .is_some()
+}
+
+fn request_view(
+    facts: &FactArchive,
+    reader: &AcquiringReader<FacultySnapshot>,
+    request: Id,
+) -> RequestView {
+    let texts = |handles: Vec<TextHandle>| -> Vec<String> {
+        handles
+            .into_iter()
+            .map(|handle| read_text(reader, handle).unwrap_or_else(|| super::handle_text(handle)))
+            .collect()
+    };
+    let zooid: Vec<Id> =
+        find!(id: Id, pattern!(facts, [{ request @ attrs::zooid: ?id }])).collect();
+    let handoff: Vec<TextHandle> =
+        find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::handoff: ?handle }]))
+            .collect();
+    let (brief, goal) = match zooid.as_slice() {
+        [spawn] => {
+            let spawn = *spawn;
+            let brief = find!(
+                handle: TextHandle,
+                pattern!(facts, [{ spawn @ metadata::tag: KIND_SPAWN, attrs::brief: ?handle }])
+            )
+            .next();
+            let goal = find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal: ?id }])).next();
+            let revision =
+                find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal_revision: ?id }])).collect();
+            (brief, goal.map(|goal| (goal, revision)))
+        }
+        _ => (None, None),
+    };
+    let outcomes = find!(
+        (outcome: Id, kind: Id),
+        pattern!(facts, [{ ?outcome @
+            metadata::tag: KIND_OUTCOME,
+            attrs::request: request,
+            attrs::outcome: ?kind,
+        }])
+    )
+    .map(|(outcome, kind)| OutcomeView {
+        id: outcome,
+        kind,
+        at: find!(
+            at: IntervalValue,
+            pattern!(facts, [{ outcome @ metadata::created_at: ?at }])
+        )
+        .collect(),
+        run: find!(id: Id, pattern!(facts, [{ outcome @ attrs::outcome_run: ?id }])).collect(),
+        unit: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ outcome @ attrs::unit: ?handle }]))
+                .collect(),
+        ),
+        reason: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ outcome @ attrs::reason: ?handle }]))
+                .collect(),
+        ),
+    })
+    .collect();
+    let runs = find!(
+        run: Id,
+        pattern!(facts, [{ ?run @ metadata::tag: KIND_RUN, attrs::request: request }])
+    )
+    .map(|run| {
+        let ended = find!(
+            at: IntervalValue,
+            pattern!(facts, [{ run @ metadata::finished_at: ?at }])
+        )
+        .next()
+        .is_some();
+        (run, ended)
+    })
+    .collect();
+    RequestView {
+        id: request,
+        host: find!(host: HostKey, pattern!(facts, [{ request @ attrs::host: ?host }])).collect(),
+        host_label: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::host_label: ?handle }]))
+                .collect(),
+        ),
+        provider: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::provider: ?handle }]))
+                .collect(),
+        ),
+        effort: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::effort: ?handle }]))
+                .collect(),
+        ),
+        previous: find!(id: Id, pattern!(facts, [{ request @ attrs::previous: ?id }])).collect(),
+        handoff_text: handoff
+            .first()
+            .and_then(|handle| read_text(reader, *handle)),
+        handoff,
+        spawner: find!(id: Id, pattern!(facts, [{ request @ archive_attrs::author: ?id }]))
+            .collect(),
+        requested_at: find!(
+            at: IntervalValue,
+            pattern!(facts, [{ request @ metadata::created_at: ?at }])
+        )
+        .collect(),
+        brief_text: brief.and_then(|handle| read_text(reader, handle)),
+        brief,
+        goal,
+        zooid,
+        outcomes,
+        runs,
+    }
+}
+
+/// The name of an outcome kind.
+pub fn outcome_name(kind: Id) -> String {
+    match kind {
+        kind if kind == OUTCOME_ACCEPTED => "accepted".to_owned(),
+        kind if kind == OUTCOME_RUNNING => "running".to_owned(),
+        kind if kind == OUTCOME_REFUSED => "refused".to_owned(),
+        kind if kind == OUTCOME_TERMINAL => "task-terminal".to_owned(),
+        other => format!("{other:x}"),
+    }
+}
+
+/// Requests with their outcomes, one block each.
+pub fn render_requests(requests: &[RequestView]) -> String {
+    let mut out = String::new();
+    if requests.is_empty() {
+        out.push_str("No requests.\n");
+    }
+    for request in requests {
+        writeln!(
+            out,
+            "request {:x}  zooid {}  host {}{}",
+            request.id,
+            request.name().unwrap_or_else(|| ids(&request.zooid)),
+            join(
+                &request
+                    .host
+                    .iter()
+                    .map(|h| super::host_text(*h))
+                    .collect::<Vec<_>>()
+            ),
+            if request.host_label.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", join(&request.host_label))
+            }
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "  provider {}  effort {}  unit {}",
+            join(&request.provider),
+            join(&request.effort),
+            super::unit_for_request(request.id)
+        )
+        .unwrap();
+        if !request.previous.is_empty() {
+            writeln!(out, "  previous run: {}", ids(&request.previous)).unwrap();
+        }
+        if !request.handoff.is_empty() {
+            writeln!(
+                out,
+                "  handoff: {}",
+                join(
+                    &request
+                        .handoff
+                        .iter()
+                        .map(|h| super::handle_text(*h))
+                        .collect::<Vec<_>>()
+                )
+            )
+            .unwrap();
+        }
+        writeln!(out, "  spawner: {}", ids(&request.spawner)).unwrap();
+        for (run, ended) in &request.runs {
+            writeln!(out, "  run {run:x}{}", if *ended { " (ended)" } else { "" }).unwrap();
+        }
+        for outcome in &request.outcomes {
+            write!(out, "  {}", outcome_name(outcome.kind)).unwrap();
+            if let Some(at) = outcome.at.first() {
+                write!(out, " at {}", crate::care::format_time(*at)).unwrap();
+            }
+            if !outcome.run.is_empty() {
+                write!(out, ", run {}", ids(&outcome.run)).unwrap();
+            }
+            for reason in &outcome.reason {
+                write!(out, ": {reason}").unwrap();
+            }
+            out.push('\n');
+        }
+        if request.outcomes.is_empty() {
+            writeln!(out, "  no outcome yet").unwrap();
+        }
+    }
+    out
+}
+
+/// One line per request a pass looked at.
+pub fn render_pass(pass: &KeepPass) -> String {
+    let mut out = format!(
+        "keep pass on host {}: {} request(s) addressed here\n",
+        super::host_text(pass.host),
+        pass.steps.len()
+    );
+    for (request, step) in &pass.steps {
+        let what = match step {
+            KeepStep::Launched { run, unit, name } => {
+                format!("launched {name} in {unit} (run {run:x})")
+            }
+            KeepStep::Refused(why) => format!("refused: {why}"),
+            KeepStep::Running => "running".to_owned(),
+            KeepStep::Ended => "task-terminal".to_owned(),
+            KeepStep::Waiting(why) => format!("waiting: {why}"),
+            KeepStep::Done => "done".to_owned(),
+        };
+        writeln!(out, "  {request:x}: {what}").unwrap();
+    }
+    out
 }
 
 fn join<T: std::fmt::Display>(values: &[T]) -> String {
@@ -1560,6 +2253,9 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         }
         if !run.goal_note.is_empty() {
             writeln!(out, "  goal note: {}", ids(&run.goal_note)).unwrap();
+        }
+        if !run.request.is_empty() {
+            writeln!(out, "  request: {}", ids(&run.request)).unwrap();
         }
         writeln!(out, "  message: {}", ids(&run.message)).unwrap();
         for why in &run.settle_failure {
@@ -1762,6 +2458,326 @@ mod tests {
                 .person_state(label)
                 .unwrap()
         }
+    }
+
+    impl Fixture {
+        fn ask(&self, brief: &str, host: Option<HostKey>, provider: Provider) -> Requested {
+            self.ask_with(brief, host, provider, None)
+        }
+        fn ask_with(
+            &self,
+            brief: &str,
+            host: Option<HostKey>,
+            provider: Provider,
+            handoff: Option<&str>,
+        ) -> Requested {
+            self.spawn
+                .request(&RequestInput {
+                    zooid: ZooidRef::Brief(brief.to_owned()),
+                    host,
+                    host_label: Some("testhost".to_owned()),
+                    provider,
+                    effort: "medium".to_owned(),
+                    spawner: "agent-cc".to_owned(),
+                    previous: None,
+                    handoff: handoff.map(str::to_owned),
+                })
+                .unwrap()
+        }
+        fn keep(&self) -> KeepPass {
+            self.spawn
+                .keep_once(&KeepConfig {
+                    workdir: self.directory.path().join("lane"),
+                })
+                .unwrap()
+        }
+        fn request_view(&self, id: Id) -> RequestView {
+            self.spawn
+                .requests(None)
+                .unwrap()
+                .into_iter()
+                .find(|view| view.id == id)
+                .expect("the request is here")
+        }
+    }
+
+    fn other_host() -> HostKey {
+        ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+            .verifying_key()
+            .to_inline()
+    }
+
+    fn kinds(view: &RequestView) -> Vec<String> {
+        let mut kinds: Vec<_> = view
+            .outcomes
+            .iter()
+            .map(|outcome| outcome_name(outcome.kind))
+            .collect();
+        kinds.sort();
+        kinds
+    }
+
+    #[test]
+    fn a_request_round_trips_with_everything_it_asks_for() {
+        let f = fixture();
+        let here = f.spawn.local_host().unwrap();
+        let previous = Id::new([5; 16]).unwrap();
+        let requested = f
+            .spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Brief("Requested task.".to_owned()),
+                host: None,
+                host_label: Some("sky".to_owned()),
+                provider: Provider::Codex,
+                effort: "xhigh".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: Some(previous),
+                handoff: Some("Open: the review thread.".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(requested.host, here);
+        assert_eq!(requested.unit, format!("spawn-req-{:x}", requested.request));
+        let view = f.request_view(requested.request);
+        let (_, spawn, brief, name) = super::super::spawn_fragment("Requested task.").unwrap();
+        assert_eq!(requested.zooid, spawn);
+        assert_eq!(view.zooid, [spawn]);
+        assert_eq!(view.brief, Some(brief));
+        assert_eq!(view.name().as_deref(), Some(name.as_str()));
+        assert_eq!(view.host, [here]);
+        assert_eq!(view.host_label, ["sky"]);
+        assert_eq!(view.provider, ["codex"]);
+        assert_eq!(view.effort, ["xhigh"]);
+        assert_eq!(view.previous, [previous]);
+        assert_eq!(
+            view.handoff_text.as_deref(),
+            Some("Open: the review thread.")
+        );
+        assert_eq!(view.spawner, [f.persona("agent-cc").unwrap().person]);
+        assert!(view.outcomes.is_empty() && view.runs.is_empty());
+        // The spawn record travelled with it, so the zooid is readable.
+        assert_eq!(f.spawn.show(&name).unwrap().id, spawn);
+        // An existing zooid can be requested by name.
+        let again = f
+            .spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Name(name.clone()),
+                host: Some(other_host()),
+                host_label: None,
+                provider: Provider::Claude,
+                effort: "high".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+            })
+            .unwrap();
+        assert_eq!(again.zooid, spawn);
+        assert_ne!(again.request, requested.request);
+        assert_eq!(f.spawn.requests(Some(here)).unwrap().len(), 1);
+        assert_eq!(f.spawn.requests(None).unwrap().len(), 2);
+        // Nothing has been launched by writing requests.
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keep_launches_one_unit_for_a_request_here_and_none_for_another_host() {
+        let f = fixture();
+        let here = f.ask("Kept task.", None, Provider::Claude);
+        let there = f.ask("Elsewhere task.", Some(other_host()), Provider::Claude);
+        let pass = f.keep();
+        assert_eq!(pass.host, f.spawn.local_host().unwrap());
+        assert_eq!(pass.steps.len(), 1, "{pass:?}");
+        let started = f.launcher.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].unit, format!("spawn-req-{:x}", here.request));
+        assert_eq!(
+            started[0].workdir,
+            std::fs::canonicalize(f.directory.path().join("lane")).unwrap()
+        );
+        let KeepStep::Launched { run, unit, name } = &pass.steps[0].1 else {
+            panic!("{pass:?}");
+        };
+        assert_eq!(unit, &started[0].unit);
+        assert_eq!(name, &here.name);
+        let view = f.request_view(here.request);
+        assert_eq!(kinds(&view), ["accepted", "running"]);
+        assert_eq!(view.runs, [(*run, false)]);
+        let running = view
+            .outcomes
+            .iter()
+            .find(|o| o.kind == OUTCOME_RUNNING)
+            .unwrap();
+        assert_eq!(running.run, [*run]);
+        // The run is an ordinary run of the zooid, marked with its request.
+        let spawn = f.spawn.show(&here.name).unwrap();
+        assert_eq!(spawn.runs[0].request, [here.request]);
+        assert_eq!(spawn.runs[0].effort, ["medium"]);
+        assert_eq!(spawn.runs[0].unit, [unit.clone()]);
+        // The request for another host is untouched.
+        assert!(f.request_view(there.request).outcomes.is_empty());
+        assert!(f.persona(&there.name).is_none());
+    }
+
+    #[test]
+    fn a_rerun_launches_nothing_new_and_an_ended_run_is_never_restarted() {
+        let f = fixture();
+        let asked = f.ask("Once only.", None, Provider::Claude);
+        let first = f.keep();
+        let KeepStep::Launched { run, .. } = first.steps[0].1.clone() else {
+            panic!("{first:?}");
+        };
+        // Still running: reconciled, not relaunched.
+        assert_eq!(f.keep().steps, [(asked.request, KeepStep::Running)]);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        // The unit is gone but settlement has not run: wait, never restart.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let pass = f.keep();
+        assert!(
+            matches!(&pass.steps[0].1, KeepStep::Waiting(why) if why.contains("settle")),
+            "{pass:?}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        // Settlement records the end and the request's task-terminal outcome.
+        f.spawn
+            .settle(&SettleRequest {
+                name: asked.name.clone(),
+                run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: None,
+            })
+            .unwrap();
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["accepted", "running", "task-terminal"]);
+        let terminal = view
+            .outcomes
+            .iter()
+            .find(|o| o.kind == OUTCOME_TERMINAL)
+            .unwrap();
+        assert_eq!(terminal.run, [run]);
+        assert_eq!(terminal.at.len(), 1);
+        // Settling again records no second terminal observation.
+        f.spawn
+            .settle(&SettleRequest {
+                name: asked.name.clone(),
+                run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: None,
+            })
+            .unwrap();
+        let view = f.request_view(asked.request);
+        let terminal = view
+            .outcomes
+            .iter()
+            .find(|o| o.kind == OUTCOME_TERMINAL)
+            .unwrap();
+        assert_eq!(terminal.at.len(), 1);
+        // The persona is retired, yet the ended request is left alone.
+        assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert_eq!(f.spawn.show(&asked.name).unwrap().runs.len(), 1);
+    }
+
+    #[test]
+    fn keep_refuses_local_and_never_falls_back_to_a_hosted_model() {
+        let f = fixture();
+        let asked = f.ask("Local only.", None, Provider::Local);
+        let pass = f.keep();
+        assert_eq!(
+            pass.steps,
+            [(
+                asked.request,
+                KeepStep::Refused("no local executor on this host".to_owned())
+            )]
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["refused"]);
+        assert_eq!(view.outcomes[0].reason, ["no local executor on this host"]);
+        assert!(view.runs.is_empty());
+        assert!(f.persona(&asked.name).is_none());
+        assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_request_from_an_unadmitted_signer_is_not_seen_and_not_launched() {
+        let f = fixture();
+        let here = f.spawn.local_host().unwrap();
+        let spawner = f.persona("agent-cc").unwrap().person;
+        let (mut fragment, zooid, _, _) = super::super::spawn_fragment("Forged task.").unwrap();
+        let (request, id) = super::super::request_fragment(&RequestFacts {
+            zooid,
+            host: here,
+            host_label: None,
+            provider: "claude".to_owned(),
+            effort: "high".to_owned(),
+            previous: None,
+            handoff: None,
+            requested_at: crate::clock::point_now().unwrap(),
+            spawner,
+        });
+        fragment += request;
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        f.storage
+            .with_store(|pile, signer, runtime| {
+                let collection = f.storage.open_collection_write(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                pile.commit(collection, &stranger, fragment)
+                    .context("commit as a stranger")?;
+                Ok(())
+            })
+            .unwrap();
+        let pass = f.keep();
+        assert!(pass.steps.is_empty(), "{pass:?}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(f
+            .spawn
+            .requests(None)
+            .unwrap()
+            .iter()
+            .all(|view| view.id != id));
+        // The same record from the admitted signer is kept.
+        let admitted = f.ask("Forged task.", None, Provider::Claude);
+        assert_eq!(f.keep().steps.len(), 1);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert_ne!(admitted.request, id);
+    }
+
+    #[test]
+    fn the_handoff_comes_once_after_the_brief() {
+        let f = fixture();
+        let brief = "Continue the move.";
+        let handoff = "HANDOFF: release route #cc, the review promised to JP.";
+        let asked = f.ask_with(brief, None, Provider::Claude, Some(handoff));
+        f.keep();
+        let prompt = std::fs::read_to_string(
+            f.launcher.started.lock().unwrap()[0]
+                .script
+                .with_extension("prompt"),
+        )
+        .unwrap();
+        let brief_at = prompt.rfind(brief).unwrap();
+        let handoff_at = prompt.find(handoff).unwrap();
+        assert!(prompt.find("STUB-WAKE").unwrap() < prompt.find("STUB-TAIL").unwrap());
+        assert!(prompt.find("STUB-TAIL").unwrap() < brief_at);
+        assert!(brief_at < prompt.find("# Handoff").unwrap());
+        assert!(prompt.find("# Handoff").unwrap() < handoff_at);
+        assert_eq!(prompt.matches(handoff).count(), 1);
+        assert!(prompt.trim_end().ends_with(handoff));
+        let run = &f.spawn.show(&asked.name).unwrap().runs[0];
+        assert_eq!(run.prompt, [super::super::text_handle(&prompt)]);
+        // A plain run has no handoff section.
+        f.spawn.run(&f.request("No handoff.")).unwrap();
+        let plain = std::fs::read_to_string(
+            f.launcher.started.lock().unwrap()[1]
+                .script
+                .with_extension("prompt"),
+        )
+        .unwrap();
+        assert!(!plain.contains("# Handoff"));
     }
 
     #[test]
@@ -2096,11 +3112,14 @@ mod tests {
         );
         // The server is the script itself, so it gets the CLI's environment:
         // the colony file, the pinned routes, PILE, the key and the persona.
+        // Its stderr goes to the run's log, so a failed start is visible;
+        // its stdout is untouched, because it is the protocol channel.
         let faculties = f.directory.path().join("bin").join("faculties");
         let mcp = script
             .find(&format!(
-                "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp; fi\n",
-                faculties.display()
+                "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp 2>> {}; fi\n",
+                faculties.display(),
+                unit.log.display()
             ))
             .unwrap_or_else(|| panic!("{script}"));
         assert!(script.find(&format!("PERSONA={}", launched.name)).unwrap() < mcp);

@@ -7,8 +7,8 @@ use anybytes::Bytes;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
-use super::operations::{render_list, render_show};
-use super::{GoalRequest, LaunchConfig, Launched, Provider, RunRequest};
+use super::operations::{render_list, render_requests, render_show};
+use super::{GoalRequest, LaunchConfig, Launched, Provider, RequestInput, RunRequest, ZooidRef};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 
@@ -22,6 +22,16 @@ const TOOLS: &[Tool] = &[
         name: "spawn_goal",
         description: "Start a task zooid for a Compass goal, like spawn_run, with the brief rendered from the goal's current revision: its title, its parent chain, its latest notes, and the zooid's authority to note, move and check off that goal itself. The spawn records the goal and the revision, and the zooid notes its launch on the goal; nothing moves the goal when the zooid exits. A new note on the goal makes a new brief and so a new zooid. Returns the zooid's name.",
         input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","auto","local"]}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "spawn_request",
+        description: "Ask one host's keeper to start a run of a zooid there, by writing a run request into the spawn collection, which syncs like any other. Name an existing zooid, or give a new brief. The request names no workdir, command or budget: the target host resolves those and records accepted, running, refused or task-terminal. local is refused while no host has a local executor; nothing falls back to a hosted model. The handoff is delivered once, after the brief, in the run's prompt; every reader of the spawn collection can read it. Returns the request id.",
+        input_schema: r#"{"type":"object","properties":{"zooid":{"type":"string","minLength":1,"description":"An existing zooid's name."},"brief":{"type":"string","minLength":1,"description":"A new zooid's whole brief, as text."},"host":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"The target host's node key. Default: the MCP server's host."},"host_label":{"type":"string","minLength":1,"description":"A readable name beside the key."},"provider":{"type":"string","enum":["claude","codex","auto","local"]},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The asking persona, messaged when the run ends."},"previous":{"type":"string","description":"The run this one continues (hex id), for a move."},"handoff":{"type":"string","description":"Text delivered once, after the brief."}},"required":["spawner"],"additionalProperties":false}"#,
+    },
+    Tool {
+        name: "spawn_requests",
+        description: "Every run request with its outcomes: accepted, running, refused with its reason, task-terminal.",
+        input_schema: r#"{"type":"object","properties":{"here":{"type":"boolean","description":"Only requests addressed to the MCP server's host."}},"additionalProperties":false}"#,
     },
     Tool {
         name: "spawn_list",
@@ -88,6 +98,35 @@ fn launched_line(launched: &Launched) -> String {
         line.push_str(&format!("\nwarning: {warning}"));
     }
     line
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    #[serde(default)]
+    zooid: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    host_label: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
+    spawner: String,
+    #[serde(default)]
+    previous: Option<String>,
+    #[serde(default)]
+    handoff: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Requests {
+    #[serde(default)]
+    here: bool,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +208,60 @@ impl Faculty for Spawn {
                     provider,
                 })?;
                 out.line(launched_line(&launched))
+            }
+            "spawn_request" => {
+                let args: Request = decode_arguments(arguments)?;
+                let zooid = match (args.zooid, args.brief) {
+                    (Some(name), None) => ZooidRef::Name(name),
+                    (None, Some(brief)) if !brief.trim().is_empty() => ZooidRef::Brief(brief),
+                    _ => return Err(invalid_arguments("give exactly one of zooid and brief")),
+                };
+                let host = args
+                    .host
+                    .as_deref()
+                    .map(super::parse_host)
+                    .transpose()
+                    .map_err(|error| invalid_arguments(format!("{error:#}")))?;
+                let previous = args
+                    .previous
+                    .as_deref()
+                    .map(|run| {
+                        triblespace::prelude::Id::from_hex(run.trim())
+                            .ok_or_else(|| invalid_arguments(format!("invalid run id {run}")))
+                    })
+                    .transpose()?;
+                let requested = self.operations()?.request(&RequestInput {
+                    zooid,
+                    host,
+                    host_label: args.host_label,
+                    provider: provider(args.provider.as_deref())?,
+                    effort: args.effort.unwrap_or_else(|| "high".to_owned()),
+                    spawner: args.spawner,
+                    previous,
+                    handoff: args.handoff,
+                })?;
+                out.line(format!(
+                    "request {:x}: {} on host {}{}; its keeper starts it in {}",
+                    requested.request,
+                    requested.name,
+                    super::host_text(requested.host),
+                    requested
+                        .host_label
+                        .as_deref()
+                        .map(|label| format!(" ({label})"))
+                        .unwrap_or_default(),
+                    requested.unit
+                ))
+            }
+            "spawn_requests" => {
+                let args: Requests = decode_arguments(arguments)?;
+                let spawn = self.operations()?;
+                let host = if args.here {
+                    Some(spawn.local_host()?)
+                } else {
+                    None
+                };
+                out.text(render_requests(&spawn.requests(host)?))
             }
             "spawn_list" => {
                 let Empty {} = decode_arguments(arguments)?;
