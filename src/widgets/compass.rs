@@ -474,99 +474,99 @@ impl CompassBoard {
 
     /// Render the board from an immutable compass dataset.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, dataset: DatasetView<'_>) {
-        // Refresh cached state if the semantic dataset revision has advanced.
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => l.cached_revision != dataset.revision,
-        };
-        if need_refresh {
-            self.live = Some(CompassLive::refresh(dataset));
-        }
-        let live = self.live.as_ref().expect("refreshed above");
-
-        // Enumerate every goal with the collection's canonical effective
-        // status. The storage boundary attached this index for the exact same
-        // source cover; equal timestamps resolve by event id without doing
-        // the identity/order joins again here.
-        let space = dataset.facts;
-        let status_register = dataset
-            .lww_register(compass::status_of.id(), metadata::created_at.id())
-            .expect("Compass datasets carry their maintained status register");
-        let mut goals: Vec<(Id, String, i128)> = Vec::new();
-        for (gid, _t, created) in find!(
-            (gid: Id, _t: TextHandle, created: (i128, i128)),
-            pattern!(space, [{
-                ?gid @
-                metadata::tag: &KIND_GOAL_ID,
-                compass::title: ?_t,
-                metadata::created_at: ?created,
-            }])
-        ) {
-            let (status, sort_at) = latest_status_event(space, status_register, gid)
-                .and_then(|(_, status, at)| {
-                    let status = dataset.reader.get::<View<str>, UTF8String>(status).ok()?;
-                    // A status time that does not decode still says the
-                    // status; only its sort position falls back to creation.
-                    Some((status.to_string(), interval_key(at).unwrap_or(created.0)))
-                })
-                .unwrap_or_else(|| ("todo".to_string(), created.0));
-            goals.push((gid, status, sort_at));
-        }
-        // Goal-level edges from the current priority snapshots; a cycle two
-        // writers asserted is drawn as such.
-        let active_priority_edges = crate::compass::active_priority_edges(space);
-
-        // Per-status counts for the section header chips.
-        let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
-        for (_, status, _) in &goals {
-            *status_counts.entry(status.clone()).or_insert(0) += 1;
-        }
-
-        let axis = self.axis;
-        let items = produce_items(axis, goals, space);
-        let total_goals: usize = items.len();
-
-        // Compute the per-card collapsed-ancestors set once over the
-        // global item stream — a Card whose any depth-ancestor is in
-        // `self.collapsed` is hidden. Tree boundaries between status
-        // groups are implicit: when a lane resets to depth 0 the path
-        // pops to empty before pushing.
-        let ancestors_collapsed: HashSet<Id> = {
-            let mut hidden: HashSet<Id> = HashSet::new();
-            let mut path: Vec<(Id, usize)> = Vec::new();
-            for item in &items {
-                while path.last().map(|(_, d)| *d >= item.depth).unwrap_or(false) {
-                    path.pop();
-                }
-                let parent_hidden = path
-                    .iter()
-                    .any(|(pid, _)| hidden.contains(pid) || self.collapsed.contains(pid));
-                if parent_hidden {
-                    hidden.insert(item.id);
-                }
-                path.push((item.id, item.depth));
-            }
-            hidden
-        };
-
-        // Resolve expanded goal's notes (if any).
-        let expanded = self.expanded_goal;
-        let expanded_notes: Option<(Id, Vec<NoteRow>)> = expanded.map(|gid| {
-            let notes = live.notes_for(dataset, gid);
-            (gid, notes)
-        });
-
-        // Mutable handles to self state we need inside the closure.
-        // The viewer is read-only — view state (expansion, collapse,
-        // axis selection) is the only thing that mutates.
-        let expanded_goal = &mut self.expanded_goal;
-        let collapsed = &mut self.collapsed;
-        let axis_ref = &mut self.axis;
-        // Borrow the live fact archive so renderers can run on-the-spot
-        // queries instead of reading hydrated row fields.
-        let space = dataset.facts;
-
         ctx.section("Compass", |ctx| {
+            // Refresh cached state if the semantic dataset revision has advanced.
+            let need_refresh = match self.live.as_ref() {
+                None => true,
+                Some(l) => l.cached_revision != dataset.revision,
+            };
+            if need_refresh {
+                self.live = Some(CompassLive::refresh(dataset));
+            }
+            let live = self.live.as_ref().expect("refreshed above");
+
+            // Enumerate every goal with the collection's canonical effective
+            // status. The storage boundary attached this index for the exact same
+            // source cover; equal timestamps resolve by event id without doing
+            // the identity/order joins again here.
+            let space = dataset.facts;
+            let status_register = dataset
+                .lww_register(compass::status_of.id(), metadata::created_at.id())
+                .expect("Compass datasets carry their maintained status register");
+            let mut goals: Vec<(Id, String, i128)> = Vec::new();
+            for (gid, _t, created) in find!(
+                (gid: Id, _t: TextHandle, created: (i128, i128)),
+                pattern!(space, [{
+                    ?gid @
+                    metadata::tag: &KIND_GOAL_ID,
+                    compass::title: ?_t,
+                    metadata::created_at: ?created,
+                }])
+            ) {
+                let (status, sort_at) = latest_status_event(space, status_register, gid)
+                    .and_then(|(_, status, at)| {
+                        let status = dataset.reader.get::<View<str>, UTF8String>(status).ok()?;
+                        // A status time that does not decode still says the
+                        // status; only its sort position falls back to creation.
+                        Some((status.to_string(), interval_key(at).unwrap_or(created.0)))
+                    })
+                    .unwrap_or_else(|| ("todo".to_string(), created.0));
+                goals.push((gid, status, sort_at));
+            }
+            // Goal-level edges from the current priority snapshots; a cycle two
+            // writers asserted is drawn as such.
+            let active_priority_edges = crate::compass::active_priority_edges(space);
+
+            // Per-status counts for the section header chips.
+            let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, status, _) in &goals {
+                *status_counts.entry(status.clone()).or_insert(0) += 1;
+            }
+
+            let axis = self.axis;
+            let items = produce_items(axis, goals, space);
+            let total_goals: usize = items.len();
+
+            // Compute the per-card collapsed-ancestors set once over the
+            // global item stream — a Card whose any depth-ancestor is in
+            // `self.collapsed` is hidden. Tree boundaries between status
+            // groups are implicit: when a lane resets to depth 0 the path
+            // pops to empty before pushing.
+            let ancestors_collapsed: HashSet<Id> = {
+                let mut hidden: HashSet<Id> = HashSet::new();
+                let mut path: Vec<(Id, usize)> = Vec::new();
+                for item in &items {
+                    while path.last().map(|(_, d)| *d >= item.depth).unwrap_or(false) {
+                        path.pop();
+                    }
+                    let parent_hidden = path
+                        .iter()
+                        .any(|(pid, _)| hidden.contains(pid) || self.collapsed.contains(pid));
+                    if parent_hidden {
+                        hidden.insert(item.id);
+                    }
+                    path.push((item.id, item.depth));
+                }
+                hidden
+            };
+
+            // Resolve expanded goal's notes (if any).
+            let expanded = self.expanded_goal;
+            let expanded_notes: Option<(Id, Vec<NoteRow>)> = expanded.map(|gid| {
+                let notes = live.notes_for(dataset, gid);
+                (gid, notes)
+            });
+
+            // Mutable handles to self state we need inside the closure.
+            // The viewer is read-only — view state (expansion, collapse,
+            // axis selection) is the only thing that mutates.
+            let expanded_goal = &mut self.expanded_goal;
+            let collapsed = &mut self.collapsed;
+            let axis_ref = &mut self.axis;
+            // Borrow the live fact archive so renderers can run on-the-spot
+            // queries instead of reading hydrated row fields.
+            let space = dataset.facts;
+
             // Header: total + per-status breakdown as small colored
             // chips. The chips are a mini-legend for the colored
             // accent stripes on each card.

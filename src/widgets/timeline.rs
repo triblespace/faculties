@@ -729,37 +729,37 @@ impl BranchTimeline {
 
     /// Render the timeline from immutable datasets resolved by stable key.
     pub fn render(&mut self, ctx: &mut CardCtx<'_>, datasets: &WidgetContext<'_>) {
-        let now = now_key();
-
-        // Refresh if any keyed dataset appeared, disappeared, or changed.
-        let revisions = source_revisions(&self.sources, datasets);
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(live) => live.cached_revisions != revisions,
-        };
-        if need_refresh {
-            self.live = Some(MultiLive::refresh(&self.sources, datasets));
-        }
-
-        let events = self
-            .live
-            .as_ref()
-            .map(|l| l.events.clone())
-            .unwrap_or_default();
-        let sources = self.sources.clone();
-        let viewport_height = self.viewport_height;
-        if self.first_render {
-            if let Some(anchor) = now.or_else(|| events.iter().map(|event| event.ts_ns).max()) {
-                self.timeline_start = anchor;
-                self.first_render = false;
-            }
-        }
-
-        // Visible time span in the viewport — used for the right-
-        // aligned scale chip in the legend row so the viewer always
-        // knows what range they're looking at without manually
-        // reading the tick marks.
         ctx.section("Activity", |ctx| {
+            let now = now_key();
+
+            // Refresh if any keyed dataset appeared, disappeared, or changed.
+            let revisions = source_revisions(&self.sources, datasets);
+            let need_refresh = match self.live.as_ref() {
+                None => true,
+                Some(live) => live.cached_revisions != revisions,
+            };
+            if need_refresh {
+                self.live = Some(MultiLive::refresh(&self.sources, datasets));
+            }
+
+            let events = self
+                .live
+                .as_ref()
+                .map(|l| l.events.clone())
+                .unwrap_or_default();
+            let sources = self.sources.clone();
+            let viewport_height = self.viewport_height;
+            if self.first_render {
+                if let Some(anchor) = now.or_else(|| events.iter().map(|event| event.ts_ns).max()) {
+                    self.timeline_start = anchor;
+                    self.first_render = false;
+                }
+            }
+
+            // Visible time span in the viewport — used for the right-
+            // aligned scale chip in the legend row so the viewer always
+            // knows what range they're looking at without manually
+            // reading the tick marks.
             if self.first_render {
                 ctx.ui_mut().label(
                     egui::RichText::new("CURRENT TIME UNAVAILABLE · NO TIMELINE EVENTS")

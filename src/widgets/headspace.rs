@@ -249,18 +249,18 @@ impl HeadspaceViewer {
         headspace_view: DatasetView<'_>,
         secrets_view: SecretsView<'_>,
     ) {
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(live) => {
-                live.headspace_revision != headspace_view.revision
-                    || live.secrets_revision != secrets_view.revision
-            }
-        };
-        if need_refresh {
-            self.live = Some(HeadspaceLive::refresh(headspace_view, secrets_view));
-        }
-
         ctx.section("Headspace", |ctx| {
+            let need_refresh = match self.live.as_ref() {
+                None => true,
+                Some(live) => {
+                    live.headspace_revision != headspace_view.revision
+                        || live.secrets_revision != secrets_view.revision
+                }
+            };
+            if need_refresh {
+                self.live = Some(HeadspaceLive::refresh(headspace_view, secrets_view));
+            }
+
             let Some(live) = self.live.as_ref() else {
                 return;
             };
