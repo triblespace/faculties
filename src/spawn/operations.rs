@@ -1586,7 +1586,7 @@ impl Spawn {
                     Ok(KeepStep::Ended)
                 }
                 None => Ok(KeepStep::Waiting(format!(
-                    "{unit} is not running and run {run:x} has no recorded end: its settlement                      did not finish. Settle it again; this keeper does not restart it."
+                    "{unit} is not running and run {run:x} has no recorded end: its settlement did not finish. Settle it again; this keeper does not restart it."
                 ))),
             };
         }
