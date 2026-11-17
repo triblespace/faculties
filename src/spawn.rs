@@ -392,9 +392,11 @@ pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) ->
     text.push_str(&format!(
         "\n## Your authority over this goal\n\n\
          This goal is assigned to you. You may add notes to it and move it (`compass note {id:x}`, \
-         `compass move {id:x}`); leave other goals' status alone. Your process ending does not \
-         achieve the goal, and nothing moves it for you. End in one of these ways, whichever is \
-         true:\n\
+         `compass move {id:x}`); leave other goals' status alone. The brief steers your \
+         attention; it does not fence it. If you find more important work along the way, you \
+         may follow it: say so in a note on this goal and in your report. Your process ending \
+         does not achieve the goal, and nothing moves it for you. End in one of these ways, \
+         whichever is true:\n\
          - Done: move it to `done` and add an outcome note with the evidence (commit, file, \
          test result).\n\
          - Not done: add a note naming the remaining step or the dependency you are waiting on, \
@@ -466,6 +468,8 @@ pub struct ScriptFacts<'a> {
     pub routes: &'a [(String, String)],
     /// The agent command line, without its input and output redirections.
     pub agent: &'a [String],
+    /// Variables exported for the agent only, after the settle branch.
+    pub agent_env: &'a [(String, String)],
     /// Whether the agent's stdout is its report. When not, the agent writes
     /// the report file itself and its stdout goes to the unit's log.
     pub stdout_is_report: bool,
@@ -514,6 +518,9 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         q(facts.report)
     ));
     script.push_str("fi\n");
+    for (variable, value) in facts.agent_env {
+        script.push_str(&format!("export {}={}\n", variable, q(value)));
+    }
     let agent = facts
         .agent
         .iter()
@@ -685,6 +692,10 @@ mod tests {
         );
         assert!(text.contains("move it to `done` and add an outcome note"));
         assert!(text.contains("never a required step"));
+        assert!(text.contains(
+            "If you find more important work along the way, you may follow it: say so in a \
+             note on this goal and in your report."
+        ));
         assert!(text.trim_end().ends_with("Use the lane at /x."));
         assert_eq!(brief.about, "Ship the thing. Serves: The bigger thing");
         // A new note is a new revision, so a new brief and a new zooid.
@@ -738,6 +749,7 @@ mod tests {
                 "blake3:abcd".to_owned(),
             )],
             agent: &["/c/claude".to_owned(), "-p".to_owned()],
+            agent_env: &[],
             stdout_is_report: true,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
@@ -771,6 +783,7 @@ mod tests {
             colony_env: None,
             routes: &[],
             agent: &["codex".to_owned(), "exec".to_owned(), "-".to_owned()],
+            agent_env: &[("CODEX_HOME".to_owned(), "/s/n.codex".to_owned())],
             stdout_is_report: false,
             prompt: "/s/n.prompt",
             report: "/s/n.report",
@@ -778,5 +791,9 @@ mod tests {
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
         assert!(!script.contains(". /"));
+        // The agent's own home is exported for the agent, not for settlement.
+        let home = script.find("export CODEX_HOME=/s/n.codex\n").unwrap();
+        assert!(script.find("= settle ]").unwrap() < home);
+        assert!(home < script.find("exec codex").unwrap());
     }
 }

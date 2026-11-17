@@ -197,6 +197,11 @@ pub struct LaunchConfig {
     pub model: String,
     /// The codex command, for `--provider codex`.
     pub codex: PathBuf,
+    /// The file codex keeps its login in, outside any run. A codex run gets
+    /// its own `CODEX_HOME` holding only a link to it, so it reads none of
+    /// the ambient configuration (MCP servers, hook trust, model). `None`
+    /// links nothing, for a codex that authenticates from its environment.
+    pub codex_auth: Option<PathBuf>,
     /// The colony's routes file. The unit sources it for what the launch
     /// did not resolve itself, and a launch refuses while it names a route
     /// the launch lacks.
@@ -227,6 +232,7 @@ impl LaunchConfig {
             },
             model: "claude-opus-5-5".to_owned(),
             codex: PathBuf::from("codex"),
+            codex_auth: Some(home.join(".codex/auth.json")),
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
             memory_max: "24G".to_owned(),
@@ -243,6 +249,28 @@ impl LaunchConfig {
     fn file(&self, name: &str, suffix: &str) -> PathBuf {
         self.state_dir.join(format!("{name}.{suffix}"))
     }
+}
+
+/// Make `home` a codex home holding nothing ambient: whatever an earlier
+/// run of this zooid left there stays (its sessions and logs), and the login
+/// is a link to `auth`, so a token codex refreshes is the one every codex on
+/// this host reads. Writes no config, so no MCP server, hook trust or model
+/// from the ambient `~/.codex/config.toml` applies.
+fn codex_home_for_run(home: &Path, auth: Option<&Path>) -> Result<()> {
+    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    let link = home.join("auth.json");
+    match std::fs::symlink_metadata(&link) {
+        Ok(_) => {
+            std::fs::remove_file(&link).with_context(|| format!("replace {}", link.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", link.display())),
+    }
+    std::os::unix::fs::symlink(auth, &link)
+        .with_context(|| format!("link {} to {}", link.display(), auth.display()))
 }
 
 /// Which agent runs a zooid. The provider annotates the run; it is never
@@ -570,15 +598,16 @@ impl Spawn {
         }
     }
 
-    /// The agent command line for a provider, and whether its stdout is the
-    /// report.
+    /// The agent command line for a provider, the environment it runs in,
+    /// and whether its stdout is the report.
     fn agent(
         &self,
         provider: Provider,
         effort: &str,
         mcp_config: &Path,
+        codex_home: &Path,
         report: &Path,
-    ) -> (Vec<String>, bool) {
+    ) -> (Vec<String>, Vec<(String, String)>, bool) {
         let text = |path: &Path| path.display().to_string();
         match provider {
             Provider::Codex => {
@@ -596,6 +625,7 @@ impl Spawn {
                         text(report),
                         "-".to_owned(),
                     ],
+                    vec![("CODEX_HOME".to_owned(), text(codex_home))],
                     false,
                 )
             }
@@ -614,6 +644,7 @@ impl Spawn {
                     "--output-format".to_owned(),
                     "text".to_owned(),
                 ],
+                Vec::new(),
                 true,
             ),
         }
@@ -659,6 +690,20 @@ impl Spawn {
         }
         let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path)] = files;
         let mcp_config = launch.state_dir.join("empty-mcp.json");
+        let codex_home = launch.file(&name, "codex");
+        super::require_unit_safe("codex home", &codex_home.display().to_string())?;
+        if provider == Provider::Codex {
+            if let Some(auth) = &launch.codex_auth {
+                if !auth.exists() {
+                    bail!(
+                        "codex is not logged in here: {} does not exist, so a codex zooid \
+                         would be refused by the API. Nothing was started; run `codex login`, \
+                         or pass --provider claude",
+                        auth.display()
+                    );
+                }
+            }
+        }
         let routes = self.pinned_routes()?;
         if let Some(env) = &launch.colony_env {
             let text = std::fs::read_to_string(env).with_context(|| {
@@ -759,7 +804,8 @@ impl Spawn {
                 untinted: untinted.clone(),
             });
             let text = |path: &Path| path.display().to_string();
-            let (agent, stdout_is_report) = self.agent(provider, effort, &mcp_config, &report_path);
+            let (agent, agent_env, stdout_is_report) =
+                self.agent(provider, effort, &mcp_config, &codex_home, &report_path);
             let script = super::unit_script(&ScriptFacts {
                 name: &name,
                 run,
@@ -769,6 +815,7 @@ impl Spawn {
                 colony_env: launch.colony_env.as_deref().map(text).as_deref(),
                 routes: &routes,
                 agent: &agent,
+                agent_env: &agent_env,
                 stdout_is_report,
                 prompt: &text(&prompt_path),
                 report: &text(&report_path),
@@ -777,6 +824,9 @@ impl Spawn {
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
             std::fs::write(&mcp_config, "{\"mcpServers\":{}}\n")?;
+            if provider == Provider::Codex {
+                codex_home_for_run(&codex_home, launch.codex_auth.as_deref())?;
+            }
             std::fs::write(&prompt_path, &prompt)?;
             std::fs::write(&script_path, script)?;
             match std::fs::remove_file(&report_path) {
@@ -1474,11 +1524,14 @@ mod tests {
         let env = directory.path().join("colony.env");
         std::fs::write(&env, colony_env).unwrap();
         std::fs::create_dir(directory.path().join("lane")).unwrap();
+        let codex_auth = directory.path().join("codex-auth.json");
+        std::fs::write(&codex_auth, "fake login\n").unwrap();
         let launch = LaunchConfig {
             state_dir: directory.path().join("state"),
             claude: PathBuf::from("/fake/claude"),
             model: "claude-opus-5-5".to_owned(),
             codex: PathBuf::from("/fake/codex"),
+            codex_auth: Some(codex_auth),
             colony_env: Some(env),
             path: "/usr/bin:/bin".to_owned(),
             memory_max: "24G".to_owned(),
@@ -1868,6 +1921,25 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains(&format!("> {}", launched.report.display())));
+        // Its own CODEX_HOME: the login linked in, nothing ambient copied.
+        let home = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.codex", launched.name));
+        assert!(
+            script.contains(&format!("export CODEX_HOME={}\n", home.display())),
+            "{script}"
+        );
+        assert_eq!(
+            std::fs::read_link(home.join("auth.json")).unwrap(),
+            f.directory.path().join("codex-auth.json")
+        );
+        let entries: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["auth.json"]);
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.provider, ["codex"]);
         // The provider is not part of the name.
@@ -1875,6 +1947,19 @@ mod tests {
             launched.name,
             super::super::name_for(super::super::text_handle("Codex task."))
         );
+
+        // Without a login nothing starts, and the brief stays relaunchable.
+        std::fs::remove_file(f.directory.path().join("codex-auth.json")).unwrap();
+        let mut request = f.request("Codex task without a login.");
+        request.provider = Provider::Codex;
+        let error = format!("{:#}", f.spawn.run(&request).unwrap_err());
+        assert!(error.contains("codex is not logged in"), "{error}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert!(f
+            .persona(&super::super::name_for(super::super::text_handle(
+                "Codex task without a login."
+            )))
+            .is_none());
 
         let mut request = f.request("Local task.");
         request.provider = Provider::Local;
@@ -1886,6 +1971,21 @@ mod tests {
                 "Local task."
             )))
             .is_none());
+    }
+
+    #[test]
+    fn a_codex_home_is_reused_and_its_login_link_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("n.codex");
+        let (old, new) = (directory.path().join("old"), directory.path().join("new"));
+        codex_home_for_run(&home, Some(&old)).unwrap();
+        std::fs::write(home.join("history.jsonl"), "earlier run\n").unwrap();
+        codex_home_for_run(&home, Some(&new)).unwrap();
+        assert_eq!(std::fs::read_link(home.join("auth.json")).unwrap(), new);
+        assert!(home.join("history.jsonl").exists());
+        let bare = directory.path().join("bare.codex");
+        codex_home_for_run(&bare, None).unwrap();
+        assert_eq!(std::fs::read_dir(&bare).unwrap().count(), 0);
     }
 
     fn group(
