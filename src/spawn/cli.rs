@@ -161,6 +161,11 @@ enum Command {
         /// The run being settled (hex id), as `spawn run` wrote it into the script.
         #[arg(long, value_name = "ID")]
         run: String,
+        /// The request the run serves (hex id), when a keeper started it.
+        /// Settlement links the run to it, so a keeper that stopped before
+        /// publishing the run record still sees that the request ran.
+        #[arg(long, value_name = "ID")]
+        request: Option<String>,
         /// `exited`, `killed` or `dumped` (systemd's EXIT_CODE).
         #[arg(long, default_value = "")]
         code: String,
@@ -387,6 +392,7 @@ pub fn run() -> Result<()> {
             Command::Settle {
                 name,
                 run,
+                request,
                 code,
                 status,
                 result,
@@ -394,10 +400,17 @@ pub fn run() -> Result<()> {
             } => {
                 let run =
                     Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
+                let request = request
+                    .map(|text| {
+                        Id::from_hex(text.trim())
+                            .ok_or_else(|| anyhow!("invalid request id {text}"))
+                    })
+                    .transpose()?;
                 let exit = Exit::from_systemd(&code, &status, &result);
                 let settled = spawn.settle(&SettleRequest {
                     name: name.clone(),
                     run,
+                    request,
                     exit: exit.clone(),
                     report,
                 })?;

@@ -288,6 +288,17 @@ pub fn outcome_fragment(
     (fragment, id)
 }
 
+/// The run's link to the request it serves, with the tag a keeper looks for.
+/// Launch publishes the same two facts in the run record; settlement
+/// publishes them again from inside the unit, so a keeper that stopped
+/// between starting the unit and publishing the record still finds the run.
+pub fn run_request_link(run: Id, request: Id) -> Fragment {
+    entity! { ExclusiveId::force_ref(&run) @
+        metadata::tag: KIND_RUN,
+        attrs::request: request,
+    }
+}
+
 /// A note about a run that is not part of its end: the message settlement
 /// sent, why a settlement step failed, the goal note of its launch.
 pub fn run_annotation(
@@ -596,6 +607,9 @@ pub fn require_unit_safe(what: &str, path: &str) -> Result<()> {
 pub struct ScriptFacts<'a> {
     pub name: &'a str,
     pub run: Id,
+    /// The request the run serves, when a keeper started it. Settlement
+    /// links the run to it, whatever happened to the keeper.
+    pub request: Option<Id>,
     pub pile: &'a str,
     pub key: &'a str,
     pub path: &'a str,
@@ -657,8 +671,12 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         q(facts.path)
     ));
     script.push_str("if [ \"${1:-}\" = settle ]; then\n");
+    let request = facts
+        .request
+        .map(|request| format!(" --request {request:x}"))
+        .unwrap_or_default();
     script.push_str(&format!(
-        "  exec {} settle {} --run {:x} --code \"${{EXIT_CODE:-}}\" --status \"${{EXIT_STATUS:-}}\" \
+        "  exec {} settle {} --run {:x}{request} --code \"${{EXIT_CODE:-}}\" --status \"${{EXIT_STATUS:-}}\" \
          --result \"${{SERVICE_RESULT:-}}\" --report {}\n",
         q(facts.spawn),
         q(facts.name),
@@ -936,6 +954,7 @@ mod tests {
         let script = unit_script(&ScriptFacts {
             name: "lusab-babad",
             run,
+            request: None,
             pile: "/p/self.pile",
             key: "/p/self.key",
             path: "/bin",
@@ -981,6 +1000,7 @@ mod tests {
         let script = unit_script(&ScriptFacts {
             name: "lusab-babad",
             run: Id::new([7; 16]).unwrap(),
+            request: None,
             pile: "/p/self.pile",
             key: "/p/self.key",
             path: "/bin",

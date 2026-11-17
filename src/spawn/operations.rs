@@ -255,15 +255,26 @@ impl LaunchConfig {
     }
 
     /// [`Self::under_home`] for `$HOME`, read when a frontend calls this,
-    /// with the codex model from `SPAWN_CODEX_MODEL` when that is set.
+    /// with the overrides [`Self::override_from`] reads from the environment.
     pub fn from_home_env() -> Result<Self> {
         let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
         let mut config = Self::under_home(Path::new(&home));
-        config.codex_model = std::env::var("SPAWN_CODEX_MODEL")
-            .ok()
-            .map(|model| model.trim().to_owned())
-            .filter(|model| !model.is_empty());
+        config.override_from(|name| std::env::var(name).ok());
         Ok(config)
+    }
+
+    /// The codex model from `SPAWN_CODEX_MODEL` and the codex login file
+    /// from `SPAWN_CODEX_AUTH`, each when set and not blank.
+    fn override_from(&mut self, var: impl Fn(&str) -> Option<String>) {
+        let set = |name: &str| {
+            var(name)
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        self.codex_model = set("SPAWN_CODEX_MODEL");
+        if let Some(auth) = set("SPAWN_CODEX_AUTH") {
+            self.codex_auth = Some(PathBuf::from(auth));
+        }
     }
 
     /// The model a provider's zooid is told to use, or why it names none.
@@ -546,6 +557,10 @@ pub struct Launched {
 pub struct SettleRequest {
     pub name: String,
     pub run: Id,
+    /// The request the run serves, when a keeper started it. Settlement
+    /// links the run to it, so a keeper that stopped before publishing the
+    /// run record still finds that the request ran.
+    pub request: Option<Id>,
     pub exit: Exit,
     /// Claude's stdout. A missing or empty file records no report.
     pub report: Option<PathBuf>,
@@ -718,6 +733,10 @@ pub enum KeepStep {
     Ended,
     /// Nothing can be done yet; the reason says what it waits for.
     Waiting(String),
+    /// Accepted earlier, yet neither a run nor a running unit is seen. It is
+    /// not started again: its side effects may have happened. The reason
+    /// says when it was accepted.
+    Uncertain(String),
     /// Already refused or ended: left alone.
     Done,
 }
@@ -1072,6 +1091,7 @@ impl Spawn {
             let script = super::unit_script(&ScriptFacts {
                 name: &name,
                 run,
+                request: extras.request,
                 pile: &text(&pile),
                 key: &text(&key),
                 path: &launch.path,
@@ -1197,17 +1217,37 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message) = self.observe(|facts, _| {
+        let (already_ended, earlier_message, linked) = self.observe(|facts, _| {
             Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
                 find!(id: Id, pattern!(facts, [{ run @ attrs::message: ?id }])).next(),
+                request.request.map_or(true, |served| {
+                    find!(
+                        id: Id,
+                        pattern!(facts, [{ run @ metadata::tag: KIND_RUN, attrs::request: ?id }])
+                    )
+                    .any(|id| id == served)
+                }),
             ))
         })?;
         let mut failures = Vec::new();
         let mut report_handle = None;
-        if !already_ended {
+        // The run's link to its request, from inside the unit: launch
+        // publishes it only after the unit started, and a keeper that
+        // stopped in between would otherwise see no run for the request.
+        let link = request
+            .request
+            .filter(|_| !linked)
+            .map(|served| super::run_request_link(run, served));
+        if already_ended {
+            if let Some(link) = link {
+                if let Err(error) = self.publish(link) {
+                    failures.push(error.context("link the run to its request"));
+                }
+            }
+        } else {
             let report = match &request.report {
                 Some(path) => match std::fs::read(path) {
                     Ok(bytes) if bytes.is_empty() => None,
@@ -1226,6 +1266,10 @@ impl Spawn {
                 report.as_deref(),
             );
             report_handle = handle;
+            let mut fragment = fragment;
+            if let Some(link) = link {
+                fragment += link;
+            }
             if let Err(error) = self.publish(fragment) {
                 failures.push(error.context("record the run's end"));
             }
@@ -1240,29 +1284,55 @@ impl Spawn {
             .next();
             Ok(started.map(|started| run_view(facts, reader, run, started)))
         });
-        // A run a keeper started for a request ends that request's task.
-        if let Ok(Some(view)) = &recorded {
+        // A run a keeper started for a request ends that request's task:
+        // the requests its record names, and the one the unit was told.
+        let mut served = match &recorded {
+            Ok(Some(view)) => view.request.clone(),
+            _ => Vec::new(),
+        };
+        served.extend(request.request.filter(|id| !served.contains(id)));
+        let unit = match &recorded {
+            Ok(Some(view)) => view.unit.first().cloned(),
+            _ => None,
+        };
+        // Without its run record the run names no spawner; the request
+        // records who asked, and that is who the run's end is for.
+        let request_spawner = || {
+            request.request.and_then(|served| {
+                self.observe(|facts, _| {
+                    Ok(find!(
+                        id: Id,
+                        pattern!(facts, [{ served @ archive_attrs::author: ?id }])
+                    )
+                    .next())
+                })
+                .ok()
+                .flatten()
+            })
+        };
+        if !served.is_empty() {
             let recorded_ends = self
                 .observe(|facts, _| {
-                    Ok(view
-                        .request
+                    Ok(served
                         .iter()
                         .map(|request| has_outcome(facts, *request, OUTCOME_TERMINAL))
                         .collect::<Vec<_>>())
                 })
-                .unwrap_or_else(|_| vec![false; view.request.len()]);
-            for (request, _) in view
-                .request
+                .unwrap_or_else(|_| vec![false; served.len()]);
+            for (request, _) in served
                 .iter()
                 .zip(recorded_ends)
                 .filter(|(_, recorded)| !recorded)
             {
+                let unit = unit
+                    .clone()
+                    .unwrap_or_else(|| super::unit_for_request(*request));
                 let (fragment, _) = super::outcome_fragment(
                     *request,
                     OUTCOME_TERMINAL,
                     crate::clock::point_now()?,
                     Some(run),
-                    view.unit.first().map(String::as_str),
+                    Some(&unit),
                     None,
                 );
                 if let Err(error) = self.publish(fragment) {
@@ -1272,14 +1342,14 @@ impl Spawn {
         }
         let (spawner, end, report) = match &recorded {
             Ok(Some(view)) => (
-                view.spawner.first().copied(),
+                view.spawner.first().copied().or_else(request_spawner),
                 describe_end(view),
                 view.report.first().copied().or(report_handle),
             ),
-            Ok(None) => (None, request.exit.describe(), report_handle),
+            Ok(None) => (request_spawner(), request.exit.describe(), report_handle),
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
-                (None, request.exit.describe(), report_handle)
+                (request_spawner(), request.exit.describe(), report_handle)
             }
         };
         let mut message = earlier_message;
@@ -1601,6 +1671,31 @@ impl Spawn {
             )?;
             return Ok(KeepStep::Running);
         }
+        if let Some(accepted) = view
+            .outcomes
+            .iter()
+            .find(|outcome| outcome.kind == OUTCOME_ACCEPTED)
+        {
+            // Accepted is recorded before the unit starts. A keeper that
+            // stopped after starting it, with a settlement that never linked
+            // the run, leaves exactly this; the absence of a process is not
+            // evidence that starting again is safe.
+            let at = accepted
+                .at
+                .first()
+                .map(|at| crate::care::format_time(*at))
+                .unwrap_or_else(|| "an unrecorded time".to_owned());
+            return Ok(KeepStep::Uncertain(format!(
+                "accepted at {at}, but no run and no unit were seen; not restarting, because \
+                 its side effects may have happened"
+            )));
+        }
+        if !view.handoff.is_empty() {
+            return self.refuse(
+                view,
+                "a handoff needs the disclosure check, which this keeper does not have".to_owned(),
+            );
+        }
         let provider = match view.provider.as_slice() {
             [one] => match Provider::parse(one) {
                 Ok(provider) => provider,
@@ -1657,9 +1752,6 @@ impl Spawn {
                 "the zooid's spawn record or brief is not here yet".to_owned(),
             ));
         };
-        if !view.handoff.is_empty() && view.handoff_text.is_none() {
-            return Ok(KeepStep::Waiting("the handoff is not here yet".to_owned()));
-        }
         let name = super::name_for(brief);
         if let Some(state) = Relations::with_storage(self.storage.clone()).person_state(&name)? {
             if !state.retired {
@@ -1682,7 +1774,8 @@ impl Spawn {
             LaunchExtras {
                 unit: Some(unit.clone()),
                 request: Some(view.id),
-                handoff: view.handoff_text.clone(),
+                // Requests with a handoff are refused above.
+                handoff: None,
             },
         );
         match launched {
@@ -2104,6 +2197,17 @@ pub fn render_requests(requests: &[RequestView]) -> String {
         }
         if request.outcomes.is_empty() {
             writeln!(out, "  no outcome yet").unwrap();
+        } else if request.runs.is_empty()
+            && request.has(OUTCOME_ACCEPTED)
+            && !request.has(OUTCOME_REFUSED)
+            && !request.has(OUTCOME_TERMINAL)
+        {
+            writeln!(
+                out,
+                "  accepted, but no run is recorded: once its unit is gone the keeper reports \
+                 it uncertain and never starts it again"
+            )
+            .unwrap();
         }
     }
     out
@@ -2125,6 +2229,7 @@ pub fn render_pass(pass: &KeepPass) -> String {
             KeepStep::Running => "running".to_owned(),
             KeepStep::Ended => "task-terminal".to_owned(),
             KeepStep::Waiting(why) => format!("waiting: {why}"),
+            KeepStep::Uncertain(why) => format!("uncertain: {why}"),
             KeepStep::Done => "done".to_owned(),
         };
         writeln!(out, "  {request:x}: {what}").unwrap();
@@ -2305,6 +2410,9 @@ mod tests {
         started: Mutex<Vec<UnitSpec>>,
         state: Mutex<String>,
         refuse: bool,
+        /// Start the unit, then stop the caller the way a crashed keeper
+        /// stops: before anything after the start runs.
+        crash_after_start: bool,
     }
 
     impl Launcher for FakeLauncher {
@@ -2314,6 +2422,9 @@ mod tests {
             }
             self.started.lock().unwrap().push(unit.clone());
             *self.state.lock().unwrap() = "active".to_owned();
+            if self.crash_after_start {
+                panic!("the keeper stops after the unit started");
+            }
             Ok(())
         }
         fn state(&self, _unit: &str) -> Result<String> {
@@ -2428,6 +2539,7 @@ mod tests {
             self.spawn.settle(&SettleRequest {
                 name: name.to_owned(),
                 run: launched.run,
+                request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: Some(launched.report.clone()),
             })
@@ -2641,6 +2753,7 @@ mod tests {
             .settle(&SettleRequest {
                 name: asked.name.clone(),
                 run,
+                request: Some(asked.request),
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
             })
@@ -2659,6 +2772,7 @@ mod tests {
             .settle(&SettleRequest {
                 name: asked.name.clone(),
                 run,
+                request: Some(asked.request),
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
             })
@@ -2748,11 +2862,30 @@ mod tests {
 
     #[test]
     fn the_handoff_comes_once_after_the_brief() {
+        // keep refuses handoffs in v1; the placement is the launch's own,
+        // ready for a keeper that has the disclosure check.
         let f = fixture();
         let brief = "Continue the move.";
         let handoff = "HANDOFF: release route #cc, the review promised to JP.";
-        let asked = f.ask_with(brief, None, Provider::Claude, Some(handoff));
-        f.keep();
+        let launched = f
+            .spawn
+            .launch(
+                Brief {
+                    about: super::super::about(brief).to_owned(),
+                    text: brief.to_owned(),
+                    goal: None,
+                },
+                &f.directory.path().join("lane"),
+                "medium",
+                "agent-cc",
+                Provider::Claude,
+                LaunchExtras {
+                    unit: None,
+                    request: None,
+                    handoff: Some(handoff.to_owned()),
+                },
+            )
+            .unwrap();
         let prompt = std::fs::read_to_string(
             f.launcher.started.lock().unwrap()[0]
                 .script
@@ -2767,7 +2900,7 @@ mod tests {
         assert!(prompt.find("# Handoff").unwrap() < handoff_at);
         assert_eq!(prompt.matches(handoff).count(), 1);
         assert!(prompt.trim_end().ends_with(handoff));
-        let run = &f.spawn.show(&asked.name).unwrap().runs[0];
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.prompt, [super::super::text_handle(&prompt)]);
         // A plain run has no handoff section.
         f.spawn.run(&f.request("No handoff.")).unwrap();
@@ -2778,6 +2911,134 @@ mod tests {
         )
         .unwrap();
         assert!(!plain.contains("# Handoff"));
+    }
+
+    #[test]
+    fn keep_refuses_a_request_that_carries_a_handoff() {
+        let f = fixture();
+        let asked = f.ask_with(
+            "Continue the move.",
+            None,
+            Provider::Claude,
+            Some("HANDOFF: private text."),
+        );
+        let reason = "a handoff needs the disclosure check, which this keeper does not have";
+        assert_eq!(
+            f.keep().steps,
+            [(asked.request, KeepStep::Refused(reason.to_owned()))]
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["refused"]);
+        assert_eq!(view.outcomes[0].reason, [reason]);
+        assert!(view.runs.is_empty());
+        assert!(f.persona(&asked.name).is_none());
+        assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    /// What the unit's settle line passes: its run and its request.
+    fn settle_ids(script: &str) -> (Id, Option<Id>) {
+        let line = script
+            .lines()
+            .find(|line| line.contains(" settle ") && line.contains(" --run "))
+            .expect("a settle line");
+        let after = |flag: &str| {
+            line.split_whitespace()
+                .skip_while(|word| *word != flag)
+                .nth(1)
+                .map(|hex| Id::from_hex(hex).unwrap())
+        };
+        (after("--run").expect("a run"), after("--request"))
+    }
+
+    /// A keeper that stops after systemd started the unit, before the run
+    /// record is published: the unit runs, the pile has only `accepted`.
+    fn keep_crashing_after_start(f: &Fixture) {
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f.keep()));
+        assert!(crashed.is_err(), "the fake keeper stops inside start");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn settle_links_the_run_when_the_keeper_stopped_before_publishing_it() {
+        let f = fixture_with(FakeLauncher {
+            crash_after_start: true,
+            ..Default::default()
+        });
+        let asked = f.ask("Crash window.", None, Provider::Claude);
+        keep_crashing_after_start(&f);
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["accepted"]);
+        assert!(view.runs.is_empty());
+        // The unit ends and is collected; its settle line still runs.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let (run, request) = settle_ids(&f.script(0));
+        assert_eq!(request, Some(asked.request));
+        f.spawn
+            .settle(&SettleRequest {
+                name: asked.name.clone(),
+                run,
+                request,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: None,
+            })
+            .unwrap();
+        let view = f.request_view(asked.request);
+        assert_eq!(view.runs, [(run, true)]);
+        assert_eq!(kinds(&view), ["accepted", "task-terminal"]);
+        // The spawner came from the request, so the zooid could message it.
+        assert!(f.inbox().iter().any(|text| matches!(
+            text,
+            crate::message::MessageText::Text(text) if text.contains(&asked.name)
+        )));
+        assert!(f.persona(&asked.name).unwrap().retired);
+        // Settling again adds nothing; the keeper launches nothing new.
+        f.spawn
+            .settle(&SettleRequest {
+                name: asked.name.clone(),
+                run,
+                request,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: None,
+            })
+            .unwrap();
+        assert_eq!(f.request_view(asked.request).runs, [(run, true)]);
+        assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_accepted_request_with_no_run_and_no_unit_is_uncertain_and_never_restarted() {
+        let f = fixture_with(FakeLauncher {
+            crash_after_start: true,
+            ..Default::default()
+        });
+        let asked = f.ask("Crash and no settle.", None, Provider::Claude);
+        keep_crashing_after_start(&f);
+        // Settlement failed and left nothing; the unit was collected.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        // Even with the persona retired by hand, nothing says replay is safe.
+        Relations::with_storage(f.storage.clone())
+            .retire(&asked.name)
+            .unwrap();
+        for _ in 0..2 {
+            let pass = f.keep();
+            assert!(
+                matches!(&pass.steps[..], [(id, KeepStep::Uncertain(why))]
+                    if *id == asked.request
+                        && why.starts_with("accepted at ")
+                        && why.contains("not restarting")),
+                "{pass:?}"
+            );
+            assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        }
+        let view = f.request_view(asked.request);
+        assert_eq!(kinds(&view), ["accepted"]);
+        assert!(view.runs.is_empty());
+        // It stays visible, and says why it is not started.
+        let listed = render_requests(&f.spawn.requests(None).unwrap());
+        assert!(listed.contains("never starts it again"), "{listed}");
     }
 
     #[test]
@@ -2862,6 +3123,7 @@ mod tests {
             .settle(&SettleRequest {
                 name: launched.name.clone(),
                 run: launched.run,
+                request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: Some(launched.report.clone()),
             })
@@ -2921,6 +3183,7 @@ mod tests {
             .settle(&SettleRequest {
                 name: launched.name.clone(),
                 run: launched.run,
+                request: None,
                 exit: Exit::from_systemd("killed", "KILL", "signal"),
                 report: Some(launched.report.clone()),
             })
@@ -3259,6 +3522,34 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_and_login_come_from_the_environment_when_set() {
+        let home = Path::new("/h");
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let mut config = LaunchConfig::under_home(home);
+        config.override_from(env(&[]));
+        assert_eq!(config.codex_model, None);
+        assert_eq!(config.codex_auth, Some(home.join(".codex/auth.json")));
+        let mut config = LaunchConfig::under_home(home);
+        config.override_from(env(&[
+            ("SPAWN_CODEX_MODEL", " gpt-5.2-codex "),
+            ("SPAWN_CODEX_AUTH", " /other/auth.json "),
+        ]));
+        assert_eq!(config.codex_model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(config.codex_auth, Some(PathBuf::from("/other/auth.json")));
+        // Blank is unset: the default login stays.
+        let mut config = LaunchConfig::under_home(home);
+        config.override_from(env(&[("SPAWN_CODEX_AUTH", "  ")]));
+        assert_eq!(config.codex_auth, Some(home.join(".codex/auth.json")));
+    }
+
+    #[test]
     fn a_codex_home_is_reused_and_its_login_link_replaced() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("n.codex");
@@ -3456,6 +3747,7 @@ mod tests {
             .settle(&SettleRequest {
                 name: launched.name.clone(),
                 run: launched.run,
+                request: None,
                 exit: Exit::from_systemd("exited", "0", "success"),
                 report: None,
             })
