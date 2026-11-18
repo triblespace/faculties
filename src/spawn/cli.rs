@@ -53,7 +53,10 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
-        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local.
+        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
+        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
+        /// {name}, {effort} and {script} replaced; refused without it, never a hosted
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -80,7 +83,10 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
-        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local.
+        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
+        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
+        /// {name}, {effort} and {script} replaced; refused without it, never a hosted
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -101,7 +107,8 @@ enum Command {
         /// --host is omitted.
         #[arg(long)]
         label: Option<String>,
-        /// The agent: claude, codex, mistral (opt-in; bills money), auto or local.
+        /// The agent: claude, codex, mistral (opt-in; bills money), auto or local
+        /// (refused by a target host without SPAWN_LOCAL_EXECUTOR).
         #[arg(long, default_value = "claude")]
         provider: String,
         /// Effort: low, medium, high, xhigh or max.

@@ -72,6 +72,9 @@ pub struct UnitSpec {
     pub script: PathBuf,
     pub log: PathBuf,
     pub memory_max: String,
+    /// `RuntimeMaxSec`, when the unit has a runtime limit. Only local units
+    /// have one ([`LaunchConfig::local_max_runtime`]).
+    pub runtime_max: Option<u64>,
 }
 
 impl UnitSpec {
@@ -79,7 +82,7 @@ impl UnitSpec {
     pub fn systemd_run_args(&self) -> Vec<String> {
         let script = self.script.display().to_string();
         let log = self.log.display().to_string();
-        vec![
+        let mut args = vec![
             "--user".to_owned(),
             "--unit".to_owned(),
             self.unit.clone(),
@@ -98,10 +101,14 @@ impl UnitSpec {
             format!("StandardError=append:{log}"),
             "-p".to_owned(),
             format!("ExecStopPost=/bin/bash {script} settle"),
-            "--".to_owned(),
-            "/bin/bash".to_owned(),
-            script,
-        ]
+        ];
+        if let Some(seconds) = self.runtime_max {
+            // Settlement runs after the limit fires: ExecStopPost is not
+            // counted against RuntimeMaxSec.
+            args.extend(["-p".to_owned(), format!("RuntimeMaxSec={seconds}")]);
+        }
+        args.extend(["--".to_owned(), "/bin/bash".to_owned(), script]);
+        args
     }
 }
 
@@ -240,6 +247,58 @@ pub struct LaunchConfig {
     /// name is resolved on `path` at launch, so the unit names an absolute
     /// file.
     pub faculties: PathBuf,
+    /// The local executor, for `--provider local`: an argv template whose
+    /// words may hold [`LOCAL_PLACEHOLDERS`]. `None` means this host has
+    /// none, and local is refused. `SPAWN_LOCAL_EXECUTOR` sets it.
+    pub local: Option<Vec<String>>,
+    /// The longest a local unit may run, in seconds: its `RuntimeMaxSec`.
+    /// `None` is no limit. Units of other providers never get one.
+    /// `SPAWN_LOCAL_MAX_RUNTIME` sets it.
+    pub local_max_runtime: Option<u64>,
+}
+
+/// The placeholders a local executor template may name, each replaced inside
+/// a word: the prompt file (also the executor's stdin), the report file it
+/// must write, the zooid's name, the effort, and the unit script, which run
+/// as `{script} mcp` is the zooid's own faculties MCP server.
+pub const LOCAL_PLACEHOLDERS: [&str; 5] =
+    ["{prompt}", "{report}", "{name}", "{effort}", "{script}"];
+
+/// What to do when a host has no local executor.
+const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
+     SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
+     {report}, {name}, {effort} and {script} replaced at launch; the executor reads the prompt \
+     on stdin and writes its report to {report}. Nothing falls back to a hosted model";
+
+/// A local executor template from `SPAWN_LOCAL_EXECUTOR`: whitespace
+/// separates words, and there is no quoting (a wrapper script holds anything
+/// more). Every `{...}` must be one of [`LOCAL_PLACEHOLDERS`], and the report
+/// must be named, since a local run's report is only ever read from its file.
+fn parse_local_executor(template: &str) -> Result<Vec<String>> {
+    let words: Vec<String> = template.split_whitespace().map(str::to_owned).collect();
+    if words.is_empty() {
+        bail!("SPAWN_LOCAL_EXECUTOR is empty");
+    }
+    for word in &words {
+        let mut rest = word.as_str();
+        while let Some(open) = rest.find('{') {
+            let Some(close) = rest[open..].find('}') else {
+                bail!("SPAWN_LOCAL_EXECUTOR word {word:?} has an unclosed {{");
+            };
+            let placeholder = &rest[open..open + close + 1];
+            if !LOCAL_PLACEHOLDERS.contains(&placeholder) {
+                bail!(
+                    "SPAWN_LOCAL_EXECUTOR names {placeholder}, which is not one of {}",
+                    LOCAL_PLACEHOLDERS.join(", ")
+                );
+            }
+            rest = &rest[open + close + 1..];
+        }
+    }
+    if !words.iter().any(|word| word.contains("{report}")) {
+        bail!("SPAWN_LOCAL_EXECUTOR never names {{report}}, so a local run could not report");
+    }
+    Ok(words)
 }
 
 impl LaunchConfig {
@@ -274,6 +333,8 @@ impl LaunchConfig {
             memory_max: "24G".to_owned(),
             spawn: "spawn".to_owned(),
             faculties: PathBuf::from("faculties"),
+            local: None,
+            local_max_runtime: None,
         }
     }
 
@@ -288,9 +349,13 @@ impl LaunchConfig {
 
     /// The codex model from `SPAWN_CODEX_MODEL`, the codex login file from
     /// `SPAWN_CODEX_AUTH`, the vibe command from `SPAWN_VIBE`, the Mistral
-    /// key's Secrets version from `SPAWN_MISTRAL_KEY_SECRET` and a mistral
-    /// run's price cap from `SPAWN_MISTRAL_MAX_PRICE`, each when set and not
-    /// blank. A price cap that is not a positive number is refused.
+    /// key's Secrets version from `SPAWN_MISTRAL_KEY_SECRET`, a mistral
+    /// run's price cap from `SPAWN_MISTRAL_MAX_PRICE`, the local executor
+    /// from `SPAWN_LOCAL_EXECUTOR` and a local unit's runtime limit from
+    /// `SPAWN_LOCAL_MAX_RUNTIME`, each when set and not blank. A price cap
+    /// that is not a positive number, a malformed executor template and a
+    /// runtime limit that is not a positive whole number of seconds are
+    /// refused.
     fn override_from(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<()> {
         let set = |name: &str| {
             var(name)
@@ -313,6 +378,17 @@ impl LaunchConfig {
                 _ => bail!("SPAWN_MISTRAL_MAX_PRICE {price:?} is not a positive number of dollars"),
             };
         }
+        if let Some(template) = set("SPAWN_LOCAL_EXECUTOR") {
+            self.local = Some(parse_local_executor(&template)?);
+        }
+        if let Some(seconds) = set("SPAWN_LOCAL_MAX_RUNTIME") {
+            self.local_max_runtime = match seconds.parse::<u64>() {
+                Ok(seconds) if seconds > 0 => Some(seconds),
+                _ => bail!(
+                    "SPAWN_LOCAL_MAX_RUNTIME {seconds:?} is not a positive whole number of seconds"
+                ),
+            };
+        }
         Ok(())
     }
 
@@ -331,6 +407,10 @@ impl LaunchConfig {
                 ),
             },
             Provider::Mistral => (Some(self.mistral_model.clone()), None),
+            Provider::Local => (
+                None,
+                Some("the local executor (SPAWN_LOCAL_EXECUTOR) chooses its own model".to_owned()),
+            ),
             _ => (Some(self.model.clone()), None),
         }
     }
@@ -547,7 +627,9 @@ pub enum Provider {
     /// Whichever of claude and codex the latest fresh quota readings show
     /// with the most headroom. Never mistral.
     Auto,
-    /// A local model. Not available yet.
+    /// A local model, through the host's configured executor
+    /// ([`LaunchConfig::local`]). Refused on a host without one; never falls
+    /// back to a hosted model.
     Local,
 }
 
@@ -705,7 +787,11 @@ pub struct Launched {
 
 /// The files of one run that an agent's command line names.
 struct RunFiles {
+    /// The zooid's name.
+    name: String,
     workdir: PathBuf,
+    /// The unit script; run as `mcp` it is the zooid's MCP server.
+    script: PathBuf,
     prompt: PathBuf,
     report: PathBuf,
     mcp_config: PathBuf,
@@ -1266,10 +1352,10 @@ impl Spawn {
             Provider::Claude | Provider::Codex | Provider::Mistral => {
                 Ok((provider, format!("{} was asked for", provider.name())))
             }
-            Provider::Local => bail!(
-                "the local provider is not available yet: Drive has no API for it. Nothing was \
-                 started; pass --provider claude or --provider codex"
-            ),
+            Provider::Local => match &self.launch.local {
+                Some(_) => Ok((provider, "local was asked for".to_owned())),
+                None => bail!("{LOCAL_UNCONFIGURED}. Nothing was started."),
+            },
             Provider::Auto => {
                 let view = crate::quota::operations::Quota::with_storage(self.storage.clone())
                     .show()
@@ -1281,7 +1367,8 @@ impl Spawn {
 
     /// The agent command line for a provider, the environment it runs in,
     /// and whether its stdout is the report. Every concrete provider has its
-    /// own arm; `auto` and `local` are refused, never sent to claude.
+    /// own arm; `auto` is refused, and `local` without an executor, never
+    /// sent to claude.
     fn agent(&self, provider: Provider, effort: &str, files: &RunFiles) -> Result<AgentLine> {
         let text = |path: &Path| path.display().to_string();
         Ok(match provider {
@@ -1364,7 +1451,35 @@ impl Spawn {
                 secrets: Vec::new(),
                 stdout_is_report: true,
             },
-            Provider::Auto | Provider::Local => bail!(
+            Provider::Local => {
+                let Some(template) = &self.launch.local else {
+                    bail!("{LOCAL_UNCONFIGURED}");
+                };
+                let values = [
+                    ("{prompt}", text(&files.prompt)),
+                    ("{report}", text(&files.report)),
+                    ("{name}", files.name.clone()),
+                    ("{effort}", effort.to_owned()),
+                    ("{script}", text(&files.script)),
+                ];
+                let argv = template
+                    .iter()
+                    .map(|word| {
+                        values
+                            .iter()
+                            .fold(word.clone(), |word, (key, value)| word.replace(key, value))
+                    })
+                    .collect();
+                // The executor writes the report file; its stdout goes to the
+                // unit's log. A missing report is settled as no report.
+                AgentLine {
+                    argv,
+                    env: Vec::new(),
+                    secrets: Vec::new(),
+                    stdout_is_report: false,
+                }
+            }
+            Provider::Auto => bail!(
                 "{} is a policy, not an agent: it is resolved before a command line is built",
                 provider.name()
             ),
@@ -1552,7 +1667,9 @@ impl Spawn {
                 provider,
                 effort,
                 &RunFiles {
+                    name: name.clone(),
                     workdir: workdir.clone(),
+                    script: script_path.clone(),
                     prompt: prompt_path.clone(),
                     report: report_path.clone(),
                     mcp_config: mcp_config.clone(),
@@ -1613,9 +1730,9 @@ impl Spawn {
                     std::fs::write(&settings, claude_hook_settings(&script_path))
                         .with_context(|| format!("write {}", settings.display()))?;
                 }
-                Provider::Auto | Provider::Local => {
-                    bail!("{} reached the launch unresolved", provider.name())
-                }
+                // The executor's own configuration is the host's.
+                Provider::Local => {}
+                Provider::Auto => bail!("{} reached the launch unresolved", provider.name()),
             }
             std::fs::write(&prompt_path, &prompt)?;
             std::fs::write(&script_path, script)?;
@@ -1631,6 +1748,9 @@ impl Spawn {
                 script: script_path.clone(),
                 log: log_path.clone(),
                 memory_max: launch.memory_max.clone(),
+                runtime_max: (provider == Provider::Local)
+                    .then_some(launch.local_max_runtime)
+                    .flatten(),
             })?;
             started = true;
             let mut record = spawn_fragment;
@@ -1859,16 +1979,27 @@ impl Spawn {
                 }
             }
         }
-        let (spawner, end, report) = match &recorded {
+        let (spawner, end, clean, report) = match &recorded {
             Ok(Some(view)) => (
                 view.spawner.first().copied().or_else(request_spawner),
                 describe_end(view),
+                ended_clean(view),
                 view.report.first().copied().or(report_handle),
             ),
-            Ok(None) => (request_spawner(), request.exit.describe(), report_handle),
+            Ok(None) => (
+                request_spawner(),
+                request.exit.describe(),
+                request.exit.clean(),
+                report_handle,
+            ),
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
-                (request_spawner(), request.exit.describe(), report_handle)
+                (
+                    request_spawner(),
+                    request.exit.describe(),
+                    request.exit.clean(),
+                    report_handle,
+                )
             }
         };
         let mut message = earlier_message;
@@ -1878,9 +2009,16 @@ impl Spawn {
                     let text = format!(
                         "{} finished, {end}, report {}. `spawn show {}` reads it.{}",
                         request.name,
-                        report
-                            .map(super::handle_text)
-                            .unwrap_or_else(|| "none".to_owned()),
+                        match report {
+                            None => "none".to_owned(),
+                            Some(report) if clean => super::handle_text(report),
+                            // Whatever a failed or stopped run left is not
+                            // its finished answer.
+                            Some(report) => format!(
+                                "{} (partial: the run did not end cleanly)",
+                                super::handle_text(report)
+                            ),
+                        },
                         request.name,
                         self.unread_note(&request.name)
                     );
@@ -2238,8 +2376,11 @@ impl Spawn {
                 )
             }
         };
-        if provider == Provider::Local {
-            return self.refuse(view, "no local executor on this host".to_owned());
+        if provider == Provider::Local && self.launch.local.is_none() {
+            return self.refuse(
+                view,
+                "no local executor on this host (SPAWN_LOCAL_EXECUTOR is unset)".to_owned(),
+            );
         }
         // A request is started unattended, by whatever wrote it (a rule, an
         // ignite pass). Until JP agrees to unattended spending, money is
@@ -2976,16 +3117,34 @@ pub fn describe_end(run: &RunView) -> String {
     if !run.ended() {
         return "not ended".to_owned();
     }
-    if !run.exit_code.is_empty() {
-        return format!("exit {}", join(&run.exit_code));
+    let end = if !run.exit_code.is_empty() {
+        format!("exit {}", join(&run.exit_code))
+    } else if !run.signal.is_empty() {
+        format!("signal {}", join(&run.signal))
+    } else if !run.result.is_empty() {
+        join(&run.result)
+    } else {
+        "ended, exit unknown".to_owned()
+    };
+    if run
+        .result
+        .iter()
+        .any(|result| result == super::TIMEOUT_RESULT)
+    {
+        return format!("{end}, {}", super::RUNTIME_LIMIT_NOTE);
     }
-    if !run.signal.is_empty() {
-        return format!("signal {}", join(&run.signal));
-    }
-    if !run.result.is_empty() {
-        return join(&run.result);
-    }
-    "ended, exit unknown".to_owned()
+    end
+}
+
+/// Whether a recorded run ended as a success: exit 0 alone, and not stopped
+/// by its runtime limit.
+pub fn ended_clean(run: &RunView) -> bool {
+    run.exit_code == [0]
+        && run.signal.is_empty()
+        && !run
+            .result
+            .iter()
+            .any(|result| result == super::TIMEOUT_RESULT)
 }
 
 /// One line per spawn: name, runs, how the latest ended, the brief's first line.
@@ -3246,6 +3405,8 @@ mod tests {
             memory_max: "24G".to_owned(),
             spawn: "spawn".to_owned(),
             faculties: PathBuf::from("faculties"),
+            local: None,
+            local_max_runtime: None,
         };
         let launcher = Arc::new(launcher);
         let spawn = Spawn::new(storage.clone(), launch)
@@ -3303,6 +3464,20 @@ mod tests {
                 .filter(|entry| entry.incoming)
                 .map(|entry| entry.body)
                 .collect()
+        }
+        /// The settlement message a zooid sent the spawner.
+        fn told(&self, name: &str) -> String {
+            self.inbox()
+                .into_iter()
+                .find_map(|body| match body {
+                    crate::message::MessageText::Text(text)
+                        if text.starts_with(&format!("{name} finished")) =>
+                    {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} told the spawner nothing"))
         }
         fn script(&self, index: usize) -> String {
             std::fs::read_to_string(&self.launcher.started.lock().unwrap()[index].script).unwrap()
@@ -3660,17 +3835,367 @@ mod tests {
             pass.steps,
             [(
                 asked.request,
-                KeepStep::Refused("no local executor on this host".to_owned())
+                KeepStep::Refused(
+                    "no local executor on this host (SPAWN_LOCAL_EXECUTOR is unset)".to_owned()
+                )
             )]
         );
         assert!(f.launcher.started.lock().unwrap().is_empty());
         let view = f.request_view(asked.request);
         assert_eq!(kinds(&view), ["refused"]);
-        assert_eq!(view.outcomes[0].reason, ["no local executor on this host"]);
+        assert_eq!(
+            view.outcomes[0].reason,
+            ["no local executor on this host (SPAWN_LOCAL_EXECUTOR is unset)"]
+        );
         assert!(view.runs.is_empty());
         assert!(f.persona(&asked.name).is_none());
         assert_eq!(f.keep().steps, [(asked.request, KeepStep::Done)]);
         assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    /// A fake local executor in the fixture's directory: it reads the prompt
+    /// on stdin, leaves the words it was given beside the report, and then
+    /// does what `body` says with the report path in `$1`.
+    fn local_executor(f: &Fixture, file: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = f.directory.path().join(file);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nwc -c > \"$1.stdin\"\necho \"$@\" > \"$1.args\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Run a launched zooid's unit script as systemd would, without systemd,
+    /// and settle it with the exit it had.
+    fn run_unit_and_settle(f: &Fixture, spawn: &Spawn, launched: &Launched) -> RunView {
+        let status = std::process::Command::new("/bin/bash")
+            .arg(launched.report.with_extension("sh"))
+            .current_dir(f.directory.path().join("lane"))
+            .env_clear()
+            .env("HOME", f.directory.path())
+            .status()
+            .unwrap();
+        let code = status.code().unwrap().to_string();
+        let result = if status.success() {
+            "success"
+        } else {
+            "exit-code"
+        };
+        spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", &code, result),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        spawn.show(&launched.name).unwrap().runs.remove(0)
+    }
+
+    fn local_request(f: &Fixture, brief: &str) -> RunRequest {
+        let mut request = f.request(brief);
+        request.provider = Provider::Local;
+        request
+    }
+
+    #[test]
+    fn a_local_zooid_runs_the_hosts_executor_and_its_report_file_is_the_report() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-ok", "printf 'local report\\n' > \"$1\"");
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(
+                parse_local_executor(&format!(
+                    "{} {{report}} --name={{name}} --effort {{effort}} --prompt {{prompt}} \
+                     --mcp {{script}}",
+                    executor.display()
+                ))
+                .unwrap(),
+            )
+        });
+        let launched = spawn.run(&local_request(&f, "Local work.")).unwrap();
+        assert_eq!(launched.provider, Provider::Local);
+        assert_eq!(launched.model, None);
+        assert!(launched
+            .model_unset
+            .as_deref()
+            .unwrap()
+            .contains("SPAWN_LOCAL_EXECUTOR"));
+        let script = f.script(0);
+        assert!(!script.contains("claude"), "{script}");
+        // The report is the executor's file, never its stdout.
+        assert!(
+            !script.contains(&format!("> {}", launched.report.display())),
+            "{script}"
+        );
+
+        let run = run_unit_and_settle(&f, &spawn, &launched);
+        assert_eq!(run.exit_code, [0]);
+        assert_eq!(run.report_text.as_deref(), Some("local report\n"));
+        let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
+        let sh = launched.report.with_extension("sh");
+        let prompt = launched.report.with_extension("prompt");
+        assert_eq!(
+            args.trim(),
+            format!(
+                "{} --name={} --effort high --prompt {} --mcp {}",
+                launched.report.display(),
+                launched.name,
+                prompt.display(),
+                sh.display()
+            )
+        );
+        // The prompt arrived on stdin too, whole.
+        let stdin =
+            std::fs::read_to_string(launched.report.with_extension("report.stdin")).unwrap();
+        assert_eq!(
+            stdin.trim().parse::<u64>().unwrap(),
+            std::fs::metadata(&prompt).unwrap().len()
+        );
+        let told = f.told(&launched.name);
+        assert!(told.contains("finished, exit 0, report blake3:"), "{told}");
+        assert!(!told.contains("partial"), "{told}");
+    }
+
+    #[test]
+    fn a_local_executor_that_fails_is_recorded_as_failed_and_nothing_else_runs() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-fail", "echo 'out of memory' > \"$1\"; exit 3");
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+        });
+        let launched = spawn
+            .run(&local_request(&f, "Failing local work."))
+            .unwrap();
+        let run = run_unit_and_settle(&f, &spawn, &launched);
+        assert_eq!(run.exit_code, [3]);
+        assert_eq!(describe_end(&run), "exit 3");
+        assert_eq!(run.report_text.as_deref(), Some("out of memory\n"));
+        // One unit, the local one; no hosted retry.
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert!(!f.script(0).contains("/fake/"));
+        assert_eq!(spawn.show(&launched.name).unwrap().runs.len(), 1);
+    }
+
+    #[test]
+    fn a_local_executor_that_writes_no_report_settles_with_none() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-silent", "echo 'stdout is not the report'");
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+        });
+        let launched = spawn.run(&local_request(&f, "Silent local work.")).unwrap();
+        let run = run_unit_and_settle(&f, &spawn, &launched);
+        assert_eq!(run.exit_code, [0]);
+        assert!(run.report.is_empty());
+        assert!(run.report_text.is_none());
+    }
+
+    #[test]
+    fn keep_starts_a_local_request_on_a_host_with_an_executor() {
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/drive/zooid {report}").unwrap())
+        });
+        let asked = f.ask("Local by request.", None, Provider::Local);
+        let pass = spawn.keep_once(&f.keep_config()).unwrap();
+        assert!(
+            !matches!(pass.steps[0].1, KeepStep::Refused(_)),
+            "{:?}",
+            pass.steps
+        );
+        let started = f.launcher.started.lock().unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            started[0].unit,
+            super::super::unit_for_request(asked.request)
+        );
+        drop(started);
+        let script = f.script(0);
+        assert!(script.contains("/opt/drive/zooid"), "{script}");
+        assert!(!script.contains("/fake/"), "{script}");
+    }
+
+    #[test]
+    fn only_a_local_unit_gets_the_runtime_limit() {
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/local {report}").unwrap());
+            launch.local_max_runtime = Some(7);
+        });
+        spawn.run(&f.request("Hosted, unlimited.")).unwrap();
+        spawn.run(&local_request(&f, "Local, limited.")).unwrap();
+        let started = f.launcher.started.lock().unwrap().clone();
+        assert_eq!(started[0].runtime_max, None);
+        assert!(!started[0]
+            .systemd_run_args()
+            .iter()
+            .any(|arg| arg.starts_with("RuntimeMaxSec")));
+        assert_eq!(started[1].runtime_max, Some(7));
+        let args = started[1].systemd_run_args();
+        let at = args
+            .iter()
+            .position(|arg| arg == "RuntimeMaxSec=7")
+            .unwrap();
+        assert_eq!(args[at - 1], "-p");
+        assert!(at < args.iter().position(|arg| arg == "--").unwrap());
+    }
+
+    /// The runtime limit through real systemd: a local executor that sleeps
+    /// past a two-second limit, and one that catches the SIGTERM, writes a
+    /// partial report and exits 0. Neither settles as a success. Skipped
+    /// where no systemd user manager answers.
+    #[test]
+    fn a_local_unit_stopped_at_its_runtime_limit_settles_as_a_failure() {
+        let reachable = std::process::Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !reachable {
+            eprintln!("skipped: no systemd user manager here");
+            return;
+        }
+        let f = fixture();
+        // settlement's command, found on the unit's PATH: it leaves its
+        // arguments for the test to settle with.
+        let settle = f.directory.path().join("bin").join("spawn");
+        std::fs::write(
+            &settle,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/../settle-$2.args\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&settle, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sleeper = local_executor(&f, "local-sleep", "exec sleep 60");
+        let catcher = local_executor(
+            &f,
+            "local-catch",
+            "trap 'echo partial > \"$1\"; exit 0' TERM\nsleep 60 &\nwait",
+        );
+        let real = |executor: &Path| {
+            let mut launch = f.spawn.launch.clone();
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap());
+            launch.local_max_runtime = Some(2);
+            Spawn::new(f.storage.clone(), launch).with_renderer(Arc::new(StubRenderer::default()))
+        };
+        // The fixture's directory makes the brief, and so the unit, unique.
+        let tag = f.directory.path().display().to_string();
+        let (sleeping, catching) = (real(&sleeper), real(&catcher));
+        let slept = sleeping
+            .run(&local_request(&f, &format!("Sleep past the limit {tag}.")))
+            .unwrap();
+        let caught = catching
+            .run(&local_request(&f, &format!("Catch the limit {tag}.")))
+            .unwrap();
+        for (spawn, launched, report) in [
+            (&sleeping, &slept, None),
+            (&catching, &caught, Some("partial\n")),
+        ] {
+            let args = f
+                .directory
+                .path()
+                .join(format!("settle-{}.args", launched.name));
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !args.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{} never settled",
+                    launched.unit
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            let args = std::fs::read_to_string(&args).unwrap();
+            let words: Vec<&str> = args.trim_end_matches('\n').split(' ').collect();
+            let after = |flag: &str| {
+                let at = words.iter().position(|word| *word == flag).unwrap();
+                words[at + 1]
+            };
+            let exit = Exit::from_systemd(after("--code"), after("--status"), after("--result"));
+            assert_eq!(exit.result.as_deref(), Some("timeout"), "{args}");
+            assert!(!exit.clean(), "{args}");
+            spawn
+                .settle(&SettleRequest {
+                    name: launched.name.clone(),
+                    run: launched.run,
+                    request: None,
+                    exit,
+                    report: Some(launched.report.clone()),
+                    usage: None,
+                })
+                .unwrap();
+            let run = &spawn.show(&launched.name).unwrap().runs[0];
+            assert!(!ended_clean(run));
+            assert!(
+                describe_end(run).ends_with("stopped at its runtime limit"),
+                "{}",
+                describe_end(run)
+            );
+            assert_eq!(run.report_text.as_deref(), report);
+            let told = f.told(&launched.name);
+            assert!(told.contains("stopped at its runtime limit"), "{told}");
+            match report {
+                Some(_) => assert!(
+                    told.contains("(partial: the run did not end cleanly)"),
+                    "{told}"
+                ),
+                None => assert!(told.contains("report none"), "{told}"),
+            }
+        }
+    }
+
+    #[test]
+    fn local_executor_templates_are_read_from_the_environment_and_checked() {
+        let home = Path::new("/h");
+        let read = |value: &'static str| {
+            let mut config = LaunchConfig::under_home(home);
+            config
+                .override_from(move |name: &str| {
+                    (name == "SPAWN_LOCAL_EXECUTOR").then(|| value.to_owned())
+                })
+                .map(|()| config.local)
+        };
+        assert_eq!(read("   ").unwrap(), None);
+        assert_eq!(
+            read(" /x/run  --out={report}\t{prompt} ").unwrap(),
+            Some(vec![
+                "/x/run".to_owned(),
+                "--out={report}".to_owned(),
+                "{prompt}".to_owned()
+            ])
+        );
+        for bad in [
+            "/x/run {prompt}",
+            "/x/run {report} {model}",
+            "/x/run {report",
+        ] {
+            assert!(read(bad).is_err(), "{bad}");
+        }
+        assert_eq!(LaunchConfig::under_home(home).local, None);
+        let limit = |value: &'static str| {
+            let mut config = LaunchConfig::under_home(home);
+            config
+                .override_from(move |name: &str| {
+                    (name == "SPAWN_LOCAL_MAX_RUNTIME").then(|| value.to_owned())
+                })
+                .map(|()| config.local_max_runtime)
+        };
+        assert_eq!(limit(" ").unwrap(), None);
+        assert_eq!(limit(" 90 ").unwrap(), Some(90));
+        for bad in ["0", "-5", "1.5", "an hour"] {
+            assert!(limit(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -4717,7 +5242,7 @@ mod tests {
         let mut request = f.request("Local task.");
         request.provider = Provider::Local;
         let error = f.spawn.run(&request).unwrap_err();
-        assert!(format!("{error:#}").contains("not available yet"));
+        assert!(format!("{error:#}").contains("SPAWN_LOCAL_EXECUTOR"));
         assert_eq!(f.launcher.started.lock().unwrap().len(), 2);
         assert!(f
             .persona(&super::super::name_for(super::super::text_handle(
@@ -4844,7 +5369,9 @@ mod tests {
     fn a_policy_provider_never_reaches_an_agent_command_line() {
         let f = fixture();
         let files = RunFiles {
+            name: "n".to_owned(),
             workdir: PathBuf::from("/w"),
+            script: PathBuf::from("/s/n.sh"),
             prompt: PathBuf::from("/s/n.prompt"),
             report: PathBuf::from("/s/n.report"),
             mcp_config: PathBuf::from("/s/n.mcp.json"),

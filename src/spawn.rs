@@ -350,14 +350,32 @@ impl Exit {
 
     /// `exit 0`, `signal KILL`, or the bare result when there is nothing else.
     pub fn describe(&self) -> String {
-        match (&self.code, &self.signal, &self.result) {
+        let end = match (&self.code, &self.signal, &self.result) {
             (Some(code), _, _) => format!("exit {code}"),
             (None, Some(signal), _) => format!("signal {signal}"),
             (None, None, Some(result)) => result.clone(),
             (None, None, None) => "exit unknown".to_owned(),
+        };
+        match self.result.as_deref() {
+            Some(TIMEOUT_RESULT) if end != TIMEOUT_RESULT => format!("{end}, {RUNTIME_LIMIT_NOTE}"),
+            Some(TIMEOUT_RESULT) => RUNTIME_LIMIT_NOTE.to_owned(),
+            _ => end,
         }
     }
+
+    /// Whether the run ended as a success: exit 0, and not stopped by its
+    /// runtime limit (an agent that exits 0 on the limit's SIGTERM did not
+    /// finish).
+    pub fn clean(&self) -> bool {
+        self.code == Some(0) && self.result.as_deref() != Some(TIMEOUT_RESULT)
+    }
 }
+
+/// systemd's `SERVICE_RESULT` when `RuntimeMaxSec` stopped the unit.
+pub const TIMEOUT_RESULT: &str = "timeout";
+
+/// How a run's end says its runtime limit stopped it.
+pub const RUNTIME_LIMIT_NOTE: &str = "stopped at its runtime limit";
 
 /// What a run's agent reported it used, read at settlement.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -907,6 +925,23 @@ mod tests {
         assert_eq!(
             Exit::from_systemd("", "", "oom-kill").describe(),
             "oom-kill"
+        );
+        assert!(Exit::from_systemd("exited", "0", "success").clean());
+        assert!(!Exit::from_systemd("exited", "3", "exit-code").clean());
+        // The runtime limit fired: never a success, even if the agent caught
+        // the SIGTERM and exited 0.
+        let stopped = Exit::from_systemd("killed", "TERM", "timeout");
+        assert!(!stopped.clean());
+        assert_eq!(
+            stopped.describe(),
+            "signal TERM, stopped at its runtime limit"
+        );
+        let caught = Exit::from_systemd("exited", "0", "timeout");
+        assert!(!caught.clean());
+        assert_eq!(caught.describe(), "exit 0, stopped at its runtime limit");
+        assert_eq!(
+            Exit::from_systemd("", "", "timeout").describe(),
+            "stopped at its runtime limit"
         );
     }
 
