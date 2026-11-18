@@ -5633,7 +5633,9 @@ async fn observe_wait(
             let now = clock::now()?;
             let sampled = pile
                 .snapshot()
-                .map_err(|error| anyhow!("refresh Orient wait snapshot: {error}"))?;
+                // Keep the source: a deadline met while acquiring this refresh
+                // is the wait's timeout, and callers find it in the chain.
+                .context("refresh Orient wait snapshot")?;
             let maintenance_changed = maintained_from
                 .as_ref()
                 .is_none_or(|previous| wait_storage_changed(&sampled, previous));

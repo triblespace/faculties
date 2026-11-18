@@ -443,4 +443,25 @@ mod tests {
         first.acknowledge(first_report).unwrap();
         assert!(fixture.presented());
     }
+
+    #[test]
+    fn wait_snapshot_refresh_keeps_its_deadline_visible() {
+        // Under a loaded suite a quiet wait's snapshot refresh met its
+        // acquisition deadline, and formatting that error into a string hid
+        // it from is_deadline: the worker ended with an error instead of a
+        // timeout report (2026-11-17 on sky). This checks the property the
+        // fix in operations.rs relies on: a deadline wrapped with .context()
+        // stays visible to is_deadline. It does not drive operations.rs itself.
+        use triblespace::core::repo::SnapshotSource;
+        let fixture = Fixture::new();
+        fixture.storage.scope(|storage| {
+            let control = AcquiringReadControl::new(Some(Instant::now() + Duration::from_millis(200)));
+            let (mut store, _, _) = crate::storage::BorrowedStore::open(storage.clone(), control, Arc::new(AtomicBool::new(false)))?;
+            std::thread::sleep(Duration::from_millis(250));
+            let error = store.snapshot().context("refresh Orient wait snapshot").err()
+                .expect("a refresh past its deadline fails");
+            assert!(is_deadline(&error), "{error:#}");
+            Ok(())
+        }).unwrap();
+    }
 }
