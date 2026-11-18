@@ -11720,10 +11720,13 @@ mod tests {
                 )
                 .unwrap()
             };
-            let mut facts = version("100000000000000501", "100000000000000601", 30_000_000);
-            facts += version("100000000000000501", "100000000000000602", 31_000_000);
-            facts += version("100000000000000502", "100000000000000603", 30_000_000);
-            facts += version("100000000000000502", "100000000000000604", 30_000_000);
+            // Sizes past the intake limit, so no version is fetched.
+            let large = crate::discord::operations::MAX_ATTACHMENT_BYTES + 1;
+            let larger = large + 1_000_000;
+            let mut facts = version("100000000000000501", "100000000000000601", large);
+            facts += version("100000000000000501", "100000000000000602", larger);
+            facts += version("100000000000000502", "100000000000000603", large);
+            facts += version("100000000000000502", "100000000000000604", large);
             facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
             pile.commit(sources.discord.source, &fixture.signer, facts)
                 .unwrap();
@@ -11748,9 +11751,9 @@ mod tests {
                      too large to store\n"
                 )
             };
-            assert_eq!(text.matches(&version(31_000_000)).count(), 1, "{text}");
+            assert_eq!(text.matches(&version(larger)).count(), 1, "{text}");
             assert_eq!(
-                text.matches(&version(30_000_000)).count(),
+                text.matches(&version(large)).count(),
                 2,
                 "one per message: the second message's two versions print alike\n{text}"
             );

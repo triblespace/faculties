@@ -19,8 +19,14 @@
 //!
 //! An attachment is stored with its bytes, and one Discord declares larger
 //! than [`MAX_ATTACHMENT_BYTES`] by its name and size alone, so a single
-//! large file can never hold a channel's ingestion back. A system notice (a
-//! pin, a member joining) is stored like any message and marked as one.
+//! oversized file can never hold a channel's ingestion back. The limit is
+//! above Discord's own largest upload (500 MB), so in practice every
+//! attachment arrives whole. A download is read into memory in full before
+//! it is staged, so one pull may briefly hold up to the limit (512 MiB) per
+//! attachment; that is acceptable on the hosts we run intake on.
+//!
+//! A system notice (a pin, a member joining) is stored like any message and
+//! marked as one.
 //!
 //! Bot authentication revisions name exact encrypted Secrets versions. Native
 //! operations resolve them with the same store and signing identity as the
@@ -60,10 +66,13 @@ use triblespace::prelude::*;
 
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 /// Attachments Discord declares larger than this are recorded by name and
-/// size, without their bytes.
-pub const MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
-/// How long one attachment download may take.
-const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// size, without their bytes. It sits above Discord's largest upload (500 MB
+/// on the highest Nitro tier), so the name-and-size path is for a declared
+/// size no upload should have; the fetch is still bounded by it.
+pub const MAX_ATTACHMENT_BYTES: u64 = 512 * 1024 * 1024;
+/// How long one attachment download may take, body included: enough for the
+/// limit above at under 1 MB/s.
+const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Forward pages one pull reads at most; a longer gap is closed by the pulls
 /// after it, each going on from the frontier the one before proved.
 const FORWARD_PAGES: usize = 10;
@@ -4909,6 +4918,15 @@ mod tests {
             batch.coverage,
             Some(discord_model::CoverageInterval::new(120, 150, true).unwrap())
         );
+    }
+
+    #[test]
+    fn the_attachment_limit_admits_discords_largest_upload() {
+        // Discord's largest upload is 500 MB; JP's 96,926,748-byte zip was
+        // recorded by name and size under the old 25 MiB limit.
+        assert_eq!(MAX_ATTACHMENT_BYTES, 512 * 1024 * 1024);
+        assert!(MAX_ATTACHMENT_BYTES >= 500_000_000);
+        assert!(MAX_ATTACHMENT_BYTES >= 96_926_748);
     }
 
     #[test]
