@@ -1638,7 +1638,7 @@ impl Spawn {
                 ),
                 Err(error) => return Err(error),
             };
-            let preamble = super::preamble(&name, spawner_label);
+            let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
             let prompt = super::assemble_prompt(
                 &wake,
                 &tail,

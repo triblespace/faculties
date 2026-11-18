@@ -447,16 +447,35 @@ pub fn settlement_fragment(
 }
 
 /// The fixed preamble that tells a zooid who it is.
-pub fn preamble(name: &str, spawner: &str) -> String {
+pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
+    // A local zooid runs in Drive, not a hosted agent: it ends its task with
+    // the `task_finish` tool, whose argument is the report, and its
+    // faculties are Drive's native tools rather than an MCP server.
+    let (report, tools) = if local {
+        (
+            "When the task is done, call `task_finish` once, alone and not beside other tool \
+             calls, with your whole answer as its `report`: that call ends the task, its report \
+             is recorded in the pile and {spawner} is messaged, and nothing else you write is \
+             read as your report. Make it the answer, not a farewell."
+                .replace("{spawner}", spawner),
+            "You have the faculties as native tools served through this Drive instance",
+        )
+    } else {
+        (
+            "Your final reply is your report: it is recorded in the pile and {spawner} is \
+             messaged when you exit, so make it the answer, not a farewell."
+                .replace("{spawner}", spawner),
+            "You have the faculties MCP tools, served for you alone",
+        )
+    };
     format!(
         "You are {name}, a task zooid of this colony, spawned by {spawner} to do the one task in the \
          brief below. Your name is your persona: PERSONA is set to it, and your faculty writes \
-         are attributed to it. Your context ends when the task ends. Your final reply is your \
-         report: it is recorded in the pile and {spawner} is messaged when you exit, so make it \
-         the answer, not a farewell. Do not arm a colony watcher (no `orient wait`): you are \
-         not a window, and news would fire into a context that ends with this task. You have \
-         the faculties MCP tools, served for you alone: their write tools never read PERSONA, \
-         so pass {name} as `from` or `persona` on every write, as the CLI would. Your name is \
+         are attributed to it. Your context ends when the task ends. {report} Do not arm a \
+         colony watcher (no `orient wait`, no `orient_next`): you are not a window, and news \
+         would fire into a context that ends with this task. {tools}. Their write tools never \
+         read PERSONA, so pass {name} wherever a write tool takes `from`, `persona`, `by` or \
+         `reader`. Your name is \
          also an address: {spawner} or another zooid may message you while you work. On a \
          longer task, check between steps with `orient_poll` (persona {name}, peek true), answer \
          with `message_send` from {name}, and `message_ack` what you have handled. The wake \
@@ -962,11 +981,32 @@ mod tests {
 
     #[test]
     fn the_preamble_names_the_zooid_as_an_address_it_polls() {
-        let text = preamble("lusab-babad", "tutor");
+        let text = preamble("lusab-babad", "tutor", false);
         // Writes are attributed by name, and the name is also its inbox.
-        assert!(text.contains("pass lusab-babad as `from` or `persona`"));
+        assert!(text.contains(
+            "pass lusab-babad wherever a write tool takes `from`, `persona`, `by` or `reader`"
+        ));
         assert!(text.contains("`orient_poll` (persona lusab-babad, peek true)"));
         assert!(text.contains("tutor or another zooid may message you"));
+        assert!(text.contains("Your final reply is your report"));
+        assert!(text.contains("faculties MCP tools"));
+        assert!(!text.contains("task_finish"));
+    }
+
+    #[test]
+    fn a_local_zooid_is_told_to_end_with_task_finish() {
+        let text = preamble("lusab-babad", "tutor", true);
+        assert!(text.contains("call `task_finish` once, alone"));
+        assert!(text.contains("tutor is messaged"));
+        assert!(text.contains("native tools served through this Drive instance"));
+        assert!(text.contains("no `orient_next`"));
+        assert!(!text.contains("Your final reply is your report"));
+        assert!(!text.contains("MCP"));
+        // The shared parts stay identical for every provider.
+        assert!(text.contains(
+            "pass lusab-babad wherever a write tool takes `from`, `persona`, `by` or `reader`"
+        ));
+        assert!(text.contains("`orient_poll` (persona lusab-babad, peek true)"));
     }
 
     #[test]
