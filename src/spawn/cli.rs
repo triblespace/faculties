@@ -9,8 +9,8 @@ use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_pass, render_requests, render_show};
 use super::{
-    keep_lock_path, Exit, GoalRequest, KeepConfig, LaunchConfig, Launched, Provider, RequestInput,
-    RunRequest, SettleRequest, Spawn, ZooidRef,
+    inbox_failure, keep_lock_path, Exit, GoalRequest, InboxHook, InboxRequest, KeepConfig,
+    LaunchConfig, Launched, Provider, RequestInput, RunRequest, SettleRequest, Spawn, ZooidRef,
 };
 
 #[derive(Parser)]
@@ -187,6 +187,80 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         usage: Option<PathBuf>,
     },
+    /// A claude zooid's inbox hook, run by its unit script as `inbox stop` or
+    /// `inbox post`: reads the hook's JSON on stdin and prints the answer.
+    /// Stop blocks the end once while messages are unread; post shows new
+    /// unread messages at most once a minute. Neither acknowledges anything.
+    Inbox {
+        name: String,
+        /// The run whose hook this is (hex id), as `spawn run` wrote it into
+        /// the script. Post's throttle and shown set are per run.
+        #[arg(long, value_name = "ID")]
+        run: String,
+        /// `stop` or `post`.
+        #[arg(long)]
+        hook: String,
+    },
+}
+
+/// Answer an inbox hook. Whatever fails, it exits 0 with the answer the
+/// hook needs: a stop that cannot read the inbox blocks once and says why,
+/// a post logs the failure to stderr (the run's log) and prints nothing.
+fn run_inbox(
+    workspace: &crate::cli_workspace::WorkspaceArgs,
+    pile: PathBuf,
+    key: Option<PathBuf>,
+    name: String,
+    run: String,
+    hook: String,
+) -> Result<()> {
+    let hook = InboxHook::parse(&hook)?;
+    let mut input = String::new();
+    let stop_hook_active = match std::io::stdin().read_to_string(&mut input) {
+        Ok(_) => match serde_json::from_str::<serde_json::Value>(&input) {
+            Ok(value) => value["stop_hook_active"].as_bool().unwrap_or(false),
+            Err(error) => {
+                // Whether this stop follows our own block is unknown, so it
+                // is never blocked on: a block here could repeat until the
+                // agent's own cap.
+                eprintln!("spawn inbox: the hook input is not JSON ({error}); allowing");
+                return Ok(());
+            }
+        },
+        Err(error) => {
+            eprintln!("spawn inbox: reading the hook input failed ({error}); allowing");
+            return Ok(());
+        }
+    };
+    let answer = (|| -> Result<_> {
+        let run = Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("the clock is before 1970")?
+            .as_secs();
+        let request = InboxRequest {
+            name,
+            run,
+            hook,
+            stop_hook_active,
+            now,
+        };
+        if hook == InboxHook::Stop && stop_hook_active {
+            return Ok(super::InboxAnswer::default());
+        }
+        let storage = workspace.storage(pile, key)?;
+        storage.scope_to_exit(|storage| {
+            Ok(Spawn::new(storage.clone(), LaunchConfig::from_home_env()?).inbox(&request))
+        })
+    })()
+    .unwrap_or_else(|error| inbox_failure(hook, &error));
+    if let Some(warning) = &answer.warning {
+        eprintln!("{warning}");
+    }
+    if let Some(output) = &answer.output {
+        println!("{output}");
+    }
+    Ok(())
 }
 
 fn spawner_or_persona(spawner: Option<String>) -> Result<String> {
@@ -259,6 +333,9 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     };
+    if let Command::Inbox { name, run, hook } = command {
+        return run_inbox(&cli.workspace, cli.pile, cli.key, name, run, hook);
+    }
     let storage = cli.workspace.storage(cli.pile, cli.key)?;
     if let Command::Keep {
         once: false,
@@ -399,7 +476,7 @@ pub fn run() -> Result<()> {
                 let view = spawn.show(&name)?;
                 crate::cli::with_output("spawn", |out| out.text(render_show(&view, brief)))
             }
-            Command::Wait { .. } => unreachable!("handled above"),
+            Command::Wait { .. } | Command::Inbox { .. } => unreachable!("handled above"),
             Command::Settle {
                 name,
                 run,

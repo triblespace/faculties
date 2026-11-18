@@ -16,10 +16,10 @@ pub mod mcp;
 pub mod operations;
 
 pub use operations::{
-    choose_provider, keep_lock_path, GoalRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig,
-    Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested,
-    RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
-    ZooidRef,
+    choose_provider, inbox_failure, keep_lock_path, GoalRequest, InboxAnswer, InboxHook,
+    InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,
+    LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested, RunRequest, RunView,
+    SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidRef,
 };
 
 use anyhow::{bail, Result};
@@ -697,7 +697,9 @@ pub struct ScriptFacts<'a> {
 
 /// The unit's script. Run without arguments it is the zooid: the agent on
 /// the prompt, writing the report. Run as `settle` it is the stop-post step,
-/// which systemd runs however the main process ended. Run as `mcp` it is the
+/// which systemd runs however the main process ended. Run as `inbox stop` or
+/// `inbox post` it is the agent's Stop or PostToolUse hook, showing the zooid
+/// the messages it has not read (`spawn inbox`). Run as `mcp` it is the
 /// zooid's faculties MCP server: the agent starts it as a child, so it runs
 /// inside the unit and ends with it, and the environment it gets is the one
 /// exported here for the CLI, not a second copy that could drift.
@@ -753,6 +755,16 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
             .unwrap_or_default()
     ));
     script.push_str("fi\n");
+    // Run as `inbox stop|post` it is the agent's hook: the agent passes the
+    // hook's JSON on stdin, which exec keeps. Its stdout is the hook's answer,
+    // so only stderr goes to the log.
+    script.push_str(&format!(
+        "if [ \"${{1:-}}\" = inbox ]; then exec {} inbox {} --run {:x} --hook \"${{2:-}}\" 2>> {}; fi\n",
+        q(facts.spawn),
+        q(facts.name),
+        facts.run,
+        q(facts.log)
+    ));
     script.push_str(&format!(
         "if [ \"${{1:-}}\" = mcp ]; then exec {} mcp 2>> {}; fi\n",
         q(facts.faculties),
@@ -1108,6 +1120,86 @@ mod tests {
             .find("if [ \"${1:-}\" = mcp ]; then exec /b/faculties mcp 2>> /s/n.log; fi\n")
             .unwrap();
         assert!(settle < mcp && mcp < script.find("exec /c/claude").unwrap());
+        // Run as `inbox stop|post` it is the agent's hook, answered by
+        // `spawn inbox` for this run, its stderr in the log.
+        let inbox = script
+            .find(&format!(
+                "if [ \"${{1:-}}\" = inbox ]; then exec spawn inbox lusab-babad --run {run:x} \
+                 --hook \"${{2:-}}\" 2>> /s/n.log; fi\n"
+            ))
+            .unwrap_or_else(|| panic!("{script}"));
+        assert!(pinned < inbox && inbox < script.find("exec /c/claude").unwrap());
+    }
+
+    /// The `inbox` dispatch, run: the hook's stdin reaches `spawn inbox`, its
+    /// stdout is the hook's answer, its stderr goes to the log, and neither
+    /// the agent nor settlement runs.
+    #[test]
+    fn the_script_run_as_inbox_hands_the_hook_input_to_spawn_inbox() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        let fake = |name: &str, body: &str| {
+            let file = dir.path().join(name);
+            std::fs::write(&file, format!("#!/bin/bash\n{body}\n")).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+            file.display().to_string()
+        };
+        let spawn = fake(
+            "spawn",
+            "echo \"args: $*\"; echo \"persona: $PERSONA\"; echo \"stdin: $(cat)\"; echo oops >&2",
+        );
+        let agent = fake("agent", "echo agent ran");
+        let run = Id::new([7; 16]).unwrap();
+        let log = path("n.log");
+        let script_text = unit_script(&ScriptFacts {
+            name: "lusab-babad",
+            run,
+            request: None,
+            pile: "/p/self.pile",
+            key: "/p/self.key",
+            path: "/usr/bin:/bin",
+            colony_env: None,
+            routes: &[],
+            agent: &[agent],
+            agent_env: &[],
+            agent_secrets: &[],
+            secrets: "secrets",
+            usage: None,
+            stdout_is_report: true,
+            prompt: "/dev/null",
+            report: &path("n.report"),
+            log: &log,
+            spawn: &spawn,
+            faculties: "/b/faculties",
+        });
+        let script = dir.path().join("n.sh");
+        std::fs::write(&script, script_text).unwrap();
+        let mut child = std::process::Command::new("/bin/bash")
+            .arg(&script)
+            .args(["inbox", "post"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"hook_event_name":"PostToolUse"}"#)
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!(
+                "args: inbox lusab-babad --run {run:x} --hook post\npersona: lusab-babad\n\
+                 stdin: {{\"hook_event_name\":\"PostToolUse\"}}\n"
+            )
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "oops\n");
+        assert!(!dir.path().join("n.report").exists());
     }
 
     #[test]

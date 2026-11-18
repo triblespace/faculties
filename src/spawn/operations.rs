@@ -390,6 +390,33 @@ pub fn claude_mcp_config(script: &Path) -> String {
     format!("{config}\n")
 }
 
+/// How long the hook gives `spawn inbox` before the agent stops waiting:
+/// one cold pile read takes seconds, and a post hook may first wait for
+/// another's turn on the run's inbox state.
+pub const INBOX_STOP_TIMEOUT_SECS: u64 = 120;
+pub const INBOX_POST_TIMEOUT_SECS: u64 = 60;
+
+/// The hooks every claude zooid gets, as a `--settings` file: its unit
+/// script run as `inbox stop` on Stop and `inbox post` after every tool call
+/// (no matcher, so every tool). Both run inside the unit, in the CLI's
+/// environment, and read the zooid's unread messages with `spawn inbox`.
+pub fn claude_hook_settings(script: &Path) -> String {
+    let hook = |kind: &str, timeout: u64| {
+        serde_json::json!([{ "hooks": [{
+            "type": "command",
+            "command": format!("/bin/bash {} inbox {kind}", super::shell_word(&script.display().to_string())),
+            "timeout": timeout,
+        }]}])
+    };
+    let config = serde_json::json!({
+        "hooks": {
+            "Stop": hook("stop", INBOX_STOP_TIMEOUT_SECS),
+            "PostToolUse": hook("post", INBOX_POST_TIMEOUT_SECS),
+        }
+    });
+    format!("{config}\n")
+}
+
 /// The same server as codex `config.toml`, the whole of it: no model, hook
 /// trust or other server. `script` is unit-safe (no quotes or backslashes),
 /// so a basic TOML string holds it verbatim. codex's defaults would cut a
@@ -682,6 +709,7 @@ struct RunFiles {
     prompt: PathBuf,
     report: PathBuf,
     mcp_config: PathBuf,
+    settings: PathBuf,
     codex_home: PathBuf,
     vibe_home: PathBuf,
     vibe_out: PathBuf,
@@ -970,6 +998,177 @@ pub struct KeepPass {
     pub steps: Vec<(Id, KeepStep)>,
 }
 
+/// The least time between two inbox reads by one run's post hook.
+pub const INBOX_POST_INTERVAL_SECS: u64 = 60;
+
+/// The longest message body an inbox hook shows; a longer one is cut, and
+/// says where the whole of it is.
+pub const INBOX_BODY_CHARS: usize = 4000;
+
+/// Which claude hook `spawn inbox` answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboxHook {
+    /// Stop: the zooid is about to end its run.
+    Stop,
+    /// PostToolUse: a tool call just finished.
+    Post,
+}
+
+impl InboxHook {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text {
+            "stop" => Ok(Self::Stop),
+            "post" => Ok(Self::Post),
+            other => bail!("hook {other:?} is not stop or post"),
+        }
+    }
+}
+
+/// One hook call: whose inbox, which run, which hook, and what the agent
+/// said about it.
+#[derive(Clone, Debug)]
+pub struct InboxRequest {
+    pub name: String,
+    pub run: Id,
+    pub hook: InboxHook,
+    /// The Stop input's `stop_hook_active`: this stop follows a Stop block.
+    pub stop_hook_active: bool,
+    /// Seconds since the Unix epoch.
+    pub now: u64,
+}
+
+/// What a hook prints and logs. No output means "carry on": the agent
+/// treats an empty stdout with exit 0 as no decision.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InboxAnswer {
+    /// The hook's JSON, printed on stdout.
+    pub output: Option<serde_json::Value>,
+    /// Written to stderr, which the unit script appends to the run's log.
+    pub warning: Option<String>,
+}
+
+/// The answer when the inbox could not be read. A stop says so and blocks
+/// the end once, since the zooid may be ending without a message meant to
+/// change its task; a post logs it and lets the tool result through.
+pub fn inbox_failure(hook: InboxHook, error: &anyhow::Error) -> InboxAnswer {
+    let warning = Some(format!(
+        "spawn inbox: the inbox could not be read: {error:#}"
+    ));
+    match hook {
+        InboxHook::Stop => InboxAnswer {
+            output: Some(serde_json::json!({
+                "decision": "block",
+                "reason": format!(
+                    "Your inbox could not be read before you finish: {error:#}. Messages sent \
+                     to you while you worked may be unread. Check with `orient_poll` (peek true) \
+                     if you can, and say in your report that the inbox could not be read. This \
+                     hook stops you only once: your next reply ends the run and becomes your \
+                     report, so give the whole report again."
+                ),
+            })),
+            warning,
+        },
+        InboxHook::Post => InboxAnswer {
+            output: None,
+            warning,
+        },
+    }
+}
+
+/// A run's post-hook state: the run it belongs to, when its inbox was last
+/// read, and the messages already shown.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct InboxState {
+    run: Option<Id>,
+    checked_at: Option<u64>,
+    shown: Vec<Id>,
+}
+
+impl InboxState {
+    fn parse(text: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let id = |text: &str| Id::from_hex(text).ok_or_else(|| anyhow!("invalid id {text:?}"));
+        Ok(Self {
+            run: value["run"].as_str().map(id).transpose()?,
+            checked_at: value["checked_at"].as_u64(),
+            shown: value["shown"]
+                .as_array()
+                .map(|ids| {
+                    ids.iter()
+                        .map(|text| {
+                            text.as_str()
+                                .ok_or_else(|| anyhow!("shown id is not a string"))
+                                .and_then(id)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
+        })
+    }
+
+    fn render(&self) -> String {
+        let value = serde_json::json!({
+            "run": self.run.map(|run| format!("{run:x}")),
+            "checked_at": self.checked_at,
+            "shown": self.shown.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>(),
+        });
+        format!("{value}\n")
+    }
+}
+
+/// Each message as the hooks show it: id, sender and body.
+fn inbox_listing(messages: &[crate::message::MessageObservation]) -> String {
+    let mut text = String::new();
+    for entry in messages {
+        let body = match &entry.body {
+            crate::message::MessageText::Text(body) => {
+                let mut chars = body.chars();
+                let cut: String = chars.by_ref().take(INBOX_BODY_CHARS).collect();
+                if chars.next().is_some() {
+                    format!("{cut}\n[cut at {INBOX_BODY_CHARS} characters; `orient_poll` shows the whole message]")
+                } else {
+                    cut
+                }
+            }
+            crate::message::MessageText::Unavailable(handle) => format!(
+                "[its text {} is not here yet; `orient_poll` may show it later]",
+                super::handle_text(*handle)
+            ),
+            crate::message::MessageText::Undecodable(handle) => {
+                format!("[its text {} is not UTF-8]", super::handle_text(*handle))
+            }
+        };
+        let _ = write!(
+            text,
+            "\n- message {:x} from {}:\n{}\n",
+            entry.id, entry.from_label, body
+        );
+    }
+    text
+}
+
+fn stop_reason(name: &str, unread: &[crate::message::MessageObservation]) -> String {
+    format!(
+        "Before you finish: {} message(s) sent to you ({name}) are unread. They may change your \
+         task or its boundaries.\n{}\nHandle each: answer with `message_send` from {name} if it \
+         asks something, and `message_ack` it once handled. This hook stops you only once: your \
+         next reply ends the run and becomes your report, so give the whole report again, \
+         including what these messages changed.",
+        unread.len(),
+        inbox_listing(unread)
+    )
+}
+
+fn post_context(name: &str, new: &[crate::message::MessageObservation]) -> String {
+    format!(
+        "New message(s) for {name} arrived while you work. They are shown once and are not \
+         acknowledged; handle them before your next step if they bear on it, and `message_ack` \
+         each once handled.\n{}",
+        inbox_listing(new)
+    )
+}
+
 /// Configured Spawn operations.
 #[derive(Clone)]
 pub struct Spawn {
@@ -1156,6 +1355,8 @@ impl Spawn {
                     "--strict-mcp-config".to_owned(),
                     "--mcp-config".to_owned(),
                     text(&files.mcp_config),
+                    "--settings".to_owned(),
+                    text(&files.settings),
                     "--output-format".to_owned(),
                     "text".to_owned(),
                 ],
@@ -1214,6 +1415,8 @@ impl Spawn {
         }
         let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path)] = files;
         let mcp_config = launch.file(&name, "mcp.json");
+        let settings = launch.file(&name, "settings.json");
+        super::require_unit_safe("settings", &settings.display().to_string())?;
         let codex_home = launch.file(&name, "codex");
         super::require_unit_safe("codex home", &codex_home.display().to_string())?;
         let vibe_home = launch.file(&name, "vibe");
@@ -1353,6 +1556,7 @@ impl Spawn {
                     prompt: prompt_path.clone(),
                     report: report_path.clone(),
                     mcp_config: mcp_config.clone(),
+                    settings: settings.clone(),
                     codex_home: codex_home.clone(),
                     vibe_home: vibe_home.clone(),
                     vibe_out: vibe_out.clone(),
@@ -1403,8 +1607,12 @@ impl Spawn {
                         }
                     }
                 }
-                Provider::Claude => std::fs::write(&mcp_config, claude_mcp_config(&script_path))
-                    .with_context(|| format!("write {}", mcp_config.display()))?,
+                Provider::Claude => {
+                    std::fs::write(&mcp_config, claude_mcp_config(&script_path))
+                        .with_context(|| format!("write {}", mcp_config.display()))?;
+                    std::fs::write(&settings, claude_hook_settings(&script_path))
+                        .with_context(|| format!("write {}", settings.display()))?;
+                }
                 Provider::Auto | Provider::Local => {
                     bail!("{} reached the launch unresolved", provider.name())
                 }
@@ -2127,15 +2335,10 @@ impl Spawn {
     /// makes a poll that never happened visible. An inbox that cannot be
     /// read is said to be unread, not reported as empty.
     fn unread_note(&self, name: &str) -> String {
-        let mut options = crate::message::ListOptions::new(name);
-        options.unread = true;
-        options.limit = 50;
-        match crate::message::Message::with_storage(self.storage.clone()).list(&options) {
-            Ok(list) => {
-                let unread: Vec<String> = list
-                    .entries
+        match self.unread(name) {
+            Ok(unread) => {
+                let unread: Vec<String> = unread
                     .iter()
-                    .filter(|entry| entry.incoming)
                     .map(|entry| format!("{:x} from {}", entry.id, entry.from_label))
                     .collect();
                 if unread.is_empty() {
@@ -2150,6 +2353,134 @@ impl Spawn {
             }
             Err(error) => format!(" Its inbox could not be read at settle: {error:#}."),
         }
+    }
+
+    /// The incoming messages addressed to `name` that it has not
+    /// acknowledged: the one query settlement and the inbox hooks share.
+    fn unread(&self, name: &str) -> Result<Vec<crate::message::MessageObservation>> {
+        let mut options = crate::message::ListOptions::new(name);
+        options.unread = true;
+        options.limit = 50;
+        let list = crate::message::Message::with_storage(self.storage.clone()).list(&options)?;
+        Ok(list
+            .entries
+            .into_iter()
+            .filter(|entry| entry.incoming)
+            .collect())
+    }
+
+    /// Answer one of a running claude zooid's inbox hooks: what its unit
+    /// script prints as `inbox stop` or `inbox post`. Showing a message never
+    /// acknowledges it; the zooid does that itself.
+    ///
+    /// Stop blocks the end once while anything is unread, naming every
+    /// message, and lets the zooid end when it is already continuing from a
+    /// Stop block. Post is throttled per run: it reads the inbox at most once
+    /// per [`INBOX_POST_INTERVAL_SECS`], under an exclusive lock on the run's
+    /// inbox state file so parallel tool calls take turns, and shows only
+    /// messages it has not shown this run. A throttled post opens no pile.
+    pub fn inbox(&self, request: &InboxRequest) -> InboxAnswer {
+        match request.hook {
+            InboxHook::Stop => {
+                if request.stop_hook_active {
+                    return InboxAnswer::default();
+                }
+                match self.unread(&request.name) {
+                    Ok(unread) if unread.is_empty() => InboxAnswer::default(),
+                    Ok(unread) => InboxAnswer {
+                        output: Some(serde_json::json!({
+                            "decision": "block",
+                            "reason": stop_reason(&request.name, &unread),
+                        })),
+                        warning: None,
+                    },
+                    Err(error) => inbox_failure(InboxHook::Stop, &error),
+                }
+            }
+            InboxHook::Post => match self.post(request) {
+                Ok(answer) => answer,
+                Err(error) => inbox_failure(InboxHook::Post, &error),
+            },
+        }
+    }
+
+    fn post(&self, request: &InboxRequest) -> Result<InboxAnswer> {
+        let path = self.launch.file(&request.name, "inbox.json");
+        std::fs::create_dir_all(&self.launch.state_dir)
+            .with_context(|| format!("create {}", self.launch.state_dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open the inbox state {}", path.display()))?;
+        // Never unlinked, so every hook of the run locks the same inode.
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)
+            .with_context(|| format!("read {}", path.display()))?;
+        let mut warning = None;
+        let mut state = if text.trim().is_empty() {
+            InboxState::default()
+        } else {
+            InboxState::parse(&text).unwrap_or_else(|error| {
+                warning = Some(format!(
+                    "{} was unreadable ({error:#}); starting this run's inbox state afresh",
+                    path.display()
+                ));
+                InboxState::default()
+            })
+        };
+        if state.run != Some(request.run) {
+            // An earlier run of the same name: nothing it showed was shown here.
+            state = InboxState {
+                run: Some(request.run),
+                ..Default::default()
+            };
+        }
+        if let Some(checked) = state.checked_at {
+            if checked <= request.now && request.now - checked < INBOX_POST_INTERVAL_SECS {
+                return Ok(InboxAnswer {
+                    output: None,
+                    warning,
+                });
+            }
+        }
+        // Stamped before reading, so a failing read is throttled too and
+        // never costs every tool call a pile open.
+        state.checked_at = Some(request.now);
+        let write = |file: &mut std::fs::File, state: &InboxState| -> Result<()> {
+            use std::io::{Seek as _, Write as _};
+            file.set_len(0)?;
+            file.seek(std::io::SeekFrom::Start(0))?;
+            file.write_all(state.render().as_bytes())?;
+            Ok(())
+        };
+        write(&mut file, &state).with_context(|| format!("write {}", path.display()))?;
+        let unread = self.unread(&request.name)?;
+        let new: Vec<_> = unread
+            .into_iter()
+            .filter(|entry| !state.shown.contains(&entry.id))
+            .collect();
+        if new.is_empty() {
+            return Ok(InboxAnswer {
+                output: None,
+                warning,
+            });
+        }
+        state.shown.extend(new.iter().map(|entry| entry.id));
+        write(&mut file, &state).with_context(|| format!("write {}", path.display()))?;
+        Ok(InboxAnswer {
+            output: Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": post_context(&request.name, &new),
+                }
+            })),
+            warning,
+        })
     }
 
     fn observe<T>(
@@ -4004,6 +4335,268 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_zooid_gets_inbox_hooks_through_its_own_settings_file() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Hooked task.")).unwrap();
+        let script = f.script(0);
+        let unit = f.launcher.started.lock().unwrap()[0].clone();
+        let settings = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.settings.json", launched.name));
+        assert!(
+            script.contains(&format!(
+                "--mcp-config {} --settings {} --output-format text",
+                f.directory
+                    .path()
+                    .join("state")
+                    .join(format!("{}.mcp.json", launched.name))
+                    .display(),
+                settings.display()
+            )),
+            "{script}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let hook = |kind: &str, timeout: u64| {
+            serde_json::json!([{"hooks": [{
+                "type": "command",
+                "command": format!("/bin/bash {} inbox {kind}", unit.script.display()),
+                "timeout": timeout,
+            }]}])
+        };
+        assert_eq!(
+            parsed,
+            serde_json::json!({"hooks": {
+                "Stop": hook("stop", INBOX_STOP_TIMEOUT_SECS),
+                "PostToolUse": hook("post", INBOX_POST_TIMEOUT_SECS),
+            }})
+        );
+        // The script answers them through `spawn inbox`, for this run, in the
+        // CLI's environment and before the agent's own exports.
+        let inbox = script
+            .find(&format!(
+                "if [ \"${{1:-}}\" = inbox ]; then exec spawn inbox {} --run {:x} --hook \"${{2:-}}\" 2>> {}; fi\n",
+                launched.name,
+                launched.run,
+                unit.log.display()
+            ))
+            .unwrap_or_else(|| panic!("{script}"));
+        assert!(script.find(&format!("PERSONA={}", launched.name)).unwrap() < inbox);
+        assert!(inbox < script.find("exec /fake/claude").unwrap());
+    }
+
+    fn hook(
+        f: &Fixture,
+        launched: &Launched,
+        hook: InboxHook,
+        active: bool,
+        now: u64,
+    ) -> InboxAnswer {
+        f.spawn.inbox(&InboxRequest {
+            name: launched.name.clone(),
+            run: launched.run,
+            hook,
+            stop_hook_active: active,
+            now,
+        })
+    }
+
+    fn context(answer: &InboxAnswer) -> String {
+        let output = answer.output.as_ref().expect("an answer");
+        assert_eq!(output["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+        output["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn blocked(answer: &InboxAnswer) -> String {
+        let output = answer.output.as_ref().expect("an answer");
+        assert_eq!(output["decision"], "block");
+        assert_eq!(output.as_object().unwrap().len(), 2, "{output}");
+        output["reason"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn the_inbox_hooks_show_unread_messages_without_acknowledging_them() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Mail while working.")).unwrap();
+        let t = 1_800_000_000;
+        // Nothing unread: both hooks print nothing.
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Stop, false, t),
+            InboxAnswer::default()
+        );
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Post, false, t),
+            InboxAnswer::default()
+        );
+
+        let messages = crate::message::Message::with_storage(f.storage.clone());
+        let send = |text: &str| {
+            messages
+                .send(&crate::message::SendOptions {
+                    from: "agent-cc",
+                    to: &launched.name,
+                    text,
+                })
+                .unwrap()
+                .id
+        };
+        let first = send("Stay source-only: no hardware.");
+        // Within a minute of the last read, post opens nothing and says nothing.
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Post, false, t + 59),
+            InboxAnswer::default()
+        );
+        // A minute on, it shows the new message once.
+        let shown = context(&hook(&f, &launched, InboxHook::Post, false, t + 60));
+        assert!(
+            shown.contains(&format!(
+                "message {first:x} from agent-cc:\nStay source-only: no hardware."
+            )),
+            "{shown}"
+        );
+        assert!(shown.contains("message_ack"), "{shown}");
+        // Already shown: a later read finds nothing new to show.
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Post, false, t + 200),
+            InboxAnswer::default()
+        );
+        // A newer message is shown alone.
+        let second = send("And one more thing.");
+        let shown = context(&hook(&f, &launched, InboxHook::Post, false, t + 300));
+        assert!(
+            shown.contains(&format!("{second:x}")) && !shown.contains(&format!("{first:x}")),
+            "{shown}"
+        );
+
+        // Showing acknowledged nothing: stop blocks once, naming both.
+        let reason = blocked(&hook(&f, &launched, InboxHook::Stop, false, t + 301));
+        for (id, text) in [
+            (first, "Stay source-only: no hardware."),
+            (second, "And one more thing."),
+        ] {
+            assert!(
+                reason.contains(&format!("message {id:x} from agent-cc:\n{text}")),
+                "{reason}"
+            );
+        }
+        assert!(
+            reason.contains("2 message(s)") && reason.contains("give the whole report again"),
+            "{reason}"
+        );
+        // Continuing from that block, the end is allowed.
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Stop, true, t + 302),
+            InboxAnswer::default()
+        );
+
+        // Acknowledged by the zooid, nothing blocks.
+        messages.ack(&format!("{first:x}"), &launched.name).unwrap();
+        messages
+            .ack(&format!("{second:x}"), &launched.name)
+            .unwrap();
+        assert_eq!(
+            hook(&f, &launched, InboxHook::Stop, false, t + 303),
+            InboxAnswer::default()
+        );
+    }
+
+    #[test]
+    fn a_new_run_of_the_same_zooid_starts_its_inbox_state_afresh() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Run twice.")).unwrap();
+        let messages = crate::message::Message::with_storage(f.storage.clone());
+        let id = messages
+            .send(&crate::message::SendOptions {
+                from: "agent-cc",
+                to: &launched.name,
+                text: "Read me.",
+            })
+            .unwrap()
+            .id;
+        let t = 1_800_000_000;
+        assert!(
+            context(&hook(&f, &launched, InboxHook::Post, false, t)).contains(&format!("{id:x}"))
+        );
+        // A later run under the same name is neither throttled by nor
+        // silenced by the earlier run's state.
+        let mut later = launched.clone();
+        later.run = Id::new([0x42; 16]).unwrap();
+        assert!(
+            context(&hook(&f, &later, InboxHook::Post, false, t + 1)).contains(&format!("{id:x}"))
+        );
+        // A clock that went back is not throttled forever.
+        assert_eq!(
+            hook(&f, &later, InboxHook::Post, false, t - 1000),
+            InboxAnswer::default()
+        );
+        // An unreadable state file is logged and replaced.
+        let state = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.inbox.json", launched.name));
+        std::fs::write(&state, "not json").unwrap();
+        let answer = hook(&f, &later, InboxHook::Post, false, t + 2);
+        assert!(context(&answer).contains(&format!("{id:x}")));
+        assert!(answer.warning.unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn an_unreadable_inbox_blocks_a_stop_once_and_is_only_logged_by_a_post() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Broken inbox.")).unwrap();
+        let broken = Spawn::new(
+            Storage::new(f.directory.path().join("no-such.pile"), None),
+            f.spawn.launch.clone(),
+        );
+        let request = |hook, active| InboxRequest {
+            name: launched.name.clone(),
+            run: launched.run,
+            hook,
+            stop_hook_active: active,
+            now: 1_800_000_000,
+        };
+        let stop = broken.inbox(&request(InboxHook::Stop, false));
+        let reason = blocked(&stop);
+        assert!(
+            reason.contains("could not be read") && reason.contains("No such file"),
+            "{reason}"
+        );
+        assert!(stop.warning.is_some());
+        assert_eq!(
+            broken.inbox(&request(InboxHook::Stop, true)),
+            InboxAnswer::default()
+        );
+        let post = broken.inbox(&request(InboxHook::Post, false));
+        assert_eq!(post.output, None);
+        assert!(post.warning.unwrap().contains("could not be read"));
+    }
+
+    #[test]
+    fn a_long_message_is_cut_and_says_where_the_rest_is() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Long mail.")).unwrap();
+        crate::message::Message::with_storage(f.storage.clone())
+            .send(&crate::message::SendOptions {
+                from: "agent-cc",
+                to: &launched.name,
+                text: &"x".repeat(INBOX_BODY_CHARS + 10),
+            })
+            .unwrap();
+        let reason = blocked(&hook(&f, &launched, InboxHook::Stop, false, 1));
+        assert!(reason.contains(&format!(
+            "{}\n[cut at {INBOX_BODY_CHARS} characters",
+            "x".repeat(INBOX_BODY_CHARS)
+        )));
+        assert!(!reason.contains(&"x".repeat(INBOX_BODY_CHARS + 1)));
+    }
+
+    #[test]
     fn a_launch_without_a_faculties_binary_starts_nothing() {
         let f = fixture();
         let spawn = f.relaunch(|launch| launch.faculties = PathBuf::from("no-such-faculties"));
@@ -4038,6 +4631,14 @@ mod tests {
             "{script}"
         );
         assert!(!script.contains(&format!("> {}", launched.report.display())));
+        // The inbox hooks are claude's; codex gets neither the flag nor a file.
+        assert!(!script.contains("--settings"), "{script}");
+        assert!(!f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.settings.json", launched.name))
+            .exists());
         // Its own CODEX_HOME: the login linked in, nothing ambient copied.
         let home = f
             .directory
@@ -4247,6 +4848,7 @@ mod tests {
             prompt: PathBuf::from("/s/n.prompt"),
             report: PathBuf::from("/s/n.report"),
             mcp_config: PathBuf::from("/s/n.mcp.json"),
+            settings: PathBuf::from("/s/n.settings.json"),
             codex_home: PathBuf::from("/s/n.codex"),
             vibe_home: PathBuf::from("/s/n.vibe"),
             vibe_out: PathBuf::from("/s/n.vibe-out"),
