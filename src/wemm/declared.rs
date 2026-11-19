@@ -408,7 +408,7 @@ fn key(identity: &WemmIdentity) -> ([u8; 32], Id, Id) {
 }
 
 fn resolution(what: &str, error: impl std::fmt::Display) -> CollectionRealizationError {
-    CollectionRealizationError::Resolution(format!("{what}: {error:#}"))
+    CollectionRealizationError::resolution(format!("{what}: {error:#}"))
 }
 
 /// One index this pass found of a listed model: its handle, its source, and

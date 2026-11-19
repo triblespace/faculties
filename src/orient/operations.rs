@@ -7794,6 +7794,135 @@ mod tests {
         pile.close().unwrap();
     }
 
+    /// The error a nested selection returns when its control interrupts the
+    /// fetch of an attached descriptor: produced by the real acquiring reader,
+    /// not assembled from its parts.
+    fn interrupted_descriptor_fetch(
+        interruption: triblespace::core::repo::async_store::AcquiringReadInterrupted,
+    ) -> anyhow::Error {
+        use triblespace::core::repo::async_store::{
+            AcquiringReadControl, AcquiringReadInterrupted,
+        };
+        let fixture = TestPile::new();
+        let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+        let receipts = ReceiptSource::register(&mut pile, &fixture.signer).unwrap();
+        let control = match interruption {
+            AcquiringReadInterrupted::Cancelled => {
+                let control = AcquiringReadControl::new(None);
+                control.cancel();
+                control
+            }
+            AcquiringReadInterrupted::DeadlineExceeded => {
+                AcquiringReadControl::new(Some(Instant::now()))
+            }
+        };
+        let reader = crate::storage::AcquiringReader::new(
+            pile.snapshot().unwrap(),
+            std::sync::Arc::new(crate::storage::runtime().unwrap()),
+        )
+        .with_control(control);
+        let error = reader
+            .attached_acquiring(receipts.rank9)
+            .err()
+            .expect("an interrupted descriptor fetch fails the selection");
+        drop(reader);
+        pile.close().unwrap();
+        // The selection task propagates this with `?`, adding no context.
+        anyhow::Error::from(error)
+    }
+
+    #[test]
+    fn nested_descriptor_cancellation_is_recognised_by_type() {
+        use triblespace::core::repo::async_store::AcquiringReadInterrupted;
+        let nested = || interrupted_descriptor_fetch(AcquiringReadInterrupted::Cancelled);
+        let error = nested();
+        assert!(
+            format!("{error:#}").starts_with("resolve collection: load collection descriptor "),
+            "{error:#}"
+        );
+        assert!(next::is_cancelled(&error));
+        // The selection we cancelled ending in its own cancellation settles it.
+        assert!(finish_wait_selection(Ok(()), Err(nested())).is_ok());
+        let error = finish_wait_selection::<()>(
+            Err(AcquiringReadInterrupted::Cancelled.into()),
+            Err(nested()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            next::completion(Err(error), false).unwrap(),
+            next::NextCompletion::CancelledBeforeReport,
+        );
+    }
+
+    #[test]
+    fn nested_descriptor_deadline_stays_a_failure() {
+        use triblespace::core::repo::async_store::AcquiringReadInterrupted;
+        let nested = || interrupted_descriptor_fetch(AcquiringReadInterrupted::DeadlineExceeded);
+        assert!(!next::is_cancelled(&nested()));
+        for result in [Ok(()), Err(AcquiringReadInterrupted::Cancelled.into())] {
+            let error = finish_wait_selection::<()>(result, Err(nested())).unwrap_err();
+            assert!(!next::is_cancelled(&error), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("deadline exceeded"),
+                "{error:#}"
+            );
+            assert!(
+                !matches!(
+                    next::completion(Err(error), false),
+                    Ok(next::NextCompletion::CancelledBeforeReport)
+                ),
+                "a nested deadline must not become CancelledBeforeReport"
+            );
+        }
+        // The typed cause now reaches the chain, so alone it is the timeout.
+        assert!(next::is_deadline(
+            &finish_wait_selection::<()>(Ok(()), Err(nested())).unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn nested_descriptor_cancellation_inside_another_failure_is_refused() {
+        use triblespace::core::repo::async_store::AcquiringReadInterrupted;
+        let nested = || interrupted_descriptor_fetch(AcquiringReadInterrupted::Cancelled);
+        assert!(!next::is_cancelled(
+            &nested().context("closing storage also failed")
+        ));
+        let error = finish_wait_selection::<()>(
+            Err(AcquiringReadInterrupted::Cancelled.into()),
+            Err(nested().context("closing storage also failed")),
+        )
+        .unwrap_err();
+        assert!(!next::is_cancelled(&error), "{error:#}");
+        let text = format!("{error:#}");
+        assert!(text.contains("closing storage also failed"), "{text}");
+        assert!(next::completion(Err(error), false).is_err());
+        // An operation failure beside the expected settlement is still reported.
+        let error = finish_wait_selection::<()>(Err(anyhow!("operation failed")), Err(nested()))
+            .unwrap_err();
+        assert!(!next::is_cancelled(&error));
+        assert!(format!("{error:#}").contains("operation failed"));
+    }
+
+    #[test]
+    fn resolution_without_a_descriptor_fetch_is_not_cancellation() {
+        use triblespace::core::repo::async_store::AcquiringReadInterrupted;
+        let structural = CollectionRealizationError::resolution("conflicting equations");
+        assert!(std::error::Error::source(&structural).is_none());
+        assert!(!next::is_cancelled(&structural.into()));
+        // Only the exact descriptor-fetch chain counts, not any cancellation
+        // somewhere beneath a Resolution.
+        let direct = CollectionRealizationError::resolution_from(
+            "some other step",
+            AcquiringReadInterrupted::Cancelled,
+        );
+        assert!(!next::is_cancelled(&direct.into()));
+        assert!(finish_wait_selection(
+            Ok(()),
+            Err(CollectionRealizationError::resolution("conflicting equations").into()),
+        )
+        .is_err());
+    }
+
     #[test]
     fn receipt_refresh_is_scoped_to_target_progress() {
         test_block_on(async {
@@ -8152,7 +8281,7 @@ mod tests {
         assert_eq!(pending_blob(&missing).unwrap().handle.raw, member.raw);
         for error in [
             CollectionRealizationError::InvalidCover("bad support".to_owned()),
-            CollectionRealizationError::Resolution("conflicting equations".to_owned()),
+            CollectionRealizationError::resolution("conflicting equations"),
             CollectionRealizationError::Stalled { cover: Vec::new() },
             CollectionRealizationError::Unmappable {
                 blocked: vec![(member, "capacity".to_owned())],

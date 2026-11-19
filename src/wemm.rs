@@ -949,7 +949,7 @@ impl Session {
         S: Store + AsyncBlobStoreAcquire + Send,
     {
         if let Err(error) = self.backing.require_still(&self.model) {
-            let error = CollectionRealizationError::Resolution(format!("{error:#}"));
+            let error = CollectionRealizationError::resolution(format!("{error:#}"));
             return Box::pin(async move { Err(error) });
         }
         PROGRESS.with(|progress| progress.set((0, backlog)));
@@ -1024,7 +1024,7 @@ where
         let inner = this.inner.as_mut();
         match with_wemm_runtime(Arc::clone(&this.runtime), || inner.poll(context)) {
             Ok(poll) => poll,
-            Err(error) => std::task::Poll::Ready(Err(CollectionRealizationError::Resolution(
+            Err(error) => std::task::Poll::Ready(Err(CollectionRealizationError::resolution(
                 format!("install the WeMM runtime: {error}"),
             ))),
         }

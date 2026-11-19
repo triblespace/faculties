@@ -5,7 +5,9 @@ use super::*;
 use crate::out::Part;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use triblespace::core::collection::CollectionDescriptorError;
 use triblespace::core::repo::async_store::{AcquiringReadControl, AcquiringReadInterrupted};
+use triblespace::core::repo::ReadFailure;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NextKind { Report, Timeout }
@@ -75,6 +77,10 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
         error = borrow;
     } else if let Some(snapshot) = error.downcast_ref::<WaitSnapshotError>() {
         error = snapshot.0.as_ref();
+    } else if let Some(resolution) = error.downcast_ref::<CollectionRealizationError>() {
+        return descriptor_fetch_interruption(resolution).is_some_and(|interrupted| matches!(
+            interrupted.downcast_ref::<AcquiringReadInterrupted>(),
+            Some(AcquiringReadInterrupted::Cancelled)));
     }
     if let Some(borrow) = error.downcast_ref::<BorrowError>() {
         let Some(cause) = std::error::Error::source(borrow) else { return false; };
@@ -82,6 +88,20 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
     }
     matches!(error.downcast_ref::<AcquiringReadInterrupted>(),
         Some(AcquiringReadInterrupted::Cancelled))
+}
+
+/// The nested selection's own descriptor fetch, interrupted by its control:
+/// exactly Resolution over the descriptor's Get over the acquiring reader's
+/// ReadFailure. Returns what that ReadFailure wraps; a source-free
+/// (structural) Resolution and every other cause return None.
+fn descriptor_fetch_interruption(
+    error: &CollectionRealizationError,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    let CollectionRealizationError::Resolution { .. } = error else { return None; };
+    let fetch = std::error::Error::source(error)?
+        .downcast_ref::<CollectionDescriptorError<ReadFailure>>()?;
+    let CollectionDescriptorError::Get { source, .. } = fetch else { return None; };
+    std::error::Error::source(source)
 }
 
 pub(super) fn completion(result: Result<()>, offered: bool) -> Result<NextCompletion> {
