@@ -258,14 +258,15 @@ pub struct LaunchConfig {
 }
 
 /// The placeholders a local executor template may name, each replaced inside
-/// a word: the prompt file (also the executor's stdin), the report file it
-/// must write, the zooid's name, the effort, the unit script, which run
-/// as `{script} mcp` is the zooid's own faculties MCP server, and the unit's
+/// a word: the prompt file (also the executor's stdin), the message file it
+/// may write the zooid's closing words to, the zooid's name, the effort, the
+/// unit script, which run as `{script} mcp` is the zooid's own faculties MCP
+/// server, and the unit's
 /// runtime limit in seconds (`SPAWN_LOCAL_MAX_RUNTIME`), which a template
 /// may name only when the limit is set.
 pub const LOCAL_PLACEHOLDERS: [&str; 6] = [
     "{prompt}",
-    "{report}",
+    "{message}",
     "{name}",
     "{effort}",
     "{script}",
@@ -279,13 +280,15 @@ const RUNTIME_UNSET: &str = "SPAWN_LOCAL_EXECUTOR names {runtime}, but SPAWN_LOC
 /// What to do when a host has no local executor.
 const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
      SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
-     {report}, {name}, {effort}, {script} and {runtime} replaced at launch; the executor reads the prompt \
-     on stdin and writes its report to {report}. Nothing falls back to a hosted model";
+     {message}, {name}, {effort}, {script} and {runtime} replaced at launch; the executor reads the \
+     prompt on stdin and may write the zooid's closing message to {message}. Nothing falls back \
+     to a hosted model";
 
 /// A local executor template from `SPAWN_LOCAL_EXECUTOR`: whitespace
 /// separates words, and there is no quoting (a wrapper script holds anything
-/// more). Every `{...}` must be one of [`LOCAL_PLACEHOLDERS`], and the report
-/// must be named, since a local run's report is only ever read from its file.
+/// more). Every `{...}` must be one of [`LOCAL_PLACEHOLDERS`]. None is
+/// required: a closing message is optional, so a template that names no
+/// `{message}` only means its runs never leave one.
 fn parse_local_executor(template: &str) -> Result<Vec<String>> {
     let words: Vec<String> = template.split_whitespace().map(str::to_owned).collect();
     if words.is_empty() {
@@ -306,9 +309,6 @@ fn parse_local_executor(template: &str) -> Result<Vec<String>> {
             }
             rest = &rest[open + close + 1..];
         }
-    }
-    if !words.iter().any(|word| word.contains("{report}")) {
-        bail!("SPAWN_LOCAL_EXECUTOR never names {{report}}, so a local run could not report");
     }
     Ok(words)
 }
@@ -837,7 +837,9 @@ pub struct SettleRequest {
     /// run record still finds that the request ran.
     pub request: Option<Id>,
     pub exit: Exit,
-    /// Claude's stdout. A missing or empty file records no report.
+    /// The run's report file: a hosted run's final reply, or a local run's
+    /// closing message. A missing or empty file records none; other bytes
+    /// are recorded as they are.
     pub report: Option<PathBuf>,
     /// vibe's `export.json`, for a mistral run: its usage and cost are
     /// recorded with the end. A file that is missing or unreadable is a
@@ -1489,7 +1491,10 @@ impl Spawn {
                 };
                 let values = [
                     ("{prompt}", text(&files.prompt)),
-                    ("{report}", text(&files.report)),
+                    // The run's report file: settlement reads a local
+                    // run's closing message from the same file it reads a
+                    // hosted run's report from.
+                    ("{message}", text(&files.report)),
                     ("{name}", files.name.clone()),
                     ("{effort}", effort.to_owned()),
                     ("{script}", text(&files.script)),
@@ -1503,8 +1508,8 @@ impl Spawn {
                             .fold(word.clone(), |word, (key, value)| word.replace(key, value))
                     })
                     .collect();
-                // The executor writes the report file; its stdout goes to the
-                // unit's log. A missing report is settled as no report.
+                // The executor may write the message file; its stdout goes to
+                // the unit's log. No file, or an empty one, is no message.
                 AgentLine {
                     argv,
                     env: Vec::new(),
@@ -1869,9 +1874,8 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, linked, local, recorded_missing) =
-            self.observe(|facts, _| {
-                Ok((
+        let (already_ended, earlier_message, linked, local) = self.observe(|facts, _| {
+            Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
@@ -1891,15 +1895,12 @@ impl Spawn {
                             served @ attrs::provider: Provider::Local.name()
                         }]))
                     }),
-                exists!(pattern!(facts, [{ run @ attrs::result: super::MISSING_REPORT_RESULT }])),
             ))
-            })?;
+        })?;
         let mut failures = Vec::new();
-        // A local executor's contract is to write the report file. Hosted
-        // providers keep their meaning: a missing report there is no report.
-        // An earlier settlement's record counts too: a retry whose read-back
-        // fails must not call a run clean that was recorded as failed.
-        let mut missing_local_report = recorded_missing;
+        // A hosted run's report or a local run's closing message. Either is
+        // optional: no file, or an empty one, records none, and how the run
+        // ended is its exit alone.
         let mut report_handle = None;
         // The run's link to its request, from inside the unit: launch
         // publishes it only after the unit started, and a keeper that
@@ -1954,13 +1955,6 @@ impl Spawn {
             );
             report_handle = handle;
             let mut fragment = fragment;
-            if local && request.exit.clean() && report.is_none() {
-                missing_local_report = true;
-                let result = fragment.put::<triblespace::prelude::blobencodings::UTF8String, _>(
-                    super::MISSING_REPORT_RESULT.to_owned(),
-                );
-                fragment += entity! { ExclusiveId::force_ref(&run) @ attrs::result: result };
-            }
             if let Some(link) = link {
                 fragment += link;
             }
@@ -2041,14 +2035,20 @@ impl Spawn {
                 ended_clean(view),
                 view.report.first().copied().or(report_handle),
             ),
-            Ok(None) => {
-                let (end, clean) = fallback_end(&request.exit, missing_local_report);
-                (request_spawner(), end, clean, report_handle)
-            }
+            Ok(None) => (
+                request_spawner(),
+                request.exit.describe(),
+                request.exit.clean(),
+                report_handle,
+            ),
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
-                let (end, clean) = fallback_end(&request.exit, missing_local_report);
-                (request_spawner(), end, clean, report_handle)
+                (
+                    request_spawner(),
+                    request.exit.describe(),
+                    request.exit.clean(),
+                    report_handle,
+                )
             }
         };
         let mut message = earlier_message;
@@ -2056,18 +2056,9 @@ impl Spawn {
             let sent = match spawner {
                 Some(spawner) => {
                     let text = format!(
-                        "{} finished, {end}, report {}. `spawn show {}` reads it.{}",
+                        "{} finished, {end}, {}. `spawn show {}` reads it.{}",
                         request.name,
-                        match report {
-                            None => "none".to_owned(),
-                            Some(report) if clean => super::handle_text(report),
-                            // Whatever a failed or stopped run left is not
-                            // its finished answer.
-                            Some(report) => format!(
-                                "{} (partial: the run did not end cleanly)",
-                                super::handle_text(report)
-                            ),
-                        },
+                        lifecycle_text(local, report, clean),
                         request.name,
                         self.unread_note(&request.name)
                     );
@@ -3201,39 +3192,38 @@ pub fn describe_end(run: &RunView) -> String {
     {
         return format!("{end}, {}", super::RUNTIME_LIMIT_NOTE);
     }
-    if run
-        .result
-        .iter()
-        .any(|result| result == super::MISSING_REPORT_RESULT)
-    {
-        return format!("{end}, {}", super::MISSING_REPORT_NOTE);
-    }
     end
 }
 
-/// The end and cleanliness a settlement reports when it cannot read its own
-/// record back: the exit it was given, and a missing local report whether
-/// this settlement or an earlier one recorded it.
-fn fallback_end(exit: &Exit, missing_local_report: bool) -> (String, bool) {
-    if missing_local_report {
-        (
-            format!("{}, {}", exit.describe(), super::MISSING_REPORT_NOTE),
-            false,
-        )
+/// What the spawner's lifecycle message says the run left: a hosted run's
+/// report, or a local run's closing message, or that there is none.
+/// Whatever a failed or stopped run left is not its finished word.
+fn lifecycle_text(local: bool, report: Option<TextHandle>, clean: bool) -> String {
+    let (what, none) = if local {
+        ("closing message", "no closing message")
     } else {
-        (exit.describe(), exit.clean())
+        ("report", "report none")
+    };
+    match report {
+        None => none.to_owned(),
+        Some(report) if clean => format!("{what} {}", super::handle_text(report)),
+        Some(report) => format!(
+            "{what} {} (partial: the run did not end cleanly)",
+            super::handle_text(report)
+        ),
     }
 }
 
-/// Whether a recorded run ended as a success: exit 0 alone, not stopped by
-/// its runtime limit, and, for a local run, with the report it must write.
+/// Whether a recorded run ended as a success: exit 0 alone, and not stopped
+/// by its runtime limit. A local run's closing message is optional and plays
+/// no part.
 pub fn ended_clean(run: &RunView) -> bool {
     run.exit_code == [0]
         && run.signal.is_empty()
         && !run
             .result
             .iter()
-            .any(|result| result == super::TIMEOUT_RESULT || result == super::MISSING_REPORT_RESULT)
+            .any(|result| result == super::TIMEOUT_RESULT)
 }
 
 /// One line per spawn: name, runs, how the latest ended, the brief's first line.
@@ -3992,19 +3982,25 @@ mod tests {
         request
     }
 
-    /// A local run launched with a trivial executor, settled directly with
-    /// `exit` and, when `report` is given, that report file's contents.
-    fn settle_local(f: &Fixture, exit: Exit, report: Option<&str>) -> RunView {
+    /// A local run launched with a trivial executor whose template names the
+    /// message file, settled directly with `exit`. `message` is what the
+    /// message file holds at settlement; `None` leaves no file at all.
+    fn settle_local(
+        f: &Fixture,
+        brief: &str,
+        exit: Exit,
+        message: Option<&[u8]>,
+    ) -> (Spawn, Launched, Settled) {
         let executor = local_executor(f, "local-settle", "true");
         let spawn = f.relaunch(|launch| {
             launch.local =
-                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+                Some(parse_local_executor(&format!("{} {{message}}", executor.display())).unwrap())
         });
-        let launched = spawn.run(&local_request(f, "Settle me.")).unwrap();
-        if let Some(text) = report {
-            std::fs::write(&launched.report, text).unwrap();
+        let launched = spawn.run(&local_request(f, brief)).unwrap();
+        if let Some(bytes) = message {
+            std::fs::write(&launched.report, bytes).unwrap();
         }
-        spawn
+        let settled = spawn
             .settle(&SettleRequest {
                 name: launched.name.clone(),
                 run: launched.run,
@@ -4014,83 +4010,172 @@ mod tests {
                 usage: None,
             })
             .unwrap();
-        // The same brief is the same zooid: its newest run is this one.
+        (spawn, launched, settled)
+    }
+
+    /// The newest run of a launched zooid.
+    fn newest_run(spawn: &Spawn, launched: &Launched) -> RunView {
         spawn.show(&launched.name).unwrap().runs.pop().unwrap()
     }
 
     #[test]
-    fn a_local_run_that_exits_0_without_its_report_settles_as_a_failure() {
+    fn a_local_run_that_leaves_no_message_file_ends_by_its_exit_with_no_message() {
         let f = fixture();
-        let run = settle_local(&f, Exit::from_systemd("exited", "0", "success"), None);
+        let exit = Exit::from_systemd("exited", "0", "success");
+        let (spawn, launched, settled) = settle_local(&f, "No message.", exit, None);
+        assert!(!launched.report.exists());
+        assert_eq!(settled.report, None);
+        let run = newest_run(&spawn, &launched);
         assert_eq!(run.exit_code, [0]);
+        assert_eq!(run.result, ["success"], "only systemd's own result");
         assert!(run.report.is_empty());
-        assert!(run
-            .result
-            .iter()
-            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        assert!(run.report_text.is_none());
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+        assert!(ended_clean(&run));
+        assert_eq!(describe_end(&run), "exit 0");
+        let told = f.told(&launched.name);
         assert!(
-            run.result.iter().any(|result| result == "success"),
-            "systemd's own result stays"
+            told.contains("finished, exit 0, no closing message."),
+            "{told}"
         );
+        assert!(!told.contains("report"), "{told}");
+        assert!(f.persona(&launched.name).unwrap().retired);
+    }
+
+    #[test]
+    fn an_empty_message_file_is_no_message_and_no_failure() {
+        let f = fixture();
+        let exit = Exit::from_systemd("exited", "0", "success");
+        let (spawn, launched, settled) = settle_local(&f, "Empty message.", exit, Some(&b""[..]));
+        assert!(launched.report.exists());
+        assert_eq!(settled.report, None);
+        let run = newest_run(&spawn, &launched);
+        assert!(run.report.is_empty());
+        assert_eq!(run.result, ["success"]);
+        assert!(ended_clean(&run));
+        assert_eq!(describe_end(&run), "exit 0");
+        let told = f.told(&launched.name);
+        assert!(told.contains("no closing message"), "{told}");
+    }
+
+    #[test]
+    fn a_closing_message_is_recorded_byte_for_byte_and_shown_to_the_spawner() {
+        let f = fixture();
+        // Leading and trailing whitespace, blank lines and non-ASCII text
+        // all survive: nothing is trimmed or normalized.
+        let words = "  done.\n\nNotes are on the goal. \u{00fc}ber \u{2713}\n\n";
+        let exit = Exit::from_systemd("exited", "0", "success");
+        let (spawn, launched, settled) =
+            settle_local(&f, "With a message.", exit, Some(words.as_bytes()));
+        let run = newest_run(&spawn, &launched);
+        assert_eq!(run.report_text.as_deref(), Some(words));
+        assert_eq!(run.report.len(), 1);
+        assert_eq!(settled.report, Some(run.report[0]));
+        assert_eq!(run.result, ["success"]);
+        assert!(ended_clean(&run));
+        let told = f.told(&launched.name);
+        assert!(
+            told.contains(&format!(
+                "finished, exit 0, closing message {}.",
+                super::super::handle_text(run.report[0])
+            )),
+            "{told}"
+        );
+        assert!(!told.contains("partial"), "{told}");
+    }
+
+    #[test]
+    fn a_local_run_that_exits_badly_fails_by_its_exit_and_keeps_its_partial_words() {
+        let f = fixture();
+        let exit = Exit::from_systemd("exited", "3", "exit-code");
+        let (spawn, launched, _) = settle_local(&f, "Fails.", exit, Some(&b"half\n"[..]));
+        let run = newest_run(&spawn, &launched);
+        assert_eq!(run.exit_code, [3]);
         assert!(!ended_clean(&run));
+        assert_eq!(describe_end(&run), "exit 3");
+        assert_eq!(run.report_text.as_deref(), Some("half\n"));
+        assert_eq!(run.result, ["exit-code"]);
+        let told = f.told(&launched.name);
+        assert!(
+            told.contains("finished, exit 3, closing message blake3:"),
+            "{told}"
+        );
+        assert!(
+            told.contains("(partial: the run did not end cleanly)"),
+            "{told}"
+        );
+    }
+
+    #[test]
+    fn a_local_run_stopped_by_its_runtime_limit_is_still_a_timeout() {
+        let f = fixture();
+        let exit = Exit::from_systemd("exited", "0", super::super::TIMEOUT_RESULT);
+        let (spawn, launched, _) = settle_local(&f, "Timed out.", exit, Some(&b"almost\n"[..]));
+        let run = newest_run(&spawn, &launched);
+        assert_eq!(run.result, [super::super::TIMEOUT_RESULT]);
+        assert!(
+            !ended_clean(&run),
+            "exit 0 on the limit's SIGTERM is no success"
+        );
         assert_eq!(
             describe_end(&run),
-            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
+            format!("exit 0, {}", super::super::RUNTIME_LIMIT_NOTE)
+        );
+        assert_eq!(run.report_text.as_deref(), Some("almost\n"));
+        let told = f.told(&launched.name);
+        assert!(told.contains(super::super::RUNTIME_LIMIT_NOTE), "{told}");
+        assert!(
+            told.contains("(partial: the run did not end cleanly)"),
+            "{told}"
         );
     }
 
     #[test]
-    fn a_local_run_with_its_report_is_clean_and_an_unclean_one_keeps_its_partial_report() {
+    fn settling_a_local_run_again_changes_nothing_it_recorded() {
         let f = fixture();
-        let run = settle_local(
-            &f,
-            Exit::from_systemd("exited", "0", "success"),
-            Some("done\n"),
-        );
-        assert!(ended_clean(&run));
-        assert_eq!(run.report_text.as_deref(), Some("done\n"));
-        assert!(!run
-            .result
-            .iter()
-            .any(|result| result == super::super::MISSING_REPORT_RESULT));
-        let run = settle_local(
-            &f,
-            Exit::from_systemd("exited", "3", "exit-code"),
-            Some("half\n"),
-        );
-        assert!(!ended_clean(&run));
-        assert_eq!(run.report_text.as_deref(), Some("half\n"));
-        assert!(!run
-            .result
-            .iter()
-            .any(|result| result == super::super::MISSING_REPORT_RESULT));
-        assert_eq!(describe_end(&run), "exit 3");
-    }
-
-    #[test]
-    fn the_fallback_end_never_calls_a_missing_local_report_clean() {
         let exit = Exit::from_systemd("exited", "0", "success");
-        assert_eq!(fallback_end(&exit, false), ("exit 0".to_owned(), true));
-        let (end, clean) = fallback_end(&exit, true);
-        assert!(!clean);
-        assert_eq!(
-            end,
-            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
-        );
+        let (spawn, launched, first) = settle_local(&f, "Twice.", exit, Some(&b"done"[..]));
+        assert!(!first.already_ended && !first.already_messaged);
+        let before = newest_run(&spawn, &launched);
+        // The second settlement reads the earlier one back: what the file
+        // says now plays no part, and neither does a different exit.
+        std::fs::write(&launched.report, "something else").unwrap();
+        let again = spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "1", "exit-code"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        assert!(again.already_ended && again.already_messaged);
+        assert_eq!(again.message, first.message);
+        assert_eq!(again.report, first.report);
+        let after = newest_run(&spawn, &launched);
+        assert_eq!(after.finished, before.finished);
+        assert_eq!(after.exit_code, [0]);
+        assert_eq!(after.result, ["success"]);
+        assert_eq!(after.report, before.report);
+        assert_eq!(after.report_text.as_deref(), Some("done"));
+        assert_eq!(after.message, before.message);
+        assert!(ended_clean(&after));
+        assert_eq!(f.inbox().len(), 1);
     }
 
-    /// The keeper stopped before publishing the run record, so settlement can
-    /// neither tell the provider from the run nor read the run back: the
-    /// request says local, the missing report is recorded, the message says
-    /// so, and a repeated settlement recovers the recorded fact.
+    /// The keeper stopped before publishing the run record, so settlement
+    /// cannot read the run back and reports the exit it was given. A clean
+    /// exit with no message is a clean end, and a repeated settlement sends
+    /// nothing more.
     #[test]
-    fn a_local_run_settled_without_its_record_settles_a_missing_report_as_a_failure() {
+    fn a_local_run_settled_without_its_record_ends_by_its_exit_alone() {
         let f = fixture_with(FakeLauncher {
             crash_after_start: true,
             ..Default::default()
         });
         let spawn = f.relaunch(|launch| {
-            launch.local = Some(parse_local_executor("/opt/drive/zooid {report}").unwrap())
+            launch.local = Some(parse_local_executor("/opt/drive/zooid {message}").unwrap())
         });
         let asked = f.ask("Local crash window.", None, Provider::Local);
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4111,27 +4196,29 @@ mod tests {
                 })
                 .unwrap()
         };
-        let first = settle();
-        assert!(!first.already_ended);
-        let recorded = |spawn: &Spawn| {
+        let results = |spawn: &Spawn| {
             spawn
                 .observe(|facts, _| {
-                    Ok(exists!(pattern!(facts, [{
-                        run @ attrs::result: super::super::MISSING_REPORT_RESULT
-                    }])))
+                    Ok(find!(
+                        handle: TextHandle,
+                        pattern!(facts, [{ run @ attrs::result: ?handle }])
+                    )
+                    .count())
                 })
                 .unwrap()
         };
-        assert!(recorded(&spawn));
-        assert!(f.inbox().iter().any(|text| matches!(
-            text,
-            crate::message::MessageText::Text(text)
-                if text.contains(&asked.name)
-                    && text.contains(super::super::MISSING_REPORT_NOTE)
-        )));
+        let first = settle();
+        assert!(!first.already_ended);
+        assert_eq!(first.report, None);
+        assert_eq!(results(&spawn), 1, "only systemd's own result");
+        let opening = format!("{} finished, exit 0, no closing message.", asked.name);
+        let told = |text: &crate::message::MessageText| matches!(text, crate::message::MessageText::Text(text) if text.starts_with(&opening));
+        assert_eq!(f.inbox().iter().filter(|text| told(text)).count(), 1);
         let second = settle();
-        assert!(second.already_ended);
-        assert!(recorded(&spawn));
+        assert!(second.already_ended && second.already_messaged);
+        assert_eq!(second.message, first.message);
+        assert_eq!(results(&spawn), 1);
+        assert_eq!(f.inbox().iter().filter(|text| told(text)).count(), 1);
     }
 
     #[test]
@@ -4155,13 +4242,13 @@ mod tests {
     }
 
     #[test]
-    fn a_local_zooid_runs_the_hosts_executor_and_its_report_file_is_the_report() {
+    fn a_local_zooid_runs_the_hosts_executor_and_its_message_file_is_the_closing_message() {
         let f = fixture();
-        let executor = local_executor(&f, "local-ok", "printf 'local report\\n' > \"$1\"");
+        let executor = local_executor(&f, "local-ok", "printf 'local words\\n' > \"$1\"");
         let spawn = f.relaunch(|launch| {
             launch.local = Some(
                 parse_local_executor(&format!(
-                    "{} {{report}} --name={{name}} --effort {{effort}} --prompt {{prompt}} \
+                    "{} {{message}} --name={{name}} --effort {{effort}} --prompt {{prompt}} \
                      --mcp {{script}}",
                     executor.display()
                 ))
@@ -4178,7 +4265,7 @@ mod tests {
             .contains("SPAWN_LOCAL_EXECUTOR"));
         let script = f.script(0);
         assert!(!script.contains("claude"), "{script}");
-        // The report is the executor's file, never its stdout.
+        // The message is the executor's file, never its stdout.
         assert!(
             !script.contains(&format!("> {}", launched.report.display())),
             "{script}"
@@ -4186,7 +4273,7 @@ mod tests {
 
         let run = run_unit_and_settle(&f, &spawn, &launched);
         assert_eq!(run.exit_code, [0]);
-        assert_eq!(run.report_text.as_deref(), Some("local report\n"));
+        assert_eq!(run.report_text.as_deref(), Some("local words\n"));
         let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
         let sh = launched.report.with_extension("sh");
         let prompt = launched.report.with_extension("prompt");
@@ -4208,7 +4295,10 @@ mod tests {
             std::fs::metadata(&prompt).unwrap().len()
         );
         let told = f.told(&launched.name);
-        assert!(told.contains("finished, exit 0, report blake3:"), "{told}");
+        assert!(
+            told.contains("finished, exit 0, closing message blake3:"),
+            "{told}"
+        );
         assert!(!told.contains("partial"), "{told}");
     }
 
@@ -4218,7 +4308,7 @@ mod tests {
         let executor = local_executor(&f, "local-fail", "echo 'out of memory' > \"$1\"; exit 3");
         let spawn = f.relaunch(|launch| {
             launch.local =
-                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+                Some(parse_local_executor(&format!("{} {{message}}", executor.display())).unwrap())
         });
         let launched = spawn
             .run(&local_request(&f, "Failing local work."))
@@ -4234,25 +4324,28 @@ mod tests {
     }
 
     #[test]
-    fn a_local_executor_that_writes_no_report_settles_with_none() {
+    fn a_local_executor_that_writes_no_message_settles_clean_with_none() {
         let f = fixture();
-        let executor = local_executor(&f, "local-silent", "echo 'stdout is not the report'");
+        let executor = local_executor(&f, "local-silent", "echo 'stdout is not the message'");
         let spawn = f.relaunch(|launch| {
             launch.local =
-                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+                Some(parse_local_executor(&format!("{} {{message}}", executor.display())).unwrap())
         });
         let launched = spawn.run(&local_request(&f, "Silent local work.")).unwrap();
         let run = run_unit_and_settle(&f, &spawn, &launched);
         assert_eq!(run.exit_code, [0]);
         assert!(run.report.is_empty());
         assert!(run.report_text.is_none());
+        assert!(ended_clean(&run));
+        let told = f.told(&launched.name);
+        assert!(told.contains("no closing message"), "{told}");
     }
 
     #[test]
     fn keep_starts_a_local_request_on_a_host_with_an_executor() {
         let f = fixture();
         let spawn = f.relaunch(|launch| {
-            launch.local = Some(parse_local_executor("/opt/drive/zooid {report}").unwrap())
+            launch.local = Some(parse_local_executor("/opt/drive/zooid {message}").unwrap())
         });
         let asked = f.ask("Local by request.", None, Provider::Local);
         let pass = spawn.keep_once(&f.keep_config()).unwrap();
@@ -4280,7 +4373,7 @@ mod tests {
         let spawn = f.relaunch(|launch| {
             launch.local = Some(
                 parse_local_executor(&format!(
-                    "{} {{report}} --runtime {{runtime}} --deadline-of={{runtime}}s",
+                    "{} {{message}} --runtime {{runtime}} --deadline-of={{runtime}}s",
                     executor.display()
                 ))
                 .unwrap(),
@@ -4305,7 +4398,7 @@ mod tests {
     fn a_template_naming_runtime_without_a_limit_starts_nothing() {
         let f = fixture();
         let spawn = f.relaunch(|launch| {
-            launch.local = Some(parse_local_executor("/opt/local {report} {runtime}").unwrap());
+            launch.local = Some(parse_local_executor("/opt/local {message} {runtime}").unwrap());
             launch.local_max_runtime = None;
         });
         let error = spawn
@@ -4330,7 +4423,7 @@ mod tests {
     fn only_a_local_unit_gets_the_runtime_limit() {
         let f = fixture();
         let spawn = f.relaunch(|launch| {
-            launch.local = Some(parse_local_executor("/opt/local {report}").unwrap());
+            launch.local = Some(parse_local_executor("/opt/local {message}").unwrap());
             launch.local_max_runtime = Some(7);
         });
         spawn.run(&f.request("Hosted, unlimited.")).unwrap();
@@ -4353,7 +4446,7 @@ mod tests {
 
     /// The runtime limit through real systemd: a local executor that sleeps
     /// past a two-second limit, and one that catches the SIGTERM, writes a
-    /// partial report and exits 0. Neither settles as a success. Skipped
+    /// partial message and exits 0. Neither settles as a success. Skipped
     /// where no systemd user manager answers.
     #[test]
     fn a_local_unit_stopped_at_its_runtime_limit_settles_as_a_failure() {
@@ -4389,7 +4482,7 @@ mod tests {
         let real = |executor: &Path| {
             let mut launch = f.spawn.launch.clone();
             launch.local =
-                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap());
+                Some(parse_local_executor(&format!("{} {{message}}", executor.display())).unwrap());
             launch.local_max_runtime = Some(2);
             Spawn::new(f.storage.clone(), launch).with_renderer(Arc::new(StubRenderer::default()))
         };
@@ -4454,7 +4547,7 @@ mod tests {
                     told.contains("(partial: the run did not end cleanly)"),
                     "{told}"
                 ),
-                None => assert!(told.contains("report none"), "{told}"),
+                None => assert!(told.contains("no closing message"), "{told}"),
             }
         }
     }
@@ -4472,17 +4565,23 @@ mod tests {
         };
         assert_eq!(read("   ").unwrap(), None);
         assert_eq!(
-            read(" /x/run  --out={report}\t{prompt} ").unwrap(),
+            read(" /x/run  --out={message}\t{prompt} ").unwrap(),
             Some(vec![
                 "/x/run".to_owned(),
-                "--out={report}".to_owned(),
+                "--out={message}".to_owned(),
                 "{prompt}".to_owned()
             ])
         );
+        // A closing message is optional, so naming no message file is fine.
+        assert_eq!(
+            read("/x/run {prompt}").unwrap(),
+            Some(vec!["/x/run".to_owned(), "{prompt}".to_owned()])
+        );
         for bad in [
-            "/x/run {prompt}",
-            "/x/run {report} {model}",
-            "/x/run {report",
+            // The old report file is no placeholder any more.
+            "/x/run {report}",
+            "/x/run {message} {model}",
+            "/x/run {message",
         ] {
             assert!(read(bad).is_err(), "{bad}");
         }

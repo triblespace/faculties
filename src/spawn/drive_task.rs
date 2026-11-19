@@ -48,7 +48,8 @@ pub struct Binding {
     pub context_window: u64,
     pub turns: u64,
     pub max_prompt_bytes: u64,
-    pub max_report_bytes: u64,
+    /// The largest closing message Drive publishes, its `--max-message-bytes`.
+    pub max_message_bytes: u64,
     /// Seconds between Drive's deadline and the unit's runtime limit.
     pub teardown_margin_secs: u64,
     pub telemetry: Telemetry,
@@ -136,7 +137,7 @@ impl Binding {
             ("context-window", self.context_window),
             ("turns", self.turns),
             ("max-prompt-bytes", self.max_prompt_bytes),
-            ("max-report-bytes", self.max_report_bytes),
+            ("max-message-bytes", self.max_message_bytes),
             ("teardown-margin-secs", self.teardown_margin_secs),
         ] {
             ensure!(value > 0, "binding key {key} must be positive");
@@ -173,8 +174,9 @@ impl Binding {
 pub struct RunInputs<'a> {
     /// `{prompt}`: the prompt file, passed to Drive untouched.
     pub prompt: &'a Path,
-    /// `{report}`: the report file Drive publishes, passed untouched.
-    pub report: &'a Path,
+    /// `{message}`: the file Drive publishes the zooid's closing message to,
+    /// passed untouched. Drive writes no file when there is no message.
+    pub message: &'a Path,
     /// `{name}`: the zooid's persona.
     pub name: &'a str,
     /// `{runtime}`: the unit's `RuntimeMaxSec`.
@@ -289,8 +291,8 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
     );
     ensure!(!run.name.is_empty(), "the zooid name is empty");
     ensure!(
-        run.prompt != run.report,
-        "prompt and report are the same file"
+        run.prompt != run.message,
+        "prompt and message are the same file"
     );
     let deadline_ms = deadline_ms(run.runtime_secs, binding.teardown_margin_secs)?;
     let roles = route_roles(run.routes)?;
@@ -303,7 +305,7 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
     let n = |value: u64| OsString::from(value.to_string());
     flag("--prompt-file", run.prompt.into());
     flag("--max-prompt-bytes", n(binding.max_prompt_bytes));
-    flag("--report-file", run.report.into());
+    flag("--message-file", run.message.into());
     flag("--native-persona", run.name.into());
     flag("--native-faculties-pile", run.pile.into());
     flag("--native-faculties-key", run.key.into());
@@ -325,7 +327,7 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
     flag("--context-window", n(binding.context_window));
     flag("--turns", n(binding.turns));
     flag("--deadline-ms", n(deadline_ms));
-    flag("--max-report-bytes", n(binding.max_report_bytes));
+    flag("--max-message-bytes", n(binding.max_message_bytes));
     match &binding.telemetry {
         Telemetry::Off => args.push("--no-telemetry".into()),
         Telemetry::Pile(pile) => {
@@ -402,9 +404,9 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
         run.prompt.display()
     );
     ensure!(
-        !run.report.try_exists()?,
-        "the report {} already exists; Drive publishes a new file only",
-        run.report.display()
+        !run.message.try_exists()?,
+        "the message file {} already exists; Drive publishes a new file only",
+        run.message.display()
     );
     let plan = plan(&parsed, run, prompt.len())?;
     eprintln!(
@@ -457,7 +459,7 @@ mod tests {
         "context-window": 4096,
         "turns": 8,
         "max-prompt-bytes": 500,
-        "max-report-bytes": 300,
+        "max-message-bytes": 300,
         "teardown-margin-secs": 60,
         "telemetry": "off",
         "provider": {"playground": {"path": "/fake/playground", "backend": "fake-backend",
@@ -484,7 +486,7 @@ mod tests {
     fn run<'a>(routes: &'a [(String, String)]) -> RunInputs<'a> {
         RunInputs {
             prompt: Path::new("/state dir/z.prompt"),
-            report: Path::new("/state dir/z.report"),
+            message: Path::new("/state dir/z.report"),
             name: "zooid-name",
             runtime_secs: 3600,
             routes,
@@ -527,7 +529,7 @@ mod tests {
             "/state dir/z.prompt",
             "--max-prompt-bytes",
             "500",
-            "--report-file",
+            "--message-file",
             "/state dir/z.report",
             "--native-persona",
             "zooid-name",
@@ -567,7 +569,7 @@ mod tests {
             "8",
             "--deadline-ms",
             "3540000",
-            "--max-report-bytes",
+            "--max-message-bytes",
             "300",
             "--no-telemetry",
             "--playground",

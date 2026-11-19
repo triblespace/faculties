@@ -383,14 +383,6 @@ pub const TIMEOUT_RESULT: &str = "timeout";
 /// How a run's end says its runtime limit stopped it.
 pub const RUNTIME_LIMIT_NOTE: &str = "stopped at its runtime limit";
 
-/// The result settlement records beside systemd's own for a local run that
-/// exited 0 without writing its report: the local executor's contract is to
-/// write the report file, so a clean exit without one is a failure.
-pub const MISSING_REPORT_RESULT: &str = "missing-report";
-
-/// How a run's end says its local executor exited 0 but wrote no report.
-pub const MISSING_REPORT_NOTE: &str = "exited 0 without writing its report";
-
 /// What a run's agent reported it used, read at settlement.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Usage {
@@ -423,7 +415,9 @@ pub fn vibe_usage(export: &str) -> Result<Usage> {
     Ok(usage)
 }
 
-/// The end of a run, annotating the run itself.
+/// The end of a run, annotating the run itself. `report` is a hosted run's
+/// final reply, or a local run's closing message when it left one; both are
+/// recorded as the run's `report`.
 pub fn settlement_fragment(
     run: Id,
     finished_at: IntervalValue,
@@ -463,14 +457,14 @@ pub fn settlement_fragment(
 /// The fixed preamble that tells a zooid who it is.
 pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
     // A local zooid runs in Drive, not a hosted agent: it ends its task with
-    // the `task_finish` tool, whose argument is the report, and its
-    // faculties are Drive's native tools rather than an MCP server.
+    // the `despawn` tool, whose optional `message` is its closing words, and
+    // its faculties are Drive's native tools rather than an MCP server.
     let (report, tools) = if local {
         (
-            "When the task is done, call `task_finish` once, alone and not beside other tool \
-             calls, with your whole answer as its `report`: that call ends the task, its report \
-             is recorded in the pile and {spawner} is messaged, and nothing else you write is \
-             read as your report. Make it the answer, not a farewell."
+            "When the task is done, call `despawn` once, alone and not beside other tool calls, \
+             optionally with a `message`: your closing words (\"done\" is fine). That call ends \
+             the run and {spawner} is messaged. Your work belongs in ordinary notes and messages \
+             as you go, not in a final report."
                 .replace("{spawner}", spawner),
             "You have the faculties as native tools served through this Drive instance",
         )
@@ -732,7 +726,8 @@ pub struct ScriptFacts<'a> {
     /// for settlement to record on the run.
     pub usage: Option<&'a str>,
     /// Whether the agent's stdout is its report. When not, the agent writes
-    /// the report file itself and its stdout goes to the unit's log.
+    /// the report file itself (a local executor only when the zooid leaves a
+    /// closing message) and its stdout goes to the unit's log.
     pub stdout_is_report: bool,
     pub prompt: &'a str,
     pub report: &'a str,
@@ -1004,14 +999,17 @@ mod tests {
         assert!(text.contains("tutor or another zooid may message you"));
         assert!(text.contains("Your final reply is your report"));
         assert!(text.contains("faculties MCP tools"));
-        assert!(!text.contains("task_finish"));
+        assert!(!text.contains("despawn"));
     }
 
     #[test]
-    fn a_local_zooid_is_told_to_end_with_task_finish() {
+    fn a_local_zooid_is_told_to_end_with_despawn_and_an_optional_message() {
         let text = preamble("lusab-babad", "tutor", true);
-        assert!(text.contains("call `task_finish` once, alone"));
+        assert!(text.contains("call `despawn` once, alone and not beside other tool calls"));
+        assert!(text.contains("optionally with a `message`"));
         assert!(text.contains("tutor is messaged"));
+        assert!(text.contains("not in a final report"));
+        assert!(!text.contains("task_finish"));
         assert!(text.contains("native tools served through this Drive instance"));
         assert!(text.contains("no `orient_next`"));
         assert!(!text.contains("Your final reply is your report"));

@@ -54,9 +54,10 @@ enum Command {
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
-        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
+        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
-        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
+        /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -84,9 +85,10 @@ enum Command {
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
-        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
+        /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
-        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
+        /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
     },
@@ -197,7 +199,8 @@ enum Command {
         /// systemd's SERVICE_RESULT, e.g. `success` or `oom-kill`.
         #[arg(long, default_value = "")]
         result: String,
-        /// File holding claude's stdout.
+        /// The run's report file: a hosted run's final reply, or a local
+        /// run's optional closing message. Missing or empty records none.
         #[arg(long, value_name = "PATH")]
         report: Option<PathBuf>,
         /// vibe's export.json, for a mistral run: its usage and cost are
@@ -207,7 +210,7 @@ enum Command {
     },
     /// A local executor for one finite Drive task, named in
     /// SPAWN_LOCAL_EXECUTOR as
-    /// `spawn drive-task --binding FILE --prompt {prompt} --report {report}
+    /// `spawn drive-task --binding FILE --prompt {prompt} --message {message}
     /// --name {name} --runtime {runtime}`. It turns the run's pinned
     /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
     /// arguments, takes everything else from the binding file, and execs
@@ -224,9 +227,10 @@ enum Command {
         /// The run's prompt file, passed to Drive untouched.
         #[arg(long, value_name = "PATH")]
         prompt: PathBuf,
-        /// The run's report file, which Drive publishes.
+        /// The run's message file, which Drive publishes with the zooid's
+        /// closing message, and leaves unwritten when there is none.
         #[arg(long, value_name = "PATH")]
-        report: PathBuf,
+        message: PathBuf,
         /// The zooid's name, Drive's native persona.
         #[arg(long)]
         name: String,
@@ -383,7 +387,7 @@ pub fn run() -> Result<()> {
     if let Command::DriveTask {
         binding,
         prompt,
-        report,
+        message,
         name,
         runtime,
     } = &command
@@ -399,7 +403,7 @@ pub fn run() -> Result<()> {
             binding,
             &super::drive_task::RunInputs {
                 prompt,
-                report,
+                message,
                 name,
                 runtime_secs: *runtime,
                 routes: &routes,
