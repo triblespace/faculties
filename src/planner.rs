@@ -6,8 +6,9 @@
 //! duplicate, and a changed definition (an edit, a move, a new EXDATE) is a
 //! new observation beside the old one, never a conflict. The records that
 //! share a UID and RECURRENCE-ID are the versions of one lineage; a reader
-//! takes the current version by SEQUENCE, then LAST-MODIFIED, then id
-//! ([`current_event_ids`]). Local cancellation is a separate intrinsic
+//! takes the current version by SEQUENCE, then LAST-MODIFIED, then a
+//! rereading (a later ingest's reading of the same revision replaces an
+//! earlier one), then id ([`current_event_ids`]). Local cancellation is a separate intrinsic
 //! assertion about one version that readers apply to its whole lineage.
 //! This keeps cancellation monotone: set union can make an event cancelled,
 //! but can never accidentally resurrect it by choosing one of several scalar
@@ -31,7 +32,8 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::schemas::planner::{
-    cancellation, event, note, KIND_CANCELLATION_ID, KIND_EVENT_ID, KIND_NOTE_ID,
+    cancellation, event, note, rereading, KIND_CANCELLATION_ID, KIND_EVENT_ID, KIND_NOTE_ID,
+    KIND_REREADING_ID,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -337,6 +339,33 @@ pub fn note_fragment(event_id: Id, text: &str, created_at: IntervalValue) -> Res
     Ok(fragment)
 }
 
+/// Build the assertion that `replacement` is a later reading of the same
+/// source revision as `replaced`.
+pub fn rereading_fragment(replaced: Id, replacement: Id) -> Fragment {
+    entity! {
+        metadata::tag: &KIND_REREADING_ID,
+        rereading::replaced: replaced,
+        rereading::replacement: replacement,
+    }
+}
+
+/// Every version some rereading replaces. A cycle of rereadings replaces
+/// all its members, which then fall back to the id tie-break.
+pub fn reread_event_ids<P>(space: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        replaced: Id,
+        pattern!(space, [{ _?reading @
+            metadata::tag: &KIND_REREADING_ID,
+            rereading::replaced: ?replaced,
+            rereading::replacement: _?replacement,
+        }])
+    )
+    .collect()
+}
+
 /// Build the unique monotone cancellation assertion for an event.
 pub fn cancellation_fragment(event_id: Id) -> Fragment {
     cancellation_record(event_id)
@@ -482,13 +511,16 @@ pub fn lineage(row: &EventRow) -> Lineage {
     (row.uid, row.recurrence_id.map(|value| value.raw))
 }
 
-/// Order of versions within one lineage: SEQUENCE, then LAST-MODIFIED, then
-/// id, each absent value below any present one. The id only breaks ties, so
-/// the choice is the same on every replica.
-fn version_key(row: &EventRow) -> ([u8; 32], Option<[u8; 32]>, Id) {
+/// Order of versions within one lineage: SEQUENCE, then LAST-MODIFIED (each
+/// absent value below any present one), then a version no rereading
+/// replaces above one that is replaced, then id. Rereadings are only written
+/// between versions that tie on SEQUENCE and LAST-MODIFIED; the id only
+/// breaks what remains, so the choice is the same on every replica.
+fn version_key(row: &EventRow, reread: &BTreeSet<Id>) -> ([u8; 32], Option<[u8; 32]>, bool, Id) {
     (
         row.sequence.map(|value| value.raw).unwrap_or([0; 32]),
         row.last_modified.map(|value| value.raw),
+        !reread.contains(&row.id),
         row.id,
     )
 }
@@ -500,13 +532,14 @@ pub fn current_event_ids<P>(space: &P) -> BTreeSet<Id>
 where
     P: TriblePattern + ?Sized,
 {
+    let reread = reread_event_ids(space);
     let mut current = BTreeMap::<Lineage, EventRow>::new();
     for row in event_ids(space)
         .into_iter()
         .filter_map(|id| event(space, id))
     {
         match current.get(&lineage(&row)) {
-            Some(best) if version_key(best) >= version_key(&row) => {}
+            Some(best) if version_key(best, &reread) >= version_key(&row, &reread) => {}
             _ => {
                 current.insert(lineage(&row), row);
             }
@@ -584,6 +617,34 @@ where
     }
 }
 
+/// Decode RFC 5545 TEXT escapes (section 3.3.11) for presentation:
+/// `\\` is a backslash, `\;` and `\,` are the punctuation, `\n` or `\N`
+/// is a newline. Any other backslash is kept as written. Stored values stay
+/// as the source wrote them; readers decode when they show summary,
+/// location and description.
+pub fn unescape_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.clone().next() {
+            Some(next @ ('\\' | ';' | ',')) => {
+                out.push(next);
+                chars.next();
+            }
+            Some('n' | 'N') => {
+                out.push('\n');
+                chars.next();
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
 /// Strictly read a UTF8String attachment.
 pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let text: anybytes::View<str> = reader.get(handle).context("read Planner text")?;
@@ -625,6 +686,45 @@ mod tests {
             tzid: None,
             recurrence_id: None,
             last_modified: None,
+        }
+    }
+
+    #[test]
+    fn unescape_text_decodes_rfc5545_text_escapes() {
+        assert_eq!(unescape_text(r"SPAM\, SPAM\; SPIT"), "SPAM, SPAM; SPIT");
+        assert_eq!(unescape_text(r"one\ntwo\NThree"), "one\ntwo\nThree");
+        assert_eq!(unescape_text(r"C:\\temp"), r"C:\temp");
+        assert_eq!(
+            unescape_text(r"\\n is not a newline"),
+            r"\n is not a newline"
+        );
+        assert_eq!(
+            unescape_text(r"keep \x and trailing \"),
+            r"keep \x and trailing \"
+        );
+        assert_eq!(unescape_text("plain"), "plain");
+    }
+
+    #[test]
+    fn a_rereading_wins_a_tie_whichever_id_is_larger() {
+        let mut escaped = draft("tie@example", r"A\, B");
+        escaped.last_modified = Some(interval(5, 5));
+        let mut decoded = escaped.clone();
+        decoded.summary = "A, B".to_owned();
+        let escaped = event_fragment(&escaped).unwrap();
+        let decoded = event_fragment(&decoded).unwrap();
+        let (old, new) = (escaped.root().unwrap(), decoded.root().unwrap());
+        for (replaced, replacement) in [(old, new), (new, old)] {
+            let mut facts = TribleSet::new();
+            facts += escaped.clone().into_facts();
+            facts += decoded.clone().into_facts();
+            assert_eq!(current_event_ids(&facts).len(), 1);
+            facts += rereading_fragment(replaced, replacement).into_facts();
+            assert_eq!(
+                current_event_ids(&facts),
+                BTreeSet::from([replacement]),
+                "the later reading is current, not the larger id"
+            );
         }
     }
 

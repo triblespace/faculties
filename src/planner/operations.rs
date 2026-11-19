@@ -9,8 +9,8 @@ use crate::clock;
 use crate::collection_names::open_configured;
 use crate::planner::{
     self as planner_model, cancellation_fragment, event_fragment, note_fragment, read_text,
-    EventDraft, EventRow, IntervalValue, TextHandle, STATUS_CANCELLED, STATUS_CONFIRMED,
-    STATUS_TENTATIVE, TRANSP_OPAQUE,
+    rereading_fragment, unescape_text, EventDraft, EventRow, IntervalValue, TextHandle,
+    STATUS_CANCELLED, STATUS_CONFIRMED, STATUS_TENTATIVE, TRANSP_OPAQUE,
 };
 use crate::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
@@ -1300,6 +1300,7 @@ enum Staged {
 fn stage_import_event(
     loaded: &LoadedPlanner,
     staged: &mut BTreeMap<Id, Fragment>,
+    rereadings: &mut Vec<Fragment>,
     fragment: Fragment,
 ) -> Result<Staged> {
     let id = fragment
@@ -1323,6 +1324,15 @@ fn stage_import_event(
                 .and_then(|root| planner_model::event(other.facts(), root))
                 .is_some_and(|row| planner_model::lineage(&row) == lineage)
         });
+    // A resident version of the same source revision that reads differently
+    // was read by an earlier ingest; this reading replaces it.
+    for existing in &resident {
+        if existing.sequence == candidate.sequence
+            && existing.last_modified == candidate.last_modified
+        {
+            rereadings.push(rereading_fragment(existing.id, id));
+        }
+    }
     staged.insert(id, fragment);
     Ok(if known { Staged::Revision } else { Staged::New })
 }
@@ -1354,6 +1364,7 @@ fn ingest(
     validate_calendars(documents)?;
     storage.update("ingest iCalendar events", |loaded| {
         let mut staged = BTreeMap::<Id, Fragment>::new();
+        let mut rereadings = Vec::new();
         let mut total = 0usize;
         let mut duplicates = 0usize;
         let mut revisions = 0usize;
@@ -1368,7 +1379,13 @@ fn ingest(
                         .with_context(|| format!("parse VEVENT in {}", document.name))?;
                     let mut draft = empty_event_draft(
                         source.uid.clone(),
-                        single_line(source.summary.as_deref().unwrap_or("(untitled)")),
+                        single_line(
+                            &source
+                                .summary
+                                .as_deref()
+                                .map(unescape_text)
+                                .unwrap_or_else(|| "(untitled)".to_owned()),
+                        ),
                         make_interval(
                             chrono_to_epoch(source.dtstart),
                             chrono_to_epoch(source.dtend),
@@ -1376,8 +1393,11 @@ fn ingest(
                         normalized_status(source.status.as_deref()),
                         normalized_transp(source.transp.as_deref()),
                     );
-                    draft.description = source.description;
-                    draft.location = source.location.as_deref().map(single_line);
+                    draft.description = source.description.as_deref().map(unescape_text);
+                    draft.location = source
+                        .location
+                        .as_deref()
+                        .map(|location| single_line(&unescape_text(location)));
                     draft.rrule = source.rrule;
                     draft.exdates = source.exdates;
                     draft.recurrence_id = source.recurrence_id;
@@ -1388,7 +1408,7 @@ fn ingest(
                         make_interval(instant, instant)
                     });
                     let fragment = event_fragment(&draft)?;
-                    match stage_import_event(loaded, &mut staged, fragment)? {
+                    match stage_import_event(loaded, &mut staged, &mut rereadings, fragment)? {
                         Staged::Duplicate => duplicates += 1,
                         Staged::Revision => revisions += 1,
                         Staged::New => {}
@@ -1407,6 +1427,9 @@ fn ingest(
             let mut fragment = Fragment::empty();
             for event in staged.into_values() {
                 fragment += event;
+            }
+            for rereading in rereadings {
+                fragment += rereading;
             }
             Some(fragment)
         };

@@ -112,15 +112,15 @@ fn same_batch_duplicate_collapses_and_changed_definition_is_a_revision() {
             assert_ne!(first.root(), changed.root(), "identity covers the content");
 
             assert!(matches!(
-                stage_import_event(loaded, &mut staged, first).unwrap(),
+                stage_import_event(loaded, &mut staged, &mut Vec::new(), first).unwrap(),
                 Staged::New
             ));
             assert!(matches!(
-                stage_import_event(loaded, &mut staged, duplicate).unwrap(),
+                stage_import_event(loaded, &mut staged, &mut Vec::new(), duplicate).unwrap(),
                 Staged::Duplicate
             ));
             assert!(matches!(
-                stage_import_event(loaded, &mut staged, changed).unwrap(),
+                stage_import_event(loaded, &mut staged, &mut Vec::new(), changed).unwrap(),
                 Staged::Revision
             ));
             assert_eq!(staged.len(), 2);
@@ -919,4 +919,119 @@ fn an_event_missing_from_a_later_export_is_not_removed() {
         starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z").len(),
         2
     );
+}
+
+#[test]
+fn ingest_unescapes_text_and_a_manual_backslash_is_kept() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let text = vevent_calendar(
+        "BEGIN:VEVENT\r\nUID:esc@example\r\nSUMMARY:SPAM\\, SPAM\\; SPIT\r\nLOCATION:Saal\\, MP7\\nOG\r\nDESCRIPTION:line\\nnext\\\\done\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\n",
+    );
+    planner
+        .ingest(
+            &[CalendarInput {
+                name: "esc.ics",
+                text: &text,
+            }],
+            IngestOptions::default(),
+        )
+        .unwrap();
+    let mut manual = AddOptions::new(
+        r"C:\new\temp, keep\,this",
+        (
+            chrono_to_epoch(utc("2026-08-10T12:00:00Z")),
+            chrono_to_epoch(utc("2026-08-10T13:00:00Z")),
+        ),
+    );
+    manual.location = Some(r"room\n2".to_owned());
+    let added = planner.add(&manual).unwrap();
+
+    let listed = planner
+        .list(
+            (
+                chrono_to_epoch(utc("2026-08-01T00:00:00Z")),
+                chrono_to_epoch(utc("2026-08-31T00:00:00Z")),
+            ),
+            false,
+        )
+        .unwrap();
+    let imported = listed
+        .iter()
+        .find(|occurrence| occurrence.event_id != added.event)
+        .unwrap();
+    assert_eq!(imported.summary, "SPAM, SPAM; SPIT");
+    assert_eq!(imported.location.as_deref(), Some("Saal, MP7 OG"));
+    let detail = planner.show(&format!("{:x}", imported.event_id)).unwrap();
+    assert_eq!(detail.description.as_deref(), Some("line\nnext\\done"));
+
+    let manual = planner.show(&format!("{:x}", added.event)).unwrap();
+    assert_eq!(manual.summary, r"C:\new\temp, keep\,this");
+    assert_eq!(manual.location.as_deref(), Some(r"room\n2"));
+}
+
+#[test]
+fn reingest_over_an_escaped_reading_makes_the_unescaped_version_current() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    // What the reader before this change stored for the same VEVENT: the
+    // escapes kept, with the same SEQUENCE and LAST-MODIFIED.
+    let mut escaped = empty_event_draft(
+        "tie@example".to_owned(),
+        r"A\, B".to_owned(),
+        make_interval(
+            chrono_to_epoch(utc("2026-08-09T12:00:00Z")),
+            chrono_to_epoch(utc("2026-08-09T13:00:00Z")),
+        ),
+        STATUS_CONFIRMED.to_owned(),
+        TRANSP_OPAQUE.to_owned(),
+    );
+    escaped.location = Some(r"Saal\, OG".to_owned());
+    escaped.sequence = Some(3u64.to_inline());
+    let modified = chrono_to_epoch(utc("2026-08-01T00:00:00Z"));
+    escaped.last_modified = Some(make_interval(modified, modified));
+    let escaped = event_fragment(&escaped).unwrap();
+    let escaped_id = escaped.root().unwrap();
+    planner
+        .storage()
+        .update("seed escaped reading", |_| Ok((Some(escaped), ())))
+        .unwrap();
+
+    let text = vevent_calendar(
+        "BEGIN:VEVENT\r\nUID:tie@example\r\nSUMMARY:A\\, B\r\nLOCATION:Saal\\, OG\r\nSEQUENCE:3\r\nLAST-MODIFIED:20260801T000000Z\r\nDTSTART:20260809T120000Z\r\nDTEND:20260809T130000Z\r\nEND:VEVENT\r\n",
+    );
+    let documents = [CalendarInput {
+        name: "tie.ics",
+        text: &text,
+    }];
+    let receipt = planner
+        .ingest(&documents, IngestOptions::default())
+        .unwrap();
+    assert_eq!(receipt.revisions, 1);
+    let decoded_id = receipt.imported[0];
+    assert_ne!(decoded_id, escaped_id);
+
+    let listed = starts_in(&planner, "2026-08-01T00:00:00Z", "2026-08-31T00:00:00Z");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].0, "A, B");
+    let next = planner
+        .list(
+            (
+                chrono_to_epoch(utc("2026-08-01T00:00:00Z")),
+                chrono_to_epoch(utc("2026-08-31T00:00:00Z")),
+            ),
+            false,
+        )
+        .unwrap();
+    assert_eq!(next[0].event_id, decoded_id);
+    assert_eq!(next[0].location.as_deref(), Some("Saal, OG"));
+
+    // The same export again is a duplicate and writes nothing more.
+    let again = planner
+        .ingest(&documents, IngestOptions::default())
+        .unwrap();
+    assert_eq!(again.duplicates, 1);
+    assert!(again.imported.is_empty());
 }

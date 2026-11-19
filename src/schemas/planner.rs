@@ -32,6 +32,14 @@ pub const KIND_NOTE_ID: Id = id_hex!("AF8C3BF988B4D97B1AAC665F2B9B8FB5");
 /// Minted with `trible genid` on 2026-08-09:
 /// `73F587E9A9B956B4B3EFA8D6A6FA6EAF`.
 pub const KIND_CANCELLATION_ID: Id = id_hex!("73F587E9A9B956B4B3EFA8D6A6FA6EAF");
+/// Marks a rereading: ingest read the same source revision (same SEQUENCE
+/// and LAST-MODIFIED) of an event differently than an earlier ingest did,
+/// and the later reading replaces the earlier one. A reader uses it only to
+/// break a SEQUENCE and LAST-MODIFIED tie between versions of one lineage.
+///
+/// Minted with `trible genid` on 2026-11-19:
+/// `92621352727A073C79A2287CECA4EA20`.
+pub const KIND_REREADING_ID: Id = id_hex!("92621352727A073C79A2287CECA4EA20");
 
 /// Event attributes — one per RFC 5545 VEVENT property we care
 /// about. Time-of-day data lives in a single `time: NsTAIInterval`
@@ -138,5 +146,18 @@ pub mod cancellation {
         // The event cancelled by this assertion. Minted with `trible genid`
         // on 2026-08-09: `123D7A7CC84D0E95EE51298021213B46`.
         "123D7A7CC84D0E95EE51298021213B46" unsafe as event: inlineencodings::GenId;
+    }
+}
+
+/// Attributes of a rereading assertion.
+pub mod rereading {
+    use super::*;
+    attributes! {
+        // The earlier version this reading replaces. Minted with
+        // `trible genid` on 2026-11-19: `795A52E1C6A175E4854E0BF9E34BB5F2`.
+        "795A52E1C6A175E4854E0BF9E34BB5F2" as replaced: inlineencodings::GenId;
+        // The later version that replaces it. Minted with `trible genid`
+        // on 2026-11-19: `50A7437120B2763017201CF15F927FF8`.
+        "50A7437120B2763017201CF15F927FF8" as replacement: inlineencodings::GenId;
     }
 }
