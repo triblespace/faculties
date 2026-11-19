@@ -140,7 +140,7 @@ fn duplicate_scalar_ical_property_is_rejected() {
     let error = parse_ical_event(
         &calendar[0].events[0],
         &ZoneTable::new(),
-        IngestOptions::default(),
+        &IngestOptions::default(),
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains("more than one UID"));
@@ -414,7 +414,7 @@ fn parse_document(text: &str, options: IngestOptions) -> Result<Vec<IcalEvent>> 
         let calendar = calendar?;
         let zones = calendar_zones(&calendar);
         for source in &calendar.events {
-            events.push(parse_ical_event(source, &zones, options)?);
+            events.push(parse_ical_event(source, &zones, &options)?);
         }
     }
     Ok(events)
@@ -429,6 +429,7 @@ fn utc(text: &str) -> DateTime<Utc> {
 fn berlin() -> IngestOptions {
     IngestOptions {
         floating_zone: Some(chrono_tz::Europe::Berlin),
+        ..IngestOptions::default()
     }
 }
 
@@ -913,8 +914,8 @@ fn an_event_missing_from_a_later_export_is_not_removed() {
         &planner,
         &vevent_calendar(&vevent("kept@example", &["DTSTART:20261120T090000Z"])),
     );
-    // Deletion needs its own observation (which versions an export held);
-    // until then an absent event stays, which is the honest default.
+    // Neither ingest said it was a complete export, so an absent event says
+    // nothing about deletion and stays.
     assert_eq!(
         starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z").len(),
         2
@@ -1034,4 +1035,290 @@ fn reingest_over_an_escaped_reading_makes_the_unescaped_version_current() {
         .unwrap();
     assert_eq!(again.duplicates, 1);
     assert!(again.imported.is_empty());
+}
+
+/// A complete export dated `stamp` holding `events` (uid, hour on 20 Nov).
+fn export_document(stamp: &str, events: &[(&str, u32)]) -> String {
+    let stamp = format!("DTSTAMP:{stamp}");
+    vevent_calendar(
+        &events
+            .iter()
+            .map(|(uid, hour)| {
+                let start = format!("DTSTART:20261120T{hour:02}0000Z");
+                vevent(uid, &[&start, &stamp])
+            })
+            .collect::<String>(),
+    )
+}
+
+fn ingest_complete(planner: &Planner, calendar: &str, text: &str) -> IngestReceipt {
+    planner
+        .ingest(
+            &[CalendarInput {
+                name: "export.ics",
+                text,
+            }],
+            IngestOptions {
+                complete_calendar: Some(calendar.to_owned()),
+                ..IngestOptions::default()
+            },
+        )
+        .unwrap()
+}
+
+/// Summaries listed on 20 Nov, in start order.
+fn listed(planner: &Planner) -> Vec<String> {
+    starts_in(planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z")
+        .into_iter()
+        .map(|(summary, _)| summary)
+        .collect()
+}
+
+#[test]
+fn an_event_missing_from_the_next_complete_export_stops_showing() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let first = ingest_complete(
+        &planner,
+        "personal",
+        &export_document(
+            "20261101T080000Z",
+            &[("kept@example", 9), ("gone@example", 10)],
+        ),
+    );
+    let first = first.export.unwrap();
+    assert!(first.recorded && first.newest);
+    assert_eq!(first.absent, 0);
+    assert_eq!(listed(&planner), ["kept@example", "gone@example"]);
+    let after = chrono_to_epoch(utc("2026-11-20T10:30:00Z"));
+    assert!(planner.next(Some(after)).unwrap().is_some());
+
+    let second = ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("kept@example", 9)]),
+    );
+    assert_eq!((second.imported.len(), second.duplicates), (0, 1));
+    let export = second.export.unwrap();
+    assert!(export.recorded && export.newest);
+    assert_eq!(export.absent, 1);
+    assert_eq!(
+        epoch_to_chrono_utc(export.exported_at).unwrap(),
+        utc("2026-11-02T08:00:00Z")
+    );
+    assert_eq!(listed(&planner), ["kept@example"]);
+    let next = planner.next(Some(after)).unwrap();
+    assert!(
+        next.is_none(),
+        "next skips the deleted 10:00 to 11:00 event"
+    );
+
+    // The same export again is the same observation, recorded once.
+    let again = ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("kept@example", 9)]),
+    );
+    assert!(!again.export.unwrap().recorded);
+}
+
+#[test]
+fn a_partial_ingest_never_deletes() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document(
+            "20261101T080000Z",
+            &[("kept@example", 9), ("other@example", 10)],
+        ),
+    );
+    // A later single-event file, not marked complete, lacks the other event.
+    let receipt = ingest_text(
+        &planner,
+        &export_document("20261102T080000Z", &[("kept@example", 9)]),
+    );
+    assert!(receipt.export.is_none());
+    assert_eq!(listed(&planner), ["kept@example", "other@example"]);
+}
+
+#[test]
+fn an_older_export_ingested_later_changes_nothing() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261101T080000Z", &[("a@example", 9), ("b@example", 10)]),
+    );
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261103T080000Z", &[("a@example", 9), ("c@example", 11)]),
+    );
+    assert_eq!(listed(&planner), ["a@example", "c@example"]);
+
+    // Made between the two, ingested last: it would bring b back and drop c.
+    let late = ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("a@example", 9), ("b@example", 10)]),
+    );
+    let late = late.export.unwrap();
+    assert!(late.recorded && !late.newest);
+    assert_eq!(listed(&planner), ["a@example", "c@example"]);
+}
+
+#[test]
+fn an_event_back_in_a_later_export_shows_again() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let both = [("a@example", 9), ("b@example", 10)];
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261101T080000Z", &both),
+    );
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("a@example", 9)]),
+    );
+    assert_eq!(listed(&planner), ["a@example"]);
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261103T080000Z", &both),
+    );
+    assert_eq!(listed(&planner), ["a@example", "b@example"]);
+}
+
+#[test]
+fn locally_added_events_are_untouched_by_exports() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261101T080000Z", &[("a@example", 9)]),
+    );
+    planner
+        .add(&AddOptions::new(
+            "local",
+            event_window("2026-11-20T12:00:00Z", None).unwrap(),
+        ))
+        .unwrap();
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("b@example", 10)]),
+    );
+    assert_eq!(listed(&planner), ["b@example", "local"]);
+}
+
+#[test]
+fn two_calendars_do_not_delete_each_others_events() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_complete(
+        &planner,
+        "work",
+        &export_document("20261101T080000Z", &[("work@example", 9)]),
+    );
+    ingest_complete(
+        &planner,
+        "home",
+        &export_document("20261102T080000Z", &[("home@example", 10)]),
+    );
+    assert_eq!(listed(&planner), ["work@example", "home@example"]);
+
+    let receipt = ingest_complete(
+        &planner,
+        "home",
+        &export_document("20261103T080000Z", &[("home2@example", 11)]),
+    );
+    assert_eq!(receipt.export.unwrap().absent, 1, "only home's own event");
+    assert_eq!(listed(&planner), ["work@example", "home2@example"]);
+}
+
+#[test]
+fn a_version_modified_after_the_newest_export_still_shows() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261101T080000Z", &[("a@example", 9), ("b@example", 10)]),
+    );
+    // An invitation update for b, modified after the next export was made.
+    ingest_text(
+        &planner,
+        &vevent_calendar(&vevent(
+            "b@example",
+            &[
+                "DTSTART:20261120T110000Z",
+                "SEQUENCE:1",
+                "LAST-MODIFIED:20261105T080000Z",
+                "DTSTAMP:20261105T080000Z",
+            ],
+        )),
+    );
+    ingest_complete(
+        &planner,
+        "personal",
+        &export_document("20261102T080000Z", &[("a@example", 9)]),
+    );
+    assert_eq!(listed(&planner), ["a@example", "b@example"]);
+}
+
+#[test]
+fn a_complete_export_needs_one_dated_document() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let complete = || IngestOptions {
+        complete_calendar: Some("personal".to_owned()),
+        ..IngestOptions::default()
+    };
+    let undated = vevent_calendar(&vevent("a@example", &["DTSTART:20261120T090000Z"]));
+    let error = planner
+        .ingest(
+            &[CalendarInput {
+                name: "undated.ics",
+                text: &undated,
+            }],
+            complete(),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("DTSTAMP"), "{error:#}");
+
+    let dated = export_document("20261101T080000Z", &[("a@example", 9)]);
+    let error = planner
+        .ingest(
+            &[
+                CalendarInput {
+                    name: "one.ics",
+                    text: &dated,
+                },
+                CalendarInput {
+                    name: "two.ics",
+                    text: &dated,
+                },
+            ],
+            complete(),
+        )
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("one document"), "{error:#}");
+    assert!(
+        listed(&planner).is_empty(),
+        "a refused ingest publishes nothing"
+    );
 }

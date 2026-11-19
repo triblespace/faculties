@@ -59,8 +59,8 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "planner_ingest",
-        description: "Ingest resident iCalendar text documents, staging the full batch before one publication. Names are diagnostics, not host paths. Exact duplicate definitions are skipped; a changed definition of a known UID (an edit, a move, a new EXDATE or override) is recorded as a new version beside the old one, never refused, and list/next use the current version per UID and RECURRENCE-ID by SEQUENCE, then LAST-MODIFIED. An event missing from a later export is not removed. Times: Z is UTC; TZID is applied (an IANA zone, or a fixed-offset VTIMEZONE in the document; anything else is an error naming the event), with a nonexistent local time moved forward by the DST gap and an ambiguous one taken as the first occurrence; RRULEs expand in the DTSTART zone, so local wall time holds across DST. Floating times (no Z, no TZID) are local times in floating_zone (an IANA name, e.g. Europe/Berlin); without it they are an error, never UTC. VALUE=DATE stays an all-day date at UTC midnight. EXDATE is applied; a RECURRENCE-ID override is its own event and replaces its master's instance. RDATE is not read.",
-        input_schema: r#"{"type":"object","properties":{"documents":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"text":{"type":"string"}},"required":["name","text"],"additionalProperties":false}},"floating_zone":{"type":"string","minLength":1}},"required":["documents"],"additionalProperties":false}"#,
+        description: "Ingest resident iCalendar text documents, staging the full batch before one publication. Names are diagnostics, not host paths. Exact duplicate definitions are skipped; a changed definition of a known UID (an edit, a move, a new EXDATE or override) is recorded as a new version beside the old one, never refused, and list/next use the current version per UID and RECURRENCE-ID by SEQUENCE, then LAST-MODIFIED. Nothing is removed unless complete_calendar is given: then the single document is recorded as a complete export of that calendar (a name the caller chooses and reuses for every export of it), dated by its latest DTSTAMP, and an event the newest complete export of its calendar no longer holds stops showing in list and next. An older export ingested later changes nothing. Never pass complete_calendar for a single invitation or a filtered export. Times: Z is UTC; TZID is applied (an IANA zone, or a fixed-offset VTIMEZONE in the document; anything else is an error naming the event), with a nonexistent local time moved forward by the DST gap and an ambiguous one taken as the first occurrence; RRULEs expand in the DTSTART zone, so local wall time holds across DST. Floating times (no Z, no TZID) are local times in floating_zone (an IANA name, e.g. Europe/Berlin); without it they are an error, never UTC. VALUE=DATE stays an all-day date at UTC midnight. EXDATE is applied; a RECURRENCE-ID override is its own event and replaces its master's instance. RDATE is not read.",
+        input_schema: r#"{"type":"object","properties":{"documents":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"text":{"type":"string"}},"required":["name","text"],"additionalProperties":false}},"floating_zone":{"type":"string","minLength":1},"complete_calendar":{"type":"string","minLength":1}},"required":["documents"],"additionalProperties":false}"#,
     },
 ];
 #[derive(Deserialize)]
@@ -131,6 +131,8 @@ struct Ingest {
     documents: Vec<Calendar>,
     #[serde(default)]
     floating_zone: Option<String>,
+    #[serde(default)]
+    complete_calendar: Option<String>,
 }
 fn selector(value: &str) -> Result<()> {
     let value = value.trim();
@@ -229,6 +231,7 @@ impl Faculty for Planner {
                         .map(super::parse_floating_zone)
                         .transpose()
                         .map_err(invalid_arguments)?,
+                    complete_calendar: args.complete_calendar,
                 };
                 presentation::ingested(&self.operations.ingest(&documents, options)?, out)
             }

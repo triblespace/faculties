@@ -97,12 +97,22 @@ enum Command {
     /// forward by the DST gap; an ambiguous one is the first occurrence.
     /// VALUE=DATE stays an all-day date. EXDATE and RECURRENCE-ID overrides
     /// are applied. Floating times need --floating-zone.
+    ///
+    /// Ingest only adds. With --complete NAME the one file is recorded as a
+    /// complete export of calendar NAME, dated by its latest DTSTAMP; an event
+    /// that the newest complete export of its calendar no longer holds stops
+    /// showing in list and next. Without --complete nothing is ever removed,
+    /// so a single invitation or a filtered export is safe to ingest.
     Ingest {
         files: Vec<PathBuf>,
         /// IANA zone for floating times (no Z, no TZID), e.g. Europe/Berlin.
         /// Without it a floating time is an error, never read as UTC.
         #[arg(long, value_name = "ZONE")]
         floating_zone: Option<String>,
+        /// The file is a complete export of this calendar (a name you choose
+        /// and reuse for every export of it). Requires exactly one file.
+        #[arg(long, value_name = "CALENDAR")]
+        complete: Option<String>,
     },
 }
 
@@ -180,12 +190,14 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Ingest {
             files,
             floating_zone,
+            complete,
         } => {
             let options = super::IngestOptions {
                 floating_zone: floating_zone
                     .as_deref()
                     .map(super::parse_floating_zone)
                     .transpose()?,
+                complete_calendar: complete,
             };
             if files.is_empty() {
                 bail!("no files supplied");

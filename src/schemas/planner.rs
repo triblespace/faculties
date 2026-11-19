@@ -41,6 +41,17 @@ pub const KIND_CANCELLATION_ID: Id = id_hex!("73F587E9A9B956B4B3EFA8D6A6FA6EAF")
 /// `92621352727A073C79A2287CECA4EA20`.
 pub const KIND_REREADING_ID: Id = id_hex!("92621352727A073C79A2287CECA4EA20");
 
+/// Marks an export observation: "this complete export of a calendar held
+/// these event versions". An ingest records one only when the caller says
+/// the document is a complete export of a named calendar; readers then treat
+/// a lineage the newest export of every calendar that held it no longer holds
+/// as deleted there. Its id is intrinsic, so ingesting the same export twice
+/// is one observation.
+///
+/// Minted with `trible genid` on 2026-11-19:
+/// `29B3279C0D2EC3F8535BE35EE17FDC02`.
+pub const KIND_EXPORT_ID: Id = id_hex!("29B3279C0D2EC3F8535BE35EE17FDC02");
+
 /// Event attributes — one per RFC 5545 VEVENT property we care
 /// about. Time-of-day data lives in a single `time: NsTAIInterval`
 /// attribute that holds both DTSTART and DTEND as the inclusive
@@ -159,5 +170,27 @@ pub mod rereading {
         // The later version that replaces it. Minted with `trible genid`
         // on 2026-11-19: `50A7437120B2763017201CF15F927FF8`.
         "50A7437120B2763017201CF15F927FF8" as replacement: inlineencodings::GenId;
+    }
+}
+
+/// Attributes of an export observation.
+pub mod export {
+    use super::*;
+    attributes! {
+        // The calendar the export is complete for, as the caller named it.
+        // Deletion is only ever inferred between exports of one calendar.
+        // Minted with `trible genid` on 2026-11-19:
+        // `BFB84BA824652A7F0287A9DF507B67B1`.
+        "BFB84BA824652A7F0287A9DF507B67B1" as calendar:
+            inlineencodings::Handle<blobencodings::UTF8String>;
+        // When the export was made (a point interval): the latest DTSTAMP in
+        // the document, which an export writer sets to the time of export.
+        // Readers order exports of one calendar by it, never by ingest time.
+        // Minted with `trible genid` on 2026-11-19:
+        // `55CD0B390294118BF94D98284C5C4BE9`.
+        "55CD0B390294118BF94D98284C5C4BE9" as exported_at: inlineencodings::NsTAIInterval;
+        // An event version the export held. Repeated. Minted with
+        // `trible genid` on 2026-11-19: `3E7FF843D9A57DFB88184E89E4812663`.
+        "3E7FF843D9A57DFB88184E89E4812663" as version: inlineencodings::GenId;
     }
 }

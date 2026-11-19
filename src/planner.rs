@@ -10,6 +10,10 @@
 //! rereading (a later ingest's reading of the same revision replaces an
 //! earlier one), then id ([`current_event_ids`]). Local cancellation is a separate intrinsic
 //! assertion about one version that readers apply to its whole lineage.
+//! Deletion is never retracted either: an ingest of a complete export of a
+//! named calendar records which versions it held, and a lineage that every
+//! calendar holding it has left out of its newest export is not current
+//! ([`deleted_lineages`]).
 //! This keeps cancellation monotone: set union can make an event cancelled,
 //! but can never accidentally resurrect it by choosing one of several scalar
 //! `status` values.
@@ -32,8 +36,8 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 use crate::schemas::planner::{
-    cancellation, event, note, rereading, KIND_CANCELLATION_ID, KIND_EVENT_ID, KIND_NOTE_ID,
-    KIND_REREADING_ID,
+    cancellation, event, export, note, rereading, KIND_CANCELLATION_ID, KIND_EVENT_ID,
+    KIND_EXPORT_ID, KIND_NOTE_ID, KIND_REREADING_ID,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -349,6 +353,148 @@ pub fn rereading_fragment(replaced: Id, replacement: Id) -> Fragment {
     }
 }
 
+/// Build the observation that a complete export of `calendar`, made at
+/// `exported_at`, held exactly `versions`. The id is intrinsic over all of
+/// it, so the same export ingested twice is one observation.
+pub fn export_fragment(
+    calendar: &str,
+    exported_at: IntervalValue,
+    versions: &BTreeSet<Id>,
+) -> Result<Fragment> {
+    validate_label("export calendar", calendar)?;
+    validate_point("export time", exported_at)?;
+    let mut fragment = Fragment::empty();
+    let calendar = fragment.put(calendar.to_owned());
+    fragment += entity! {
+        metadata::tag: &KIND_EXPORT_ID,
+        export::calendar: calendar,
+        export::exported_at: exported_at,
+        export::version*: versions.iter(),
+    };
+    Ok(fragment)
+}
+
+/// One readable export observation: its calendar, its time, and the
+/// versions it held.
+pub struct ExportRow {
+    pub id: Id,
+    pub calendar: TextHandle,
+    pub exported_at: IntervalValue,
+    pub versions: BTreeSet<Id>,
+}
+
+/// Every readable export observation. One with several calendar or time
+/// values (which no writer here produces) appears once per combination.
+pub fn exports<P>(space: &P) -> Vec<ExportRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    find!(
+        (id: Id, calendar: TextHandle, exported_at: IntervalValue),
+        pattern!(space, [{ ?id @
+            metadata::tag: &KIND_EXPORT_ID,
+            export::calendar: ?calendar,
+            export::exported_at: ?exported_at,
+        }])
+    )
+    .filter(|(_, _, exported_at)| validate_point("export time", *exported_at).is_ok())
+    .map(|(id, calendar, exported_at)| ExportRow {
+        id,
+        calendar,
+        exported_at,
+        versions: find!(
+            version: Id,
+            pattern!(space, [{ id @ export::version: ?version }])
+        )
+        .collect(),
+    })
+    .collect()
+}
+
+/// For every calendar with a complete export: the time of its newest export
+/// and the lineages that export held. Exports tied at the newest time are
+/// read together, so a tie can only keep an event, never drop one. An older
+/// export says nothing here, whenever it was ingested.
+fn newest_exports<P>(space: &P, lineage_of: &BTreeMap<Id, Lineage>) -> Vec<NewestExport>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut by_calendar = BTreeMap::<TextHandle, Vec<ExportRow>>::new();
+    for row in exports(space) {
+        by_calendar.entry(row.calendar).or_default().push(row);
+    }
+    by_calendar
+        .into_values()
+        .map(|rows| {
+            let newest = rows
+                .iter()
+                .map(|row| row.exported_at.raw)
+                .max()
+                .expect("a calendar entry has at least one export");
+            let lineages = |rows: &mut dyn Iterator<Item = &ExportRow>| {
+                rows.flat_map(|row| row.versions.iter())
+                    .filter_map(|version| lineage_of.get(version).copied())
+                    .collect::<BTreeSet<_>>()
+            };
+            NewestExport {
+                exported_at: newest,
+                ever_held: lineages(&mut rows.iter()),
+                held: lineages(&mut rows.iter().filter(|row| row.exported_at.raw == newest)),
+            }
+        })
+        .collect()
+}
+
+struct NewestExport {
+    exported_at: [u8; 32],
+    /// Lineages any export of this calendar ever held.
+    ever_held: BTreeSet<Lineage>,
+    /// Lineages its newest export holds.
+    held: BTreeSet<Lineage>,
+}
+
+/// Lineages deleted from their calendars. A lineage is deleted when at least
+/// one calendar's complete exports have held it and the newest export of
+/// every such calendar holds no version of it, unless its current version
+/// was modified after that export was made (the export could not have known
+/// it). Events never seen in a complete export, such as local ones or those
+/// from a single invitation file, are never deleted.
+pub fn deleted_lineages<P>(space: &P) -> BTreeSet<Lineage>
+where
+    P: TriblePattern + ?Sized,
+{
+    let (current, lineage_of) = current_versions(space);
+    deleted_among(space, &current, &lineage_of)
+}
+
+fn deleted_among<P>(
+    space: &P,
+    current: &BTreeMap<Lineage, EventRow>,
+    lineage_of: &BTreeMap<Id, Lineage>,
+) -> BTreeSet<Lineage>
+where
+    P: TriblePattern + ?Sized,
+{
+    let newest = newest_exports(space, lineage_of);
+    current
+        .iter()
+        .filter(|(lineage, row)| {
+            let mut holders = newest
+                .iter()
+                .filter(|calendar| calendar.ever_held.contains(lineage))
+                .peekable();
+            holders.peek().is_some()
+                && holders.all(|calendar| {
+                    !calendar.held.contains(lineage)
+                        && row
+                            .last_modified
+                            .is_none_or(|modified| modified.raw <= calendar.exported_at)
+                })
+        })
+        .map(|(lineage, _)| *lineage)
+        .collect()
+}
+
 /// Every version some rereading replaces. A cycle of rereadings replaces
 /// all its members, which then fall back to the id tie-break.
 pub fn reread_event_ids<P>(space: &P) -> BTreeSet<Id>
@@ -525,19 +671,37 @@ fn version_key(row: &EventRow, reread: &BTreeSet<Id>) -> ([u8; 32], Option<[u8; 
     )
 }
 
-/// The current version of every readable lineage. Older versions stay in the
-/// collection as what an earlier export said; readers that list or schedule
-/// events consult only these.
+/// The current version of every readable lineage that is not deleted
+/// ([`deleted_lineages`]). Older versions stay in the collection as what an
+/// earlier export said; readers that list or schedule events consult only
+/// these.
 pub fn current_event_ids<P>(space: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    let (current, lineage_of) = current_versions(space);
+    let deleted = deleted_among(space, &current, &lineage_of);
+    current
+        .into_iter()
+        .filter(|(lineage, _)| !deleted.contains(lineage))
+        .map(|(_, row)| row.id)
+        .collect()
+}
+
+/// The current version of every readable lineage, deleted ones included,
+/// and the lineage of every readable version.
+fn current_versions<P>(space: &P) -> (BTreeMap<Lineage, EventRow>, BTreeMap<Id, Lineage>)
 where
     P: TriblePattern + ?Sized,
 {
     let reread = reread_event_ids(space);
     let mut current = BTreeMap::<Lineage, EventRow>::new();
+    let mut lineage_of = BTreeMap::<Id, Lineage>::new();
     for row in event_ids(space)
         .into_iter()
         .filter_map(|id| event(space, id))
     {
+        lineage_of.insert(row.id, lineage(&row));
         match current.get(&lineage(&row)) {
             Some(best) if version_key(best, &reread) >= version_key(&row, &reread) => {}
             _ => {
@@ -545,7 +709,7 @@ where
             }
         }
     }
-    current.into_values().map(|row| row.id).collect()
+    (current, lineage_of)
 }
 
 /// Every readable version in the lineage of `row`, including `row`.

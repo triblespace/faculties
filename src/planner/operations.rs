@@ -12,7 +12,7 @@ use crate::planner::{
     rereading_fragment, unescape_text, EventDraft, EventRow, IntervalValue, TextHandle,
     STATUS_CANCELLED, STATUS_CONFIRMED, STATUS_TENTATIVE, TRANSP_OPAQUE,
 };
-use crate::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID};
+use crate::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID, KIND_EXPORT_ID};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
@@ -116,9 +116,16 @@ pub struct CalendarInput<'a> {
 /// `floating_zone` set, floating times are local times in that zone, and the
 /// zone is recorded as the event's TZID so recurrences expand in it. Without
 /// it, a floating time is an error naming the event; it is never read as UTC.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `complete_calendar` names the calendar the single document is a complete
+/// export of. Only then does the ingest record which versions the export held
+/// (an export observation dated by its latest DTSTAMP), and only then can an
+/// event left out of a later export stop being listed. A partial file, such
+/// as one invitation, is ingested without it and never removes anything.
+#[derive(Clone, Debug, Default)]
 pub struct IngestOptions {
     pub floating_zone: Option<chrono_tz::Tz>,
+    pub complete_calendar: Option<String>,
 }
 /// An IANA zone name for [`IngestOptions::floating_zone`].
 pub fn parse_floating_zone(name: &str) -> Result<chrono_tz::Tz> {
@@ -133,6 +140,24 @@ pub struct IngestReceipt {
     /// Imported records whose UID and RECURRENCE-ID were already present
     /// with a different definition: a new version beside the old one.
     pub revisions: usize,
+    /// Present when the document was ingested as a complete export.
+    pub export: Option<ExportReceipt>,
+}
+/// What an ingest of a complete export recorded about its calendar.
+#[derive(Clone, Debug)]
+pub struct ExportReceipt {
+    pub calendar: String,
+    /// The latest DTSTAMP in the document.
+    pub exported_at: Epoch,
+    /// False when this exact export was already recorded.
+    pub recorded: bool,
+    /// False when an export of this calendar made later is already recorded;
+    /// then this one changes nothing about what is listed.
+    pub newest: bool,
+    /// Events earlier exports of this calendar held that this one does not.
+    /// When `newest`, list and next stop showing them (unless their current
+    /// version was modified after this export was made).
+    pub absent: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Planner {
@@ -984,6 +1009,9 @@ struct IcalEvent {
     transp: Option<String>,
     sequence: Option<u64>,
     last_modified: Option<DateTime<Utc>>,
+    /// When the source wrote this VEVENT out. Not stored on the event (in an
+    /// export it is the export time); it dates a complete export.
+    dtstamp: Option<DateTime<Utc>>,
 }
 
 /// TZIDs a calendar defines itself. Only a VTIMEZONE whose every offset is
@@ -1100,7 +1128,7 @@ fn parse_ical_time(
     value: &str,
     property: &ical::property::Property,
     zones: &ZoneTable,
-    options: IngestOptions,
+    options: &IngestOptions,
 ) -> Result<IcalTime> {
     let value = value.trim();
     let name = &property.name;
@@ -1152,7 +1180,7 @@ fn set_once(slot: &mut Option<String>, field: &str, value: String) -> Result<()>
 fn parse_ical_event(
     event: &ical::parser::ical::component::IcalEvent,
     zones: &ZoneTable,
-    options: IngestOptions,
+    options: &IngestOptions,
 ) -> Result<IcalEvent> {
     let mut uid = None;
     let mut summary = None;
@@ -1167,6 +1195,7 @@ fn parse_ical_event(
     let mut exdates = Vec::new();
     let mut sequence = None;
     let mut last_modified = None;
+    let mut dtstamp = None;
 
     for property in &event.properties {
         let value = property.value.clone().unwrap_or_default();
@@ -1198,6 +1227,11 @@ fn parse_ical_event(
             "LAST-MODIFIED" => {
                 if last_modified.replace(property).is_some() {
                     bail!("VEVENT has more than one LAST-MODIFIED property");
+                }
+            }
+            "DTSTAMP" => {
+                if dtstamp.replace(property).is_some() {
+                    bail!("VEVENT has more than one DTSTAMP property");
                 }
             }
             _ => {}
@@ -1261,6 +1295,10 @@ fn parse_ical_event(
         .map(|property| time(property).with_context(|| named("LAST-MODIFIED")))
         .transpose()?
         .map(|value| value.instant);
+    let dtstamp = dtstamp
+        .map(|property| time(property).with_context(|| named("DTSTAMP")))
+        .transpose()?
+        .map(|value| value.instant);
 
     Ok(IcalEvent {
         uid,
@@ -1277,6 +1315,7 @@ fn parse_ical_event(
         transp,
         sequence,
         last_modified,
+        dtstamp,
     })
 }
 
@@ -1362,12 +1401,26 @@ fn ingest(
     options: IngestOptions,
 ) -> Result<IngestReceipt> {
     validate_calendars(documents)?;
+    if let Some(calendar) = &options.complete_calendar {
+        planner_model::validate_label("export calendar", calendar)?;
+        if documents.len() != 1 {
+            bail!(
+                "a complete export is one document; {} were supplied",
+                documents.len()
+            );
+        }
+    }
     storage.update("ingest iCalendar events", |loaded| {
         let mut staged = BTreeMap::<Id, Fragment>::new();
         let mut rereadings = Vec::new();
         let mut total = 0usize;
         let mut duplicates = 0usize;
         let mut revisions = 0usize;
+        // Every version the document holds, staged or already resident, and
+        // the latest DTSTAMP: what a complete export observation records.
+        let mut held = BTreeSet::<Id>::new();
+        let mut held_lineages = BTreeSet::<planner_model::Lineage>::new();
+        let mut exported_at = None::<DateTime<Utc>>;
 
         for document in documents {
             for calendar in ical::IcalParser::new(document.text.as_bytes()) {
@@ -1375,8 +1428,9 @@ fn ingest(
                 let zones = calendar_zones(&calendar);
                 for source in &calendar.events {
                     total += 1;
-                    let source = parse_ical_event(source, &zones, options)
+                    let source = parse_ical_event(source, &zones, &options)
                         .with_context(|| format!("parse VEVENT in {}", document.name))?;
+                    exported_at = exported_at.max(source.dtstamp);
                     let mut draft = empty_event_draft(
                         source.uid.clone(),
                         single_line(
@@ -1408,6 +1462,11 @@ fn ingest(
                         make_interval(instant, instant)
                     });
                     let fragment = event_fragment(&draft)?;
+                    let id = fragment.root().expect("event fragment has one root");
+                    held.insert(id);
+                    if let Some(row) = planner_model::event(fragment.facts(), id) {
+                        held_lineages.insert(planner_model::lineage(&row));
+                    }
                     match stage_import_event(loaded, &mut staged, &mut rereadings, fragment)? {
                         Staged::Duplicate => duplicates += 1,
                         Staged::Revision => revisions += 1,
@@ -1417,11 +1476,52 @@ fn ingest(
             }
         }
 
+        let mut export = None;
+        let mut export_fragment = None;
+        if let Some(calendar) = &options.complete_calendar {
+            let exported_at = exported_at.ok_or_else(|| {
+                anyhow!(
+                    "a complete export is dated by its latest DTSTAMP, and {} has none",
+                    documents[0].name
+                )
+            })?;
+            let instant = chrono_to_epoch(exported_at);
+            let observation =
+                planner_model::export_fragment(calendar, make_interval(instant, instant), &held)?;
+            let id = observation.root().expect("export fragment has one root");
+            let recorded = !exists!(pattern!(&loaded.facts, [{ id @
+                metadata::tag: &KIND_EXPORT_ID,
+            }]));
+            let handle = planner_model::text_handle(calendar);
+            let earlier = planner_model::exports(&loaded.facts)
+                .into_iter()
+                .filter(|row| row.calendar == handle)
+                .collect::<Vec<_>>();
+            let point = make_interval(instant, instant).raw;
+            let newest = earlier.iter().all(|row| row.exported_at.raw <= point);
+            let absent = earlier
+                .iter()
+                .flat_map(|row| row.versions.iter())
+                .filter_map(|version| planner_model::event(&loaded.facts, *version))
+                .map(|row| planner_model::lineage(&row))
+                .filter(|lineage| !held_lineages.contains(lineage))
+                .collect::<BTreeSet<_>>()
+                .len();
+            export = Some(ExportReceipt {
+                calendar: calendar.clone(),
+                exported_at: instant,
+                recorded,
+                newest,
+                absent,
+            });
+            export_fragment = recorded.then_some(observation);
+        }
+
         let imported = staged
             .values()
             .map(|fragment| fragment.root().expect("event fragment has one root"))
             .collect::<Vec<_>>();
-        let fragment = if imported.is_empty() {
+        let fragment = if imported.is_empty() && export_fragment.is_none() {
             None
         } else {
             let mut fragment = Fragment::empty();
@@ -1430,6 +1530,9 @@ fn ingest(
             }
             for rereading in rereadings {
                 fragment += rereading;
+            }
+            if let Some(observation) = export_fragment {
+                fragment += observation;
             }
             Some(fragment)
         };
@@ -1440,6 +1543,7 @@ fn ingest(
                 total,
                 duplicates,
                 revisions,
+                export,
             },
         ))
     })

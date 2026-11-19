@@ -77,7 +77,27 @@ pub fn ingested(receipt: &IngestReceipt, out: &mut Out<'_>) -> Result<()> {
         receipt.total,
         receipt.revisions,
         receipt.duplicates
-    ))
+    ))?;
+    if let Some(export) = &receipt.export {
+        let when = epoch_to_chrono_utc(export.exported_at)?.format("%Y-%m-%d %H:%M:%S UTC");
+        let recorded = if export.recorded {
+            "recorded"
+        } else {
+            "already recorded"
+        };
+        if export.newest {
+            out.line(format!(
+                "complete export of calendar '{}' made {when} {recorded}; {} earlier events no longer in it stop showing",
+                export.calendar, export.absent
+            ))?;
+        } else {
+            out.line(format!(
+                "complete export of calendar '{}' made {when} {recorded}; a later export is already recorded, so it changes nothing",
+                export.calendar
+            ))?;
+        }
+    }
+    Ok(())
 }
 pub fn show(detail: &EventDetail, out: &mut Out<'_>) -> Result<()> {
     let row = &detail.event;
