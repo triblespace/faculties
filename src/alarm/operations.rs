@@ -38,7 +38,7 @@ use super::{
     rung_name, step_fragment, steps, via_name, Ack, Note, Outcome, Raise, Resolve, Step, StepRow,
     TextHandle, SECOND,
 };
-use crate::relations::{self, Head};
+use crate::relations;
 use crate::schemas::alarm::{
     alarm as attrs, CLASSES, DEFAULT_SCOPE_ID, KIND_ACK, KIND_ALARM, KIND_FALSE_ALARM, KIND_NOTE,
     KIND_RESOLVE, KIND_TEST, VIA_RELAYED,
@@ -53,7 +53,7 @@ use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore
 pub type Reader = AcquiringReader<FacultySnapshot>;
 
 /// The affinity a Relations person must carry to raise an alarm.
-pub const ZOOID_AFFINITY: &str = "zooid";
+pub use crate::relations::ZOOID_AFFINITY;
 
 /// How often `raise` retries an observation it could not read completely,
 /// and how long it waits between tries.
@@ -765,20 +765,8 @@ pub(crate) fn resolve_zooid(view: &View, selector: &str) -> Result<Id> {
     }
     let person = resolve_active(view, selector)
         .with_context(|| format!("raiser {selector:?} is not an active Relations person"))?;
-    let heads = match relations::profile_head(&view.relations, person)? {
-        Head::Unique(head) => vec![head],
-        Head::Forked(heads) => heads,
-        Head::Missing => Vec::new(),
-    };
-    for head in heads {
-        let profile = relations::profile_snapshot(&view.relations, head)?;
-        for affinity in profile.affinities {
-            if read_text(&view.reader, affinity)
-                .is_some_and(|text| text.trim().eq_ignore_ascii_case(ZOOID_AFFINITY))
-            {
-                return Ok(person);
-            }
-        }
+    if relations::carries_zooid_affinity(&view.reader, &view.relations, person)? {
+        return Ok(person);
     }
     bail!("raiser {selector:?} is not a zooid: only a live zooid raises an alarm")
 }

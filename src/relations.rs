@@ -1120,6 +1120,54 @@ where
     }
 }
 
+/// The affinity that marks a colony zooid in Relations.
+pub const ZOOID_AFFINITY: &str = "zooid";
+
+/// Whether any current profile head of `person` carries [`ZOOID_AFFINITY`].
+/// A fork is grow-only evidence: one head carrying it is enough. An
+/// affinity text that is not here does not match.
+pub fn carries_zooid_affinity<Store, P>(reader: &Store, facts: &P, person: Id) -> Result<bool>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let heads = match profile_head(facts, person)? {
+        Head::Unique(head) => vec![head],
+        Head::Forked(heads) => heads,
+        Head::Missing => Vec::new(),
+    };
+    for head in heads {
+        for affinity in profile_snapshot(facts, head)?.affinities {
+            if read_text(reader, affinity)
+                .is_ok_and(|text| text.trim().eq_ignore_ascii_case(ZOOID_AFFINITY))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Every person carrying [`ZOOID_AFFINITY`] who is not recorded as retired.
+/// A missing or forked lifecycle is not evidence of retirement, so such a
+/// person is kept.
+pub fn live_zooids<Store, P>(reader: &Store, facts: &P) -> Result<Vec<Id>>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let mut zooids = Vec::new();
+    for person in person_anchors(facts) {
+        if person_is_retired(facts, person).unwrap_or(false) {
+            continue;
+        }
+        if carries_zooid_affinity(reader, facts, person)? {
+            zooids.push(person);
+        }
+    }
+    Ok(zooids)
+}
+
 pub fn current_group<P>(facts: &P, group_id: Id) -> Result<GroupSnapshot>
 where
     P: TriblePattern,

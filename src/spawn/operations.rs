@@ -1274,6 +1274,11 @@ impl Spawn {
         }
     }
 
+    /// The storage every operation reads and writes through.
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Self {
         self.launcher = launcher;
         self
@@ -2084,16 +2089,7 @@ impl Spawn {
 
     /// Every spawn, by name.
     pub fn list(&self) -> Result<Vec<SpawnView>> {
-        self.observe(|facts, reader| {
-            let mut spawns = find!(
-                (spawn: Id, brief: TextHandle),
-                pattern!(facts, [{ ?spawn @ metadata::tag: KIND_SPAWN, attrs::brief: ?brief }])
-            )
-            .map(|(spawn, brief)| spawn_view(facts, reader, spawn, brief))
-            .collect::<Result<Vec<_>>>()?;
-            spawns.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-            Ok(spawns)
-        })
+        self.observe(|facts, reader| spawns_in(facts, reader))
     }
 
     /// One spawn by its name.
@@ -2207,32 +2203,7 @@ impl Spawn {
 
     /// Every request, or only those addressed to `host`, oldest first.
     pub fn requests(&self, host: Option<HostKey>) -> Result<Vec<RequestView>> {
-        self.observe(|facts, reader| {
-            let mut ids = find!(
-                (request: Id, at: IntervalValue),
-                pattern!(facts, [{ ?request @
-                    metadata::tag: KIND_REQUEST,
-                    metadata::created_at: ?at,
-                }])
-            )
-            .collect::<Vec<_>>();
-            ids.sort_by_key(|(request, at)| {
-                let start = at
-                    .try_from_inline::<(Epoch, Epoch)>()
-                    .map(|(start, _)| start.to_tai_duration().total_nanoseconds())
-                    .unwrap_or(i128::MIN);
-                (start, *request)
-            });
-            // A request with two times sorts by its earliest and is read once.
-            let mut seen = std::collections::HashSet::new();
-            let views = ids
-                .into_iter()
-                .filter(|(request, _)| seen.insert(*request))
-                .map(|(request, _)| request_view(facts, reader, request))
-                .filter(|view| host.map_or(true, |host| view.host.contains(&host)))
-                .collect();
-            Ok(views)
-        })
+        self.observe(|facts, reader| Ok(requests_in(facts, reader, host)))
     }
 
     /// One keeper pass: reconcile every request addressed to this host
@@ -2688,9 +2659,56 @@ fn read_text<R: BlobStoreGet + ?Sized>(reader: &R, handle: TextHandle) -> Option
         .map(|text| text.to_string())
 }
 
-fn spawn_view(
+/// Every spawn in these facts, by name. [`Spawn::list`] over facts a caller
+/// already holds, such as the viewer's routed Spawn collection.
+pub(super) fn spawns_in<R: BlobStoreGet + ?Sized>(
     facts: &FactArchive,
-    reader: &AcquiringReader<FacultySnapshot>,
+    reader: &R,
+) -> Result<Vec<SpawnView>> {
+    let mut spawns = find!(
+        (spawn: Id, brief: TextHandle),
+        pattern!(facts, [{ ?spawn @ metadata::tag: KIND_SPAWN, attrs::brief: ?brief }])
+    )
+    .map(|(spawn, brief)| spawn_view(facts, reader, spawn, brief))
+    .collect::<Result<Vec<_>>>()?;
+    spawns.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    Ok(spawns)
+}
+
+/// Every request in these facts, or only those addressed to `host`, oldest
+/// first. [`Spawn::requests`] over facts a caller already holds.
+pub(super) fn requests_in<R: BlobStoreGet + ?Sized>(
+    facts: &FactArchive,
+    reader: &R,
+    host: Option<HostKey>,
+) -> Vec<RequestView> {
+    let mut ids = find!(
+        (request: Id, at: IntervalValue),
+        pattern!(facts, [{ ?request @
+            metadata::tag: KIND_REQUEST,
+            metadata::created_at: ?at,
+        }])
+    )
+    .collect::<Vec<_>>();
+    ids.sort_by_key(|(request, at)| {
+        let start = at
+            .try_from_inline::<(Epoch, Epoch)>()
+            .map(|(start, _)| start.to_tai_duration().total_nanoseconds())
+            .unwrap_or(i128::MIN);
+        (start, *request)
+    });
+    // A request with two times sorts by its earliest and is read once.
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .filter(|(request, _)| seen.insert(*request))
+        .map(|(request, _)| request_view(facts, reader, request))
+        .filter(|view| host.map_or(true, |host| view.host.contains(&host)))
+        .collect()
+}
+
+fn spawn_view<R: BlobStoreGet + ?Sized>(
+    facts: &FactArchive,
+    reader: &R,
     spawn: Id,
     brief: TextHandle,
 ) -> Result<SpawnView> {
@@ -2727,9 +2745,9 @@ fn spawn_view(
     })
 }
 
-fn run_view(
+fn run_view<R: BlobStoreGet + ?Sized>(
     facts: &FactArchive,
-    reader: &AcquiringReader<FacultySnapshot>,
+    reader: &R,
     run: Id,
     started: IntervalValue,
 ) -> RunView {
@@ -2863,9 +2881,9 @@ fn has_outcome(facts: &FactArchive, request: Id, kind: Id) -> bool {
     .is_some()
 }
 
-fn request_view(
+fn request_view<R: BlobStoreGet + ?Sized>(
     facts: &FactArchive,
-    reader: &AcquiringReader<FacultySnapshot>,
+    reader: &R,
     request: Id,
 ) -> RequestView {
     let texts = |handles: Vec<TextHandle>| -> Vec<String> {

@@ -330,15 +330,7 @@ impl Compass {
     /// Every goal's current status and tags, read from one frozen view.
     pub fn goal_states(&self) -> Result<Vec<GoalState>> {
         self.storage().with_view(|space, reader, status_register| {
-            all_goal_ids(space)
-                .into_iter()
-                .map(|goal| {
-                    let status = task_latest_status(reader, space, status_register, goal)?
-                        .map(|(status, _)| status);
-                    let tags = task_tags(reader, space, goal, &[])?;
-                    Ok(GoalState { goal, status, tags })
-                })
-                .collect()
+            goal_states_in(reader, space, status_register)
         })
     }
 
@@ -376,6 +368,34 @@ impl Compass {
     pub fn resolve(&self, prefix: &str) -> Result<Id> {
         resolve(self.storage(), prefix.to_owned())
     }
+}
+
+/// [`Compass::goal_states`] over facts and a status register a caller already
+/// holds, such as the viewer's routed Compass dataset.
+pub fn goal_states_in<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    status_register: &LwwQuery,
+) -> Result<Vec<GoalState>> {
+    all_goal_ids(space)
+        .into_iter()
+        .map(|goal| {
+            let status =
+                task_latest_status(reader, space, status_register, goal)?.map(|(status, _)| status);
+            let tags = task_tags(reader, space, goal, &[])?;
+            Ok(GoalState { goal, status, tags })
+        })
+        .collect()
+}
+
+/// [`Compass::reading`] of one goal id over facts a caller already holds.
+pub fn goal_reading_in<P: TriblePattern>(
+    reader: &impl BlobStoreGet,
+    space: &P,
+    status_register: &LwwQuery,
+    goal: Id,
+) -> Result<GoalReading> {
+    goal_reading(reader, space, status_register, goal)
 }
 
 // ── on-demand board queries ───────────────────────────────────────────

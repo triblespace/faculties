@@ -12,9 +12,14 @@
 //! that touches the pile, Relations, Message or systemd is in [`operations`].
 
 pub mod cli;
+pub mod colony;
 pub mod mcp;
 pub mod operations;
 
+pub use colony::{
+    colony_view, render_colony, ColonyOptions, ColonyRole, ColonyRoles, ColonyView, Evidence,
+    ParentSource, ParentView,
+};
 pub use operations::{
     choose_provider, inbox_failure, keep_lock_path, GoalRequest, InboxAnswer, InboxHook,
     InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,

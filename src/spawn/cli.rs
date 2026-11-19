@@ -148,6 +148,17 @@ enum Command {
     },
     /// Every spawn, one line each.
     List,
+    /// Each parent persona: its doing goals, the zooids it started that have
+    /// no end recorded, finished reports it has not read, open ask-jp goals
+    /// and when it was last seen. Read from existing records; a persona with
+    /// no current evidence is `unknown`, never idle.
+    Colony {
+        /// Also show this persona (label, alias or id), beside every spawner
+        /// and every resident zooid (affinity zooid, not retired, not a
+        /// spawned run's own persona).
+        #[arg(long = "persona", value_name = "PERSONA")]
+        personas: Vec<String>,
+    },
     /// One spawn and all its runs, with the latest report.
     Show {
         name: String,
@@ -474,6 +485,10 @@ pub fn run() -> Result<()> {
             Command::Keep { workdir, .. } => {
                 let pass = spawn.keep_once(&keep_config(workdir)?)?;
                 crate::cli::with_output("spawn", |out| out.text(render_pass(&pass)))
+            }
+            Command::Colony { personas } => {
+                let view = spawn.colony(&super::ColonyOptions { personas })?;
+                crate::cli::with_output("spawn", |out| out.text(super::render_colony(&view)))
             }
             Command::List => {
                 let spawns = spawn.list()?;
