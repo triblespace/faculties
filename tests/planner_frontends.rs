@@ -118,7 +118,7 @@ fn direct_add_and_initial_note_are_one_publication_and_cancel_is_monotone() {
 }
 
 #[test]
-fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
+fn resident_ingest_stages_full_batch_and_keeps_changed_definitions_as_versions() {
     let fixture = Fixture::new();
     let planner = fixture.operations();
     let a = calendar("a@example", "first");
@@ -157,14 +157,17 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
             IngestOptions::default(),
         )
         .unwrap();
+    // A later SEQUENCE is a new definition of the same event: a new version,
+    // published beside the first, never a refused conflict.
     assert_eq!(
         (again.imported.len(), again.total, again.duplicates),
-        (0, 1, 1)
+        (1, 1, 0)
     );
-    assert_eq!(fixture.commits(), 1);
+    assert_eq!(fixture.commits(), 2);
+    assert_eq!(planner.list(window(), false).unwrap().len(), 2);
     let new = calendar("not-published@example", "staged only");
     let conflict = calendar("a@example", "changed");
-    let error = planner
+    let both = planner
         .ingest(
             &[
                 CalendarInput {
@@ -178,10 +181,15 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
             ],
             IngestOptions::default(),
         )
-        .unwrap_err();
-    assert!(error.to_string().contains("immutable fields differ"));
-    assert_eq!(fixture.commits(), 1);
-    assert_eq!(planner.list(window(), false).unwrap().len(), 2);
+        .unwrap();
+    // A changed definition under a known UID is another version, not an error;
+    // the SEQUENCE:99 version stays current, so a@example still lists once.
+    assert_eq!(
+        (both.imported.len(), both.total, both.duplicates),
+        (2, 2, 0)
+    );
+    assert_eq!(fixture.commits(), 3);
+    assert_eq!(planner.list(window(), false).unwrap().len(), 3);
     let malformed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:missing uid\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     assert!(planner
         .ingest(
@@ -198,7 +206,8 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
             IngestOptions::default()
         )
         .is_err());
-    assert_eq!(fixture.commits(), 1);
+    // A malformed document still refuses the whole batch: nothing published.
+    assert_eq!(fixture.commits(), 3);
 }
 
 #[test]
