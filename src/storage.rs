@@ -808,9 +808,12 @@ where
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let Some(missing) = error
-            .chain()
+        // A blob missing beneath a Resolution is that fault's diagnosis, not
+        // a blob to acquire.
+        let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+        let Some(missing) = triblespace::core::repo::recovery_chain(cause)
             .find_map(|error| error.downcast_ref::<MissingBlob>())
+            .copied()
         else {
             return Err(error);
         };
@@ -863,15 +866,16 @@ where
     S: SnapshotSource + AsyncBlobStoreAcquire,
     S::Snapshot: BlobStoreList,
 {
+    // Neither looks beneath a Resolution: its cause is that fault's diagnosis.
     let missing = |error: &anyhow::Error| {
-        error
-            .chain()
+        let error: &(dyn std::error::Error + 'static) = error.as_ref();
+        triblespace::core::repo::recovery_chain(error)
             .find_map(|error| error.downcast_ref::<MissingBlob>())
             .map(|missing| missing.handle)
     };
     let undecodable = |error: &anyhow::Error| {
-        error
-            .chain()
+        let error: &(dyn std::error::Error + 'static) = error.as_ref();
+        triblespace::core::repo::recovery_chain(error)
             .find_map(|error| error.downcast_ref::<anybytes::view::ViewError>())
             .map(|error| format!("undecodable: {error}"))
     };

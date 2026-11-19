@@ -1418,9 +1418,7 @@ struct OrientQuery<'a> {
 }
 
 fn is_payload_pending(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|source| source.downcast_ref::<MissingBlob>().is_some())
+    recovery_causes(error).any(|source| source.downcast_ref::<MissingBlob>().is_some())
 }
 
 /// An unavailable observation may be retried; authority, malformed descriptors,
@@ -1430,7 +1428,7 @@ fn is_payload_pending(error: &anyhow::Error) -> bool {
 /// (`Unmappable`) is not: upkeep treats it as lag and never returns it
 /// ([`crate::storage::tolerate_own_lag`]), and waiting would not change it.
 fn is_preparation_pending(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| {
+    recovery_causes(error).any(|source| {
         source.downcast_ref::<MissingBlob>().is_some()
             // Typed incomplete support includes unavailable dependencies and
             // a mapping's bounded inability to represent a foundation. It is
@@ -4770,7 +4768,7 @@ fn wait_storage_changed(sampled: &FacultySnapshot, previous: &FacultySnapshot) -
 }
 
 fn pending_blob(error: &anyhow::Error) -> Option<MissingBlob> {
-    error.chain().find_map(|source| {
+    recovery_causes(error).find_map(|source| {
         source.downcast_ref::<MissingBlob>().copied().or_else(|| {
             match source.downcast_ref::<CollectionRealizationError>() {
                 Some(CollectionRealizationError::MissingDependency { member }) => {
@@ -5915,6 +5913,34 @@ impl std::error::Error for WaitSnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
 }
 
+/// A nested selection that failed after the operation owning it completed.
+/// The operation's outcome is this failed settlement. Whatever stopped the
+/// selection (a deadline, a missing blob) is diagnostic ancestry: it stays
+/// reachable through `source` but never makes this a published timeout, a
+/// cancellation or a pending read. [`recovery_causes`] stops here.
+#[derive(Debug)]
+struct SelectionSettlementError(anyhow::Error);
+
+impl std::fmt::Display for SelectionSettlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Orient selection failed to settle")
+    }
+}
+impl std::error::Error for SelectionSettlementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+}
+
+/// The causes Orient may base recovery on: retrying, waiting for a blob or
+/// publishing a timeout. This is TribleSpace's recovery walk, which stops
+/// beneath a Resolution, stopping also at a failed selection settlement.
+/// Exact known wrappers are recognised by exact downcasts instead
+/// ([`next::is_cancelled`]).
+fn recovery_causes(error: &anyhow::Error) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> + '_ {
+    let error: &(dyn std::error::Error + 'static) = error.as_ref();
+    triblespace::core::repo::recovery_chain(error)
+        .take_while(|cause| !cause.is::<SelectionSettlementError>())
+}
+
 fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> &str {
     panic.downcast_ref::<String>().map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-text panic payload")
@@ -5926,7 +5952,7 @@ fn finish_wait_selection<T>(result: Result<T>, settlement: Result<()>) -> Result
         Err(error) if next::is_cancelled(&error) => result,
         Ok(()) => result,
         Err(error) => match result {
-            Ok(_) => Err(error),
+            Ok(_) => Err(SelectionSettlementError(error).into()),
             // Do not retain Cancelled as the type of a mixed failure: the
             // owner must not normalize away the other failed settlement.
             Err(operation) => Err(anyhow!("Orient operation failed: {operation:#}; \
@@ -5988,8 +6014,13 @@ mod settlement_tests {
             assert!(!matches!(next::completion(Err(error), false), Ok(next::NextCompletion::CancelledBeforeReport)),
                 "a nested deadline must not become CancelledBeforeReport");
         }
-        // Alone, the nested deadline keeps its type for the timeout path.
-        assert!(next::is_deadline(&finish_wait_selection::<()>(Ok(()), Err(deadline())).unwrap_err()));
+        // Alone, the nested deadline stays a failed settlement, not a timeout.
+        let error = finish_wait_selection::<()>(Ok(()), Err(deadline())).unwrap_err();
+        assert!(!next::is_deadline(&error), "{error:#}");
+        assert!(error.is::<SelectionSettlementError>());
+        // The deadline is still reachable for diagnostics.
+        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<AcquiringReadInterrupted>(),
+            Some(AcquiringReadInterrupted::DeadlineExceeded))));
     }
 }
 
@@ -7797,7 +7828,7 @@ mod tests {
     /// The error a nested selection returns when its control interrupts the
     /// fetch of an attached descriptor: produced by the real acquiring reader,
     /// not assembled from its parts.
-    fn interrupted_descriptor_fetch(
+    pub(super) fn interrupted_descriptor_fetch(
         interruption: triblespace::core::repo::async_store::AcquiringReadInterrupted,
     ) -> anyhow::Error {
         use triblespace::core::repo::async_store::{
@@ -7874,8 +7905,14 @@ mod tests {
                 "a nested deadline must not become CancelledBeforeReport"
             );
         }
-        // The typed cause now reaches the chain, so alone it is the timeout.
-        assert!(next::is_deadline(
+        // A Resolution's cause is diagnosis: alone it is no timeout either,
+        // though the deadline stays reachable through the chain.
+        assert!(!next::is_deadline(&nested()));
+        assert!(nested().chain().any(|cause| matches!(
+            cause.downcast_ref::<AcquiringReadInterrupted>(),
+            Some(AcquiringReadInterrupted::DeadlineExceeded)
+        )));
+        assert!(!next::is_deadline(
             &finish_wait_selection::<()>(Ok(()), Err(nested())).unwrap_err()
         ));
     }
@@ -7921,6 +7958,51 @@ mod tests {
             Err(CollectionRealizationError::resolution("conflicting equations").into()),
         )
         .is_err());
+    }
+
+    /// Core's passive attached read builds this when the store reported the
+    /// descriptor resident and its get then missed. Core's
+    /// a_descriptor_reported_resident_whose_get_fails_stays_a_fault drives
+    /// that with a real reader; this side cannot construct core's ReadFailure,
+    /// so the get error here is the MissingBlob itself.
+    fn resident_descriptor_get_failure(collection: triblespace::core::collection::CollectionHandle) -> anyhow::Error {
+        CollectionRealizationError::resolution_from(
+            format!("load collection descriptor {}", hex::encode_upper(collection.raw)),
+            triblespace::core::collection::CollectionDescriptorError::Get {
+                collection,
+                source: MissingBlob { handle: Inline::new(collection.raw) },
+            },
+        )
+        .into()
+    }
+
+    #[test]
+    fn a_descriptor_reported_resident_whose_get_fails_is_no_pending_read() {
+        let collection = Inline::new([0x5A; 32]);
+        let fault = || resident_descriptor_get_failure(collection);
+        for error in [fault(), finish_wait_selection::<()>(Ok(()), Err(fault())).unwrap_err()] {
+            assert!(!is_preparation_pending(&error), "{error:#}");
+            assert!(pending_blob(&error).is_none(), "{error:#}");
+            assert!(!is_payload_pending(&error), "{error:#}");
+            let cause: &(dyn std::error::Error + 'static) = error.as_ref();
+            assert!(!triblespace::core::repo::is_missing_blob(cause));
+            // The real cause is still there for diagnostics.
+            assert!(error.chain().any(|cause| cause
+                .downcast_ref::<MissingBlob>()
+                .is_some_and(|missing| missing.handle.raw == collection.raw)));
+        }
+    }
+
+    #[test]
+    fn an_absent_dependency_is_still_a_pending_read() {
+        let raw = [0x6B; 32];
+        for error in [
+            anyhow::Error::from(CollectionRealizationError::MissingDependency { member: Inline::new(raw) }),
+            anyhow::Error::from(MissingBlob { handle: Inline::new(raw) }).context("read selected payload"),
+        ] {
+            assert!(is_preparation_pending(&error), "{error:#}");
+            assert_eq!(pending_blob(&error).map(|missing| missing.handle.raw), Some(raw));
+        }
     }
 
     #[test]

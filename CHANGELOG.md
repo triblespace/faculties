@@ -16,6 +16,12 @@ All notable changes to this project will be documented in this file.
   `orient wait` now reports a panic in the wait as an error instead of
   re-raising it, and a nested selection that fails for any reason other than
   its own cancellation is reported instead of discarded.
+  Such a failed settlement is its own error: neither its deadline nor a
+  missing blob beneath it makes the call a published timeout or a pending
+  read. Recovery classifiers (deadline, pending preparation and payload,
+  the pending blob, and `storage::read`/`read_presentable` acquisition) also
+  stop beneath a TribleSpace resolution error, whose cause is diagnosis. A
+  descriptor reported resident whose read fails therefore stays a fault.
 
 - Compass can mark a goal unclear: `Compass::mark_unclear` (and
   `mark_unclear_in` over a host's borrowed pile) writes an ordinary attributed

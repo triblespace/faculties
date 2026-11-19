@@ -177,27 +177,37 @@ impl Next {
                     self.quiet_snapshot.as_ref(),
                 ))
             };
-            match result {
-                Ok(outcome) if !outcome.news_printed => {
-                    parts.push(Part::Text { text: format!("{}\n", outcome.timeout_text()) });
-                    offer_timeout(&send, self.owner.clone(), parts).map(|()| NextCompletion::Completed)
-                }
-                Ok(_) => Ok(NextCompletion::Completed),
-                Err(error) if !offered.get() && is_deadline(&error) => {
-                    parts.push(Part::Text { text:
-                        "Orient next reached its deadline before a complete readable report was accepted.\n".to_owned() });
-                    offer_timeout(&send, self.owner.clone(), parts).map(|()| NextCompletion::Completed)
-                }
-                // This is still inside scope: a subsequent storage close
-                // failure cannot be mistaken for normal cancellation.
-                Err(error) => completion(Err(error), offered.get()),
-            }
+            // This is still inside scope: a subsequent storage close
+            // failure cannot be mistaken for normal cancellation.
+            conclude(result, offered.get(), parts, &send, self.owner.clone())
         })
     }
 }
 
+/// How the wait's settled result becomes this call's output: a quiet or
+/// deadline-ended wait publishes a timeout, anything else is completion.
+fn conclude(result: Result<WaitOutcome>, offered: bool, mut parts: Vec<Part>,
+    send: &Sender<PreparedReport>, owner: Arc<()>,
+) -> Result<NextCompletion> {
+    match result {
+        Ok(outcome) if !outcome.news_printed => {
+            parts.push(Part::Text { text: format!("{}\n", outcome.timeout_text()) });
+            offer_timeout(send, owner, parts).map(|()| NextCompletion::Completed)
+        }
+        Ok(_) => Ok(NextCompletion::Completed),
+        Err(error) if !offered && is_deadline(&error) => {
+            parts.push(Part::Text { text:
+                "Orient next reached its deadline before a complete readable report was accepted.\n".to_owned() });
+            offer_timeout(send, owner, parts).map(|()| NextCompletion::Completed)
+        }
+        Err(error) => completion(Err(error), offered),
+    }
+}
+
+/// A deadline Orient itself reached. Neither a failed selection settlement
+/// nor a Resolution's diagnostic cause counts ([`super::recovery_causes`]).
 pub(super) fn is_deadline(error: &anyhow::Error) -> bool {
-    error.chain().any(|source| matches!(source.downcast_ref::<AcquiringReadInterrupted>(),
+    super::recovery_causes(error).any(|source| matches!(source.downcast_ref::<AcquiringReadInterrupted>(),
         Some(AcquiringReadInterrupted::DeadlineExceeded)))
 }
 
@@ -992,6 +1002,74 @@ mod tests {
         first.acknowledge(first_report).unwrap();
         assert!(first.is_settled());
         assert!(fixture.presented());
+    }
+
+    /// Runs `Next::run`'s own conclusion of a settled wait on the call's owned
+    /// worker, and returns what the caller sees: the join outcome and the
+    /// kind of any published report.
+    fn concluded(result: Result<WaitOutcome>) -> (Result<NextCompletion>, Option<NextKind>) {
+        let owner = Arc::new(());
+        let worker_owner = owner.clone();
+        let mut next = PendingNext::spawn(AcquiringReadControl::new(None), owner, move |send| {
+            conclude(result, false, Vec::new(), &send, worker_owner)
+        }).unwrap();
+        let completion = next.join();
+        let published = next.ready.try_recv().ok().map(|report| report.kind());
+        (completion, published)
+    }
+
+    fn quiet() -> WaitOutcome { WaitOutcome { news_printed: false, view_pending: false, had_ready_frame: true } }
+    fn printed() -> WaitOutcome { WaitOutcome { news_printed: true, view_pending: false, had_ready_frame: true } }
+
+    #[test]
+    fn nested_selection_deadline_is_a_failed_settlement_through_next() {
+        use super::super::tests::interrupted_descriptor_fetch;
+        let nested: [fn() -> anyhow::Error; 2] = [
+            // The descriptor fetch, interrupted by the real acquiring reader.
+            || interrupted_descriptor_fetch(AcquiringReadInterrupted::DeadlineExceeded),
+            // Any other selection read that met the deadline.
+            || anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
+                .context("settle frozen Orient selection"),
+        ];
+        for nested in nested {
+            for outcome in [quiet(), printed()] {
+                let (completion, published) =
+                    concluded(finish_wait_selection(Ok(outcome), Err(nested())));
+                let error = completion.expect_err("a failed settlement fails the call");
+                assert_eq!(published, None, "no timeout is published: {error:#}");
+                // The deadline stays in the diagnostic text.
+                assert!(format!("{error:#}").contains("deadline exceeded"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn next_keeps_direct_deadlines_and_exact_cancellations() {
+        use super::super::tests::interrupted_descriptor_fetch;
+        // A deadline Orient met directly is a published timeout.
+        for direct in [
+            anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded),
+            WaitSnapshotError(AcquiringReadInterrupted::DeadlineExceeded.into()).into(),
+        ] {
+            let (completion, published) = concluded(Err(direct));
+            assert_eq!(completion.unwrap(), NextCompletion::Completed);
+            assert_eq!(published, Some(NextKind::Timeout));
+        }
+        // A bare cancellation before any offer settles without output.
+        let (completion, published) = concluded(Err(AcquiringReadInterrupted::Cancelled.into()));
+        assert_eq!(completion.unwrap(), NextCompletion::CancelledBeforeReport);
+        assert_eq!(published, None);
+        // The selection we cancelled, ending in its own descriptor-fetch
+        // cancellation, leaves the quiet wait's timeout in place.
+        let (completion, published) = concluded(finish_wait_selection(
+            Ok(quiet()), Err(interrupted_descriptor_fetch(AcquiringReadInterrupted::Cancelled))));
+        assert_eq!(completion.unwrap(), NextCompletion::Completed);
+        assert_eq!(published, Some(NextKind::Timeout));
+        // A cancellation inside another failure is refused.
+        let (completion, published) = concluded(Err(anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
+            .context("closing storage also failed")));
+        assert!(completion.is_err());
+        assert_eq!(published, None);
     }
 
     #[test]
