@@ -429,19 +429,19 @@ impl MailViewer {
         view: DatasetView<'_>,
         relations: Option<DatasetView<'_>>,
     ) {
-        let revision = view.revision;
-        let relations_revision = relations.map(|view| view.revision);
-        let need_refresh = match self.live.as_ref() {
-            None => true,
-            Some(l) => {
-                l.cached_revision != revision || l.relations_cached_revision != relations_revision
-            }
-        };
-        if need_refresh {
-            self.live = Some(MailLive::refresh(view, relations));
-        }
-
         ctx.section("Mail", |ctx| {
+            let revision = view.revision;
+            let relations_revision = relations.map(|view| view.revision);
+            let need_refresh = match self.live.as_ref() {
+                None => true,
+                Some(l) => {
+                    l.cached_revision != revision || l.relations_cached_revision != relations_revision
+                }
+            };
+            if need_refresh {
+                self.live = Some(MailLive::refresh(view, relations));
+            }
+
             let Some(live) = self.live.as_ref() else {
                 return;
             };
