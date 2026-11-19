@@ -4,9 +4,17 @@
 //! asks which matters more. An answer is handed to the host as a
 //! `higher > lower` request; the host performs it as an ordinary Compass
 //! priority write (`Compass::prioritize`), with its own storage and identity.
-//! "Can't compare" records nothing. The widget reads only the immutable
+//! "Can't compare" records nothing. "Unclear" says the reader cannot tell
+//! what one goal does, so cannot judge it: the host writes an attributed
+//! Compass note tagged `unclear` (`Compass::mark_unclear`), which ranks
+//! nothing and moves no status, and the game moves on. A goal stays out of
+//! the game while an unclear note on it is unanswered
+//! ([`crate::compass::unclear_goals`]); a note that supersedes it, the
+//! explanation, brings it back. A goal's title opens its details (status, parents, notes) inside
+//! the card, read from the same view. The widget reads only the immutable
 //! [`DatasetView`] it is given and keeps session-local UI state: the pairs
-//! already offered, the current pair, and a small seeded generator.
+//! already offered, the current pair, the goals whose details are open, and
+//! a small seeded generator.
 //!
 //! Pairs are chosen by [`choose_pair`]: two open goals with no priority path
 //! between them (explicit priorities plus the child-before-parent rule),
@@ -26,6 +34,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 
+use crate::compass::operations::goal_reading_in;
 use crate::schemas::compass::{board, latest_status_event, KIND_GOAL_ID, KIND_NOTE_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
@@ -33,6 +42,21 @@ type TextHandle = Inline<Handle<UTF8String>>;
 
 /// Statuses a goal can be played in.
 const OPEN_STATUSES: [&str; 3] = ["todo", "doing", "blocked"];
+
+/// One answer the game hands to its host as a write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GameWrite {
+    /// Rank `higher` over `lower`.
+    Prioritize { higher: Id, lower: Id },
+    /// The reader cannot tell what this goal does; ask for an explanation.
+    Unclear(Id),
+}
+
+/// What the reader did with the pair on screen.
+enum Answer {
+    Write(GameWrite),
+    Skip,
+}
 
 /// Session-local state of the priority game.
 pub struct PriorityGame {
@@ -44,6 +68,8 @@ pub struct PriorityGame {
     pair: Option<(Id, Id)>,
     /// Pairs answered, refused or skipped this session, smaller id first.
     seen: HashSet<(Id, Id)>,
+    /// Goals of the current pair whose details are open.
+    details: BTreeSet<Id>,
     message: Option<String>,
 }
 
@@ -66,21 +92,22 @@ impl PriorityGame {
             open: BTreeSet::new(),
             pair: None,
             seen: HashSet::new(),
+            details: BTreeSet::new(),
             message: None,
         }
     }
 
-    /// Render the game. `prioritize(higher, lower)` hands one answer to the
-    /// host; `Err` is a refused write and is shown before the next pair.
+    /// Render the game. `write` hands one answer to the host; `Err` is a
+    /// refused write and is shown before the next pair.
     pub fn render(
         &mut self,
         ctx: &mut CardCtx<'_>,
         dataset: DatasetView<'_>,
-        mut prioritize: impl FnMut(Id, Id) -> Result<(), String>,
+        mut write: impl FnMut(GameWrite) -> Result<(), String>,
     ) {
         if self.revision != Some(dataset.revision) {
             self.revision = Some(dataset.revision);
-            self.open = open_goals(dataset);
+            self.open = playable_goals(dataset);
             let open = &self.open;
             let still_open = self.pair.is_some_and(|(a, b)| {
                 open.contains(&a)
@@ -92,10 +119,10 @@ impl PriorityGame {
             }
         }
         if self.pair.is_none() {
-            self.pair = choose_pair(dataset.facts, &self.open, &self.seen, &mut self.rng);
+            self.next_pair(dataset);
         }
 
-        let mut answer: Option<Option<(Id, Id)>> = None;
+        let mut answer: Option<Answer> = None;
         ctx.section("Priority game", |ctx| {
             let ui = ctx.ui_mut();
             if let Some(message) = self.message.as_ref() {
@@ -106,18 +133,34 @@ impl PriorityGame {
                 return;
             };
             ui.label(egui::RichText::new("Which matters more?").strong());
+            let details = &mut self.details;
             ui.columns(2, |columns| {
                 for (column, (goal, other)) in
                     columns.iter_mut().zip([(left, right), (right, left)])
                 {
-                    goal_card(column, dataset, goal);
-                    if column.button("this one").clicked() {
-                        answer = Some(Some((goal, other)));
-                    }
+                    goal_card(column, dataset, goal, details);
+                    column.horizontal(|ui| {
+                        if ui.button("this one").clicked() {
+                            answer = Some(Answer::Write(GameWrite::Prioritize {
+                                higher: goal,
+                                lower: other,
+                            }));
+                        }
+                        if ui
+                            .button("unclear")
+                            .on_hover_text(
+                                "I can't tell what this goal does. Records no ranking; \
+                                 asks for an explanation in a note.",
+                            )
+                            .clicked()
+                        {
+                            answer = Some(Answer::Write(GameWrite::Unclear(goal)));
+                        }
+                    });
                 }
             });
             if ui.button("can't compare").clicked() {
-                answer = Some(None);
+                answer = Some(Answer::Skip);
             }
         });
 
@@ -126,15 +169,35 @@ impl PriorityGame {
         };
         let (left, right) = self.pair.take().expect("answered pair is on screen");
         self.seen.insert(pair_key(left, right));
-        self.message = match answer {
-            None => Some("Skipped.".to_owned()),
-            Some((higher, lower)) => Some(match prioritize(higher, lower) {
-                Ok(()) => format!("{} over {}", title(dataset, higher), title(dataset, lower)),
-                Err(error) => format!("Not recorded: {error}"),
-            }),
-        };
+        self.message = Some(match answer {
+            Answer::Skip => "Skipped.".to_owned(),
+            Answer::Write(answer) => match (write(answer), answer) {
+                (Err(error), _) => format!("Not recorded: {error}"),
+                (Ok(()), GameWrite::Prioritize { higher, lower }) => {
+                    format!("{} over {}", title(dataset, higher), title(dataset, lower))
+                }
+                // A host may only queue the write; the next observed
+                // revision decides whether the goal leaves the game.
+                (Ok(()), GameWrite::Unclear(goal)) => {
+                    format!("Unclear sent: {}", title(dataset, goal))
+                }
+            },
+        });
+        self.next_pair(dataset);
+    }
+
+    fn next_pair(&mut self, dataset: DatasetView<'_>) {
+        self.details.clear();
         self.pair = choose_pair(dataset.facts, &self.open, &self.seen, &mut self.rng);
     }
+}
+
+/// Open goals that are not waiting for an explanation.
+fn playable_goals(dataset: DatasetView<'_>) -> BTreeSet<Id> {
+    let unclear = crate::compass::unclear_goals(dataset.facts);
+    let mut open = open_goals(dataset);
+    open.retain(|goal| !unclear.contains(goal));
+    open
 }
 
 /// Goals whose current status, read like the board reads it, is open. A goal
@@ -289,7 +352,7 @@ fn title(dataset: DatasetView<'_>, goal: Id) -> String {
     .unwrap_or_else(|| format!("{goal:x}"))
 }
 
-fn goal_card(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
+fn goal_card(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id, details: &mut BTreeSet<Id>) {
     let facts = dataset.facts;
     let status = dataset
         .lww_register(board::status_of.id(), metadata::created_at.id())
@@ -324,9 +387,23 @@ fn goal_card(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
             .map(str::to_owned)
     });
 
+    let open = details.contains(&goal);
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(egui::RichText::new(title(dataset, goal)).strong());
+        // The title opens the goal's details in place; it never votes.
+        let marker = if open { "\u{25BE}" } else { "\u{25B8}" };
+        let heading = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(format!("{marker} {}", title(dataset, goal))).strong(),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text(if open { "Hide details" } else { "Show details" });
+        if heading.clicked() && !details.remove(&goal) {
+            details.insert(goal);
+        }
         ui.label(
             egui::RichText::new(format!("{status} · {}", &format!("{goal:x}")[..8]))
                 .small()
@@ -335,10 +412,50 @@ fn goal_card(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
         if !tags.is_empty() {
             ui.label(egui::RichText::new(tags.join(" ")).small());
         }
-        if let Some(note) = note {
+        if open {
+            goal_details(ui, dataset, goal);
+        } else if let Some(note) = note {
             ui.label(egui::RichText::new(note).small().italics());
         }
     });
+}
+
+/// The goal's full id, parent chain and current notes, newest first: the
+/// reading `compass show` prints, from the view the game already holds.
+fn goal_details(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
+    ui.separator();
+    ui.label(egui::RichText::new(format!("{goal:x}")).small().monospace());
+    let Some(register) = dataset.lww_register(board::status_of.id(), metadata::created_at.id())
+    else {
+        ui.label(egui::RichText::new("Details are unavailable in this view.").small());
+        return;
+    };
+    let reading = match goal_reading_in(dataset.reader, dataset.facts, register, goal) {
+        Ok(reading) => reading,
+        Err(error) => {
+            ui.label(egui::RichText::new(format!("Details unreadable: {error:#}")).small());
+            return;
+        }
+    };
+    for (parent, parent_title) in &reading.ancestors {
+        ui.label(
+            egui::RichText::new(format!(
+                "under {parent_title} · {}",
+                &format!("{parent:x}")[..8]
+            ))
+            .small(),
+        );
+    }
+    if reading.notes.is_empty() {
+        ui.label(egui::RichText::new("No notes yet.").small().italics());
+    }
+    for note in reading.notes.iter().rev() {
+        ui.label(egui::RichText::new(&note.at).small().monospace().weak());
+        ui.add(
+            egui::Label::new(egui::RichText::new(&note.text).small())
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+    }
 }
 
 #[cfg(test)]

@@ -673,6 +673,47 @@ pub fn priority_notes<P: TriblePattern>(
     }
     notes
 }
+/// The note tag that says its author cannot tell what a goal does, and so
+/// cannot judge how important it is: a request for an explanation. It ranks
+/// nothing and moves no status.
+pub const UNCLEAR_TAG: &str = "unclear";
+
+/// The body of the note [`Compass::mark_unclear`] writes.
+pub const UNCLEAR_NOTE: &str =
+    "Unclear: I can't tell what this goal does, so I can't judge its importance. Please explain it in a note.";
+
+/// Goals with an unanswered unclear note: a note tagged [`UNCLEAR_TAG`] that
+/// no other note supersedes.
+///
+/// Nothing is retracted. The answer is an ordinary note on the goal that
+/// supersedes the unclear note (`compass note <goal> ... --supersedes
+/// <note>`), which Compass readings already treat as replacing it; an
+/// unrelated later note, such as a progress note, answers nothing. A new
+/// unclear note makes the goal unclear again.
+pub fn unclear_goals<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
+    let unclear = crate::schemas::compass::text_handle(UNCLEAR_TAG);
+    let superseded: BTreeSet<Id> = find!(
+        (newer: Id, old: Id),
+        pattern!(facts, [{ ?newer @
+            metadata::tag: &KIND_NOTE_ID,
+            metadata::supersedes: ?old,
+        }])
+    )
+    .map(|(_, old)| old)
+    .collect();
+    find!(
+        (goal: Id, note: Id, tag: TextHandle),
+        pattern!(facts, [{ ?note @
+            metadata::tag: &KIND_NOTE_ID,
+            board::task: ?goal,
+            board::tag: ?tag,
+        }])
+    )
+    .filter(|(_, note, tag)| *tag == unclear && !superseded.contains(note))
+    .map(|(goal, _, _)| goal)
+    .collect()
+}
+
 /// The complete priority relation used by Compass views.
 ///
 /// Explicit priority assertions are joined with the structural rule that a

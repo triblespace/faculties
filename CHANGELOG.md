@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Compass can mark a goal unclear: `Compass::mark_unclear` (and
+  `mark_unclear_in` over a host's borrowed pile) writes an ordinary attributed
+  note tagged `unclear` asking what the goal does. It ranks nothing and moves
+  no status. `compass::unclear_goals` reads a goal as unclear while such a
+  note is not superseded by another note; the explanation is a note that
+  supersedes it (`compass note <goal> ... --supersedes <note>`), and an
+  unrelated later note answers nothing.
+- The priority game has an "unclear" button per goal (host action
+  `HostAction::MarkGoalUnclear { goal }`), leaves unclear goals out of its
+  pairs, and opens a goal's details (full id, parents, current notes) in place
+  when its title is clicked, without voting. `viewer::perform_storage_action`
+  performs the Compass host actions with a host's storage and identity.
+- The wiki graph keeps every node a small dot at every zoom; labels still
+  appear when zoomed in. Hover and click reach the nearest node within a
+  fixed 9-point radius, independent of the drawn size.
 - `compass tag <goal> <tag>...` (MCP `compass_tag`) adds tags to an existing
   goal: the same `board::tag` fact `compass add --tag` writes, asserted later
   beside the goal's identity. Tags cannot be removed. Tags the goal already

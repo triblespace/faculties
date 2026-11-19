@@ -4,10 +4,10 @@ use super::{Target, Viewer};
 use crate::compass::Compass;
 use crate::storage::Storage;
 use crate::widgets::{
-    AtlasViewer, BranchTimeline, ColonyViewer, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
-    GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
-    PriorityGame, RelationsViewer, SourceKey, StorageState, TeamsViewer, TimelineSource,
-    TriageViewer, WidgetContext, WikiViewer,
+    AtlasViewer, BranchTimeline, ColonyViewer, CompassBoard, DecidePanel, DiscordViewer,
+    FilesViewer, GameWrite, GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel,
+    PlannerViewer, PriorityGame, RelationsViewer, SourceKey, StorageState, TeamsViewer,
+    TimelineSource, TriageViewer, WidgetContext, WikiViewer,
 };
 use std::sync::Arc;
 use triblespace::prelude::Id;
@@ -71,6 +71,34 @@ pub enum HostAction {
         higher: Id,
         lower: Id,
     },
+    /// Say the goal is unclear to the host's identity, as
+    /// `Compass::mark_unclear` does: an attributed note tagged `unclear`
+    /// asking for an explanation. It ranks nothing and moves no status.
+    MarkGoalUnclear {
+        goal: Id,
+    },
+}
+
+/// Perform one Compass write a widget asked for, with the host's own storage
+/// and identity. Every host calls this so they all write the same observation;
+/// `None` means the action is not a storage write (opening a file or link),
+/// which the host handles itself.
+pub fn perform_storage_action(
+    storage: &Storage,
+    persona: Option<&str>,
+    action: &HostAction,
+) -> Option<Result<(), String>> {
+    let compass = || Compass::with_storage(storage.clone());
+    let written = match action {
+        HostAction::WikiLink(_) | HostAction::Entity(_) => return None,
+        HostAction::Prioritize { higher, lower } => compass()
+            .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), persona)
+            .map(drop),
+        HostAction::MarkGoalUnclear { goal } => compass()
+            .mark_unclear(&format!("{goal:x}"), persona)
+            .map(drop),
+    };
+    Some(written.map_err(|error| format!("{error:#}")))
 }
 
 /// Supplies one frozen render boundary and its selection generation. App hosts
@@ -115,7 +143,7 @@ impl Host for Standalone {
     }
 }
 
-/// Perform one action for the standalone host, synchronously. A priority
+/// Perform one action for the standalone host, synchronously. A Compass
 /// write moves the pile stamp, so the next render observes it.
 fn perform(
     storage: &Storage,
@@ -128,15 +156,17 @@ fn perform(
             .dataset(SourceKey::Files)
             .ok_or_else(|| "Files are unavailable.".to_owned())
     };
+    if let Some(written) = perform_storage_action(storage, persona, &action) {
+        return written;
+    }
     match action {
         HostAction::WikiLink(selector) => {
             WikiViewer::open_file_with(files()?, &selector, || Ok(()))
         }
         HostAction::Entity(entity) => FilesViewer::open_entity_with(files()?, entity, || Ok(())),
-        HostAction::Prioritize { higher, lower } => Compass::with_storage(storage.clone())
-            .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), persona)
-            .map(drop)
-            .map_err(|error| format!("{error:#}")),
+        HostAction::Prioritize { .. } | HostAction::MarkGoalUnclear { .. } => {
+            unreachable!("Compass writes are storage actions")
+        }
     }
 }
 
@@ -203,9 +233,15 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
     }
 
     if target == Target::Dashboard || target == Target::Colony {
-        card(nb, host.clone(), "colony", ColonyViewer::default, |ctx, panel, sources, _| {
-            panel.render(ctx, sources);
-        });
+        card(
+            nb,
+            host.clone(),
+            "colony",
+            ColonyViewer::default,
+            |ctx, panel, sources, _| {
+                panel.render(ctx, sources);
+            },
+        );
     }
 
     if target == Target::Dashboard {
@@ -303,8 +339,13 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                 let Some(view) = sources.dataset(SourceKey::Compass) else {
                     return;
                 };
-                game.render(ctx, view, |higher, lower| {
-                    act(HostAction::Prioritize { higher, lower })
+                game.render(ctx, view, |answer| {
+                    act(match answer {
+                        GameWrite::Prioritize { higher, lower } => {
+                            HostAction::Prioritize { higher, lower }
+                        }
+                        GameWrite::Unclear(goal) => HostAction::MarkGoalUnclear { goal },
+                    })
                 });
             },
         );
@@ -565,6 +606,39 @@ mod tests {
             refused.contains("children are implicitly prioritized"),
             "{refused}"
         );
+    }
+
+    /// The standalone host writes an unclear answer as an attributed note
+    /// the next view reads as unclear, with no priority edge.
+    #[test]
+    fn standalone_unclear_writes_a_note_the_next_view_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let pile = directory.path().join("unclear.pile");
+        let key = directory.path().join("unclear.key");
+        std::fs::File::create(&pile).unwrap();
+        crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+        let storage = Storage::new(pile, Some(key));
+        let goal = Compass::with_storage(storage.clone())
+            .add("puzzling", Default::default())
+            .unwrap()
+            .goal;
+
+        let mut state = StorageState::with_storage(storage, [SourceKey::Compass]);
+        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        assert!(crate::compass::unclear_goals(view.facts).is_empty());
+        perform(
+            state.storage(),
+            None,
+            state.loaded_context(),
+            HostAction::MarkGoalUnclear { goal },
+        )
+        .unwrap();
+        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        assert_eq!(
+            crate::compass::unclear_goals(view.facts),
+            std::collections::BTreeSet::from([goal])
+        );
+        assert!(crate::compass::active_priority_edges(view.facts).is_empty());
     }
 
     #[test]

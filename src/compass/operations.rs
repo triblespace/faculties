@@ -327,6 +327,22 @@ impl Compass {
         )
     }
 
+    /// Say that the goal is unclear to `persona`: an ordinary attributed
+    /// note tagged [`compass::UNCLEAR_TAG`] asking for an explanation. It
+    /// writes no priority and no status; [`compass::unclear_goals`] reads it
+    /// until a note on the goal supersedes it.
+    pub fn mark_unclear(&self, id: &str, persona: Option<&str>) -> Result<AddedNote> {
+        let id = id.to_owned();
+        self.storage().update(
+            persona,
+            &[],
+            |space, _reader, by_id, _mentions| Ok((resolve_task_id(&id, space)?, by_id)),
+            |(goal, by_id)| {
+                author_unclear_note(goal, by_id).map(|(fragment, note)| (Some(fragment), note))
+            },
+        )
+    }
+
     /// Every goal's current status and tags, read from one frozen view.
     pub fn goal_states(&self) -> Result<Vec<GoalState>> {
         self.storage().with_view(|space, reader, status_register| {
@@ -1687,9 +1703,14 @@ fn prioritize(
     lower_input: String,
     persona: Option<&str>,
 ) -> Result<PriorityChange> {
-    storage.update(persona, &[], |space, reader, by_id, _| {
-        prepare_priority(space, reader, &higher_input, &lower_input, by_id)
-    }, author_prepared_priority)
+    storage.update(
+        persona,
+        &[],
+        |space, reader, by_id, _| {
+            prepare_priority(space, reader, &higher_input, &lower_input, by_id)
+        },
+        author_prepared_priority,
+    )
 }
 
 // Operation-local plan, consumed exactly once by the author.
@@ -1717,16 +1738,13 @@ fn prepare_priority(
     // a parent ranked over its own descendant, or a cycle closed
     // through a claim the new snapshot does not reach.
     let plan = priority_plan(space, higher_id, Some(lower_id), None);
-    let edges =
-        compass::goal_priority_edges_after(space, higher_id, plan.over.keys().copied());
+    let edges = compass::goal_priority_edges_after(space, higher_id, plan.over.keys().copied());
     let on_cycle = edges.iter().any(|&(from, to)| {
         from == higher_id && compass::would_create_priority_cycle(&edges, higher_id, to)
     });
     if on_cycle {
         let paths = parent_paths(space)?;
-        if is_ancestor(&paths, higher_id, lower_id)
-            || is_ancestor(&paths, lower_id, higher_id)
-        {
+        if is_ancestor(&paths, higher_id, lower_id) || is_ancestor(&paths, lower_id, higher_id) {
             bail!("children are implicitly prioritized over their parents");
         }
         bail!("would create a priority cycle");
@@ -1774,7 +1792,9 @@ pub async fn prioritize_in(
 ) -> Result<PriorityChange> {
     let snapshot = pile.snapshot()?;
     let source = crate::collection_names::open_workspace_read_in(
-        &snapshot, signer.verifying_key(), collection,
+        &snapshot,
+        signer.verifying_key(),
+        collection,
     )?;
     let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
     let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
@@ -1784,12 +1804,74 @@ pub async fn prioritize_in(
     let (fragment, value) = author_prepared_priority(prepared)?;
     if let Some(fragment) = fragment {
         crate::collection_names::open_workspace_write_in(
-            &pile.snapshot()?, signer.verifying_key(), collection,
+            &pile.snapshot()?,
+            signer.verifying_key(),
+            collection,
         )?;
         before_commit()?;
         publish_compass(pile, source, signer, fragment).await?;
     }
     Ok(value)
+}
+
+/// The note [`Compass::mark_unclear`] and [`mark_unclear_in`] both write: the
+/// fixed request body, tagged [`compass::UNCLEAR_TAG`], attributed to `by`.
+fn author_unclear_note(goal: Id, by: Option<Id>) -> Result<(Fragment, AddedNote)> {
+    let mut change = compass::kind_catalog_fragment();
+    let (record, note) = compass::note_fragment(
+        goal,
+        compass::UNCLEAR_NOTE,
+        vec![compass::UNCLEAR_TAG.to_owned()],
+        Vec::new(),
+        Vec::new(),
+        by,
+        clock::point_now()?,
+    )?;
+    change += record;
+    Ok((
+        change,
+        AddedNote {
+            goal,
+            note,
+            unresolved_mentions: Vec::new(),
+        },
+    ))
+}
+
+/// [`Compass::mark_unclear`] over a host's borrowed native pile and exact
+/// route, as [`prioritize_in`] is for a priority. No storage is opened and no
+/// persona is inferred: `by` is the Relations person the host already knows to
+/// be acting, or `None`, leaving the commit's signer as the only authorship.
+/// The host revalidates its workspace before entry and cancels stale intent at
+/// the final publication gate.
+pub async fn mark_unclear_in(
+    pile: &mut triblespace::core::repo::pile::Pile,
+    signer: &ed25519_dalek::SigningKey,
+    collection: triblespace::core::collection::CollectionHandle,
+    goal: Id,
+    by: Option<Id>,
+    before_commit: impl FnOnce() -> Result<()>,
+) -> Result<AddedNote> {
+    let snapshot = pile.snapshot()?;
+    let source = crate::collection_names::open_workspace_read_in(
+        &snapshot,
+        signer.verifying_key(),
+        collection,
+    )?;
+    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+    let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+    let reader = pile.snapshot()?;
+    let facts = storage::acquire_facts(&reader, rank9)?;
+    let goal = resolve_task_id(&fmt_id(goal), &facts)?;
+    let (fragment, note) = author_unclear_note(goal, by)?;
+    crate::collection_names::open_workspace_write_in(
+        &pile.snapshot()?,
+        signer.verifying_key(),
+        collection,
+    )?;
+    before_commit()?;
+    publish_compass(pile, source, signer, fragment).await?;
+    Ok(note)
 }
 
 async fn publish_compass<S>(
@@ -1804,13 +1886,16 @@ where
         + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
         + Send,
 {
-    pile.commit(source, signer, fragment).context("commit Compass collection fragment")?;
+    pile.commit(source, signer, fragment)
+        .context("commit Compass collection fragment")?;
     async {
         let status = compass::status_register_for_source(pile, source)?;
         storage::seed_attached(pile, status, signer).await?;
         storage::ensure_downstream(pile, source, signer).await?;
         Ok::<_, anyhow::Error>(())
-    }.await.context("Compass fragment was committed, but ensuring its derived views failed")
+    }
+    .await
+    .context("Compass fragment was committed, but ensuring its derived views failed")
 }
 
 /// What one priority write says about `goal`: the goals its new snapshot
@@ -1955,31 +2040,216 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let signer = SigningKey::from_bytes(&[22; 32]);
         let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
-        let source = pile.collection("priority fixture", CollectionPolicy::new(
-            AdmissionPolicy::Open, AdmissionPolicy::direct(signer.verifying_key()),
-        )).unwrap();
+        let source = pile
+            .collection(
+                "priority fixture",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                ),
+            )
+            .unwrap();
         let mut fragment = Fragment::empty();
         let higher = plain_goal(&mut fragment, "higher", 1.0);
         let lower = plain_goal(&mut fragment, "lower", 1.0);
         pile.commit(source, &signer, fragment).unwrap();
         let count = |pile: &mut Pile| {
-            pile.snapshot().unwrap().records().unwrap().map(|record| record.unwrap())
-                .filter(|record| matches!(record, triblespace::core::collection::CollectionRecord::Commit(_)))
+            pile.snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(|record| record.unwrap())
+                .filter(|record| {
+                    matches!(
+                        record,
+                        triblespace::core::collection::CollectionRecord::Commit(_)
+                    )
+                })
                 .count()
         };
         let before = count(&mut pile);
-        assert!(pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, lower,
-            || bail!("cancelled fixture"))).is_err());
+        assert!(pollster::block_on(prioritize_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            higher,
+            lower,
+            || bail!("cancelled fixture")
+        ))
+        .is_err());
         assert_eq!(count(&mut pile), before);
-        let change = pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, lower, || Ok(()))).unwrap();
-        assert_eq!((change.higher, change.lower, change.active), (higher, lower, true));
+        let change = pollster::block_on(prioritize_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            higher,
+            lower,
+            || Ok(()),
+        ))
+        .unwrap();
+        assert_eq!(
+            (change.higher, change.lower, change.active),
+            (higher, lower, true)
+        );
         assert_eq!(count(&mut pile), before + 1);
-        assert!(pollster::block_on(prioritize_in(&mut pile, &signer, source.handle(), higher, higher,
-            || panic!("self-priority reached publication"))).is_err());
+        assert!(pollster::block_on(prioritize_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            higher,
+            higher,
+            || panic!("self-priority reached publication")
+        ))
+        .is_err());
         let denied = SigningKey::from_bytes(&[23; 32]);
-        assert!(pollster::block_on(prioritize_in(&mut pile, &denied, source.handle(), lower, higher,
-            || panic!("denied writer reached publication"))).is_err());
+        assert!(pollster::block_on(prioritize_in(
+            &mut pile,
+            &denied,
+            source.handle(),
+            lower,
+            higher,
+            || panic!("denied writer reached publication")
+        ))
+        .is_err());
         assert_eq!(count(&mut pile), before + 1);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn borrowed_unclear_note_stays_unclear_until_a_note_supersedes_it_and_cancels_before_publication(
+    ) {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        use triblespace::core::repo::pile::Pile;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[24; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let source = pile
+            .collection(
+                "unclear fixture",
+                CollectionPolicy::new(
+                    AdmissionPolicy::Open,
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let mut fragment = Fragment::empty();
+        let goal = plain_goal(&mut fragment, "puzzling", 1.0);
+        let other = plain_goal(&mut fragment, "plain", 1.0);
+        pile.commit(source, &signer, fragment).unwrap();
+        let count = |pile: &mut Pile| {
+            pile.snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .map(|record| record.unwrap())
+                .filter(|record| {
+                    matches!(
+                        record,
+                        triblespace::core::collection::CollectionRecord::Commit(_)
+                    )
+                })
+                .count()
+        };
+        let facts = |pile: &mut Pile| {
+            let snapshot = pile.snapshot().unwrap();
+            let read = crate::collection_names::open_workspace_read_in(
+                &snapshot,
+                signer.verifying_key(),
+                source.handle(),
+            )
+            .unwrap();
+            let succinct = pile.attach::<SuccinctArchiveBlob>(read, ()).unwrap();
+            let rank9 = pile
+                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(read, succinct)
+                .unwrap();
+            storage::acquire_facts(&pile.snapshot().unwrap(), rank9).unwrap()
+        };
+        let before = count(&mut pile);
+        assert!(pollster::block_on(mark_unclear_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            goal,
+            None,
+            || bail!("cancelled fixture")
+        ))
+        .is_err());
+        assert_eq!(count(&mut pile), before);
+
+        let added = pollster::block_on(mark_unclear_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            goal,
+            None,
+            || Ok(()),
+        ))
+        .unwrap();
+        assert_eq!(added.goal, goal);
+        assert_eq!(count(&mut pile), before + 1);
+        let read = facts(&mut pile);
+        assert_eq!(compass::unclear_goals(&read), BTreeSet::from([goal]));
+        // Unclear is a note: no priority edge and no status was written.
+        assert!(compass::active_priority_edges(&read).is_empty());
+        assert_eq!(
+            find!(event: Id, pattern!(&read, [{ ?event @ metadata::tag: &KIND_STATUS_ID }]))
+                .count(),
+            0
+        );
+
+        // An unrelated later note, such as progress, answers nothing.
+        let (progress, _) = compass::note_fragment(
+            goal,
+            "Worked on it.",
+            vec![],
+            vec![],
+            vec![],
+            None,
+            point(4.0e9),
+        )
+        .unwrap();
+        pile.commit(source, &signer, progress).unwrap();
+        assert_eq!(
+            compass::unclear_goals(&facts(&mut pile)),
+            BTreeSet::from([goal])
+        );
+        // The explanation supersedes the unclear note and clears it.
+        let (explanation, _) = compass::note_fragment(
+            goal,
+            "It tracks the puzzle.",
+            vec![],
+            vec![],
+            vec![added.note],
+            None,
+            point(4.1e9),
+        )
+        .unwrap();
+        pile.commit(source, &signer, explanation).unwrap();
+        assert!(compass::unclear_goals(&facts(&mut pile)).is_empty());
+
+        assert!(pollster::block_on(mark_unclear_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            other,
+            None,
+            || Ok(())
+        ))
+        .is_ok());
+        let denied = SigningKey::from_bytes(&[25; 32]);
+        assert!(pollster::block_on(mark_unclear_in(
+            &mut pile,
+            &denied,
+            source.handle(),
+            goal,
+            None,
+            || panic!("denied writer reached publication")
+        ))
+        .is_err());
+        assert_eq!(
+            compass::unclear_goals(&facts(&mut pile)),
+            BTreeSet::from([other])
+        );
         pile.close().unwrap();
     }
 

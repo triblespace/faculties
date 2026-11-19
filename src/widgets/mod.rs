@@ -36,7 +36,7 @@ pub use mail::MailViewer;
 pub use memory::MemoryViewer;
 pub use messages::MessagesPanel;
 pub use planner::PlannerViewer;
-pub use priority_game::PriorityGame;
+pub use priority_game::{GameWrite, PriorityGame};
 pub use relations::RelationsViewer;
 pub use storage::{DatasetRevision, DatasetView, SourceKey, StorageState, WidgetContext};
 pub use teams::TeamsViewer;

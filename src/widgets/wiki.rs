@@ -42,6 +42,11 @@ use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 use crate::wiki::{EntryRecord, RevisionRecord};
 
+/// How close, in screen points, the pointer must come to a graph node to
+/// hover or click it. Independent of the drawn dot, which stays a pixel or
+/// two wide, so a small dot is still easy to hit.
+const NODE_HIT_RADIUS: f32 = 9.0;
+
 /// Handle to a long-string blob living in a pile.
 type TextHandle = Inline<Handle<UTF8String>>;
 
@@ -525,15 +530,9 @@ impl WikiGraph {
         let positions = self.positions();
         let to_screen = |world: [f32; 2]| view.to_screen(rect, world);
 
-        // The shared mark size, not a second copy of the constant. A mark is a
-        // symbol rather than a measured object, so it holds its size instead of
-        // shrinking to a speck when a large graph is framed or growing into a
-        // plate when one node is.
-        let node_radius = graph::MARK * view.mark_scale();
         let edge_color = ui.visuals().weak_text_color();
         let node_match_fill = GORBIE::themes::ral(1003);
         let needle_lower = search.query().to_lowercase();
-        let node_stroke = ui.visuals().widgets.noninteractive.bg_stroke;
         let label_color = ui.visuals().text_color();
         let font_id = egui::TextStyle::Small.resolve(ui.style());
 
@@ -564,6 +563,8 @@ impl WikiGraph {
         }
 
         let mut clicked = None;
+        // The nearest node within reach of the pointer, and its distance.
+        let mut hovered: Option<(_, f32)> = None;
         let hover_pos = response.hover_pos();
         let show_labels = zoom > 0.3 && !dotted;
         // Slightly-translucent background behind each label so text
@@ -596,25 +597,18 @@ impl WikiGraph {
                 continue;
             }
 
-            // Scale node radius by degree: isolated nodes at the base
-            // size, hub revisions grow logarithmically. Caps at 3×.
-            // The degree comes from the layout's own adjacency rather than
-            // from a second count kept here: the solver already builds it, and
-            // two counts of the same edges are two chances to disagree.
+            // Every node is a small dot at every zoom (JP, 2026-11-19: zooming
+            // in made them suddenly big again). Unlinked notes a little
+            // smaller, so the linked structure reads first; a search match
+            // keeps a visible size. The degree comes from the layout's own
+            // adjacency rather than from a second count kept here.
             let degree = self.layout.layout().degree(index);
-            let deg_scale = (1.0 + degree.ln() * 0.4).min(3.0);
-            let r = if dotted {
-                // Unlinked notes a little smaller, so the linked structure
-                // reads first; a search match keeps a visible size.
-                if is_match {
-                    3.0
-                } else if degree <= 1.0 {
-                    1.0
-                } else {
-                    1.5
-                }
+            let r = if is_match {
+                3.0
+            } else if degree <= 1.0 {
+                1.0
             } else {
-                node_radius * deg_scale
+                1.5
             };
             // Matching nodes paint in RAL 1003 (signal yellow) — same
             // color GORBIE uses for word-level search underlines, so
@@ -626,24 +620,7 @@ impl WikiGraph {
             } else {
                 frag_color(node.entry_key)
             };
-            // Drawn through the shared mark kit, so a wiki node, a peer and a
-            // collection are the same vocabulary rather than three sketches of
-            // it. The outline is a second call because the kit takes one
-            // colour per mark; the result is the shape `painter.circle` drew.
-            if dotted {
-                painter.circle_filled(pos, r, fill);
-            } else {
-                graph::draw_node(
-                    &painter,
-                    pos,
-                    r / graph::MARK,
-                    graph::Glyph::Circle,
-                    graph::Stroke2::Filled,
-                    fill,
-                    1,
-                );
-                painter.circle_stroke(pos, r, node_stroke);
-            }
+            painter.circle_filled(pos, r, fill);
             if show_labels {
                 // Measure the label first so we know whether it fits
                 // on the right. If painting to the right of the node
@@ -672,12 +649,18 @@ impl WikiGraph {
             }
 
             if let Some(hp) = hover_pos {
-                if (hp - pos).length() < r + 8.0 {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if response.clicked() {
-                        clicked = Some(node.revision_id);
-                    }
+                let distance = (hp - pos).length();
+                if distance < NODE_HIT_RADIUS
+                    && hovered.is_none_or(|(_, nearest)| distance < nearest)
+                {
+                    hovered = Some((node.revision_id, distance));
                 }
+            }
+        }
+        if let Some((revision, _)) = hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                clicked = Some(revision);
             }
         }
 
