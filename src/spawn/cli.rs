@@ -55,7 +55,7 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
-        /// {name}, {effort} and {script} replaced; refused without it, never a hosted
+        /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
         #[arg(long, default_value = "claude")]
         provider: String,
@@ -85,7 +85,7 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {report},
-        /// {name}, {effort} and {script} replaced; refused without it, never a hosted
+        /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit).
         #[arg(long, default_value = "claude")]
         provider: String,
@@ -204,6 +204,35 @@ enum Command {
         /// recorded with the end.
         #[arg(long, value_name = "PATH")]
         usage: Option<PathBuf>,
+    },
+    /// A local executor for one finite Drive task, named in
+    /// SPAWN_LOCAL_EXECUTOR as
+    /// `spawn drive-task --binding FILE --prompt {prompt} --report {report}
+    /// --name {name} --runtime {runtime}`. It turns the run's pinned
+    /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
+    /// arguments, takes everything else from the binding file, and execs
+    /// `drive task`. It opens no pile. A route variable naming no faculties
+    /// collection, a malformed or repeated route, a missing archive route, a
+    /// missing or extra binding key, a prompt over the bound or a runtime
+    /// limit too short for the teardown margin refuses before Drive starts.
+    /// A role Drive does not accept is refused by Drive itself, naming it.
+    DriveTask {
+        /// The host's binding file (JSON): drive, tenant, home, model,
+        /// sizes, telemetry and provider. Every key is required.
+        #[arg(long, value_name = "PATH")]
+        binding: PathBuf,
+        /// The run's prompt file, passed to Drive untouched.
+        #[arg(long, value_name = "PATH")]
+        prompt: PathBuf,
+        /// The run's report file, which Drive publishes.
+        #[arg(long, value_name = "PATH")]
+        report: PathBuf,
+        /// The zooid's name, Drive's native persona.
+        #[arg(long)]
+        name: String,
+        /// The unit's runtime limit in seconds, from {runtime}.
+        #[arg(long, value_name = "SECONDS")]
+        runtime: u64,
     },
     /// A claude zooid's inbox hook, run by its unit script as `inbox stop` or
     /// `inbox post`: reads the hook's JSON on stdin and prints the answer.
@@ -351,6 +380,35 @@ pub fn run() -> Result<()> {
         println!();
         return Ok(());
     };
+    if let Command::DriveTask {
+        binding,
+        prompt,
+        report,
+        name,
+        runtime,
+    } = &command
+    {
+        // The run's pile and key are Drive's native faculties owner; no
+        // store is opened here.
+        let key = cli
+            .key
+            .as_deref()
+            .ok_or_else(|| anyhow!("drive-task needs the run's TRIBLESPACE_KEY"))?;
+        let routes = super::drive_task::routes_from_env()?;
+        let never = super::drive_task::exec(
+            binding,
+            &super::drive_task::RunInputs {
+                prompt,
+                report,
+                name,
+                runtime_secs: *runtime,
+                routes: &routes,
+                pile: &cli.pile,
+                key,
+            },
+        )?;
+        match never {}
+    }
     if let Command::Inbox { name, run, hook } = command {
         return run_inbox(&cli.workspace, cli.pile, cli.key, name, run, hook);
     }
@@ -498,7 +556,9 @@ pub fn run() -> Result<()> {
                 let view = spawn.show(&name)?;
                 crate::cli::with_output("spawn", |out| out.text(render_show(&view, brief)))
             }
-            Command::Wait { .. } | Command::Inbox { .. } => unreachable!("handled above"),
+            Command::Wait { .. } | Command::Inbox { .. } | Command::DriveTask { .. } => {
+                unreachable!("handled above")
+            }
             Command::Settle {
                 name,
                 run,

@@ -13,6 +13,7 @@
 
 pub mod cli;
 pub mod colony;
+pub mod drive_task;
 pub mod mcp;
 pub mod operations;
 
@@ -381,6 +382,14 @@ pub const TIMEOUT_RESULT: &str = "timeout";
 
 /// How a run's end says its runtime limit stopped it.
 pub const RUNTIME_LIMIT_NOTE: &str = "stopped at its runtime limit";
+
+/// The result settlement records beside systemd's own for a local run that
+/// exited 0 without writing its report: the local executor's contract is to
+/// write the report file, so a clean exit without one is a failure.
+pub const MISSING_REPORT_RESULT: &str = "missing-report";
+
+/// How a run's end says its local executor exited 0 but wrote no report.
+pub const MISSING_REPORT_NOTE: &str = "exited 0 without writing its report";
 
 /// What a run's agent reported it used, read at settlement.
 #[derive(Clone, Debug, Default, PartialEq)]

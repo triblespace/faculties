@@ -259,15 +259,27 @@ pub struct LaunchConfig {
 
 /// The placeholders a local executor template may name, each replaced inside
 /// a word: the prompt file (also the executor's stdin), the report file it
-/// must write, the zooid's name, the effort, and the unit script, which run
-/// as `{script} mcp` is the zooid's own faculties MCP server.
-pub const LOCAL_PLACEHOLDERS: [&str; 5] =
-    ["{prompt}", "{report}", "{name}", "{effort}", "{script}"];
+/// must write, the zooid's name, the effort, the unit script, which run
+/// as `{script} mcp` is the zooid's own faculties MCP server, and the unit's
+/// runtime limit in seconds (`SPAWN_LOCAL_MAX_RUNTIME`), which a template
+/// may name only when the limit is set.
+pub const LOCAL_PLACEHOLDERS: [&str; 6] = [
+    "{prompt}",
+    "{report}",
+    "{name}",
+    "{effort}",
+    "{script}",
+    "{runtime}",
+];
+
+/// Why a template that names `{runtime}` cannot run without a limit.
+const RUNTIME_UNSET: &str = "SPAWN_LOCAL_EXECUTOR names {runtime}, but SPAWN_LOCAL_MAX_RUNTIME \
+     is unset, so the unit has no runtime limit to pass on. Nothing was started";
 
 /// What to do when a host has no local executor.
 const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
      SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
-     {report}, {name}, {effort} and {script} replaced at launch; the executor reads the prompt \
+     {report}, {name}, {effort}, {script} and {runtime} replaced at launch; the executor reads the prompt \
      on stdin and writes its report to {report}. Nothing falls back to a hosted model";
 
 /// A local executor template from `SPAWN_LOCAL_EXECUTOR`: whitespace
@@ -299,6 +311,11 @@ fn parse_local_executor(template: &str) -> Result<Vec<String>> {
         bail!("SPAWN_LOCAL_EXECUTOR never names {{report}}, so a local run could not report");
     }
     Ok(words)
+}
+
+/// Whether a local executor template names `{runtime}`.
+fn names_runtime(template: &[String]) -> bool {
+    template.iter().any(|word| word.contains("{runtime}"))
 }
 
 impl LaunchConfig {
@@ -1358,6 +1375,11 @@ impl Spawn {
                 Ok((provider, format!("{} was asked for", provider.name())))
             }
             Provider::Local => match &self.launch.local {
+                Some(template)
+                    if names_runtime(template) && self.launch.local_max_runtime.is_none() =>
+                {
+                    bail!("{RUNTIME_UNSET}.")
+                }
                 Some(_) => Ok((provider, "local was asked for".to_owned())),
                 None => bail!("{LOCAL_UNCONFIGURED}. Nothing was started."),
             },
@@ -1460,12 +1482,18 @@ impl Spawn {
                 let Some(template) = &self.launch.local else {
                     bail!("{LOCAL_UNCONFIGURED}");
                 };
+                let runtime = match self.launch.local_max_runtime {
+                    Some(seconds) => seconds.to_string(),
+                    None if names_runtime(template) => bail!("{RUNTIME_UNSET}"),
+                    None => String::new(),
+                };
                 let values = [
                     ("{prompt}", text(&files.prompt)),
                     ("{report}", text(&files.report)),
                     ("{name}", files.name.clone()),
                     ("{effort}", effort.to_owned()),
                     ("{script}", text(&files.script)),
+                    ("{runtime}", runtime),
                 ];
                 let argv = template
                     .iter()
@@ -1841,8 +1869,9 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, linked) = self.observe(|facts, _| {
-            Ok((
+        let (already_ended, earlier_message, linked, local, recorded_missing) =
+            self.observe(|facts, _| {
+                Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
@@ -1854,9 +1883,23 @@ impl Spawn {
                     )
                     .any(|id| id == served)
                 }),
+                // Local by its run record or, in the window before that
+                // record is published, by the request it serves.
+                exists!(pattern!(facts, [{ run @ attrs::provider: Provider::Local.name() }]))
+                    || request.request.is_some_and(|served| {
+                        exists!(pattern!(facts, [{
+                            served @ attrs::provider: Provider::Local.name()
+                        }]))
+                    }),
+                exists!(pattern!(facts, [{ run @ attrs::result: super::MISSING_REPORT_RESULT }])),
             ))
-        })?;
+            })?;
         let mut failures = Vec::new();
+        // A local executor's contract is to write the report file. Hosted
+        // providers keep their meaning: a missing report there is no report.
+        // An earlier settlement's record counts too: a retry whose read-back
+        // fails must not call a run clean that was recorded as failed.
+        let mut missing_local_report = recorded_missing;
         let mut report_handle = None;
         // The run's link to its request, from inside the unit: launch
         // publishes it only after the unit started, and a keeper that
@@ -1911,6 +1954,13 @@ impl Spawn {
             );
             report_handle = handle;
             let mut fragment = fragment;
+            if local && request.exit.clean() && report.is_none() {
+                missing_local_report = true;
+                let result = fragment.put::<triblespace::prelude::blobencodings::UTF8String, _>(
+                    super::MISSING_REPORT_RESULT.to_owned(),
+                );
+                fragment += entity! { ExclusiveId::force_ref(&run) @ attrs::result: result };
+            }
             if let Some(link) = link {
                 fragment += link;
             }
@@ -1991,20 +2041,14 @@ impl Spawn {
                 ended_clean(view),
                 view.report.first().copied().or(report_handle),
             ),
-            Ok(None) => (
-                request_spawner(),
-                request.exit.describe(),
-                request.exit.clean(),
-                report_handle,
-            ),
+            Ok(None) => {
+                let (end, clean) = fallback_end(&request.exit, missing_local_report);
+                (request_spawner(), end, clean, report_handle)
+            }
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
-                (
-                    request_spawner(),
-                    request.exit.describe(),
-                    request.exit.clean(),
-                    report_handle,
-                )
+                let (end, clean) = fallback_end(&request.exit, missing_local_report);
+                (request_spawner(), end, clean, report_handle)
             }
         };
         let mut message = earlier_message;
@@ -2352,6 +2396,12 @@ impl Spawn {
                 view,
                 "no local executor on this host (SPAWN_LOCAL_EXECUTOR is unset)".to_owned(),
             );
+        }
+        if provider == Provider::Local
+            && self.launch.local.as_deref().is_some_and(names_runtime)
+            && self.launch.local_max_runtime.is_none()
+        {
+            return self.refuse(view, RUNTIME_UNSET.to_owned());
         }
         // A request is started unattended, by whatever wrote it (a rule, an
         // ignite pass). Until JP agrees to unattended spending, money is
@@ -3151,18 +3201,39 @@ pub fn describe_end(run: &RunView) -> String {
     {
         return format!("{end}, {}", super::RUNTIME_LIMIT_NOTE);
     }
+    if run
+        .result
+        .iter()
+        .any(|result| result == super::MISSING_REPORT_RESULT)
+    {
+        return format!("{end}, {}", super::MISSING_REPORT_NOTE);
+    }
     end
 }
 
-/// Whether a recorded run ended as a success: exit 0 alone, and not stopped
-/// by its runtime limit.
+/// The end and cleanliness a settlement reports when it cannot read its own
+/// record back: the exit it was given, and a missing local report whether
+/// this settlement or an earlier one recorded it.
+fn fallback_end(exit: &Exit, missing_local_report: bool) -> (String, bool) {
+    if missing_local_report {
+        (
+            format!("{}, {}", exit.describe(), super::MISSING_REPORT_NOTE),
+            false,
+        )
+    } else {
+        (exit.describe(), exit.clean())
+    }
+}
+
+/// Whether a recorded run ended as a success: exit 0 alone, not stopped by
+/// its runtime limit, and, for a local run, with the report it must write.
 pub fn ended_clean(run: &RunView) -> bool {
     run.exit_code == [0]
         && run.signal.is_empty()
         && !run
             .result
             .iter()
-            .any(|result| result == super::TIMEOUT_RESULT)
+            .any(|result| result == super::TIMEOUT_RESULT || result == super::MISSING_REPORT_RESULT)
 }
 
 /// One line per spawn: name, runs, how the latest ended, the brief's first line.
@@ -3921,6 +3992,168 @@ mod tests {
         request
     }
 
+    /// A local run launched with a trivial executor, settled directly with
+    /// `exit` and, when `report` is given, that report file's contents.
+    fn settle_local(f: &Fixture, exit: Exit, report: Option<&str>) -> RunView {
+        let executor = local_executor(f, "local-settle", "true");
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+        });
+        let launched = spawn.run(&local_request(f, "Settle me.")).unwrap();
+        if let Some(text) = report {
+            std::fs::write(&launched.report, text).unwrap();
+        }
+        spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit,
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        // The same brief is the same zooid: its newest run is this one.
+        spawn.show(&launched.name).unwrap().runs.pop().unwrap()
+    }
+
+    #[test]
+    fn a_local_run_that_exits_0_without_its_report_settles_as_a_failure() {
+        let f = fixture();
+        let run = settle_local(&f, Exit::from_systemd("exited", "0", "success"), None);
+        assert_eq!(run.exit_code, [0]);
+        assert!(run.report.is_empty());
+        assert!(run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        assert!(
+            run.result.iter().any(|result| result == "success"),
+            "systemd's own result stays"
+        );
+        assert!(!ended_clean(&run));
+        assert_eq!(
+            describe_end(&run),
+            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
+        );
+    }
+
+    #[test]
+    fn a_local_run_with_its_report_is_clean_and_an_unclean_one_keeps_its_partial_report() {
+        let f = fixture();
+        let run = settle_local(
+            &f,
+            Exit::from_systemd("exited", "0", "success"),
+            Some("done\n"),
+        );
+        assert!(ended_clean(&run));
+        assert_eq!(run.report_text.as_deref(), Some("done\n"));
+        assert!(!run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        let run = settle_local(
+            &f,
+            Exit::from_systemd("exited", "3", "exit-code"),
+            Some("half\n"),
+        );
+        assert!(!ended_clean(&run));
+        assert_eq!(run.report_text.as_deref(), Some("half\n"));
+        assert!(!run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        assert_eq!(describe_end(&run), "exit 3");
+    }
+
+    #[test]
+    fn the_fallback_end_never_calls_a_missing_local_report_clean() {
+        let exit = Exit::from_systemd("exited", "0", "success");
+        assert_eq!(fallback_end(&exit, false), ("exit 0".to_owned(), true));
+        let (end, clean) = fallback_end(&exit, true);
+        assert!(!clean);
+        assert_eq!(
+            end,
+            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
+        );
+    }
+
+    /// The keeper stopped before publishing the run record, so settlement can
+    /// neither tell the provider from the run nor read the run back: the
+    /// request says local, the missing report is recorded, the message says
+    /// so, and a repeated settlement recovers the recorded fact.
+    #[test]
+    fn a_local_run_settled_without_its_record_settles_a_missing_report_as_a_failure() {
+        let f = fixture_with(FakeLauncher {
+            crash_after_start: true,
+            ..Default::default()
+        });
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/drive/zooid {report}").unwrap())
+        });
+        let asked = f.ask("Local crash window.", None, Provider::Local);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spawn.keep_once(&f.keep_config())
+        }));
+        assert!(crashed.is_err(), "the fake keeper stops inside start");
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let (run, request) = settle_ids(&f.script(0));
+        let settle = || {
+            spawn
+                .settle(&SettleRequest {
+                    name: asked.name.clone(),
+                    run,
+                    request,
+                    exit: Exit::from_systemd("exited", "0", "success"),
+                    report: None,
+                    usage: None,
+                })
+                .unwrap()
+        };
+        let first = settle();
+        assert!(!first.already_ended);
+        let recorded = |spawn: &Spawn| {
+            spawn
+                .observe(|facts, _| {
+                    Ok(exists!(pattern!(facts, [{
+                        run @ attrs::result: super::super::MISSING_REPORT_RESULT
+                    }])))
+                })
+                .unwrap()
+        };
+        assert!(recorded(&spawn));
+        assert!(f.inbox().iter().any(|text| matches!(
+            text,
+            crate::message::MessageText::Text(text)
+                if text.contains(&asked.name)
+                    && text.contains(super::super::MISSING_REPORT_NOTE)
+        )));
+        let second = settle();
+        assert!(second.already_ended);
+        assert!(recorded(&spawn));
+    }
+
+    #[test]
+    fn a_hosted_run_that_exits_0_without_a_report_keeps_its_meaning() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Hosted, no report.")).unwrap();
+        f.spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(run.report.is_empty());
+        assert!(ended_clean(run));
+        assert_eq!(describe_end(run), "exit 0");
+    }
+
     #[test]
     fn a_local_zooid_runs_the_hosts_executor_and_its_report_file_is_the_report() {
         let f = fixture();
@@ -4038,6 +4271,59 @@ mod tests {
         let script = f.script(0);
         assert!(script.contains("/opt/drive/zooid"), "{script}");
         assert!(!script.contains("/fake/"), "{script}");
+    }
+
+    #[test]
+    fn a_local_template_gets_the_runtime_limit_it_names() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-runtime", "printf 'ok' > \"$1\"");
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(
+                parse_local_executor(&format!(
+                    "{} {{report}} --runtime {{runtime}} --deadline-of={{runtime}}s",
+                    executor.display()
+                ))
+                .unwrap(),
+            );
+            launch.local_max_runtime = Some(90);
+        });
+        let launched = spawn.run(&local_request(&f, "Runtime named.")).unwrap();
+        assert_eq!(f.launcher.started.lock().unwrap()[0].runtime_max, Some(90));
+        let run = run_unit_and_settle(&f, &spawn, &launched);
+        assert_eq!(run.exit_code, [0]);
+        let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
+        assert_eq!(
+            args.trim(),
+            format!(
+                "{} --runtime 90 --deadline-of=90s",
+                launched.report.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_template_naming_runtime_without_a_limit_starts_nothing() {
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/local {report} {runtime}").unwrap());
+            launch.local_max_runtime = None;
+        });
+        let error = spawn
+            .run(&local_request(&f, "Runtime named, none set."))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SPAWN_LOCAL_MAX_RUNTIME"), "{error}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        // A keeper refuses the same request the same way.
+        let asked = f.ask("Runtime by request.", None, Provider::Local);
+        let pass = spawn.keep_once(&f.keep_config()).unwrap();
+        assert!(
+            matches!(&pass.steps[0], (request, KeepStep::Refused(why))
+                if *request == asked.request && why.contains("SPAWN_LOCAL_MAX_RUNTIME")),
+            "{:?}",
+            pass.steps
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 
     #[test]
