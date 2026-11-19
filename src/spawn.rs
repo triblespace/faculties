@@ -637,20 +637,17 @@ pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) ->
         }
     }
     text.push_str(&format!(
-        "\n## Your authority over this goal\n\n\
-         This goal is assigned to you. You may add notes to it and move it (`compass note {id:x}`, \
-         `compass move {id:x}`); leave other goals' status alone. The brief steers your \
-         attention; it does not fence it. If you find more important work along the way, you \
-         may follow it: say so in a note on this goal and in your report. Your process ending \
-         does not achieve the goal, and nothing moves it for you. End in one of these ways, \
-         whichever is true:\n\
-         - Done: move it to `done` and add an outcome note with the evidence (commit, file, \
-         test result).\n\
-         - Not done: add a note naming the remaining step or the dependency you are waiting on, \
-         and leave its status true.\n\
-         - If you judge it needs another zooid's review, you may ask for one: a note naming the \
-         exact candidate (commit, file), its evidence, and the review question. That is your \
-         choice, never a required step.\n",
+        "\n## This goal and your run\n\n\
+         This goal prompted the run. You may add notes to it and move it (`compass note {id:x}`, \
+         `compass move {id:x}`), as you may any goal, under the colony's ordinary rules for \
+         attribution and coordination. The brief steers your attention; it does not fence it. \
+         If you find more important work along the way, you may follow it: say so in a note on \
+         this goal and in your report. Your process ending does not achieve the goal, and \
+         nothing moves it for you. When something useful happens, a note on the goal is a good \
+         place for it: a result with its evidence (commit, file, test result), the remaining \
+         step or dependency, or a review question naming the exact candidate. When the goal is \
+         done you may move it to `done` with an outcome note. None of these is a condition for \
+         ending your run.\n",
         id = reading.goal
     ));
     if let Some(extra) = extra.filter(|extra| !extra.trim().is_empty()) {
@@ -1092,8 +1089,10 @@ mod tests {
             brief.revision,
             [id(2), id(12), id(13), id(14), id(15), id(16), id(17)]
         );
-        assert!(text.contains("move it to `done` and add an outcome note"));
-        assert!(text.contains("never a required step"));
+        assert!(text.contains("This goal prompted the run."));
+        assert!(text.contains("move it to `done` with an outcome note"));
+        assert!(text.contains("None of these is a condition for ending your run."));
+        assert!(!text.contains("assigned to you") && !text.contains("other goals' status"));
         assert!(text.contains(
             "If you find more important work along the way, you may follow it: say so in a \
              note on this goal and in your report."
