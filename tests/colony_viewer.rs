@@ -330,6 +330,9 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
         "2025-01-10",
         "Latest Compass note",
         "unread",
+        "Started · current run state unknown",
+        "Run ended · exit 0",
+        "Assigned goal",
     ] {
         assert!(text.contains(expected), "missing {expected:?} in {text:?}");
     }
@@ -389,13 +392,21 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
     host.open.set(true);
     let first = frame();
     assert!(first.contains("Spawn route missing"));
-    assert!(
-        !first.contains(&fixture.ended_child),
-        "prior workspace evidence leaked"
-    );
     let remaining = wait(&mut frame, "Inspect the rehearsal audio");
     assert!(remaining.contains("Spawn route missing"));
-    assert!(!remaining.contains(&fixture.child));
+    // Relations still names these people. Only Spawn supplied their runs.
+    assert!(remaining.contains(&fixture.child));
+    for frame in [&first, &remaining] {
+        for stale in [
+            "Run ended",
+            "Started ·",
+            "Assigned goal",
+            "Requests without a recorded outcome",
+            &name,
+        ] {
+            assert!(!frame.contains(stale), "stale Spawn evidence: {stale}");
+        }
+    }
     fixture.pile.close().unwrap();
 }
 

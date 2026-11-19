@@ -181,7 +181,7 @@ fn draw_parent(ui: &mut Ui, parent: &ParentView) {
         ui.weak(format!("Last spawned worker · {}", format_time(at)));
     }
     if parent.doing.is_empty() && parent.asks_jp.is_empty() {
-        ui.label("Parent’s current activity unknown");
+        ui.label("Current activity unknown");
     }
     for goal in &parent.doing {
         draw_goal(ui, goal, "Compass · doing");
