@@ -1869,8 +1869,9 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, linked, local) = self.observe(|facts, _| {
-            Ok((
+        let (already_ended, earlier_message, linked, local, recorded_missing) =
+            self.observe(|facts, _| {
+                Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
@@ -1882,13 +1883,23 @@ impl Spawn {
                     )
                     .any(|id| id == served)
                 }),
-                exists!(pattern!(facts, [{ run @ attrs::provider: Provider::Local.name() }])),
+                // Local by its run record or, in the window before that
+                // record is published, by the request it serves.
+                exists!(pattern!(facts, [{ run @ attrs::provider: Provider::Local.name() }]))
+                    || request.request.is_some_and(|served| {
+                        exists!(pattern!(facts, [{
+                            served @ attrs::provider: Provider::Local.name()
+                        }]))
+                    }),
+                exists!(pattern!(facts, [{ run @ attrs::result: super::MISSING_REPORT_RESULT }])),
             ))
-        })?;
+            })?;
         let mut failures = Vec::new();
         // A local executor's contract is to write the report file. Hosted
         // providers keep their meaning: a missing report there is no report.
-        let mut missing_local_report = false;
+        // An earlier settlement's record counts too: a retry whose read-back
+        // fails must not call a run clean that was recorded as failed.
+        let mut missing_local_report = recorded_missing;
         let mut report_handle = None;
         // The run's link to its request, from inside the unit: launch
         // publishes it only after the unit started, and a keeper that
@@ -2030,20 +2041,14 @@ impl Spawn {
                 ended_clean(view),
                 view.report.first().copied().or(report_handle),
             ),
-            Ok(None) => (
-                request_spawner(),
-                fallback_end(&request.exit, missing_local_report),
-                request.exit.clean() && !missing_local_report,
-                report_handle,
-            ),
+            Ok(None) => {
+                let (end, clean) = fallback_end(&request.exit, missing_local_report);
+                (request_spawner(), end, clean, report_handle)
+            }
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
-                (
-                    request_spawner(),
-                    fallback_end(&request.exit, missing_local_report),
-                    request.exit.clean() && !missing_local_report,
-                    report_handle,
-                )
+                let (end, clean) = fallback_end(&request.exit, missing_local_report);
+                (request_spawner(), end, clean, report_handle)
             }
         };
         let mut message = earlier_message;
@@ -3206,12 +3211,17 @@ pub fn describe_end(run: &RunView) -> String {
     end
 }
 
-/// The end a settlement reports when it cannot read its own record back.
-fn fallback_end(exit: &Exit, missing_local_report: bool) -> String {
+/// The end and cleanliness a settlement reports when it cannot read its own
+/// record back: the exit it was given, and a missing local report whether
+/// this settlement or an earlier one recorded it.
+fn fallback_end(exit: &Exit, missing_local_report: bool) -> (String, bool) {
     if missing_local_report {
-        format!("{}, {}", exit.describe(), super::MISSING_REPORT_NOTE)
+        (
+            format!("{}, {}", exit.describe(), super::MISSING_REPORT_NOTE),
+            false,
+        )
     } else {
-        exit.describe()
+        (exit.describe(), exit.clean())
     }
 }
 
@@ -4055,6 +4065,73 @@ mod tests {
             .iter()
             .any(|result| result == super::super::MISSING_REPORT_RESULT));
         assert_eq!(describe_end(&run), "exit 3");
+    }
+
+    #[test]
+    fn the_fallback_end_never_calls_a_missing_local_report_clean() {
+        let exit = Exit::from_systemd("exited", "0", "success");
+        assert_eq!(fallback_end(&exit, false), ("exit 0".to_owned(), true));
+        let (end, clean) = fallback_end(&exit, true);
+        assert!(!clean);
+        assert_eq!(
+            end,
+            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
+        );
+    }
+
+    /// The keeper stopped before publishing the run record, so settlement can
+    /// neither tell the provider from the run nor read the run back: the
+    /// request says local, the missing report is recorded, the message says
+    /// so, and a repeated settlement recovers the recorded fact.
+    #[test]
+    fn a_local_run_settled_without_its_record_settles_a_missing_report_as_a_failure() {
+        let f = fixture_with(FakeLauncher {
+            crash_after_start: true,
+            ..Default::default()
+        });
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/drive/zooid {report}").unwrap())
+        });
+        let asked = f.ask("Local crash window.", None, Provider::Local);
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            spawn.keep_once(&f.keep_config())
+        }));
+        assert!(crashed.is_err(), "the fake keeper stops inside start");
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let (run, request) = settle_ids(&f.script(0));
+        let settle = || {
+            spawn
+                .settle(&SettleRequest {
+                    name: asked.name.clone(),
+                    run,
+                    request,
+                    exit: Exit::from_systemd("exited", "0", "success"),
+                    report: None,
+                    usage: None,
+                })
+                .unwrap()
+        };
+        let first = settle();
+        assert!(!first.already_ended);
+        let recorded = |spawn: &Spawn| {
+            spawn
+                .observe(|facts, _| {
+                    Ok(exists!(pattern!(facts, [{
+                        run @ attrs::result: super::super::MISSING_REPORT_RESULT
+                    }])))
+                })
+                .unwrap()
+        };
+        assert!(recorded(&spawn));
+        assert!(f.inbox().iter().any(|text| matches!(
+            text,
+            crate::message::MessageText::Text(text)
+                if text.contains(&asked.name)
+                    && text.contains(super::super::MISSING_REPORT_NOTE)
+        )));
+        let second = settle();
+        assert!(second.already_ended);
+        assert!(recorded(&spawn));
     }
 
     #[test]
