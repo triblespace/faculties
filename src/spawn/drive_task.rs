@@ -22,50 +22,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
 
-/// The collection roles the frozen `drive task` source accepts in
-/// `--native-collection ROLE=DESCRIPTOR`: the names of
-/// `faculties::collection_names::table()` at the faculties revision that
-/// Drive build pins, in its order. A pinned route whose role is not here
-/// refuses the launch; it is never dropped.
-///
-/// Source: Drive `src/main.rs` `Options::native_faculties` resolves each role
-/// with `collection_names::table()`; the pinned faculties is commit
-/// 0fd9a9b870ca55c11c947bb9228ee4c1d3b9cce7, `src/collection_names.rs`.
-pub const DRIVE_TASK_ROLES: [&str; 32] = [
-    "atlas",
-    "archive",
-    "body",
-    "code",
-    "cognition",
-    "compass",
-    "config",
-    "decide",
-    "discord",
-    "embeddings",
-    "files",
-    "habit",
-    "headspace",
-    "mail",
-    "memory-journal",
-    "memory-comb",
-    "message",
-    "models",
-    "orient",
-    "orient-receipts",
-    "planner",
-    "posture-policy",
-    "posture-scan",
-    "quota",
-    "relations",
-    "secrets",
-    "status",
-    "swarm-health",
-    "teams",
-    "voice",
-    "web",
-    "wiki",
-];
-
 /// The role whose route is also Drive's `--native-archive`, the collection
 /// Drive writes the task's own history to.
 pub const ARCHIVE_ROLE: &str = "archive";
@@ -242,32 +198,26 @@ pub fn deadline_ms(runtime_secs: u64, margin_secs: u64) -> Result<u64> {
         .ok_or_else(|| anyhow!("the Drive deadline overflows"))
 }
 
-/// The pinned routes as `role -> descriptor` for the roles `drive_roles`
-/// accepts. A route whose variable names no faculties collection, a route
-/// whose role Drive does not accept, a repeated variable, an empty or
-/// malformed descriptor, or a missing archive route refuses, naming every
+/// The pinned routes as `role -> descriptor`, every one of them passed on.
+/// Which roles Drive accepts is Drive's own table, and Drive refuses an
+/// unknown role itself, naming it; a second copy of that table here would go
+/// stale whenever Drive's faculties pin moves. A route whose variable names
+/// no faculties collection, a repeated variable, an empty or malformed
+/// descriptor, or a missing archive route refuses here, naming every
 /// offending route at once.
-pub fn route_roles(
-    routes: &[(String, String)],
-    drive_roles: &[&str],
-) -> Result<BTreeMap<&'static str, String>> {
+pub fn route_roles(routes: &[(String, String)]) -> Result<BTreeMap<&'static str, String>> {
     let known: Vec<(String, &'static str)> = crate::collection_names::table()
         .into_iter()
         .map(|(scope, name)| (crate::collection_names::override_env_name(scope), name))
         .collect();
     let mut roles = BTreeMap::new();
     let mut unknown = Vec::new();
-    let mut not_drive = Vec::new();
     let mut malformed = Vec::new();
     for (variable, value) in routes {
         let Some((_, role)) = known.iter().find(|(known, _)| known == variable) else {
             unknown.push(variable.clone());
             continue;
         };
-        if !drive_roles.contains(role) {
-            not_drive.push(format!("{variable} ({role})"));
-            continue;
-        }
         if !is_descriptor(value) {
             malformed.push(variable.clone());
             continue;
@@ -282,12 +232,6 @@ pub fn route_roles(
         problems.push(format!(
             "routes that name no faculties collection: {}",
             unknown.join(", ")
-        ));
-    }
-    if !not_drive.is_empty() {
-        problems.push(format!(
-            "pinned routes whose role this Drive task does not accept: {}",
-            not_drive.join(", ")
         ));
     }
     if !malformed.is_empty() {
@@ -325,12 +269,7 @@ fn is_descriptor(value: &str) -> bool {
 /// The `drive task` command line for one run, or why there is none.
 /// `prompt_len` is the prompt file's size; a prompt larger than the binding's
 /// bound refuses rather than being cut.
-pub fn plan(
-    binding: &Binding,
-    run: &RunInputs<'_>,
-    prompt_len: u64,
-    drive_roles: &[&str],
-) -> Result<Plan> {
+pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<Plan> {
     ensure!(
         prompt_len <= binding.max_prompt_bytes,
         "refusing to start Drive: the prompt is {prompt_len} bytes and max-prompt-bytes is {}; \
@@ -343,7 +282,7 @@ pub fn plan(
         "prompt and report are the same file"
     );
     let deadline_ms = deadline_ms(run.runtime_secs, binding.teardown_margin_secs)?;
-    let roles = route_roles(run.routes, drive_roles)?;
+    let roles = route_roles(run.routes)?;
 
     let mut args: Vec<OsString> = Vec::new();
     let mut flag = |name: &str, value: OsString| {
@@ -456,7 +395,7 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
         "the report {} already exists; Drive publishes a new file only",
         run.report.display()
     );
-    let plan = plan(&parsed, run, prompt.len(), &DRIVE_TASK_ROLES)?;
+    let plan = plan(&parsed, run, prompt.len())?;
     eprintln!(
         "spawn drive-task: binding {} blake3:{}; deadline-ms {} (runtime {} s less {} s \
          teardown); prompt {} bytes",
@@ -551,27 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn every_drive_role_is_a_faculties_collection_and_its_variable_is_the_route() {
-        let names: Vec<&str> = crate::collection_names::table()
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect();
-        for role in DRIVE_TASK_ROLES {
-            assert!(names.contains(&role), "{role}");
-        }
-        // The five collections faculties gained after Drive's pin.
-        let newer: Vec<&str> = names
-            .iter()
-            .copied()
-            .filter(|name| !DRIVE_TASK_ROLES.contains(name))
-            .collect();
-        assert_eq!(newer, ["alarm", "home", "imagine", "rules", "spawn"]);
-    }
-
-    #[test]
     fn the_whole_argv_from_routes_and_a_binding() {
         let pinned = routes(&["archive", "compass", "message", "memory-journal"]);
-        let plan = plan(&binding(), &run(&pinned), 500, &DRIVE_TASK_ROLES).unwrap();
+        let plan = plan(&binding(), &run(&pinned), 500).unwrap();
         assert_eq!(plan.program, PathBuf::from("/fake/bin/drive"));
         assert_eq!(plan.deadline_ms, 3_540_000);
         let collection = |role: &str| format!("{role}={DESCRIPTOR}");
@@ -651,7 +572,7 @@ mod tests {
             token_file: "/fake token".into(),
         });
         let pinned = routes(&["archive"]);
-        let args = strings(&plan(&binding, &run(&pinned), 1, &DRIVE_TASK_ROLES).unwrap());
+        let args = strings(&plan(&binding, &run(&pinned), 1).unwrap());
         let tail = &args[args.len() - 8..];
         assert_eq!(
             tail,
@@ -669,20 +590,15 @@ mod tests {
     }
 
     #[test]
-    fn a_route_drive_does_not_take_refuses_and_names_them_all() {
+    fn every_pinned_faculties_route_is_passed_on() {
+        // Drive, not this adapter, decides which roles it accepts; a Drive
+        // pinned to an older faculties refuses the newer ones itself.
         let pinned = routes(&["archive", "compass", "spawn", "alarm"]);
-        let error = plan(&binding(), &run(&pinned), 1, &DRIVE_TASK_ROLES)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("TRIBLESPACE_COLLECTION_SPAWN (spawn)"),
-            "{error}"
-        );
-        assert!(
-            error.contains("TRIBLESPACE_COLLECTION_ALARM (alarm)"),
-            "{error}"
-        );
-        assert!(error.contains("nothing was dropped"), "{error}");
+        let args = strings(&plan(&binding(), &run(&pinned), 1).unwrap());
+        for role in ["archive", "compass", "spawn", "alarm"] {
+            let collection = format!("{role}={DESCRIPTOR}");
+            assert!(args.contains(&collection), "{role}: {args:?}");
+        }
     }
 
     #[test]
@@ -692,9 +608,7 @@ mod tests {
             "TRIBLESPACE_COLLECTION_NOT_A_FACULTY".to_owned(),
             DESCRIPTOR.to_owned(),
         ));
-        let error = plan(&binding(), &run(&pinned), 1, &DRIVE_TASK_ROLES)
-            .unwrap_err()
-            .to_string();
+        let error = plan(&binding(), &run(&pinned), 1).unwrap_err().to_string();
         assert!(
             error.contains("TRIBLESPACE_COLLECTION_NOT_A_FACULTY"),
             "{error}"
@@ -704,9 +618,7 @@ mod tests {
     #[test]
     fn a_missing_archive_route_refuses() {
         let pinned = routes(&["compass"]);
-        let error = plan(&binding(), &run(&pinned), 1, &DRIVE_TASK_ROLES)
-            .unwrap_err()
-            .to_string();
+        let error = plan(&binding(), &run(&pinned), 1).unwrap_err().to_string();
         assert!(error.contains("TRIBLESPACE_COLLECTION_ARCHIVE"), "{error}");
         assert!(error.contains("--native-archive"), "{error}");
     }
@@ -715,12 +627,10 @@ mod tests {
     fn a_malformed_or_repeated_route_refuses() {
         let mut pinned = routes(&["archive", "compass"]);
         pinned[1].1 = "blake3:12".to_owned();
-        assert!(plan(&binding(), &run(&pinned), 1, &DRIVE_TASK_ROLES).is_err());
+        assert!(plan(&binding(), &run(&pinned), 1).is_err());
         let mut twice = routes(&["archive", "compass"]);
         twice.push(twice[1].clone());
-        let error = plan(&binding(), &run(&twice), 1, &DRIVE_TASK_ROLES)
-            .unwrap_err()
-            .to_string();
+        let error = plan(&binding(), &run(&twice), 1).unwrap_err().to_string();
         assert!(error.contains("given twice"), "{error}");
     }
 
@@ -734,17 +644,15 @@ mod tests {
         let pinned = routes(&["archive"]);
         let mut short = run(&pinned);
         short.runtime_secs = 60;
-        let error = plan(&binding(), &short, 1, &DRIVE_TASK_ROLES)
-            .unwrap_err()
-            .to_string();
+        let error = plan(&binding(), &short, 1).unwrap_err().to_string();
         assert!(error.contains("SPAWN_LOCAL_MAX_RUNTIME"), "{error}");
     }
 
     #[test]
     fn a_prompt_over_the_bound_refuses_and_one_at_it_passes() {
         let pinned = routes(&["archive"]);
-        assert!(plan(&binding(), &run(&pinned), 500, &DRIVE_TASK_ROLES).is_ok());
-        let error = plan(&binding(), &run(&pinned), 501, &DRIVE_TASK_ROLES)
+        assert!(plan(&binding(), &run(&pinned), 500).is_ok());
+        let error = plan(&binding(), &run(&pinned), 501)
             .unwrap_err()
             .to_string();
         assert!(error.contains("nothing is truncated"), "{error}");

@@ -264,12 +264,8 @@ fn refused(setup: &Setup, output: &Output, why: &str) {
 }
 
 #[test]
-fn a_route_drive_cannot_take_refuses_before_drive_starts() {
+fn route_refusals_happen_before_drive_starts() {
     let setup = setup();
-    let routes = [route("archive"), route("spawn"), route("alarm")];
-    let output = adapter(&setup, &routes, 3600, "report");
-    refused(&setup, &output, "TRIBLESPACE_COLLECTION_SPAWN (spawn)");
-    refused(&setup, &output, "TRIBLESPACE_COLLECTION_ALARM (alarm)");
     let unknown = [
         route("archive"),
         (
