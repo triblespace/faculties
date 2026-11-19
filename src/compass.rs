@@ -691,7 +691,6 @@ pub const UNCLEAR_NOTE: &str =
 /// unrelated later note, such as a progress note, answers nothing. A new
 /// unclear note makes the goal unclear again.
 pub fn unclear_goals<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
-    let unclear = crate::schemas::compass::text_handle(UNCLEAR_TAG);
     let superseded: BTreeSet<Id> = find!(
         (newer: Id, old: Id),
         pattern!(facts, [{ ?newer @
@@ -702,15 +701,15 @@ pub fn unclear_goals<P: TriblePattern>(facts: &P) -> BTreeSet<Id> {
     .map(|(_, old)| old)
     .collect();
     find!(
-        (goal: Id, note: Id, tag: TextHandle),
+        (goal: Id, note: Id),
         pattern!(facts, [{ ?note @
             metadata::tag: &KIND_NOTE_ID,
             board::task: ?goal,
-            board::tag: ?tag,
+            board::tag: UNCLEAR_TAG,
         }])
     )
-    .filter(|(_, note, tag)| *tag == unclear && !superseded.contains(note))
-    .map(|(goal, _, _)| goal)
+    .filter(|(_, note)| !superseded.contains(note))
+    .map(|(goal, _)| goal)
     .collect()
 }
 
