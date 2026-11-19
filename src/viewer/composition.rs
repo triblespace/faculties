@@ -4,7 +4,7 @@ use super::{Target, Viewer};
 use crate::compass::Compass;
 use crate::storage::Storage;
 use crate::widgets::{
-    AtlasViewer, BranchTimeline, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
+    AtlasViewer, BranchTimeline, ColonyViewer, CompassBoard, DecidePanel, DiscordViewer, FilesViewer,
     GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel, PlannerViewer,
     PriorityGame, RelationsViewer, SourceKey, StorageState, TeamsViewer, TimelineSource,
     TriageViewer, WidgetContext, WikiViewer,
@@ -19,6 +19,7 @@ impl Target {
         match self {
             Self::Dashboard => &SourceKey::ALL,
             Self::Atlas => &[SourceKey::Atlas],
+            Self::Colony => &crate::widgets::colony::INPUTS,
             Self::Discord => &[SourceKey::Discord],
             Self::Files => &[SourceKey::Files],
             Self::Gauge => &[SourceKey::Wiki],
@@ -199,6 +200,12 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                 panel.render(ctx, headspace, secrets);
             },
         );
+    }
+
+    if target == Target::Dashboard || target == Target::Colony {
+        card(nb, host.clone(), "colony", ColonyViewer::default, |ctx, panel, sources, _| {
+            panel.render(ctx, sources);
+        });
     }
 
     if target == Target::Dashboard {

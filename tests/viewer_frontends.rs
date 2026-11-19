@@ -27,20 +27,21 @@ fn tiny_page() -> CapturePage {
 
 #[test]
 fn target_inventory_and_original_dashboard_order_are_explicit() {
-    assert_eq!(Target::ALL.len(), 11);
+    assert_eq!(Target::ALL.len(), 12);
     assert_eq!(
         Target::ALL
             .into_iter()
             .map(Target::name)
             .collect::<BTreeSet<_>>()
             .len(),
-        11
+        12
     );
     assert_eq!(
         Target::Dashboard.card_names(),
         &[
             "storage",
             "headspace",
+            "colony",
             "timeline",
             "gauge",
             "wiki",

@@ -1149,7 +1149,14 @@ keeps using it until the route itself is changed.
 
 ## GORBIE viewer
 
-The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile.
+The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile. The
+**Colony** section shows the selected workspace’s parent personas, their spawned
+runs, recorded Compass work, JP requests and report acknowledgments. It reads
+the routed Spawn, Compass, Message and Relations evidence when expanded.
+Active people with the `zooid` affinity appear in the roster even if they
+have never spawned a worker. Task zooids appear under the parent recorded
+on their run. A run without a recorded
+end has unknown current activity on a desktop without unit observations.
 The 10 small capture binaries select shared compositions for Atlas, Discord,
 Files, Gauge, Headspace, Memory, Messages, Planner, Teams and Triage.
 They retain GORBIE's explicit window, headless-file and web-export CLI UX;
@@ -1162,7 +1169,7 @@ atlas-capture --pile ./self.pile --headless --out-dir captures
 
 Rust callers can use `viewer::Viewer::capture_with` for typed resident PNG
 pages, or `capture` for native `Out` delivery. MCP `viewer_capture` accepts
-`target: "dashboard"` or one of the 11 panel names and returns card/page
+`target: "dashboard"` or a panel name such as `"colony"` and returns card/page
 metadata followed by image attachments. It neither opens a window nor writes
 a host capture directory. Normal loading/error banners remain part of the
 image: rendering is not a certification that every source has been acquired.

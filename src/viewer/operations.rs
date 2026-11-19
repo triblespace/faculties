@@ -11,6 +11,7 @@ use crate::out::Out;
 pub enum Target {
     Dashboard,
     Atlas,
+    Colony,
     Discord,
     Files,
     Gauge,
@@ -23,9 +24,10 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Dashboard,
         Self::Atlas,
+        Self::Colony,
         Self::Discord,
         Self::Files,
         Self::Gauge,
@@ -41,6 +43,7 @@ impl Target {
         match self {
             Self::Dashboard => "dashboard",
             Self::Atlas => "atlas",
+            Self::Colony => "colony",
             Self::Discord => "discord",
             Self::Files => "files",
             Self::Gauge => "gauge",
@@ -59,6 +62,7 @@ impl Target {
             Self::Dashboard => &[
                 "storage",
                 "headspace",
+                "colony",
                 "timeline",
                 "gauge",
                 "wiki",
@@ -76,6 +80,7 @@ impl Target {
                 "atlas",
             ],
             Self::Atlas => &["storage", "atlas"],
+            Self::Colony => &["storage", "colony"],
             Self::Discord => &["storage", "discord"],
             Self::Files => &["storage", "files"],
             Self::Gauge => &["storage", "gauge"],

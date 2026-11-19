@@ -18,6 +18,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 use triblespace::core::blob::encodings::succinctarchive::{
@@ -49,6 +50,7 @@ use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
 use crate::schemas::planner::DEFAULT_SCOPE_ID as PLANNER_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
+use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
 use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
@@ -83,6 +85,7 @@ pub enum SourceKey {
     Reason,
     Relations,
     Secrets,
+    Spawn,
     Teams,
     Triage,
     Wiki,
@@ -90,7 +93,7 @@ pub enum SourceKey {
 
 impl SourceKey {
     /// Every logical input understood by the viewer core.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::Archive,
         Self::Atlas,
         Self::Compass,
@@ -105,6 +108,7 @@ impl SourceKey {
         Self::Reason,
         Self::Relations,
         Self::Secrets,
+        Self::Spawn,
         Self::Teams,
         Self::Triage,
         Self::Wiki,
@@ -241,6 +245,7 @@ impl DatasetView<'_> {
 #[derive(Clone, Copy)]
 pub struct WidgetContext<'a> {
     datasets: Option<&'a BTreeMap<SourceKey, LoadedDataset>>,
+    routed_but_unavailable: Option<&'a BTreeSet<SourceKey>>,
     secrets: Option<&'a LoadedSecrets>,
 }
 
@@ -248,7 +253,23 @@ impl<'a> WidgetContext<'a> {
     /// Return the exact requested logical dataset, or `None` when that source
     /// is absent. Missing sources never shift another source into its place.
     pub fn dataset(&self, key: SourceKey) -> Option<DatasetView<'a>> {
-        self.datasets?.get(&key).map(LoadedDataset::view)
+        self.datasets?.get(&key)?.view().ok()
+    }
+
+    /// A workspace observation omits absent routes and records routes it failed to read.
+    pub(super) fn missing_route(&self, key: SourceKey) -> bool {
+        !self.contains(key) && self.routed_but_unavailable.is_some_and(|keys| !keys.contains(&key))
+    }
+
+    /// The selected observation token is available before decoding a deferred archive.
+    pub(super) fn revision(&self, key: SourceKey) -> Option<DatasetRevision> {
+        self.datasets?.get(&key).map(|dataset| dataset.revision)
+    }
+
+    /// Keep this frozen input on an asynchronous card worker. Archives, snapshots
+    /// and prepared indexes share their underlying observation.
+    pub(super) fn owned_dataset(&self, key: SourceKey) -> Option<LoadedDataset> {
+        self.datasets?.get(&key).cloned()
     }
 
     /// Return the explicitly configured readable Secrets collection.
@@ -274,12 +295,26 @@ pub struct SecretsView<'a> {
     pub revision: DatasetRevision,
 }
 
-struct LoadedDataset {
-    facts: FactArchive,
+#[derive(Clone)]
+pub(super) struct LoadedDataset {
+    facts: DatasetFacts,
     reader: PileSnapshot,
     revision: DatasetRevision,
-    lww_registers: BTreeMap<(Id, Id), LwwQuery>,
-    latest_indexes: BTreeMap<Id, LatestIndex>,
+    lww_registers: Arc<BTreeMap<(Id, Id), LwwQuery>>,
+    latest_indexes: Arc<BTreeMap<Id, LatestIndex>>,
+}
+
+#[derive(Clone)]
+enum DatasetFacts {
+    Ready(FactArchive),
+    Deferred(Arc<DeferredFacts>),
+}
+
+/// Freeze the native selection on the observation owner. Decode its archival
+/// payload only when a consumer requests facts, on Colony's background worker.
+struct DeferredFacts {
+    selected: AttachedSnapshot<WidgetReader, Rank9AcceleratedSuccinctArchiveBlob>,
+    facts: OnceLock<Result<FactArchive, String>>,
 }
 
 impl LoadedDataset {
@@ -291,22 +326,50 @@ impl LoadedDataset {
         latest_indexes: BTreeMap<Id, LatestIndex>,
     ) -> Self {
         Self {
-            facts,
+            facts: DatasetFacts::Ready(facts),
             reader,
             revision,
-            lww_registers,
-            latest_indexes,
+            lww_registers: Arc::new(lww_registers),
+            latest_indexes: Arc::new(latest_indexes),
         }
     }
 
-    fn view(&self) -> DatasetView<'_> {
-        DatasetView {
-            facts: &self.facts,
+    fn deferred_spawn(
+        reader: WidgetReader,
+        selected: AttachedSnapshot<WidgetReader, Rank9AcceleratedSuccinctArchiveBlob>,
+    ) -> Self {
+        // A usable archive has no unread residual. An incomplete read below
+        // returns an error and can never expose a partial dataset at this token.
+        let empty = selected.residual().difference(selected.residual())
+            .expect("one frozen residual has one collection");
+        let revision = DatasetRevision::from_attached(&selected, &empty);
+        Self {
+            facts: DatasetFacts::Deferred(Arc::new(DeferredFacts {
+                selected, facts: OnceLock::new(),
+            })),
+            reader, revision,
+            lww_registers: Default::default(),
+            latest_indexes: Default::default(),
+        }
+    }
+
+    pub(super) fn view(&self) -> Result<DatasetView<'_>, &str> {
+        let facts = match &self.facts {
+            DatasetFacts::Ready(facts) => facts,
+            DatasetFacts::Deferred(deferred) => deferred.facts.get_or_init(|| {
+                triblespace::core::collection::succinctarchive_union::read_attached_acquiring(&deferred.selected)
+                    .map_err(anyhow::Error::from)
+                    .and_then(crate::storage::require_complete_attached_read)
+                    .map_err(|error| format!("Spawn evidence unavailable: {error:#}"))
+            }).as_ref().map_err(String::as_str)?,
+        };
+        Ok(DatasetView {
+            facts,
             reader: &self.reader,
             revision: self.revision,
             lww_registers: &self.lww_registers,
             latest_indexes: &self.latest_indexes,
-        }
+        })
     }
 }
 
@@ -342,7 +405,8 @@ impl WorkspaceObservation {
     }
 
     pub fn loaded_context(&self) -> WidgetContext<'_> {
-        WidgetContext { datasets: Some(&self.0.datasets), secrets: self.0.secrets.as_ref() }
+        WidgetContext { datasets: Some(&self.0.datasets), secrets: self.0.secrets.as_ref(),
+            routed_but_unavailable: Some(&self.0.unavailable) }
     }
 
     pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -502,6 +566,11 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Relations",
     },
     CollectionSource {
+        key: SourceKey::Spawn,
+        scope: SPAWN_SCOPE_ID,
+        label: "Spawn",
+    },
+    CollectionSource {
         key: SourceKey::Teams,
         scope: TEAMS_SCOPE_ID,
         label: "Teams",
@@ -654,6 +723,7 @@ impl StorageState {
     pub fn loaded_context(&self) -> WidgetContext<'_> {
         WidgetContext {
             datasets: self.datasets.as_ref(),
+            routed_but_unavailable: (self.workspace_only && self.datasets.is_some()).then_some(&self.unavailable),
             secrets: self.secrets.as_ref(),
         }
     }
@@ -1086,6 +1156,16 @@ fn read_inputs(
 
     let mut datasets = BTreeMap::new();
     for (scope, label, rank9) in collections {
+        if scope == SPAWN_SCOPE_ID {
+            match snapshot.attached_acquiring(rank9) {
+                Ok(selected) => {
+                    datasets.insert(SourceKey::Spawn, LoadedDataset::deferred_spawn(snapshot.clone(), selected));
+                }
+                Err(error) if !partial => return Err(format!("select {label}: {error:#}")),
+                Err(_) => { unavailable.insert(SourceKey::Spawn); }
+            }
+            continue;
+        }
         let read = (|| {
             let (facts, mut revision) = attached_facts_and_revision(&snapshot, rank9)
                 .map_err(|error| format!("read {label}: {error:#}"))?;

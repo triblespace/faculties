@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod atlas;
+pub mod colony;
 pub mod compass;
 pub mod decide;
 pub mod discord;
@@ -24,6 +25,7 @@ pub mod wiki;
 
 pub use args::resolve_pile_path;
 pub use atlas::AtlasViewer;
+pub use colony::ColonyViewer;
 pub use compass::CompassBoard;
 pub use decide::DecidePanel;
 pub use discord::DiscordViewer;

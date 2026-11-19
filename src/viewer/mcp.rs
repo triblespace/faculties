@@ -25,7 +25,7 @@ impl Viewer {
 const TOOLS: &[Tool] = &[Tool {
     name: "viewer_capture",
     description: "Render the selected shared notebook against the launcher-configured pile, returning ordered card/page metadata and resident PNG images. Requires the native widgets feature and a local GPU; discovery does not open either. This is one finite capture, not a window, watcher, host file path or web export. The images include normal viewer loading/error banners; capture does not certify source completeness. Dashboard preserves all existing widgets and may initialize their own local GPU computations. Settle timeout is per layout pass; output bounds limit PNG bytes/images, not raw renderer allocations or transport base64. Previously emitted pages are not retried on failure.",
-    input_schema: r#"{"type":"object","properties":{"target":{"type":"string","enum":["dashboard","atlas","discord","files","gauge","headspace","memory","messages","planner","teams","triage"]},"scale":{"type":"number","minimum":0.25,"maximum":4,"default":2},"settle_ms":{"type":"integer","minimum":0,"maximum":5000,"default":2000},"max_images":{"type":"integer","minimum":1,"maximum":256,"default":64},"max_bytes":{"type":"integer","minimum":1,"maximum":33554432,"default":4194304}},"required":["target"],"additionalProperties":false}"#,
+    input_schema: r#"{"type":"object","properties":{"target":{"type":"string","enum":["dashboard","atlas","colony","discord","files","gauge","headspace","memory","messages","planner","teams","triage"]},"scale":{"type":"number","minimum":0.25,"maximum":4,"default":2},"settle_ms":{"type":"integer","minimum":0,"maximum":5000,"default":2000},"max_images":{"type":"integer","minimum":1,"maximum":256,"default":64},"max_bytes":{"type":"integer","minimum":1,"maximum":33554432,"default":4194304}},"required":["target"],"additionalProperties":false}"#,
 }];
 
 #[derive(Deserialize)]
@@ -33,6 +33,7 @@ const TOOLS: &[Tool] = &[Tool {
 enum CaptureTarget {
     Dashboard,
     Atlas,
+    Colony,
     Discord,
     Files,
     Gauge,
@@ -48,6 +49,7 @@ impl From<CaptureTarget> for Target {
         match value {
             CaptureTarget::Dashboard => Self::Dashboard,
             CaptureTarget::Atlas => Self::Atlas,
+            CaptureTarget::Colony => Self::Colony,
             CaptureTarget::Discord => Self::Discord,
             CaptureTarget::Files => Self::Files,
             CaptureTarget::Gauge => Self::Gauge,
