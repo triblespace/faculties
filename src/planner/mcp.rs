@@ -59,8 +59,8 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         name: "planner_ingest",
-        description: "Ingest resident iCalendar text documents, staging the full batch before one publication. Names are diagnostics, not host paths. Exact duplicate UID definitions are skipped; differing immutable fields reject the whole batch, not replaced by SEQUENCE/revision order. Preserves the current parser subset: date/floating times are UTC and TZID is not applied; this is not a general timezone-aware RFC5545 importer.",
-        input_schema: r#"{"type":"object","properties":{"documents":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"text":{"type":"string"}},"required":["name","text"],"additionalProperties":false}}},"required":["documents"],"additionalProperties":false}"#,
+        description: "Ingest resident iCalendar text documents, staging the full batch before one publication. Names are diagnostics, not host paths. Exact duplicate definitions are skipped; differing immutable fields reject the whole batch, not replaced by SEQUENCE/revision order. Times: Z is UTC; TZID is applied (an IANA zone, or a fixed-offset VTIMEZONE in the document; anything else is an error naming the event), with a nonexistent local time moved forward by the DST gap and an ambiguous one taken as the first occurrence; RRULEs expand in the DTSTART zone, so local wall time holds across DST. Floating times (no Z, no TZID) are local times in floating_zone (an IANA name, e.g. Europe/Berlin); without it they are an error, never UTC. VALUE=DATE stays an all-day date at UTC midnight. EXDATE is applied; a RECURRENCE-ID override is its own event and replaces its master's instance. RDATE is not read.",
+        input_schema: r#"{"type":"object","properties":{"documents":{"type":"array","minItems":1,"items":{"type":"object","properties":{"name":{"type":"string","minLength":1},"text":{"type":"string"}},"required":["name","text"],"additionalProperties":false}},"floating_zone":{"type":"string","minLength":1}},"required":["documents"],"additionalProperties":false}"#,
     },
 ];
 #[derive(Deserialize)]
@@ -129,6 +129,8 @@ struct Calendar {
 struct Ingest {
     #[serde(deserialize_with = "crate::mcp::object::vec")]
     documents: Vec<Calendar>,
+    #[serde(default)]
+    floating_zone: Option<String>,
 }
 fn selector(value: &str) -> Result<()> {
     let value = value.trim();
@@ -220,7 +222,15 @@ impl Faculty for Planner {
                     })
                     .collect::<Vec<_>>();
                 super::validate_calendars(&documents).map_err(invalid_arguments)?;
-                presentation::ingested(&self.operations.ingest(&documents)?, out)
+                let options = super::IngestOptions {
+                    floating_zone: args
+                        .floating_zone
+                        .as_deref()
+                        .map(super::parse_floating_zone)
+                        .transpose()
+                        .map_err(invalid_arguments)?,
+                };
+                presentation::ingested(&self.operations.ingest(&documents, options)?, out)
             }
             _ => bail!("unknown Planner tool '{name}'"),
         }

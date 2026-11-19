@@ -91,7 +91,19 @@ enum Command {
     /// Resolve an event-id prefix.
     Resolve { prefix: String },
     /// Ingest one or more iCalendar files atomically.
-    Ingest { files: Vec<PathBuf> },
+    ///
+    /// Z times are UTC. TZID is applied (IANA, or a fixed-offset VTIMEZONE in
+    /// the file); RRULEs expand in that zone. A nonexistent local time moves
+    /// forward by the DST gap; an ambiguous one is the first occurrence.
+    /// VALUE=DATE stays an all-day date. EXDATE and RECURRENCE-ID overrides
+    /// are applied. Floating times need --floating-zone.
+    Ingest {
+        files: Vec<PathBuf>,
+        /// IANA zone for floating times (no Z, no TZID), e.g. Europe/Berlin.
+        /// Without it a floating time is an error, never read as UTC.
+        #[arg(long, value_name = "ZONE")]
+        floating_zone: Option<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -165,7 +177,16 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Show { id } => presentation::show(&planner.show(&id)?, out),
         Command::Cancel { id } => presentation::cancelled(&planner.cancel(&id)?, out),
         Command::Resolve { prefix } => out.line(format!("{:x}", planner.resolve(&prefix)?)),
-        Command::Ingest { files } => {
+        Command::Ingest {
+            files,
+            floating_zone,
+        } => {
+            let options = super::IngestOptions {
+                floating_zone: floating_zone
+                    .as_deref()
+                    .map(super::parse_floating_zone)
+                    .transpose()?,
+            };
             if files.is_empty() {
                 bail!("no files supplied");
             }
@@ -186,7 +207,7 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 .zip(&texts)
                 .map(|(name, text)| CalendarInput { name, text })
                 .collect::<Vec<_>>();
-            presentation::ingested(&planner.ingest(&documents)?, out)
+            presentation::ingested(&planner.ingest(&documents, options)?, out)
         }
     }
 }

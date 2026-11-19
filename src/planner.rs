@@ -53,6 +53,10 @@ pub struct EventDraft {
     pub attendees: BTreeSet<Id>,
     pub organizer: Option<Id>,
     pub sequence: Option<SequenceValue>,
+    /// IANA zone of the source DTSTART, read when an RRULE is expanded.
+    pub tzid: Option<String>,
+    /// RFC 5545 RECURRENCE-ID: original start of the overridden instance.
+    pub recurrence_id: Option<IntervalValue>,
 }
 
 /// One exact event projected from a Planner collection. Text fields are the
@@ -73,6 +77,8 @@ pub struct EventRow {
     pub attendees: BTreeSet<Id>,
     pub organizer: Option<Id>,
     pub sequence: Option<SequenceValue>,
+    pub tzid: Option<TextHandle>,
+    pub recurrence_id: Option<IntervalValue>,
 }
 
 /// One intrinsic note attached to an event.
@@ -155,7 +161,15 @@ fn validate_draft_values(draft: &EventDraft) -> Result<()> {
     validate_label("event status", &draft.status)?;
     validate_status(&draft.status)?;
     validate_label("event transparency", &draft.transp)?;
-    validate_transp(&draft.transp)
+    validate_transp(&draft.transp)?;
+    if let Some(zone) = &draft.tzid {
+        zone.parse::<chrono_tz::Tz>()
+            .map_err(|_| anyhow!("event TZID '{zone}' is not an IANA time zone"))?;
+    }
+    if let Some(recurrence_id) = draft.recurrence_id {
+        validate_point("event RECURRENCE-ID", recurrence_id)?;
+    }
+    Ok(())
 }
 
 fn validate_event_values(row: &EventRow) -> Result<()> {
@@ -181,10 +195,13 @@ fn validate_event_values(row: &EventRow) -> Result<()> {
     Ok(())
 }
 
-fn event_identity(uid: TextHandle) -> Fragment {
+/// The identity core: the UID, plus the RECURRENCE-ID for an override of one
+/// recurring instance. A master (no RECURRENCE-ID) keeps its UID-only id.
+fn event_identity(uid: TextHandle, recurrence_id: Option<&IntervalValue>) -> Fragment {
     entity! {
         metadata::tag: &KIND_EVENT_ID,
         event::ical_uid: uid,
+        event::recurrence_id?: recurrence_id,
     }
 }
 
@@ -203,8 +220,10 @@ fn event_record(
     attendees: &BTreeSet<Id>,
     organizer: Option<Id>,
     sequence: Option<SequenceValue>,
+    tzid: Option<TextHandle>,
+    recurrence_id: Option<IntervalValue>,
 ) -> Fragment {
-    let mut fragment = event_identity(uid);
+    let mut fragment = event_identity(uid, recurrence_id.as_ref());
     let id = fragment
         .root()
         .expect("event identity record has one intrinsic root");
@@ -218,6 +237,7 @@ fn event_record(
         event::transp: transp,
         event::organizer?: organizer.as_ref(),
         event::sequence?: sequence.as_ref(),
+        event::tzid?: tzid.as_ref(),
     };
     for value in rdates {
         fragment += entity! { ExclusiveId::force_ref(&id) @ event::rdate: value };
@@ -268,6 +288,7 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
         .map(|location| fragment.put(location.clone()));
     let status = fragment.put(draft.status.clone());
     let transp = fragment.put(draft.transp.clone());
+    let tzid = draft.tzid.as_ref().map(|zone| fragment.put(zone.clone()));
     let record = event_record(
         uid,
         summary,
@@ -282,6 +303,8 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
         &draft.attendees,
         draft.organizer,
         draft.sequence,
+        tzid,
+        draft.recurrence_id,
     );
     let row = EventRow {
         id: record.root().expect("event record has one root"),
@@ -298,6 +321,8 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
         attendees: draft.attendees.clone(),
         organizer: draft.organizer,
         sequence: draft.sequence,
+        tzid,
+        recurrence_id: draft.recurrence_id,
     };
     validate_event_values(&row)?;
     fragment += record;
@@ -411,6 +436,16 @@ where
                 pattern!(space, [{ id @ event::sequence: ?value }])
             )
             .next(),
+            tzid: find!(
+                value: TextHandle,
+                pattern!(space, [{ id @ event::tzid: ?value }])
+            )
+            .next(),
+            recurrence_id: find!(
+                value: IntervalValue,
+                pattern!(space, [{ id @ event::recurrence_id: ?value }])
+            )
+            .next(),
         };
         validate_event_values(&row).is_ok().then_some(row)
     })
@@ -519,6 +554,8 @@ mod tests {
             attendees: BTreeSet::new(),
             organizer: None,
             sequence: None,
+            tzid: None,
+            recurrence_id: None,
         }
     }
 
@@ -580,7 +617,7 @@ mod tests {
         )
         .next()
         .unwrap();
-        let mut facts = event_identity(uid).into_facts();
+        let mut facts = event_identity(uid, None).into_facts();
         facts += event_fragment(&draft("kept@example", "meeting"))
             .unwrap()
             .into_facts();

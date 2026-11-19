@@ -7,7 +7,8 @@ use faculties::collection_names::open_configured;
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
 use faculties::planner::{
-    self, cli, mcp, AddOptions, CalendarInput, Planner, STATUS_CANCELLED, STATUS_CONFIRMED,
+    self, cli, mcp, AddOptions, CalendarInput, IngestOptions, Planner, STATUS_CANCELLED,
+    STATUS_CONFIRMED,
 };
 use faculties::schemas::planner::DEFAULT_SCOPE_ID;
 use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
@@ -123,20 +124,23 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
     let a = calendar("a@example", "first");
     let b = calendar("b@example", "second");
     let receipt = planner
-        .ingest(&[
-            CalendarInput {
-                name: "first.ics",
-                text: &a,
-            },
-            CalendarInput {
-                name: "same-again.ics",
-                text: &a,
-            },
-            CalendarInput {
-                name: "second.ics",
-                text: &b,
-            },
-        ])
+        .ingest(
+            &[
+                CalendarInput {
+                    name: "first.ics",
+                    text: &a,
+                },
+                CalendarInput {
+                    name: "same-again.ics",
+                    text: &a,
+                },
+                CalendarInput {
+                    name: "second.ics",
+                    text: &b,
+                },
+            ],
+            IngestOptions::default(),
+        )
         .unwrap();
     assert_eq!(
         (receipt.imported.len(), receipt.total, receipt.duplicates),
@@ -145,10 +149,13 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
     assert_eq!(fixture.commits(), 1);
     let with_sequence = a.replace("SUMMARY:first", "SUMMARY:first\r\nSEQUENCE:99");
     let again = planner
-        .ingest(&[CalendarInput {
-            name: "later-sequence.ics",
-            text: &with_sequence,
-        }])
+        .ingest(
+            &[CalendarInput {
+                name: "later-sequence.ics",
+                text: &with_sequence,
+            }],
+            IngestOptions::default(),
+        )
         .unwrap();
     assert_eq!(
         (again.imported.len(), again.total, again.duplicates),
@@ -158,32 +165,38 @@ fn resident_ingest_stages_full_batch_and_preserves_uid_duplicate_conflicts() {
     let new = calendar("not-published@example", "staged only");
     let conflict = calendar("a@example", "changed");
     let error = planner
-        .ingest(&[
-            CalendarInput {
-                name: "new-first.ics",
-                text: &new,
-            },
-            CalendarInput {
-                name: "conflict-later.ics",
-                text: &conflict,
-            },
-        ])
+        .ingest(
+            &[
+                CalendarInput {
+                    name: "new-first.ics",
+                    text: &new,
+                },
+                CalendarInput {
+                    name: "conflict-later.ics",
+                    text: &conflict,
+                },
+            ],
+            IngestOptions::default(),
+        )
         .unwrap_err();
     assert!(error.to_string().contains("immutable fields differ"));
     assert_eq!(fixture.commits(), 1);
     assert_eq!(planner.list(window(), false).unwrap().len(), 2);
     let malformed = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:missing uid\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     assert!(planner
-        .ingest(&[
-            CalendarInput {
-                name: "new-first.ics",
-                text: &new
-            },
-            CalendarInput {
-                name: "invalid-later.ics",
-                text: malformed
-            },
-        ])
+        .ingest(
+            &[
+                CalendarInput {
+                    name: "new-first.ics",
+                    text: &new
+                },
+                CalendarInput {
+                    name: "invalid-later.ics",
+                    text: malformed
+                },
+            ],
+            IngestOptions::default()
+        )
         .is_err());
     assert_eq!(fixture.commits(), 1);
 }

@@ -131,7 +131,12 @@ fn duplicate_scalar_ical_property_is_rejected() {
         .into_iter()
         .map(|calendar| calendar.unwrap())
         .collect();
-    let error = parse_ical_event(&calendar[0].events[0]).unwrap_err();
+    let error = parse_ical_event(
+        &calendar[0].events[0],
+        &ZoneTable::new(),
+        IngestOptions::default(),
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("more than one UID"));
 }
 
@@ -154,8 +159,8 @@ fn exact_reingest_does_not_publish_another_authored_commit() {
         name: "event.ics",
         text: &text,
     }];
-    ingest(storage, &documents).unwrap();
-    ingest(storage, &documents).unwrap();
+    ingest(storage, &documents, IngestOptions::default()).unwrap();
+    ingest(storage, &documents, IngestOptions::default()).unwrap();
 
     assert_eq!(storage.payload_count().unwrap(), 1);
 }
@@ -181,6 +186,7 @@ fn conflicting_same_batch_uid_fails_before_any_signed_commit() {
             name: "conflict.ics",
             text: &text,
         }],
+        IngestOptions::default(),
     )
     .unwrap_err();
 
@@ -378,4 +384,290 @@ fn next_compares_rrule_and_every_rdate_after_applying_exdates() {
             Epoch::from_unix_seconds(110.0),
         ))
     );
+}
+
+// --- iCalendar time zones (TZID, floating, DST, overrides) ---
+
+fn vevent_calendar(body: &str) -> String {
+    format!("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n{body}END:VCALENDAR\r\n")
+}
+
+fn vevent(uid: &str, lines: &[&str]) -> String {
+    let mut text = format!("BEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{uid}\r\n");
+    for line in lines {
+        text.push_str(line);
+        text.push_str("\r\n");
+    }
+    text.push_str("END:VEVENT\r\n");
+    text
+}
+
+/// Parse every VEVENT of one document the way `ingest` does.
+fn parse_document(text: &str, options: IngestOptions) -> Result<Vec<IcalEvent>> {
+    let mut events = Vec::new();
+    for calendar in ical::IcalParser::new(text.as_bytes()) {
+        let calendar = calendar?;
+        let zones = calendar_zones(&calendar);
+        for source in &calendar.events {
+            events.push(parse_ical_event(source, &zones, options)?);
+        }
+    }
+    Ok(events)
+}
+
+fn utc(text: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(text)
+        .unwrap()
+        .with_timezone(&Utc)
+}
+
+fn berlin() -> IngestOptions {
+    IngestOptions {
+        floating_zone: Some(chrono_tz::Europe::Berlin),
+    }
+}
+
+#[test]
+fn tzid_berlin_resolves_winter_and_summer_offsets() {
+    let text = vevent_calendar(&format!(
+        "{}{}",
+        vevent(
+            "winter@example",
+            &[
+                "DTSTART;TZID=Europe/Berlin:20260115T100000",
+                "DTEND;TZID=Europe/Berlin:20260115T110000"
+            ]
+        ),
+        vevent(
+            "summer@example",
+            &[
+                "DTSTART;TZID=Europe/Berlin:20260715T100000",
+                "DTEND;TZID=Europe/Berlin:20260715T110000"
+            ]
+        ),
+    ));
+    let events = parse_document(&text, IngestOptions::default()).unwrap();
+    assert_eq!(events[0].dtstart, utc("2026-01-15T09:00:00Z"));
+    assert_eq!(events[0].dtend, utc("2026-01-15T10:00:00Z"));
+    assert_eq!(events[0].zone, Some(chrono_tz::Europe::Berlin));
+    assert_eq!(events[1].dtstart, utc("2026-07-15T08:00:00Z"));
+    assert_eq!(events[1].dtend, utc("2026-07-15T09:00:00Z"));
+}
+
+#[test]
+fn utc_and_date_values_are_unchanged_and_carry_no_zone() {
+    let text = vevent_calendar(&format!(
+        "{}{}",
+        vevent("z@example", &["DTSTART:20260809T120000Z"]),
+        vevent("day@example", &["DTSTART;VALUE=DATE:20260809"]),
+    ));
+    let events = parse_document(&text, IngestOptions::default()).unwrap();
+    assert_eq!(events[0].dtstart, utc("2026-08-09T12:00:00Z"));
+    assert_eq!(events[0].zone, None);
+    assert_eq!(events[1].dtstart, utc("2026-08-09T00:00:00Z"));
+    assert_eq!(events[1].dtend, utc("2026-08-10T00:00:00Z"));
+    assert_eq!(events[1].zone, None);
+}
+
+#[test]
+fn dst_gap_moves_forward_and_overlap_takes_the_first_occurrence() {
+    // 02:30 does not exist in Berlin on 2026-03-29: read with the offset
+    // before the gap (+01:00), so it is 01:30Z, which is 03:30 CEST.
+    let gap = NaiveDate::from_ymd_opt(2026, 3, 29)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    assert_eq!(
+        resolve_local(chrono_tz::Europe::Berlin, gap),
+        utc("2026-03-29T01:30:00Z")
+    );
+    // 02:30 happens twice on 2026-10-25: the first is still CEST (+02:00).
+    let overlap = NaiveDate::from_ymd_opt(2026, 10, 25)
+        .unwrap()
+        .and_hms_opt(2, 30, 0)
+        .unwrap();
+    assert_eq!(
+        resolve_local(chrono_tz::Europe::Berlin, overlap),
+        utc("2026-10-25T00:30:00Z")
+    );
+}
+
+#[test]
+fn unknown_tzid_is_an_error_naming_the_event() {
+    let text = vevent_calendar(&vevent(
+        "windows@example",
+        &["DTSTART;TZID=W. Europe Standard Time:20260115T100000"],
+    ));
+    let error = format!(
+        "{:#}",
+        parse_document(&text, IngestOptions::default()).unwrap_err()
+    );
+    assert!(error.contains("windows@example"), "{error}");
+    assert!(
+        error.contains("unknown TZID 'W. Europe Standard Time'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn fixed_offset_vtimezone_resolves_and_varying_one_does_not() {
+    let fixed = "BEGIN:VTIMEZONE\r\nTZID:GMT-0700\r\nBEGIN:STANDARD\r\nDTSTART:20010101T000000\r\nTZOFFSETFROM:-0700\r\nTZOFFSETTO:-0700\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n";
+    let text = vevent_calendar(&format!(
+        "{fixed}{}",
+        vevent(
+            "fixed@example",
+            &[
+                "DTSTART:20160701T170000Z",
+                "DTEND;TZID=GMT-0700:20160701T114500"
+            ]
+        )
+    ));
+    let events = parse_document(&text, IngestOptions::default()).unwrap();
+    assert_eq!(events[0].dtend, utc("2016-07-01T18:45:00Z"));
+
+    let varying = "BEGIN:VTIMEZONE\r\nTZID:Custom\r\nBEGIN:STANDARD\r\nDTSTART:20010101T000000\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n";
+    let text = vevent_calendar(&format!(
+        "{varying}{}",
+        vevent("custom@example", &["DTSTART;TZID=Custom:20160701T114500"])
+    ));
+    let error = format!(
+        "{:#}",
+        parse_document(&text, IngestOptions::default()).unwrap_err()
+    );
+    assert!(
+        error.contains("custom@example") && error.contains("unknown TZID 'Custom'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn floating_time_needs_a_zone_and_is_never_utc() {
+    let text = vevent_calendar(&vevent("floating@example", &["DTSTART:20260115T100000"]));
+    let error = format!(
+        "{:#}",
+        parse_document(&text, IngestOptions::default()).unwrap_err()
+    );
+    assert!(
+        error.contains("floating@example") && error.contains("floating time"),
+        "{error}"
+    );
+
+    let events = parse_document(&text, berlin()).unwrap();
+    assert_eq!(events[0].dtstart, utc("2026-01-15T09:00:00Z"));
+    assert_eq!(events[0].zone, Some(chrono_tz::Europe::Berlin));
+}
+
+#[test]
+fn local_until_is_rewritten_to_utc_in_the_event_zone() {
+    assert_eq!(
+        utc_until("FREQ=WEEKLY;UNTIL=20171005", chrono_tz::Europe::Berlin),
+        "FREQ=WEEKLY;UNTIL=20171005T215959Z"
+    );
+    assert_eq!(
+        utc_until(
+            "FREQ=WEEKLY;UNTIL=20251120T123000Z;BYDAY=TH",
+            chrono_tz::Europe::Berlin
+        ),
+        "FREQ=WEEKLY;UNTIL=20251120T123000Z;BYDAY=TH"
+    );
+}
+
+fn starts_in(planner: &Planner, from: &str, to: &str) -> Vec<(String, DateTime<Utc>)> {
+    planner
+        .list(
+            (chrono_to_epoch(utc(from)), chrono_to_epoch(utc(to))),
+            false,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|occurrence| {
+            (
+                occurrence.summary,
+                epoch_to_chrono_utc(occurrence.start).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn rrule_keeps_local_wall_time_across_the_october_dst_change() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let text = vevent_calendar(&vevent(
+        "weekly@example",
+        &[
+            "DTSTART;TZID=Europe/Berlin:20261015T100000",
+            "DTEND;TZID=Europe/Berlin:20261015T110000",
+            "RRULE:FREQ=WEEKLY;COUNT=4",
+        ],
+    ));
+    planner
+        .ingest(
+            &[CalendarInput {
+                name: "weekly.ics",
+                text: &text,
+            }],
+            IngestOptions::default(),
+        )
+        .unwrap();
+    let starts = starts_in(&planner, "2026-10-01T00:00:00Z", "2026-12-01T00:00:00Z")
+        .into_iter()
+        .map(|(_, start)| start)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts,
+        vec![
+            utc("2026-10-15T08:00:00Z"),
+            utc("2026-10-22T08:00:00Z"),
+            utc("2026-10-29T09:00:00Z"),
+            utc("2026-11-05T09:00:00Z"),
+        ]
+    );
+}
+
+#[test]
+fn exdate_and_recurrence_id_override_replace_master_instances() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let master = vevent(
+        "series@example",
+        &[
+            "DTSTART;TZID=Europe/Berlin:20261015T100000",
+            "DTEND;TZID=Europe/Berlin:20261015T110000",
+            "RRULE:FREQ=WEEKLY;COUNT=4",
+            "EXDATE;TZID=Europe/Berlin:20261022T100000",
+        ],
+    );
+    let moved = "BEGIN:VEVENT\r\nUID:series@example\r\nSUMMARY:moved\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261029T100000\r\nDTSTART;TZID=Europe/Berlin:20261029T140000\r\nDTEND;TZID=Europe/Berlin:20261029T150000\r\nEND:VEVENT\r\n";
+    let text = vevent_calendar(&format!("{master}{moved}"));
+    let documents = [CalendarInput {
+        name: "series.ics",
+        text: &text,
+    }];
+    let receipt = planner
+        .ingest(&documents, IngestOptions::default())
+        .unwrap();
+    assert_eq!((receipt.imported.len(), receipt.total), (2, 2));
+    assert_eq!(
+        starts_in(&planner, "2026-10-01T00:00:00Z", "2026-12-01T00:00:00Z"),
+        vec![
+            ("series@example".to_owned(), utc("2026-10-15T08:00:00Z")),
+            ("moved".to_owned(), utc("2026-10-29T13:00:00Z")),
+            ("series@example".to_owned(), utc("2026-11-05T09:00:00Z")),
+        ]
+    );
+    // Re-ingesting the same document is a pair of exact duplicates.
+    let again = planner
+        .ingest(&documents, IngestOptions::default())
+        .unwrap();
+    assert_eq!((again.imported.len(), again.duplicates), (0, 2));
+    // The next occurrence after the first skips both the EXDATE and the
+    // replaced instance.
+    let next = planner
+        .next(Some(chrono_to_epoch(utc("2026-10-16T00:00:00Z"))))
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.summary, "moved");
 }

@@ -94,6 +94,20 @@ pub mod event {
         // resolve which copy of an event is newest when multiple
         // are received.
         "FCE0827D74722DCF89E4AD87F866936D" unsafe as sequence: inlineencodings::U256BE;
+        // IANA zone the source DTSTART was written in (RFC 5545 TZID,
+        // or the caller's default zone for a floating time). `time`
+        // stays the resolved UTC instant; this annotation is read when
+        // an RRULE is expanded, so a weekly 10:00 Berlin meeting stays
+        // at 10:00 local across DST. Not part of the event's identity.
+        // Minted with `trible genid` on 2026-11-19:
+        // `59B6CFFD98B896521972D21C87E14743`.
+        "59B6CFFD98B896521972D21C87E14743" as tzid: inlineencodings::Handle<blobencodings::UTF8String>;
+        // RFC 5545 RECURRENCE-ID: the original start (a point interval)
+        // of the recurring instance this VEVENT overrides. Part of the
+        // identity core of an override, beside `ical_uid`, so an
+        // override and its master are distinct events. Minted with
+        // `trible genid` on 2026-11-19: `5FC91FAD3846B5D404F2D10E6B30F232`.
+        "5FC91FAD3846B5D404F2D10E6B30F232" as recurrence_id: inlineencodings::NsTAIInterval;
     }
 }
 

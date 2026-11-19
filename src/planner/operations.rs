@@ -17,7 +17,7 @@ use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use hifitime::Epoch;
-use rrule::{RRuleSet, Tz};
+use rrule::{RRule, RRuleSet, Tz, Unvalidated};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -108,6 +108,22 @@ pub struct EventDetail {
 pub struct CalendarInput<'a> {
     pub name: &'a str,
     pub text: &'a str,
+}
+/// How an ingest reads datetimes that carry neither `Z` nor `TZID`.
+///
+/// RFC 5545 floating times mean "this wall-clock time wherever you are". The
+/// Planner stores instants, so a floating time needs a zone to become one. With
+/// `floating_zone` set, floating times are local times in that zone, and the
+/// zone is recorded as the event's TZID so recurrences expand in it. Without
+/// it, a floating time is an error naming the event; it is never read as UTC.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IngestOptions {
+    pub floating_zone: Option<chrono_tz::Tz>,
+}
+/// An IANA zone name for [`IngestOptions::floating_zone`].
+pub fn parse_floating_zone(name: &str) -> Result<chrono_tz::Tz> {
+    name.parse::<chrono_tz::Tz>()
+        .map_err(|_| anyhow!("floating zone '{name}' is not an IANA time zone"))
 }
 #[derive(Clone, Debug)]
 pub struct IngestReceipt {
@@ -283,8 +299,12 @@ impl Planner {
     /// All resident calendars are staged before one publication. Exact
     /// duplicates are skipped; conflicting immutable definitions never replace
     /// an existing UID, including when a source offers a different SEQUENCE.
-    pub fn ingest(&self, documents: &[CalendarInput<'_>]) -> Result<IngestReceipt> {
-        ingest(self.storage(), documents)
+    pub fn ingest(
+        &self,
+        documents: &[CalendarInput<'_>],
+        options: IngestOptions,
+    ) -> Result<IngestReceipt> {
+        ingest(self.storage(), documents, options)
     }
 }
 fn cancel(storage: PlannerStorage<'_>, id: &str) -> Result<CancellationReceipt> {
@@ -545,6 +565,8 @@ fn empty_event_draft(
         attendees: BTreeSet::new(),
         organizer: None,
         sequence: None,
+        tzid: None,
+        recurrence_id: None,
     }
 }
 
@@ -572,6 +594,12 @@ struct OccurrenceEvent {
     exdates: Vec<EpochInterval>,
     location: Option<String>,
     status: String,
+    /// Zone the RRULE expands in; `None` expands in UTC.
+    zone: Option<chrono_tz::Tz>,
+    /// Starts of recurring instances replaced by an override event with the
+    /// same UID and that RECURRENCE-ID. Queried here, never stored on the
+    /// master: the source said "replaced", not "excluded".
+    overridden: Vec<[u8; 32]>,
 }
 
 fn occurrence_event<R, P>(reader: &R, space: &P, id: Id) -> Option<OccurrenceEvent>
@@ -581,18 +609,20 @@ where
 {
     find!(
         (
+            uid: TextHandle,
             summary: TextHandle,
             time: EpochInterval,
             status: TextHandle,
         ),
         pattern!(space, [{ id @
             metadata::tag: &KIND_EVENT_ID,
+            event::ical_uid: ?uid,
             event::summary: ?summary,
             event::time: ?time,
             event::status: ?status,
         }])
     )
-    .find_map(|(summary, time, status)| {
+    .find_map(|(uid, summary, time, status)| {
         let summary = read_text(reader, summary).ok()?;
         let status = read_text(reader, status).ok()?;
         if !matches!(
@@ -644,6 +674,29 @@ where
                 None => None,
             },
             status,
+            // A zone text no writer here produces (writers validate it) still
+            // has a correct first instant; expand it in UTC rather than drop it.
+            zone: find!(
+                value: TextHandle,
+                pattern!(space, [{ id @ event::tzid: ?value }])
+            )
+            .next()
+            .and_then(|handle| read_text(reader, handle).ok())
+            .and_then(|zone| zone.parse::<chrono_tz::Tz>().ok()),
+            overridden: if exists!(pattern!(space, [{ id @ event::recurrence_id: _?own }])) {
+                Vec::new()
+            } else {
+                find!(
+                    start: IntervalValue,
+                    pattern!(space, [{ _?other @
+                        metadata::tag: &KIND_EVENT_ID,
+                        event::ical_uid: uid,
+                        event::recurrence_id: ?start,
+                    }])
+                )
+                .map(|start| start.raw)
+                .collect()
+            },
         })
     })
 }
@@ -653,26 +706,62 @@ fn interval_raw((start, end): EpochInterval) -> [u8; 32] {
 }
 
 fn is_excluded(row: &OccurrenceEvent, interval: EpochInterval) -> bool {
+    let start = interval_raw((interval.0, interval.0));
     let interval = interval_raw(interval);
     row.exdates
         .iter()
         .any(|excluded| interval_raw(*excluded) == interval)
+        || row.overridden.contains(&start)
 }
 
 fn overlaps((start, end): EpochInterval, (window_start, window_end): EpochInterval) -> bool {
     !(end < window_start || start > window_end)
 }
 
+/// RFC 5545 lets UNTIL be a DATE or a local datetime when DTSTART is; rrule
+/// 0.14 requires UTC beside a zoned DTSTART. Rewrite such an UNTIL to the UTC
+/// instant it names in `zone`; a DATE means the end of that local day, since
+/// UNTIL is inclusive.
+fn utc_until(rule: &str, zone: chrono_tz::Tz) -> String {
+    rule.split(';')
+        .map(|part| {
+            let Some(value) = part
+                .strip_prefix("UNTIL=")
+                .filter(|value| !value.ends_with('Z'))
+            else {
+                return part.to_owned();
+            };
+            let local = NaiveDate::parse_from_str(value, "%Y%m%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(23, 59, 59))
+                .or_else(|| NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S").ok());
+            match local {
+                Some(local) => format!(
+                    "UNTIL={}",
+                    resolve_local(zone, local).format("%Y%m%dT%H%M%SZ")
+                ),
+                None => part.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 fn recurrence_set(row: &OccurrenceEvent) -> Option<RRuleSet> {
     let rule = row.rrule.as_ref()?;
     let (base_start, base_end) = row.time;
     let duration = base_end - base_start;
+    // Expanding from a zoned DTSTART keeps the local wall time across DST.
+    // The start comes from the stored UTC instant, so it is never ambiguous.
+    let zone = row.zone.unwrap_or(chrono_tz::UTC);
     let dtstart = epoch_to_chrono_utc(base_start)
         .ok()?
-        .format("%Y%m%dT%H%M%SZ")
-        .to_string();
-    let combined = format!("DTSTART:{dtstart}\nRRULE:{rule}");
-    let mut set = combined.parse::<RRuleSet>().ok()?;
+        .with_timezone(&Tz::Tz(zone));
+    let mut set = utc_until(rule, zone)
+        .parse::<RRule<Unvalidated>>()
+        .ok()?
+        .build(dtstart)
+        .ok()?;
 
     // Let `all(1)` step past exact exclusions for `next`. Recurrence DTSTARTs
     // are serialized at whole-second precision above, so only equivalent
@@ -881,10 +970,169 @@ struct IcalEvent {
     description: Option<String>,
     dtstart: DateTime<Utc>,
     dtend: DateTime<Utc>,
+    /// Zone of DTSTART, recorded so an RRULE expands in local time.
+    zone: Option<chrono_tz::Tz>,
     location: Option<String>,
     rrule: Option<String>,
+    exdates: BTreeSet<IntervalValue>,
+    recurrence_id: Option<IntervalValue>,
     status: Option<String>,
     transp: Option<String>,
+}
+
+/// TZIDs a calendar defines itself. Only a VTIMEZONE whose every offset is
+/// the same whole number of hours is understood: it is the fixed IANA zone
+/// `Etc/GMT∓N` (POSIX sign: `Etc/GMT+7` is UTC-07:00). An IANA TZID always
+/// resolves through chrono-tz first, whatever its VTIMEZONE says.
+type ZoneTable = BTreeMap<String, chrono_tz::Tz>;
+
+fn calendar_zones(calendar: &ical::parser::ical::component::IcalCalendar) -> ZoneTable {
+    let mut zones = ZoneTable::new();
+    for timezone in &calendar.timezones {
+        let Some(name) = timezone
+            .properties
+            .iter()
+            .find(|property| property.name == "TZID")
+            .and_then(|property| property.value.clone())
+        else {
+            continue;
+        };
+        let offsets = timezone
+            .transitions
+            .iter()
+            .flat_map(|transition| transition.properties.iter())
+            .filter(|property| matches!(property.name.as_str(), "TZOFFSETFROM" | "TZOFFSETTO"))
+            .map(|property| property.value.as_deref().and_then(parse_utc_offset))
+            .collect::<Option<BTreeSet<i32>>>();
+        let Some(offsets) = offsets else { continue };
+        let [seconds] = offsets.into_iter().collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        if seconds % 3600 != 0 {
+            continue;
+        }
+        let hours = -seconds / 3600;
+        let iana = match hours {
+            0 => "Etc/GMT".to_owned(),
+            hours => format!("Etc/GMT{hours:+}"),
+        };
+        if let Ok(zone) = iana.parse::<chrono_tz::Tz>() {
+            zones.insert(name, zone);
+        }
+    }
+    zones
+}
+
+/// `-0700`, `+0530` or `+013000` as seconds east of UTC.
+fn parse_utc_offset(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let (sign, digits) = match value.as_bytes().first()? {
+        b'+' => (1, &value[1..]),
+        b'-' => (-1, &value[1..]),
+        _ => return None,
+    };
+    if !matches!(digits.len(), 4 | 6) || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hours: i32 = digits[0..2].parse().ok()?;
+    let minutes: i32 = digits[2..4].parse().ok()?;
+    let seconds: i32 = digits.get(4..6).map_or(Some(0), |s| s.parse().ok())?;
+    Some(sign * (hours * 3600 + minutes * 60 + seconds))
+}
+
+fn resolve_zone(name: &str, zones: &ZoneTable) -> Result<chrono_tz::Tz> {
+    name.parse::<chrono_tz::Tz>()
+        .ok()
+        .or_else(|| zones.get(name).copied())
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown TZID '{name}': not an IANA zone and no fixed-offset VTIMEZONE defines it"
+            )
+        })
+}
+
+/// A local time in `zone` as the instant it names. RFC 5545 §3.3.5: a local
+/// time that does not exist (spring-forward gap) is read with the offset in
+/// force before the gap, so it moves forward by the gap's length (02:30 in
+/// Berlin on the last Sunday of March is 03:30 CEST); an ambiguous one
+/// (fall-back overlap) is the first occurrence, the earlier instant.
+pub(super) fn resolve_local(zone: chrono_tz::Tz, local: NaiveDateTime) -> DateTime<Utc> {
+    use chrono::offset::{LocalResult, Offset};
+    match zone.from_local_datetime(&local) {
+        LocalResult::Single(datetime) => datetime.with_timezone(&Utc),
+        LocalResult::Ambiguous(first, second) => first
+            .min(second.with_timezone(&first.timezone()))
+            .with_timezone(&Utc),
+        LocalResult::None => {
+            // No real zone has two transitions within a day.
+            let before = zone
+                .offset_from_utc_datetime(&(local - chrono::Duration::days(1)))
+                .fix()
+                .local_minus_utc();
+            Utc.from_utc_datetime(&(local - chrono::Duration::seconds(before.into())))
+        }
+    }
+}
+
+fn property_param<'a>(property: &'a ical::property::Property, name: &str) -> Option<&'a str> {
+    property.params.as_ref()?.iter().find_map(|(key, values)| {
+        (key.eq_ignore_ascii_case(name))
+            .then(|| values.first().map(String::as_str))
+            .flatten()
+    })
+}
+
+/// One DATE or DATE-TIME value: its instant, whether it is a whole date, and
+/// the zone it was written in (`None` for UTC and for dates).
+struct IcalTime {
+    instant: DateTime<Utc>,
+    is_date: bool,
+    zone: Option<chrono_tz::Tz>,
+}
+
+fn parse_ical_time(
+    value: &str,
+    property: &ical::property::Property,
+    zones: &ZoneTable,
+    options: IngestOptions,
+) -> Result<IcalTime> {
+    let value = value.trim();
+    let name = &property.name;
+    if property_param(property, "VALUE") == Some("DATE") || value.len() == 8 {
+        // A DATE stays an all-day date at UTC midnight, the stored convention.
+        let date = NaiveDate::parse_from_str(value, "%Y%m%d")
+            .with_context(|| format!("parse {name} date '{value}'"))?;
+        return Ok(IcalTime {
+            instant: Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists")),
+            is_date: true,
+            zone: None,
+        });
+    }
+    if let Some(utc) = value.strip_suffix('Z') {
+        let datetime = NaiveDateTime::parse_from_str(utc, "%Y%m%dT%H%M%S")
+            .with_context(|| format!("parse {name} UTC datetime '{value}'"))?;
+        return Ok(IcalTime {
+            instant: Utc.from_utc_datetime(&datetime),
+            is_date: false,
+            zone: None,
+        });
+    }
+    let local = NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%S")
+        .with_context(|| format!("parse {name} datetime '{value}'"))?;
+    let zone = match property_param(property, "TZID") {
+        Some(tzid) => resolve_zone(tzid, zones).with_context(|| format!("{name}"))?,
+        None => options.floating_zone.ok_or_else(|| {
+            anyhow!(
+                "{name} '{value}' is a floating time (no Z, no TZID); \
+                 supply a floating zone to say which local time it is"
+            )
+        })?,
+    };
+    Ok(IcalTime {
+        instant: resolve_local(zone, local),
+        is_date: false,
+        zone: Some(zone),
+    })
 }
 
 fn set_once(slot: &mut Option<String>, field: &str, value: String) -> Result<()> {
@@ -895,7 +1143,11 @@ fn set_once(slot: &mut Option<String>, field: &str, value: String) -> Result<()>
     Ok(())
 }
 
-fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<IcalEvent> {
+fn parse_ical_event(
+    event: &ical::parser::ical::component::IcalEvent,
+    zones: &ZoneTable,
+    options: IngestOptions,
+) -> Result<IcalEvent> {
     let mut uid = None;
     let mut summary = None;
     let mut description = None;
@@ -905,7 +1157,8 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
     let mut rrule = None;
     let mut status = None;
     let mut transp = None;
-    let mut dtstart_is_date = None;
+    let mut recurrence_id = None;
+    let mut exdates = Vec::new();
 
     for property in &event.properties {
         let value = property.value.clone().unwrap_or_default();
@@ -914,15 +1167,21 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
             "SUMMARY" => set_once(&mut summary, "SUMMARY", value)?,
             "DESCRIPTION" => set_once(&mut description, "DESCRIPTION", value)?,
             "DTSTART" => {
-                set_once(&mut dtstart, "DTSTART", value)?;
-                let is_date = property.params.as_ref().is_some_and(|params| {
-                    params.iter().any(|(name, values)| {
-                        name == "VALUE" && values.iter().any(|value| value == "DATE")
-                    })
-                });
-                dtstart_is_date = Some(is_date);
+                if dtstart.replace(property).is_some() {
+                    bail!("VEVENT has more than one DTSTART property");
+                }
             }
-            "DTEND" => set_once(&mut dtend, "DTEND", value)?,
+            "DTEND" => {
+                if dtend.replace(property).is_some() {
+                    bail!("VEVENT has more than one DTEND property");
+                }
+            }
+            "RECURRENCE-ID" => {
+                if recurrence_id.replace(property).is_some() {
+                    bail!("VEVENT has more than one RECURRENCE-ID property");
+                }
+            }
+            "EXDATE" => exdates.push(property),
             "LOCATION" => set_once(&mut location, "LOCATION", value)?,
             "RRULE" => set_once(&mut rrule, "RRULE", value)?,
             "STATUS" => set_once(&mut status, "STATUS", value)?,
@@ -932,57 +1191,78 @@ fn parse_ical_event(event: &ical::parser::ical::component::IcalEvent) -> Result<
     }
 
     let uid = uid.ok_or_else(|| anyhow!("VEVENT missing UID"))?;
-    let dtstart_raw = dtstart.ok_or_else(|| anyhow!("VEVENT missing DTSTART"))?;
-    let is_date = dtstart_is_date.unwrap_or(false);
-    let dtstart = parse_ical_datetime(&dtstart_raw, is_date)?;
-    let dtend = match dtend {
-        Some(value) => parse_ical_datetime(&value, is_date)?,
-        None if is_date => dtstart + chrono::Duration::days(1),
-        None => dtstart + chrono::Duration::hours(1),
+    let named = |what: &str| format!("{what} of VEVENT UID '{uid}'");
+    let time = |property: &ical::property::Property| {
+        parse_ical_time(
+            property.value.as_deref().unwrap_or_default(),
+            property,
+            zones,
+            options,
+        )
     };
-    if dtend < dtstart {
-        bail!("VEVENT DTEND is before DTSTART");
+    let start_property = dtstart.ok_or_else(|| anyhow!("VEVENT UID '{uid}' missing DTSTART"))?;
+    let start = time(start_property).with_context(|| named("DTSTART"))?;
+    let dtend = match dtend {
+        Some(property) => time(property).with_context(|| named("DTEND"))?.instant,
+        None if start.is_date => start.instant + chrono::Duration::days(1),
+        None => start.instant + chrono::Duration::hours(1),
+    };
+    if dtend < start.instant {
+        bail!("VEVENT UID '{uid}' DTEND is before DTSTART");
     }
+    let duration = dtend - start.instant;
+    let mut excluded = BTreeSet::new();
+    for property in exdates {
+        // One EXDATE line may list several comma-separated values.
+        for value in property.value.as_deref().unwrap_or_default().split(',') {
+            let excluded_start = parse_ical_time(value, property, zones, options)
+                .with_context(|| named("EXDATE"))?
+                .instant;
+            excluded.insert(make_interval(
+                chrono_to_epoch(excluded_start),
+                chrono_to_epoch(excluded_start + duration),
+            ));
+        }
+    }
+    let recurrence_id = recurrence_id
+        .map(|property| -> Result<IntervalValue> {
+            let instant = chrono_to_epoch(
+                time(property)
+                    .with_context(|| named("RECURRENCE-ID"))?
+                    .instant,
+            );
+            Ok(make_interval(instant, instant))
+        })
+        .transpose()?;
 
     Ok(IcalEvent {
         uid,
         summary,
         description,
-        dtstart,
+        dtstart: start.instant,
         dtend,
+        zone: start.zone,
         location,
         rrule,
+        exdates: excluded,
+        recurrence_id,
         status,
         transp,
     })
-}
-
-fn parse_ical_datetime(input: &str, is_date: bool) -> Result<DateTime<Utc>> {
-    let input = input.trim();
-    if is_date || input.len() == 8 {
-        let date = NaiveDate::parse_from_str(input, "%Y%m%d")
-            .with_context(|| format!("parse date '{input}'"))?;
-        return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists")));
-    }
-    if let Some(input) = input.strip_suffix('Z') {
-        let datetime = NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%S")
-            .with_context(|| format!("parse UTC datetime '{input}Z'"))?;
-        return Ok(Utc.from_utc_datetime(&datetime));
-    }
-    let datetime = NaiveDateTime::parse_from_str(input, "%Y%m%dT%H%M%S")
-        .with_context(|| format!("parse floating datetime '{input}'"))?;
-    Ok(Utc.from_utc_datetime(&datetime))
 }
 
 fn single_line(value: &str) -> String {
     value.replace('\n', " ")
 }
 
+/// Staging key: a master is its UID; an override is its UID and RECURRENCE-ID.
+type StageKey = (TextHandle, Option<[u8; 32]>);
+
 /// Stage one UID-derived import into a deterministic map. Identical records
-/// collapse; same-UID conflicts are an error independent of file order.
+/// collapse; same-identity conflicts are an error independent of file order.
 fn stage_import_event(
     loaded: &LoadedPlanner,
-    staged: &mut BTreeMap<TextHandle, Fragment>,
+    staged: &mut BTreeMap<StageKey, Fragment>,
     uid: &str,
     fragment: Fragment,
 ) -> Result<bool> {
@@ -990,7 +1270,14 @@ fn stage_import_event(
         .root()
         .and_then(|id| planner_model::event(fragment.facts(), id))
         .ok_or_else(|| anyhow!("constructed iCalendar event has no readable projection"))?;
-    let existing = planner_model::events_with_uid(&loaded.facts, candidate.uid);
+    let key = (
+        candidate.uid,
+        candidate.recurrence_id.map(|value| value.raw),
+    );
+    let existing = planner_model::events_with_uid(&loaded.facts, candidate.uid)
+        .into_iter()
+        .filter(|existing| existing.recurrence_id == candidate.recurrence_id)
+        .collect::<Vec<_>>();
     if !existing.is_empty() {
         if existing
             .iter()
@@ -1002,7 +1289,7 @@ fn stage_import_event(
             "iCalendar UID '{uid}' already exists but its immutable fields differ from the imported event"
         );
     }
-    if let Some(previous) = staged.get(&candidate.uid) {
+    if let Some(previous) = staged.get(&key) {
         let previous = previous
             .root()
             .and_then(|id| planner_model::event(previous.facts(), id))
@@ -1014,7 +1301,7 @@ fn stage_import_event(
             "iCalendar UID '{uid}' occurs more than once in this batch with conflicting immutable fields"
         );
     }
-    staged.insert(candidate.uid, fragment);
+    staged.insert(key, fragment);
     Ok(true)
 }
 
@@ -1032,21 +1319,28 @@ fn same_event_definition(left: &EventRow, right: &EventRow) -> bool {
         && left.attendees == right.attendees
         && left.organizer == right.organizer
         && left.sequence == right.sequence
+        && left.tzid == right.tzid
+        && left.recurrence_id == right.recurrence_id
 }
 
-fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Result<IngestReceipt> {
+fn ingest(
+    storage: PlannerStorage<'_>,
+    documents: &[CalendarInput<'_>],
+    options: IngestOptions,
+) -> Result<IngestReceipt> {
     validate_calendars(documents)?;
     storage.update("ingest iCalendar events", |loaded| {
-        let mut staged = BTreeMap::<TextHandle, Fragment>::new();
+        let mut staged = BTreeMap::<StageKey, Fragment>::new();
         let mut total = 0usize;
         let mut duplicates = 0usize;
 
         for document in documents {
             for calendar in ical::IcalParser::new(document.text.as_bytes()) {
                 let calendar = calendar.with_context(|| format!("parse {}", document.name))?;
-                for source in calendar.events {
+                let zones = calendar_zones(&calendar);
+                for source in &calendar.events {
                     total += 1;
-                    let source = parse_ical_event(&source)
+                    let source = parse_ical_event(source, &zones, options)
                         .with_context(|| format!("parse VEVENT in {}", document.name))?;
                     let mut draft = empty_event_draft(
                         source.uid.clone(),
@@ -1061,6 +1355,9 @@ fn ingest(storage: PlannerStorage<'_>, documents: &[CalendarInput<'_>]) -> Resul
                     draft.description = source.description;
                     draft.location = source.location.as_deref().map(single_line);
                     draft.rrule = source.rrule;
+                    draft.exdates = source.exdates;
+                    draft.recurrence_id = source.recurrence_id;
+                    draft.tzid = source.zone.map(|zone| zone.name().to_owned());
                     let fragment = event_fragment(&draft)?;
                     if !stage_import_event(loaded, &mut staged, &source.uid, fragment)? {
                         duplicates += 1;
