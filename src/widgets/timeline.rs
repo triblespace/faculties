@@ -43,12 +43,12 @@
 //! at nice times. Labels are placed independently at the coarsest interval
 //! that gives ~6-10 labels per viewport.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hifitime::{Duration as HifiDuration, Epoch};
 use triblespace::core::id::Id;
 use triblespace::core::inline::encodings::hash::Handle;
-use triblespace::core::inline::Inline;
+use triblespace::core::inline::{Inline, RawInline};
 use triblespace::core::metadata;
 use triblespace::core::repo::BlobStoreGet;
 use triblespace::macros::{find, pattern};
@@ -62,6 +62,7 @@ use crate::schemas::blockdag as archive;
 use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::message::{local as message_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
+use crate::schemas::wiki::{attrs as wiki_attrs, KIND_AUTHORSHIP};
 use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
@@ -256,23 +257,47 @@ fn status_color(status: &str) -> egui::Color32 {
     }
 }
 
-// ── Event model ──────────────────────────────────────────────────────
+// ── Marks: metadata selected by time window ─────────────────────────
 
-/// A single point on the timeline. Flat enough that we can sort and
-/// paint without re-querying per frame. Per-kind fields live as
-/// optional extras on the row so the painter can decorate without
-/// re-reading the fact space.
-#[derive(Clone, Debug)]
-struct Event {
+/// What a chip would show, as the handles it would read. Selecting the
+/// marks of a time window reads facts only; a label's text is read when the
+/// label is drawn, never for a strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Label {
+    /// A goal's creation: its title.
+    Goal { title: TextHandle },
+    /// A status change: the goal's title and the status text.
+    Status { goal: Id, status: TextHandle },
+    /// A note: the goal's title and the note body.
+    Note { goal: Id, note: TextHandle },
+    /// A local message: its body; sender and recipient are ids.
+    Message { from: Id, to: Id, body: TextHandle },
+    /// A wiki revision: its title.
+    Wiki { title: TextHandle },
+    /// A reasoning note: its text.
+    Reason { text: TextHandle },
+    /// A source projection: the texts of the node it projects to.
+    Archive { block: Id },
+}
+
+/// A single point on the timeline, without its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mark {
     source_idx: usize,
     kind: SourceKind,
     entity_id: Id,
     ts_ns: i128,
+    label: Label,
+}
+
+/// The text a drawn label shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Shown {
     /// Primary one-line preview (goal title, message body, or wiki title).
     summary: String,
     /// Optional kanban-status pill label (Compass).
     status: Option<String>,
-    /// Optional sender pill label (LocalMessages — "<from_prefix> → <to_prefix>").
+    /// Optional sender line (LocalMessages — "<from> → <to>"), tooltip only.
     from_to: Option<String>,
 }
 
@@ -303,39 +328,6 @@ fn source_revisions(
         .collect()
 }
 
-/// Cached events + per-source revision markers. Rebuilt when any keyed
-/// dataset appears, disappears, or changes revision.
-struct MultiLive {
-    cached_revisions: BTreeMap<SourceKey, DatasetRevision>,
-    events: Vec<Event>,
-}
-
-impl MultiLive {
-    /// Rebuild events from the datasets available in this context.
-    fn refresh(sources: &[TimelineSource], datasets: &WidgetContext<'_>) -> Self {
-        let mut out: Vec<Event> = Vec::new();
-        let mut cached_revisions = BTreeMap::new();
-
-        for (idx, src, dataset) in resolve_sources(sources, |key| datasets.dataset(key)) {
-            cached_revisions.insert(src.key(), dataset.revision);
-            match src {
-                TimelineSource::Compass { .. } => collect_compass_events(idx, dataset, &mut out),
-                TimelineSource::LocalMessages { .. } => {
-                    collect_local_events(idx, dataset, &mut out)
-                }
-                TimelineSource::Wiki { .. } => collect_wiki_events(idx, dataset, &mut out),
-                TimelineSource::Reason { .. } => collect_reason_events(idx, dataset, &mut out),
-                TimelineSource::Archive { .. } => collect_archive_events(idx, dataset, &mut out),
-            }
-        }
-        out.sort_by_key(|e| e.ts_ns);
-        MultiLive {
-            cached_revisions,
-            events: out,
-        }
-    }
-}
-
 fn read_text(dataset: DatasetView<'_>, h: TextHandle) -> String {
     dataset
         .reader
@@ -352,324 +344,644 @@ fn interval_start(interval: Inline<NsTAIInterval>) -> Option<i128> {
     Some(lower)
 }
 
-/// Emit a Compass event per status-change entity. Also records "goal
-/// created" and "note" events so quiet boards still show up.
-fn collect_compass_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let mut title_by_goal: HashMap<Id, String> = HashMap::new();
+/// `NsTAIInterval` stores each bound as an i128 with its sign bit flipped,
+/// big-endian, lower bound first. Raw byte order is therefore start order,
+/// which is what lets a window seek the attribute's ordered facts.
+const INTERVAL_SIGN_BIT: u128 = 1 << 127;
 
-    let goal_rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
-        (gid: Id, title: TextHandle, ts: (i128, i128)),
-        pattern!(dataset.facts, [{
-            ?gid @
-            metadata::tag: &KIND_GOAL_ID,
-            compass_attrs::title: ?title,
-            metadata::created_at: ?ts,
-        }])
-    )
-    .collect();
+fn raw_interval_start(raw: &RawInline) -> i128 {
+    let mut lower = [0u8; 16];
+    lower.copy_from_slice(&raw[..16]);
+    (u128::from_be_bytes(lower) ^ INTERVAL_SIGN_BIT) as i128
+}
 
-    for (gid, title_h, ts) in goal_rows {
-        let title = read_text(dataset, title_h);
-        title_by_goal.insert(gid, title.clone());
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Compass,
-            entity_id: gid,
-            ts_ns: ts.0,
-            summary: preview(&title, 80),
-            status: Some("created".to_string()),
-            from_to: None,
-        });
-    }
+/// The least raw interval starting at `start`.
+fn raw_interval_from(start: i128) -> RawInline {
+    let mut raw = [0u8; 32];
+    raw[..16].copy_from_slice(&((start as u128) ^ INTERVAL_SIGN_BIT).to_be_bytes());
+    raw
+}
 
-    let status_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
-        (event_id: Id, gid: Id, status: TextHandle, ts: (i128, i128)),
-        pattern!(dataset.facts, [{
-            ?event_id @
-            metadata::tag: &KIND_STATUS_ID,
-            compass_attrs::status_of: ?gid,
-            compass_attrs::status: ?status,
-            metadata::created_at: ?ts,
-        }])
-    )
-    .collect();
+/// The facts of one interval attribute whose start lies in `[lo, hi]`, in
+/// start order. Each shard seeks to `lo` in O(log n) and the walk stops past
+/// `hi`, so facts outside the window are neither decoded nor merged. Values
+/// whose bounds are inverted are returned too; each caller passes over them
+/// as its full-history read did.
+fn starts_in(
+    facts: &FactArchive,
+    attribute: Id,
+    lo: i128,
+    hi: i128,
+) -> Vec<(Inline<NsTAIInterval>, Id)> {
+    let from = raw_interval_from(lo);
+    facts
+        .iter_attribute_value_entities_from(&attribute, &from)
+        .take_while(|(raw, _)| raw_interval_start(raw) <= hi)
+        .map(|(raw, entity)| (Inline::new(raw), entity))
+        .collect()
+}
 
-    for (event_id, gid, status, ts) in status_rows {
-        let title = title_by_goal
-            .get(&gid)
-            .cloned()
-            .unwrap_or_else(|| "(untitled)".to_string());
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Compass,
-            entity_id: event_id,
-            ts_ns: ts.0,
-            summary: preview(&title, 80),
-            status: Some(read_text(dataset, status)),
-            from_to: None,
-        });
-    }
-
-    let note_rows: Vec<(Id, Id, TextHandle, (i128, i128))> = find!(
-        (event_id: Id, gid: Id, note: TextHandle, ts: (i128, i128)),
-        pattern!(dataset.facts, [{
-            ?event_id @
-            metadata::tag: &KIND_NOTE_ID,
-            compass_attrs::task: ?gid,
-            compass_attrs::note: ?note,
-            metadata::created_at: ?ts,
-        }])
-    )
-    .collect();
-
-    for (event_id, gid, note_h, ts) in note_rows {
-        let body = read_text(dataset, note_h);
-        let title = title_by_goal
-            .get(&gid)
-            .cloned()
-            .unwrap_or_else(|| "(untitled)".to_string());
-        let summary = if body.is_empty() {
-            preview(&title, 80)
-        } else {
-            preview(&format!("{title} — {body}"), 80)
-        };
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Compass,
-            entity_id: event_id,
-            ts_ns: ts.0,
-            summary,
-            status: Some("note".to_string()),
-            from_to: None,
-        });
+/// Every mark of one source whose time lies in `[lo, hi]`, appended to
+/// `out`. Reads facts only. Returns how many time facts the window held:
+/// the metadata work this selection did.
+fn marks_in(
+    idx: usize,
+    source: &TimelineSource,
+    facts: &FactArchive,
+    lo: i128,
+    hi: i128,
+    out: &mut Vec<Mark>,
+) -> usize {
+    match source {
+        TimelineSource::Compass { .. } => compass_marks(idx, facts, lo, hi, out),
+        TimelineSource::LocalMessages { .. } => local_marks(idx, facts, lo, hi, out),
+        TimelineSource::Wiki { .. } => wiki_marks(idx, facts, lo, hi, out),
+        TimelineSource::Reason { .. } => reason_marks(idx, facts, lo, hi, out),
+        TimelineSource::Archive { .. } => archive_marks(idx, facts, lo, hi, out),
     }
 }
 
-/// Emit a LocalMessages event per message.
-fn collect_local_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let mut rows: Vec<(Id, Id, Id, TextHandle, Inline<NsTAIInterval>)> = find!(
-        (
-            id: Id,
-            from: Id,
-            to: Id,
-            body: TextHandle,
-            created_at: Inline<NsTAIInterval>
-        ),
-        pattern!(dataset.facts, [{ ?id @
-            metadata::tag: &KIND_MESSAGE_ID,
-            message_attrs::from: ?from,
-            message_attrs::to: ?to,
-            message_attrs::body: ?body,
-            metadata::created_at: ?created_at,
-        }])
-    )
-    .collect();
-
-    // One chip per envelope. The view answers with a bag, so a repeated field
-    // is another witness of the same message; keep the newest, as the message
-    // listing and the triage count do.
-    rows.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| interval_start(right.4).cmp(&interval_start(left.4)))
-    });
-    rows.dedup_by_key(|row| row.0);
-
-    for (id, from, to, body, created_at) in rows {
-        let Some(ts_ns) = interval_start(created_at) else {
+/// A Compass mark per goal creation, status change and note at its
+/// `created_at`, so quiet boards still show up.
+fn compass_marks(
+    idx: usize,
+    facts: &FactArchive,
+    lo: i128,
+    hi: i128,
+    out: &mut Vec<Mark>,
+) -> usize {
+    let times = starts_in(facts, metadata::created_at.id(), lo, hi);
+    for &(at, entity) in &times {
+        let Some(ts_ns) = interval_start(at) else {
             continue;
         };
-        let body = read_text(dataset, body);
-        out.push(Event {
+        let mark = |label| Mark {
             source_idx: idx,
-            kind: SourceKind::LocalMessages,
-            entity_id: id,
+            kind: SourceKind::Compass,
+            entity_id: entity,
             ts_ns,
-            summary: preview(&body, 80),
-            status: None,
-            from_to: Some(format!("{} → {}", id_hex(from), id_hex(to))),
-        });
+            label,
+        };
+        for title in find!(
+            title: TextHandle,
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_GOAL_ID,
+                compass_attrs::title: ?title,
+            }])
+        ) {
+            out.push(mark(Label::Goal { title }));
+        }
+        for (goal, status) in find!(
+            (goal: Id, status: TextHandle),
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_STATUS_ID,
+                compass_attrs::status_of: ?goal,
+                compass_attrs::status: ?status,
+            }])
+        ) {
+            out.push(mark(Label::Status { goal, status }));
+        }
+        for (goal, note) in find!(
+            (goal: Id, note: TextHandle),
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_NOTE_ID,
+                compass_attrs::task: ?goal,
+                compass_attrs::note: ?note,
+            }])
+        ) {
+            out.push(mark(Label::Note { goal, note }));
+        }
     }
+    times.len()
 }
 
-/// Emit a Wiki event per fragment-version.
-fn collect_wiki_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    for revision_id in crate::wiki::revision_ids(dataset.facts) {
-        for revision in crate::wiki::revision_records(dataset.facts, revision_id) {
+/// One LocalMessages mark per envelope. The view answers with a bag, so a
+/// repeated field is another witness of the same message; the mark sits at
+/// the newest `created_at`, as the message listing and the triage count do,
+/// and only a window holding that newest time shows it.
+fn local_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
+    let times = starts_in(facts, metadata::created_at.id(), lo, hi);
+    let mut placed = HashSet::new();
+    for &(at, entity) in &times {
+        let Some(ts_ns) = interval_start(at) else {
+            continue;
+        };
+        if placed.contains(&entity) {
+            continue;
+        }
+        let Some((from, to, body)) = find!(
+            (from: Id, to: Id, body: TextHandle),
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_MESSAGE_ID,
+                message_attrs::from: ?from,
+                message_attrs::to: ?to,
+                message_attrs::body: ?body,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        let newest = find!(
+            created_at: Inline<NsTAIInterval>,
+            pattern!(facts, [{ entity @ metadata::created_at: ?created_at }])
+        )
+        .map(interval_start)
+        .max()
+        .flatten();
+        if newest != Some(ts_ns) {
+            continue;
+        }
+        placed.insert(entity);
+        out.push(Mark {
+            source_idx: idx,
+            kind: SourceKind::LocalMessages,
+            entity_id: entity,
+            ts_ns,
+            label: Label::Message { from, to, body },
+        });
+    }
+    times.len()
+}
+
+/// A Wiki mark per revision projection at its authored time: a native
+/// revision's earliest authorship, a legacy version's greatest observation.
+/// A `created_at` in the window names either the legacy version itself or
+/// an authorship of a native revision; each candidate is then projected
+/// exactly as the full listing projects it and kept if its time is here.
+fn wiki_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
+    let times = starts_in(facts, metadata::created_at.id(), lo, hi);
+    let mut candidates = BTreeSet::new();
+    for &(_, entity) in &times {
+        let mut authored = find!(
+            revision: Id,
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_AUTHORSHIP,
+                wiki_attrs::revision: ?revision,
+            }])
+        )
+        .peekable();
+        if authored.peek().is_none() {
+            candidates.insert(entity);
+        } else {
+            candidates.extend(authored);
+        }
+    }
+    for revision_id in candidates {
+        for revision in crate::wiki::revision_records(facts, revision_id) {
             let Some(ts_ns) = revision.authored_at().and_then(interval_start) else {
                 continue;
             };
-            let title = read_text(dataset, revision.title);
-            out.push(Event {
+            if ts_ns < lo || ts_ns > hi {
+                continue;
+            }
+            out.push(Mark {
                 source_idx: idx,
                 kind: SourceKind::Wiki,
                 entity_id: revision.id,
                 ts_ns,
-                summary: preview(&title, 80),
-                status: None,
-                from_to: None,
+                label: Label::Wiki {
+                    title: revision.title,
+                },
             });
         }
     }
+    times.len()
 }
 
-/// Emit a Reason event per reasoning entity. Each
-/// entity has a long-string `text` payload (the agent's thought)
-/// and a created-at timestamp; the timeline chip shows the first
-/// line of the thought as its summary.
-fn collect_reason_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let rows: Vec<(Id, TextHandle, (i128, i128))> = find!(
-        (rid: Id, text: TextHandle, ts: (i128, i128)),
-        pattern!(dataset.facts, [{
-            ?rid @
-            metadata::tag: &KIND_REASON_ID,
-            reason_attrs::text: ?text,
-            metadata::created_at: ?ts,
-        }])
-    )
-    .collect();
-
-    for (rid, text_h, ts) in rows {
-        let text = read_text(dataset, text_h);
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Reason,
-            entity_id: rid,
-            ts_ns: ts.0,
-            summary: preview(&text, 80),
-            status: None,
-            from_to: None,
-        });
-    }
-}
-
-/// Emit one Archive event per source projection receipt. A receipt's
-/// earliest genuine source timestamp wins when present; otherwise the
-/// canonical node time is used. A node's texts are rendered, and a node
-/// holding no text remains visible as a typed placeholder.
-fn collect_archive_events(idx: usize, dataset: DatasetView<'_>, out: &mut Vec<Event>) {
-    let source_times = earliest_source_times(dataset.facts);
-    // A chip shows a node's text, and a capture carries it to a model: what
-    // a recorded classifier stop followed shows only that it is withheld.
-    let stopped = crate::archive::classifier_stopped(dataset.facts);
-
-    let mut block_times = BTreeMap::new();
-    for (block, timestamp) in find!(
-        (block: Id, timestamp: Inline<NsTAIInterval>),
-        pattern!(dataset.facts, [{ ?block @ archive::block::timestamp: ?timestamp }])
-    ) {
-        block_times.insert(block, timestamp);
-    }
-
-    let mut part_counts = HashMap::<Id, usize>::new();
-    for (block, _) in find!(
-        (block: Id, fact: Id),
-        pattern!(dataset.facts, [{ ?block @ archive::block::holds: ?fact }])
-    ) {
-        *part_counts.entry(block).or_default() += 1;
-    }
-
-    // A node holds one fact, or a set at one moment: its texts in fact order.
-    let mut text_parts = HashMap::<Id, Vec<(Id, String)>>::new();
-    for (block, fact, payload) in find!(
-        (block: Id, fact: Id, payload: TextHandle),
-        pattern!(dataset.facts, [
-            { ?block @ archive::block::holds: ?fact },
-            { ?fact @ archive::content_fact::payload: ?payload },
-        ])
-    ) {
-        text_parts
-            .entry(block)
-            .or_default()
-            .push((fact, read_text(dataset, payload)));
-    }
-    for parts in text_parts.values_mut() {
-        parts.sort_unstable_by_key(|(fact, _)| *fact);
-    }
-
-    let projections: Vec<(Id, Id)> = find!(
-        (projection: Id, block: Id),
-        pattern!(dataset.facts, [{
-            ?projection @
-            metadata::tag: &archive::source_projection::KIND,
-            archive::source_projection::projects_to: ?block,
-        }])
-    )
-    .collect();
-    for (projection, block) in projections {
-        let timestamp = source_times
-            .get(&projection)
-            .or_else(|| block_times.get(&block));
-        let Some(timestamp) = timestamp else {
+/// A Reason mark per reasoning entity. Each entity has a long-string
+/// `text` payload (the agent's thought) and a created-at timestamp; the
+/// label shows the first line of the thought as its summary.
+fn reason_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
+    let times = starts_in(facts, metadata::created_at.id(), lo, hi);
+    for &(at, entity) in &times {
+        let Some(ts_ns) = interval_start(at) else {
             continue;
         };
-        let texts = text_parts.get(&block);
-        let content = if stopped.contains(&block) {
-            "[withheld: a classifier stop followed this]".to_owned()
-        } else {
-            texts
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .map(|(_, text)| text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .filter(|text| !text.trim().is_empty())
-                .unwrap_or_else(|| {
-                    format!(
-                        "[{} non-text part{}]",
-                        part_counts.get(&block).copied().unwrap_or(0),
-                        if part_counts.get(&block).copied().unwrap_or(0) == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    )
-                })
-        };
-        let Some(ts_ns) = interval_start(*timestamp) else {
-            continue;
-        };
-        out.push(Event {
-            source_idx: idx,
-            kind: SourceKind::Archive,
-            entity_id: projection,
-            ts_ns,
-            summary: preview(&content, 80),
-            status: None,
-            from_to: None,
-        });
+        for text in find!(
+            text: TextHandle,
+            pattern!(facts, [{
+                entity @
+                metadata::tag: &KIND_REASON_ID,
+                reason_attrs::text: ?text,
+            }])
+        ) {
+            out.push(Mark {
+                source_idx: idx,
+                kind: SourceKind::Reason,
+                entity_id: entity,
+                ts_ns,
+                label: Label::Reason { text },
+            });
+        }
     }
+    times.len()
 }
 
-/// Each receipt's earliest source timestamp, for the receipts that have one.
+/// One Archive mark per source projection receipt and node it projects to.
+/// A receipt's earliest genuine source timestamp wins when present;
+/// otherwise the canonical node time is used. So a window looks in two
+/// places: receipts whose earliest source time is here, and nodes whose
+/// time is here for the receipts without one.
+fn archive_marks(
+    idx: usize,
+    facts: &FactArchive,
+    lo: i128,
+    hi: i128,
+    out: &mut Vec<Mark>,
+) -> usize {
+    let mark = |projection, ts_ns, block| Mark {
+        source_idx: idx,
+        kind: SourceKind::Archive,
+        entity_id: projection,
+        ts_ns,
+        label: Label::Archive { block },
+    };
+
+    let sourced = starts_in(
+        facts,
+        archive::source_projection::source_timestamp.id(),
+        lo,
+        hi,
+    );
+    let mut receipts = HashSet::new();
+    for &(_, projection) in &sourced {
+        if !receipts.insert(projection) {
+            continue;
+        }
+        let Some(ts_ns) = earliest_source_time(facts, projection).and_then(interval_start) else {
+            continue;
+        };
+        if ts_ns < lo || ts_ns > hi {
+            continue;
+        }
+        for block in find!(
+            block: Id,
+            pattern!(facts, [{
+                projection @
+                metadata::tag: &archive::source_projection::KIND,
+                archive::source_projection::projects_to: ?block,
+            }])
+        ) {
+            out.push(mark(projection, ts_ns, block));
+        }
+    }
+
+    let timed = starts_in(facts, archive::block::timestamp.id(), lo, hi);
+    let mut nodes = HashSet::new();
+    for &(_, block) in &timed {
+        if !nodes.insert(block) {
+            continue;
+        }
+        let Some(ts_ns) = node_time(facts, block) else {
+            continue;
+        };
+        if ts_ns < lo || ts_ns > hi {
+            continue;
+        }
+        for projection in find!(
+            projection: Id,
+            pattern!(facts, [{
+                ?projection @
+                metadata::tag: &archive::source_projection::KIND,
+                archive::source_projection::projects_to: &block,
+            }])
+        ) {
+            if earliest_source_time(facts, projection).is_none() {
+                out.push(mark(projection, ts_ns, block));
+            }
+        }
+    }
+    sourced.len() + timed.len()
+}
+
+/// A receipt's earliest source timestamp, when it has one.
 ///
 /// A receipt carries one timestamp per observed occurrence: a Codex fork or
 /// resume that replays its parent adds the replay's time to the parent's
 /// receipt. The earliest is when the message was first said, and it is the
 /// one `archive list` prints. A timestamp that is not a valid interval is
 /// passed over, as that typed read passes it over.
-fn earliest_source_times(facts: &FactArchive) -> BTreeMap<Id, Inline<NsTAIInterval>> {
-    let mut source_times = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
-    for (projection, timestamp) in find!(
-        (projection: Id, timestamp: Inline<NsTAIInterval>),
+fn earliest_source_time(facts: &FactArchive, projection: Id) -> Option<Inline<NsTAIInterval>> {
+    find!(
+        timestamp: Inline<NsTAIInterval>,
         pattern!(facts, [{
-            ?projection @ archive::source_projection::source_timestamp: ?timestamp
+            projection @ archive::source_projection::source_timestamp: ?timestamp
         }])
-    ) {
-        let Some(start) = interval_start(timestamp) else {
-            continue;
-        };
-        let earliest = source_times.entry(projection).or_insert((start, timestamp));
-        if start < earliest.0 {
-            *earliest = (start, timestamp);
+    )
+    .filter_map(|timestamp| interval_start(timestamp).map(|start| (start, timestamp)))
+    .min_by_key(|(start, _)| *start)
+    .map(|(_, timestamp)| timestamp)
+}
+
+/// A node's canonical time: its earliest valid timestamp.
+fn node_time(facts: &FactArchive, block: Id) -> Option<i128> {
+    find!(
+        timestamp: Inline<NsTAIInterval>,
+        pattern!(facts, [{ block @ archive::block::timestamp: ?timestamp }])
+    )
+    .filter_map(interval_start)
+    .min()
+}
+
+/// Read the text one drawn label shows. `stopped` is the source's set of
+/// nodes a recorded classifier stop followed, found once per revision on
+/// the first archive label drawn.
+fn hydrate(
+    label: Label,
+    facts: &FactArchive,
+    stopped: &mut Option<BTreeSet<Id>>,
+    read: &mut dyn FnMut(TextHandle) -> String,
+) -> Shown {
+    match label {
+        Label::Goal { title } => Shown {
+            summary: preview(&read(title), 80),
+            status: Some("created".to_string()),
+            from_to: None,
+        },
+        Label::Status { goal, status } => Shown {
+            summary: preview(&goal_title(facts, goal, read), 80),
+            status: Some(read(status)),
+            from_to: None,
+        },
+        Label::Note { goal, note } => {
+            let body = read(note);
+            let title = goal_title(facts, goal, read);
+            let summary = if body.is_empty() {
+                preview(&title, 80)
+            } else {
+                preview(&format!("{title} — {body}"), 80)
+            };
+            Shown {
+                summary,
+                status: Some("note".to_string()),
+                from_to: None,
+            }
+        }
+        Label::Message { from, to, body } => Shown {
+            summary: preview(&read(body), 80),
+            status: None,
+            from_to: Some(format!("{} → {}", id_hex(from), id_hex(to))),
+        },
+        Label::Wiki { title } | Label::Reason { text: title } => Shown {
+            summary: preview(&read(title), 80),
+            status: None,
+            from_to: None,
+        },
+        Label::Archive { block } => Shown {
+            summary: preview(&archive_content(facts, block, stopped, read), 80),
+            status: None,
+            from_to: None,
+        },
+    }
+}
+
+/// The title a status or note shows for its goal: a created goal's title.
+fn goal_title(facts: &FactArchive, goal: Id, read: &mut dyn FnMut(TextHandle) -> String) -> String {
+    find!(
+        title: TextHandle,
+        pattern!(facts, [{
+            goal @
+            metadata::tag: &KIND_GOAL_ID,
+            compass_attrs::title: ?title,
+            metadata::created_at: _?created_at,
+        }])
+    )
+    .last()
+    .map(read)
+    .unwrap_or_else(|| "(untitled)".to_string())
+}
+
+/// A node's texts in fact order. A chip shows a node's text, and a capture
+/// carries it to a model: what a recorded classifier stop followed shows
+/// only that it is withheld, and is not read. A node holding no text
+/// remains visible as a typed placeholder.
+fn archive_content(
+    facts: &FactArchive,
+    block: Id,
+    stopped: &mut Option<BTreeSet<Id>>,
+    read: &mut dyn FnMut(TextHandle) -> String,
+) -> String {
+    let stopped = stopped.get_or_insert_with(|| crate::archive::classifier_stopped(facts));
+    if stopped.contains(&block) {
+        return "[withheld: a classifier stop followed this]".to_owned();
+    }
+    // A node holds one fact, or a set at one moment: its texts in fact order.
+    let mut parts: Vec<(Id, TextHandle)> = find!(
+        (fact: Id, payload: TextHandle),
+        pattern!(facts, [
+            { block @ archive::block::holds: ?fact },
+            { ?fact @ archive::content_fact::payload: ?payload },
+        ])
+    )
+    .collect();
+    parts.sort_unstable();
+    let text = parts
+        .into_iter()
+        .map(|(_, payload)| read(payload))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !text.trim().is_empty() {
+        return text;
+    }
+    let count = find!(
+        fact: Id,
+        pattern!(facts, [{ block @ archive::block::holds: ?fact }])
+    )
+    .count();
+    format!(
+        "[{count} non-text part{}]",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+// ── Window selection and layout ──────────────────────────────────────
+
+/// Height of a label chip; also the spacing a mark needs to be labelled.
+const CHIP_H: f32 = 16.0;
+/// Labels read on demand are kept up to this many, then forgotten.
+const SHOWN_CAPACITY: usize = 4096;
+
+/// A pixel row of strips from one source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Strip {
+    /// Offset from the viewport top, in pixels.
+    y: f32,
+    /// How many marks of this source fall in this pixel row.
+    count: usize,
+    /// The row's newest mark, selected by a click.
+    mark: Mark,
+}
+
+/// What one viewport draws.
+#[derive(Debug, Default)]
+struct Frame {
+    /// Marks with room for a chip, with their text: `(offset, mark, text)`.
+    labels: Vec<(f32, Mark, Shown)>,
+    /// Marks too dense for a chip, drawn from metadata alone.
+    strips: Vec<Strip>,
+}
+
+/// Marks for a time range around the viewport, and the labels already read.
+///
+/// Selection seeks each source's ordered time facts, so it costs the window,
+/// not the history. The selected range reaches one viewport beyond each edge,
+/// so panning within it and zooming in re-select nothing; zooming out, or a
+/// range grown far wider than the view, re-selects. A keyed dataset changing
+/// discards everything.
+struct Activity {
+    revisions: BTreeMap<SourceKey, DatasetRevision>,
+    /// The selected time range `[lo, hi]`; `marks` holds every mark in it,
+    /// ordered by time.
+    range: Option<(i128, i128)>,
+    marks: Vec<Mark>,
+    /// Time facts the last selection examined: its metadata work.
+    scanned: usize,
+    shown: HashMap<(usize, Label), Shown>,
+    stopped: HashMap<usize, Option<BTreeSet<Id>>>,
+    /// Instrumentation: selections run and texts read by this widget.
+    selections: usize,
+    reads: usize,
+}
+
+impl Activity {
+    fn new(revisions: BTreeMap<SourceKey, DatasetRevision>) -> Self {
+        Self {
+            revisions,
+            range: None,
+            marks: Vec::new(),
+            scanned: 0,
+            shown: HashMap::new(),
+            stopped: HashMap::new(),
+            selections: 0,
+            reads: 0,
         }
     }
-    source_times
-        .into_iter()
-        .map(|(projection, (_, timestamp))| (projection, timestamp))
-        .collect()
+
+    /// Forget every selection and label when a keyed dataset appeared,
+    /// disappeared, or changed revision.
+    fn observe(&mut self, revisions: BTreeMap<SourceKey, DatasetRevision>) {
+        if self.revisions != revisions {
+            let (selections, reads) = (self.selections, self.reads);
+            *self = Self::new(revisions);
+            self.selections = selections;
+            self.reads = reads;
+        }
+    }
+
+    /// The marks in `[view_end, view_start]`, selecting a range around it
+    /// when the current one does not cover it.
+    fn visible(
+        &mut self,
+        view_end: i128,
+        view_start: i128,
+        select: &mut dyn FnMut(i128, i128, &mut Vec<Mark>) -> usize,
+    ) -> std::ops::Range<usize> {
+        let span = view_start.saturating_sub(view_end).max(1);
+        let covered = self.range.is_some_and(|(lo, hi)| {
+            lo <= view_end && view_start <= hi && hi.saturating_sub(lo) / span <= 16
+        });
+        if !covered {
+            let lo = view_end.saturating_sub(span);
+            let hi = view_start.saturating_add(span);
+            self.marks.clear();
+            self.scanned = select(lo, hi, &mut self.marks);
+            self.marks.sort_by_key(|mark| mark.ts_ns);
+            self.range = Some((lo, hi));
+            self.selections += 1;
+        }
+        let first = self.marks.partition_point(|mark| mark.ts_ns < view_end);
+        let last = self.marks.partition_point(|mark| mark.ts_ns <= view_start);
+        first..last
+    }
+
+    /// Lay out one viewport. A mark is labelled when its neighbours are at
+    /// least a chip apart; only labels read text, so a frame reads at most
+    /// one label's text per chip height of viewport. Denser marks become
+    /// strips, aggregated per pixel row and source.
+    fn frame<'f>(
+        &mut self,
+        view_start: i128,
+        ns_per_px: f64,
+        height: f32,
+        select: &mut dyn FnMut(i128, i128, &mut Vec<Mark>) -> usize,
+        facts: &dyn Fn(usize) -> Option<&'f FactArchive>,
+        read: &mut dyn FnMut(usize, TextHandle) -> String,
+    ) -> Frame {
+        let view_end = view_start - (height as f64 * ns_per_px) as i128;
+        let visible = self.visible(view_end, view_start, select);
+        let offset = |mark: &Mark| ((view_start - mark.ts_ns) as f64 / ns_per_px) as f32;
+
+        let mut frame = Frame::default();
+        let mut row: Vec<Strip> = Vec::new();
+        let flush = |row: &mut Vec<Strip>, strips: &mut Vec<Strip>| strips.append(row);
+        for i in visible.clone() {
+            let mark = self.marks[i];
+            let y = offset(&mark);
+            let roomy = |j: usize| (offset(&self.marks[j]) - y).abs() >= CHIP_H;
+            let above = i + 1 == visible.end || roomy(i + 1);
+            let below = i == visible.start || roomy(i - 1);
+            if above && below {
+                let shown = self.shown(&mark, facts, read);
+                frame.labels.push((y, mark, shown));
+                continue;
+            }
+            let pixel = y.floor();
+            if row.first().is_some_and(|strip| strip.y != pixel) {
+                flush(&mut row, &mut frame.strips);
+            }
+            match row
+                .iter_mut()
+                .find(|strip| strip.mark.source_idx == mark.source_idx)
+            {
+                // Marks ascend in time, so the last one seen is the newest.
+                Some(strip) => {
+                    strip.count += 1;
+                    strip.mark = mark;
+                }
+                None => row.push(Strip {
+                    y: pixel,
+                    count: 1,
+                    mark,
+                }),
+            }
+        }
+        flush(&mut row, &mut frame.strips);
+        frame
+    }
+
+    /// The text of one drawn label, read once per revision.
+    fn shown<'f>(
+        &mut self,
+        mark: &Mark,
+        facts: &dyn Fn(usize) -> Option<&'f FactArchive>,
+        read: &mut dyn FnMut(usize, TextHandle) -> String,
+    ) -> Shown {
+        let key = (mark.source_idx, mark.label);
+        if let Some(shown) = self.shown.get(&key) {
+            return shown.clone();
+        }
+        let Some(facts) = facts(mark.source_idx) else {
+            return Shown::default();
+        };
+        if self.shown.len() >= SHOWN_CAPACITY {
+            self.shown.clear();
+        }
+        let reads = &mut self.reads;
+        let stopped = self.stopped.entry(mark.source_idx).or_default();
+        let source_idx = mark.source_idx;
+        let mut counted = |handle| {
+            *reads += 1;
+            read(source_idx, handle)
+        };
+        let shown = hydrate(mark.label, facts, stopped, &mut counted);
+        self.shown.insert(key, shown.clone());
+        shown
+    }
 }
 
 // ── Widget ───────────────────────────────────────────────────────────
@@ -682,7 +994,12 @@ fn earliest_source_times(facts: &FactArchive) -> BTreeMap<Id, Inline<NsTAIInterv
 /// * a four-sine ruler (constructive interference at minute / hour /
 ///   day boundaries)
 /// * time labels at the coarsest interval that fits
-/// * per-source event chips with source-specific decoration
+/// * per-source event chips with source-specific decoration where there
+///   is room, and thin source-colored strips where events are denser than
+///   a chip; a strip is drawn from metadata and reads no text
+///
+/// Only the time range around the viewport is selected, through each
+/// source's ordered time facts, and only drawn chips read their text.
 ///
 /// Sources are resolved by [`SourceKey`] from the immutable context supplied by
 /// the host. Missing datasets are omitted independently.
@@ -691,9 +1008,9 @@ pub struct BranchTimeline {
     /// never inferred from this vector's positional relationship to input.
     sources: Vec<TimelineSource>,
     viewport_height: f32,
-    /// Cached events + revision markers; rebuilt when any source dataset
+    /// Selected marks and read labels; discarded when any source dataset
     /// changes.
-    live: Option<MultiLive>,
+    activity: Option<Activity>,
     /// Top edge of viewport, in TAI ns. Newest visible time.
     timeline_start: i128,
     /// Pixels per minute of wall time.
@@ -713,7 +1030,7 @@ impl BranchTimeline {
         Self {
             sources,
             viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-            live: None,
+            activity: None,
             timeline_start: 0,
             timeline_scale: TIMELINE_DEFAULT_SCALE,
             first_render: true,
@@ -732,25 +1049,24 @@ impl BranchTimeline {
         ctx.section("Activity", |ctx| {
             let now = now_key();
 
-            // Refresh if any keyed dataset appeared, disappeared, or changed.
             let revisions = source_revisions(&self.sources, datasets);
-            let need_refresh = match self.live.as_ref() {
-                None => true,
-                Some(live) => live.cached_revisions != revisions,
-            };
-            if need_refresh {
-                self.live = Some(MultiLive::refresh(&self.sources, datasets));
-            }
+            self.activity
+                .get_or_insert_with(|| Activity::new(revisions.clone()))
+                .observe(revisions);
 
-            let events = self
-                .live
-                .as_ref()
-                .map(|l| l.events.clone())
-                .unwrap_or_default();
-            let sources = self.sources.clone();
-            let viewport_height = self.viewport_height;
             if self.first_render {
-                if let Some(anchor) = now.or_else(|| events.iter().map(|event| event.ts_ns).max()) {
+                // Without a clock the view opens at the newest event, which
+                // takes one metadata pass over every source's history.
+                let anchor = now.or_else(|| {
+                    let mut marks = Vec::new();
+                    for (idx, source, view) in
+                        resolve_sources(&self.sources, |key| datasets.dataset(key))
+                    {
+                        marks_in(idx, source, view.facts, i128::MIN, i128::MAX, &mut marks);
+                    }
+                    marks.iter().map(|mark| mark.ts_ns).max()
+                });
+                if let Some(anchor) = anchor {
                     self.timeline_start = anchor;
                     self.first_render = false;
                 }
@@ -774,7 +1090,7 @@ impl BranchTimeline {
             // section, matching the wiki graph's treatment. Legend
             // + SPAN + zoom-hint all live as overlays inside the
             // viewport itself.
-            self.paint_viewport(ctx, viewport_height, now, &events, &sources);
+            self.paint_viewport(ctx, now, datasets);
         });
     }
 
@@ -782,11 +1098,10 @@ impl BranchTimeline {
     fn paint_viewport(
         &mut self,
         ctx: &mut CardCtx<'_>,
-        viewport_height: f32,
         now: Option<i128>,
-        events: &[Event],
-        sources: &[TimelineSource],
+        datasets: &WidgetContext<'_>,
     ) {
+        let viewport_height = self.viewport_height;
         let ui = ctx.ui_mut();
         let scroll_speed = 3.0;
         let viewport_width = ui.available_width();
@@ -1035,6 +1350,38 @@ impl BranchTimeline {
             painter.galley(span_pos, span_galley, span_color);
         }
 
+        // Select the window's marks, then read only the labels with room.
+        let views: Vec<Option<DatasetView<'_>>> = self
+            .sources
+            .iter()
+            .map(|source| datasets.dataset(source.key()))
+            .collect();
+        let sources = &self.sources;
+        let mut select = |lo, hi, out: &mut Vec<Mark>| {
+            resolve_sources(sources, |key| datasets.dataset(key))
+                .into_iter()
+                .map(|(idx, source, view)| marks_in(idx, source, view.facts, lo, hi, out))
+                .sum::<usize>()
+        };
+        let facts = |idx: usize| views.get(idx).copied().flatten().map(|view| view.facts);
+        let mut read = |idx: usize, handle| match views.get(idx).copied().flatten() {
+            Some(view) => read_text(view, handle),
+            None => String::new(),
+        };
+        let frame = self
+            .activity
+            .as_mut()
+            .map_or_else(Frame::default, |activity| {
+                activity.frame(
+                    view_start,
+                    ns_per_px,
+                    viewport_height,
+                    &mut select,
+                    &facts,
+                    &mut read,
+                )
+            });
+
         // Per-source chip rows with source-specific decoration.
         let pointer_pos = ui.input(|i| i.pointer.hover_pos());
         let mut clicked_event: Option<(SourceKind, Id)> = None;
@@ -1043,14 +1390,28 @@ impl BranchTimeline {
         let event_left = viewport_rect.left() + max_len + 110.0;
         let event_right_margin = 8.0;
         let event_width = (viewport_rect.right() - event_left - event_right_margin).max(80.0);
-        let chip_h = 16.0;
+        let chip_h = CHIP_H;
+        let src_pill_w = 42.0;
         let text_color = egui::Color32::from_rgb(0xe6, 0xe6, 0xe6);
 
-        for ev in events {
-            if ev.ts_ns < view_end || ev.ts_ns > view_start {
-                continue;
-            }
-            let y = viewport_rect.top() + ((view_start - ev.ts_ns) as f64 / ns_per_px) as f32;
+        // Strips: one source-colored line per pixel row and source, under
+        // the source pill's column so the chips' column structure holds.
+        let strip_h = 2.0;
+        for strip in &frame.strips {
+            let y = viewport_rect.top() + strip.y;
+            let color = sources[strip.mark.source_idx].color();
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(event_left + 2.0, y - strip_h * 0.5),
+                    egui::vec2(src_pill_w, strip_h),
+                ),
+                0.0,
+                color,
+            );
+        }
+
+        for (offset, ev, shown) in &frame.labels {
+            let y = viewport_rect.top() + offset;
             let src = &sources[ev.source_idx];
             let src_color = src.color();
             let src_label = src.label();
@@ -1064,7 +1425,6 @@ impl BranchTimeline {
             painter.rect_filled(chip_rect, 3.0, frame_color);
 
             // Source pill (left).
-            let src_pill_w = 42.0;
             let src_pill = egui::Rect::from_min_size(
                 egui::pos2(event_left + 2.0, y - chip_h * 0.5 + 1.0),
                 egui::vec2(src_pill_w, chip_h - 2.0),
@@ -1080,7 +1440,7 @@ impl BranchTimeline {
 
             // Optional secondary pill (status / from→to).
             let mut text_x = event_left + src_pill_w + 6.0;
-            if let Some(status) = &ev.status {
+            if let Some(status) = &shown.status {
                 let pill_color = match ev.kind {
                     SourceKind::Compass => status_color(status),
                     _ => src_color,
@@ -1110,7 +1470,7 @@ impl BranchTimeline {
             // clip-rect cutoff because it always ends at a char
             // boundary with a visible overflow indicator.
             let available_px = (chip_rect.right() - text_x - 4.0).max(0.0);
-            let truncated = truncate_to_chip_width(&ev.summary, available_px, 6.0);
+            let truncated = truncate_to_chip_width(&shown.summary, available_px, 6.0);
             painter.text(
                 egui::pos2(text_x, y),
                 egui::Align2::LEFT_CENTER,
@@ -1130,10 +1490,10 @@ impl BranchTimeline {
                     }
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     let time_str = format_time_marker(ev.ts_ns);
-                    let summary = ev.summary.clone();
+                    let summary = shown.summary.clone();
                     let src_label = src_label.clone();
-                    let status_label = ev.status.clone();
-                    let fromto_label = ev.from_to.clone();
+                    let status_label = shown.status.clone();
+                    let fromto_label = shown.from_to.clone();
                     let src_color_tip = src_color;
                     egui::Tooltip::always_open(
                         ui.ctx().clone(),
@@ -1199,6 +1559,89 @@ impl BranchTimeline {
             }
         }
 
+        // A strip under the pointer, when no chip is: metadata only. The
+        // nearest pixel row within a few pixels answers, and a click
+        // selects its newest mark.
+        if hover_rect.is_none() {
+            let near = pointer_pos
+                .filter(|p| {
+                    viewport_rect.contains(*p)
+                        && p.x >= event_left
+                        && p.x <= event_left + event_width
+                })
+                .and_then(|p| {
+                    let at = p.y - viewport_rect.top();
+                    frame
+                        .strips
+                        .iter()
+                        .filter(|strip| (strip.y - at).abs() <= 3.0)
+                        .min_by(|a, b| (a.y - at).abs().total_cmp(&(b.y - at).abs()))
+                });
+            if let Some(strip) = near {
+                let row: Vec<&Strip> = frame
+                    .strips
+                    .iter()
+                    .filter(|other| other.y == strip.y)
+                    .collect();
+                let src = &sources[strip.mark.source_idx];
+                let src_color = src.color();
+                let row_rect = egui::Rect::from_min_size(
+                    egui::pos2(event_left + 2.0, viewport_rect.top() + strip.y - 3.0),
+                    egui::vec2(src_pill_w, 6.0),
+                );
+                hover_rect = Some((row_rect, src_color));
+                if viewport_response.clicked() {
+                    clicked_event = Some((strip.mark.kind, strip.mark.entity_id));
+                }
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                let time_str = format_time_marker(strip.mark.ts_ns);
+                let lines: Vec<(String, egui::Color32, usize)> = row
+                    .iter()
+                    .map(|strip| {
+                        let src = &sources[strip.mark.source_idx];
+                        (src.label().to_uppercase(), src.color(), strip.count)
+                    })
+                    .collect();
+                let newest = id_hex(strip.mark.entity_id);
+                egui::Tooltip::always_open(
+                    ui.ctx().clone(),
+                    ui.layer_id(),
+                    egui::Id::new(("timeline_strip_tip", strip.mark.entity_id)),
+                    egui::PopupAnchor::Pointer,
+                )
+                .gap(12.0)
+                .show(|tip| {
+                    tip.set_max_width(360.0);
+                    tip.label(egui::RichText::new(time_str).small().monospace().weak());
+                    for (label, color, count) in lines {
+                        tip.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            let (dot_rect, _) =
+                                ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot_rect.center(), 4.0, color);
+                            ui.label(
+                                egui::RichText::new(format!("{label} × {count}"))
+                                    .small()
+                                    .monospace()
+                                    .strong()
+                                    .color(color),
+                            );
+                        });
+                    }
+                    tip.label(
+                        egui::RichText::new("ZOOM IN TO READ")
+                            .small()
+                            .monospace()
+                            .weak(),
+                    );
+                    tip.add(
+                        egui::Label::new(egui::RichText::new(newest).monospace().small().weak())
+                            .wrap(),
+                    );
+                });
+            }
+        }
+
         if let Some((rect, color)) = hover_rect {
             painter.rect_stroke(
                 rect,
@@ -1243,6 +1686,9 @@ fn format_span(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
+    use triblespace::core::trible::TribleSet;
+    use triblespace::prelude::{entity, Blob, ExclusiveId, IntoBlob, TryToInline};
 
     fn kind(source: &TimelineSource) -> SourceKind {
         match source {
@@ -1330,22 +1776,304 @@ mod tests {
         assert_eq!(route(&forward), route(&reverse));
     }
 
+    const SECOND: i128 = 1_000_000_000;
+    const MINUTE: i128 = 60 * SECOND;
+    /// An arbitrary origin, so no test relies on times near zero.
+    const T0: i128 = 1_000_000 * MINUTE;
+    /// The default zoom: two pixels per minute.
+    const DEFAULT_NS_PER_PX: f64 = 30.0 * SECOND as f64;
+    const HEIGHT: f32 = 800.0;
+
+    fn instant(ns: i128) -> Inline<NsTAIInterval> {
+        let epoch = Epoch::from_tai_duration(HifiDuration::from_total_nanoseconds(ns));
+        (epoch, epoch).try_to_inline().expect("valid interval")
+    }
+
+    fn text(value: &str) -> TextHandle {
+        let blob: Blob<UTF8String> = value.to_owned().to_blob();
+        blob.get_handle()
+    }
+
+    fn id(n: u64) -> Id {
+        let mut raw = [0u8; 16];
+        raw[0] = 0xa5;
+        raw[8..].copy_from_slice(&n.to_be_bytes());
+        Id::new(raw).expect("non-nil")
+    }
+
+    fn archive_of(facts: &TribleSet) -> FactArchive {
+        FactArchive::new(vec![SuccinctArchive::from(facts)])
+    }
+
+    fn reason_source() -> Vec<TimelineSource> {
+        vec![TimelineSource::Reason {
+            key: SourceKey::Reason,
+            label: "reason".into(),
+        }]
+    }
+
+    /// One reasoning note at each time.
+    fn reasons(times: impl IntoIterator<Item = i128>) -> FactArchive {
+        let mut facts = TribleSet::new();
+        for (n, at) in times.into_iter().enumerate() {
+            let rid = id(n as u64 + 1);
+            facts += entity! { ExclusiveId::force_ref(&rid) @
+                metadata::tag: &KIND_REASON_ID,
+                reason_attrs::text: text(&format!("thought {n}")),
+                metadata::created_at: instant(at),
+            }
+            .into_facts();
+        }
+        archive_of(&facts)
+    }
+
+    /// Draw one viewport the way `paint_viewport` does, with a reader that
+    /// counts on `Activity::reads` and answers every handle with "text".
+    fn draw(
+        activity: &mut Activity,
+        sources: &[TimelineSource],
+        facts: &FactArchive,
+        view_start: i128,
+        ns_per_px: f64,
+    ) -> Frame {
+        let mut select = |lo, hi, out: &mut Vec<Mark>| {
+            sources
+                .iter()
+                .enumerate()
+                .map(|(idx, source)| marks_in(idx, source, facts, lo, hi, out))
+                .sum::<usize>()
+        };
+        let lookup = |_: usize| Some(facts);
+        let mut read = |_: usize, _: TextHandle| "text".to_owned();
+        activity.frame(
+            view_start,
+            ns_per_px,
+            HEIGHT,
+            &mut select,
+            &lookup,
+            &mut read,
+        )
+    }
+
+    fn drawn_marks(frame: &Frame) -> usize {
+        frame.labels.len() + frame.strips.iter().map(|strip| strip.count).sum::<usize>()
+    }
+
+    /// History outside the window is neither decoded nor read: the seek
+    /// lands past it, so the selection examined no time fact at all.
+    #[test]
+    fn offscreen_history_is_neither_selected_nor_read() {
+        let facts = reasons((0..2_000).map(|n| T0 + n * MINUTE));
+        let mut activity = Activity::new(BTreeMap::new());
+        let far_later = T0 + 30 * 24 * 60 * MINUTE;
+
+        let frame = draw(
+            &mut activity,
+            &reason_source(),
+            &facts,
+            far_later,
+            DEFAULT_NS_PER_PX,
+        );
+
+        assert!(frame.labels.is_empty() && frame.strips.is_empty());
+        assert_eq!(activity.scanned, 0);
+        assert_eq!(activity.reads, 0);
+        assert_eq!(activity.selections, 1);
+    }
+
+    /// Marks denser than a chip are drawn from metadata alone: every
+    /// visible mark is counted in a strip, and no text is read, although
+    /// all of them are inside the viewport.
+    #[test]
+    fn dense_marks_draw_as_strips_without_reading() {
+        let facts = reasons((0..5_000).map(|n| T0 + n * SECOND));
+        let mut activity = Activity::new(BTreeMap::new());
+        // The default zoom shows 400 minutes; 5,000 seconds fit in 167 px.
+        let view_start = T0 + 5_000 * SECOND + 10 * MINUTE;
+
+        let frame = draw(
+            &mut activity,
+            &reason_source(),
+            &facts,
+            view_start,
+            DEFAULT_NS_PER_PX,
+        );
+
+        assert!(frame.labels.is_empty());
+        assert_eq!(drawn_marks(&frame), 5_000);
+        assert!(frame.strips.len() <= 170, "{} strips", frame.strips.len());
+        assert_eq!(activity.reads, 0);
+    }
+
+    /// A lone mark beside a dense cluster gets its chip; only it is read.
+    #[test]
+    fn a_sparse_mark_beside_a_dense_cluster_alone_is_read() {
+        let lone = T0 + 60 * MINUTE;
+        let facts = reasons((0..1_000).map(|n| T0 + n * SECOND).chain([lone]));
+        let mut activity = Activity::new(BTreeMap::new());
+
+        let frame = draw(
+            &mut activity,
+            &reason_source(),
+            &facts,
+            lone + MINUTE,
+            DEFAULT_NS_PER_PX,
+        );
+
+        assert_eq!(frame.labels.len(), 1);
+        assert_eq!(frame.labels[0].1.ts_ns, lone);
+        assert_eq!(drawn_marks(&frame), 1_001);
+        assert_eq!(activity.reads, 1);
+    }
+
+    /// Zooming in re-selects a small window and reads exactly the labels
+    /// that now have room, never more than one per chip height.
+    #[test]
+    fn zooming_in_reads_only_the_labels_drawn() {
+        let facts = reasons((0..5_000).map(|n| T0 + n * SECOND));
+        let sources = reason_source();
+        let mut activity = Activity::new(BTreeMap::new());
+        let view_start = T0 + 2_500 * SECOND;
+
+        draw(
+            &mut activity,
+            &sources,
+            &facts,
+            view_start,
+            DEFAULT_NS_PER_PX,
+        );
+        assert_eq!(activity.reads, 0);
+
+        // Twenty pixels a second: 40 s in view, each mark a chip apart.
+        let frame = draw(
+            &mut activity,
+            &sources,
+            &facts,
+            view_start,
+            SECOND as f64 / 20.0,
+        );
+
+        assert_eq!(activity.selections, 2);
+        assert!(
+            activity.scanned <= 3 * 40 + 3,
+            "scanned {}",
+            activity.scanned
+        );
+        assert!(frame.strips.is_empty());
+        assert!(
+            (40..=41).contains(&frame.labels.len()),
+            "{} labels",
+            frame.labels.len()
+        );
+        assert!(frame.labels.len() <= (HEIGHT / CHIP_H) as usize + 1);
+        assert_eq!(activity.reads, frame.labels.len());
+        assert!(frame
+            .labels
+            .iter()
+            .all(|(_, _, shown)| shown.summary == "text"));
+    }
+
+    /// Panning inside the selected range re-selects nothing and reads only
+    /// the labels it newly draws; panning past it selects once more.
+    #[test]
+    fn panning_reads_only_newly_drawn_labels() {
+        let facts = reasons((0..5_000).map(|n| T0 + n * SECOND));
+        let sources = reason_source();
+        let mut activity = Activity::new(BTreeMap::new());
+        let ns_per_px = SECOND as f64 / 20.0;
+        let view_start = T0 + 2_500 * SECOND;
+
+        let first = draw(&mut activity, &sources, &facts, view_start, ns_per_px);
+        let before: HashSet<Id> = first
+            .labels
+            .iter()
+            .map(|(_, mark, _)| mark.entity_id)
+            .collect();
+        let reads = activity.reads;
+
+        let panned = draw(
+            &mut activity,
+            &sources,
+            &facts,
+            view_start - 10 * SECOND,
+            ns_per_px,
+        );
+        let new = panned
+            .labels
+            .iter()
+            .filter(|(_, mark, _)| !before.contains(&mark.entity_id))
+            .count();
+
+        assert_eq!(activity.selections, 1);
+        assert!((10..=11).contains(&new), "{new} new labels");
+        assert_eq!(activity.reads - reads, new);
+
+        // Back where it started: everything drawn has been read already.
+        let reads = activity.reads;
+        draw(&mut activity, &sources, &facts, view_start, ns_per_px);
+        assert_eq!(activity.reads, reads);
+
+        // Far past the selected range: one more selection.
+        draw(
+            &mut activity,
+            &sources,
+            &facts,
+            view_start - 600 * SECOND,
+            ns_per_px,
+        );
+        assert_eq!(activity.selections, 2);
+    }
+
+    /// One chip per envelope, at its newest time: a window holding only an
+    /// older witness shows nothing.
+    #[test]
+    fn a_message_shows_only_where_its_newest_time_is() {
+        let message = id(1);
+        let mut facts = TribleSet::new();
+        for at in [T0, T0 + 600 * MINUTE] {
+            facts += entity! { ExclusiveId::force_ref(&message) @
+                metadata::tag: &KIND_MESSAGE_ID,
+                message_attrs::from: id(2),
+                message_attrs::to: id(3),
+                message_attrs::body: text("hello"),
+                metadata::created_at: instant(at),
+            }
+            .into_facts();
+        }
+        let facts = archive_of(&facts);
+        let source = TimelineSource::LocalMessages {
+            key: SourceKey::Messages,
+            label: "local".into(),
+        };
+
+        let mut old = Vec::new();
+        local_marks(0, &facts, T0 - MINUTE, T0 + MINUTE, &mut old);
+        let mut new = Vec::new();
+        marks_in(
+            0,
+            &source,
+            &facts,
+            T0 + 599 * MINUTE,
+            T0 + 601 * MINUTE,
+            &mut new,
+        );
+
+        assert!(old.is_empty());
+        assert_eq!(new.len(), 1);
+        assert_eq!(
+            new[0].ts_ns,
+            interval_start(instant(T0 + 600 * MINUTE)).unwrap()
+        );
+    }
+
     /// A Codex fork replays its parent's records, and the replay's time
     /// annotates the parent's receipt beside the original's. The timeline
     /// shows that receipt where `archive list` does: at its earliest time.
     #[test]
     fn a_receipt_observed_twice_is_shown_at_its_earliest_time() {
-        use triblespace::core::blob::encodings::succinctarchive::SuccinctArchive;
-        use triblespace::core::trible::TribleSet;
-        use triblespace::prelude::{entity, ExclusiveId, TryToInline};
-
-        let instant = |seconds: f64| -> Inline<NsTAIInterval> {
-            let epoch = Epoch::from_unix_seconds(seconds);
-            (epoch, epoch).try_to_inline().expect("valid interval")
-        };
         let receipt = Id::new([7; 16]).expect("non-nil");
-        let original = instant(1_000.0);
-        let replay = instant(2_000.0);
+        let original = instant(1_000 * SECOND);
+        let replay = instant(2_000 * SECOND);
         let mut facts = TribleSet::new();
         for timestamp in [original, replay] {
             facts += entity! { ExclusiveId::force_ref(&receipt) @
@@ -1353,8 +2081,99 @@ mod tests {
             }
             .into_facts();
         }
-        let facts = FactArchive::new(vec![SuccinctArchive::from(&facts)]);
+        let facts = archive_of(&facts);
 
-        assert_eq!(earliest_source_times(&facts).get(&receipt), Some(&original));
+        assert_eq!(earliest_source_time(&facts, receipt), Some(original));
+    }
+
+    /// The first stop text in `archive::operations::CLASSIFIER_STOPS`.
+    const STOP: &str = "Your response above was stopped by a safety classifier \u{2014} this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.";
+
+    /// Archive windows find a receipt by its earliest source time and a
+    /// receipt without one by its node's time; a node a classifier stop
+    /// followed is drawn as withheld and its text is not read.
+    #[test]
+    fn archive_marks_keep_source_time_fallback_and_withholding() {
+        let (sourced, fallback, stop_node) = (id(10), id(11), id(12));
+        let (sourced_block, fallback_block) = (id(20), id(21));
+        let (sourced_fact, fallback_fact, stop_fact) = (id(30), id(31), id(32));
+        let mut facts = TribleSet::new();
+        for (block, fact, at) in [
+            (sourced_block, sourced_fact, T0),
+            (fallback_block, fallback_fact, T0 + 100 * MINUTE),
+        ] {
+            facts += entity! { ExclusiveId::force_ref(&block) @
+                archive::block::holds: fact,
+                archive::block::timestamp: instant(at),
+            }
+            .into_facts();
+            facts += entity! { ExclusiveId::force_ref(&fact) @
+                archive::content_fact::payload: text("said"),
+            }
+            .into_facts();
+        }
+        // The source time moves the first receipt away from its node's time.
+        facts += entity! { ExclusiveId::force_ref(&sourced) @
+            metadata::tag: &archive::source_projection::KIND,
+            archive::source_projection::projects_to: sourced_block,
+            archive::source_projection::source_timestamp: instant(T0 + 50 * MINUTE),
+        }
+        .into_facts();
+        facts += entity! { ExclusiveId::force_ref(&fallback) @
+            metadata::tag: &archive::source_projection::KIND,
+            archive::source_projection::projects_to: fallback_block,
+        }
+        .into_facts();
+        // A stop follows the fallback receipt's node.
+        facts += entity! { ExclusiveId::force_ref(&stop_node) @
+            archive::block::previous: fallback_block,
+            archive::block::holds: stop_fact,
+        }
+        .into_facts();
+        facts += entity! { ExclusiveId::force_ref(&stop_fact) @
+            archive::content_fact::payload: text(STOP),
+        }
+        .into_facts();
+        let facts = archive_of(&facts);
+
+        let window = |lo, hi| {
+            let mut out = Vec::new();
+            archive_marks(0, &facts, lo, hi, &mut out);
+            out.into_iter()
+                .map(|mark| mark.entity_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(window(T0 - MINUTE, T0 + MINUTE), Vec::<Id>::new());
+        assert_eq!(window(T0 + 49 * MINUTE, T0 + 51 * MINUTE), vec![sourced]);
+        assert_eq!(window(T0 + 99 * MINUTE, T0 + 101 * MINUTE), vec![fallback]);
+
+        let mut reads = 0;
+        let mut read = |_: TextHandle| {
+            reads += 1;
+            "said".to_owned()
+        };
+        let mut stopped = None;
+        let withheld = hydrate(
+            Label::Archive {
+                block: fallback_block,
+            },
+            &facts,
+            &mut stopped,
+            &mut read,
+        );
+        assert_eq!(
+            withheld.summary,
+            "[withheld: a classifier stop followed this]"
+        );
+        let shown = hydrate(
+            Label::Archive {
+                block: sourced_block,
+            },
+            &facts,
+            &mut stopped,
+            &mut read,
+        );
+        assert_eq!(shown.summary, "said");
+        assert_eq!(reads, 1);
     }
 }
