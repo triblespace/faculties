@@ -1,15 +1,22 @@
 //! Canonical Planner records and open-world collection projections.
 //!
-//! An event is an immutable VEVENT-shaped record whose stable identity is the
-//! intrinsic pair `{ KIND_EVENT_ID, event::ical_uid }`.  Local cancellation is
-//! a separate intrinsic assertion.  This keeps cancellation monotone: set
-//! union can make an event cancelled, but can never accidentally resurrect it
-//! by choosing one of several scalar `status` values.
+//! An event is an immutable VEVENT-shaped record, and its identity core is
+//! the whole record: every stored field, the UID included. One VEVENT
+//! definition is one entity, so re-importing the same definition is a
+//! duplicate, and a changed definition (an edit, a move, a new EXDATE) is a
+//! new observation beside the old one, never a conflict. The records that
+//! share a UID and RECURRENCE-ID are the versions of one lineage; a reader
+//! takes the current version by SEQUENCE, then LAST-MODIFIED, then id
+//! ([`current_event_ids`]). Local cancellation is a separate intrinsic
+//! assertion about one version that readers apply to its whole lineage.
+//! This keeps cancellation monotone: set union can make an event cancelled,
+//! but can never accidentally resurrect it by choosing one of several scalar
+//! `status` values.
 //!
 //! Ordinary readers query the maintained fact archive directly and skip rows
 //! they cannot decode.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub mod cli;
 pub mod mcp;
@@ -57,6 +64,8 @@ pub struct EventDraft {
     pub tzid: Option<String>,
     /// RFC 5545 RECURRENCE-ID: original start of the overridden instance.
     pub recurrence_id: Option<IntervalValue>,
+    /// RFC 5545 LAST-MODIFIED, a point interval.
+    pub last_modified: Option<IntervalValue>,
 }
 
 /// One exact event projected from a Planner collection. Text fields are the
@@ -79,6 +88,7 @@ pub struct EventRow {
     pub sequence: Option<SequenceValue>,
     pub tzid: Option<TextHandle>,
     pub recurrence_id: Option<IntervalValue>,
+    pub last_modified: Option<IntervalValue>,
 }
 
 /// One intrinsic note attached to an event.
@@ -195,16 +205,8 @@ fn validate_event_values(row: &EventRow) -> Result<()> {
     Ok(())
 }
 
-/// The identity core: the UID, plus the RECURRENCE-ID for an override of one
-/// recurring instance. A master (no RECURRENCE-ID) keeps its UID-only id.
-fn event_identity(uid: TextHandle, recurrence_id: Option<&IntervalValue>) -> Fragment {
-    entity! {
-        metadata::tag: &KIND_EVENT_ID,
-        event::ical_uid: uid,
-        event::recurrence_id?: recurrence_id,
-    }
-}
-
+/// One event record. Its id is intrinsic over every field, so equal
+/// definitions are one entity and any change is a different entity.
 #[allow(clippy::too_many_arguments)]
 fn event_record(
     uid: TextHandle,
@@ -222,33 +224,27 @@ fn event_record(
     sequence: Option<SequenceValue>,
     tzid: Option<TextHandle>,
     recurrence_id: Option<IntervalValue>,
+    last_modified: Option<IntervalValue>,
 ) -> Fragment {
-    let mut fragment = event_identity(uid, recurrence_id.as_ref());
-    let id = fragment
-        .root()
-        .expect("event identity record has one intrinsic root");
-    fragment += entity! { ExclusiveId::force_ref(&id) @
+    entity! {
+        metadata::tag: &KIND_EVENT_ID,
+        event::ical_uid: uid,
         event::summary: summary,
         event::description?: description.as_ref(),
         event::time: time,
         event::rrule?: rrule.as_ref(),
+        event::rdate*: rdates.iter(),
+        event::exdate*: exdates.iter(),
         event::location?: location.as_ref(),
         event::status: status,
         event::transp: transp,
+        event::attendee*: attendees.iter(),
         event::organizer?: organizer.as_ref(),
         event::sequence?: sequence.as_ref(),
         event::tzid?: tzid.as_ref(),
-    };
-    for value in rdates {
-        fragment += entity! { ExclusiveId::force_ref(&id) @ event::rdate: value };
+        event::recurrence_id?: recurrence_id.as_ref(),
+        event::last_modified?: last_modified.as_ref(),
     }
-    for value in exdates {
-        fragment += entity! { ExclusiveId::force_ref(&id) @ event::exdate: value };
-    }
-    for attendee in attendees {
-        fragment += entity! { ExclusiveId::force_ref(&id) @ event::attendee: attendee };
-    }
-    fragment
 }
 
 fn note_record(event_id: Id, text: TextHandle, created_at: IntervalValue) -> Fragment {
@@ -269,8 +265,9 @@ fn cancellation_record(event_id: Id) -> Fragment {
 
 /// Build one self-contained canonical event fragment.
 ///
-/// The returned root depends only on the exact UID bytes. Repeating an import
-/// therefore names the same event even across processes and machines.
+/// The returned root depends only on the definition. Repeating an import of
+/// an unchanged event therefore names the same entity even across processes
+/// and machines; an edited event gets a new id.
 pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
     validate_uid(&draft.uid)?;
     validate_draft_values(draft)?;
@@ -305,6 +302,7 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
         draft.sequence,
         tzid,
         draft.recurrence_id,
+        draft.last_modified,
     );
     let row = EventRow {
         id: record.root().expect("event record has one root"),
@@ -323,6 +321,7 @@ pub fn event_fragment(draft: &EventDraft) -> Result<Fragment> {
         sequence: draft.sequence,
         tzid,
         recurrence_id: draft.recurrence_id,
+        last_modified: draft.last_modified,
     };
     validate_event_values(&row)?;
     fragment += record;
@@ -446,6 +445,11 @@ where
                 pattern!(space, [{ id @ event::recurrence_id: ?value }])
             )
             .next(),
+            last_modified: find!(
+                value: IntervalValue,
+                pattern!(space, [{ id @ event::last_modified: ?value }])
+            )
+            .next(),
         };
         validate_event_values(&row).is_ok().then_some(row)
     })
@@ -469,6 +473,57 @@ where
     )
     .filter_map(|id| event(space, id))
     .collect()
+}
+
+/// The lineage a version belongs to: its UID and RECURRENCE-ID.
+pub type Lineage = (TextHandle, Option<[u8; 32]>);
+
+pub fn lineage(row: &EventRow) -> Lineage {
+    (row.uid, row.recurrence_id.map(|value| value.raw))
+}
+
+/// Order of versions within one lineage: SEQUENCE, then LAST-MODIFIED, then
+/// id, each absent value below any present one. The id only breaks ties, so
+/// the choice is the same on every replica.
+fn version_key(row: &EventRow) -> ([u8; 32], Option<[u8; 32]>, Id) {
+    (
+        row.sequence.map(|value| value.raw).unwrap_or([0; 32]),
+        row.last_modified.map(|value| value.raw),
+        row.id,
+    )
+}
+
+/// The current version of every readable lineage. Older versions stay in the
+/// collection as what an earlier export said; readers that list or schedule
+/// events consult only these.
+pub fn current_event_ids<P>(space: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern + ?Sized,
+{
+    let mut current = BTreeMap::<Lineage, EventRow>::new();
+    for row in event_ids(space)
+        .into_iter()
+        .filter_map(|id| event(space, id))
+    {
+        match current.get(&lineage(&row)) {
+            Some(best) if version_key(best) >= version_key(&row) => {}
+            _ => {
+                current.insert(lineage(&row), row);
+            }
+        }
+    }
+    current.into_values().map(|row| row.id).collect()
+}
+
+/// Every readable version in the lineage of `row`, including `row`.
+pub fn lineage_versions<P>(space: &P, row: &EventRow) -> Vec<EventRow>
+where
+    P: TriblePattern + ?Sized,
+{
+    events_with_uid(space, row.uid)
+        .into_iter()
+        .filter(|other| other.recurrence_id == row.recurrence_id)
+        .collect()
 }
 
 /// Every readable note attached to one event.
@@ -503,17 +558,30 @@ where
 }
 
 /// Whether the event has either an RFC cancellation status or a monotone
-/// local cancellation assertion.
+/// local cancellation assertion. The status is this version's; a local
+/// cancellation of any version in its lineage cancels it, so a later export
+/// of a cancelled event does not bring it back.
 pub fn event_is_cancelled<P>(space: &P, event_id: Id) -> bool
 where
     P: TriblePattern + ?Sized,
 {
-    exists!(pattern!(space, [{ event_id @
+    if exists!(pattern!(space, [{ event_id @
         event::status: STATUS_CANCELLED,
-    }])) || exists!(pattern!(space, [{ _?assertion @
-        metadata::tag: &KIND_CANCELLATION_ID,
-        cancellation::event: event_id,
-    }]))
+    }])) {
+        return true;
+    }
+    let locally_cancelled = |id: Id| {
+        exists!(pattern!(space, [{ _?assertion @
+            metadata::tag: &KIND_CANCELLATION_ID,
+            cancellation::event: id,
+        }]))
+    };
+    match event(space, event_id) {
+        Some(row) => lineage_versions(space, &row)
+            .iter()
+            .any(|version| locally_cancelled(version.id)),
+        None => locally_cancelled(event_id),
+    }
 }
 
 /// Strictly read a UTF8String attachment.
@@ -556,18 +624,25 @@ mod tests {
             sequence: None,
             tzid: None,
             recurrence_id: None,
+            last_modified: None,
         }
     }
 
     #[test]
-    fn event_identity_depends_on_uid_not_import_order_or_other_fields() {
+    fn event_identity_is_the_whole_definition() {
         let first = event_fragment(&draft("stable@example", "first")).unwrap();
-        let second = event_fragment(&draft("stable@example", "second")).unwrap();
+        let again = event_fragment(&draft("stable@example", "first")).unwrap();
+        let edited = event_fragment(&draft("stable@example", "second")).unwrap();
         let other = event_fragment(&draft("other@example", "first")).unwrap();
+        let mut stamped = draft("stable@example", "first");
+        stamped.last_modified = Some(interval(5, 5));
+        let stamped = event_fragment(&stamped).unwrap();
 
-        assert_eq!(first.root(), second.root());
+        assert_eq!(first.root(), again.root());
+        assert_eq!(first.facts(), again.facts());
+        assert_ne!(first.root(), edited.root());
         assert_ne!(first.root(), other.root());
-        assert_ne!(first.facts(), second.facts());
+        assert_ne!(first.root(), stamped.root());
     }
 
     #[test]
@@ -617,7 +692,11 @@ mod tests {
         )
         .next()
         .unwrap();
-        let mut facts = event_identity(uid, None).into_facts();
+        let mut facts = entity! {
+            metadata::tag: &KIND_EVENT_ID,
+            event::ical_uid: uid,
+        }
+        .into_facts();
         facts += event_fragment(&draft("kept@example", "meeting"))
             .unwrap()
             .into_facts();

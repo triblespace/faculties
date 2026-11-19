@@ -130,6 +130,9 @@ pub struct IngestReceipt {
     pub imported: Vec<Id>,
     pub total: usize,
     pub duplicates: usize,
+    /// Imported records whose UID and RECURRENCE-ID were already present
+    /// with a different definition: a new version beside the old one.
+    pub revisions: usize,
 }
 #[derive(Clone, Debug)]
 pub struct Planner {
@@ -265,7 +268,12 @@ impl Planner {
                 .map(|handle| read_text(&loaded.reader, handle))
                 .transpose()?;
             let cancelled = planner_model::event_is_cancelled(&loaded.facts, event_id);
-            let mut notes = planner_model::notes_for_event(&loaded.facts, event_id);
+            // Notes belong to the lineage: one written on an earlier version
+            // still shows on the version that replaced it.
+            let mut notes = planner_model::lineage_versions(&loaded.facts, &event)
+                .into_iter()
+                .flat_map(|version| planner_model::notes_for_event(&loaded.facts, version.id))
+                .collect::<Vec<_>>();
             notes.sort_by_key(|row| (interval_key(row.created_at), row.id));
             let notes = notes
                 .into_iter()
@@ -297,8 +305,9 @@ impl Planner {
             .with_view(|loaded| resolve_event_id(prefix, &loaded.facts))
     }
     /// All resident calendars are staged before one publication. Exact
-    /// duplicates are skipped; conflicting immutable definitions never replace
-    /// an existing UID, including when a source offers a different SEQUENCE.
+    /// duplicates are skipped. A changed definition of a known UID is a new
+    /// version recorded beside the old one; nothing is replaced or refused,
+    /// and readers pick the current version per lineage.
     pub fn ingest(
         &self,
         documents: &[CalendarInput<'_>],
@@ -567,6 +576,7 @@ fn empty_event_draft(
         sequence: None,
         tzid: None,
         recurrence_id: None,
+        last_modified: None,
     }
 }
 
@@ -846,10 +856,7 @@ where
     P: TriblePattern + ?Sized,
 {
     let mut occurrences = Vec::new();
-    for event_id in find!(
-        id: Id,
-        pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
-    ) {
+    for event_id in planner_model::current_event_ids(space) {
         let Some(row) = occurrence_event(reader, space, event_id) else {
             continue;
         };
@@ -917,10 +924,7 @@ where
     P: TriblePattern + ?Sized,
 {
     let mut next = None;
-    for event_id in find!(
-        id: Id,
-        pattern!(space, [{ ?id @ metadata::tag: &KIND_EVENT_ID }])
-    ) {
+    for event_id in planner_model::current_event_ids(space) {
         let Some(row) = occurrence_event(reader, space, event_id) else {
             continue;
         };
@@ -978,6 +982,8 @@ struct IcalEvent {
     recurrence_id: Option<IntervalValue>,
     status: Option<String>,
     transp: Option<String>,
+    sequence: Option<u64>,
+    last_modified: Option<DateTime<Utc>>,
 }
 
 /// TZIDs a calendar defines itself. Only a VTIMEZONE whose every offset is
@@ -1159,6 +1165,8 @@ fn parse_ical_event(
     let mut transp = None;
     let mut recurrence_id = None;
     let mut exdates = Vec::new();
+    let mut sequence = None;
+    let mut last_modified = None;
 
     for property in &event.properties {
         let value = property.value.clone().unwrap_or_default();
@@ -1186,6 +1194,12 @@ fn parse_ical_event(
             "RRULE" => set_once(&mut rrule, "RRULE", value)?,
             "STATUS" => set_once(&mut status, "STATUS", value)?,
             "TRANSP" => set_once(&mut transp, "TRANSP", value)?,
+            "SEQUENCE" => set_once(&mut sequence, "SEQUENCE", value)?,
+            "LAST-MODIFIED" => {
+                if last_modified.replace(property).is_some() {
+                    bail!("VEVENT has more than one LAST-MODIFIED property");
+                }
+            }
             _ => {}
         }
     }
@@ -1235,6 +1249,19 @@ fn parse_ical_event(
         })
         .transpose()?;
 
+    let sequence = sequence
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| named("SEQUENCE"))
+        })
+        .transpose()?;
+    let last_modified = last_modified
+        .map(|property| time(property).with_context(|| named("LAST-MODIFIED")))
+        .transpose()?
+        .map(|value| value.instant);
+
     Ok(IcalEvent {
         uid,
         summary,
@@ -1248,6 +1275,8 @@ fn parse_ical_event(
         recurrence_id,
         status,
         transp,
+        sequence,
+        last_modified,
     })
 }
 
@@ -1255,54 +1284,47 @@ fn single_line(value: &str) -> String {
     value.replace('\n', " ")
 }
 
-/// Staging key: a master is its UID; an override is its UID and RECURRENCE-ID.
-type StageKey = (TextHandle, Option<[u8; 32]>);
+/// What staging one record did.
+enum Staged {
+    /// The same definition is already resident or staged.
+    Duplicate,
+    /// A new lineage.
+    New,
+    /// A new version of a lineage already resident or staged.
+    Revision,
+}
 
-/// Stage one UID-derived import into a deterministic map. Identical records
-/// collapse; same-identity conflicts are an error independent of file order.
+/// Stage one record into a deterministic map keyed by its content-derived id.
+/// Nothing is refused: an unchanged definition is a duplicate, a changed one
+/// a new version, whatever the order of files and VEVENTs.
 fn stage_import_event(
     loaded: &LoadedPlanner,
-    staged: &mut BTreeMap<StageKey, Fragment>,
-    uid: &str,
+    staged: &mut BTreeMap<Id, Fragment>,
     fragment: Fragment,
-) -> Result<bool> {
-    let candidate = fragment
+) -> Result<Staged> {
+    let id = fragment
         .root()
-        .and_then(|id| planner_model::event(fragment.facts(), id))
+        .ok_or_else(|| anyhow!("constructed iCalendar event has no root"))?;
+    let candidate = planner_model::event(fragment.facts(), id)
         .ok_or_else(|| anyhow!("constructed iCalendar event has no readable projection"))?;
-    let key = (
-        candidate.uid,
-        candidate.recurrence_id.map(|value| value.raw),
-    );
-    let existing = planner_model::events_with_uid(&loaded.facts, candidate.uid)
-        .into_iter()
-        .filter(|existing| existing.recurrence_id == candidate.recurrence_id)
-        .collect::<Vec<_>>();
-    if !existing.is_empty() {
-        if existing
+    let resident = planner_model::lineage_versions(&loaded.facts, &candidate);
+    if staged.contains_key(&id)
+        || resident
             .iter()
             .any(|existing| same_event_definition(existing, &candidate))
-        {
-            return Ok(false);
-        }
-        bail!(
-            "iCalendar UID '{uid}' already exists but its immutable fields differ from the imported event"
-        );
+    {
+        return Ok(Staged::Duplicate);
     }
-    if let Some(previous) = staged.get(&key) {
-        let previous = previous
-            .root()
-            .and_then(|id| planner_model::event(previous.facts(), id))
-            .ok_or_else(|| anyhow!("staged iCalendar event has no readable projection"))?;
-        if same_event_definition(&previous, &candidate) {
-            return Ok(false);
-        }
-        bail!(
-            "iCalendar UID '{uid}' occurs more than once in this batch with conflicting immutable fields"
-        );
-    }
-    staged.insert(key, fragment);
-    Ok(true)
+    let lineage = planner_model::lineage(&candidate);
+    let known = !resident.is_empty()
+        || staged.values().any(|other| {
+            other
+                .root()
+                .and_then(|root| planner_model::event(other.facts(), root))
+                .is_some_and(|row| planner_model::lineage(&row) == lineage)
+        });
+    staged.insert(id, fragment);
+    Ok(if known { Staged::Revision } else { Staged::New })
 }
 
 fn same_event_definition(left: &EventRow, right: &EventRow) -> bool {
@@ -1321,6 +1343,7 @@ fn same_event_definition(left: &EventRow, right: &EventRow) -> bool {
         && left.sequence == right.sequence
         && left.tzid == right.tzid
         && left.recurrence_id == right.recurrence_id
+        && left.last_modified == right.last_modified
 }
 
 fn ingest(
@@ -1330,9 +1353,10 @@ fn ingest(
 ) -> Result<IngestReceipt> {
     validate_calendars(documents)?;
     storage.update("ingest iCalendar events", |loaded| {
-        let mut staged = BTreeMap::<StageKey, Fragment>::new();
+        let mut staged = BTreeMap::<Id, Fragment>::new();
         let mut total = 0usize;
         let mut duplicates = 0usize;
+        let mut revisions = 0usize;
 
         for document in documents {
             for calendar in ical::IcalParser::new(document.text.as_bytes()) {
@@ -1358,9 +1382,16 @@ fn ingest(
                     draft.exdates = source.exdates;
                     draft.recurrence_id = source.recurrence_id;
                     draft.tzid = source.zone.map(|zone| zone.name().to_owned());
+                    draft.sequence = source.sequence.map(|value| value.to_inline());
+                    draft.last_modified = source.last_modified.map(|instant| {
+                        let instant = chrono_to_epoch(instant);
+                        make_interval(instant, instant)
+                    });
                     let fragment = event_fragment(&draft)?;
-                    if !stage_import_event(loaded, &mut staged, &source.uid, fragment)? {
-                        duplicates += 1;
+                    match stage_import_event(loaded, &mut staged, fragment)? {
+                        Staged::Duplicate => duplicates += 1,
+                        Staged::Revision => revisions += 1,
+                        Staged::New => {}
                     }
                 }
             }
@@ -1385,6 +1416,7 @@ fn ingest(
                 imported,
                 total,
                 duplicates,
+                revisions,
             },
         ))
     })

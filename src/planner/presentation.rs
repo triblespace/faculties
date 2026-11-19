@@ -72,9 +72,10 @@ pub fn cancelled(receipt: &CancellationReceipt, out: &mut Out<'_>) -> Result<()>
 }
 pub fn ingested(receipt: &IngestReceipt, out: &mut Out<'_>) -> Result<()> {
     out.line(format!(
-        "ingested {} of {} events ({} exact duplicates skipped)",
+        "ingested {} of {} events ({} new versions of known events, {} exact duplicates skipped)",
         receipt.imported.len(),
         receipt.total,
+        receipt.revisions,
         receipt.duplicates
     ))
 }
