@@ -98,16 +98,23 @@ pub mod event {
         // or the caller's default zone for a floating time). `time`
         // stays the resolved UTC instant; this annotation is read when
         // an RRULE is expanded, so a weekly 10:00 Berlin meeting stays
-        // at 10:00 local across DST. Not part of the event's identity.
+        // at 10:00 local across DST.
         // Minted with `trible genid` on 2026-11-19:
         // `59B6CFFD98B896521972D21C87E14743`.
         "59B6CFFD98B896521972D21C87E14743" as tzid: inlineencodings::Handle<blobencodings::UTF8String>;
         // RFC 5545 RECURRENCE-ID: the original start (a point interval)
-        // of the recurring instance this VEVENT overrides. Part of the
-        // identity core of an override, beside `ical_uid`, so an
-        // override and its master are distinct events. Minted with
+        // of the recurring instance this VEVENT overrides. With
+        // `ical_uid` it names the lineage a version belongs to, so an
+        // override and its master are distinct lineages. Minted with
         // `trible genid` on 2026-11-19: `5FC91FAD3846B5D404F2D10E6B30F232`.
         "5FC91FAD3846B5D404F2D10E6B30F232" as recurrence_id: inlineencodings::NsTAIInterval;
+        // RFC 5545 LAST-MODIFIED: when the source calendar last changed
+        // this VEVENT (a point interval). With `sequence`, it lets a reader
+        // choose the current version among several records of one UID.
+        // DTSTAMP is deliberately not stored: in an export it is the export
+        // time, so it would make every re-export a new version. Minted with
+        // `trible genid` on 2026-11-19: `C8B852FD677FAD4DFC1159D39A297046`.
+        "C8B852FD677FAD4DFC1159D39A297046" as last_modified: inlineencodings::NsTAIInterval;
     }
 }
 

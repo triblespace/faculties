@@ -97,7 +97,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
 }
 
 #[test]
-fn same_batch_duplicate_uid_collapses_but_conflict_is_rejected() {
+fn same_batch_duplicate_collapses_and_changed_definition_is_a_revision() {
     let directory = TestDirectory::new();
     let (pile, key) = fresh_storage(&directory);
     let storage = PlannerStorage {
@@ -108,16 +108,22 @@ fn same_batch_duplicate_uid_collapses_but_conflict_is_rejected() {
             let mut staged = BTreeMap::new();
             let first = event_fragment(&fixture_draft("duplicate@example", "same")).unwrap();
             let duplicate = event_fragment(&fixture_draft("duplicate@example", "same")).unwrap();
-            let conflict =
-                event_fragment(&fixture_draft("duplicate@example", "different")).unwrap();
+            let changed = event_fragment(&fixture_draft("duplicate@example", "different")).unwrap();
+            assert_ne!(first.root(), changed.root(), "identity covers the content");
 
-            assert!(stage_import_event(loaded, &mut staged, "duplicate@example", first).unwrap());
-            assert!(
-                !stage_import_event(loaded, &mut staged, "duplicate@example", duplicate).unwrap()
-            );
-            let error =
-                stage_import_event(loaded, &mut staged, "duplicate@example", conflict).unwrap_err();
-            assert!(format!("{error:#}").contains("conflicting immutable fields"));
+            assert!(matches!(
+                stage_import_event(loaded, &mut staged, first).unwrap(),
+                Staged::New
+            ));
+            assert!(matches!(
+                stage_import_event(loaded, &mut staged, duplicate).unwrap(),
+                Staged::Duplicate
+            ));
+            assert!(matches!(
+                stage_import_event(loaded, &mut staged, changed).unwrap(),
+                Staged::Revision
+            ));
+            assert_eq!(staged.len(), 2);
             Ok(())
         })
         .unwrap();
@@ -166,38 +172,37 @@ fn exact_reingest_does_not_publish_another_authored_commit() {
 }
 
 #[test]
-fn conflicting_same_batch_uid_fails_before_any_signed_commit() {
+fn two_definitions_of_one_uid_in_a_batch_are_both_kept() {
     let directory = TestDirectory::new();
     let (pile, key) = fresh_storage(&directory);
-    let ics = directory.0.join("conflict.ics");
-    fs::write(
-        &ics,
-        "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:fork@example\r\nSUMMARY:Left\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:fork@example\r\nSUMMARY:Right\r\nDTSTART:20260809T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-    )
-    .unwrap();
-    let storage = PlannerStorage {
-        storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
-    };
-
-    let text = fs::read_to_string(&ics).unwrap();
-    let error = ingest(
-        storage,
-        &[CalendarInput {
-            name: "conflict.ics",
-            text: &text,
-        }],
-        IngestOptions::default(),
-    )
-    .unwrap_err();
-
-    assert!(format!("{error:#}").contains("conflicting immutable fields"));
-    assert_eq!(storage.payload_count().unwrap(), 0);
-    storage
-        .with_view(|loaded| {
-            assert!(planner_model::event_ids(&loaded.facts).is_empty());
-            Ok(())
-        })
+    let planner = Planner::new(pile, Some(key));
+    let text = vevent_calendar(&format!(
+        "{}{}",
+        vevent("fork@example", &["DTSTART:20260809T120000Z", "SEQUENCE:0"]),
+        vevent("fork@example", &["DTSTART:20260809T140000Z", "SEQUENCE:1"]),
+    ));
+    let receipt = planner
+        .ingest(
+            &[CalendarInput {
+                name: "fork.ics",
+                text: &text,
+            }],
+            IngestOptions::default(),
+        )
         .unwrap();
+    assert_eq!(
+        (
+            receipt.imported.len(),
+            receipt.revisions,
+            receipt.duplicates
+        ),
+        (2, 1, 0)
+    );
+    let starts = starts_in(&planner, "2026-08-09T00:00:00Z", "2026-08-10T00:00:00Z");
+    assert_eq!(
+        starts,
+        vec![("fork@example".to_owned(), utc("2026-08-09T14:00:00Z"))]
+    );
 }
 
 #[test]
@@ -670,4 +675,248 @@ fn exdate_and_recurrence_id_override_replace_master_instances() {
         .unwrap()
         .unwrap();
     assert_eq!(next.summary, "moved");
+}
+
+// --- Re-export: changed, moved and deleted events (open world) ---
+
+fn ingest_text(planner: &Planner, text: &str) -> IngestReceipt {
+    planner
+        .ingest(
+            &[CalendarInput {
+                name: "export.ics",
+                text,
+            }],
+            IngestOptions::default(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn reexport_with_a_moved_event_records_a_new_version_and_lists_only_it() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let first = vevent_calendar(&format!(
+        "{}{}",
+        vevent(
+            "dentist@example",
+            &[
+                "DTSTART:20261120T090000Z",
+                "DTEND:20261120T100000Z",
+                "SEQUENCE:0",
+                "LAST-MODIFIED:20261101T120000Z",
+                "DTSTAMP:20261119T082419Z",
+            ],
+        ),
+        vevent(
+            "lunch@example",
+            &[
+                "DTSTART:20261121T110000Z",
+                "SEQUENCE:0",
+                "DTSTAMP:20261119T082419Z",
+            ],
+        ),
+    ));
+    let receipt = ingest_text(&planner, &first);
+    assert_eq!((receipt.imported.len(), receipt.revisions), (2, 0));
+
+    // The second export moved the dentist, left lunch alone, and has a new
+    // DTSTAMP everywhere, which must not make lunch a new version.
+    let second = vevent_calendar(&format!(
+        "{}{}",
+        vevent(
+            "dentist@example",
+            &[
+                "DTSTART:20261120T140000Z",
+                "DTEND:20261120T150000Z",
+                "SEQUENCE:1",
+                "LAST-MODIFIED:20261119T100000Z",
+                "DTSTAMP:20261126T082419Z",
+            ],
+        ),
+        vevent(
+            "lunch@example",
+            &[
+                "DTSTART:20261121T110000Z",
+                "SEQUENCE:0",
+                "DTSTAMP:20261126T082419Z",
+            ],
+        ),
+    ));
+    let receipt = ingest_text(&planner, &second);
+    assert_eq!(
+        (
+            receipt.imported.len(),
+            receipt.revisions,
+            receipt.duplicates
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(
+        starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-22T00:00:00Z"),
+        vec![
+            ("dentist@example".to_owned(), utc("2026-11-20T14:00:00Z")),
+            ("lunch@example".to_owned(), utc("2026-11-21T11:00:00Z")),
+        ]
+    );
+
+    // Re-ingesting the first export afterwards adds nothing and does not
+    // move the dentist back: the newer SEQUENCE stays current.
+    let receipt = ingest_text(&planner, &first);
+    assert_eq!((receipt.imported.len(), receipt.duplicates), (0, 2));
+    assert_eq!(
+        starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z"),
+        vec![("dentist@example".to_owned(), utc("2026-11-20T14:00:00Z"))]
+    );
+}
+
+#[test]
+fn version_order_is_sequence_then_last_modified_not_file_order() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let newer = vevent(
+        "edited@example",
+        &[
+            "DTSTART:20261120T150000Z",
+            "SEQUENCE:0",
+            "LAST-MODIFIED:20261110T000000Z",
+        ],
+    );
+    let older = vevent(
+        "edited@example",
+        &[
+            "DTSTART:20261120T090000Z",
+            "SEQUENCE:0",
+            "LAST-MODIFIED:20261101T000000Z",
+        ],
+    );
+    // The newer version arrives first; LAST-MODIFIED decides at equal SEQUENCE.
+    ingest_text(&planner, &vevent_calendar(&newer));
+    ingest_text(&planner, &vevent_calendar(&older));
+    assert_eq!(
+        starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z"),
+        vec![("edited@example".to_owned(), utc("2026-11-20T15:00:00Z"))]
+    );
+    // A higher SEQUENCE wins over a later LAST-MODIFIED.
+    ingest_text(
+        &planner,
+        &vevent_calendar(&vevent(
+            "edited@example",
+            &[
+                "DTSTART:20261120T070000Z",
+                "SEQUENCE:2",
+                "LAST-MODIFIED:20261105T000000Z",
+            ],
+        )),
+    );
+    assert_eq!(
+        starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z"),
+        vec![("edited@example".to_owned(), utc("2026-11-20T07:00:00Z"))]
+    );
+}
+
+#[test]
+fn a_new_exdate_and_a_new_override_on_reexport_are_revisions() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let master = |extra: &[&str]| {
+        let mut lines = vec![
+            "DTSTART;TZID=Europe/Berlin:20261015T100000",
+            "DTEND;TZID=Europe/Berlin:20261015T110000",
+            "RRULE:FREQ=WEEKLY;COUNT=3",
+        ];
+        lines.extend_from_slice(extra);
+        vevent("series@example", &lines)
+    };
+    ingest_text(&planner, &vevent_calendar(&master(&["SEQUENCE:0"])));
+    let override_ = "BEGIN:VEVENT\r\nUID:series@example\r\nSUMMARY:moved\r\nRECURRENCE-ID;TZID=Europe/Berlin:20261029T100000\r\nDTSTART;TZID=Europe/Berlin:20261029T140000\r\nDTEND;TZID=Europe/Berlin:20261029T150000\r\nEND:VEVENT\r\n";
+    let receipt = ingest_text(
+        &planner,
+        &vevent_calendar(&format!(
+            "{}{override_}",
+            master(&["SEQUENCE:1", "EXDATE;TZID=Europe/Berlin:20261022T100000"])
+        )),
+    );
+    assert_eq!(
+        (receipt.imported.len(), receipt.revisions),
+        (2, 1),
+        "the master is a revision, the override a new lineage"
+    );
+    assert_eq!(
+        starts_in(&planner, "2026-10-01T00:00:00Z", "2026-12-01T00:00:00Z"),
+        vec![
+            ("series@example".to_owned(), utc("2026-10-15T08:00:00Z")),
+            ("moved".to_owned(), utc("2026-10-29T13:00:00Z")),
+        ]
+    );
+}
+
+#[test]
+fn a_local_cancellation_holds_for_later_versions_and_old_versions_stay_readable() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    let first = ingest_text(
+        &planner,
+        &vevent_calendar(&vevent(
+            "party@example",
+            &["DTSTART:20261120T180000Z", "SEQUENCE:0"],
+        )),
+    );
+    let old = first.imported[0];
+    planner.note(&format!("{old:x}"), "bring cake").unwrap();
+    planner.cancel(&format!("{old:x}")).unwrap();
+    let second = ingest_text(
+        &planner,
+        &vevent_calendar(&vevent(
+            "party@example",
+            &["DTSTART:20261120T190000Z", "SEQUENCE:1"],
+        )),
+    );
+    let new = second.imported[0];
+    assert!(starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z").is_empty());
+    let current = planner.show(&format!("{new:x}")).unwrap();
+    assert!(current.cancelled);
+    assert_eq!(current.notes.len(), 1, "notes belong to the lineage");
+    // The superseded version is still what the first export said.
+    let shown = planner.show(&format!("{old:x}")).unwrap();
+    assert_eq!(
+        epoch_to_chrono_utc(
+            shown
+                .event
+                .time
+                .try_from_inline::<(Epoch, Epoch)>()
+                .unwrap()
+                .0
+        )
+        .unwrap(),
+        utc("2026-11-20T18:00:00Z")
+    );
+}
+
+#[test]
+fn an_event_missing_from_a_later_export_is_not_removed() {
+    let directory = TestDirectory::new();
+    let (pile, key) = fresh_storage(&directory);
+    let planner = Planner::new(pile, Some(key));
+    ingest_text(
+        &planner,
+        &vevent_calendar(&format!(
+            "{}{}",
+            vevent("kept@example", &["DTSTART:20261120T090000Z"]),
+            vevent("deleted@example", &["DTSTART:20261120T100000Z"]),
+        )),
+    );
+    ingest_text(
+        &planner,
+        &vevent_calendar(&vevent("kept@example", &["DTSTART:20261120T090000Z"])),
+    );
+    // Deletion needs its own observation (which versions an export held);
+    // until then an absent event stays, which is the honest default.
+    assert_eq!(
+        starts_in(&planner, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z").len(),
+        2
+    );
 }
