@@ -826,13 +826,8 @@ struct Frame {
     strips: Vec<Strip>,
 }
 
-/// Marks for a time range around the viewport, and the labels already read.
-///
-/// Selection seeks each source's ordered time facts, so it costs the window,
-/// not the history. The selected range reaches one viewport beyond each edge,
-/// so panning within it and zooming in re-select nothing; zooming out, or a
-/// range grown far wider than the view, re-selects. A keyed dataset changing
-/// discards everything.
+/// Marks in the visible interval and previews already requested. When the
+/// viewport moves, retain the overlap and query only newly exposed times.
 struct Activity {
     revisions: BTreeMap<SourceKey, DatasetRevision>,
     /// The selected time range `[lo, hi]`; `marks` holds every mark in it,
@@ -873,30 +868,42 @@ impl Activity {
         }
     }
 
-    /// The marks in `[view_end, view_start]`, selecting a range around it
-    /// when the current one does not cover it.
+    /// Keep the marks within the viewport, in ascending timestamp order.
     fn visible(
         &mut self,
-        view_end: i128,
-        view_start: i128,
+        lo: i128,
+        hi: i128,
         select: &mut dyn FnMut(i128, i128, &mut Vec<Mark>) -> usize,
     ) -> std::ops::Range<usize> {
-        let span = view_start.saturating_sub(view_end).max(1);
-        let covered = self.range.is_some_and(|(lo, hi)| {
-            lo <= view_end && view_start <= hi && hi.saturating_sub(lo) / span <= 16
-        });
-        if !covered {
-            let lo = view_end.saturating_sub(span);
-            let hi = view_start.saturating_add(span);
+        if self.range == Some((lo, hi)) {
+            return 0..self.marks.len();
+        }
+        self.scanned = 0;
+        if let Some((old_lo, old_hi)) = self.range.filter(|&(a, b)| a <= hi && lo <= b) {
+            let first = self.marks.partition_point(|mark| mark.ts_ns < lo);
+            let last = self.marks.partition_point(|mark| mark.ts_ns <= hi);
+            self.marks.truncate(last);
+            self.marks.drain(..first);
+            if lo < old_lo {
+                let mut earlier = Vec::new();
+                self.scanned += select(lo, old_lo - 1, &mut earlier);
+                earlier.sort_by_key(|mark| mark.ts_ns);
+                earlier.append(&mut self.marks);
+                self.marks = earlier;
+            }
+            if hi > old_hi {
+                let offset = self.marks.len();
+                self.scanned += select(old_hi + 1, hi, &mut self.marks);
+                self.marks[offset..].sort_by_key(|mark| mark.ts_ns);
+            }
+        } else {
             self.marks.clear();
             self.scanned = select(lo, hi, &mut self.marks);
             self.marks.sort_by_key(|mark| mark.ts_ns);
-            self.range = Some((lo, hi));
-            self.selections += 1;
         }
-        let first = self.marks.partition_point(|mark| mark.ts_ns < view_end);
-        let last = self.marks.partition_point(|mark| mark.ts_ns <= view_start);
-        first..last
+        self.range = Some((lo, hi));
+        self.selections += 1;
+        0..self.marks.len()
     }
 
     /// Lay out one viewport. A mark is labelled when its neighbours are at
@@ -918,7 +925,10 @@ impl Activity {
 
         let mut frame = Frame::default();
         let mut row: Vec<Strip> = Vec::new();
-        let flush = |row: &mut Vec<Strip>, strips: &mut Vec<Strip>| strips.append(row);
+        let flush = |row: &mut Vec<Strip>, strips: &mut Vec<Strip>| {
+            row.sort_by_key(|strip| strip.mark.source_idx);
+            strips.append(row);
+        };
         for i in visible.clone() {
             let mark = self.marks[i];
             let y = offset(&mark);
@@ -998,7 +1008,7 @@ impl Activity {
 ///   is room, and thin source-colored strips where events are denser than
 ///   a chip; a strip is drawn from metadata and reads no text
 ///
-/// Only the time range around the viewport is selected, through each
+/// Only the visible time range is selected, through each
 /// source's ordered time facts, and only drawn chips read their text.
 ///
 /// Sources are resolved by [`SourceKey`] from the immutable context supplied by
@@ -1397,17 +1407,26 @@ impl BranchTimeline {
         // Strips: one source-colored line per pixel row and source, under
         // the source pill's column so the chips' column structure holds.
         let strip_h = 2.0;
-        for strip in &frame.strips {
-            let y = viewport_rect.top() + strip.y;
-            let color = sources[strip.mark.source_idx].color();
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(event_left + 2.0, y - strip_h * 0.5),
-                    egui::vec2(src_pill_w, strip_h),
-                ),
-                0.0,
-                color,
-            );
+        let mut pointed_strip: Option<(f32, &Strip, egui::Rect, &[Strip])> = None;
+        for row in frame.strips.chunk_by(|a, b| a.y == b.y) {
+            let width = src_pill_w / row.len() as f32;
+            for (column, strip) in row.iter().enumerate() {
+                let y = viewport_rect.top() + strip.y;
+                let x = event_left + 2.0 + column as f32 * width;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, y - strip_h * 0.5),
+                    egui::vec2(width, strip_h),
+                );
+                painter.rect_filled(rect, 0.0, sources[strip.mark.source_idx].color());
+                if let Some(pos) = pointer_pos.filter(|p| viewport_rect.contains(*p)) {
+                    let distance = (pos.y - y).abs();
+                    if pos.x >= rect.left() && pos.x < rect.right() && distance <= 3.0
+                        && pointed_strip.as_ref().is_none_or(|(best, ..)| distance < *best)
+                    {
+                        pointed_strip = Some((distance, strip, rect, row));
+                    }
+                }
+            }
         }
 
         for (offset, ev, shown) in &frame.labels {
@@ -1563,32 +1582,8 @@ impl BranchTimeline {
         // nearest pixel row within a few pixels answers, and a click
         // selects its newest mark.
         if hover_rect.is_none() {
-            let near = pointer_pos
-                .filter(|p| {
-                    viewport_rect.contains(*p)
-                        && p.x >= event_left
-                        && p.x <= event_left + event_width
-                })
-                .and_then(|p| {
-                    let at = p.y - viewport_rect.top();
-                    frame
-                        .strips
-                        .iter()
-                        .filter(|strip| (strip.y - at).abs() <= 3.0)
-                        .min_by(|a, b| (a.y - at).abs().total_cmp(&(b.y - at).abs()))
-                });
-            if let Some(strip) = near {
-                let row: Vec<&Strip> = frame
-                    .strips
-                    .iter()
-                    .filter(|other| other.y == strip.y)
-                    .collect();
-                let src = &sources[strip.mark.source_idx];
-                let src_color = src.color();
-                let row_rect = egui::Rect::from_min_size(
-                    egui::pos2(event_left + 2.0, viewport_rect.top() + strip.y - 3.0),
-                    egui::vec2(src_pill_w, 6.0),
-                );
+            if let Some((_, strip, row_rect, row)) = pointed_strip {
+                let src_color = sources[strip.mark.source_idx].color();
                 hover_rect = Some((row_rect, src_color));
                 if viewport_response.clicked() {
                     clicked_event = Some((strip.mark.kind, strip.mark.entity_id));
@@ -1863,15 +1858,17 @@ mod tests {
     /// lands past it, so the selection examined no time fact at all.
     #[test]
     fn offscreen_history_is_neither_selected_nor_read() {
-        let facts = reasons((0..2_000).map(|n| T0 + n * MINUTE));
+        let view_start = T0 + 2_400 * MINUTE;
+        let view_end = view_start - 400 * MINUTE;
+        let facts = reasons((0..2_000).map(|n| T0 + n * MINUTE)
+            .chain([view_end - 1, view_start + 1]));
         let mut activity = Activity::new(BTreeMap::new());
-        let far_later = T0 + 30 * 24 * 60 * MINUTE;
 
         let frame = draw(
             &mut activity,
             &reason_source(),
             &facts,
-            far_later,
+            view_start,
             DEFAULT_NS_PER_PX,
         );
 
@@ -1955,7 +1952,7 @@ mod tests {
 
         assert_eq!(activity.selections, 2);
         assert!(
-            activity.scanned <= 3 * 40 + 3,
+            activity.scanned == 0,
             "scanned {}",
             activity.scanned
         );
@@ -1973,8 +1970,8 @@ mod tests {
             .all(|(_, _, shown)| shown.summary == "text"));
     }
 
-    /// Panning inside the selected range re-selects nothing and reads only
-    /// the labels it newly draws; panning past it selects once more.
+    /// Panning queries only newly visible times. Returning to a previous
+    /// viewport reuses the previews already read.
     #[test]
     fn panning_reads_only_newly_drawn_labels() {
         let facts = reasons((0..5_000).map(|n| T0 + n * SECOND));
@@ -2004,7 +2001,7 @@ mod tests {
             .filter(|(_, mark, _)| !before.contains(&mark.entity_id))
             .count();
 
-        assert_eq!(activity.selections, 1);
+        assert_eq!(activity.scanned, 10);
         assert!((10..=11).contains(&new), "{new} new labels");
         assert_eq!(activity.reads - reads, new);
 
@@ -2021,7 +2018,7 @@ mod tests {
             view_start - 600 * SECOND,
             ns_per_px,
         );
-        assert_eq!(activity.selections, 2);
+        assert_eq!(activity.scanned, first.labels.len());
     }
 
     /// One chip per envelope, at its newest time: a window holding only an
