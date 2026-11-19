@@ -13,6 +13,7 @@
 
 pub mod cli;
 pub mod colony;
+pub mod drive_task;
 pub mod mcp;
 pub mod operations;
 

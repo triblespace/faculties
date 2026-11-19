@@ -259,15 +259,27 @@ pub struct LaunchConfig {
 
 /// The placeholders a local executor template may name, each replaced inside
 /// a word: the prompt file (also the executor's stdin), the report file it
-/// must write, the zooid's name, the effort, and the unit script, which run
-/// as `{script} mcp` is the zooid's own faculties MCP server.
-pub const LOCAL_PLACEHOLDERS: [&str; 5] =
-    ["{prompt}", "{report}", "{name}", "{effort}", "{script}"];
+/// must write, the zooid's name, the effort, the unit script, which run
+/// as `{script} mcp` is the zooid's own faculties MCP server, and the unit's
+/// runtime limit in seconds (`SPAWN_LOCAL_MAX_RUNTIME`), which a template
+/// may name only when the limit is set.
+pub const LOCAL_PLACEHOLDERS: [&str; 6] = [
+    "{prompt}",
+    "{report}",
+    "{name}",
+    "{effort}",
+    "{script}",
+    "{runtime}",
+];
+
+/// Why a template that names `{runtime}` cannot run without a limit.
+const RUNTIME_UNSET: &str = "SPAWN_LOCAL_EXECUTOR names {runtime}, but SPAWN_LOCAL_MAX_RUNTIME \
+     is unset, so the unit has no runtime limit to pass on. Nothing was started";
 
 /// What to do when a host has no local executor.
 const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
      SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
-     {report}, {name}, {effort} and {script} replaced at launch; the executor reads the prompt \
+     {report}, {name}, {effort}, {script} and {runtime} replaced at launch; the executor reads the prompt \
      on stdin and writes its report to {report}. Nothing falls back to a hosted model";
 
 /// A local executor template from `SPAWN_LOCAL_EXECUTOR`: whitespace
@@ -299,6 +311,11 @@ fn parse_local_executor(template: &str) -> Result<Vec<String>> {
         bail!("SPAWN_LOCAL_EXECUTOR never names {{report}}, so a local run could not report");
     }
     Ok(words)
+}
+
+/// Whether a local executor template names `{runtime}`.
+fn names_runtime(template: &[String]) -> bool {
+    template.iter().any(|word| word.contains("{runtime}"))
 }
 
 impl LaunchConfig {
@@ -1358,6 +1375,11 @@ impl Spawn {
                 Ok((provider, format!("{} was asked for", provider.name())))
             }
             Provider::Local => match &self.launch.local {
+                Some(template)
+                    if names_runtime(template) && self.launch.local_max_runtime.is_none() =>
+                {
+                    bail!("{RUNTIME_UNSET}.")
+                }
                 Some(_) => Ok((provider, "local was asked for".to_owned())),
                 None => bail!("{LOCAL_UNCONFIGURED}. Nothing was started."),
             },
@@ -1460,12 +1482,18 @@ impl Spawn {
                 let Some(template) = &self.launch.local else {
                     bail!("{LOCAL_UNCONFIGURED}");
                 };
+                let runtime = match self.launch.local_max_runtime {
+                    Some(seconds) => seconds.to_string(),
+                    None if names_runtime(template) => bail!("{RUNTIME_UNSET}"),
+                    None => String::new(),
+                };
                 let values = [
                     ("{prompt}", text(&files.prompt)),
                     ("{report}", text(&files.report)),
                     ("{name}", files.name.clone()),
                     ("{effort}", effort.to_owned()),
                     ("{script}", text(&files.script)),
+                    ("{runtime}", runtime),
                 ];
                 let argv = template
                     .iter()
@@ -2352,6 +2380,12 @@ impl Spawn {
                 view,
                 "no local executor on this host (SPAWN_LOCAL_EXECUTOR is unset)".to_owned(),
             );
+        }
+        if provider == Provider::Local
+            && self.launch.local.as_deref().is_some_and(names_runtime)
+            && self.launch.local_max_runtime.is_none()
+        {
+            return self.refuse(view, RUNTIME_UNSET.to_owned());
         }
         // A request is started unattended, by whatever wrote it (a rule, an
         // ignite pass). Until JP agrees to unattended spending, money is
@@ -4038,6 +4072,59 @@ mod tests {
         let script = f.script(0);
         assert!(script.contains("/opt/drive/zooid"), "{script}");
         assert!(!script.contains("/fake/"), "{script}");
+    }
+
+    #[test]
+    fn a_local_template_gets_the_runtime_limit_it_names() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-runtime", "printf 'ok' > \"$1\"");
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(
+                parse_local_executor(&format!(
+                    "{} {{report}} --runtime {{runtime}} --deadline-of={{runtime}}s",
+                    executor.display()
+                ))
+                .unwrap(),
+            );
+            launch.local_max_runtime = Some(90);
+        });
+        let launched = spawn.run(&local_request(&f, "Runtime named.")).unwrap();
+        assert_eq!(f.launcher.started.lock().unwrap()[0].runtime_max, Some(90));
+        let run = run_unit_and_settle(&f, &spawn, &launched);
+        assert_eq!(run.exit_code, [0]);
+        let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
+        assert_eq!(
+            args.trim(),
+            format!(
+                "{} --runtime 90 --deadline-of=90s",
+                launched.report.display()
+            )
+        );
+    }
+
+    #[test]
+    fn a_template_naming_runtime_without_a_limit_starts_nothing() {
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/local {report} {runtime}").unwrap());
+            launch.local_max_runtime = None;
+        });
+        let error = spawn
+            .run(&local_request(&f, "Runtime named, none set."))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SPAWN_LOCAL_MAX_RUNTIME"), "{error}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        // A keeper refuses the same request the same way.
+        let asked = f.ask("Runtime by request.", None, Provider::Local);
+        let pass = spawn.keep_once(&f.keep_config()).unwrap();
+        assert!(
+            matches!(&pass.steps[0], (request, KeepStep::Refused(why))
+                if *request == asked.request && why.contains("SPAWN_LOCAL_MAX_RUNTIME")),
+            "{:?}",
+            pass.steps
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 
     #[test]
