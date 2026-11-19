@@ -1869,7 +1869,7 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, linked) = self.observe(|facts, _| {
+        let (already_ended, earlier_message, linked, local) = self.observe(|facts, _| {
             Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
@@ -1882,9 +1882,13 @@ impl Spawn {
                     )
                     .any(|id| id == served)
                 }),
+                exists!(pattern!(facts, [{ run @ attrs::provider: Provider::Local.name() }])),
             ))
         })?;
         let mut failures = Vec::new();
+        // A local executor's contract is to write the report file. Hosted
+        // providers keep their meaning: a missing report there is no report.
+        let mut missing_local_report = false;
         let mut report_handle = None;
         // The run's link to its request, from inside the unit: launch
         // publishes it only after the unit started, and a keeper that
@@ -1939,6 +1943,13 @@ impl Spawn {
             );
             report_handle = handle;
             let mut fragment = fragment;
+            if local && request.exit.clean() && report.is_none() {
+                missing_local_report = true;
+                let result = fragment.put::<triblespace::prelude::blobencodings::UTF8String, _>(
+                    super::MISSING_REPORT_RESULT.to_owned(),
+                );
+                fragment += entity! { ExclusiveId::force_ref(&run) @ attrs::result: result };
+            }
             if let Some(link) = link {
                 fragment += link;
             }
@@ -2021,16 +2032,16 @@ impl Spawn {
             ),
             Ok(None) => (
                 request_spawner(),
-                request.exit.describe(),
-                request.exit.clean(),
+                fallback_end(&request.exit, missing_local_report),
+                request.exit.clean() && !missing_local_report,
                 report_handle,
             ),
             Err(error) => {
                 failures.push(anyhow!("read the run back: {error:#}"));
                 (
                     request_spawner(),
-                    request.exit.describe(),
-                    request.exit.clean(),
+                    fallback_end(&request.exit, missing_local_report),
+                    request.exit.clean() && !missing_local_report,
                     report_handle,
                 )
             }
@@ -3185,18 +3196,34 @@ pub fn describe_end(run: &RunView) -> String {
     {
         return format!("{end}, {}", super::RUNTIME_LIMIT_NOTE);
     }
+    if run
+        .result
+        .iter()
+        .any(|result| result == super::MISSING_REPORT_RESULT)
+    {
+        return format!("{end}, {}", super::MISSING_REPORT_NOTE);
+    }
     end
 }
 
-/// Whether a recorded run ended as a success: exit 0 alone, and not stopped
-/// by its runtime limit.
+/// The end a settlement reports when it cannot read its own record back.
+fn fallback_end(exit: &Exit, missing_local_report: bool) -> String {
+    if missing_local_report {
+        format!("{}, {}", exit.describe(), super::MISSING_REPORT_NOTE)
+    } else {
+        exit.describe()
+    }
+}
+
+/// Whether a recorded run ended as a success: exit 0 alone, not stopped by
+/// its runtime limit, and, for a local run, with the report it must write.
 pub fn ended_clean(run: &RunView) -> bool {
     run.exit_code == [0]
         && run.signal.is_empty()
         && !run
             .result
             .iter()
-            .any(|result| result == super::TIMEOUT_RESULT)
+            .any(|result| result == super::TIMEOUT_RESULT || result == super::MISSING_REPORT_RESULT)
 }
 
 /// One line per spawn: name, runs, how the latest ended, the brief's first line.
@@ -3953,6 +3980,101 @@ mod tests {
         let mut request = f.request(brief);
         request.provider = Provider::Local;
         request
+    }
+
+    /// A local run launched with a trivial executor, settled directly with
+    /// `exit` and, when `report` is given, that report file's contents.
+    fn settle_local(f: &Fixture, exit: Exit, report: Option<&str>) -> RunView {
+        let executor = local_executor(f, "local-settle", "true");
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{report}}", executor.display())).unwrap())
+        });
+        let launched = spawn.run(&local_request(f, "Settle me.")).unwrap();
+        if let Some(text) = report {
+            std::fs::write(&launched.report, text).unwrap();
+        }
+        spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit,
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        // The same brief is the same zooid: its newest run is this one.
+        spawn.show(&launched.name).unwrap().runs.pop().unwrap()
+    }
+
+    #[test]
+    fn a_local_run_that_exits_0_without_its_report_settles_as_a_failure() {
+        let f = fixture();
+        let run = settle_local(&f, Exit::from_systemd("exited", "0", "success"), None);
+        assert_eq!(run.exit_code, [0]);
+        assert!(run.report.is_empty());
+        assert!(run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        assert!(
+            run.result.iter().any(|result| result == "success"),
+            "systemd's own result stays"
+        );
+        assert!(!ended_clean(&run));
+        assert_eq!(
+            describe_end(&run),
+            format!("exit 0, {}", super::super::MISSING_REPORT_NOTE)
+        );
+    }
+
+    #[test]
+    fn a_local_run_with_its_report_is_clean_and_an_unclean_one_keeps_its_partial_report() {
+        let f = fixture();
+        let run = settle_local(
+            &f,
+            Exit::from_systemd("exited", "0", "success"),
+            Some("done\n"),
+        );
+        assert!(ended_clean(&run));
+        assert_eq!(run.report_text.as_deref(), Some("done\n"));
+        assert!(!run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        let run = settle_local(
+            &f,
+            Exit::from_systemd("exited", "3", "exit-code"),
+            Some("half\n"),
+        );
+        assert!(!ended_clean(&run));
+        assert_eq!(run.report_text.as_deref(), Some("half\n"));
+        assert!(!run
+            .result
+            .iter()
+            .any(|result| result == super::super::MISSING_REPORT_RESULT));
+        assert_eq!(describe_end(&run), "exit 3");
+    }
+
+    #[test]
+    fn a_hosted_run_that_exits_0_without_a_report_keeps_its_meaning() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Hosted, no report.")).unwrap();
+        f.spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(run.report.is_empty());
+        assert!(ended_clean(run));
+        assert_eq!(describe_end(run), "exit 0");
     }
 
     #[test]

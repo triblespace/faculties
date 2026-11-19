@@ -8,8 +8,12 @@
 //! everything the run does not decide (tenant, session home, model, sizes,
 //! telemetry, provider) comes from one binding file the host provisions. No
 //! value has a default, nothing is truncated, no text is added to the
-//! prompt, and nothing falls back to a hosted model. Any route Drive cannot
-//! take refuses the launch before Drive starts, naming the routes.
+//! prompt, and nothing falls back to a hosted model. Every pinned faculties
+//! route is passed on; a route variable that names no faculties collection,
+//! a malformed or repeated route, or a missing archive route refuses before
+//! Drive starts, naming the routes. Which roles Drive accepts is Drive's own
+//! table: a Drive pinned to an older faculties refuses a newer role itself,
+//! at argument parsing, naming it.
 //!
 //! The deadline Drive gets ends a stated teardown margin before the unit's
 //! `RuntimeMaxSec`, so Drive's own cooperative deadline fires first and the
@@ -94,9 +98,16 @@ impl Binding {
     /// Read and check a binding file. A missing file, a missing or extra
     /// key, an empty value or a zero size refuses.
     pub fn read(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let bytes = std::fs::read(path)
             .with_context(|| format!("read the Drive binding {}", path.display()))?;
-        let binding: Self = serde_json::from_str(&text)
+        Self::parse(&bytes, path)
+    }
+
+    /// Parse and check binding bytes already read from `path`. The adapter
+    /// hashes the same bytes it parses, so the digest it logs names the
+    /// configuration it executes even if the file changes afterwards.
+    pub fn parse(bytes: &[u8], path: &Path) -> Result<Self> {
+        let binding: Self = serde_json::from_slice(bytes)
             .with_context(|| format!("the Drive binding {} is not valid", path.display()))?;
         binding.check()?;
         Ok(binding)
@@ -382,7 +393,7 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
     use std::os::unix::process::CommandExt as _;
     let bytes = std::fs::read(binding)
         .with_context(|| format!("read the Drive binding {}", binding.display()))?;
-    let parsed = Binding::read(binding)?;
+    let parsed = Binding::parse(&bytes, binding)?;
     let prompt = std::fs::metadata(run.prompt)
         .with_context(|| format!("the prompt {}", run.prompt.display()))?;
     ensure!(
@@ -487,6 +498,20 @@ mod tests {
             .iter()
             .map(|arg| arg.to_str().unwrap().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn the_parsed_binding_is_the_hashed_bytes_not_a_second_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("binding.json");
+        let original = FAKE_BINDING.as_bytes().to_vec();
+        std::fs::write(&path, &original).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // The file changes after the adapter captured and hashed it.
+        std::fs::write(&path, FAKE_BINDING.replace("fake-tenant", "another tenant")).unwrap();
+        let parsed = Binding::parse(&bytes, &path).unwrap();
+        assert_eq!(parsed.tenant, binding().tenant);
+        assert_eq!(bytes, original);
     }
 
     #[test]

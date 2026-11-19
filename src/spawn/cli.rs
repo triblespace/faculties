@@ -211,9 +211,11 @@ enum Command {
     /// --name {name} --runtime {runtime}`. It turns the run's pinned
     /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
     /// arguments, takes everything else from the binding file, and execs
-    /// `drive task`. It opens no pile. Any route Drive cannot take, a missing
-    /// or extra binding key, a prompt over the bound or a runtime limit too
-    /// short for the teardown margin refuses before Drive starts.
+    /// `drive task`. It opens no pile. A route variable naming no faculties
+    /// collection, a malformed or repeated route, a missing archive route, a
+    /// missing or extra binding key, a prompt over the bound or a runtime
+    /// limit too short for the teardown margin refuses before Drive starts.
+    /// A role Drive does not accept is refused by Drive itself, naming it.
     DriveTask {
         /// The host's binding file (JSON): drive, tenant, home, model,
         /// sizes, telemetry and provider. Every key is required.
