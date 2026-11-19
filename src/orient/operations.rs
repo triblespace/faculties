@@ -14,7 +14,7 @@ mod next;
 mod receipt_import;
 #[path = "service_events.rs"]
 mod service_events;
-pub use next::{Next, NextKind, PendingNext, PreparedReport};
+pub use next::{Next, NextKind, NextCompletion, PendingNext, PreparedReport};
 
 #[derive(Clone, Debug)]
 pub struct Orient {
@@ -418,6 +418,7 @@ use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionRealizationError,
+    CollectionRegistrationError,
     CollectionSnapshotExt, CollectionStoreExt, Cover,
 };
 use triblespace::core::metadata;
@@ -767,6 +768,23 @@ fn visible_notes(
     Ok(notes)
 }
 
+/// Diagnostic context for one registration, without erasing its error variants.
+#[derive(Debug)]
+struct OrientRegistrationError<E> {
+    label: &'static str,
+    projection: &'static str,
+    cause: CollectionRegistrationError<E>,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for OrientRegistrationError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "register {} {} collection: {}", self.label, self.projection, self.cause)
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for OrientRegistrationError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+}
+
 /// One Orient input's authored collection and explicit query projections.
 #[derive(Clone, Copy)]
 struct OrientSource {
@@ -808,15 +826,17 @@ impl OrientSource {
         label: &'static str,
     ) -> Result<Self>
     where
-        S: CollectionStoreExt + SnapshotSource,
+        S: FacultyAccess,
         S::Snapshot: BlobStoreGet + CapabilityProofRead,
     {
         let succinct = pile
             .attach::<SuccinctArchiveBlob>(source, ())
-            .with_context(|| format!("register {label} Succinct collection"))?;
+            .map_err(|cause| OrientRegistrationError { label, projection: "Succinct", cause })?;
+        #[cfg(test)]
+        pile.before_orient_rank9_registration(label)?;
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-            .with_context(|| format!("register {label} Rank9 collection"))?;
+            .map_err(|cause| OrientRegistrationError { label, projection: "Rank9", cause })?;
         Ok(Self {
             source,
             succinct,
@@ -5221,6 +5241,8 @@ async fn cmd_observe(
         continuous,
         deadline,
         output,
+        #[cfg(test)]
+        None,
     )
     .await?;
     if !continuous && !outcome.news_printed {
@@ -5241,6 +5263,7 @@ async fn observe_wait(
     continuous: bool,
     deadline: Option<Instant>,
     output: &mut Out<'_>,
+    #[cfg(test)] quiet_snapshot: Option<&next::quiet_snapshot_test::Rendezvous>,
 ) -> Result<WaitOutcome> {
     use futures_util::FutureExt;
     let Some(persona_input) = persona else {
@@ -5619,6 +5642,10 @@ async fn observe_wait(
             });
             tokio::time::sleep(sleep).await;
             routing.validate_workspace_at(pile, signer.verifying_key())?;
+            #[cfg(test)]
+            if let Some(hook) = quiet_snapshot {
+                hook.pause(next::quiet_snapshot_test::Boundary::Health).await?;
+            }
             let (fired, deadline) = health
                 .poll_in(pile, signer, persona_input, false, form, output)
                 .await?;
@@ -5631,11 +5658,16 @@ async fn observe_wait(
                 });
             }
             let now = clock::now()?;
+            #[cfg(test)]
+            if let Some(hook) = quiet_snapshot {
+                hook.pause(next::quiet_snapshot_test::Boundary::Ordinary).await?;
+            }
             let sampled = pile
                 .snapshot()
                 // Keep the source: a deadline met while acquiring this refresh
-                // is the wait's timeout, and callers find it in the chain.
-                .context("refresh Orient wait snapshot")?;
+                // is the wait's timeout, and callers find it in the chain. The
+                // typed wrapper also lets Next tell a bare cancellation apart.
+                .map_err(|error| WaitSnapshotError(error.into()))?;
             let maintenance_changed = maintained_from
                 .as_ref()
                 .is_none_or(|previous| wait_storage_changed(&sampled, previous));
@@ -5836,23 +5868,24 @@ async fn observe_wait(
     })
     .catch_unwind()
     .await;
-    if let Some(selected) = selection.take() {
+    let settlement = if let Some(selected) = selection.take() {
         selected.control.cancel();
         // A deadline does not preempt synchronous decoding/query work. This
         // join can therefore outlast the logical deadline, and must remain
         // owned rather than being reported as already settled.
-        let joined = selected
+        selected
             .task
             .await
-            .context("settle frozen Orient selection");
-        if matches!(&result, Ok(Ok(_))) {
-            let _ = joined?;
-        }
-    }
+            .context("settle frozen Orient selection")
+            .and_then(|result| result.map(|_| ()))
+    } else {
+        Ok(())
+    };
     let result: Result<WaitOutcome> = match result {
         Ok(result) => result,
-        Err(panic) => std::panic::resume_unwind(panic),
+        Err(panic) => Err(anyhow!("Orient wait panicked: {}", panic_text(&panic))),
     };
+    let result = finish_wait_selection(result, settlement);
     match &result {
         // A run-for deadline reached with a report still unsent is a
         // deliberate stop the daemon maps to Ok, not a failed exit.
@@ -5866,6 +5899,83 @@ async fn observe_wait(
         Ok(_) => {}
     }
     result
+}
+
+/// Diagnostic context for exactly one snapshot failure, never a combined
+/// operation/settlement failure. Preserve its type for the owned Next caller.
+#[derive(Debug)]
+struct WaitSnapshotError(anyhow::Error);
+
+impl std::fmt::Display for WaitSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refresh Orient wait snapshot: {}", self.0)
+    }
+}
+impl std::error::Error for WaitSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+}
+
+fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic.downcast_ref::<String>().map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-text panic payload")
+}
+
+fn finish_wait_selection<T>(result: Result<T>, settlement: Result<()>) -> Result<T> {
+    match settlement {
+        // We explicitly canceled this exact nested selection before joining.
+        Err(error) if next::is_cancelled(&error) => result,
+        Ok(()) => result,
+        Err(error) => match result {
+            Ok(_) => Err(error),
+            // Do not retain Cancelled as the type of a mixed failure: the
+            // owner must not normalize away the other failed settlement.
+            Err(operation) => Err(anyhow!("Orient operation failed: {operation:#}; \
+                settling its selection also failed: {error:#}")),
+        },
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use triblespace::core::repo::async_store::AcquiringReadInterrupted;
+
+    #[test]
+    fn nested_failure_survives_outer_cancellation_after_exact_join() {
+        for panic in [false, true] {
+            crate::storage::runtime().unwrap().block_on(async {
+                let (entered, ready) = std::sync::mpsc::channel();
+                let (release, go) = std::sync::mpsc::channel();
+                let task = tokio::task::spawn_blocking(move || -> Result<()> {
+                    entered.send(()).unwrap();
+                    go.recv().unwrap();
+                    if panic { panic!("nested selection panic"); }
+                    anyhow::bail!("nested selection failure");
+                });
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!task.is_finished());
+                release.send(()).unwrap();
+                let joined = task.await.context("settle frozen Orient selection")
+                    .and_then(|result| result);
+                let error = finish_wait_selection::<()>(
+                    Err(AcquiringReadInterrupted::Cancelled.into()), joined).unwrap_err();
+                assert!(!next::is_cancelled(&error), "mixed failure must not normalize to cancellation");
+                let text = format!("{error:#}");
+                assert!(text.contains("exact acquisition cancelled"));
+                assert!(text.contains(if panic { "nested selection panic" } else { "nested selection failure" }));
+            });
+        }
+    }
+
+    #[test]
+    fn only_nested_cancellation_is_expected_settlement() {
+        let canceled = || anyhow::Error::from(AcquiringReadInterrupted::Cancelled);
+        assert!(finish_wait_selection(Ok(()), Err(canceled())).is_ok());
+        assert!(next::is_cancelled(&finish_wait_selection::<()>(Err(canceled()), Ok(())).unwrap_err()));
+        assert!(finish_wait_selection(Ok(()), Err(anyhow!("selection failed"))).is_err());
+        assert!(!next::is_cancelled(&canceled().context("closing storage also failed")),
+            "an interruption inside another failure is not bare cancellation");
+    }
 }
 
 impl WaitOutcome {

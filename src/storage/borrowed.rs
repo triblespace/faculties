@@ -22,6 +22,9 @@ pub(crate) trait FacultyAccess:
     fn with_local<T>(&mut self, operation: impl FnOnce(&mut Pile) -> Result<T>) -> Result<T>;
 
     fn read_control(&self) -> Option<AcquiringReadControl> { None }
+
+    #[cfg(test)]
+    fn before_orient_rank9_registration(&self, _label: &'static str) -> Result<()> { Ok(()) }
 }
 
 impl FacultyAccess for FacultyStore {
@@ -38,10 +41,18 @@ pub(crate) struct BorrowedStore {
     prepared: Arc<AtomicBool>,
     runtime: Arc<tokio::runtime::Runtime>,
     remote: bool,
+    #[cfg(test)]
+    pub(crate) registration: Option<registration_test::Rendezvous>,
 }
 
 #[derive(Debug)]
 pub(crate) struct BorrowError(anyhow::Error);
+
+#[cfg(test)]
+impl BorrowError {
+    /// Classifier fixture only; does not simulate a failed store operation.
+    pub(crate) fn for_classification_test(cause: anyhow::Error) -> Self { Self(cause) }
+}
 
 impl std::fmt::Display for BorrowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
@@ -57,7 +68,10 @@ impl BorrowedStore {
         let (signer, runtime, remote) = borrow(&storage, &control, |store, signer, runtime| {
             Ok((signer.clone(), runtime.clone(), store.acquires_remotely()))
         })?;
-        Ok((Self { storage, control, prepared, runtime: runtime.clone(), remote }, signer, runtime))
+        Ok((Self { storage, control, prepared, runtime: runtime.clone(), remote,
+            #[cfg(test)]
+            registration: None,
+        }, signer, runtime))
     }
 
     fn control(&self) -> AcquiringReadControl {
@@ -149,4 +163,49 @@ impl FacultyAccess for BorrowedStore {
     }
 
     fn read_control(&self) -> Option<AcquiringReadControl> { Some(self.control()) }
+
+    #[cfg(test)]
+    fn before_orient_rank9_registration(&self, label: &'static str) -> Result<()> {
+        if let Some(hook) = &self.registration { hook.pause(label)?; }
+        Ok(())
+    }
+}
+
+/// Per-call equipment for the real descriptor-write path, never a global hook.
+#[cfg(test)]
+pub(crate) mod registration_test {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
+
+    pub(crate) struct Rendezvous {
+        entered: Sender<&'static str>,
+        release: std::sync::Mutex<Option<Receiver<()>>>,
+    }
+
+    pub(crate) struct Release(pub(crate) Option<Sender<()>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            if let Some(send) = self.0.take() { let _ = send.send(()); }
+        }
+    }
+
+    impl Rendezvous {
+        pub(crate) fn new() -> (Self, Receiver<&'static str>, Sender<()>) {
+            let (entered, ready) = mpsc::channel();
+            let (release, go) = mpsc::channel();
+            (Self { entered, release: std::sync::Mutex::new(Some(go)) }, ready, release)
+        }
+
+        pub(super) fn pause(&self, label: &'static str) -> Result<()> {
+            if label != "Relations" { return Ok(()); }
+            // Neither this mutex nor the Storage owner spans the wait.
+            let go = self.release.lock().unwrap().take();
+            let Some(go) = go else { return Ok(()); };
+            self.entered.send(label).context("observe Relations Rank9 registration rendezvous")?;
+            go.recv_timeout(Duration::from_secs(10))
+                .context("Relations Rank9 registration rendezvous release")?;
+            // Do not check cancellation here: the real attach/put must observe it.
+            Ok(())
+        }
+    }
 }

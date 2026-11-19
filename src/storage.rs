@@ -98,6 +98,8 @@ pub use triblespace::core::repo::async_store::AcquiringReader;
 
 mod borrowed;
 pub(crate) use borrowed::{BorrowedStore, FacultyAccess};
+#[cfg(test)]
+pub(crate) use borrowed::registration_test;
 
 /// Explicit application bindings from a faculty role to one exact descriptor.
 /// Roles are the schema IDs in [`crate::collection_names::table`], not names
@@ -768,6 +770,12 @@ fn finish_close<T>(result: Result<T>, close: Result<()>) -> Result<T> {
             Err(error.context(format!("closing storage also failed: {close_error:#}")))
         }
     }
+}
+
+/// Exercise actual close aggregation from owned-call tests without live I/O failure.
+#[cfg(test)]
+pub(crate) fn finish_close_for_test<T>(result: Result<T>, close: Result<()>) -> Result<T> {
+    finish_close(result, close)
 }
 
 /// Enter the async I/O boundary of a foreground command.

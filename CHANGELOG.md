@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `PendingNext::cancel_and_join` returns `Result<NextCompletion>`
+  (`orient::NextCompletion::{Completed, CancelledBeforeReport}`).
+  `CancelledBeforeReport` means the call's own cancellation won before any
+  complete report was offered, so there is nothing to retain or acknowledge.
+  A cancellation after a report was offered, a deadline, an unrelated worker
+  error, or a cancellation wrapped in another failure (close, nested
+  settlement) stays an error. A joined outcome is kept, so repeated joins
+  return the same result. Registration and quiet-wait snapshot failures keep
+  typed wrappers so this classification does not depend on message text.
+  `orient wait` now reports a panic in the wait as an error instead of
+  re-raising it, and a nested selection that fails for any reason other than
+  its own cancellation is reported instead of discarded.
+
 - Compass can mark a goal unclear: `Compass::mark_unclear` (and
   `mark_unclear_in` over a host's borrowed pile) writes an ordinary attributed
   note tagged `unclear` asking what the goal does. It ranks nothing and moves

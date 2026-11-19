@@ -22,7 +22,7 @@ mod operations;
 #[cfg(all(test, unix))]
 mod process_tests;
 pub use operations::{
-    BaselineReceipt, NewsForm, Next, NextKind, Orient, PendingNext, PreparedReport, ShowOptions, WaitOptions,
+    BaselineReceipt, NewsForm, Next, NextKind, NextCompletion, Orient, PendingNext, PreparedReport, ShowOptions, WaitOptions,
     WakeOptions, WakePairsOptions,
 };
 
