@@ -433,14 +433,19 @@ fn daemon_cli_has_one_callback_channel_and_failure_does_not_acknowledge() {
         let event = f.message("one callback, no stdout copy", f.persona);
         let report = f.directory.path().join("delivered");
         let code = if success { "0" } else { "7" };
-        let result = f
+        // The run-for clock starts before the store opens, so a short window
+        // can expire on a loaded machine before any news is observed. Give
+        // the daemon a long window and wait on the delivery itself: a failed
+        // callback ends the daemon on its own, a successful one is stopped
+        // with SIGTERM once its report exists.
+        let child = f
             .process(None)
             .args([
                 "daemon",
                 "--poll-ms",
                 "10",
                 "--run-for",
-                "1s",
+                "60s",
                 "--callback",
                 "/bin/sh",
                 "--callback-arg=-c",
@@ -452,8 +457,21 @@ fn daemon_cli_has_one_callback_channel_and_failure_does_not_acknowledge() {
             ])
             .arg(&report)
             .args(["--callback-arg", code])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .unwrap();
+        if success {
+            let started = std::time::Instant::now();
+            while !report.exists() && started.elapsed() < Duration::from_secs(30) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The callback and receipt publication complete synchronously
+            // before the observer yields to its signal boundary.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        }
+        let result = child.wait_with_output().unwrap();
+        assert!(report.exists(), "daemon never delivered: {:?}", result);
         assert_eq!(result.status.success(), success, "{:?}", result);
         assert!(
             result.stdout.is_empty(),
