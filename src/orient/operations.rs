@@ -5976,6 +5976,21 @@ mod settlement_tests {
         assert!(!next::is_cancelled(&canceled().context("closing storage also failed")),
             "an interruption inside another failure is not bare cancellation");
     }
+
+    #[test]
+    fn nested_deadline_settlement_stays_a_failure() {
+        let deadline = || anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
+            .context("settle frozen Orient selection");
+        for result in [Ok(()), Err(AcquiringReadInterrupted::Cancelled.into())] {
+            let error = finish_wait_selection::<()>(result, Err(deadline())).unwrap_err();
+            assert!(!next::is_cancelled(&error), "a nested deadline is not a cancellation: {error:#}");
+            assert!(format!("{error:#}").contains("deadline"), "{error:#}");
+            assert!(!matches!(next::completion(Err(error), false), Ok(next::NextCompletion::CancelledBeforeReport)),
+                "a nested deadline must not become CancelledBeforeReport");
+        }
+        // Alone, the nested deadline keeps its type for the timeout path.
+        assert!(next::is_deadline(&finish_wait_selection::<()>(Ok(()), Err(deadline())).unwrap_err()));
+    }
 }
 
 impl WaitOutcome {

@@ -84,7 +84,7 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
         Some(AcquiringReadInterrupted::Cancelled))
 }
 
-fn completion(result: Result<()>, offered: bool) -> Result<NextCompletion> {
+pub(super) fn completion(result: Result<()>, offered: bool) -> Result<NextCompletion> {
     match result {
         Ok(()) => Ok(NextCompletion::Completed),
         Err(error) if !offered && is_cancelled(&error) => Ok(NextCompletion::CancelledBeforeReport),
