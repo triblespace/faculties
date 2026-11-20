@@ -2597,6 +2597,20 @@ impl Spawn {
     /// the goal and revision it was rendered from, annotating the spawn the
     /// way `spawn goal` does.
     fn request_from(&self, input: &RequestInput, goal: Option<(Id, &[Id])>) -> Result<Requested> {
+        let (fragment, requested) = self.request_parts(input, goal, false)?;
+        self.publish(fragment)?;
+        Ok(requested)
+    }
+
+    /// A request's facts, unpublished. With `accepted`, the fragment also
+    /// carries the request's accepted outcome, so the request is never
+    /// pending: no keeper but the one that wrote it ever starts it.
+    fn request_parts(
+        &self,
+        input: &RequestInput,
+        goal: Option<(Id, &[Id])>,
+        accepted: bool,
+    ) -> Result<(Fragment, Requested)> {
         if !super::EFFORTS.contains(&input.effort.as_str()) {
             bail!(
                 "effort {:?} is not one of {}",
@@ -2643,15 +2657,28 @@ impl Spawn {
             spawner,
         });
         fragment += request;
-        self.publish(fragment)?;
-        Ok(Requested {
-            request: id,
-            zooid,
-            name,
-            host,
-            host_label: input.host_label.clone(),
-            unit: super::unit_for_request(id),
-        })
+        if accepted {
+            let (outcome, _) = super::outcome_fragment(
+                id,
+                OUTCOME_ACCEPTED,
+                crate::clock::point_now()?,
+                None,
+                Some(&super::unit_for_request(id)),
+                None,
+            );
+            fragment += outcome;
+        }
+        Ok((
+            fragment,
+            Requested {
+                request: id,
+                zooid,
+                name,
+                host,
+                host_label: input.host_label.clone(),
+                unit: super::unit_for_request(id),
+            },
+        ))
     }
 
     /// This host's node key: the key this store signs with.
@@ -2798,26 +2825,30 @@ impl Spawn {
                         KeepStep::Refused(why) => {
                             format!("ignited, but keep refused its spawn request: {why}")
                         }
-                        other => format!("ignited; keep left its spawn request {other:?}"),
+                        other => format!(
+                            "ignited, but its spawn request was not launched ({other:?}); it is \
+                             accepted with no run, so no keeper starts it later"
+                        ),
                     },
                     step: Some(step),
                 },
-                // Written, kept, and neither launched nor withdrawn: keep had
-                // accepted it (its unit may be running, and no keeper starts
-                // an accepted request again), or rereading or withdrawing it
-                // failed. The error says which.
+                // Its commit may have happened, and the request was written
+                // already accepted: no keeper starts it later. Its unit may
+                // be running if keep failed after starting it.
                 Ok((spawn_request, Err(error))) => IgniteDecision {
                     request,
                     goal,
                     spawn_request: Some(spawn_request),
                     step: None,
                     reason: format!(
-                        "ignited and spawn request {spawn_request:x} written, but keeping it failed: \
+                        "ignited; spawn request {spawn_request:x} was written already accepted (or \
+                         its commit failed), so no keeper starts it later, but launching it failed: \
                          {error:#}"
                     ),
                 },
                 Err(error) => skip(format!(
-                    "ignited, but its spawn request could not be written; not retried: {error:#}"
+                    "ignited, but its spawn request could not be built, nothing was published; not \
+                     retried: {error:#}"
                 )),
             });
             break;
@@ -2825,13 +2856,14 @@ impl Spawn {
         Ok(decisions)
     }
 
-    /// Render the goal's brief, write its spawn request for this host, and
-    /// keep it. The caller holds the keep lock. The outer error means no
-    /// request was written. Once one is, it is launched now or withdrawn:
-    /// a request keep did not accept (it waited, or failed before
-    /// accepting) is refused, so no later keeper launches it without the
-    /// goal's checks. The inner error is left only for a request keep had
-    /// accepted, which no keeper starts again.
+    /// Render the goal's brief, write its spawn request for this host
+    /// already accepted, in one commit, and launch it. The caller holds the
+    /// keep lock. Because the request is never pending, no keeper but this
+    /// one ever starts it: whatever fails after the commit (the upkeep after
+    /// it, a reread, keep itself) leaves it accepted with no run, which
+    /// every keeper treats as uncertain and never starts. The outer error
+    /// means nothing was published; the inner one is anything after that,
+    /// including a publish whose commit may have happened.
     fn ignite_one(
         &self,
         config: &KeepConfig,
@@ -2842,7 +2874,7 @@ impl Spawn {
             .reading(&format!("{goal:x}"))
             .with_context(|| format!("read goal {goal:x}"))?;
         let rendered = super::goal_brief(&reading, ignition.extra.as_deref());
-        let requested = self.request_from(
+        let (fragment, requested) = self.request_parts(
             &RequestInput {
                 zooid: ZooidRef::Brief(rendered.text),
                 host: None,
@@ -2855,41 +2887,24 @@ impl Spawn {
                 cover_percent: None,
             },
             Some((reading.goal, &rendered.revision)),
+            true,
         )?;
         let request = requested.request;
-        let read = || -> Result<RequestView> {
-            self.requests(Some(requested.host))?
-                .into_iter()
-                .find(|view| view.id == request)
-                .ok_or_else(|| {
-                    anyhow!("spawn request {request:x} is not readable after writing it")
-                })
-        };
-        let withdraw = |view: &RequestView, why: &str| {
-            self.refuse(
-                view,
-                format!(
-                    "withdrawn by the effector, so no later keeper launches it without the goal's \
-                     checks: {why}"
-                ),
-            )
-        };
-        let kept = read().and_then(|view| {
-            match self
-                .keep_one(config, &view)
-                .with_context(|| format!("keep spawn request {request:x}"))
-            {
-                Ok(KeepStep::Waiting(why)) => withdraw(&view, &why),
-                Ok(step) => Ok(step),
-                Err(error) => match read() {
-                    Ok(now) if !now.has(OUTCOME_ACCEPTED) => withdraw(&now, &format!("{error:#}"))
-                        .map_err(|withdrawing| {
-                            error.context(format!("and withdrawing it failed: {withdrawing:#}"))
-                        }),
-                    _ => Err(error),
-                },
-            }
-        });
+        let kept = self
+            .publish(fragment)
+            .context("publish the accepted spawn request")
+            .and_then(|()| {
+                self.requests(Some(requested.host))?
+                    .into_iter()
+                    .find(|view| view.id == request)
+                    .ok_or_else(|| {
+                        anyhow!("spawn request {request:x} is not readable after writing it")
+                    })
+            })
+            .and_then(|view| {
+                self.keep_one_as(config, &view, true)
+                    .with_context(|| format!("keep spawn request {request:x}"))
+            });
         Ok((request, kept))
     }
 
@@ -2921,6 +2936,19 @@ impl Spawn {
     }
 
     fn keep_one(&self, config: &KeepConfig, view: &RequestView) -> Result<KeepStep> {
+        self.keep_one_as(config, view, false)
+    }
+
+    /// `accepted_here`: this caller wrote the request already accepted, in
+    /// the same commit, and holds the keep lock, so its accepted outcome is
+    /// not a sign of an earlier start. Every other caller treats accepted
+    /// with no run and no unit as uncertain and never starts it.
+    fn keep_one_as(
+        &self,
+        config: &KeepConfig,
+        view: &RequestView,
+        accepted_here: bool,
+    ) -> Result<KeepStep> {
         if view.has(OUTCOME_REFUSED) || view.has(OUTCOME_TERMINAL) {
             return Ok(KeepStep::Done);
         }
@@ -2956,7 +2984,7 @@ impl Spawn {
         if let Some(accepted) = view
             .outcomes
             .iter()
-            .find(|outcome| outcome.kind == OUTCOME_ACCEPTED)
+            .find(|outcome| outcome.kind == OUTCOME_ACCEPTED && !accepted_here)
         {
             // Accepted is recorded before the unit starts. A keeper that
             // stopped after starting it, with a settlement that never linked
@@ -7588,11 +7616,11 @@ mod tests {
         assert!(again[0].reason.contains("ignited before"), "{again:?}");
     }
 
-    /// keep failing before it accepts leaves no pending request behind: the
-    /// effector withdraws it, so a later ordinary keeper cannot launch it
-    /// without the goal's checks.
+    /// The effector's request is never pending: it is written already
+    /// accepted, so when the launch fails before anything started, the
+    /// request is accepted with no run, which no ordinary keeper starts.
     #[test]
-    fn a_request_keep_never_accepted_is_withdrawn_not_left_pending() {
+    fn an_effector_request_is_written_accepted_so_no_keeper_starts_it_later() {
         let f = fixture_with(FakeLauncher {
             state_fails: true,
             ..Default::default()
@@ -7602,9 +7630,10 @@ mod tests {
         let decisions = ignite(&f, &concluded(&[goal]));
         let spawn_request = decisions[0].spawn_request.expect("a request was written");
         assert!(
-            decisions[0].reason.contains("withdrawn by the effector"),
+            decisions[0].reason.contains("no keeper starts it later"),
             "{decisions:?}"
         );
+        assert!(decisions[0].reason.contains("fake systemd does not answer"));
         assert!(f.launcher.started.lock().unwrap().is_empty());
         let view = f
             .spawn
@@ -7613,7 +7642,44 @@ mod tests {
             .into_iter()
             .find(|view| view.id == spawn_request)
             .unwrap();
-        assert!(view.has(OUTCOME_REFUSED) && !view.has(OUTCOME_ACCEPTED));
+        assert!(view.has(OUTCOME_ACCEPTED) && view.runs.is_empty());
         assert!(ignited_list(&f).contains(&goal), "never started twice");
+    }
+
+    /// An ordinary keeper meets an accepted request with no run as
+    /// uncertain and leaves it: the same request the effector wrote, kept by
+    /// keep_once, is never started.
+    #[test]
+    fn an_ordinary_keeper_never_starts_an_effector_request() {
+        let f = fixture_with(FakeLauncher::default());
+        let (fragment, requested) = f
+            .spawn
+            .request_parts(
+                &RequestInput {
+                    zooid: ZooidRef::Brief("Accepted elsewhere.".to_owned()),
+                    host: None,
+                    host_label: Some("testhost".to_owned()),
+                    provider: Provider::Claude,
+                    effort: "medium".to_owned(),
+                    spawner: "agent-cc".to_owned(),
+                    previous: None,
+                    handoff: None,
+                    cover_percent: None,
+                },
+                None,
+                true,
+            )
+            .unwrap();
+        f.spawn.publish(fragment).unwrap();
+        let view = f
+            .spawn
+            .requests(None)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.id == requested.request)
+            .unwrap();
+        let step = f.spawn.keep_one(&f.keep_config(), &view).unwrap();
+        assert!(matches!(step, KeepStep::Uncertain(_)), "{step:?}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 }
