@@ -124,7 +124,22 @@ enum Command {
         /// once. WEMM_COPY_WEIGHTS and WEMM_PROBE_DIR apply to every bind.
         #[arg(long)]
         declared: bool,
+        /// With --declared, the registrations this daemon maintains: `wemm`
+        /// (the declared WeMM indexes) and `archive-bm25` (the attached
+        /// Archive BM25 faculties defines). Both when omitted. A host whose
+        /// application maintains the attached mappings with its own Driver
+        /// selects `wemm` alone, so each index has one maintainer.
+        #[arg(long, value_enum, value_delimiter = ',', requires = "declared")]
+        registrations: Vec<Upkept>,
     },
+}
+
+/// A registration `faculties maintain --declared` can run.
+#[cfg(feature = "wemm")]
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Upkept {
+    Wemm,
+    ArchiveBm25,
 }
 
 #[derive(Subcommand)]
@@ -216,6 +231,7 @@ fn run(command: Command) -> Result<()> {
             key,
             poll,
             declared: false,
+            ..
         } => maintain(pile, key, poll),
         #[cfg(feature = "wemm")]
         Command::Maintain {
@@ -223,7 +239,8 @@ fn run(command: Command) -> Result<()> {
             key,
             poll,
             declared: true,
-        } => maintain_declared(pile, key, poll),
+            registrations,
+        } => maintain_declared(pile, key, poll, &registrations),
     }
 }
 
@@ -276,26 +293,55 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
 /// `faculties maintain --declared`: every WeMM index the pile's records
 /// name, each with its own descriptor's model (faculties::wemm::declared).
 #[cfg(feature = "wemm")]
-fn maintain_declared(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
+fn maintain_declared(
+    pile: PathBuf,
+    key: Option<PathBuf>,
+    poll: u64,
+    registrations: &[Upkept],
+) -> Result<()> {
+    use faculties::maintenance::Upkeep;
     use faculties::wemm::declared::{Config, Registration, SessionBinder};
     anyhow::ensure!(
         std::env::var_os("FACULTIES_WORKSPACE").is_none(),
         "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE"
     );
+    let selected = |upkept| registrations.is_empty() || registrations.contains(&upkept);
     let sink: faculties::maintenance::Sink = std::sync::Arc::new(|line| eprintln!("{line}"));
-    let registration = Registration::checked(
-        Config::from_env()?.floor_retry(std::time::Duration::from_secs(poll)),
-        SessionBinder::from_env(&pile)?,
-        sink.clone(),
-    )?;
-    eprintln!("{}", faculties::maintenance::describe());
-    let storage = faculties::storage::Storage::shared(pile.clone(), key);
-    let backing = faculties::pile_watch::BackingIdentity::of(&pile)?;
-    let mut upkeep = faculties::maintenance::Upkeep::new(registration, sink);
+    let wemm = || {
+        Registration::checked(
+            Config::from_env()?.floor_retry(std::time::Duration::from_secs(poll)),
+            SessionBinder::from_env(&pile)?,
+            sink.clone(),
+        )
+    };
+    if selected(Upkept::ArchiveBm25) {
+        eprintln!("{}", faculties::maintenance::describe());
+    }
+    match (selected(Upkept::Wemm), selected(Upkept::ArchiveBm25)) {
+        (true, true) => run_upkeep(&pile, key, poll, Upkeep::new(wemm()?, sink.clone())),
+        (true, false) => run_upkeep(&pile, key, poll, Upkeep::alone(wemm()?, sink.clone())),
+        _ => run_upkeep(&pile, key, poll, Upkeep::new((), sink.clone())),
+    }
+}
+
+/// Run `upkeep` until the pile file is replaced.
+#[cfg(feature = "wemm")]
+fn run_upkeep<D, A>(
+    pile: &std::path::Path,
+    key: Option<PathBuf>,
+    poll: u64,
+    mut upkeep: faculties::maintenance::Upkeep<D, A>,
+) -> Result<()>
+where
+    D: triblespace::core::collection::Mappings,
+    A: triblespace::core::collection::Mappings,
+{
+    let storage = faculties::storage::Storage::shared(pile.to_path_buf(), key);
+    let backing = faculties::pile_watch::BackingIdentity::of(pile)?;
     // A pass runs when the pile grows or when deferred work (a bind retry, a
     // model waiting for the next pass) is due, whichever is first.
     let result = faculties::pile_watch::run_until_replaced_or_due(
-        &pile,
+        pile,
         &backing,
         std::time::Duration::from_secs(poll),
         || upkeep.pass(&storage),

@@ -2881,6 +2881,55 @@ mod tests {
         );
     }
 
+    /// `Upkeep::alone` leaves faculties' attached mappings to another owner:
+    /// a declared BM25 index with work stays as it is, and the pass logs
+    /// nothing.
+    #[test]
+    fn a_pass_alone_leaves_the_attached_index_to_its_owner() {
+        use triblespace::core::collection::CollectionRead;
+        let fixture = fixture();
+        let source = fixture._directory.path().join("one.jsonl");
+        fs::write(
+            &source,
+            r#"{"type":"user","sessionId":"read","uuid":"one","timestamp":"2026-03-01T15:34:01Z","message":{"role":"user","content":"quasar needle"}}"#,
+        )
+        .unwrap();
+        run_import(storage(&fixture), &source, CliImportSource::ClaudeCode).unwrap();
+        let lagging = || {
+            storage(&fixture)
+                .storage
+                .with_store(|store, signer, runtime| {
+                    let source = storage(&fixture).storage.open_collection_read(
+                        store,
+                        archive_schema::DEFAULT_SCOPE_ID,
+                        signer.verifying_key(),
+                        runtime,
+                    )?;
+                    let target =
+                        store.attach_with(source, crate::archive_bm25::ArchiveTextBm25Mapping)?;
+                    Ok(store.snapshot()?.attached(target)?.residual().len())
+                })
+                .unwrap()
+        };
+        // budget 0: one commit indexed and kept, which declares the index.
+        archive_collection::search_views_within(storage(&fixture).storage, 0).unwrap();
+        assert_eq!(lagging(), 2);
+
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let collected = collected.clone();
+            std::sync::Arc::new(move |line: &str| collected.lock().unwrap().push(line.to_owned()))
+        };
+        let mut upkeep = crate::maintenance::Upkeep::alone((), sink);
+        upkeep.pass(storage(&fixture).storage).unwrap();
+        assert!(
+            collected.lock().unwrap().is_empty(),
+            "{:?}",
+            collected.lock().unwrap()
+        );
+        assert_eq!(lagging(), 2, "the attached index is left to its owner");
+    }
+
     /// The daemon's attached pass finds the BM25 index once a search's MAP
     /// names it, and after new commits maintains it until a search has
     /// nothing left to build; with nothing new it does nothing.

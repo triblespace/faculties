@@ -50,11 +50,12 @@ pub fn describe() -> String {
     )
 }
 
-/// The daemon's pass over the attached indexes faculties defines and the
+/// The daemon's pass over the attached indexes faculties defines (`A`; `()`
+/// with [`Upkeep::alone`]) and the
 /// collections `D` runs. It keeps nothing between passes but what `D` keeps
 /// (a bound model, say): each asks the store again.
-pub struct Upkeep<D = ()> {
-    registered: (Mappings, D),
+pub struct Upkeep<D = (), A = Mappings> {
+    registered: (A, D),
     sink: Sink,
 }
 
@@ -65,7 +66,25 @@ impl<D: triblespace::core::collection::Mappings> Upkeep<D> {
             sink,
         }
     }
+}
 
+impl<D: triblespace::core::collection::Mappings> Upkeep<D, ()> {
+    /// The pass over `other` alone, without faculties' attached mappings:
+    /// for a host where another owner (an application's Driver) maintains
+    /// those, so each index has one maintainer.
+    pub fn alone(other: D, sink: Sink) -> Self {
+        Self {
+            registered: ((), other),
+            sink,
+        }
+    }
+}
+
+impl<D, A> Upkeep<D, A>
+where
+    D: triblespace::core::collection::Mappings,
+    A: triblespace::core::collection::Mappings,
+{
     /// The registration beside faculties' attached mappings.
     pub fn other(&self) -> &D {
         &self.registered.1
