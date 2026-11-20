@@ -55,6 +55,9 @@ pub trait Launcher: Send + Sync {
     /// systemd's `ActiveState` for the unit. A collected unit that has ended
     /// reads `inactive`.
     fn state(&self, unit: &str) -> Result<String>;
+    /// How many units whose names start with `prefix` are `active` now,
+    /// whoever started them: the room the ignite effector leaves.
+    fn active(&self, prefix: &str) -> Result<usize>;
 }
 
 /// Whether an `ActiveState` means the unit has not finished yet. A unit in
@@ -143,6 +146,24 @@ impl Launcher for SystemdLauncher {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
+    fn active(&self, prefix: &str) -> Result<usize> {
+        let output = Command::new("systemctl")
+            .args(["--user", "list-units", &format!("{prefix}*")])
+            .args(["--state=active", "--no-legend", "--plain"])
+            .output()
+            .context("run systemctl")?;
+        if !output.status.success() {
+            bail!(
+                "systemctl could not list {prefix}* units: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count())
     }
 }
 
@@ -1145,6 +1166,36 @@ pub enum KeepStep {
 pub struct KeepPass {
     pub host: HostKey,
     pub steps: Vec<(Id, KeepStep)>,
+}
+
+/// What the ignite effector ([`Spawn::ignite`]) resolves on its own host,
+/// never from a concluded request.
+#[derive(Clone, Debug)]
+pub struct Ignition {
+    /// The persona tag whose goals ignite, and the spawner of every run.
+    pub owner: String,
+    /// The ignited list: one goal id per line. A goal is appended before its
+    /// launch, so it is never started twice, even when the launch fails.
+    pub ignited: PathBuf,
+    /// Most `spawn-*` units active at once, whoever started them.
+    pub max_running: usize,
+    pub effort: String,
+    /// The spawner's instructions appended to every rendered goal brief.
+    pub extra: Option<String>,
+}
+
+/// What the effector decided about one concluded run request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IgniteDecision {
+    /// The concluded request.
+    pub request: Id,
+    pub goal: Id,
+    /// The spawn request written for it, when it was launched.
+    pub spawn_request: Option<Id>,
+    /// What keep did with that spawn request.
+    pub step: Option<KeepStep>,
+    /// What happened, or why nothing did.
+    pub reason: String,
 }
 
 /// The least time between two inbox reads by one run's post hook.
@@ -2539,6 +2590,13 @@ impl Spawn {
     /// spawn record travels in the same commit, so the request never names
     /// a zooid its readers lack.
     pub fn request(&self, input: &RequestInput) -> Result<Requested> {
+        self.request_from(input, None)
+    }
+
+    /// [`Self::request`], and for a new brief rendered from a Compass goal,
+    /// the goal and revision it was rendered from, annotating the spawn the
+    /// way `spawn goal` does.
+    fn request_from(&self, input: &RequestInput, goal: Option<(Id, &[Id])>) -> Result<Requested> {
         if !super::EFFORTS.contains(&input.effort.as_str()) {
             bail!(
                 "effort {:?} is not one of {}",
@@ -2561,7 +2619,10 @@ impl Spawn {
                 (Fragment::empty(), view.id, view.name)
             }
             ZooidRef::Brief(brief) => {
-                let (fragment, id, _, name) = super::spawn_fragment(brief)?;
+                let (mut fragment, id, _, name) = super::spawn_fragment(brief)?;
+                if let Some((goal, revision)) = goal {
+                    fragment += super::goal_fragment(id, goal, revision);
+                }
                 (fragment, id, name)
             }
         };
@@ -2641,6 +2702,155 @@ impl Spawn {
             }
             std::thread::sleep(poll);
         }
+    }
+
+    /// The ignite effector: act on run requests the rules concluded
+    /// (`candidates`, concluded request to goal). A conclusion is not
+    /// permission and may be stale, so under this host's keep lock it
+    /// rereads everything it was concluded from: the goal's status and tag
+    /// facts and the ignited list ([`crate::rules::ineligibility`]), the
+    /// weekly quota ([`crate::rules::quota_ok`]) and the room. Candidates go
+    /// in `ignite.sh`'s order: `#focus` first, then the board's priority
+    /// tier, then id. Each stale one is skipped with its reason; the first
+    /// that holds is launched, unless the quota or the room holds it, and
+    /// nothing after it is looked at. At most one launch per call.
+    ///
+    /// A launch appends the goal to the ignited list first, then writes an
+    /// ordinary spawn request for this host whose brief is rendered as
+    /// `spawn goal` renders it, then keeps that request in the same locked
+    /// pass. A failure after the append leaves the goal ignited and not
+    /// running; the decision says so, and it is never retried here.
+    pub fn ignite(
+        &self,
+        config: &KeepConfig,
+        ignition: &Ignition,
+        candidates: &std::collections::BTreeMap<Id, Id>,
+    ) -> Result<Vec<IgniteDecision>> {
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _turn = KeepLock::acquire(&config.lock)?;
+        let compass = Compass::with_storage(self.storage.clone());
+        let states: std::collections::BTreeMap<Id, crate::compass::GoalState> = compass
+            .goal_states()
+            .context("reread compass")?
+            .into_iter()
+            .map(|state| (state.goal, state))
+            .collect();
+        let ranks = compass.priority_ranks().context("reread priorities")?;
+        let ignited = crate::rules::read_ignited(&ignition.ignited)?;
+        let quota = crate::quota::operations::Quota::with_storage(self.storage.clone())
+            .show()
+            .context("reread quota")?;
+        let held = if crate::rules::quota_ok(&quota).is_none() {
+            Some(
+                "held: no fresh weekly Claude quota reading under or on pace, so capacity is unknown or spent"
+                    .to_owned(),
+            )
+        } else {
+            let running = self.launcher.active(super::UNIT_PREFIX)?;
+            (running >= ignition.max_running).then(|| {
+                format!(
+                    "held: {running} spawn unit(s) already running (limit {})",
+                    ignition.max_running
+                )
+            })
+        };
+        let mut ranked: Vec<(Id, Id)> = candidates.iter().map(|(r, g)| (*r, *g)).collect();
+        ranked.sort_by_key(|&(_, goal)| {
+            let focus = states
+                .get(&goal)
+                .is_some_and(|state| state.tags.iter().any(|tag| tag == "focus"));
+            (
+                !focus,
+                ranks.get(&goal).copied().unwrap_or(usize::MAX),
+                goal,
+            )
+        });
+        let mut decisions = Vec::new();
+        for (request, goal) in ranked {
+            let skip = |reason: String| IgniteDecision {
+                request,
+                goal,
+                spawn_request: None,
+                step: None,
+                reason,
+            };
+            let state = states.get(&goal);
+            if let Some(stale) = crate::rules::ineligibility(state, &ignition.owner, &ignited) {
+                decisions.push(skip(format!("skipped, stale: {stale}")));
+                continue;
+            }
+            if let Some(held) = &held {
+                decisions.push(skip(held.clone()));
+                break;
+            }
+            append_ignited(&ignition.ignited, goal)?;
+            decisions.push(match self.ignite_one(config, ignition, goal) {
+                Ok((spawn_request, step)) => IgniteDecision {
+                    request,
+                    goal,
+                    spawn_request: Some(spawn_request),
+                    reason: match &step {
+                        KeepStep::Launched { name, unit, .. } => {
+                            format!("launched {name} in {unit}")
+                        }
+                        KeepStep::Refused(why) => {
+                            format!("ignited, but keep refused its spawn request: {why}")
+                        }
+                        other => format!("ignited; keep left its spawn request {other:?}"),
+                    },
+                    step: Some(step),
+                },
+                Err(error) => skip(format!(
+                    "ignited, but the launch failed and is not retried: {error:#}"
+                )),
+            });
+            break;
+        }
+        Ok(decisions)
+    }
+
+    /// Render the goal's brief, write its spawn request for this host, and
+    /// keep it. The caller holds the keep lock.
+    fn ignite_one(
+        &self,
+        config: &KeepConfig,
+        ignition: &Ignition,
+        goal: Id,
+    ) -> Result<(Id, KeepStep)> {
+        let reading = Compass::with_storage(self.storage.clone())
+            .reading(&format!("{goal:x}"))
+            .with_context(|| format!("read goal {goal:x}"))?;
+        let rendered = super::goal_brief(&reading, ignition.extra.as_deref());
+        let requested = self.request_from(
+            &RequestInput {
+                zooid: ZooidRef::Brief(rendered.text),
+                host: None,
+                host_label: None,
+                provider: Provider::Claude,
+                effort: ignition.effort.clone(),
+                spawner: ignition.owner.clone(),
+                previous: None,
+                handoff: None,
+                cover_percent: None,
+            },
+            Some((reading.goal, &rendered.revision)),
+        )?;
+        let view = self
+            .requests(Some(requested.host))?
+            .into_iter()
+            .find(|view| view.id == requested.request)
+            .ok_or_else(|| {
+                anyhow!(
+                    "spawn request {:x} is not readable after writing it",
+                    requested.request
+                )
+            })?;
+        let step = self
+            .keep_one(config, &view)
+            .with_context(|| format!("keep spawn request {:x}", requested.request))?;
+        Ok((requested.request, step))
     }
 
     fn outcome(
@@ -3068,6 +3278,22 @@ impl Spawn {
             Ok(())
         })
     }
+}
+
+/// Append one goal to the ignited list and sync it, before its launch.
+fn append_ignited(path: &Path, goal: Id) -> Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    writeln!(file, "{goal:x}").with_context(|| format!("append to {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))
 }
 
 fn read_text<R: BlobStoreGet + ?Sized>(reader: &R, handle: TextHandle) -> Option<String> {
@@ -3813,6 +4039,8 @@ mod tests {
         /// The unit ends and systemd forgets it as soon as it starts, so its
         /// name can refuse nothing afterwards.
         collected_at_once: bool,
+        /// Units active besides the ones started here (`active`).
+        others_active: Mutex<usize>,
     }
 
     impl Launcher for FakeLauncher {
@@ -3833,6 +4061,14 @@ mod tests {
         }
         fn state(&self, _unit: &str) -> Result<String> {
             Ok(self.state.lock().unwrap().clone())
+        }
+        fn active(&self, _prefix: &str) -> Result<usize> {
+            let mine = if is_running(&self.state.lock().unwrap()) {
+                self.started.lock().unwrap().len()
+            } else {
+                0
+            };
+            Ok(mine + *self.others_active.lock().unwrap())
         }
     }
 
@@ -7046,5 +7282,264 @@ mod tests {
             })
             .unwrap();
         assert!(spawn.show(&launched.name).unwrap().runs[0].message.len() == 1);
+    }
+
+    // The ignite effector (`Spawn::ignite`): concluded run requests,
+    // revalidated under keep's lock.
+
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// A fresh weekly Claude reading with `used` percent at half the window.
+    /// Each reading is a second newer than the last, so the newest is one
+    /// reading: two at one instant are ambiguous, and the sensor says nothing.
+    fn ignite_quota(f: &Fixture, used: f64) {
+        static LATER: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        let later = LATER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = now_unix();
+        crate::quota::operations::Quota::with_storage(f.storage.clone())
+            .record(crate::quota::Observation {
+                provider: crate::schemas::quota::PROVIDER_CLAUDE,
+                account: "a".to_owned(),
+                window_secs: crate::rules::WEEK_SECS as u64,
+                used_percent: used,
+                resets_at: now + crate::rules::WEEK_SECS / 2,
+                observed_at: now - 600 + later,
+                host: "testhost".to_owned(),
+                bucket: None,
+            })
+            .unwrap();
+    }
+
+    fn ignite_goal(f: &Fixture, title: &str, tags: &[&str]) -> Id {
+        let tags: Vec<String> = tags.iter().map(|tag| tag.to_string()).collect();
+        Compass::with_storage(f.storage.clone())
+            .add(
+                title,
+                crate::compass::AddOptions {
+                    tags: &tags,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .goal
+    }
+
+    fn ignition(f: &Fixture) -> Ignition {
+        Ignition {
+            owner: "agent-cc".to_owned(),
+            ignited: f.directory.path().join("state/ignite/ignited"),
+            max_running: 2,
+            effort: "medium".to_owned(),
+            extra: Some("Spawner's own words.".to_owned()),
+        }
+    }
+
+    /// One concluded request per goal, as the ignite rule names them.
+    fn concluded(goals: &[Id]) -> std::collections::BTreeMap<Id, Id> {
+        goals.iter().map(|goal| (*genid(), *goal)).collect()
+    }
+
+    fn ignite(f: &Fixture, candidates: &std::collections::BTreeMap<Id, Id>) -> Vec<IgniteDecision> {
+        f.spawn
+            .ignite(&f.keep_config(), &ignition(f), candidates)
+            .unwrap()
+    }
+
+    fn ignited_list(f: &Fixture) -> std::collections::BTreeSet<Id> {
+        crate::rules::read_ignited(&ignition(f).ignited).unwrap()
+    }
+
+    #[test]
+    fn ignite_launches_a_fresh_request_once_and_a_second_pass_never_again() {
+        let f = fixture();
+        ignite_quota(&f, 10.0);
+        let goal = ignite_goal(&f, "Build the widget", &["agent-cc"]);
+        let candidates = concluded(&[goal]);
+        let first = ignite(&f, &candidates);
+        assert_eq!(first.len(), 1, "{first:?}");
+        let decision = &first[0];
+        assert!(decision.reason.starts_with("launched "), "{decision:?}");
+        assert!(matches!(decision.step, Some(KeepStep::Launched { .. })));
+        let spawn_request = decision.spawn_request.expect("a spawn request");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert_eq!(
+            f.launcher.started.lock().unwrap()[0].unit,
+            super::super::unit_for_request(spawn_request)
+        );
+        assert!(ignited_list(&f).contains(&goal));
+        // An ordinary spawn request keep understands, rendered as `spawn goal`
+        // renders it, with the goal on its spawn record.
+        let view = f.request_view(spawn_request);
+        assert_eq!(view.goal.as_ref().map(|(g, _)| *g), Some(goal));
+        assert_eq!(view.effort, ["medium"]);
+        assert_eq!(view.provider, ["claude"]);
+        let brief = view.brief_text.clone().unwrap();
+        assert!(brief.starts_with("# Goal: Build the widget\n"), "{brief}");
+        assert!(
+            brief.trim_end().ends_with("Spawner's own words."),
+            "{brief}"
+        );
+        assert_eq!(kinds(&view), ["accepted", "running"]);
+        // The same enduring request, the next pass: never relaunched.
+        let second = ignite(&f, &candidates);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].spawn_request, None);
+        assert!(second[0].reason.contains("ignited before"), "{second:?}");
+        // Even after its unit ended and was collected.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let third = ignite(&f, &candidates);
+        assert!(third[0].reason.contains("ignited before"), "{third:?}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+        assert_eq!(f.spawn.requests(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignite_skips_a_goal_that_moved_before_the_effector_ran_and_launches_the_next() {
+        let f = fixture();
+        ignite_quota(&f, 10.0);
+        let compass = Compass::with_storage(f.storage.clone());
+        let mut stale = Vec::new();
+        for status in ["doing", "done", "blocked"] {
+            let goal = ignite_goal(&f, &format!("Went {status}"), &["agent-cc", "focus"]);
+            compass
+                .move_goal(&format!("{goal:x}"), status, None)
+                .unwrap();
+            stale.push((goal, status));
+        }
+        let fresh = ignite_goal(&f, "Still ready", &["agent-cc"]);
+        let mut goals: Vec<Id> = stale.iter().map(|(goal, _)| *goal).collect();
+        goals.push(fresh);
+        let decisions = ignite(&f, &concluded(&goals));
+        assert_eq!(decisions.len(), 4, "{decisions:?}");
+        for (goal, status) in &stale {
+            let decision = decisions.iter().find(|d| d.goal == *goal).unwrap();
+            assert_eq!(decision.spawn_request, None);
+            assert!(
+                decision.reason.contains(&format!("is {status} now")),
+                "{decision:?}"
+            );
+            assert!(!ignited_list(&f).contains(goal));
+        }
+        let last = decisions.last().unwrap();
+        assert_eq!(
+            last.goal, fresh,
+            "focus ranks first, so the stale ones are read first"
+        );
+        assert!(last.reason.starts_with("launched "), "{last:?}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignite_launches_at_most_one_in_focus_then_priority_order() {
+        let f = fixture();
+        ignite_quota(&f, 10.0);
+        let plain = ignite_goal(&f, "Plain", &["agent-cc"]);
+        let lower = ignite_goal(&f, "Lower", &["agent-cc", "focus"]);
+        let higher = ignite_goal(&f, "Higher", &["agent-cc", "focus"]);
+        Compass::with_storage(f.storage.clone())
+            .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), None)
+            .unwrap();
+        let decisions = ignite(&f, &concluded(&[plain, lower, higher]));
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0].goal, higher);
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ignite_holds_while_the_room_is_full() {
+        let f = fixture();
+        ignite_quota(&f, 10.0);
+        *f.launcher.others_active.lock().unwrap() = 2;
+        let goal = ignite_goal(&f, "Waits for room", &["agent-cc"]);
+        let decisions = ignite(&f, &concluded(&[goal]));
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            decisions[0]
+                .reason
+                .contains("2 spawn unit(s) already running (limit 2)"),
+            "{decisions:?}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(
+            !ignited_list(&f).contains(&goal),
+            "a held goal stays ignitable"
+        );
+        assert!(f.spawn.requests(None).unwrap().is_empty());
+        // Room again: the same conclusion launches.
+        *f.launcher.others_active.lock().unwrap() = 1;
+        let decisions = ignite(&f, &concluded(&[goal]));
+        assert!(
+            decisions[0].reason.starts_with("launched "),
+            "{decisions:?}"
+        );
+    }
+
+    #[test]
+    fn ignite_needs_a_fresh_quota_reading_under_or_on_pace() {
+        let f = fixture();
+        let goal = ignite_goal(&f, "Needs quota", &["agent-cc"]);
+        let candidates = concluded(&[goal]);
+        let none = ignite(&f, &candidates);
+        assert!(none[0].reason.contains("quota"), "no reading: {none:?}");
+        ignite_quota(&f, 90.0);
+        let over = ignite(&f, &candidates);
+        assert!(over[0].reason.contains("quota"), "over pace: {over:?}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(!ignited_list(&f).contains(&goal));
+        ignite_quota(&f, 10.0);
+        let under = ignite(&f, &candidates);
+        assert!(
+            under[0].reason.starts_with("launched "),
+            "under pace: {under:?}"
+        );
+    }
+
+    #[test]
+    fn ignite_reads_tags_from_tag_facts_never_from_the_title() {
+        let f = fixture();
+        ignite_quota(&f, 10.0);
+        let titled = ignite_goal(&f, "Tidy the lane #agent-cc #focus", &[]);
+        let states = Compass::with_storage(f.storage.clone())
+            .goal_states()
+            .unwrap();
+        assert!(
+            crate::rules::eligible_goals(&states, "agent-cc", &Default::default()).is_empty(),
+            "the sensor concludes nothing for it"
+        );
+        // Even a request naming it, from anywhere, is not launched.
+        let decisions = ignite(&f, &concluded(&[titled]));
+        assert!(
+            decisions[0].reason.contains("not tagged #agent-cc"),
+            "{decisions:?}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_ignite_launch_stays_ignited_and_says_so() {
+        let f = fixture_with(FakeLauncher {
+            refuse: true,
+            ..Default::default()
+        });
+        ignite_quota(&f, 10.0);
+        let goal = ignite_goal(&f, "Will not start", &["agent-cc"]);
+        let candidates = concluded(&[goal]);
+        let decisions = ignite(&f, &candidates);
+        assert!(
+            decisions[0]
+                .reason
+                .starts_with("ignited, but keep refused its spawn request"),
+            "{decisions:?}"
+        );
+        assert!(decisions[0].reason.contains("fake systemd refuses"));
+        assert!(decisions[0].spawn_request.is_some());
+        assert!(ignited_list(&f).contains(&goal), "never started twice");
+        let again = ignite(&f, &candidates);
+        assert!(again[0].reason.contains("ignited before"), "{again:?}");
     }
 }

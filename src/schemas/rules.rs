@@ -13,7 +13,10 @@
 //! core, so evaluating the same facts again names the same request.
 //!
 //! A concluded request is a request, never permission: an effector revalidates
-//! under its own lock before acting. Nothing acts on these yet (shadow mode).
+//! under its own lock before acting. The ignite effector (`rules tick
+//! --effect`, through `Spawn::ignite`) records each decision as an effect
+//! entity beside the request: launched, with the spawn request it wrote, or
+//! skipped, with the reason.
 //!
 //! Every id below was minted with `trible genid` on 2026-11-17. Attributes use
 //! the explicit-anchor form, so each value encoding participates in identity;
@@ -48,6 +51,12 @@ pub const IGNITE_REVISION: Id = id_hex!("CD7AE21BC2F0E6D765466116C73DF819");
 /// The ask-jp rule's revision, as written in `src/rules/ask_jp.rules`.
 pub const ASK_JP_REVISION: Id = id_hex!("CDE937E729EEDD5B56BA737AECCC1039");
 
+/// Kind marker of one effector decision about one concluded request.
+///
+/// Minted with `trible genid` on 2026-11-20:
+/// `BB26DE3AF498FE2A477689A58C27C90C`.
+pub const KIND_EFFECT: Id = id_hex!("BB26DE3AF498FE2A477689A58C27C90C");
+
 pub mod rules {
     use super::*;
     attributes! {
@@ -72,5 +81,12 @@ pub mod rules {
         "8A5FAA5D6139AA07FF6274C8AD2D0AA7" as nudge_about: inlineencodings::GenId;
         /// Conclusion annotation: a tick whose observations supported the nudge.
         "4923B4217188AF87C62297E3EEC92EA1" as nudge_in: inlineencodings::GenId;
+        /// Effect core: the concluded request this decision is about (minted
+        /// 2026-11-20).
+        "CBCB8BC516EA38AB31FAA7A947451535" as effect_on: inlineencodings::GenId;
+        /// Effect annotation: what the effector did, or why it did nothing.
+        "BB912A75C195BC84EC5B80A55369C2AA" as effect_reason: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Effect annotation: the spawn request the effector wrote and kept.
+        "236E59B982AE1A38FC157AE60DB2073F" as effect_spawn_request: inlineencodings::GenId;
     }
 }

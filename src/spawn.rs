@@ -23,10 +23,11 @@ pub use colony::{
     ParentSource, ParentView,
 };
 pub use operations::{
-    choose_provider, inbox_failure, keep_lock_path, CoverWish, GoalRequest, InboxAnswer, InboxHook,
-    InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,
-    LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested, RunRequest, RunView,
-    SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidRef,
+    choose_provider, inbox_failure, keep_lock_path, CoverWish, GoalRequest, IgniteDecision,
+    Ignition, InboxAnswer, InboxHook, InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig,
+    Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested,
+    RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
+    ZooidRef,
 };
 
 use anyhow::{bail, Result};

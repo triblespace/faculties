@@ -1,6 +1,8 @@
 //! `rules tick`: run the sensors, settle the driver, and in shadow mode log the
 //! rules' conclusions beside what `ignite.sh --dry-run` and `ask-jp-due.sh`
-//! decide. Nothing here acts on a conclusion.
+//! decide. With `--effect`, the ignite effector acts on this tick's run
+//! requests ([`crate::spawn::Spawn::ignite`]) and each decision is recorded in
+//! the rules collection. Nudges are never acted on here.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -16,20 +18,21 @@ use triblespace::core::repo::StorageFlush;
 use triblespace::prelude::*;
 
 use super::{
-    ask_quiet_since, eligible_goals, nudges_in, open_asks, program, quota_ok, run_requests_in,
-    settle, tick_fragment, Sensed,
+    ask_quiet_since, effect_fragment, eligible_goals, nudges_in, open_asks, program, quota_ok,
+    read_ignited, run_requests_in, settle, tick_fragment, Sensed,
 };
 use crate::compass::Compass;
 use crate::out::Out;
 use crate::quota::operations::Quota;
 use crate::schemas::rules::{DEFAULT_SCOPE_ID as RULES_SCOPE_ID, ENVIRONMENT_ANCHOR};
+use crate::spawn::{keep_lock_path, Ignition, KeepConfig, LaunchConfig, Spawn};
 use crate::storage::Storage;
 
 #[derive(Parser)]
 #[command(
     version = crate::GIT_VERSION,
     name = "rules",
-    about = "The colony's rule environment: positive sensors, text rules, one driver (shadow mode)"
+    about = "The colony's rule environment: positive sensors, text rules, one driver, and the ignite effector (--effect)"
 )]
 pub struct Cli {
     /// Pile the sensors read Compass and Quota from.
@@ -70,17 +73,48 @@ enum Command {
         /// Append one JSON line per tick here.
         #[arg(long)]
         log: Option<PathBuf>,
+        /// Act on this tick's run requests: revalidate each under this host's
+        /// spawn keep lock and launch at most one, as ignite.sh would, and
+        /// record every decision in the rules collection.
+        #[arg(long)]
+        effect: bool,
+        /// The directory every effected run starts in (ignite.sh's WORK).
+        #[arg(long, env = "RULES_IGNITE_WORKDIR")]
+        workdir: Option<PathBuf>,
+        /// The spawner's instructions appended to every rendered goal brief
+        /// (ignite.sh's extra text). A `hold.txt` in --ignite-state is
+        /// appended after it while it exists.
+        #[arg(long, env = "RULES_IGNITE_EXTRA")]
+        extra: Option<PathBuf>,
+        /// Effort of every effected run.
+        #[arg(long, env = "RULES_IGNITE_EFFORT", default_value = "medium")]
+        effort: String,
+        /// Most spawn units active at once, whoever started them.
+        #[arg(long, env = "RULES_IGNITE_MAX_RUNNING", default_value_t = 2)]
+        max_running: usize,
     },
 }
 
 fn ignited(state: &Path) -> Result<BTreeSet<Id>> {
-    let path = state.join("ignited");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    Ok(text.split_whitespace().filter_map(Id::from_hex).collect())
+    read_ignited(&state.join("ignited"))
+}
+
+/// The extra text, then `hold.txt` from the state directory while it exists,
+/// as ignite.sh joins them.
+fn ignite_extra(extra: &Path, state: &Path) -> Result<String> {
+    let mut text =
+        std::fs::read_to_string(extra).with_context(|| format!("read {}", extra.display()))?;
+    let hold = state.join("hold.txt");
+    match std::fs::read_to_string(&hold) {
+        Ok(held) if !held.trim().is_empty() => {
+            text.push('\n');
+            text.push_str(&held);
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("read {}", hold.display())),
+    }
+    Ok(text)
 }
 
 fn last_asked(state: &Path) -> Result<Option<i64>> {
@@ -124,7 +158,14 @@ fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
         ignite_script,
         ask_script,
         log,
+        effect,
+        workdir,
+        extra,
+        effort,
+        max_running,
     } = cli.command;
+    let main_pile = cli.pile.clone();
+    let main_key = cli.key.clone();
 
     // Sense: one read of Compass and Quota, then the two local state files.
     let states = Compass::with_storage(Storage::new(cli.pile.clone(), cli.key.clone()))
@@ -196,6 +237,55 @@ fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             ))
         })?;
 
+    // The effector: this tick's run requests, revalidated under keep's lock.
+    let decisions = if effect {
+        let (Some(workdir), Some(extra)) = (workdir, extra) else {
+            bail!("--effect needs --workdir and --extra (or RULES_IGNITE_WORKDIR and RULES_IGNITE_EXTRA)");
+        };
+        let ignition = Ignition {
+            owner: owner.clone(),
+            ignited: ignite_state.join("ignited"),
+            max_running,
+            effort,
+            extra: Some(ignite_extra(&extra, &ignite_state)?),
+        };
+        let spawn = Spawn::new(
+            Storage::new(main_pile, main_key),
+            LaunchConfig::from_home_env()?,
+        );
+        let config = KeepConfig {
+            workdir,
+            lock: keep_lock_path()?,
+        };
+        let decisions = spawn.ignite(&config, &ignition, &requests)?;
+        if !decisions.is_empty() {
+            let at = crate::clock::point_now()?;
+            let mut fragment = Fragment::empty();
+            for decision in &decisions {
+                fragment += effect_fragment(
+                    decision.request,
+                    at,
+                    &decision.reason,
+                    decision.spawn_request,
+                );
+            }
+            rules_storage.with_store(|store, signer, runtime| {
+                let root = rules_storage.open_collection_write(
+                    store,
+                    RULES_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                store.commit(root, signer, fragment.clone())?;
+                store.flush()?;
+                Ok(())
+            })?;
+        }
+        Some(decisions)
+    } else {
+        None
+    };
+
     let requested: BTreeSet<Id> = requests.values().copied().collect();
     let mut record = serde_json::json!({
         "at": chrono_now(now_unix),
@@ -215,6 +305,20 @@ fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             "outcome": settled.outcome, "settled": settled.settled, "seeded": seeded,
         },
     });
+    if let Some(decisions) = &decisions {
+        record["effect"] = decisions
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "request": format!("{:x}", d.request),
+                    "goal": format!("{:x}", d.goal),
+                    "spawn_request": d.spawn_request.map(|id| format!("{id:x}")),
+                    "reason": d.reason,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
     if let Some(((pick, line), ask_due)) = scripts {
         let ignite_verdict = match &pick {
             Some(goal) if requested.iter().any(|g| format!("{g:x}") == *goal) => "match",

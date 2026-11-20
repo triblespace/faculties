@@ -11,11 +11,17 @@
 //! - **Rules** ([`program`]) are text in `src/rules/*.rules`, positive only,
 //!   and conclude requests whose identity derives from the conclusion alone.
 //! - **The driver** is triblespace's `CollectionDriver`, stepped by [`settle`].
-//! - **Effectors** (spawn keep, the nudge) are not wired. A conclusion is a
-//!   request, never permission; an effector revalidates under its own lock.
+//! - **Effectors** act on conclusions. A conclusion is a request, never
+//!   permission; an effector revalidates under its own lock. The ignite
+//!   effector is `Spawn::ignite`, run by `rules tick --effect`: under spawn
+//!   keep's lock it rereads the goal with [`ineligibility`], the quota with
+//!   [`quota_ok`] and the room, then writes an ordinary spawn request and
+//!   keeps it. Each decision is an [`effect_fragment`]. The nudge has no
+//!   effector yet.
 //!
 //! The first two rules replace `ignite.sh` and the ask-jp habit's condition.
-//! They run in shadow mode: conclusions are published and nothing acts on them.
+//! Without `--effect` they run in shadow mode: conclusions are published and
+//! nothing acts on them.
 //!
 //! The driver runs whatever the pile's current reading selects. The text in
 //! `src/rules/*.rules` is a seed, published by `rules tick` only when no
@@ -46,7 +52,7 @@ use crate::quota::operations::QuotaView;
 use crate::quota::{self, Pace};
 use crate::schemas::quota::PROVIDER_CLAUDE;
 use crate::schemas::rules::{
-    rules, ASK_JP_REVISION, ENVIRONMENT_ANCHOR, IGNITE_REVISION, KIND_TICK,
+    rules, ASK_JP_REVISION, ENVIRONMENT_ANCHOR, IGNITE_REVISION, KIND_EFFECT, KIND_TICK,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -89,19 +95,55 @@ pub struct Sensed {
 pub fn eligible_goals(states: &[GoalState], owner: &str, ignited: &BTreeSet<Id>) -> Vec<Id> {
     let mut goals: Vec<Id> = states
         .iter()
-        .filter(|state| state.status.as_deref() == Some("todo"))
-        .filter(|state| state.tags.iter().any(|tag| tag == owner))
-        .filter(|state| {
-            !state
-                .tags
-                .iter()
-                .any(|tag| IGNITE_SKIP.contains(&tag.as_str()))
-        })
-        .filter(|state| !ignited.contains(&state.goal))
+        .filter(|state| ineligibility(Some(state), owner, ignited).is_none())
         .map(|state| state.goal)
         .collect();
     goals.sort();
     goals
+}
+
+/// Why a goal is not eligible for ignition, or `None` when it is. The one
+/// predicate behind both the sensor ([`eligible_goals`]) and the effector's
+/// revalidation. Tags are the goal's tag facts only: words in a title that
+/// look like tags are not tags.
+pub fn ineligibility(
+    state: Option<&GoalState>,
+    owner: &str,
+    ignited: &BTreeSet<Id>,
+) -> Option<String> {
+    let Some(state) = state else {
+        return Some("the goal is not on the board".to_owned());
+    };
+    match state.status.as_deref() {
+        Some("todo") => {}
+        Some(status) => return Some(format!("the goal is {status} now, not todo")),
+        None => return Some("the goal has no status".to_owned()),
+    }
+    if !state.tags.iter().any(|tag| tag == owner) {
+        return Some(format!("the goal is not tagged #{owner}"));
+    }
+    if let Some(tag) = state
+        .tags
+        .iter()
+        .find(|tag| IGNITE_SKIP.contains(&tag.as_str()))
+    {
+        return Some(format!("the goal is tagged #{tag}"));
+    }
+    if ignited.contains(&state.goal) {
+        return Some("the goal was ignited before".to_owned());
+    }
+    None
+}
+
+/// The ignited list: one goal id per line, as `ignite.sh` writes it.
+/// A missing file is an empty list; a line that is not an id is ignored.
+pub fn read_ignited(path: &std::path::Path) -> Result<BTreeSet<Id>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    Ok(text.split_whitespace().filter_map(Id::from_hex).collect())
 }
 
 /// Open `#ask-jp` goals: tagged, with a current status that is not done.
@@ -160,6 +202,26 @@ pub fn tick_fragment(at: IntervalValue, sensed: &Sensed) -> Result<Fragment> {
         rules::ask_open*: sensed.ask_open.iter().copied(),
         rules::ask_quiet_since?: quiet,
     })
+}
+
+/// One effector decision about one concluded request: when, what it did or
+/// why it did nothing, and the spawn request it wrote when it launched.
+pub fn effect_fragment(
+    request: Id,
+    at: IntervalValue,
+    reason: &str,
+    spawn_request: Option<Id>,
+) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let reason = fragment.put::<blobencodings::UTF8String, _>(reason.to_owned());
+    fragment += entity! { _ @
+        metadata::tag: &KIND_EFFECT,
+        rules::effect_on: request,
+        metadata::created_at: at,
+        rules::effect_reason: reason,
+        rules::effect_spawn_request?: spawn_request,
+    };
+    fragment
 }
 
 /// Both rule revisions, parsed from their text with the attribute aliases
@@ -344,6 +406,36 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn an_effect_names_its_request_its_reason_and_its_spawn_request() {
+        let (request, spawn) = (*genid(), *genid());
+        let at = quota::unix_point(5).unwrap();
+        let launched = effect_fragment(request, at, "launched x", Some(spawn));
+        let found: Vec<(Id, Id)> = find!(
+            (effect: Id, spawn_request: Id),
+            pattern!(launched.facts(), [{ ?effect @
+                metadata::tag: &KIND_EFFECT,
+                rules::effect_on: &request,
+                rules::effect_spawn_request: ?spawn_request,
+            }])
+        )
+        .collect();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1, spawn);
+        let skipped = effect_fragment(request, at, "skipped, stale", None);
+        assert_ne!(
+            skipped.root(),
+            launched.root(),
+            "another decision, another effect"
+        );
+        assert!(find!(
+            s: Id,
+            pattern!(skipped.facts(), [{ _?e @ rules::effect_spawn_request: ?s }])
+        )
+        .next()
+        .is_none());
     }
 
     #[test]

@@ -350,6 +350,18 @@ impl Compass {
         })
     }
 
+    /// Every goal's priority tier from the board's own priority relation
+    /// (lower is more important), as `compass priorities` layers it, read
+    /// from one frozen view at the time of the call.
+    pub fn priority_ranks(&self) -> Result<BTreeMap<Id, usize>> {
+        self.storage()
+            .with_view(|space, _reader, _status_register| {
+                let goals = all_goal_ids(space);
+                let edges = compass::goal_priority_edges(space);
+                Ok(compass::priority_ranks(goals.iter().copied(), &edges))
+            })
+    }
+
     pub fn show(&self, id: &str) -> Result<String> {
         show(self.storage(), id.to_owned())
     }

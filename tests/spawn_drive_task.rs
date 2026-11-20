@@ -368,6 +368,9 @@ impl Launcher for FakeLauncher {
     fn state(&self, _unit: &str) -> Result<String> {
         Ok("active".to_owned())
     }
+    fn active(&self, _prefix: &str) -> Result<usize> {
+        Ok(self.started.lock().unwrap().len())
+    }
 }
 
 struct StubRenderer;
