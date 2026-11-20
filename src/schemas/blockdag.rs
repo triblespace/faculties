@@ -174,6 +174,8 @@ pub mod source_projection {
         /// IDENTITY of a producer-native receipt; annotation on an importer
         /// receipt, where it names the conversation (session, rollout or
         /// conversation id) on the leaves of one imported source unit.
+        /// Spawn also writes it on a run, as the conversation the provider
+        /// reported at settlement; that alone claims no import or receipt.
         "5F3F80B819EBFB04E2AF20852F9FE3E3" unsafe as pub source_locator: Handle<UTF8String>;
         /// IDENTITY of a producer-native receipt (Drive's own canonical
         /// receipt encoding). Never written by an importer.
