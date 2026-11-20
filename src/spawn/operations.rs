@@ -1448,11 +1448,12 @@ impl Spawn {
     /// share of the context window. Without one the wake is the plain cover
     /// and nothing is looked up. With one, the target is `percent` of `W`;
     /// beliefs and goals are measured by a wake with no memory budget and
-    /// always render whole; the memory part gets what they leave, never less
-    /// than [`cover::MIN_MEMORY_CHARS`]. If the whole prompt is then
+    /// always render whole; the memory part gets what they leave, and at
+    /// least [`cover::MIN_MEMORY_CHARS`]. If the whole prompt is then
     /// estimated above `W` less the headroom, the memory part is rendered
-    /// once more aimed at that line, and the second render replaces the
-    /// first. Every figure is an estimate and nothing is refused for one.
+    /// once more aimed at that line, possibly with no memory at all, and the
+    /// second render replaces the first. Every figure is an estimate, the
+    /// line is an aim and not an observed limit, and nothing is refused.
     fn size_cover(
         &self,
         provider: Provider,
@@ -2216,12 +2217,12 @@ impl Spawn {
             let report = match &request.report {
                 Some(path) => match std::fs::read(path) {
                     Ok(bytes) if bytes.is_empty() => None,
-                    Ok(bytes) => Some(self.read_report(
+                    Ok(bytes) => self.read_report(
                         &bytes,
                         agent.as_deref(),
                         agent_model.as_deref(),
                         &mut reported,
-                    )),
+                    ),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => {
                         return Err(error).with_context(|| format!("read {}", path.display()))
@@ -2431,26 +2432,32 @@ impl Spawn {
     /// the session transcript) go into `reported`. Bytes that are not a
     /// result object (a crash, partial output, a run started before the
     /// JSON format) are recorded as they are, as is a result with no text.
+    /// An empty `result` is no report, as empty text output always was; the
+    /// window and first-call tokens are still kept.
     fn read_report(
         &self,
         bytes: &[u8],
         agent: Option<&str>,
         model: Option<&str>,
         reported: &mut Reported,
-    ) -> String {
+    ) -> Option<String> {
         let raw = || String::from_utf8_lossy(bytes).into_owned();
         if agent != Some(Provider::Claude.name()) {
-            return raw();
+            return Some(raw());
         }
         let Some(result) = cover::claude_result(bytes, model) else {
-            return raw();
+            return Some(raw());
         };
         reported.context_window = result.context_window;
         reported.first_call_input_tokens = result
             .session_id
             .as_deref()
             .and_then(|session| self.claude_first_call(session));
-        result.report.unwrap_or_else(raw)
+        match result.report {
+            Some(text) if text.is_empty() => None,
+            Some(text) => Some(text),
+            None => Some(raw()),
+        }
     }
 
     /// The first model call's input tokens in claude's transcript of a
@@ -2465,8 +2472,13 @@ impl Spawn {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().join(format!("{session}.jsonl")))
             .find(|path| path.is_file())
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| cover::claude_first_call(&text))
+            .and_then(|path| std::fs::File::open(path).ok())
+            .and_then(|file| {
+                use std::io::BufRead as _;
+                cover::claude_first_call(
+                    std::io::BufReader::new(file).lines().map_while(Result::ok),
+                )
+            })
     }
 
     /// Every spawn, by name.
@@ -5673,6 +5685,21 @@ mod tests {
             "{}",
             cover.window_source
         );
+    }
+
+    #[test]
+    fn an_empty_claude_result_is_no_report_but_keeps_its_window() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Empty claude result.")).unwrap();
+        std::fs::write(
+            &launched.report,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"","modelUsage":{"claude-opus-5-5":{"inputTokens":2,"contextWindow":1000000}}}"#,
+        )
+        .unwrap();
+        f.settle(&launched.name, &launched).unwrap();
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert_eq!(run.report_text, None);
+        assert_eq!(run.context_window, [1_000_000]);
     }
 
     #[test]

@@ -18,12 +18,13 @@ use std::path::Path;
 /// spent on one tinted render.
 pub const PLAIN_MEMORY_CHARS: usize = 240_000;
 
-/// The smallest memory budget a `--cover` launch gives, however little of
-/// its target the beliefs and goals leave. 40k characters is the size of the
-/// former task tail: a coarse recollection of the whole life, about 15k
-/// tokens at the measured claude ratio. A zooid always wakes with one; going
-/// over the target for it is normal, not a failure. A starting value, not
-/// settled policy.
+/// The smallest memory budget the target split gives, however little of
+/// the target the beliefs and goals leave: 40k characters, the size of the
+/// former task tail, a coarse recollection of the whole life, about 15k
+/// tokens at the claude ratio. Going over the target for it is normal, not
+/// a failure. It is not a floor on the cover: when the whole prompt is
+/// estimated above the headroom line, the re-render may give memory less,
+/// down to nothing. A starting value, not settled policy.
 pub const MIN_MEMORY_CHARS: usize = 40_000;
 
 /// The fraction of `W` the launch leaves for the work: when the whole
@@ -40,9 +41,11 @@ pub const MISTRAL_CONTEXT_TOKENS: u64 = 1_048_576;
 /// a cover sized with it errs small.
 pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.0;
 
-/// claude's harness overhead (system prompt, tool schemas): the largest
-/// first-call `cache_read_input_tokens` over 138 spawn runs of
+/// An estimate of claude's fixed overhead (system prompt, tool schemas):
+/// the largest first-call `cache_read_input_tokens` over 138 spawn runs of
 /// claude-opus-5-5 on CLI 2.1.312, 16 to 20 Nov 2026 (11,266 to 13,059).
+/// Those counts bound what the first call read from cache; they do not say
+/// what it was, so taking them for the harness alone is an assumption.
 pub const CLAUDE_OVERHEAD_TOKENS: u64 = 13_100;
 
 /// Harness overhead assumed for a provider with no measurement.
@@ -81,10 +84,13 @@ pub fn calibration(provider: &str, model: Option<&str>) -> Calibration {
 }
 
 /// The harness overhead in tokens the estimate adds for a provider, and
-/// whether it was measured.
+/// what that figure rests on.
 pub fn overhead(provider: &str) -> (u64, &'static str) {
     match provider {
-        "claude" => (CLAUDE_OVERHEAD_TOKENS, "measured"),
+        "claude" => (
+            CLAUDE_OVERHEAD_TOKENS,
+            "estimated from first-call cache reads",
+        ),
         _ => (DEFAULT_OVERHEAD_TOKENS, "assumed, not measured"),
     }
 }
@@ -165,8 +171,9 @@ pub fn target_chars(percent: f64, window: u64, chars_per_token: f64) -> usize {
     (percent / 100.0 * window as f64 * chars_per_token).round() as usize
 }
 
-/// The memory budget for a target: what beliefs and goals leave of it, and
-/// never less than [`MIN_MEMORY_CHARS`].
+/// The memory budget a target splits off: what beliefs and goals leave of
+/// it, and at least [`MIN_MEMORY_CHARS`]. The estimate check after
+/// rendering may still lower it.
 pub fn memory_budget(target_chars: usize, fixed_chars: usize) -> usize {
     target_chars
         .saturating_sub(fixed_chars)
@@ -203,18 +210,15 @@ pub struct ClaudeResult {
 /// claude's result object, or `None` when the bytes are not one (a crash,
 /// partial output, or a run started before the switch to JSON): the caller
 /// then records the bytes as they are. The window is the entry for `model`
-/// in `modelUsage`, or the only entry.
+/// in `modelUsage`; with no entry under that exact key it stays unknown.
 pub fn claude_result(bytes: &[u8], model: Option<&str>) -> Option<ClaudeResult> {
     let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     if value["type"] != "result" {
         return None;
     }
-    let usage = value["modelUsage"].as_object();
-    let entry = usage.and_then(|usage| {
-        model
-            .and_then(|model| usage.get(model))
-            .or_else(|| (usage.len() == 1).then(|| usage.values().next()).flatten())
-    });
+    // Only the run's own model's entry: a window filed under another key
+    // would later size a launch of a model it does not belong to.
+    let entry = model.and_then(|model| value["modelUsage"].get(model));
     Some(ClaudeResult {
         report: value["result"].as_str().map(str::to_owned),
         context_window: entry
@@ -225,10 +229,11 @@ pub fn claude_result(bytes: &[u8], model: Option<&str>) -> Option<ClaudeResult> 
 }
 
 /// The input tokens of the first model call in a claude session
-/// transcript: uncached, cache-written and cache-read together.
-pub fn claude_first_call(transcript: &str) -> Option<u64> {
-    transcript.lines().find_map(|line| {
-        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+/// transcript: uncached, cache-written and cache-read together. Reads lines
+/// only up to that call, so a long transcript is never held whole.
+pub fn claude_first_call<L: AsRef<str>>(lines: impl IntoIterator<Item = L>) -> Option<u64> {
+    lines.into_iter().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line.as_ref()).ok()?;
         if value["type"] != "assistant" {
             return None;
         }
@@ -251,7 +256,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_budget_is_what_beliefs_and_goals_leave_and_never_below_the_minimum() {
+    fn the_split_gives_memory_what_beliefs_and_goals_leave_and_at_least_the_minimum() {
         // 20% of a 1M window at the claude ratio.
         let target = target_chars(20.0, 1_000_000, 2.423);
         assert_eq!(target, 484_600);
@@ -324,6 +329,12 @@ mod tests {
             result.session_id.as_deref(),
             Some("e0bf4238-7a93-4604-be3f-a4ddb456d86b")
         );
+        // A window under another model's key, even the only one, is not
+        // this run's: it stays unknown, the report still reads.
+        let other = claude_result(json, Some("claude-sonnet-5-5")).unwrap();
+        assert_eq!(other.context_window, None);
+        assert_eq!(other.report.as_deref(), Some("the answer\n"));
+        assert_eq!(claude_result(json, None).unwrap().context_window, None);
         // Text, partial output, and other JSON are not a result.
         assert!(claude_result(b"plain words", None).is_none());
         assert!(claude_result(br#"{"type":"result","resu"#, None).is_none());
@@ -340,7 +351,7 @@ mod tests {
             r#"{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":203334}}}"#,
             "\n"
         );
-        assert_eq!(claude_first_call(transcript), Some(203_334));
-        assert_eq!(claude_first_call(""), None);
+        assert_eq!(claude_first_call(transcript.lines()), Some(203_334));
+        assert_eq!(claude_first_call("".lines()), None);
     }
 }
