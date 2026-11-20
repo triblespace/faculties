@@ -2787,7 +2787,7 @@ impl Spawn {
             }
             append_ignited(&ignition.ignited, goal)?;
             decisions.push(match self.ignite_one(config, ignition, goal) {
-                Ok((spawn_request, step)) => IgniteDecision {
+                Ok((spawn_request, Ok(step))) => IgniteDecision {
                     request,
                     goal,
                     spawn_request: Some(spawn_request),
@@ -2802,8 +2802,22 @@ impl Spawn {
                     },
                     step: Some(step),
                 },
+                // Written, kept, and neither launched nor withdrawn: keep had
+                // accepted it (its unit may be running, and no keeper starts
+                // an accepted request again), or rereading or withdrawing it
+                // failed. The error says which.
+                Ok((spawn_request, Err(error))) => IgniteDecision {
+                    request,
+                    goal,
+                    spawn_request: Some(spawn_request),
+                    step: None,
+                    reason: format!(
+                        "ignited and spawn request {spawn_request:x} written, but keeping it failed: \
+                         {error:#}"
+                    ),
+                },
                 Err(error) => skip(format!(
-                    "ignited, but the launch failed and is not retried: {error:#}"
+                    "ignited, but its spawn request could not be written; not retried: {error:#}"
                 )),
             });
             break;
@@ -2812,13 +2826,18 @@ impl Spawn {
     }
 
     /// Render the goal's brief, write its spawn request for this host, and
-    /// keep it. The caller holds the keep lock.
+    /// keep it. The caller holds the keep lock. The outer error means no
+    /// request was written. Once one is, it is launched now or withdrawn:
+    /// a request keep did not accept (it waited, or failed before
+    /// accepting) is refused, so no later keeper launches it without the
+    /// goal's checks. The inner error is left only for a request keep had
+    /// accepted, which no keeper starts again.
     fn ignite_one(
         &self,
         config: &KeepConfig,
         ignition: &Ignition,
         goal: Id,
-    ) -> Result<(Id, KeepStep)> {
+    ) -> Result<(Id, Result<KeepStep>)> {
         let reading = Compass::with_storage(self.storage.clone())
             .reading(&format!("{goal:x}"))
             .with_context(|| format!("read goal {goal:x}"))?;
@@ -2837,20 +2856,41 @@ impl Spawn {
             },
             Some((reading.goal, &rendered.revision)),
         )?;
-        let view = self
-            .requests(Some(requested.host))?
-            .into_iter()
-            .find(|view| view.id == requested.request)
-            .ok_or_else(|| {
-                anyhow!(
-                    "spawn request {:x} is not readable after writing it",
-                    requested.request
-                )
-            })?;
-        let step = self
-            .keep_one(config, &view)
-            .with_context(|| format!("keep spawn request {:x}", requested.request))?;
-        Ok((requested.request, step))
+        let request = requested.request;
+        let read = || -> Result<RequestView> {
+            self.requests(Some(requested.host))?
+                .into_iter()
+                .find(|view| view.id == request)
+                .ok_or_else(|| {
+                    anyhow!("spawn request {request:x} is not readable after writing it")
+                })
+        };
+        let withdraw = |view: &RequestView, why: &str| {
+            self.refuse(
+                view,
+                format!(
+                    "withdrawn by the effector, so no later keeper launches it without the goal's \
+                     checks: {why}"
+                ),
+            )
+        };
+        let kept = read().and_then(|view| {
+            match self
+                .keep_one(config, &view)
+                .with_context(|| format!("keep spawn request {request:x}"))
+            {
+                Ok(KeepStep::Waiting(why)) => withdraw(&view, &why),
+                Ok(step) => Ok(step),
+                Err(error) => match read() {
+                    Ok(now) if !now.has(OUTCOME_ACCEPTED) => withdraw(&now, &format!("{error:#}"))
+                        .map_err(|withdrawing| {
+                            error.context(format!("and withdrawing it failed: {withdrawing:#}"))
+                        }),
+                    _ => Err(error),
+                },
+            }
+        });
+        Ok((request, kept))
     }
 
     fn outcome(
@@ -4041,6 +4081,8 @@ mod tests {
         collected_at_once: bool,
         /// Units active besides the ones started here (`active`).
         others_active: Mutex<usize>,
+        /// Fail every state query, as an unreachable systemd would.
+        state_fails: bool,
     }
 
     impl Launcher for FakeLauncher {
@@ -4060,6 +4102,9 @@ mod tests {
             Ok(())
         }
         fn state(&self, _unit: &str) -> Result<String> {
+            if self.state_fails {
+                bail!("fake systemd does not answer");
+            }
             Ok(self.state.lock().unwrap().clone())
         }
         fn active(&self, _prefix: &str) -> Result<usize> {
@@ -7541,5 +7586,34 @@ mod tests {
         assert!(ignited_list(&f).contains(&goal), "never started twice");
         let again = ignite(&f, &candidates);
         assert!(again[0].reason.contains("ignited before"), "{again:?}");
+    }
+
+    /// keep failing before it accepts leaves no pending request behind: the
+    /// effector withdraws it, so a later ordinary keeper cannot launch it
+    /// without the goal's checks.
+    #[test]
+    fn a_request_keep_never_accepted_is_withdrawn_not_left_pending() {
+        let f = fixture_with(FakeLauncher {
+            state_fails: true,
+            ..Default::default()
+        });
+        ignite_quota(&f, 10.0);
+        let goal = ignite_goal(&f, "No systemd", &["agent-cc"]);
+        let decisions = ignite(&f, &concluded(&[goal]));
+        let spawn_request = decisions[0].spawn_request.expect("a request was written");
+        assert!(
+            decisions[0].reason.contains("withdrawn by the effector"),
+            "{decisions:?}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        let view = f
+            .spawn
+            .requests(None)
+            .unwrap()
+            .into_iter()
+            .find(|view| view.id == spawn_request)
+            .unwrap();
+        assert!(view.has(OUTCOME_REFUSED) && !view.has(OUTCOME_ACCEPTED));
+        assert!(ignited_list(&f).contains(&goal), "never started twice");
     }
 }
