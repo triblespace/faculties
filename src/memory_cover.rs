@@ -353,6 +353,27 @@ where
     }
 }
 
+/// [`about_relevance_scores`]'s semantic half, asked ahead of a render
+/// (spawn scores its tint before Orient's wake renders the cover): `None`
+/// without asking when no exact span holds more than one recollection,
+/// since `--about` can then choose nothing and the render would never bind
+/// a model for it either.
+pub fn about_scores_if_choice<P: TriblePattern>(
+    space: &P,
+    query: &str,
+    semantic: &mut Semantic<'_>,
+) -> Result<Option<HashMap<Id, f32>>> {
+    let raw_spans = collect_chunk_spans(space);
+    if !recollection_classes(&raw_spans)
+        .1
+        .iter()
+        .any(|class| class.len() > 1)
+    {
+        return Ok(None);
+    }
+    semantic(query)
+}
+
 /// Per-chunk positive-similarity scores for `--filter`/`--remove` ELIGIBILITY,
 /// using the SAME scoring as `--about`. With semantic scores, a chunk the index
 /// has no row for falls back to its exact lexical score if it has text; a
@@ -1540,6 +1561,18 @@ mod recollection_tests {
         render(&distinct, &options(Some("amber"), None), &mut |_| {
             panic!("--about without equal spans asked")
         });
+        // Scoring ahead of the render (spawn's tint) keeps the same guard.
+        let ahead = about_scores_if_choice(distinct.facts(), "amber", &mut |_| {
+            panic!("scoring ahead without equal spans asked")
+        });
+        assert!(ahead.unwrap().is_none());
+        let mut asked_ahead = 0;
+        about_scores_if_choice(facts.facts(), "amber", &mut |_| {
+            asked_ahead += 1;
+            Ok(None)
+        })
+        .unwrap();
+        assert_eq!(asked_ahead, 1);
 
         // Lexically "amber" is the lamps; by meaning it is the reading.
         let mut asked = Vec::new();

@@ -329,13 +329,17 @@ impl Memory {
     }
     /// Every recollection's score by meaning against `query`, as
     /// `memory context --about` scores it, or `None` when no semantic index
-    /// answers and exact BM25 stands in. A caller that renders the cover
-    /// elsewhere (spawn, through Orient's wake) scores its tint here first.
+    /// answers (exact BM25 then stands in) or no exact span offers a choice
+    /// (nothing is scored, and no model is bound). A caller that renders the
+    /// cover elsewhere (spawn, through Orient's wake) scores its tint here.
     pub fn about_scores(&self, query: &str) -> Result<Option<std::collections::HashMap<Id, f32>>> {
         #[cfg(feature = "wemm")]
         return self.with_operation(|storage| {
             let loaded = storage.load()?;
-            semantic_scores(storage, &loaded, &mut None, query)
+            let mut session = None;
+            crate::memory_cover::about_scores_if_choice(&loaded.memory.facts, query, &mut |query| {
+                semantic_scores(storage, &loaded, &mut session, query)
+            })
         });
         #[cfg(not(feature = "wemm"))]
         {
