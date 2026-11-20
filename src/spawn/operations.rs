@@ -2189,12 +2189,10 @@ impl Spawn {
                     find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }]))
                         .next()
                         .and_then(|handle| read_text(reader, handle)),
-                    find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::started_at: ?at }]))
-                        .next(),
                 ),
             ))
             })?;
-        let (agent, agent_model, run_started) = agent;
+        let (agent, agent_model) = agent;
         let mut failures = Vec::new();
         // A hosted run's report or a local run's closing message. Either is
         // optional: no file, or an empty one, records none, and how the run
@@ -2231,11 +2229,6 @@ impl Spawn {
                 },
                 None => None,
             };
-            if agent.as_deref() == Some(Provider::Codex.name()) {
-                let (first, window) = self.codex_reported(&request.name, run_started);
-                reported.first_call_input_tokens = first;
-                reported.context_window = window;
-            }
             let usage = match &request.usage {
                 Some(path) => match std::fs::read_to_string(path)
                     .with_context(|| format!("read {}", path.display()))
@@ -2474,55 +2467,6 @@ impl Spawn {
             .find(|path| path.is_file())
             .and_then(|path| std::fs::read_to_string(path).ok())
             .and_then(|text| cover::claude_first_call(&text))
-    }
-
-    /// What a codex run's rollout reported: the first call's input tokens
-    /// and the context window. The zooid's codex home keeps every run's
-    /// sessions, so only the newest rollout written since this run started
-    /// is read.
-    fn codex_reported(
-        &self,
-        name: &str,
-        started: Option<IntervalValue>,
-    ) -> (Option<u64>, Option<u64>) {
-        let since = started
-            .and_then(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
-            .map(|(from, _)| from);
-        let mut rollouts = Vec::new();
-        let mut dirs = vec![self.launch.file(name, "codex").join("sessions")];
-        while let Some(dir) = dirs.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.filter_map(|entry| entry.ok()) {
-                let path = entry.path();
-                let Ok(meta) = entry.metadata() else { continue };
-                if meta.is_dir() {
-                    dirs.push(path);
-                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                    if let Ok(modified) = meta.modified() {
-                        rollouts.push((modified, path));
-                    }
-                }
-            }
-        }
-        let newest = rollouts
-            .into_iter()
-            .filter(|(modified, _)| {
-                let modified = modified
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|age| Epoch::from_unix_seconds(age.as_secs_f64()));
-                match (since, modified) {
-                    (Some(since), Ok(modified)) => modified >= since,
-                    (Some(_), Err(_)) => false,
-                    (None, _) => true,
-                }
-            })
-            .max_by(|a, b| a.0.cmp(&b.0));
-        newest
-            .and_then(|(_, path)| std::fs::read_to_string(path).ok())
-            .map(|text| cover::codex_rollout(&text))
-            .unwrap_or((None, None))
     }
 
     /// Every spawn, by name.
@@ -6045,35 +5989,6 @@ mod tests {
         let fixed = renderer.wake(&f.storage, None, 0).unwrap();
         assert!(fixed.contains("Beliefs (cover):"), "{fixed}");
         assert!(!fixed.contains(amber) && !fixed.contains(walk), "{fixed}");
-    }
-
-    #[test]
-    fn a_codex_runs_rollout_records_its_first_call_and_window() {
-        let f = fixture();
-        let mut request = f.request("Codex settled.");
-        request.provider = Provider::Codex;
-        let launched = f.spawn.run(&request).unwrap();
-        let sessions = launched
-            .report
-            .with_extension("codex")
-            .join("sessions/2026/11/20");
-        std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::write(
-            sessions.join("rollout-x.jsonl"),
-            concat!(
-                r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
-                "\n",
-                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":27750,"cached_input_tokens":11392}}}}"#,
-                "\n"
-            ),
-        )
-        .unwrap();
-        std::fs::write(&launched.report, "codex's last message\n").unwrap();
-        f.settle(&launched.name, &launched).unwrap();
-        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
-        assert_eq!(run.report_text.as_deref(), Some("codex's last message\n"));
-        assert_eq!(run.context_window, [258_400]);
-        assert_eq!(run.first_call_input_tokens, [27_750]);
     }
 
     #[test]

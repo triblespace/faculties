@@ -246,31 +246,6 @@ pub fn claude_first_call(transcript: &str) -> Option<u64> {
     })
 }
 
-/// The first model call's input tokens and the context window in a codex
-/// rollout: its first `token_count` event's `last_token_usage.input_tokens`
-/// (cached tokens are part of it) and `model_context_window`.
-pub fn codex_rollout(rollout: &str) -> (Option<u64>, Option<u64>) {
-    let mut window = None;
-    for line in rollout.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let payload = &value["payload"];
-        if window.is_none() {
-            window = payload["model_context_window"]
-                .as_u64()
-                .or_else(|| payload["info"]["model_context_window"].as_u64());
-        }
-        if payload["type"] == "token_count" {
-            if let Some(first) = payload["info"]["last_token_usage"]["input_tokens"].as_u64() {
-                let window = window.or_else(|| payload["info"]["model_context_window"].as_u64());
-                return (Some(first), window);
-            }
-        }
-    }
-    (None, window)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,19 +342,5 @@ mod tests {
         );
         assert_eq!(claude_first_call(transcript), Some(203_334));
         assert_eq!(claude_first_call(""), None);
-    }
-
-    #[test]
-    fn a_codex_rollout_gives_its_first_call_and_window() {
-        let rollout = concat!(
-            r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":27750,"cached_input_tokens":11392},"model_context_window":258400}}}"#,
-            "\n",
-            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":40000}}}}"#,
-            "\n"
-        );
-        assert_eq!(codex_rollout(rollout), (Some(27_750), Some(258_400)));
-        assert_eq!(codex_rollout(""), (None, None));
     }
 }

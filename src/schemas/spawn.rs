@@ -208,7 +208,7 @@ pub mod spawn {
         /// The cover sizing in words, as the launch printed it.
         "0C2D920B25D94AAC4BF00E9B9C967E8D" as cover_sizing: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The context window the provider itself reported for the run's
-        /// model, recorded at settlement (claude's result, codex's rollout).
+        /// model, recorded at settlement (claude's result).
         /// A later launch of the same provider and model may size against it.
         "4C6F000230728ED25E33E3DC15BE3C03" as context_window: inlineencodings::U256BE;
         /// The input tokens of the run's first model call as the provider
