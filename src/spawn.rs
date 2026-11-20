@@ -37,6 +37,7 @@ use triblespace::prelude::inlineencodings::{Handle, NsTAIInterval};
 use triblespace::prelude::*;
 
 use crate::schemas::archive::archive as archive_attrs;
+use crate::schemas::blockdag;
 use crate::schemas::imagine::imagine as imagine_attrs;
 use crate::schemas::spawn::{spawn as attrs, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN};
 
@@ -460,12 +461,14 @@ pub fn vibe_usage(export: &str) -> Result<Usage> {
 }
 
 /// What the provider itself reported about a run's context, read at
-/// settlement: the window for its model, and the input tokens of its first
-/// model call (overhead, prompt and cover in one total).
+/// settlement: the window for its model, the input tokens of its first
+/// model call (overhead, prompt and cover in one total), and the
+/// conversation it recorded, as the archive's `session/<id>` locator.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Reported {
     pub context_window: Option<u64>,
     pub first_call_input_tokens: Option<u64>,
+    pub source_locator: Option<String>,
 }
 
 /// The end of a run, annotating the run itself. `report` is a hosted run's
@@ -506,9 +509,16 @@ pub fn settlement_fragment(
         };
     }
     if reported != &Reported::default() {
+        // The archive's own attribute, so a run and the receipts of the
+        // conversation it recorded share one locator.
+        let locator = reported
+            .source_locator
+            .as_ref()
+            .map(|text| fragment.put::<UTF8String, _>(text.clone()));
         fragment += entity! { ExclusiveId::force_ref(&run) @
             attrs::context_window?: reported.context_window,
             attrs::first_call_input_tokens?: reported.first_call_input_tokens,
+            blockdag::source_projection::source_locator?: locator,
         };
     }
     (fragment, report)

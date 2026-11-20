@@ -968,6 +968,9 @@ pub struct RunView {
     pub context_window: Vec<u64>,
     /// The first model call's input tokens as the provider reported them.
     pub first_call_input_tokens: Vec<u64>,
+    /// The conversation the provider recorded, as the archive locates it
+    /// (`session/<id>`); `archive thread` reads it once imported.
+    pub source_locator: Vec<String>,
 }
 
 impl RunView {
@@ -2504,6 +2507,12 @@ impl Spawn {
             .session_id
             .as_deref()
             .and_then(|session| self.claude_first_call(session));
+        // The archive names an imported Claude Code session `session/<id>`.
+        reported.source_locator = result
+            .session_id
+            .as_deref()
+            .filter(|session| !session.is_empty() && !session.contains(['/', '.']))
+            .map(|session| format!("session/{session}"));
         match result.report {
             Some(text) if text.is_empty() => None,
             Some(text) => Some(text),
@@ -3589,6 +3598,15 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             )
             .collect(),
         ),
+        source_locator: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{
+                    run @ crate::schemas::blockdag::source_projection::source_locator: ?handle
+                }])
+            )
+            .collect(),
+        ),
     }
 }
 
@@ -4024,6 +4042,9 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
                 join(&run.first_call_input_tokens)
             )
             .unwrap();
+        }
+        if !run.source_locator.is_empty() {
+            writeln!(out, "  conversation: {}", run.source_locator.join(", ")).unwrap();
         }
         if !run.input_tokens.is_empty() || !run.output_tokens.is_empty() {
             writeln!(
@@ -5984,6 +6005,7 @@ mod tests {
         assert_eq!(run.report_text.as_deref(), Some("the report\n"));
         assert_eq!(run.context_window, [1_000_000]);
         assert_eq!(run.first_call_input_tokens, [203_334]);
+        assert_eq!(run.source_locator, [format!("session/{session}")]);
         let later = f
             .spawn
             .run(&covered(&f, "Second claude run.", 20.0, None))
