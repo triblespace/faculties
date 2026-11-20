@@ -45,6 +45,8 @@ pub struct WakeOptions {
     pub chars: usize,
     pub doing_limit: usize,
     pub todo_limit: usize,
+    /// Tints the memory cover. `None` is the untinted wake.
+    pub tint: Option<WakeTint>,
 }
 impl Default for WakeOptions {
     fn default() -> Self {
@@ -52,8 +54,19 @@ impl Default for WakeOptions {
             chars: 800_000,
             doing_limit: 5,
             todo_limit: 5,
+            tint: None,
         }
     }
+}
+/// A topic for the memory cover: among recollections of exactly the same
+/// span, the one closest to it is chosen (`memory context --about`); the
+/// cover's shape does not change. `scores` are the recollections' scores by
+/// meaning, computed beforehand (`Memory::about_scores`), so the wake itself
+/// never binds a model; `None` scores the topic by exact BM25.
+#[derive(Clone, Debug)]
+pub struct WakeTint {
+    pub about: String,
+    pub scores: Option<HashMap<Id, f32>>,
 }
 /// `orient wake --pairs`: the plain wake's selection, with the memory cover
 /// priced for a consumer that adds `chunk_overhead` characters per recall.
@@ -216,6 +229,7 @@ impl Orient {
                 signer,
                 persona,
                 options.chars,
+                options.tint.as_ref(),
                 options.doing_limit,
                 options.todo_limit,
                 record_presented,
@@ -6081,6 +6095,7 @@ async fn wake_selection(
     signer: &SigningKey,
     persona: Option<&str>,
     cover_opts: &CoverOpts,
+    about_scores: Option<&HashMap<Id, f32>>,
     doing_limit: usize,
     todo_limit: usize,
 ) -> Result<WakeSelection> {
@@ -6134,9 +6149,12 @@ async fn wake_selection(
     .await?;
     // Prepare each independent section separately. A missing Wiki or
     // Compass attachment must not repeat memory-cover planning/diagnostics.
-    // Plain wake never scores by meaning; these facts stay shard-backed.
+    // The wake never scores by meaning itself; a tint brings its scores, and
+    // these facts stay shard-backed.
     let cover = read(storage, &observation.snapshot, |reader| {
-        render_cover_report(&memory_facts, reader, cover_opts, &mut |_| Ok(None))
+        render_cover_report(&memory_facts, reader, cover_opts, &mut |_| {
+            Ok(about_scores.cloned())
+        })
     })
     .await?;
     // Beliefs and goals render what can be read: a payload no provider
@@ -6188,6 +6206,7 @@ async fn cmd_wake(
     signer: &SigningKey,
     persona: Option<&str>,
     chars: usize,
+    tint: Option<&WakeTint>,
     doing_limit: usize,
     todo_limit: usize,
     record_presented: bool,
@@ -6195,12 +6214,15 @@ async fn cmd_wake(
 ) -> Result<()> {
     use std::fmt::Write as _;
 
+    let mut cover = CoverOpts::plain(chars);
+    cover.about = tint.map(|tint| tint.about.clone());
     let selection = wake_selection(
         routing,
         storage,
         signer,
         persona,
-        &CoverOpts::plain(chars),
+        &cover,
+        tint.and_then(|tint| tint.scores.as_ref()),
         doing_limit,
         todo_limit,
     )
@@ -6368,6 +6390,7 @@ async fn cmd_wake_pairs(
         signer,
         None,
         &cover_opts,
+        None,
         options.doing_limit,
         options.todo_limit,
     )
@@ -6874,6 +6897,7 @@ mod tests {
                 &fixture.signer,
                 None,
                 0,
+                None,
                 5,
                 5,
                 true,
@@ -7629,6 +7653,7 @@ mod tests {
                 &fixture.signer,
                 Some("wake-reader"),
                 0,
+                None,
                 5,
                 5,
                 true,

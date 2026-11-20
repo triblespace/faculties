@@ -473,6 +473,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 chars,
                 doing_limit,
                 todo_limit,
+                tint: None,
             },
             out,
         ),

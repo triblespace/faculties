@@ -327,6 +327,22 @@ impl Memory {
             )
         })
     }
+    /// Every recollection's score by meaning against `query`, as
+    /// `memory context --about` scores it, or `None` when no semantic index
+    /// answers and exact BM25 stands in. A caller that renders the cover
+    /// elsewhere (spawn, through Orient's wake) scores its tint here first.
+    pub fn about_scores(&self, query: &str) -> Result<Option<std::collections::HashMap<Id, f32>>> {
+        #[cfg(feature = "wemm")]
+        return self.with_operation(|storage| {
+            let loaded = storage.load()?;
+            semantic_scores(storage, &loaded, &mut None, query)
+        });
+        #[cfg(not(feature = "wemm"))]
+        {
+            let _ = query;
+            Ok(None)
+        }
+    }
     pub fn consolidate_start(&self, persona: &str, edge: Epoch) -> Result<()> {
         self.set_cursor(CONSOLIDATE_STREAM, persona, Some(edge), None)
     }

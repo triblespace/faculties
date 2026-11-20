@@ -2,7 +2,7 @@
 //!
 //! One input fixes the whole zooid: the brief. Its blob handle names the
 //! spawn (the first 32 bits of the handle as two proquints), it
-//! tints the memory tail the zooid wakes into, and it is the prompt. An
+//! tints the memory cover the zooid wakes into, and it is the prompt. An
 //! identical brief relaunches the same zooid; a changed brief is a new one.
 //! `spawn goal` renders the brief from a Compass goal's current revision, so
 //! a new note on the goal makes a new zooid.
@@ -47,7 +47,7 @@ pub type HostKey = Inline<inlineencodings::ED25519PublicKey>;
 pub const UNIT_PREFIX: &str = "spawn-";
 /// Effort levels `claude --effort` accepts.
 pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-/// Bytes of topic text that tint the memory tail. WeMM embeds a query of at
+/// Bytes of topic text that tint the memory cover. WeMM embeds a query of at
 /// most 256 token ids, framing and its terminal embedding token included, and
 /// refuses a longer one rather than truncating it. Its tokenizer is byte-level
 /// BPE, so no byte sequence costs more than one id per byte: 240 bytes fit
@@ -487,25 +487,19 @@ pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
          also an address: {spawner} or another zooid may message you while you work. On a \
          longer task, check between steps with `orient_poll` (persona {name}, peek true), answer \
          with `message_send` from {name}, and `message_ack` what you have handled. The wake \
-         above is the shared self; the recollection after it was chosen for this brief.\n"
+         above is the shared self, its memories recalled with this brief in mind.\n"
     )
 }
 
-/// The opening context in its fixed order: wake, memory tail, preamble,
-/// brief, and a request's handoff last, once, when there is one.
-pub fn assemble_prompt(
-    wake: &str,
-    tail: &str,
-    preamble: &str,
-    brief: &str,
-    handoff: Option<&str>,
-) -> String {
+/// The opening context in its fixed order: wake (one cover, tinted by the
+/// brief), preamble, brief, and a request's handoff last, once, when there
+/// is one.
+pub fn assemble_prompt(wake: &str, preamble: &str, brief: &str, handoff: Option<&str>) -> String {
     let mut prompt = String::with_capacity(
-        wake.len() + tail.len() + preamble.len() + brief.len() + handoff.map_or(0, str::len),
+        wake.len() + preamble.len() + brief.len() + handoff.map_or(0, str::len),
     );
     let sections = [
         ("Wake", Some(wake)),
-        ("Recollection for this task", Some(tail)),
         ("Who you are", Some(preamble)),
         ("Brief", Some(brief)),
         ("Handoff", handoff),
@@ -524,7 +518,7 @@ pub fn assemble_prompt(
 }
 
 /// The longest prefix of a topic that fits [`ABOUT_BYTES`], ending on a
-/// character boundary: the memory tail's query.
+/// character boundary: the memory cover's tint query.
 pub fn about(topic: &str) -> &str {
     let topic = topic.trim_start();
     if topic.len() <= ABOUT_BYTES {
@@ -573,7 +567,7 @@ pub struct GoalBrief {
     pub text: String,
     /// The status event and notes it was rendered from.
     pub revision: Vec<Id>,
-    /// The memory tail's topic: the title and its purpose.
+    /// The memory cover's tint topic: the title and its purpose.
     pub about: String,
 }
 
@@ -971,15 +965,15 @@ mod tests {
     }
 
     #[test]
-    fn prompt_order_is_wake_tail_preamble_brief() {
-        let prompt = assemble_prompt("WAKE", "TAIL", "PREAMBLE", "BRIEF", None);
+    fn prompt_order_is_wake_preamble_brief() {
+        let prompt = assemble_prompt("WAKE", "PREAMBLE", "BRIEF", None);
         let at = |needle: &str| prompt.find(needle).unwrap();
-        assert!(at("WAKE") < at("TAIL"));
-        assert!(at("TAIL") < at("PREAMBLE"));
+        assert!(at("WAKE") < at("PREAMBLE"));
+        assert!(!prompt.contains("# Recollection for this task"));
         assert!(at("PREAMBLE") < at("BRIEF"));
         assert!(prompt.ends_with("BRIEF\n\n"));
         assert!(!prompt.contains("# Handoff"));
-        let prompt = assemble_prompt("WAKE", "TAIL", "PREAMBLE", "BRIEF", Some("HANDOFF"));
+        let prompt = assemble_prompt("WAKE", "PREAMBLE", "BRIEF", Some("HANDOFF"));
         assert!(prompt.find("BRIEF").unwrap() < prompt.find("# Handoff").unwrap());
         assert_eq!(prompt.matches("HANDOFF").count(), 1);
         assert!(prompt.ends_with("HANDOFF\n\n"));

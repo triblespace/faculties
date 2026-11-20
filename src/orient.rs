@@ -23,7 +23,7 @@ mod operations;
 mod process_tests;
 pub use operations::{
     BaselineReceipt, NewsForm, Next, NextKind, NextCompletion, Orient, PendingNext, PreparedReport, ShowOptions, WaitOptions,
-    WakeOptions, WakePairsOptions,
+    WakeOptions, WakePairsOptions, WakeTint,
 };
 
 /// Receipt facts for a key-private source collection. Event identity is stable

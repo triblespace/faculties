@@ -33,7 +33,7 @@ use triblespace::prelude::*;
 
 use super::{Exit, HostKey, IntervalValue, RequestFacts, RunFacts, ScriptFacts, TextHandle};
 use crate::compass::{Compass, NoteOptions};
-use crate::memory_cover::CoverOpts;
+use crate::orient::WakeTint;
 use crate::out::{Out, Part};
 use crate::relations::{ProfileInput, Relations};
 use crate::schemas::archive::archive as archive_attrs;
@@ -143,33 +143,44 @@ impl Launcher for SystemdLauncher {
     }
 }
 
-/// Renders the two pile-derived parts of the opening context.
+/// Renders the pile-derived part of the opening context.
 pub trait Renderer: Send + Sync {
-    /// The shared self: beliefs, a memory cover and goals.
-    fn wake(&self, storage: &Storage) -> Result<String>;
-    /// Recollection chosen for a topic, or the untinted tail without one.
-    fn tail(&self, storage: &Storage, about: Option<&str>) -> Result<String>;
+    /// Scores the memory cover's recollections against a topic. Its own
+    /// step, so a launch can tell a tint that failed from a wake that did.
+    fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint>;
+    /// The shared self: a memory cover, beliefs and goals. With a tint, the
+    /// memory cover is tinted by its topic (one cover, rendered once; JP
+    /// 2026-11-20: "the tinted cover is a different cover").
+    fn wake(&self, storage: &Storage, tint: Option<&WakeTint>) -> Result<String>;
 }
 
-/// The wake and tail through the Orient and Memory libraries, on the
-/// caller's storage, so one pile open serves the whole launch.
+/// The tint through the Memory library and the wake through Orient's, on
+/// the caller's storage.
 #[derive(Clone, Copy, Debug)]
 pub struct LibraryRenderer {
+    /// Memory characters of the one cover.
     pub wake_chars: usize,
-    pub tail_chars: usize,
 }
 
 impl Default for LibraryRenderer {
     fn default() -> Self {
         Self {
-            wake_chars: 200_000,
-            tail_chars: 40_000,
+            // The former 200k wake plus 40k tail, now spent on one render.
+            wake_chars: 240_000,
         }
     }
 }
 
 impl Renderer for LibraryRenderer {
-    fn wake(&self, storage: &Storage) -> Result<String> {
+    fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint> {
+        let memory = crate::memory::Memory::with_storage(storage.clone());
+        Ok(WakeTint {
+            about: about.to_owned(),
+            scores: memory.about_scores(about)?,
+        })
+    }
+
+    fn wake(&self, storage: &Storage, tint: Option<&WakeTint>) -> Result<String> {
         let orient = crate::orient::Orient::with_storage(storage.clone());
         let mut text = String::new();
         let mut collect = |part: Part| {
@@ -184,18 +195,12 @@ impl Renderer for LibraryRenderer {
             None,
             &crate::orient::WakeOptions {
                 chars: self.wake_chars,
+                tint: tint.cloned(),
                 ..Default::default()
             },
             &mut Out::new(&mut collect),
         )?;
         Ok(text)
-    }
-
-    fn tail(&self, storage: &Storage, about: Option<&str>) -> Result<String> {
-        let memory = crate::memory::Memory::with_storage(storage.clone());
-        let mut options = CoverOpts::plain(self.tail_chars);
-        options.about = about.map(str::to_owned);
-        Ok(memory.context(&options)?.text)
     }
 }
 
@@ -1664,26 +1669,20 @@ impl Spawn {
 
         let mut started = false;
         let launched = (|| -> Result<Launched> {
-            let wake = self.renderer.wake(&self.storage)?;
             let about = Some(brief.about.as_str()).filter(|about| !about.trim().is_empty());
             // The tint chooses among equal recollections; it is never worth
-            // a launch. Without it the zooid wakes into the untinted tail.
-            let (tail, untinted) = match self.renderer.tail(&self.storage, about) {
-                Ok(tail) => (tail, None),
-                Err(error) if about.is_some() => (
-                    self.renderer.tail(&self.storage, None)?,
-                    Some(format!("{error:#}")),
-                ),
-                Err(error) => return Err(error),
+            // a launch. A tint that fails wakes the zooid into the untinted
+            // cover and says so; a wake that fails fails the launch.
+            let (tint, untinted) = match about.map(|about| self.renderer.tint(&self.storage, about))
+            {
+                None => (None, None),
+                Some(Ok(tint)) => (Some(tint), None),
+                Some(Err(error)) => (None, Some(format!("{error:#}"))),
             };
+            let wake = self.renderer.wake(&self.storage, tint.as_ref())?;
             let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
-            let prompt = super::assemble_prompt(
-                &wake,
-                &tail,
-                &preamble,
-                &brief.text,
-                extras.handoff.as_deref(),
-            );
+            let prompt =
+                super::assemble_prompt(&wake, &preamble, &brief.text, extras.handoff.as_deref());
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -3416,20 +3415,30 @@ mod tests {
 
     #[derive(Default)]
     struct StubRenderer {
-        /// Refuse a tinted tail the way WeMM refuses an over-long query.
+        /// Refuse a tint the way WeMM refuses an over-long query.
         refuse_tint: bool,
+        /// Fail every wake, as an unreadable pile would.
+        refuse_wake: bool,
     }
 
     impl Renderer for StubRenderer {
-        fn wake(&self, _storage: &Storage) -> Result<String> {
-            Ok("STUB-WAKE".to_owned())
-        }
-        fn tail(&self, _storage: &Storage, about: Option<&str>) -> Result<String> {
-            match about {
-                Some(_) if self.refuse_tint => bail!("WeMM text preparation: too long"),
-                Some(about) => Ok(format!("STUB-TAIL about {about}")),
-                None => Ok("STUB-TAIL untinted".to_owned()),
+        fn tint(&self, _storage: &Storage, about: &str) -> Result<WakeTint> {
+            if self.refuse_tint {
+                bail!("WeMM text preparation: too long");
             }
+            Ok(WakeTint {
+                about: about.to_owned(),
+                scores: None,
+            })
+        }
+        fn wake(&self, _storage: &Storage, tint: Option<&WakeTint>) -> Result<String> {
+            if self.refuse_wake {
+                bail!("read selected Memory collection: unreadable");
+            }
+            Ok(match tint {
+                Some(tint) => format!("STUB-WAKE about {}", tint.about),
+                None => "STUB-WAKE untinted".to_owned(),
+            })
         }
     }
 
@@ -4707,8 +4716,12 @@ mod tests {
         .unwrap();
         let brief_at = prompt.rfind(brief).unwrap();
         let handoff_at = prompt.find(handoff).unwrap();
-        assert!(prompt.find("STUB-WAKE").unwrap() < prompt.find("STUB-TAIL").unwrap());
-        assert!(prompt.find("STUB-TAIL").unwrap() < brief_at);
+        assert_eq!(
+            prompt.matches("STUB-WAKE").count(),
+            1,
+            "one cover, rendered once"
+        );
+        assert!(prompt.find("STUB-WAKE").unwrap() < brief_at);
         assert!(brief_at < prompt.find("# Handoff").unwrap());
         assert!(prompt.find("# Handoff").unwrap() < handoff_at);
         assert_eq!(prompt.matches(handoff).count(), 1);
@@ -4915,10 +4928,15 @@ mod tests {
         let script_dir = &f.launcher.started.lock().unwrap()[0].script;
         let prompt = std::fs::read_to_string(script_dir.with_extension("prompt")).unwrap();
         let at = |needle: &str| prompt.find(needle).unwrap();
-        // The stub tail quotes the brief, so the brief itself is its last occurrence.
+        // The stub wake quotes the brief, so the brief itself is its last occurrence.
         let brief_at = prompt.rfind(brief).unwrap();
-        assert!(at("STUB-WAKE") < at("STUB-TAIL about Brief body"));
-        assert!(at("STUB-TAIL") < at(&format!("You are {}", launched.name)));
+        assert!(at("STUB-WAKE about Brief body") < at(&format!("You are {}", launched.name)));
+        assert_eq!(
+            prompt.matches("STUB-WAKE").count(),
+            1,
+            "no second memory pass"
+        );
+        assert!(!prompt.contains("# Recollection for this task"));
         assert!(at("spawned by agent-cc") < brief_at);
         assert!(prompt.trim_end().ends_with(brief));
         assert!(prompt.contains("Do not arm a colony watcher"));
@@ -5154,10 +5172,57 @@ mod tests {
     }
 
     #[test]
-    fn a_tint_that_fails_falls_back_to_the_untinted_tail_and_says_so() {
+    fn a_wake_that_fails_fails_the_launch_even_with_a_tint() {
         let f = fixture_full(
             FakeLauncher::default(),
-            StubRenderer { refuse_tint: true },
+            StubRenderer {
+                refuse_wake: true,
+                ..Default::default()
+            },
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        let refusal = f.spawn.run(&f.request("Wake refused.")).unwrap_err();
+        assert!(format!("{refusal:#}").contains("unreadable"), "{refusal:#}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    /// The real renderer: the tint reaches the cover's own exact-span
+    /// choice, so of two memories over the same span the one about the topic
+    /// is the one the wake recalls.
+    #[test]
+    fn a_tint_chooses_between_memories_of_the_same_span() {
+        let f = fixture_with(FakeLauncher::default());
+        let memory = crate::memory::Memory::with_storage(f.storage.clone());
+        let span = (
+            hifitime::Epoch::from_gregorian_utc_hms(2026, 1, 1, 18, 0, 0),
+            hifitime::Epoch::from_gregorian_utc_hms(2026, 1, 1, 20, 0, 0),
+        );
+        let amber = "Under the amber lamp JP played the piano.";
+        let walk = "A long walk along the Weser in the rain.";
+        memory.create(amber, Some(span), &[]).unwrap();
+        memory.create(walk, Some(span), &[]).unwrap();
+        let renderer = LibraryRenderer::default();
+        let wake = |about: &str| {
+            let tint = WakeTint {
+                about: about.to_owned(),
+                scores: None,
+            };
+            renderer.wake(&f.storage, Some(&tint)).unwrap()
+        };
+        let tinted = wake("amber lamp piano");
+        assert!(tinted.contains(amber) && !tinted.contains(walk), "{tinted}");
+        let tinted = wake("walk Weser rain");
+        assert!(tinted.contains(walk) && !tinted.contains(amber), "{tinted}");
+    }
+
+    #[test]
+    fn a_tint_that_fails_falls_back_to_the_untinted_cover_and_says_so() {
+        let f = fixture_full(
+            FakeLauncher::default(),
+            StubRenderer {
+                refuse_tint: true,
+                ..Default::default()
+            },
             "export TRIBLESPACE_PEERS=none\n",
         );
         let launched = f.spawn.run(&f.request("Tint refused.")).unwrap();
@@ -5169,7 +5234,8 @@ mod tests {
                 .with_extension("prompt"),
         )
         .unwrap();
-        assert!(prompt.contains("STUB-TAIL untinted"));
+        assert!(prompt.contains("STUB-WAKE untinted"));
+        assert_eq!(prompt.matches("STUB-WAKE").count(), 1);
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.untinted, [why]);
     }
@@ -6111,7 +6177,7 @@ mod tests {
                 .with_extension("prompt"),
         )
         .unwrap();
-        assert!(prompt.contains("STUB-TAIL about Build the widget. Serves: The larger aim"));
+        assert!(prompt.contains("STUB-WAKE about Build the widget. Serves: The larger aim"));
 
         // The zooid noted its launch on the goal, as itself.
         let note = launched.goal_note.expect("a launch note");
