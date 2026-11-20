@@ -2842,7 +2842,8 @@ impl Spawn {
                     step: None,
                     reason: format!(
                         "ignited; spawn request {spawn_request:x} was written already accepted (or \
-                         its commit failed), so no keeper starts it later, but launching it failed: \
+                         its commit failed), so no keeper starts it later, but a step after writing \
+                         it failed, and its unit may be running if that step came after the launch: \
                          {error:#}"
                     ),
                 },
