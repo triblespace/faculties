@@ -16,6 +16,14 @@
 //! or trust a caller-supplied tenant/path. Even loopback needs authentication:
 //! some jail deployments share the parent's network stack. TLS and public
 //! OAuth discovery belong to the existing hosting edge.
+//!
+//! The one exception is [`Config::app_loopback`], used only by a machine-local
+//! desktop owner. It carries no credential: any local process able to connect
+//! to its loopback port, including other users' processes, may use it. It
+//! refuses browser-shaped requests instead: any Origin header (including
+//! `null`), any Host or absolute-form authority other than this listener's
+//! own address or `localhost` at its actual port, and every non-JSON POST.
+//! It installs no CORS and answers no preflight. Bearer endpoints are unchanged.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -85,9 +93,17 @@ impl BearerToken {
     }
 }
 
+/// How a request is admitted before any MCP processing.
+#[derive(Clone)]
+enum Access {
+    Bearer(BearerToken),
+    /// See [`Config::app_loopback`]. Never a default.
+    AppLoopback,
+}
+
 pub struct Config {
     pub bind: SocketAddr,
-    pub token: BearerToken,
+    access: Access,
     /// Exact serialized origins, e.g. https://mcp.example.com (no final slash).
     /// Absent Origin is allowed for server-to-server clients. Every present
     /// Origin must be allowed; no CORS or wildcard access is installed.
@@ -104,9 +120,21 @@ pub struct Config {
 
 impl Config {
     pub fn new(bind: SocketAddr, token: BearerToken) -> Self {
+        Self::with_access(bind, Access::Bearer(token))
+    }
+
+    /// Erlkonig's machine-local owner, with no credential (see the module
+    /// documentation). `bind` must be a loopback IP; `allowed_origins` must
+    /// stay empty, because this mode refuses every Origin. Binding fails
+    /// otherwise, including after either field is changed.
+    pub fn app_loopback(bind: SocketAddr) -> Self {
+        Self::with_access(bind, Access::AppLoopback)
+    }
+
+    fn with_access(bind: SocketAddr, access: Access) -> Self {
         Self {
             bind,
-            token,
+            access,
             allowed_origins: Vec::new(),
             limits: Limits::default(),
             max_connections: 64,
@@ -127,6 +155,11 @@ impl Config {
             || self.body_timeout.is_zero()
         {
             bail!("MCP HTTP connection/session/admission limits and timeouts must be positive and supported");
+        }
+        if matches!(self.access, Access::AppLoopback)
+            && (!self.bind.ip().is_loopback() || !self.allowed_origins.is_empty())
+        {
+            bail!("app loopback MCP HTTP requires a loopback IP bind and no allowed origins");
         }
         Server::with_limits(&[], self.limits)?;
         for origin in &self.allowed_origins {
@@ -310,8 +343,21 @@ impl Endpoint {
             .build()
             .context("create MCP HTTP I/O runtime")?;
         let (tx, mut rx) = mpsc::channel(self.config.max_requests);
+        let access = match self.config.access {
+            Access::Bearer(token) => RequestAccess::Bearer(token),
+            Access::AppLoopback => {
+                // The actual bound address, so an OS-assigned port is exact.
+                let local = self
+                    .listener
+                    .local_addr()
+                    .context("read MCP HTTP listening address")?;
+                RequestAccess::AppLoopback {
+                    authorities: [local.to_string(), format!("localhost:{}", local.port())],
+                }
+            }
+        };
         let state = Arc::new(HttpState {
-            token: self.config.token,
+            access,
             origins: self.config.allowed_origins,
             body_timeout: self.config.body_timeout,
             response_bytes: self.config.limits.response_bytes,
@@ -356,8 +402,16 @@ impl Endpoint {
 }
 
 pub fn serve(faculties: &[&dyn Faculty], config: Config) -> Result<()> {
+    let bearer = matches!(config.access, Access::Bearer(_));
     let endpoint = Endpoint::bind(config)?;
-    eprintln!("faculties MCP HTTP: http://{}/ (authenticated internal hop; public TLS/OAuth belong to the hosting edge)", endpoint.local_addr()?);
+    if bearer {
+        eprintln!("faculties MCP HTTP: http://{}/ (authenticated internal hop; public TLS/OAuth belong to the hosting edge)", endpoint.local_addr()?);
+    } else {
+        eprintln!(
+            "faculties MCP HTTP: http://{}/ (machine-local app endpoint without a credential)",
+            endpoint.local_addr()?
+        );
+    }
     endpoint.serve(faculties)
 }
 
@@ -379,8 +433,16 @@ async fn shutdown_signal() {
     tokio::select! { _ = interrupt => {}, _ = terminate => {} }
 }
 
+enum RequestAccess {
+    Bearer(BearerToken),
+    /// The listener's own `ip:port` and `localhost:port`.
+    AppLoopback {
+        authorities: [String; 2],
+    },
+}
+
 struct HttpState {
-    token: BearerToken,
+    access: RequestAccess,
     origins: Vec<String>,
     body_timeout: Duration,
     response_bytes: usize,
@@ -411,28 +473,42 @@ async fn handle(State(state): State<Arc<HttpState>>, request: Request) -> Respon
 
 async fn handle_request(state: Arc<HttpState>, request: Request) -> Response {
     let headers = request.headers();
-    match single_header(headers, header::ORIGIN.as_str()) {
-        Ok(None) => {}
-        Ok(Some(origin)) if state.origins.iter().any(|allowed| allowed == origin) => {}
-        _ => return error(StatusCode::FORBIDDEN, "Origin is not allowed"),
-    }
-    let authorized = single_header(headers, header::AUTHORIZATION.as_str())
-        .ok()
-        .flatten()
-        .and_then(|value| value.split_once(' '))
-        .is_some_and(|(scheme, token)| {
-            scheme.eq_ignore_ascii_case("Bearer")
-                && state.token.accepts(token.trim_start_matches(' '))
-        });
-    if !authorized {
-        let mut response = error(
-            StatusCode::UNAUTHORIZED,
-            "MCP HTTP bearer authentication required",
-        );
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        return response;
+    match &state.access {
+        RequestAccess::Bearer(token) => {
+            match single_header(headers, header::ORIGIN.as_str()) {
+                Ok(None) => {}
+                Ok(Some(origin)) if state.origins.iter().any(|allowed| allowed == origin) => {}
+                _ => return error(StatusCode::FORBIDDEN, "Origin is not allowed"),
+            }
+            let authorized = single_header(headers, header::AUTHORIZATION.as_str())
+                .ok()
+                .flatten()
+                .and_then(|value| value.split_once(' '))
+                .is_some_and(|(scheme, value)| {
+                    scheme.eq_ignore_ascii_case("Bearer")
+                        && token.accepts(value.trim_start_matches(' '))
+                });
+            if !authorized {
+                let mut response = error(
+                    StatusCode::UNAUTHORIZED,
+                    "MCP HTTP bearer authentication required",
+                );
+                response
+                    .headers_mut()
+                    .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+                return response;
+            }
+        }
+        RequestAccess::AppLoopback { authorities } => {
+            if !local_authority(&request, authorities) {
+                return error(StatusCode::FORBIDDEN, "Host is not this local endpoint");
+            }
+            // Browsers attach Origin to every POST and DELETE; no local
+            // client of this endpoint sends one. A null or duplicate one too.
+            if headers.contains_key(header::ORIGIN) {
+                return error(StatusCode::FORBIDDEN, "Origin is not allowed");
+            }
+        }
     }
     match single_header(headers, VERSION_HEADER) {
         Ok(None) | Ok(Some(PROTOCOL_VERSION)) => {}
@@ -557,6 +633,25 @@ struct AdmittedBody {
 impl AsRef<[u8]> for AdmittedBody {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+/// Exactly one Host naming this listener, and an absolute-form target, if
+/// present, naming the same authority. Hostnames compare case-insensitively.
+fn local_authority(request: &Request, authorities: &[String; 2]) -> bool {
+    let expected = |value: &str| authorities.iter().any(|a| a.eq_ignore_ascii_case(value));
+    let Ok(Some(host)) = single_header(request.headers(), header::HOST.as_str()) else {
+        return false;
+    };
+    if !expected(host) {
+        return false;
+    }
+    let uri = request.uri();
+    match uri.authority() {
+        None => uri.scheme().is_none(),
+        Some(authority) => {
+            uri.scheme_str() == Some("http") && authority.as_str().eq_ignore_ascii_case(host)
+        }
     }
 }
 
@@ -984,6 +1079,209 @@ mod tests {
         let mut candidate = config();
         candidate.body_timeout = Duration::ZERO;
         assert!(Endpoint::bind(candidate).is_err());
+    }
+
+    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+
+    /// Serve an empty registry until the returned sender is dropped.
+    fn spawn(config: Config) -> (SocketAddr, oneshot::Sender<()>, std::thread::JoinHandle<()>) {
+        let endpoint = Endpoint::bind(config).unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            endpoint
+                .serve_until(&[], async move {
+                    let _ = stopped.await;
+                })
+                .unwrap();
+        });
+        (addr, stop, thread)
+    }
+
+    /// One raw HTTP/1.1 exchange; returns the status code and the lowercase head.
+    /// Every socket step has a deadline, so a stalled endpoint fails the test.
+    fn exchange(addr: SocketAddr, target: &str, headers: &[&str], body: &str) -> (u16, String) {
+        use std::io::Write;
+        let deadline = Some(Duration::from_secs(10));
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, deadline.unwrap()).unwrap();
+        stream.set_read_timeout(deadline).unwrap();
+        stream.set_write_timeout(deadline).unwrap();
+        let mut head = format!("POST {target} HTTP/1.1\r\n");
+        for header in headers {
+            head.push_str(header);
+            head.push_str("\r\n");
+        }
+        head.push_str(&format!(
+            "Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response[9..12].parse().unwrap();
+        let head = response
+            .split("\r\n\r\n")
+            .next()
+            .unwrap()
+            .to_ascii_lowercase();
+        (status, head)
+    }
+
+    const JSON: [&str; 2] = [
+        "Content-Type: application/json",
+        "Accept: application/json, text/event-stream",
+    ];
+
+    #[test]
+    fn app_loopback_requires_a_loopback_bind_and_no_origins() {
+        assert!(Endpoint::bind(Config::app_loopback("0.0.0.0:0".parse().unwrap())).is_err());
+        let mut config = Config::app_loopback("127.0.0.1:0".parse().unwrap());
+        config.allowed_origins.push("https://example.test".into());
+        assert!(Endpoint::bind(config).is_err());
+        let mut config = Config::app_loopback("127.0.0.1:0".parse().unwrap());
+        config.bind = "0.0.0.0:0".parse().unwrap();
+        assert!(Endpoint::bind(config).is_err());
+        assert!(Endpoint::bind(Config::app_loopback("127.0.0.1:0".parse().unwrap())).is_ok());
+    }
+
+    #[test]
+    fn app_loopback_serves_local_clients_without_a_credential() {
+        let (addr, stop, thread) = spawn(Config::app_loopback("127.0.0.1:0".parse().unwrap()));
+        let port = addr.port();
+        let good = format!("Host: {addr}");
+        let named = format!("Host: LocalHost:{port}");
+        for (target, host) in [
+            ("/".to_owned(), good.clone()),
+            ("/".to_owned(), named),
+            (format!("http://{addr}/"), good.clone()),
+        ] {
+            let (status, head) = exchange(addr, &target, &[&host, JSON[0], JSON[1]], INIT);
+            assert_eq!(status, 200, "{target} {host}");
+            assert!(head.contains("mcp-session-id: "));
+            assert!(!head.contains("access-control-"));
+        }
+        drop(stop);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn app_loopback_refuses_browser_shaped_and_misdirected_requests() {
+        let (addr, stop, thread) = spawn(Config::app_loopback("127.0.0.1:0".parse().unwrap()));
+        let port = addr.port();
+        let good = format!("Host: {addr}");
+        let refused: Vec<(String, Vec<String>, u16)> = vec![
+            ("/".into(), vec![good.clone(), "Origin: null".into()], 403),
+            (
+                "/".into(),
+                vec![good.clone(), "Origin: http://example.test".into()],
+                403,
+            ),
+            (
+                "/".into(),
+                vec![good.clone(), format!("Origin: http://{addr}")],
+                403,
+            ),
+            ("/".into(), vec![], 403),
+            ("/".into(), vec![good.clone(), good.clone()], 403),
+            (
+                "/".into(),
+                vec![format!("Host: 127.0.0.1:{}", port.wrapping_add(1))],
+                403,
+            ),
+            ("/".into(), vec!["Host: 127.0.0.1".into()], 403),
+            ("/".into(), vec![format!("Host: example.test:{port}")], 403),
+            ("/".into(), vec![format!("Host: localhost.:{port}")], 403),
+            ("/".into(), vec![format!("Host: [::1]:{port}")], 403),
+            (
+                format!("http://example.test:{port}/"),
+                vec![good.clone()],
+                403,
+            ),
+            (format!("http://localhost:{port}/"), vec![good.clone()], 403),
+            (
+                "/".into(),
+                vec![
+                    good.clone(),
+                    "Content-Type: text/plain".into(),
+                    JSON[1].into(),
+                ],
+                415,
+            ),
+            (
+                "/".into(),
+                vec![good.clone(), JSON[0].into(), "Accept: */*".into()],
+                406,
+            ),
+        ];
+        for (target, mut headers, expected) in refused {
+            if expected == 403 {
+                headers.extend(JSON.iter().map(|h| h.to_string()));
+            }
+            let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+            let (status, head) = exchange(addr, &target, &headers, INIT);
+            assert_eq!(status, expected, "{target} {headers:?}");
+            assert!(!head.contains("mcp-session-id"), "{target} {headers:?}");
+            assert!(!head.contains("access-control-"));
+        }
+        drop(stop);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn bearer_endpoint_still_requires_its_token() {
+        let mut config = Config::new(
+            "127.0.0.1:0".parse().unwrap(),
+            BearerToken::new(TOKEN).unwrap(),
+        );
+        config.allowed_origins.push("https://edge.example".into());
+        let (addr, stop, thread) = spawn(config);
+        let host = format!("Host: {addr}");
+        let bearer = format!("Authorization: Bearer {TOKEN}");
+        let (status, head) = exchange(addr, "/", &[&host, JSON[0], JSON[1]], INIT);
+        assert_eq!(status, 401);
+        assert!(head.contains("www-authenticate: bearer"));
+        let wrong = "Authorization: Bearer wrong-token-0123456789abcdef0123456789";
+        assert_eq!(
+            exchange(addr, "/", &[&host, wrong, JSON[0], JSON[1]], INIT).0,
+            401
+        );
+        let origin = "Origin: http://example.test";
+        assert_eq!(
+            exchange(addr, "/", &[&host, &bearer, origin, JSON[0], JSON[1]], INIT).0,
+            403
+        );
+        assert_eq!(
+            exchange(addr, "/", &[&host, &bearer, JSON[0], JSON[1]], INIT).0,
+            200
+        );
+        let allowed = "Origin: https://edge.example";
+        assert_eq!(
+            exchange(
+                addr,
+                "/",
+                &[&host, &bearer, allowed, JSON[0], JSON[1]],
+                INIT
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            exchange(addr, "/", &[&host, allowed, JSON[0], JSON[1]], INIT).0,
+            401
+        );
+        // Bearer endpoints keep their unrestricted Host (a hosting edge forwards).
+        assert_eq!(
+            exchange(
+                addr,
+                "/",
+                &["Host: edge.example:443", &bearer, JSON[0], JSON[1]],
+                INIT
+            )
+            .0,
+            200
+        );
+        drop(stop);
+        thread.join().unwrap();
     }
 
     #[test]
