@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use faculties::orient::WakeTint;
 use faculties::relations::{ProfileInput, Relations};
 use faculties::spawn::operations::{describe_end, ended_clean};
 use faculties::spawn::{
@@ -372,11 +373,19 @@ impl Launcher for FakeLauncher {
 struct StubRenderer;
 
 impl Renderer for StubRenderer {
-    fn wake(&self, _storage: &Storage) -> Result<String> {
-        Ok("STUB-WAKE".to_owned())
+    fn tint(&self, _storage: &Storage, about: &str) -> Result<WakeTint> {
+        Ok(WakeTint {
+            about: about.to_owned(),
+            scores: None,
+        })
     }
-    fn tail(&self, _storage: &Storage, _about: Option<&str>) -> Result<String> {
-        Ok("STUB-TAIL".to_owned())
+    fn wake(
+        &self,
+        _storage: &Storage,
+        _tint: Option<&WakeTint>,
+        _memory_chars: usize,
+    ) -> Result<String> {
+        Ok("STUB-WAKE".to_owned())
     }
 }
 
@@ -425,6 +434,8 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         faculties: PathBuf::from("faculties"),
         local: Some(template.split_whitespace().map(str::to_owned).collect()),
         local_max_runtime: Some(600),
+        codex_models: None,
+        claude_projects: None,
     };
     let launcher = Arc::new(FakeLauncher::default());
     let spawn = Spawn::new(storage.clone(), launch)
@@ -448,6 +459,7 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
             effort: "high".to_owned(),
             spawner: "agent-parent".to_owned(),
             provider: Provider::Local,
+            cover: Default::default(),
         })
         .unwrap();
     assert_eq!(launcher.started.lock().unwrap()[0].runtime_max, Some(600));

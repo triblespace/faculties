@@ -9,8 +9,9 @@ use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_pass, render_requests, render_show};
 use super::{
-    inbox_failure, keep_lock_path, Exit, GoalRequest, InboxHook, InboxRequest, KeepConfig,
-    LaunchConfig, Launched, Provider, RequestInput, RunRequest, SettleRequest, Spawn, ZooidRef,
+    inbox_failure, keep_lock_path, CoverWish, Exit, GoalRequest, InboxHook, InboxRequest,
+    KeepConfig, LaunchConfig, Launched, Provider, RequestInput, RunRequest, SettleRequest, Spawn,
+    ZooidRef,
 };
 
 #[derive(Parser)]
@@ -60,6 +61,18 @@ enum Command {
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
+        /// The cover's wished share of the worker's context window, in
+        /// percent, for memories, beliefs and goals together (e.g. 20). Best
+        /// effort: beliefs and goals render whole, so the cover may come out
+        /// larger; the sizing is printed and recorded. Without it the cover
+        /// is the plain one (240,000 memory characters).
+        #[arg(long, value_name = "PERCENT")]
+        cover: Option<f64>,
+        /// The worker model's context window in tokens, before any other
+        /// source (the provider's configuration, a window an earlier run
+        /// recorded). Only used with --cover.
+        #[arg(long, value_name = "TOKENS", requires = "cover")]
+        window: Option<u64>,
     },
     /// Launch a zooid for a Compass goal: the brief is rendered from the
     /// goal's title, its parent chain and its latest notes, plus the zooid's
@@ -91,6 +104,18 @@ enum Command {
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
+        /// The cover's wished share of the worker's context window, in
+        /// percent, for memories, beliefs and goals together (e.g. 20). Best
+        /// effort: beliefs and goals render whole, so the cover may come out
+        /// larger; the sizing is printed and recorded. Without it the cover
+        /// is the plain one (240,000 memory characters).
+        #[arg(long, value_name = "PERCENT")]
+        cover: Option<f64>,
+        /// The worker model's context window in tokens, before any other
+        /// source (the provider's configuration, a window an earlier run
+        /// recorded). Only used with --cover.
+        #[arg(long, value_name = "TOKENS", requires = "cover")]
+        window: Option<u64>,
     },
     /// Ask one host's keeper to start a run of a zooid there: writes a run
     /// request into the spawn collection, which syncs like any other. The
@@ -127,6 +152,10 @@ enum Command {
         /// disclosure check yet.
         #[arg(long, value_name = "PATH")]
         handoff: Option<String>,
+        /// The cover's wished share of the worker's context window, in
+        /// percent (best effort). The target host finds the window.
+        #[arg(long, value_name = "PERCENT")]
+        cover: Option<f64>,
     },
     /// Every run request with its outcomes.
     Requests {
@@ -347,6 +376,9 @@ fn print_launched(launched: &Launched) -> Result<()> {
         if let Some(why) = &launched.untinted {
             out.note(format!("recollection untinted: {why}"))?;
         }
+        if let Some(cover) = &launched.cover {
+            out.note(format!("cover sizing: {}", cover.summary))?;
+        }
         for warning in &launched.warnings {
             out.note(format!("warning: {warning}"))?;
         }
@@ -454,6 +486,8 @@ pub fn run() -> Result<()> {
                 effort,
                 spawner,
                 provider,
+                cover,
+                window,
             } => {
                 let launched = spawn.run(&RunRequest {
                     brief: read_brief(&brief)?,
@@ -461,6 +495,10 @@ pub fn run() -> Result<()> {
                     effort,
                     spawner: spawner_or_persona(spawner)?,
                     provider: Provider::parse(&provider)?,
+                    cover: CoverWish {
+                        percent: cover,
+                        window,
+                    },
                 })?;
                 print_launched(&launched)
             }
@@ -471,6 +509,8 @@ pub fn run() -> Result<()> {
                 effort,
                 spawner,
                 provider,
+                cover,
+                window,
             } => {
                 let launched = spawn.goal(&GoalRequest {
                     goal,
@@ -479,6 +519,10 @@ pub fn run() -> Result<()> {
                     effort,
                     spawner: spawner_or_persona(spawner)?,
                     provider: Provider::parse(&provider)?,
+                    cover: CoverWish {
+                        percent: cover,
+                        window,
+                    },
                 })?;
                 print_launched(&launched)
             }
@@ -492,6 +536,7 @@ pub fn run() -> Result<()> {
                 spawner,
                 previous,
                 handoff,
+                cover,
             } => {
                 let zooid = match (zooid, brief) {
                     (Some(name), None) => ZooidRef::Name(name),
@@ -519,6 +564,7 @@ pub fn run() -> Result<()> {
                         })
                         .transpose()?,
                     handoff: handoff.as_deref().map(read_brief).transpose()?,
+                    cover_percent: cover,
                 })?;
                 crate::cli::with_output("spawn", |out| {
                     out.line(format!("{:x}", requested.request))?;

@@ -31,7 +31,10 @@ use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
-use super::{Exit, HostKey, IntervalValue, RequestFacts, RunFacts, ScriptFacts, TextHandle};
+use super::cover::{self, CoverRecord, MISTRAL_CONTEXT_TOKENS, PLAIN_MEMORY_CHARS};
+use super::{
+    Exit, HostKey, IntervalValue, Reported, RequestFacts, RunFacts, ScriptFacts, TextHandle,
+};
 use crate::compass::{Compass, NoteOptions};
 use crate::orient::WakeTint;
 use crate::out::{Out, Part};
@@ -148,28 +151,23 @@ pub trait Renderer: Send + Sync {
     /// Scores the memory cover's recollections against a topic. Its own
     /// step, so a launch can tell a tint that failed from a wake that did.
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint>;
-    /// The shared self: a memory cover, beliefs and goals. With a tint, the
-    /// memory cover is tinted by its topic (one cover, rendered once; JP
-    /// 2026-11-20: "the tinted cover is a different cover").
-    fn wake(&self, storage: &Storage, tint: Option<&WakeTint>) -> Result<String>;
+    /// The shared self: a memory cover of `memory_chars` characters,
+    /// beliefs and goals. With a tint, the memory cover is tinted by its
+    /// topic (one cover, rendered once; JP 2026-11-20: "the tinted cover is
+    /// a different cover"). With no memory characters it is beliefs and
+    /// goals alone, which is how a `--cover` launch measures them.
+    fn wake(
+        &self,
+        storage: &Storage,
+        tint: Option<&WakeTint>,
+        memory_chars: usize,
+    ) -> Result<String>;
 }
 
 /// The tint through the Memory library and the wake through Orient's, on
 /// the caller's storage.
-#[derive(Clone, Copy, Debug)]
-pub struct LibraryRenderer {
-    /// Memory characters of the one cover.
-    pub wake_chars: usize,
-}
-
-impl Default for LibraryRenderer {
-    fn default() -> Self {
-        Self {
-            // The former 200k wake plus 40k tail, now spent on one render.
-            wake_chars: 240_000,
-        }
-    }
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LibraryRenderer;
 
 impl Renderer for LibraryRenderer {
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint> {
@@ -180,7 +178,12 @@ impl Renderer for LibraryRenderer {
         })
     }
 
-    fn wake(&self, storage: &Storage, tint: Option<&WakeTint>) -> Result<String> {
+    fn wake(
+        &self,
+        storage: &Storage,
+        tint: Option<&WakeTint>,
+        memory_chars: usize,
+    ) -> Result<String> {
         let orient = crate::orient::Orient::with_storage(storage.clone());
         let mut text = String::new();
         let mut collect = |part: Part| {
@@ -194,7 +197,7 @@ impl Renderer for LibraryRenderer {
         orient.wake_unpresented(
             None,
             &crate::orient::WakeOptions {
-                chars: self.wake_chars,
+                chars: memory_chars,
                 tint: tint.cloned(),
                 ..Default::default()
             },
@@ -260,6 +263,13 @@ pub struct LaunchConfig {
     /// `None` is no limit. Units of other providers never get one.
     /// `SPAWN_LOCAL_MAX_RUNTIME` sets it.
     pub local_max_runtime: Option<u64>,
+    /// codex's model catalog (`models_cache.json` of the ambient codex
+    /// home), read for a `--cover` launch's window when a codex model is
+    /// named. `None` reads none.
+    pub codex_models: Option<PathBuf>,
+    /// claude's session transcripts (`~/.claude/projects`), read at
+    /// settlement for the first model call's input tokens. `None` reads none.
+    pub claude_projects: Option<PathBuf>,
 }
 
 /// The placeholders a local executor template may name, each replaced inside
@@ -357,6 +367,8 @@ impl LaunchConfig {
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
+            codex_models: Some(home.join(".codex/models_cache.json")),
+            claude_projects: Some(home.join(".claude/projects")),
         }
     }
 
@@ -587,7 +599,7 @@ pub fn vibe_config(script: &Path, model: &str, thinking: &str) -> String {
          output_price = {MISTRAL_OUTPUT_PRICE:?}\n\
          thinking = \"{thinking}\"\n\
          thinking_levels = [\"low\", \"medium\", \"high\"]\n\
-         max_context_length = 1048576\n\
+         max_context_length = {MISTRAL_CONTEXT_TOKENS}\n\
          \n\
          [[mcp_servers]]\n\
          name = \"faculties\"\n\
@@ -751,6 +763,18 @@ pub struct RunRequest {
     /// The spawning persona: label, alias or id.
     pub spawner: String,
     pub provider: Provider,
+    pub cover: CoverWish,
+}
+
+/// What a launch asks of its cover's size: `percent` of the worker's
+/// context window for the whole cover, a best-effort wish, and the window
+/// itself when the caller knows it. The default asks nothing: the plain
+/// cover of [`PLAIN_MEMORY_CHARS`] memory characters.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CoverWish {
+    pub percent: Option<f64>,
+    /// The window in tokens (`--window`), before any other source.
+    pub window: Option<u64>,
 }
 
 /// Launch a zooid whose brief is rendered from a Compass goal.
@@ -764,6 +788,7 @@ pub struct GoalRequest {
     pub effort: String,
     pub spawner: String,
     pub provider: Provider,
+    pub cover: CoverWish,
 }
 
 /// What one launch runs from: the brief text, the memory tail's topic, and
@@ -781,6 +806,7 @@ struct LaunchExtras {
     unit: Option<String>,
     request: Option<Id>,
     handoff: Option<String>,
+    cover: CoverWish,
 }
 
 #[derive(Clone, Debug)]
@@ -801,6 +827,9 @@ pub struct Launched {
     pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
+    /// How the cover was sized, when the launch asked for a share
+    /// (`--cover`).
+    pub cover: Option<CoverRecord>,
     /// The goal note the zooid added at launch (`spawn goal`).
     pub goal_note: Option<Id>,
     /// What went wrong after the unit had started. The zooid runs anyway.
@@ -912,6 +941,12 @@ pub struct RunView {
     pub output_tokens: Vec<u64>,
     /// The agent's own cost estimate in US dollars, not the provider's bill.
     pub cost_usd: Vec<f64>,
+    /// How the cover was sized, in words (`--cover` launches).
+    pub cover_sizing: Vec<String>,
+    /// The window the provider reported at settlement.
+    pub context_window: Vec<u64>,
+    /// The first model call's input tokens as the provider reported them.
+    pub first_call_input_tokens: Vec<u64>,
 }
 
 impl RunView {
@@ -946,6 +981,9 @@ pub struct RequestInput {
     pub previous: Option<Id>,
     /// Delivered once, after the brief, in the run's prompt.
     pub handoff: Option<String>,
+    /// The cover share the run asks for (`--cover`). The window is the
+    /// target host's to find.
+    pub cover_percent: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -983,6 +1021,7 @@ pub struct RequestView {
     pub handoff: Vec<TextHandle>,
     /// The first handoff's text, when its blob is here.
     pub handoff_text: Option<String>,
+    pub cover_percent: Vec<f64>,
     pub spawner: Vec<Id>,
     pub requested_at: Vec<IntervalValue>,
     /// The zooid's brief handle and text (when here), and its goal revision.
@@ -1326,7 +1365,10 @@ impl Spawn {
             &request.effort,
             &request.spawner,
             request.provider,
-            LaunchExtras::default(),
+            LaunchExtras {
+                cover: request.cover,
+                ..Default::default()
+            },
         )
     }
 
@@ -1350,7 +1392,10 @@ impl Spawn {
             &request.effort,
             &request.spawner,
             request.provider,
-            LaunchExtras::default(),
+            LaunchExtras {
+                cover: request.cover,
+                ..Default::default()
+            },
         )
     }
 
@@ -1397,6 +1442,228 @@ impl Spawn {
                 choose_provider(&view)
             }
         }
+    }
+
+    /// The prompt, and how its cover was sized when the launch asked for a
+    /// share of the context window. Without one the wake is the plain cover
+    /// and nothing is looked up. With one, the target is `percent` of `W`;
+    /// beliefs and goals are measured by a wake with no memory budget and
+    /// always render whole; the memory part gets what they leave, never less
+    /// than [`cover::MIN_MEMORY_CHARS`]. If the whole prompt is then
+    /// estimated above `W` less the headroom, the memory part is rendered
+    /// once more aimed at that line, and the second render replaces the
+    /// first. Every figure is an estimate and nothing is refused for one.
+    fn size_cover(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        tint: Option<&WakeTint>,
+        wish: CoverWish,
+        assemble: &dyn Fn(&str) -> String,
+    ) -> Result<(String, Option<CoverRecord>)> {
+        let wake = |memory_chars: usize| self.renderer.wake(&self.storage, tint, memory_chars);
+        let Some(percent) = wish.percent else {
+            return Ok((assemble(&wake(PLAIN_MEMORY_CHARS)?), None));
+        };
+        let window = match self.window(provider, model, wish.window) {
+            Ok(window) => window,
+            Err(why) => {
+                let delivered = wake(PLAIN_MEMORY_CHARS)?;
+                let summary = format!(
+                    "cover {percent}%: no context window is known for {} {} ({why}), so it was \
+                     rendered at the plain size, {PLAIN_MEMORY_CHARS} memory characters; \
+                     --window N gives one",
+                    provider.name(),
+                    model.unwrap_or("(no model named)")
+                );
+                return Ok((
+                    assemble(&delivered),
+                    Some(CoverRecord {
+                        percent,
+                        window: None,
+                        window_source: why,
+                        calibration: None,
+                        target_chars: None,
+                        fixed_chars: None,
+                        memory_budget: PLAIN_MEMORY_CHARS,
+                        cover_chars: delivered.chars().count(),
+                        estimate: None,
+                        headroom: None,
+                        reduction: None,
+                        summary,
+                    }),
+                ));
+            }
+        };
+        let calibration = cover::calibration(provider.name(), model);
+        let ratio = calibration.chars_per_token;
+        let (overhead, overhead_basis) = cover::overhead(provider.name());
+        let target = cover::target_chars(percent, window.tokens, ratio);
+        let fixed = wake(0)?.chars().count();
+        let mut budget = cover::memory_budget(target, fixed);
+        let mut delivered = wake(budget)?;
+        let mut prompt = assemble(&delivered);
+        let mut estimate = cover::estimate_tokens(prompt.chars().count(), ratio, overhead);
+        let aim = cover::aim_tokens(window.tokens);
+        let mut reduction = None;
+        if estimate > aim {
+            let rendered = delivered.chars().count().saturating_sub(fixed);
+            let smaller = cover::reduced_budget(rendered, estimate, aim, ratio);
+            let again = wake(smaller)?;
+            let again_prompt = assemble(&again);
+            let again_estimate =
+                cover::estimate_tokens(again_prompt.chars().count(), ratio, overhead);
+            let mut text = format!(
+                "the prompt was estimated at {estimate} tokens, above {aim} (W {} less {}% \
+                 headroom for the work), so the memory part was rendered once more: budget \
+                 {budget} -> {smaller} characters, estimate {again_estimate} tokens",
+                window.tokens,
+                cover::HEADROOM * 100.0
+            );
+            if again_estimate > window.tokens {
+                text.push_str(&format!(
+                    "; still estimated above the whole window of {} tokens{}, launched anyway: \
+                     an estimate, not a refusal",
+                    window.tokens,
+                    if smaller == 0 {
+                        " even with no memories"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            reduction = Some(text);
+            budget = smaller;
+            delivered = again;
+            prompt = again_prompt;
+            estimate = again_estimate;
+        }
+        let cover_chars = delivered.chars().count();
+        let mut summary = format!(
+            "cover {percent}% of a {} token window ({}): target {target} characters at {ratio} \
+             characters per token ({}); beliefs and goals {fixed} characters, memory budget \
+             {budget}, cover {cover_chars} characters{}; whole prompt estimated at {estimate} \
+             tokens with {overhead} tokens of harness overhead ({overhead_basis})",
+            window.tokens,
+            window.source,
+            calibration.basis,
+            if cover_chars > target {
+                ", over its target (beliefs and goals render whole)"
+            } else {
+                ""
+            }
+        );
+        if let Some(reduction) = &reduction {
+            summary.push_str("; ");
+            summary.push_str(reduction);
+        }
+        Ok((
+            prompt,
+            Some(CoverRecord {
+                percent,
+                window: Some(window.tokens),
+                window_source: window.source,
+                calibration: Some(calibration),
+                target_chars: Some(target),
+                fixed_chars: Some(fixed),
+                memory_budget: budget,
+                cover_chars,
+                estimate: Some(estimate),
+                headroom: Some(cover::HEADROOM),
+                reduction,
+                summary,
+            }),
+        ))
+    }
+
+    /// The worker model's context window, from the first source that gives
+    /// one: `--window`; the provider's own configuration for the model
+    /// (codex's catalog, the window spawn writes for mistral); a value the
+    /// provider reported at the end of an earlier run of the same provider
+    /// and model, the latest. A local run takes `--window` only. `Err` says
+    /// why no source gave one; nothing invents a window.
+    fn window(
+        &self,
+        provider: Provider,
+        model: Option<&str>,
+        flag: Option<u64>,
+    ) -> std::result::Result<cover::Window, String> {
+        if let Some(tokens) = flag {
+            return Ok(cover::Window {
+                tokens,
+                source: "--window".to_owned(),
+            });
+        }
+        let mut why = Vec::new();
+        match provider {
+            Provider::Local => {
+                return Err("a local run takes its window from --window only".to_owned())
+            }
+            Provider::Mistral => {
+                return Ok(cover::Window {
+                    tokens: MISTRAL_CONTEXT_TOKENS,
+                    source: "the max_context_length spawn writes into the run's vibe \
+                             configuration"
+                        .to_owned(),
+                })
+            }
+            Provider::Codex => match (model, &self.launch.codex_models) {
+                (Some(model), Some(path)) => match cover::codex_catalog_window(path, model) {
+                    Ok(window) => return Ok(window),
+                    Err(error) => why.push(error),
+                },
+                (None, _) => why.push("no codex model is named (SPAWN_CODEX_MODEL)".to_owned()),
+                (Some(_), None) => why.push("no codex model catalog is configured".to_owned()),
+            },
+            _ => {}
+        }
+        let Some(model) = model else {
+            why.push("no model is named to look up a recorded window for".to_owned());
+            return Err(why.join("; "));
+        };
+        match self.recorded_window(provider.name(), model) {
+            Ok(Some(window)) => Ok(window),
+            Ok(None) => {
+                why.push(format!(
+                    "no settled {} run of {model} has recorded one",
+                    provider.name()
+                ));
+                Err(why.join("; "))
+            }
+            Err(error) => {
+                why.push(format!("reading recorded windows failed: {error:#}"));
+                Err(why.join("; "))
+            }
+        }
+    }
+
+    /// The latest context window a settled run of this provider and model
+    /// recorded, with that run and its end. Its age refuses nothing.
+    fn recorded_window(&self, provider: &str, model: &str) -> Result<Option<cover::Window>> {
+        self.observe(|facts, _| {
+            let latest = find!(
+                (run: Id, window: Inline<inlineencodings::U256BE>, at: IntervalValue),
+                pattern!(facts, [{ ?run @
+                    attrs::provider: provider,
+                    attrs::model: model,
+                    attrs::context_window: ?window,
+                    metadata::finished_at: ?at,
+                }])
+            )
+            .filter_map(|(run, window, at)| {
+                let window = window.try_from_inline::<u64>().ok()?;
+                let (from, _) = at.try_from_inline::<(Epoch, Epoch)>().ok()?;
+                Some((from, run, window, at))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            Ok(latest.map(|(_, run, tokens, at)| cover::Window {
+                tokens,
+                source: format!(
+                    "reported by {provider} for {model} at the end of run {run:x}, {}",
+                    crate::care::format_time(at)
+                ),
+            }))
+        })
     }
 
     /// The agent command line for a provider, the environment it runs in,
@@ -1478,8 +1745,11 @@ impl Spawn {
                     text(&files.mcp_config),
                     "--settings".to_owned(),
                     text(&files.settings),
+                    // One result object on stdout: settlement records its
+                    // `result` text as the report, as the text format's
+                    // stdout was, and the window the CLI reports.
                     "--output-format".to_owned(),
-                    "text".to_owned(),
+                    "json".to_owned(),
                 ],
                 env: Vec::new(),
                 secrets: Vec::new(),
@@ -1555,6 +1825,12 @@ impl Spawn {
             .ok_or_else(|| anyhow!("workdir {} is not UTF-8", workdir.display()))?
             .to_owned();
         super::require_unit_safe("workdir", &workdir_text)?;
+        if let Some(percent) = extras.cover.percent {
+            cover::check_percent(percent)?;
+        }
+        if extras.cover.window == Some(0) {
+            bail!("--window 0 is not a context window");
+        }
         let (provider, provider_reason) = self.resolve_provider(provider)?;
         let (spawn_fragment, spawn, brief_handle, name) = super::spawn_fragment(&brief.text)?;
         let unit = extras
@@ -1679,10 +1955,17 @@ impl Spawn {
                 Some(Ok(tint)) => (Some(tint), None),
                 Some(Err(error)) => (None, Some(format!("{error:#}"))),
             };
-            let wake = self.renderer.wake(&self.storage, tint.as_ref())?;
             let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
-            let prompt =
-                super::assemble_prompt(&wake, &preamble, &brief.text, extras.handoff.as_deref());
+            let assemble = |wake: &str| {
+                super::assemble_prompt(wake, &preamble, &brief.text, extras.handoff.as_deref())
+            };
+            let (prompt, cover) = self.size_cover(
+                provider,
+                model.as_deref(),
+                tint.as_ref(),
+                extras.cover,
+                &assemble,
+            )?;
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -1698,6 +1981,7 @@ impl Spawn {
                 model_unset: model_unset.clone(),
                 untinted: untinted.clone(),
                 request: extras.request,
+                cover: cover.clone(),
             });
             let text = |path: &Path| path.display().to_string();
             let agent = self.agent(
@@ -1851,6 +2135,7 @@ impl Spawn {
                 model: model.clone(),
                 model_unset: model_unset.clone(),
                 untinted,
+                cover,
                 goal_note,
                 warnings,
             })
@@ -1873,8 +2158,9 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, linked, local) = self.observe(|facts, _| {
-            Ok((
+        let (already_ended, earlier_message, linked, local, agent) =
+            self.observe(|facts, reader| {
+                Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
@@ -1894,8 +2180,21 @@ impl Spawn {
                             served @ attrs::provider: Provider::Local.name()
                         }]))
                     }),
+                // The agent and model the run record names, for reading what
+                // the provider reported about the run.
+                (
+                    find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::provider: ?handle }]))
+                        .next()
+                        .and_then(|handle| read_text(reader, handle)),
+                    find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }]))
+                        .next()
+                        .and_then(|handle| read_text(reader, handle)),
+                    find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::started_at: ?at }]))
+                        .next(),
+                ),
             ))
-        })?;
+            })?;
+        let (agent, agent_model, run_started) = agent;
         let mut failures = Vec::new();
         // A hosted run's report or a local run's closing message. Either is
         // optional: no file, or an empty one, records none, and how the run
@@ -1915,10 +2214,16 @@ impl Spawn {
                 }
             }
         } else {
+            let mut reported = Reported::default();
             let report = match &request.report {
                 Some(path) => match std::fs::read(path) {
                     Ok(bytes) if bytes.is_empty() => None,
-                    Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                    Ok(bytes) => Some(self.read_report(
+                        &bytes,
+                        agent.as_deref(),
+                        agent_model.as_deref(),
+                        &mut reported,
+                    )),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => {
                         return Err(error).with_context(|| format!("read {}", path.display()))
@@ -1926,6 +2231,11 @@ impl Spawn {
                 },
                 None => None,
             };
+            if agent.as_deref() == Some(Provider::Codex.name()) {
+                let (first, window) = self.codex_reported(&request.name, run_started);
+                reported.first_call_input_tokens = first;
+                reported.context_window = window;
+            }
             let usage = match &request.usage {
                 Some(path) => match std::fs::read_to_string(path)
                     .with_context(|| format!("read {}", path.display()))
@@ -1951,6 +2261,7 @@ impl Spawn {
                 &request.exit,
                 report.as_deref(),
                 usage.as_ref(),
+                &reported,
             );
             report_handle = handle;
             let mut fragment = fragment;
@@ -2121,6 +2432,99 @@ impl Spawn {
         }
     }
 
+    /// A report file's text. A claude run's stdout is its result object:
+    /// the report is the `result` text, as the text format printed it, and
+    /// the window the CLI reported and the first call's input tokens (from
+    /// the session transcript) go into `reported`. Bytes that are not a
+    /// result object (a crash, partial output, a run started before the
+    /// JSON format) are recorded as they are, as is a result with no text.
+    fn read_report(
+        &self,
+        bytes: &[u8],
+        agent: Option<&str>,
+        model: Option<&str>,
+        reported: &mut Reported,
+    ) -> String {
+        let raw = || String::from_utf8_lossy(bytes).into_owned();
+        if agent != Some(Provider::Claude.name()) {
+            return raw();
+        }
+        let Some(result) = cover::claude_result(bytes, model) else {
+            return raw();
+        };
+        reported.context_window = result.context_window;
+        reported.first_call_input_tokens = result
+            .session_id
+            .as_deref()
+            .and_then(|session| self.claude_first_call(session));
+        result.report.unwrap_or_else(raw)
+    }
+
+    /// The first model call's input tokens in claude's transcript of a
+    /// session: `<projects>/<any project>/<session>.jsonl`.
+    fn claude_first_call(&self, session: &str) -> Option<u64> {
+        if session.is_empty() || session.contains(['/', '.']) {
+            return None;
+        }
+        let projects = self.launch.claude_projects.as_ref()?;
+        std::fs::read_dir(projects)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join(format!("{session}.jsonl")))
+            .find(|path| path.is_file())
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| cover::claude_first_call(&text))
+    }
+
+    /// What a codex run's rollout reported: the first call's input tokens
+    /// and the context window. The zooid's codex home keeps every run's
+    /// sessions, so only the newest rollout written since this run started
+    /// is read.
+    fn codex_reported(
+        &self,
+        name: &str,
+        started: Option<IntervalValue>,
+    ) -> (Option<u64>, Option<u64>) {
+        let since = started
+            .and_then(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
+            .map(|(from, _)| from);
+        let mut rollouts = Vec::new();
+        let mut dirs = vec![self.launch.file(name, "codex").join("sessions")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    if let Ok(modified) = meta.modified() {
+                        rollouts.push((modified, path));
+                    }
+                }
+            }
+        }
+        let newest = rollouts
+            .into_iter()
+            .filter(|(modified, _)| {
+                let modified = modified
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|age| Epoch::from_unix_seconds(age.as_secs_f64()));
+                match (since, modified) {
+                    (Some(since), Ok(modified)) => modified >= since,
+                    (Some(_), Err(_)) => false,
+                    (None, _) => true,
+                }
+            })
+            .max_by(|a, b| a.0.cmp(&b.0));
+        newest
+            .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+            .map(|text| cover::codex_rollout(&text))
+            .unwrap_or((None, None))
+    }
+
     /// Every spawn, by name.
     pub fn list(&self) -> Result<Vec<SpawnView>> {
         self.observe(|facts, reader| spawns_in(facts, reader))
@@ -2186,6 +2590,9 @@ impl Spawn {
                 super::EFFORTS.join(", ")
             );
         }
+        if let Some(percent) = input.cover_percent {
+            cover::check_percent(percent)?;
+        }
         let spawner =
             match Relations::with_storage(self.storage.clone()).person_state(&input.spawner)? {
                 Some(state) if !state.retired => state.person,
@@ -2214,6 +2621,7 @@ impl Spawn {
             effort: input.effort.clone(),
             previous: input.previous,
             handoff: input.handoff.clone(),
+            cover_percent: input.cover_percent,
             requested_at: crate::clock::point_now()?,
             spawner,
         });
@@ -2420,6 +2828,16 @@ impl Spawn {
                 )
             }
         };
+        let cover_percent = match view.cover_percent.as_slice() {
+            [] => None,
+            [one] => Some(*one),
+            other => {
+                return self.refuse(
+                    view,
+                    format!("the request names {} cover percents", other.len()),
+                )
+            }
+        };
         if view.zooid.len() != 1 {
             return self.refuse(
                 view,
@@ -2459,6 +2877,10 @@ impl Spawn {
                 request: Some(view.id),
                 // Requests with a handoff are refused above.
                 handoff: None,
+                cover: CoverWish {
+                    percent: cover_percent,
+                    window: None,
+                },
             },
         );
         match launched {
@@ -2898,6 +3320,24 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             .collect(),
         ),
         cost_usd: find!(cost: f64, pattern!(facts, [{ run @ attrs::cost_usd: ?cost }])).collect(),
+        cover_sizing: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::cover_sizing: ?handle }]))
+                .collect(),
+        ),
+        context_window: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::context_window: ?count }])
+            )
+            .collect(),
+        ),
+        first_call_input_tokens: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::first_call_input_tokens: ?count }])
+            )
+            .collect(),
+        ),
     }
 }
 
@@ -3013,6 +3453,11 @@ fn request_view<R: BlobStoreGet + ?Sized>(
             .first()
             .and_then(|handle| read_text(reader, *handle)),
         handoff,
+        cover_percent: find!(
+            percent: f64,
+            pattern!(facts, [{ request @ attrs::cover_percent: ?percent }])
+        )
+        .collect(),
         spawner: find!(id: Id, pattern!(facts, [{ request @ archive_attrs::author: ?id }]))
             .collect(),
         requested_at: find!(
@@ -3076,6 +3521,9 @@ pub fn render_requests(requests: &[RequestView]) -> String {
         .unwrap();
         if !request.previous.is_empty() {
             writeln!(out, "  previous run: {}", ids(&request.previous)).unwrap();
+        }
+        if !request.cover_percent.is_empty() {
+            writeln!(out, "  cover: {}%", join(&request.cover_percent)).unwrap();
         }
         if !request.handoff.is_empty() {
             writeln!(
@@ -3307,6 +3755,25 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         for why in &run.untinted {
             writeln!(out, "  untinted recollection: {why}").unwrap();
         }
+        for sizing in &run.cover_sizing {
+            writeln!(out, "  cover sizing: {sizing}").unwrap();
+        }
+        if !run.context_window.is_empty() {
+            writeln!(
+                out,
+                "  context window reported: {} tokens",
+                join(&run.context_window)
+            )
+            .unwrap();
+        }
+        if !run.first_call_input_tokens.is_empty() {
+            writeln!(
+                out,
+                "  first call input: {} tokens (overhead, prompt and cover together)",
+                join(&run.first_call_input_tokens)
+            )
+            .unwrap();
+        }
         if !run.input_tokens.is_empty() || !run.output_tokens.is_empty() {
             writeln!(
                 out,
@@ -3413,12 +3880,19 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct StubRenderer {
         /// Refuse a tint the way WeMM refuses an over-long query.
         refuse_tint: bool,
         /// Fail every wake, as an unreadable pile would.
         refuse_wake: bool,
+        /// Render the memory part as exactly its budget of characters, the
+        /// way a full cover fills it.
+        fill: bool,
+        /// Beliefs and goals: appended whole to every wake.
+        fixed: String,
+        /// The memory budget of every wake, in order.
+        calls: Arc<Mutex<Vec<usize>>>,
     }
 
     impl Renderer for StubRenderer {
@@ -3431,14 +3905,22 @@ mod tests {
                 scores: None,
             })
         }
-        fn wake(&self, _storage: &Storage, tint: Option<&WakeTint>) -> Result<String> {
+        fn wake(
+            &self,
+            _storage: &Storage,
+            tint: Option<&WakeTint>,
+            memory_chars: usize,
+        ) -> Result<String> {
+            self.calls.lock().unwrap().push(memory_chars);
             if self.refuse_wake {
                 bail!("read selected Memory collection: unreadable");
             }
-            Ok(match tint {
+            let memory = match tint {
+                _ if self.fill => "m".repeat(memory_chars),
                 Some(tint) => format!("STUB-WAKE about {}", tint.about),
                 None => "STUB-WAKE untinted".to_owned(),
-            })
+            };
+            Ok(format!("{memory}{}", self.fixed))
         }
     }
 
@@ -3495,6 +3977,8 @@ mod tests {
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
+            codex_models: Some(directory.path().join("codex-models.json")),
+            claude_projects: Some(directory.path().join("claude-projects")),
         };
         let launcher = Arc::new(launcher);
         let spawn = Spawn::new(storage.clone(), launch)
@@ -3531,6 +4015,7 @@ mod tests {
                 effort: "high".to_owned(),
                 spawner: "agent-cc".to_owned(),
                 provider: Provider::Claude,
+                cover: CoverWish::default(),
             }
         }
         fn settle(&self, name: &str, launched: &Launched) -> Result<Settled> {
@@ -3606,6 +4091,7 @@ mod tests {
                     spawner: "agent-cc".to_owned(),
                     previous: None,
                     handoff: handoff.map(str::to_owned),
+                    cover_percent: None,
                 })
                 .unwrap()
         }
@@ -3660,6 +4146,7 @@ mod tests {
                 spawner: "agent-cc".to_owned(),
                 previous: Some(previous),
                 handoff: Some("Open: the review thread.".to_owned()),
+                cover_percent: None,
             })
             .unwrap();
         assert_eq!(requested.host, here);
@@ -3695,6 +4182,7 @@ mod tests {
                 spawner: "agent-cc".to_owned(),
                 previous: None,
                 handoff: None,
+                cover_percent: None,
             })
             .unwrap();
         assert_eq!(again.zooid, spawn);
@@ -4648,6 +5136,7 @@ mod tests {
             effort: "high".to_owned(),
             previous: None,
             handoff: None,
+            cover_percent: None,
             requested_at: crate::clock::point_now().unwrap(),
             spawner,
         });
@@ -4705,6 +5194,7 @@ mod tests {
                     unit: None,
                     request: None,
                     handoff: Some(handoff.to_owned()),
+                    cover: CoverWish::default(),
                 },
             )
             .unwrap();
@@ -4944,6 +5434,341 @@ mod tests {
         assert_eq!(launched.prompt_chars, prompt.chars().count());
         let recorded = f.spawn.show(&launched.name).unwrap().runs[0].prompt[0];
         assert_eq!(recorded, super::super::text_handle(&prompt));
+    }
+
+    fn covered(f: &Fixture, brief: &str, percent: f64, window: Option<u64>) -> RunRequest {
+        let mut request = f.request(brief);
+        request.cover = CoverWish {
+            percent: Some(percent),
+            window,
+        };
+        request
+    }
+
+    fn prompt_of(f: &Fixture, index: usize) -> String {
+        let script = f.launcher.started.lock().unwrap()[index].script.clone();
+        std::fs::read_to_string(script.with_extension("prompt")).unwrap()
+    }
+
+    /// A stub whose memory part is exactly its budget, beside `fixed`
+    /// characters of beliefs and goals.
+    fn filled(fixed: usize) -> StubRenderer {
+        StubRenderer {
+            fill: true,
+            fixed: "b".repeat(fixed),
+            ..Default::default()
+        }
+    }
+
+    fn fixture_rendering(renderer: StubRenderer) -> Fixture {
+        fixture_full(
+            FakeLauncher::default(),
+            renderer,
+            "export TRIBLESPACE_PEERS=none\n",
+        )
+    }
+
+    #[test]
+    fn without_cover_the_prompt_is_the_plain_one_and_nothing_is_sized() {
+        let renderer = StubRenderer::default();
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let brief = "Plain brief.";
+        let launched = f.spawn.run(&f.request(brief)).unwrap();
+        let expected = super::super::assemble_prompt(
+            &format!("STUB-WAKE about {brief}"),
+            &super::super::preamble(&launched.name, "agent-cc", false),
+            brief,
+            None,
+        );
+        assert_eq!(prompt_of(&f, 0), expected);
+        assert_eq!(*calls.lock().unwrap(), [PLAIN_MEMORY_CHARS]);
+        assert!(launched.cover.is_none());
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(run.cover_sizing.is_empty());
+    }
+
+    #[test]
+    fn a_percent_picks_the_memory_budget_from_the_window_the_ratio_and_the_beliefs() {
+        let renderer = filled(270_000);
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let launched = f
+            .spawn
+            .run(&covered(&f, "Sized brief.", 20.0, Some(1_000_000)))
+            .unwrap();
+        let cover = launched.cover.clone().unwrap();
+        assert_eq!(cover.window, Some(1_000_000));
+        assert_eq!(cover.window_source, "--window");
+        // 20% of 1M tokens at 2.423 characters per token.
+        assert_eq!(cover.target_chars, Some(484_600));
+        assert_eq!(cover.fixed_chars, Some(270_000));
+        assert_eq!(cover.memory_budget, 214_600);
+        // Beliefs and goals measured with no memory budget, then one render.
+        assert_eq!(*calls.lock().unwrap(), [0, 214_600]);
+        assert_eq!(cover.cover_chars, 484_600);
+        assert!(cover.reduction.is_none());
+        assert_eq!(cover.headroom, Some(cover::HEADROOM));
+        assert_eq!(cover.calibration.as_ref().unwrap().n, Some(138));
+        let prompt = prompt_of(&f, 0);
+        assert!(prompt.contains(&"b".repeat(270_000)));
+        assert_eq!(
+            cover.estimate,
+            Some(cover::estimate_tokens(
+                prompt.chars().count(),
+                2.423,
+                cover::CLAUDE_OVERHEAD_TOKENS
+            ))
+        );
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.cover_sizing, [cover.summary.clone()]);
+        assert!(
+            cover.summary.contains("memory budget 214600"),
+            "{}",
+            cover.summary
+        );
+    }
+
+    #[test]
+    fn beliefs_render_whole_and_still_leave_the_minimum_recollection() {
+        let renderer = filled(600_000);
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let launched = f
+            .spawn
+            .run(&covered(&f, "Heavy beliefs.", 20.0, Some(1_000_000)))
+            .unwrap();
+        let cover = launched.cover.unwrap();
+        assert_eq!(cover.memory_budget, cover::MIN_MEMORY_CHARS);
+        assert_eq!(*calls.lock().unwrap(), [0, cover::MIN_MEMORY_CHARS]);
+        assert_eq!(cover.cover_chars, 600_000 + cover::MIN_MEMORY_CHARS);
+        assert!(
+            cover.summary.contains("over its target"),
+            "{}",
+            cover.summary
+        );
+        assert!(prompt_of(&f, 0).contains(&"b".repeat(600_000)));
+    }
+
+    #[test]
+    fn an_estimate_over_the_window_renders_the_memory_part_once_more_and_replaces_it() {
+        let renderer = filled(10_000);
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let launched = f
+            .spawn
+            .run(&covered(&f, "Over the window.", 100.0, Some(100_000)))
+            .unwrap();
+        let cover = launched.cover.unwrap();
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls[..2], [0, 232_300]);
+        assert!(calls[2] < 232_300 && calls[2] > 0, "{calls:?}");
+        assert_eq!(cover.memory_budget, calls[2]);
+        assert!(cover.estimate.unwrap() <= cover::aim_tokens(100_000));
+        let reduction = cover.reduction.unwrap();
+        assert!(reduction.contains("rendered once more"), "{reduction}");
+        assert!(!reduction.contains("launched anyway"), "{reduction}");
+        // One cover reaches the zooid: the second render's.
+        let prompt = prompt_of(&f, 0);
+        assert!(prompt.contains(&format!("{}b", "m".repeat(calls[2]))));
+        assert!(!prompt.contains(&"m".repeat(calls[2] + 1)));
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn even_an_empty_memory_part_estimated_over_the_window_launches_and_says_so() {
+        let renderer = filled(400_000);
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let launched = f
+            .spawn
+            .run(&covered(
+                &f,
+                "Beliefs past the window.",
+                20.0,
+                Some(100_000),
+            ))
+            .unwrap();
+        let cover = launched.cover.unwrap();
+        assert_eq!(*calls.lock().unwrap(), [0, cover::MIN_MEMORY_CHARS, 0]);
+        assert_eq!(cover.memory_budget, 0);
+        let reduction = cover.reduction.unwrap();
+        assert!(reduction.contains("even with no memories"), "{reduction}");
+        assert!(reduction.contains("launched anyway"), "{reduction}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn with_no_window_known_the_cover_is_the_plain_size_and_says_why() {
+        let renderer = StubRenderer::default();
+        let calls = renderer.calls.clone();
+        let f = fixture_rendering(renderer);
+        let launched = f.spawn.run(&covered(&f, "No window.", 20.0, None)).unwrap();
+        assert_eq!(*calls.lock().unwrap(), [PLAIN_MEMORY_CHARS]);
+        let cover = launched.cover.unwrap();
+        assert_eq!(cover.window, None);
+        assert_eq!(cover.estimate, None);
+        assert_eq!(cover.memory_budget, PLAIN_MEMORY_CHARS);
+        assert!(
+            cover
+                .window_source
+                .contains("no settled claude run of claude-opus-5-5"),
+            "{}",
+            cover.window_source
+        );
+        assert!(cover.summary.contains("plain size"), "{}", cover.summary);
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.cover_sizing, [cover.summary]);
+        // codex with no model named has no catalog entry to read.
+        let mut codex = covered(&f, "No codex window.", 20.0, None);
+        codex.provider = Provider::Codex;
+        let cover = f.relaunch(|_| {}).run(&codex).unwrap().cover.unwrap();
+        assert!(
+            cover.window_source.contains("no codex model is named"),
+            "{}",
+            cover.window_source
+        );
+        // A local run takes --window only; mistral's is spawn's own setting.
+        assert!(f
+            .spawn
+            .window(Provider::Local, None, None)
+            .unwrap_err()
+            .contains("--window only"));
+        assert_eq!(
+            f.spawn
+                .window(Provider::Mistral, Some("mistral-large-4"), None)
+                .unwrap()
+                .tokens,
+            cover::MISTRAL_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            f.spawn
+                .window(Provider::Local, None, Some(4096))
+                .unwrap()
+                .tokens,
+            4096
+        );
+    }
+
+    #[test]
+    fn a_bad_cover_percent_or_window_is_refused_before_anything_starts() {
+        let f = fixture();
+        for (percent, window) in [(0.0, None), (150.0, None), (20.0, Some(0))] {
+            let error = f
+                .spawn
+                .run(&covered(&f, "Refused size.", percent, window))
+                .unwrap_err();
+            assert!(!format!("{error:#}").is_empty());
+        }
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+        assert!(f
+            .persona(&super::super::name_for(super::super::text_handle(
+                "Refused size."
+            )))
+            .is_none());
+    }
+
+    #[test]
+    fn a_codex_window_comes_from_its_catalog_when_a_model_is_named() {
+        let f = fixture();
+        std::fs::write(
+            f.directory.path().join("codex-models.json"),
+            r#"{"fetched_at":"2026-10-02T16:49:47Z","models":[
+                {"slug":"gpt-5.5","context_window":272000,"effective_context_window_percent":95}]}"#,
+        )
+        .unwrap();
+        let spawn = f.relaunch(|launch| launch.codex_model = Some("gpt-5.5".to_owned()));
+        let mut request = covered(&f, "Codex sized.", 20.0, None);
+        request.provider = Provider::Codex;
+        let cover = spawn.run(&request).unwrap().cover.unwrap();
+        assert_eq!(cover.window, Some(258_400));
+        assert!(cover.window_source.contains("codex model catalog"));
+        let calibration = cover.calibration.unwrap();
+        assert_eq!(calibration.n, None);
+        assert_eq!(calibration.chars_per_token, cover::DEFAULT_CHARS_PER_TOKEN);
+    }
+
+    #[test]
+    fn a_claude_result_records_its_window_and_first_call_and_a_later_cover_uses_it() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("First claude run.")).unwrap();
+        let session = "e0bf4238-7a93-4604-be3f-a4ddb456d86b";
+        std::fs::write(
+            &launched.report,
+            format!(
+                r#"{{"type":"result","subtype":"success","is_error":false,"result":"the report\n","session_id":"{session}","modelUsage":{{"claude-opus-5-5":{{"inputTokens":2,"contextWindow":1000000}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let project = f.directory.path().join("claude-projects/-lane");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{session}.jsonl")),
+            concat!(
+                r#"{"type":"user","message":{"content":"x"}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":192066,"cache_read_input_tokens":11266}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        f.settle(&launched.name, &launched).unwrap();
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert_eq!(run.report_text.as_deref(), Some("the report\n"));
+        assert_eq!(run.context_window, [1_000_000]);
+        assert_eq!(run.first_call_input_tokens, [203_334]);
+        let later = f
+            .spawn
+            .run(&covered(&f, "Second claude run.", 20.0, None))
+            .unwrap();
+        let cover = later.cover.unwrap();
+        assert_eq!(cover.window, Some(1_000_000));
+        assert!(
+            cover.window_source.contains(&format!("{:x}", launched.run)),
+            "{}",
+            cover.window_source
+        );
+    }
+
+    #[test]
+    fn a_claude_report_that_is_not_a_result_object_is_recorded_as_it_is() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Plain report.")).unwrap();
+        std::fs::write(&launched.report, "plain words\n").unwrap();
+        f.settle(&launched.name, &launched).unwrap();
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert_eq!(run.report_text.as_deref(), Some("plain words\n"));
+        assert!(run.context_window.is_empty() && run.first_call_input_tokens.is_empty());
+    }
+
+    #[test]
+    fn a_requests_cover_percent_reaches_the_run_it_starts() {
+        let f = fixture();
+        let requested = f
+            .spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Brief("Requested size.".to_owned()),
+                host: None,
+                host_label: None,
+                provider: Provider::Claude,
+                effort: "high".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+                cover_percent: Some(20.0),
+            })
+            .unwrap();
+        assert_eq!(f.request_view(requested.request).cover_percent, [20.0]);
+        f.keep();
+        let run = f.spawn.show(&requested.name).unwrap().runs[0].clone();
+        assert!(
+            run.cover_sizing
+                .first()
+                .is_some_and(|text| text.starts_with("cover 20%")),
+            "{:?}",
+            run.cover_sizing
+        );
     }
 
     #[test]
@@ -5207,12 +6032,48 @@ mod tests {
                 about: about.to_owned(),
                 scores: None,
             };
-            renderer.wake(&f.storage, Some(&tint)).unwrap()
+            renderer
+                .wake(&f.storage, Some(&tint), PLAIN_MEMORY_CHARS)
+                .unwrap()
         };
         let tinted = wake("amber lamp piano");
         assert!(tinted.contains(amber) && !tinted.contains(walk), "{tinted}");
         let tinted = wake("walk Weser rain");
         assert!(tinted.contains(walk) && !tinted.contains(amber), "{tinted}");
+        // With no memory budget the wake is beliefs and goals alone: how a
+        // --cover launch measures them.
+        let fixed = renderer.wake(&f.storage, None, 0).unwrap();
+        assert!(fixed.contains("Beliefs (cover):"), "{fixed}");
+        assert!(!fixed.contains(amber) && !fixed.contains(walk), "{fixed}");
+    }
+
+    #[test]
+    fn a_codex_runs_rollout_records_its_first_call_and_window() {
+        let f = fixture();
+        let mut request = f.request("Codex settled.");
+        request.provider = Provider::Codex;
+        let launched = f.spawn.run(&request).unwrap();
+        let sessions = launched
+            .report
+            .with_extension("codex")
+            .join("sessions/2026/11/20");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout-x.jsonl"),
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":27750,"cached_input_tokens":11392}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(&launched.report, "codex's last message\n").unwrap();
+        f.settle(&launched.name, &launched).unwrap();
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert_eq!(run.report_text.as_deref(), Some("codex's last message\n"));
+        assert_eq!(run.context_window, [258_400]);
+        assert_eq!(run.first_call_input_tokens, [27_750]);
     }
 
     #[test]
@@ -5270,7 +6131,7 @@ mod tests {
             "{script}"
         );
         assert!(script.contains("--strict-mcp-config"));
-        assert!(script.contains("--output-format text < "));
+        assert!(script.contains("--output-format json < "));
     }
 
     #[test]
@@ -5341,7 +6202,7 @@ mod tests {
             .join(format!("{}.settings.json", launched.name));
         assert!(
             script.contains(&format!(
-                "--mcp-config {} --settings {} --output-format text",
+                "--mcp-config {} --settings {} --output-format json",
                 f.directory
                     .path()
                     .join("state")
@@ -6155,6 +7016,7 @@ mod tests {
             effort: "high".to_owned(),
             spawner: "agent-cc".to_owned(),
             provider: Provider::Claude,
+            cover: CoverWish::default(),
         };
         let launched = f.spawn.goal(&request).unwrap();
         let view = f.spawn.show(&launched.name).unwrap();

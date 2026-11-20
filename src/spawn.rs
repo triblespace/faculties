@@ -13,6 +13,7 @@
 
 pub mod cli;
 pub mod colony;
+pub mod cover;
 pub mod drive_task;
 pub mod mcp;
 pub mod operations;
@@ -22,7 +23,7 @@ pub use colony::{
     ParentSource, ParentView,
 };
 pub use operations::{
-    choose_provider, inbox_failure, keep_lock_path, GoalRequest, InboxAnswer, InboxHook,
+    choose_provider, inbox_failure, keep_lock_path, CoverWish, GoalRequest, InboxAnswer, InboxHook,
     InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig, Launched, Launcher,
     LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested, RunRequest, RunView,
     SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidRef,
@@ -166,6 +167,9 @@ pub struct RunFacts {
     pub untinted: Option<String>,
     /// The request this run serves, when a keeper started it.
     pub request: Option<Id>,
+    /// How the cover was sized, when the launch asked for a share of the
+    /// context window (`--cover`).
+    pub cover: Option<cover::CoverRecord>,
 }
 
 /// A run: the spawn and start time as its intrinsic core, the rest as
@@ -211,7 +215,42 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::model_unset?: model_unset,
         attrs::request?: run.request,
     };
+    if let Some(cover) = &run.cover {
+        fragment += cover_fragment(id, cover);
+    }
     (fragment, id)
+}
+
+/// How a run's cover was sized, annotating the run.
+pub fn cover_fragment(run: Id, cover: &cover::CoverRecord) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let source = fragment.put::<UTF8String, _>(cover.window_source.clone());
+    let summary = fragment.put::<UTF8String, _>(cover.summary.clone());
+    let reduction = cover
+        .reduction
+        .as_ref()
+        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
+    let calibration = cover.calibration.as_ref();
+    let basis =
+        calibration.map(|calibration| fragment.put::<UTF8String, _>(calibration.basis.clone()));
+    let count = |value: Option<usize>| value.map(|value| value as u64);
+    fragment += entity! { ExclusiveId::force_ref(&run) @
+        attrs::cover_percent: cover.percent,
+        attrs::window?: cover.window,
+        attrs::window_source: source,
+        attrs::chars_per_token?: calibration.map(|calibration| calibration.chars_per_token),
+        attrs::chars_per_token_n?: calibration.and_then(|calibration| calibration.n),
+        attrs::chars_per_token_basis?: basis,
+        attrs::cover_target_chars?: count(cover.target_chars),
+        attrs::fixed_chars?: count(cover.fixed_chars),
+        attrs::memory_budget: cover.memory_budget as u64,
+        attrs::cover_chars: cover.cover_chars as u64,
+        attrs::prompt_tokens_estimate?: cover.estimate,
+        attrs::headroom?: cover.headroom,
+        attrs::cover_reduction?: reduction,
+        attrs::cover_sizing: summary,
+    };
+    fragment
 }
 
 /// What a run request says. It names no workdir, command, tool or budget:
@@ -226,6 +265,9 @@ pub struct RequestFacts {
     pub effort: String,
     pub previous: Option<Id>,
     pub handoff: Option<String>,
+    /// The cover share asked for (`--cover`), carried like the provider and
+    /// effort. Absent keeps the identity a request had before it existed.
+    pub cover_percent: Option<f64>,
     pub requested_at: IntervalValue,
     /// The persona that asked, messaged when the run ends. A reply route,
     /// not authority: authority is the COMMIT signer's WRITE admission.
@@ -251,6 +293,7 @@ pub fn request_fragment(request: &RequestFacts) -> (Fragment, Id) {
         attrs::effort: effort,
         attrs::previous?: request.previous,
         attrs::handoff?: handoff,
+        attrs::cover_percent?: request.cover_percent,
         metadata::created_at: request.requested_at,
     };
     let id = core.root().expect("a request has one intrinsic root");
@@ -415,6 +458,15 @@ pub fn vibe_usage(export: &str) -> Result<Usage> {
     Ok(usage)
 }
 
+/// What the provider itself reported about a run's context, read at
+/// settlement: the window for its model, and the input tokens of its first
+/// model call (overhead, prompt and cover in one total).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reported {
+    pub context_window: Option<u64>,
+    pub first_call_input_tokens: Option<u64>,
+}
+
 /// The end of a run, annotating the run itself. `report` is a hosted run's
 /// final reply, or a local run's closing message when it left one; both are
 /// recorded as the run's `report`.
@@ -424,6 +476,7 @@ pub fn settlement_fragment(
     exit: &Exit,
     report: Option<&str>,
     usage: Option<&Usage>,
+    reported: &Reported,
 ) -> (Fragment, Option<TextHandle>) {
     let mut fragment = Fragment::empty();
     let report = report.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
@@ -449,6 +502,12 @@ pub fn settlement_fragment(
             imagine_attrs::output_tokens?: usage.output_tokens,
             imagine_attrs::total_tokens?: usage.total_tokens,
             attrs::cost_usd?: usage.cost_usd,
+        };
+    }
+    if reported != &Reported::default() {
+        fragment += entity! { ExclusiveId::force_ref(&run) @
+            attrs::context_window?: reported.context_window,
+            attrs::first_call_input_tokens?: reported.first_call_input_tokens,
         };
     }
     (fragment, report)
@@ -900,6 +959,7 @@ mod tests {
             effort: "high".to_owned(),
             previous: None,
             handoff: Some("h".to_owned()),
+            cover_percent: None,
             requested_at: at(when),
             spawner: Id::new([spawner; 16]).unwrap(),
         };
@@ -908,6 +968,10 @@ mod tests {
         assert_eq!(request_fragment(&facts("other", 4, 10)).1, first);
         // A request asked at another time is another request.
         assert_ne!(request_fragment(&facts("sky", 3, 11)).1, first);
+        // A cover share is part of what a request asks for.
+        let mut covered = facts("sky", 3, 10);
+        covered.cover_percent = Some(20.0);
+        assert_ne!(request_fragment(&covered).1, first);
         let mut different = facts("sky", 3, 10);
         different.provider = "codex".to_owned();
         assert_ne!(request_fragment(&different).1, first);

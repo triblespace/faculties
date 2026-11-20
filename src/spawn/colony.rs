@@ -960,6 +960,7 @@ mod tests {
                 model_unset: Some("none".to_owned()),
                 untinted: None,
                 request: None,
+                cover: None,
             });
             Self::add(&mut self.spawn, &mut self.blobs, fragment);
             run
@@ -984,6 +985,7 @@ mod tests {
                 },
                 Some("report"),
                 None,
+                &Default::default(),
             );
             Self::add(&mut self.spawn, &mut self.blobs, fragment);
             Self::add(

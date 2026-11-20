@@ -163,5 +163,58 @@ pub mod spawn {
         /// provider's bill. Recorded at settlement (`mistral`, from vibe's
         /// `export.json`). Minted with `trible genid` on 2026-11-17.
         "26501A21D1CA70A5C8ADE843317A9D22" as cost_usd: inlineencodings::F64;
+        /// The share of the worker's context window, in percent, asked for
+        /// the whole cover (memories, beliefs, goals): a best-effort wish,
+        /// not an allocation (`spawn run --cover`). On a run and on a
+        /// request. Minted with `trible genid` on 2026-11-20, like every
+        /// attribute below.
+        "2760EF854F5B4200EE6DD3FB5C025486" as cover_percent: inlineencodings::F64;
+        /// The worker model's effective context window in tokens, as the
+        /// launch sized the cover against it.
+        "A669BF2422A02CD0A0615775AB1D1637" as window: inlineencodings::U256BE;
+        /// Where [`window`] came from: the `--window` flag, the provider's
+        /// own configuration, or a value recorded from an earlier run (with
+        /// its date). When no source gave one, why not.
+        "A11B538EA9D1D4F2363B1F07379F4775" as window_source: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The characters-per-token estimate the launch converted with. An
+        /// estimate, not a count.
+        "4E184BB4C14254B12CF22C62944B8937" as chars_per_token: inlineencodings::F64;
+        /// How many measured runs [`chars_per_token`] rests on. Absent for a
+        /// stated default.
+        "7F3CB1F3E6C55E676AF0271AD23BCBC5" as chars_per_token_n: inlineencodings::U256BE;
+        /// What [`chars_per_token`] is: which measurement, or that it is a
+        /// default for a model with no calibration.
+        "04848666DB77C23FB4AA0717267DD642" as chars_per_token_basis: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The whole cover's target in characters: [`cover_percent`] of
+        /// [`window`], converted at [`chars_per_token`].
+        "19A16D1E322B1438D983CDE566780B80" as cover_target_chars: inlineencodings::U256BE;
+        /// The memory characters the cover was rendered with.
+        "C0F0039FA7720E7865E87C12E07045A3" as memory_budget: inlineencodings::U256BE;
+        /// The characters of the rendered wake: memories, beliefs, goals.
+        "00688FBD690AFBD0ADD4CCBF10C56244" as cover_chars: inlineencodings::U256BE;
+        /// The characters of the wake rendered with no memory budget: the
+        /// beliefs and goals, which always render whole.
+        "06802B5A38B326C85E72B7A85E143CCC" as fixed_chars: inlineencodings::U256BE;
+        /// The estimated tokens of the whole opening prompt, the provider's
+        /// harness overhead included. An estimate.
+        "728DC3993E9CF20275552F36637DCA16" as prompt_tokens_estimate: inlineencodings::U256BE;
+        /// The fraction of [`window`] the launch left for the work when it
+        /// checked the estimate against the window.
+        "DDFD4ABA01A3FBD1C19093DC2CFC8D2E" as headroom: inlineencodings::F64;
+        /// Why and how the memory part was rendered again with a smaller
+        /// budget: the first budget and estimate, the second, and whether
+        /// even that is estimated not to fit.
+        "32CA9ABDC02633289E1D46F01356C1F2" as cover_reduction: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The cover sizing in words, as the launch printed it.
+        "0C2D920B25D94AAC4BF00E9B9C967E8D" as cover_sizing: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The context window the provider itself reported for the run's
+        /// model, recorded at settlement (claude's result, codex's rollout).
+        /// A later launch of the same provider and model may size against it.
+        "4C6F000230728ED25E33E3DC15BE3C03" as context_window: inlineencodings::U256BE;
+        /// The input tokens of the run's first model call as the provider
+        /// reported them, cached and uncached together: harness overhead,
+        /// prompt and cover in one total, not a count of the cover.
+        /// Recorded at settlement.
+        "A77C832D269A2AEEAB5E3A2CF5C2BCC7" as first_call_input_tokens: inlineencodings::U256BE;
     }
 }

@@ -8,7 +8,9 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 
 use super::operations::{render_list, render_requests, render_show};
-use super::{GoalRequest, LaunchConfig, Launched, Provider, RequestInput, RunRequest, ZooidRef};
+use super::{
+    CoverWish, GoalRequest, LaunchConfig, Launched, Provider, RequestInput, RunRequest, ZooidRef,
+};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 
@@ -16,17 +18,17 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "spawn_run",
         description: "Start a task zooid on the MCP server's host: a headless agent session (Claude by default) in its own systemd user unit that outlives the caller. The brief text is the prompt, verbatim, and names the zooid (its hash as two proquints); an identical brief relaunches the same zooid once its last run settled, and refuses while it is still running. The zooid wakes into the shared self plus recollection chosen for the brief. When it exits, its report is recorded and the spawner is messaged by the zooid. Returns the zooid's name.",
-        input_schema: r#"{"type":"object","properties":{"brief":{"type":"string","minLength":1,"description":"The whole brief as text."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"],"description":"The agent. mistral runs Mistral Large 4 through vibe and bills money per token, capped per run; it is only used when named. auto picks whichever of claude and codex the latest fresh quota readings show with the most headroom, never mistral; local runs the host's own executor, configured by SPAWN_LOCAL_EXECUTOR (an argv template with {prompt}, {message}, {name}, {effort}, {script} and {runtime}; it reads the prompt on stdin and may write the zooid's closing message to the {message} file, which is optional), and is refused on a host without one, never falling back to a hosted model; SPAWN_LOCAL_MAX_RUNTIME (seconds) optionally bounds a local unit, and a run stopped by it settles as a failure. Default claude."}},"required":["brief","workdir","spawner"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"brief":{"type":"string","minLength":1,"description":"The whole brief as text."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"],"description":"The agent. mistral runs Mistral Large 4 through vibe and bills money per token, capped per run; it is only used when named. auto picks whichever of claude and codex the latest fresh quota readings show with the most headroom, never mistral; local runs the host's own executor, configured by SPAWN_LOCAL_EXECUTOR (an argv template with {prompt}, {message}, {name}, {effort}, {script} and {runtime}; it reads the prompt on stdin and may write the zooid's closing message to the {message} file, which is optional), and is refused on a host without one, never falling back to a hosted model; SPAWN_LOCAL_MAX_RUNTIME (seconds) optionally bounds a local unit, and a run stopped by it settles as a failure. Default claude."},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Best effort: beliefs and goals render whole, so the cover may come out larger; the sizing is returned and recorded. Omitted: the plain cover of 240,000 memory characters."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["brief","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
         name: "spawn_goal",
         description: "Start a task zooid for a Compass goal, like spawn_run, with the brief rendered from the goal's current revision: its title, its parent chain, its latest notes, and the zooid's authority to note, move and check off that goal itself. The spawn records the goal and the revision, and the zooid notes its launch on the goal; nothing moves the goal when the zooid exits. A new note on the goal makes a new brief and so a new zooid. Returns the zooid's name.",
-        input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Best effort: beliefs and goals render whole, so the cover may come out larger; the sizing is returned and recorded. Omitted: the plain cover of 240,000 memory characters."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
         name: "spawn_request",
         description: "Ask one host's keeper to start a run of a zooid there, by writing a run request into the spawn collection, which syncs like any other. Name an existing zooid, or give a new brief. The request names no workdir, command or budget: the target host resolves those and records accepted, running, refused or task-terminal. local is refused by a host whose SPAWN_LOCAL_EXECUTOR is unset; nothing falls back to a hosted model. mistral is refused too: it spends money, and a request runs unattended; only spawn_run may choose it. A request with a handoff is refused by today's keeper, which has no disclosure check; every reader of the spawn collection can read a handoff. Returns the request id.",
-        input_schema: r#"{"type":"object","properties":{"zooid":{"type":"string","minLength":1,"description":"An existing zooid's name."},"brief":{"type":"string","minLength":1,"description":"A new zooid's whole brief, as text."},"host":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"The target host's node key. Default: the MCP server's host."},"host_label":{"type":"string","minLength":1,"description":"A readable name beside the key."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The asking persona, messaged when the run ends."},"previous":{"type":"string","description":"The run this one continues (hex id), for a move."},"handoff":{"type":"string","description":"Text delivered once, after the brief."}},"required":["spawner"],"additionalProperties":false}"#,
+        input_schema: r#"{"type":"object","properties":{"zooid":{"type":"string","minLength":1,"description":"An existing zooid's name."},"brief":{"type":"string","minLength":1,"description":"A new zooid's whole brief, as text."},"host":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"The target host's node key. Default: the MCP server's host."},"host_label":{"type":"string","minLength":1,"description":"A readable name beside the key."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The asking persona, messaged when the run ends."},"previous":{"type":"string","description":"The run this one continues (hex id), for a move."},"handoff":{"type":"string","description":"Text delivered once, after the brief."},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent (best effort). The target host finds the window."}},"required":["spawner"],"additionalProperties":false}"#,
     },
     Tool {
         name: "spawn_requests",
@@ -55,6 +57,10 @@ struct Run {
     spawner: String,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    cover_percent: Option<f64>,
+    #[serde(default)]
+    window: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +75,10 @@ struct Goal {
     spawner: String,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    cover_percent: Option<f64>,
+    #[serde(default)]
+    window: Option<u64>,
 }
 
 fn provider(name: Option<&str>) -> Result<Provider> {
@@ -93,6 +103,9 @@ fn launched_line(launched: &Launched) -> String {
     }
     if let Some(why) = &launched.untinted {
         line.push_str(&format!("\nrecollection untinted: {why}"));
+    }
+    if let Some(cover) = &launched.cover {
+        line.push_str(&format!("\ncover sizing: {}", cover.summary));
     }
     for warning in &launched.warnings {
         line.push_str(&format!("\nwarning: {warning}"));
@@ -120,6 +133,8 @@ struct Request {
     previous: Option<String>,
     #[serde(default)]
     handoff: Option<String>,
+    #[serde(default)]
+    cover_percent: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +208,10 @@ impl Faculty for Spawn {
                     effort: args.effort.unwrap_or_else(|| "high".to_owned()),
                     spawner: args.spawner,
                     provider,
+                    cover: CoverWish {
+                        percent: args.cover_percent,
+                        window: args.window,
+                    },
                 })?;
                 out.line(launched_line(&launched))
             }
@@ -206,6 +225,10 @@ impl Faculty for Spawn {
                     effort: args.effort.unwrap_or_else(|| "high".to_owned()),
                     spawner: args.spawner,
                     provider,
+                    cover: CoverWish {
+                        percent: args.cover_percent,
+                        window: args.window,
+                    },
                 })?;
                 out.line(launched_line(&launched))
             }
@@ -239,6 +262,7 @@ impl Faculty for Spawn {
                     spawner: args.spawner,
                     previous,
                     handoff: args.handoff,
+                    cover_percent: args.cover_percent,
                 })?;
                 out.line(format!(
                     "request {:x}: {} on host {}{}; its keeper starts it in {}",

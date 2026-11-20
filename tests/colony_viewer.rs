@@ -129,6 +129,7 @@ impl Fixture {
                 model_unset: None,
                 untinted: None,
                 request: None,
+                cover: None,
             });
             workers += start;
             if index == 1 {
@@ -141,6 +142,7 @@ impl Fixture {
                     },
                     Some("Complete"),
                     None,
+                    &Default::default(),
                 )
                 .0;
                 let (envelope, message_id) = message::message_fragment(
@@ -361,6 +363,7 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
         effort: "medium".into(),
         previous: None,
         handoff: None,
+        cover_percent: None,
         requested_at: clock::point_now().unwrap(),
         spawner: genid().id,
     })
