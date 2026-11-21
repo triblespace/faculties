@@ -240,6 +240,10 @@ impl Wiki {
     pub fn import_texts(&self, documents: Vec<ImportDocument>, tags: &[String]) -> Result<Vec<Id>> {
         cmd_import(self.storage(), documents, tags.to_vec())
     }
+    /// Replay a translated foreign history; see [`ImportPlan`].
+    pub fn import_plan(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
+        cmd_import_plan(self.storage(), plan, tags.to_vec())
+    }
     pub fn export_all(&self) -> Result<Vec<(Id, String)>> {
         cmd_batch_export(self.storage())
     }
@@ -1784,6 +1788,290 @@ fn cmd_import(
     Ok(ids)
 }
 
+/// A translated foreign history (a Gollum git repository, say), replayed as
+/// Wiki revisions by the importer.
+///
+/// Commits come in topological order, and inside one commit attachments come
+/// before revisions. Keys are plan-local names: a revision key names one
+/// revision, a page key the page across renames, an attachment key one file.
+/// Nothing stores a key. Every revision id is a pure function of the plan and
+/// the importer's key, so replaying the plan converges.
+#[derive(Clone, Debug, Default)]
+pub struct ImportPlan {
+    /// The Files id of the exact source bundle every provenance record cites.
+    pub bundle: Option<Id>,
+    pub commits: Vec<PlanCommit>,
+}
+
+/// One source commit and what it changed.
+#[derive(Clone, Debug)]
+pub struct PlanCommit {
+    pub commit: String,
+    /// The source's own author string, kept as text: never a Relations person.
+    pub author: String,
+    /// The source's own author date. It is source provenance, not the
+    /// importer's publication time.
+    pub authored_at: Option<Inline<inlineencodings::NsTAIInterval>>,
+    pub attachments: Vec<PlanAttachment>,
+    pub revisions: Vec<PlanRevision>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanAttachment {
+    pub key: String,
+    /// Path in the source tree.
+    pub path: String,
+    pub media_type: String,
+    pub bytes: anybytes::Bytes,
+}
+
+/// One page state at one commit. `content` may name earlier plan pages and
+/// attachments as `#link("plan:<key>")`.
+#[derive(Clone, Debug)]
+pub struct PlanRevision {
+    pub key: String,
+    pub page: String,
+    /// Path in the source tree.
+    pub path: String,
+    pub title: String,
+    pub content: String,
+    /// Revision keys of the source parents' states of this page.
+    pub predecessors: Vec<String>,
+}
+
+/// What one plan run published. A replay of a completed plan reports zero
+/// of everything new and zero publications.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanReport {
+    /// Every plan revision key with its revision id, in plan order.
+    pub revisions: Vec<(String, Id)>,
+    pub new_revisions: usize,
+    pub new_provenance: usize,
+    pub new_files: usize,
+    pub publications: usize,
+}
+
+/// Structural checks before anything is staged: unique keys, predecessors
+/// that come earlier on the same page, and no key naming two things.
+fn check_plan(plan: &ImportPlan) -> Result<()> {
+    let mut revision_pages: HashMap<&str, &str> = HashMap::new();
+    let mut attachments: BTreeSet<&str> = BTreeSet::new();
+    let mut pages: BTreeSet<&str> = BTreeSet::new();
+    for commit in &plan.commits {
+        for attachment in &commit.attachments {
+            if pages.contains(attachment.key.as_str()) {
+                bail!(
+                    "plan key '{}' names both a page and an attachment",
+                    attachment.key
+                );
+            }
+            attachments.insert(&attachment.key);
+        }
+        for revision in &commit.revisions {
+            if revision_pages.contains_key(revision.key.as_str()) {
+                bail!("plan revision key '{}' appears twice", revision.key);
+            }
+            if attachments.contains(revision.page.as_str()) {
+                bail!(
+                    "plan key '{}' names both a page and an attachment",
+                    revision.page
+                );
+            }
+            for predecessor in &revision.predecessors {
+                match revision_pages.get(predecessor.as_str()) {
+                    None => bail!(
+                        "plan revision '{}' names predecessor '{predecessor}', which no earlier revision defines",
+                        revision.key
+                    ),
+                    Some(page) if *page != revision.page => bail!(
+                        "plan revision '{}' on page '{}' names predecessor '{predecessor}' on page '{page}'",
+                        revision.key,
+                        revision.page
+                    ),
+                    Some(_) => {}
+                }
+            }
+            revision_pages.insert(&revision.key, &revision.page);
+            pages.insert(&revision.page);
+        }
+    }
+    Ok(())
+}
+
+/// Replace every `#link("plan:<key>")` with the page's latest revision so
+/// far in the plan, or the attachment's content handle. A key the plan has
+/// not reached yet fails loudly: content-derived ids cannot point forward,
+/// so the plan breaks such a link with an extra revision.
+fn resolve_plan_links(
+    content: &str,
+    pages: &HashMap<String, Id>,
+    attachments: &HashMap<String, String>,
+    revision: &str,
+) -> Result<String> {
+    static PLAN_LINK: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PLAN_LINK.get_or_init(|| regex::Regex::new(r#"#link\("plan:([^"]+)"\)"#).unwrap());
+    let mut missing = None;
+    let resolved = re.replace_all(content, |captures: &regex::Captures| {
+        let key = &captures[1];
+        if let Some(id) = pages.get(key) {
+            format!("#link(\"wiki:{id:x}\")")
+        } else if let Some(hash) = attachments.get(key) {
+            format!("#link(\"files:{hash}\")")
+        } else {
+            missing.get_or_insert_with(|| key.to_owned());
+            captures[0].to_owned()
+        }
+    });
+    if let Some(key) = missing {
+        bail!(
+            "plan revision '{revision}' links plan key '{key}', which no earlier page or attachment defines"
+        );
+    }
+    Ok(resolved.into_owned())
+}
+
+fn cmd_import_plan(
+    storage: WikiStorage<'_>,
+    plan: ImportPlan,
+    tags: Vec<String>,
+) -> Result<PlanReport> {
+    check_plan(&plan)?;
+    let (wiki_facts, files_facts, known_files, tags, tag_fragment) =
+        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+            let mut fragment = Fragment::empty();
+            let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
+            let known_files: BTreeSet<Id> = find!(
+                id: Id,
+                pattern!(files, [{ ?id @ metadata::tag: &KIND_FILE }])
+            )
+            .collect();
+            Ok((
+                view.facts.clone(),
+                files.clone(),
+                known_files,
+                tags,
+                fragment,
+            ))
+        })?;
+    if let Some(bundle) = plan.bundle {
+        if !known_files.contains(&bundle) {
+            bail!("plan bundle {bundle:x} names no cataloged file");
+        }
+    }
+    let known_revisions = all_selectors(&wiki_facts);
+    let known_provenance: BTreeSet<Id> = find!(
+        id: Id,
+        pattern!(&wiki_facts, [{ ?id @ metadata::tag: &schema::KIND_SOURCE_PROVENANCE }])
+    )
+    .collect();
+    let (author_fragment, author) = storage.author_fragment()?;
+    let tag_list: Vec<Id> = tags.iter().copied().collect();
+    let files = crate::files::Files::with_storage(storage.storage.clone());
+
+    let mut report = PlanReport::default();
+    let mut revisions: HashMap<String, Id> = HashMap::new();
+    let mut pages: HashMap<String, Id> = HashMap::new();
+    let mut attachments: HashMap<String, String> = HashMap::new();
+    let mut staged_files = BTreeSet::new();
+    let mut staged_revisions = BTreeSet::new();
+    let mut staged_provenance = BTreeSet::new();
+    let mut pending_tags = Some(tag_fragment);
+    for commit in &plan.commits {
+        // Attachments first, in their own Files commit, so a page that links
+        // one names a cataloged file. A file already cataloged gets no new
+        // import occurrence: replaying is not importing the bytes again.
+        let mut files_fragment = Fragment::empty();
+        for attachment in &commit.attachments {
+            let staged = crate::files::stage(
+                attachment.bytes.clone(),
+                crate::files::leaf_name(&attachment.path),
+                &attachment.media_type,
+            )?;
+            let file_id = staged.root().expect("a staged file has one root");
+            let content = find!(
+                content: ContentHandle,
+                pattern!(staged.facts(), [{ file_id @ file::content: ?content }])
+            )
+            .next()
+            .context("staged file content")?;
+            attachments.insert(attachment.key.clone(), content_hash_hex(content));
+            if !known_files.contains(&file_id) && staged_files.insert(file_id) {
+                let source_path: schema::TextHandle =
+                    files_fragment.put(format!("{}:{}", commit.commit, attachment.path));
+                files_fragment += staged;
+                files_fragment += entity! {
+                    metadata::tag: &crate::schemas::files::KIND_IMPORT,
+                    file::root: &file_id,
+                    file::imported_at: now_interval()?,
+                    file::source_path: source_path,
+                };
+                report.new_files += 1;
+            }
+        }
+        if !files_fragment.facts().is_empty() {
+            files.publish(files_fragment).with_context(|| {
+                format!("publish attachments of source commit {}", commit.commit)
+            })?;
+            report.publications += 1;
+        }
+
+        let mut fragment = pending_tags.take().unwrap_or_else(Fragment::empty);
+        for revision in &commit.revisions {
+            wiki_model::check_revision_inputs(&revision.title, &tags)?;
+            let content = prepare_content(&revision.content, &wiki_facts, Some(&files_facts), true)
+                .with_context(|| format!("plan revision '{}'", revision.key))?;
+            let content = resolve_plan_links(&content, &pages, &attachments, &revision.key)?;
+            let predecessors: Vec<Id> = revision
+                .predecessors
+                .iter()
+                .map(|key| revisions[key])
+                .collect();
+            let record = schema::revision_fragment(
+                author,
+                &revision.title,
+                &content,
+                &tag_list,
+                &predecessors,
+            );
+            let id = record.root().expect("revision has one intrinsic root");
+            // The authorship observation carries the importer's publication
+            // time, so it is written once: a revision already present was
+            // already published.
+            if !known_revisions.contains(&id) && staged_revisions.insert(id) {
+                fragment += author_fragment.clone();
+                fragment += record;
+                fragment += schema::authorship_fragment(id, Some(author), Some(now_interval()?))
+                    .expect("native authorship is non-empty");
+                report.new_revisions += 1;
+            }
+            let provenance = schema::source_provenance_fragment(
+                id,
+                &commit.commit,
+                &revision.path,
+                &commit.author,
+                commit.authored_at,
+                plan.bundle,
+            );
+            let provenance_id = provenance.root().expect("provenance has one root");
+            if !known_provenance.contains(&provenance_id) && staged_provenance.insert(provenance_id)
+            {
+                fragment += provenance;
+                report.new_provenance += 1;
+            }
+            revisions.insert(revision.key.clone(), id);
+            pages.insert(revision.page.clone(), id);
+            report.revisions.push((revision.key.clone(), id));
+        }
+        if !fragment.facts().is_empty() {
+            storage
+                .publish(fragment)
+                .with_context(|| format!("publish revisions of source commit {}", commit.commit))?;
+            report.publications += 1;
+        }
+    }
+    Ok(report)
+}
+
 fn search_hits(
     storage: WikiStorage<'_>,
     query: &str,
@@ -2322,6 +2610,10 @@ mod typst_validate {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod plan_tests;
 
 #[cfg(test)]
 mod tests {

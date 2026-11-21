@@ -1,6 +1,8 @@
 //! Wiki command-line UX: Clap, host paths, and @file/@- expansion live here.
 
-use super::operations::{ImportDocument, ListOptions, Wiki};
+use super::operations::{
+    ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit, PlanRevision, Wiki,
+};
 use crate::out::Out;
 use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
@@ -144,7 +146,12 @@ enum Command {
         command: TagCommand,
     },
     Import {
-        path: PathBuf,
+        #[arg(required_unless_present = "plan")]
+        path: Option<PathBuf>,
+        /// Replay a translated foreign history from a JSON plan instead; see
+        /// `ImportPlan`. Content and attachment paths are relative to the plan.
+        #[arg(long, conflicts_with = "path")]
+        plan: Option<PathBuf>,
         #[arg(long)]
         tag: Vec<String>,
     },
@@ -305,7 +312,17 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 name.trim().to_ascii_lowercase()
             )),
         },
-        Command::Import { path, tag } => import(&wiki, &path, &tag, out),
+        Command::Import {
+            plan: Some(plan),
+            tag,
+            ..
+        } => import_plan(&wiki, &plan, &tag, out),
+        Command::Import { path, tag, .. } => import(
+            &wiki,
+            &path.expect("clap requires a path without --plan"),
+            &tag,
+            out,
+        ),
         Command::Search {
             query,
             context,
@@ -385,4 +402,152 @@ fn import(wiki: &Wiki, path: &Path, tags: &[String], out: &mut Out<'_>) -> Resul
         out.line(format!("{id:x}  {}", path.display()))?;
     }
     Ok(())
+}
+
+/// The plan file: plain JSON, every path relative to the plan's directory.
+///
+/// ```json
+/// { "bundle": "<32-hex Files id of the git bundle>",
+///   "commits": [ { "commit": "<sha>", "author": "Name <email>",
+///                  "date": "2019-03-01T10:00:00+01:00",
+///                  "attachments": [ { "key": "uploads/a.png", "path": "uploads/a.png",
+///                                     "file": "blobs/a.png", "media_type": "image/png" } ],
+///                  "revisions": [ { "key": "c1:Home", "page": "home", "path": "Home.md",
+///                                   "title": "Home", "content": "pages/c1-home.typ",
+///                                   "predecessors": [] } ] } ] }
+/// ```
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFile {
+    #[serde(default)]
+    bundle: Option<String>,
+    commits: Vec<PlanFileCommit>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFileCommit {
+    commit: String,
+    author: String,
+    #[serde(default)]
+    date: Option<String>,
+    #[serde(default)]
+    attachments: Vec<PlanFileAttachment>,
+    #[serde(default)]
+    revisions: Vec<PlanFileRevision>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFileAttachment {
+    /// Defaults to `path`.
+    #[serde(default)]
+    key: Option<String>,
+    path: String,
+    file: PathBuf,
+    /// Inferred from `path` when absent.
+    #[serde(default)]
+    media_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFileRevision {
+    key: String,
+    page: String,
+    path: String,
+    title: String,
+    content: PathBuf,
+    #[serde(default)]
+    predecessors: Vec<String>,
+}
+
+/// An RFC 3339 source date (git's `%aI`) as a point interval; the offset only
+/// locates the instant, and the exact original stays in the source bundle.
+pub(crate) fn parse_source_date(
+    raw: &str,
+) -> Result<triblespace::prelude::Inline<triblespace::prelude::inlineencodings::NsTAIInterval>> {
+    use chrono::{Datelike, Timelike};
+    let at = chrono::DateTime::parse_from_rfc3339(raw)
+        .with_context(|| format!("source date '{raw}' is not RFC 3339"))?
+        .with_timezone(&chrono::Utc);
+    let epoch = hifitime::Epoch::maybe_from_gregorian_utc(
+        at.year(),
+        at.month() as u8,
+        at.day() as u8,
+        at.hour() as u8,
+        at.minute() as u8,
+        at.second() as u8,
+        at.nanosecond(),
+    )
+    .map_err(|error| anyhow!("source date '{raw}': {error}"))?;
+    crate::clock::point(epoch)
+}
+
+/// Read a plan file and everything it names into a resident [`ImportPlan`].
+pub(crate) fn read_plan(path: &Path) -> Result<ImportPlan> {
+    let text = fs::read_to_string(path).with_context(|| format!("read plan {}", path.display()))?;
+    let file: PlanFile =
+        serde_json::from_str(&text).with_context(|| format!("parse plan {}", path.display()))?;
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let bundle = file
+        .bundle
+        .map(|raw| {
+            Id::from_hex(raw.trim())
+                .ok_or_else(|| anyhow!("plan bundle '{raw}' is not a 32-hex Files id"))
+        })
+        .transpose()?;
+    let mut commits = Vec::with_capacity(file.commits.len());
+    for commit in file.commits {
+        let authored_at = commit.date.as_deref().map(parse_source_date).transpose()?;
+        let mut attachments = Vec::with_capacity(commit.attachments.len());
+        for attachment in commit.attachments {
+            let source = base.join(&attachment.file);
+            let bytes = fs::read(&source).with_context(|| format!("read {}", source.display()))?;
+            attachments.push(PlanAttachment {
+                key: attachment.key.unwrap_or_else(|| attachment.path.clone()),
+                media_type: attachment.media_type.unwrap_or_else(|| {
+                    crate::files::infer_media_type(Path::new(&attachment.path)).to_owned()
+                }),
+                path: attachment.path,
+                bytes: bytes.into(),
+            });
+        }
+        let mut revisions = Vec::with_capacity(commit.revisions.len());
+        for revision in commit.revisions {
+            let source = base.join(&revision.content);
+            revisions.push(PlanRevision {
+                content: fs::read_to_string(&source)
+                    .with_context(|| format!("read {}", source.display()))?,
+                key: revision.key,
+                page: revision.page,
+                path: revision.path,
+                title: revision.title,
+                predecessors: revision.predecessors,
+            });
+        }
+        commits.push(PlanCommit {
+            commit: commit.commit,
+            author: commit.author,
+            authored_at,
+            attachments,
+            revisions,
+        });
+    }
+    Ok(ImportPlan { bundle, commits })
+}
+
+fn import_plan(wiki: &Wiki, path: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
+    let report = wiki.import_plan(read_plan(path)?, tags)?;
+    for (key, id) in &report.revisions {
+        out.line(format!("{id:x}  {key}"))?;
+    }
+    out.line(format!(
+        "{} revisions in plan: {} new revisions, {} new provenance records, {} new files, {} publications",
+        report.revisions.len(),
+        report.new_revisions,
+        report.new_provenance,
+        report.new_files,
+        report.publications,
+    ))
 }

@@ -42,6 +42,13 @@ pub const TAG_SPECS: [(Id, &str); 9] = [
 pub const KIND_REVISION: Id = id_hex!("F2442F00FB816AE01EC450AA5FFE806F");
 pub const KIND_AUTHORSHIP: Id = id_hex!("46130A9EC858D471273BAB519C6FE01A");
 
+/// Kind of a source-provenance record: where an imported revision's text came
+/// from in a foreign history (minted with `trible genid` on 2026-11-21).
+///
+/// The importer is the revision's author; the source's own author and date
+/// are observations about the source, never a Relations identity.
+pub const KIND_SOURCE_PROVENANCE: Id = id_hex!("02B3830DB64357ED4D6A6AA6ABCCF271");
+
 pub mod attrs {
     use super::*;
     attributes! {
@@ -179,6 +186,40 @@ pub fn authorship_fragment(
         metadata::created_at?: authored_at,
         metadata::tag: KIND_AUTHORSHIP,
     })
+}
+
+/// Source provenance for one imported revision: a source commit and path,
+/// the source's own author string and date, and the exact source bundle.
+///
+/// Intrinsic over all of it, so replaying the same import converges. Every
+/// attribute is reused from where it already means this: the Code faculty's
+/// git commit, the Files source path, and the archive importer's source-given
+/// author and time. The author string is source text, not a person.
+pub fn source_provenance_fragment(
+    revision: Id,
+    commit: &str,
+    path: &str,
+    source_author: &str,
+    source_authored_at: Option<Inline<inlineencodings::NsTAIInterval>>,
+    bundle: Option<Id>,
+) -> Fragment {
+    use crate::schemas::archive::import_schema;
+    use crate::schemas::code::attrs as code;
+    use crate::schemas::files::file;
+    let mut fragment = Fragment::empty();
+    let commit: TextHandle = fragment.put(commit.to_owned());
+    let path: TextHandle = fragment.put(path.to_owned());
+    let source_author: TextHandle = fragment.put(source_author.to_owned());
+    fragment += entity! {
+        metadata::tag: KIND_SOURCE_PROVENANCE,
+        attrs::revision: revision,
+        code::commit: commit,
+        file::source_path: path,
+        import_schema::source_author: source_author,
+        import_schema::source_created_at?: source_authored_at,
+        attrs::references_file?: bundle,
+    };
+    fragment
 }
 
 #[cfg(test)]

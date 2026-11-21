@@ -22,7 +22,10 @@ pub mod cli;
 pub mod mcp;
 pub mod operations;
 
-pub use operations::{Export, ImportDocument, ListOptions, Wiki};
+pub use operations::{
+    Export, ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit, PlanReport,
+    PlanRevision, Wiki,
+};
 
 use crate::storage::FactRead;
 use std::collections::{BTreeMap, BTreeSet};
@@ -522,15 +525,22 @@ pub fn author_record(key: &VerifyingKey) -> (Fragment, Id) {
     (fragment, author)
 }
 
-pub fn revision_record(draft: RevisionDraft) -> Result<(Fragment, Id)> {
-    if draft.title.trim().is_empty() {
+/// The input rules every written revision obeys: a title, and no user tag
+/// that is a reserved record kind.
+pub fn check_revision_inputs(title: &str, tags: &BTreeSet<Id>) -> Result<()> {
+    if title.trim().is_empty() {
         bail!("Wiki title must not be empty");
     }
     for reserved in [KIND_VERSION_ID, KIND_REVISION, KIND_AUTHORSHIP] {
-        if draft.tags.contains(&reserved) {
+        if tags.contains(&reserved) {
             bail!("Wiki user tags cannot use reserved record kind {reserved:x}");
         }
     }
+    Ok(())
+}
+
+pub fn revision_record(draft: RevisionDraft) -> Result<(Fragment, Id)> {
+    check_revision_inputs(&draft.title, &draft.tags)?;
     require_point("Wiki authored-at", draft.authored_at)?;
     let fragment = revision_fragment(
         draft.author,
