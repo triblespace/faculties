@@ -25,10 +25,13 @@ What becomes what:
   predecessor per distinct parent state).
 - A revision is written when a commit changes a page's bytes or path, or
   merges distinct states of it. Unchanged pages are carried, not re-stated.
-- Every other file is an attachment, keyed by its path. A version is listed
-  whenever the commit's bytes differ from what the key resolves to so far
-  in plan order, so every version reaches Files and links pin the version
+- Every other regular file is an attachment, keyed by its path. A version is
+  listed whenever the commit's bytes differ from what the key resolves to so
+  far in plan order, so every version reaches Files and links pin the version
   current at their commit.
+- A symbolic link (mode 120000) is neither: its blob is target text, so it is
+  a loss finding wherever a commit adds or retargets it, and a link to its
+  path stays text. The bundle keeps it.
 - Gollum `[[Page]]`, `[[text|Page]]`, `[[file.png|alt=..]]`, relative Markdown
   links and images become `#link("plan:KEY")[..]`. Images become links: the
   Wiki has no image embed.
@@ -40,8 +43,9 @@ What becomes what:
 Everything the plan cannot represent is a finding in report.json, with its
 commit and path. Findings marked `loss` (a construct converted lossily, a page
 deletion, two pages merged into one path, a link pinned to a concurrent
-branch's revision, a page in an unsupported markup) make `plan` refuse to
-write plan.json unless --accept-loss is given. The bundle keeps all of it.
+branch's revision, a page in an unsupported markup, a symbolic link) make
+`plan` refuse to write plan.json unless --accept-loss is given. The bundle
+keeps all of it.
 """
 
 import argparse
@@ -68,15 +72,25 @@ def git(repo, *args, binary=False):
     return p.stdout if binary else p.stdout.decode()
 
 
+SYMLINK_MODE = "120000"
+
+
 def tree(repo, commit):
-    """path -> blob sha of every file in the commit's tree."""
+    """path -> blob sha of every regular file in the commit's tree.
+
+    A symbolic link is a blob too, with mode 120000, and its blob is the link
+    target text, not file content. It goes under "\0symlink" (path -> blob),
+    never into the file map, so it can become neither a page nor an
+    attachment. Gitlinks go under "\0unsupported"."""
     out = {}
     for line in git(repo, "ls-tree", "-r", "-z", commit).split("\0"):
         if not line:
             continue
         meta, path = line.split("\t", 1)
         mode, kind, sha = meta.split()
-        if kind == "blob":
+        if kind == "blob" and mode == SYMLINK_MODE:
+            out.setdefault("\0symlink", {})[path] = sha
+        elif kind == "blob":
             out[path] = sha
         else:
             out.setdefault("\0unsupported", []).append((kind, path))
@@ -568,10 +582,20 @@ class Driver:
             t = tree(self.repo, commit)
             for kind, path in t.pop("\0unsupported", []):
                 self.finding("submodule", commit, path, f"{kind} entry not imported", True)
-            moved = {p: renames(self.repo, p, commit) for p in parents}
+            links_here = t.pop("\0symlink", {})
             parent_trees = {p: tree(self.repo, p) for p in parents}
+            parent_links = {p: parent_trees[p].pop("\0symlink", {}) for p in parents}
             for p in parent_trees:
                 parent_trees[p].pop("\0unsupported", None)
+            for path, blob in sorted(links_here.items()):
+                if not any(parent_links[p].get(path) == blob for p in parents):
+                    target = git(self.repo, "cat-file", "blob", blob, binary=True).decode("utf-8", errors="replace")
+                    self.finding("symlink", commit, path,
+                                 f"symbolic link to {target!r} not imported as a page or attachment; "
+                                 f"the bundle keeps it", True)
+            # Git pairs renames of symlinks too; neither side is ours to follow.
+            moved = {p: {new: old for new, old in renames(self.repo, p, commit).items()
+                         if new not in links_here and old not in parent_links[p]} for p in parents}
 
             pages_here = {}  # path -> (page_key, preds, needs_revision)
             for path in sorted(t):

@@ -32,6 +32,16 @@ set +e; "$G" plan "$W/repo" "$W/refused" 2>/dev/null; rc=$?; set -e
 [ $rc = 2 ] && [ ! -e "$W/refused/plan.json" ] || fail "lossy plan was not refused (rc=$rc)"
 ok "lossy plan refused without --accept-loss"
 
+# A symbolic link alone is a loss: a repository whose only loss is one is refused.
+S=$W/symlink-only; git init -q -b master "$S"
+printf '# Page\n\nSee [[Alias]].\n' > "$S/Page.md"; printf 'bytes' > "$S/data.bin"; ln -s Page.md "$S/Alias.md"
+git -C "$S" add -A; git -C "$S" -c user.name=n -c user.email=n@example.test commit -q -m symlink
+set +e; "$G" plan "$S" "$W/symlink-refused" 2>"$W/symlink-refused.err"; rc=$?; set -e
+[ $rc = 2 ] && [ ! -e "$W/symlink-refused/plan.json" ] || fail "symlink-only loss was not refused (rc=$rc)"
+[ "$(grep -c '^LOSS' "$W/symlink-refused.err")" = 1 ] && grep -q "^LOSS symlink .* Alias.md: symbolic link to 'Page.md'" "$W/symlink-refused.err" \
+  || fail "symlink-only refusal does not name exactly Alias.md"
+ok "a repository whose only loss is a symlink is refused, naming its commit and path"
+
 mkdir -p "$W/pile"
 clean "$TRIBLE" pile create "$P" >/dev/null
 clean "$TRIBLE" pile signing-key init "$P" >/dev/null
@@ -47,6 +57,12 @@ cmp -s "$W/source.bundle" "$W/back.bundle" || fail "bundle read back differs"
 git clone -q "$W/back.bundle" "$W/clone"
 [ "$(git -C "$W/clone" rev-parse master)" = "$TIP" ] || fail "clone tip differs"
 ok "bundle $BUNDLE reads back byte-exact; clone master = $TIP"
+C8=$(git -C "$W/repo" log --format=%H --grep="link aliases" master)
+for rev in "$C8" "$TIP"; do for path in Links.md uploads/logo.png; do
+  [ "$(git -C "$W/clone" ls-tree "$rev" -- "$path")" = "$(git -C "$W/repo" ls-tree "$rev" -- "$path")" ] \
+    && git -C "$W/clone" ls-tree "$rev" -- "$path" | grep -q '^120000 blob ' || fail "bundle lost symlink $path at $rev"
+done; done
+ok "the bundle keeps Links.md and uploads/logo.png as mode 120000 with their targets, at $C8 and at $TIP"
 
 "$G" plan "$W/clone" "$W/plan" --ref master --bundle-id "$BUNDLE" --accept-loss 2>"$W/plan.findings"
 "$G" plan "$W/clone" "$W/plan2" --ref master --bundle-id "$BUNDLE" --accept-loss 2>/dev/null >/dev/null
@@ -58,8 +74,8 @@ ok "plan deterministic, and the same from the Files read-back as from the origin
 w import --plan "$W/plan/plan.json" > "$W/import1.txt"
 w import --plan "$W/plan/plan.json" > "$W/import2.txt"
 tail -1 "$W/import1.txt"; tail -1 "$W/import2.txt"
-grep -q '^13 revisions in plan: 13 new revisions, 13 new provenance records, 2 new files' "$W/import1.txt" || fail "first import counts"
-grep -q '^13 revisions in plan: 0 new revisions, 0 new provenance records, 0 new files, 0 publications$' "$W/import2.txt" || fail "replay was not a no-op"
+grep -q '^14 revisions in plan: 14 new revisions, 14 new provenance records, 3 new files' "$W/import1.txt" || fail "first import counts"
+grep -q '^14 revisions in plan: 0 new revisions, 0 new provenance records, 0 new files, 0 publications$' "$W/import2.txt" || fail "replay was not a no-op"
 diff <(head -n -1 "$W/import1.txt") <(head -n -1 "$W/import2.txt") >/dev/null || fail "replay minted different ids"
 ok "replay publishes nothing and returns the same ids"
 id() { awk -v k="$1" '$2 == k {print $1}' "$W/import1.txt"; }
@@ -74,7 +90,7 @@ echo "$H" | grep -q "v3  $(id "$C3:New-Staff-Guide.md")  New Staff Guide  parent
 ok "rename is one entry: Onboarding Guide -> Onboarding Guide -> New Staff Guide"
 
 # Links name native revisions; cycles complete through fixups.
-w links | grep -q 'resolve live:        72' && w links | grep -q 'archived target:     0' && w links | grep -q 'never written:       0' || fail "link audit"
+w links | grep -q 'resolve live:        73' && w links | grep -q 'archived target:     0' && w links | grep -q 'never written:       0' || fail "link audit"
 D=$(w diff "$(id "$C3:Home.md:fixup")")
 echo "$D" | grep -q "^-.*wiki:$(id "$C2:Onboarding-Guide.md")" && echo "$D" | grep -q "^+.*wiki:$(id "$C3:New-Staff-Guide.md")" || fail "Home fixup does not retarget the renamed guide"
 D=$(w diff "$(id "$C5:FAQ.md:fixup")")
@@ -91,14 +107,33 @@ H2=$(w diff "$(id "$C4:Office-Plan.md")" | sed -n 's/^+.*files:\([0-9a-f]*\).*/\
 f get "$H1" @- | cmp -s - "$W/git-$V1" || fail "floor.png v1 bytes"
 f get "$H2" @- | cmp -s - "$W/git-$V2" || fail "floor.png v2 bytes"
 [ "$(f imports | grep -c ':uploads/floor.png')" = 2 ] || fail "attachment import occurrences"
+[ "$(f imports | grep -c ':uploads/map.png')" = 1 ] || fail "map.png import occurrences"
 ok "floor.png v1 ($V1) and v2 ($V2) read back byte-exact; Office Plan pins v1 at $C1 and v2 at $C4"
 
 # Provenance has no CLI reader; its source strings are at least in the pile.
 for s in "$C3" "New-Staff-Guide.md" "Clara Curator <clara@example.test>"; do grep -aqF "$s" "$P" || fail "provenance text $s absent"; done
-ok "provenance: 13 records counted by the importer; commit, path and author strings present in the pile"
+ok "provenance: 14 records counted by the importer; commit, path and author strings present in the pile"
 
 grep -E '^LOSS' "$W/plan.findings"
-[ "$(grep -c '^LOSS' "$W/plan.findings")" = 2 ] || fail "expected 2 loss findings"
+[ "$(grep -c '^LOSS' "$W/plan.findings")" = 5 ] || fail "expected 5 loss findings"
+C9=$(git -C "$W/repo" log --format=%H --grep="logo alias" master)
+grep -q "^LOSS symlink ${C8:0:12} Links.md: symbolic link to 'Home.md'" "$W/plan.findings" \
+  && grep -q "^LOSS symlink ${C8:0:12} uploads/logo.png: symbolic link to 'floor.png'" "$W/plan.findings" \
+  && grep -q "^LOSS symlink ${C9:0:12} uploads/logo.png: symbolic link to 'map.png'" "$W/plan.findings" || fail "symlink findings"
+# Even accepted, a symlink is neither a page, an attachment, a link target nor content.
+for path in Links.md uploads/logo.png; do grep -qF "\"$path\"" "$W/plan/plan.json" && fail "$path is in plan.json"; done
+for rev in "$C8" "$TIP"; do for path in Links.md uploads/logo.png; do
+  [ ! -e "$W/plan/blobs/$(git -C "$W/repo" rev-parse "$rev:$path")" ] || fail "symlink target blob of $path written"
+done; done
+grep -rqF 'plan:uploads/logo.png' "$W/plan/pages" && fail "a page links the symlink"
+grep -q 'The Links page and the logo are symbolic links' "$W/plan/pages/"*.typ || fail "links to symlinks are not kept as text"
+grep -q 'plan:uploads/map.png' "$W/plan/pages/"*.typ || fail "regular neighbour attachment not linked"
+[ "$(f imports | grep -c ':uploads/logo.png')" = 0 ] || fail "uploads/logo.png reached Files as an attachment"
+w list > "$W/list.txt"
+title() { awk -v t="$1" '{id=$1; $1=""; sub(/^ /, "")} $0 == t {print id}' "$W/list.txt"; }
+[ -n "$(title Contacts)" ] || fail "regular neighbour Contacts is not a Wiki page"
+[ -z "$(title Links)" ] || fail "Links.md became a Wiki page"
+ok "symlinks reported at $C8 and its retarget at $C9; with --accept-loss none is a page, attachment, blob or link target"
 grep -q '^LOSS deleted .* Office-Plan.md' "$W/plan.findings" && grep -q '^LOSS unsupported-markup .* Notes.textile' "$W/plan.findings" || fail "loss findings"
 w show "$(id "$C4:Office-Plan.md")" >/dev/null
 ok "deleted Office-Plan.md and unconverted Notes.textile reported by path; the deleted page's Wiki head survives (by design of the plan format)"

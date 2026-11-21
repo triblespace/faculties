@@ -3,7 +3,9 @@
 # tests and its CLI gate. Fixed authors and dates, so every commit sha is the
 # same on every run. Covers: edits, a git-mv rename, Gollum and Markdown links,
 # link cycles inside one commit, a forward (dangling) link, two versions of an
-# image, a branch and a merge, a deletion, and an unsupported markup page.
+# image, a branch and a merge, a deletion, an unsupported markup page, and
+# symbolic links shaped like a page and like an attachment, added beside a
+# regular page and attachment and later retargeted on their own.
 set -euo pipefail
 D=${1:?fixture directory}
 [ ! -e "$D" ] || { echo "$D exists" >&2; exit 1; }
@@ -132,4 +134,19 @@ GIT_COMMITTER_NAME="Frank Merger" GIT_COMMITTER_EMAIL=frank@example.test GIT_COM
 git rm -q Office-Plan.md
 printf 'h1. Notes\n\nTextile, which gollum-plan does not convert.\n' > Notes.textile
 git add -A; commit "Gina Gardener" gina@example.test "2020-03-01T08:00:00+01:00" "Retire the office plan; add notes"
+
+ln -s Home.md Links.md
+ln -s floor.png uploads/logo.png
+cat > Contacts.md <<'MD'
+# Contacts
+
+Reception is on the [map](uploads/map.png). Back to [[Home]].
+
+The [[Links]] page and the ![logo](uploads/logo.png) are symbolic links.
+MD
+png 7 > uploads/map.png
+git add -A; commit "Hana Helper" hana@example.test "2020-04-01T08:00:00+02:00" "Add contacts and map; link aliases"
+
+ln -sfn map.png uploads/logo.png
+git add -A; commit "Ivo Indexer" ivo@example.test "2020-04-02T08:00:00+02:00" "Point the logo alias at the map"
 git rev-parse HEAD
