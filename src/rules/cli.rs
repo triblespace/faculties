@@ -74,7 +74,7 @@ enum Command {
         #[arg(long)]
         log: Option<PathBuf>,
         /// Act on this tick's run requests: revalidate each under this host's
-        /// spawn keep lock and launch at most one, as ignite.sh would, and
+        /// zooid keep lock and launch at most one, as ignite.sh would, and
         /// record every decision in the rules collection.
         #[arg(long)]
         effect: bool,

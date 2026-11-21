@@ -139,7 +139,6 @@ impl Catalog {
             Box::new(relations::mcp::Relations::with_storage(storage.clone())),
             Box::new(search::mcp::Search::with_storage(storage.clone())),
             Box::new(secrets::mcp::Secrets::with_storage(storage.clone())),
-            Box::new(spawn::mcp::Spawn::with_storage(storage.clone())),
             Box::new(teams::mcp::Teams::with_storage(storage.clone())),
             Box::new(triage::mcp::Triage::with_storage(storage.clone())),
             Box::new(viewer::mcp::Viewer::with_storage(storage.clone())),
@@ -147,6 +146,7 @@ impl Catalog {
             Box::new(web::mcp::Web::with_storage(storage.clone())),
             Box::new(wiki::mcp::Wiki::with_storage(storage.clone())),
             Box::new(world::mcp::WorldTools::new(world_url, world_session)),
+            Box::new(spawn::mcp::Spawn::with_storage(storage.clone())),
         ];
         Self {
             faculties,

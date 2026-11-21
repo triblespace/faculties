@@ -17,7 +17,7 @@ use super::{
 #[derive(Parser)]
 #[command(
     version = crate::GIT_VERSION,
-    name = "spawn",
+    name = "zooid",
     about = "Start a task zooid from a brief, in its own systemd user unit"
 )]
 pub(crate) struct Cli {
@@ -40,7 +40,7 @@ enum Command {
     /// The name is the brief's hash as two proquints. An
     /// identical brief relaunches the same zooid once its last run has
     /// settled; while its persona is live this refuses.
-    Run {
+    Spawn {
         /// The brief: a file, or `-` for stdin. It is the prompt, verbatim.
         #[arg(long, value_name = "PATH")]
         brief: String,
@@ -177,7 +177,7 @@ enum Command {
         #[arg(long, default_value_t = 60)]
         poll: u64,
     },
-    /// Every spawn, one line each.
+    /// Every zooid, one line each.
     List,
     /// Each parent persona: its doing goals, the zooids it started that have
     /// no end recorded, finished reports it has not read, open ask-jp goals
@@ -190,7 +190,7 @@ enum Command {
         #[arg(long = "persona", value_name = "PERSONA")]
         personas: Vec<String>,
     },
-    /// One spawn and all its runs, with the latest report.
+    /// One zooid and all its runs, with the latest report.
     Show {
         name: String,
         /// Print the brief too.
@@ -211,7 +211,7 @@ enum Command {
     /// systemd's EXIT_CODE, EXIT_STATUS and SERVICE_RESULT.
     Settle {
         name: String,
-        /// The run being settled (hex id), as `spawn run` wrote it into the script.
+        /// The run being settled (hex id), as `zooid spawn` wrote it into the script.
         #[arg(long, value_name = "ID")]
         run: String,
         /// The request the run serves (hex id), when a keeper started it.
@@ -239,7 +239,7 @@ enum Command {
     },
     /// A local executor for one finite Drive task, named in
     /// SPAWN_LOCAL_EXECUTOR as
-    /// `spawn drive-task --binding FILE --prompt {prompt} --message {message}
+    /// `zooid drive-task --binding FILE --prompt {prompt} --message {message}
     /// --name {name} --runtime {runtime}`. It turns the run's pinned
     /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
     /// arguments, takes everything else from the binding file, and execs
@@ -273,7 +273,7 @@ enum Command {
     /// unread messages at most once a minute. Neither acknowledges anything.
     Inbox {
         name: String,
-        /// The run whose hook this is (hex id), as `spawn run` wrote it into
+        /// The run whose hook this is (hex id), as `zooid spawn` wrote it into
         /// the script. Post's throttle and shown set are per run.
         #[arg(long, value_name = "ID")]
         run: String,
@@ -303,12 +303,12 @@ fn run_inbox(
                 // Whether this stop follows our own block is unknown, so it
                 // is never blocked on: a block here could repeat until the
                 // agent's own cap.
-                eprintln!("spawn inbox: the hook input is not JSON ({error}); allowing");
+                eprintln!("zooid inbox: the hook input is not JSON ({error}); allowing");
                 return Ok(());
             }
         },
         Err(error) => {
-            eprintln!("spawn inbox: reading the hook input failed ({error}); allowing");
+            eprintln!("zooid inbox: reading the hook input failed ({error}); allowing");
             return Ok(());
         }
     };
@@ -351,11 +351,11 @@ fn spawner_or_persona(spawner: Option<String>) -> Result<String> {
 }
 
 fn print_launched(launched: &Launched) -> Result<()> {
-    crate::cli::with_output("spawn", |out| {
+    crate::cli::with_output("zooid", |out| {
         out.line(&launched.name)?;
         out.note(format!(
             "started {} (run {:x}, {} prompt chars, {}: {}); report -> {}, log -> {}; \
-             `spawn wait {}` blocks until it ends",
+             `zooid wait {}` blocks until it ends",
             launched.unit,
             launched.run,
             launched.prompt_chars,
@@ -475,12 +475,12 @@ pub fn run() -> Result<()> {
         let run = view.runs.last().expect("wait found a run");
         let mut text = format!("{} ended: {}\n", view.name, describe_end(run));
         text.push_str(&render_show(&view, false));
-        return crate::cli::with_output("spawn", |out| out.text(text));
+        return crate::cli::with_output("zooid", |out| out.text(text));
     }
     storage.scope_to_exit(|storage| {
         let spawn = Spawn::new(storage.clone(), LaunchConfig::from_home_env()?);
         match command {
-            Command::Run {
+            Command::Spawn {
                 brief,
                 workdir,
                 effort,
@@ -566,7 +566,7 @@ pub fn run() -> Result<()> {
                     handoff: handoff.as_deref().map(read_brief).transpose()?,
                     cover_percent: cover,
                 })?;
-                crate::cli::with_output("spawn", |out| {
+                crate::cli::with_output("zooid", |out| {
                     out.line(format!("{:x}", requested.request))?;
                     out.note(format!(
                         "requested {} on host {}{}; its keeper starts it in {}",
@@ -588,23 +588,23 @@ pub fn run() -> Result<()> {
                     None
                 };
                 let requests = spawn.requests(host)?;
-                crate::cli::with_output("spawn", |out| out.text(render_requests(&requests)))
+                crate::cli::with_output("zooid", |out| out.text(render_requests(&requests)))
             }
             Command::Keep { workdir, .. } => {
                 let pass = spawn.keep_once(&keep_config(workdir)?)?;
-                crate::cli::with_output("spawn", |out| out.text(render_pass(&pass)))
+                crate::cli::with_output("zooid", |out| out.text(render_pass(&pass)))
             }
             Command::Colony { personas } => {
                 let view = spawn.colony(&super::ColonyOptions { personas })?;
-                crate::cli::with_output("spawn", |out| out.text(super::render_colony(&view)))
+                crate::cli::with_output("zooid", |out| out.text(super::render_colony(&view)))
             }
             Command::List => {
                 let spawns = spawn.list()?;
-                crate::cli::with_output("spawn", |out| out.text(render_list(&spawns)))
+                crate::cli::with_output("zooid", |out| out.text(render_list(&spawns)))
             }
             Command::Show { name, brief } => {
                 let view = spawn.show(&name)?;
-                crate::cli::with_output("spawn", |out| out.text(render_show(&view, brief)))
+                crate::cli::with_output("zooid", |out| out.text(render_show(&view, brief)))
             }
             Command::Wait { .. } | Command::Inbox { .. } | Command::DriveTask { .. } => {
                 unreachable!("handled above")
@@ -636,7 +636,7 @@ pub fn run() -> Result<()> {
                     report,
                     usage,
                 })?;
-                crate::cli::with_output("spawn", |out| {
+                crate::cli::with_output("zooid", |out| {
                     out.line(format!(
                         "settled {name} run {:x}: {}{}, report {}{}",
                         settled.run,

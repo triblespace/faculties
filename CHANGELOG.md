@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The `spawn` binary is now `zooid`. Its `run` subcommand is `zooid spawn`; `goal`, `request`, `requests`, `keep`,
+  `list`, `colony`, `show`, `wait`, `settle`, `drive-task` and `inbox` keep
+  their names and behaviour. The MCP tools `spawn_run`, `spawn_goal`,
+  `spawn_request`, `spawn_requests`, `spawn_list` and `spawn_show` are now
+  `zooid_spawn`, `zooid_goal`, `zooid_request`, `zooid_requests`, `zooid_list`
+  and `zooid_show`. There is no alias. Identities are unchanged: the Spawn
+  schema and collection, `TRIBLESPACE_COLLECTION_SPAWN`, the `spawn-<name>`
+  and `spawn-req-<id>` units, `~/.local/state/spawn` and the `SPAWN_*`
+  settings. Unit scripts written before this call `spawn settle` and
+  `spawn inbox` by name, so activate a cohort with this change only while no
+  `spawn-*` unit is active, and rewrite any `SPAWN_LOCAL_EXECUTOR` template
+  that names `spawn drive-task` first.
+
 - `PendingNext::cancel_and_join` returns `Result<NextCompletion>`
   (`orient::NextCompletion::{Completed, CancelledBeforeReport}`).
   `CancelledBeforeReport` means the call's own cancellation won before any

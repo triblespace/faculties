@@ -42,7 +42,7 @@ pub const KIND_SPAWN: Id = id_hex!("8F02DF7BB6C50FF3F3BC5024329B4932");
 pub const KIND_RUN: Id = id_hex!("A44B774609F22742FEE22457D8268CFE");
 
 /// Kind marker of a run request: a record asking one host's keeper to start
-/// a run of a zooid there (`spawn request`, `spawn keep`).
+/// a run of a zooid there (`zooid request`, `zooid keep`).
 ///
 /// Minted with `trible genid` on 2026-11-17:
 /// `C19ED05A4C53CDA5645CE2D8897B6119`.
@@ -110,7 +110,7 @@ pub mod spawn {
         /// query failed and the untinted memory tail was used instead.
         /// Minted 2026-11-16.
         "B5BD0429EB1C43D6F4135BA6BEECF09D" as untinted: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The Compass goal a spawn's brief was rendered from (`spawn goal`).
+        /// The Compass goal a spawn's brief was rendered from (`zooid goal`).
         /// Minted 2026-11-16.
         "FD3241C45361C64F87ED5A597F772BFF" as goal: inlineencodings::GenId;
         /// A Compass note or status event the brief was rendered from: with
@@ -165,7 +165,7 @@ pub mod spawn {
         "26501A21D1CA70A5C8ADE843317A9D22" as cost_usd: inlineencodings::F64;
         /// The share of the worker's context window, in percent, asked for
         /// the whole cover (memories, beliefs, goals): a best-effort wish,
-        /// not an allocation (`spawn run --cover`). On a run and on a
+        /// not an allocation (`zooid spawn --cover`). On a run and on a
         /// request. Minted with `trible genid` on 2026-11-20, like every
         /// attribute below.
         "2760EF854F5B4200EE6DD3FB5C025486" as cover_percent: inlineencodings::F64;

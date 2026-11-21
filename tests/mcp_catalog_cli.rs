@@ -164,7 +164,6 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
             "relations",
             "search",
             "secrets",
-            "spawn",
             "teams",
             "triage",
             "viewer",
@@ -172,6 +171,7 @@ fn catalog_discovery_preserves_all_adapters_without_opening_configuration() {
             "web",
             "wiki",
             "world",
+            "zooid",
         ]
     );
     let mut server = Server::new(&registrations).unwrap();

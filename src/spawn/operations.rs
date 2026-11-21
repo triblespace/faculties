@@ -384,7 +384,7 @@ impl LaunchConfig {
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
             memory_max: "24G".to_owned(),
-            spawn: "spawn".to_owned(),
+            spawn: "zooid".to_owned(),
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
@@ -525,7 +525,7 @@ pub fn claude_mcp_config(script: &Path) -> String {
     format!("{config}\n")
 }
 
-/// How long the hook gives `spawn inbox` before the agent stops waiting:
+/// How long the hook gives `zooid inbox` before the agent stops waiting:
 /// one cold pile read takes seconds, and a post hook may first wait for
 /// another's turn on the run's inbox state.
 pub const INBOX_STOP_TIMEOUT_SECS: u64 = 120;
@@ -534,7 +534,7 @@ pub const INBOX_POST_TIMEOUT_SECS: u64 = 60;
 /// The hooks every claude zooid gets, as a `--settings` file: its unit
 /// script run as `inbox stop` on Stop and `inbox post` after every tool call
 /// (no matcher, so every tool). Both run inside the unit, in the CLI's
-/// environment, and read the zooid's unread messages with `spawn inbox`.
+/// environment, and read the zooid's unread messages with `zooid inbox`.
 pub fn claude_hook_settings(script: &Path) -> String {
     let hook = |kind: &str, timeout: u64| {
         serde_json::json!([{ "hooks": [{
@@ -558,7 +558,7 @@ pub fn claude_hook_settings(script: &Path) -> String {
 /// tool call at 60 s and a cold first call can take longer.
 pub fn codex_mcp_config(script: &Path) -> String {
     format!(
-        "# Written by `spawn` for this run. Nothing else is configured here.\n\
+        "# Written by `zooid` for this run. Nothing else is configured here.\n\
          [mcp_servers.faculties]\n\
          command = \"/bin/bash\"\n\
          args = [\"{}\", \"mcp\"]\n\
@@ -570,7 +570,7 @@ pub fn codex_mcp_config(script: &Path) -> String {
 
 /// Why a keeper refuses a request naming mistral.
 pub const MISTRAL_KEEP_REFUSAL: &str =
-    "mistral spends money; only a direct spawn run may choose it until JP agrees to unattended spend";
+    "mistral spends money; only a direct zooid spawn may choose it until JP agrees to unattended spend";
 
 /// Mistral Large 4's list price, US dollars per million input tokens.
 pub const MISTRAL_INPUT_PRICE: f64 = 0.70;
@@ -596,7 +596,7 @@ pub fn vibe_thinking(effort: &str) -> &'static str {
 /// `script` and `model` are unit-safe, so basic TOML strings hold them.
 pub fn vibe_config(script: &Path, model: &str, thinking: &str) -> String {
     format!(
-        "# Written by `spawn` for this run. Nothing else is configured here.\n\
+        "# Written by `zooid` for this run. Nothing else is configured here.\n\
          active_model = \"{model}\"\n\
          enable_telemetry = false\n\
          enable_update_checks = false\n\
@@ -813,7 +813,7 @@ pub struct GoalRequest {
 }
 
 /// What one launch runs from: the brief text, the memory tail's topic, and
-/// for `spawn goal`, the goal revision it was rendered from.
+/// for `zooid goal`, the goal revision it was rendered from.
 struct Brief {
     text: String,
     about: String,
@@ -851,7 +851,7 @@ pub struct Launched {
     /// How the cover was sized, when the launch asked for a share
     /// (`--cover`).
     pub cover: Option<CoverRecord>,
-    /// The goal note the zooid added at launch (`spawn goal`).
+    /// The goal note the zooid added at launch (`zooid goal`).
     pub goal_note: Option<Id>,
     /// What went wrong after the unit had started. The zooid runs anyway.
     pub warnings: Vec<String>,
@@ -988,7 +988,7 @@ pub enum ZooidRef {
     Brief(String),
 }
 
-/// `spawn request`: ask one host's keeper to start a run there. It names no
+/// `zooid request`: ask one host's keeper to start a run there. It names no
 /// workdir, command, tool or budget; the host resolves those itself.
 #[derive(Clone, Debug)]
 pub struct RequestInput {
@@ -1068,7 +1068,7 @@ impl RequestView {
     }
 }
 
-/// What `spawn keep` resolves on its own host, never from a request.
+/// What `zooid keep` resolves on its own host, never from a request.
 #[derive(Clone, Debug)]
 pub struct KeepConfig {
     /// The directory every request's run starts in.
@@ -1134,7 +1134,7 @@ impl KeepLock {
             }
         }
         eprintln!(
-            "spawn keep: waiting for another keeper pass on this host ({} is held)",
+            "zooid keep: waiting for another keeper pass on this host ({} is held)",
             path.display()
         );
         file.lock()
@@ -1208,7 +1208,7 @@ pub const INBOX_POST_INTERVAL_SECS: u64 = 60;
 /// says where the whole of it is.
 pub const INBOX_BODY_CHARS: usize = 4000;
 
-/// Which claude hook `spawn inbox` answers.
+/// Which claude hook `zooid inbox` answers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InboxHook {
     /// Stop: the zooid is about to end its run.
@@ -1255,7 +1255,7 @@ pub struct InboxAnswer {
 /// change its task; a post logs it and lets the tool result through.
 pub fn inbox_failure(hook: InboxHook, error: &anyhow::Error) -> InboxAnswer {
     let warning = Some(format!(
-        "spawn inbox: the inbox could not be read: {error:#}"
+        "zooid inbox: the inbox could not be read: {error:#}"
     ));
     match hook {
         InboxHook::Stop => InboxAnswer {
@@ -2152,7 +2152,7 @@ impl Spawn {
             let mut goal_note = None;
             if let Some((goal, revision)) = &brief.goal {
                 let note = format!(
-                    "spawned {name} run {run:x} from goal revision {}. `spawn show {name}` reads \
+                    "spawned {name} run {run:x} from goal revision {}. `zooid show {name}` reads \
                      it; the goal's status is {name}'s to move.",
                     revision
                         .iter()
@@ -2425,7 +2425,7 @@ impl Spawn {
             let sent = match spawner {
                 Some(spawner) => {
                     let text = format!(
-                        "{} finished, {end}, {}. `spawn show {}` reads it.{}",
+                        "{} finished, {end}, {}. `zooid show {}` reads it.{}",
                         request.name,
                         lifecycle_text(local, report, clean),
                         request.name,
@@ -2615,7 +2615,7 @@ impl Spawn {
 
     /// [`Self::request`], and for a new brief rendered from a Compass goal,
     /// the goal and revision it was rendered from, annotating the spawn the
-    /// way `spawn goal` does.
+    /// way `zooid goal` does.
     fn request_from(&self, input: &RequestInput, goal: Option<(Id, &[Id])>) -> Result<Requested> {
         let (fragment, requested) = self.request_parts(input, goal, false)?;
         self.publish(fragment)?;
@@ -2764,7 +2764,7 @@ impl Spawn {
     ///
     /// A launch appends the goal to the ignited list first, then writes an
     /// ordinary spawn request for this host whose brief is rendered as
-    /// `spawn goal` renders it, then keeps that request in the same locked
+    /// `zooid goal` renders it, then keeps that request in the same locked
     /// pass. A failure after the append leaves the goal ignited and not
     /// running; the decision says so, and it is never retried here.
     pub fn ignite(
@@ -3058,7 +3058,7 @@ impl Spawn {
         }
         // A request is started unattended, by whatever wrote it (a rule, an
         // ignite pass). Until JP agrees to unattended spending, money is
-        // only spent by a direct `spawn run --provider mistral`.
+        // only spent by a direct `zooid spawn --provider mistral`.
         if provider == Provider::Mistral {
             return self.refuse(view, MISTRAL_KEEP_REFUSAL.to_owned());
         }
@@ -3353,7 +3353,7 @@ impl Spawn {
                 collection,
                 signer,
                 "Spawn",
-                "spawn list",
+                "zooid list",
                 runtime,
             )?;
             pile.commit(collection, signer, fragment)
@@ -4286,7 +4286,7 @@ mod tests {
             colony_env: Some(env),
             path: format!("/usr/bin:/bin:{}", directory.path().join("bin").display()),
             memory_max: "24G".to_owned(),
-            spawn: "spawn".to_owned(),
+            spawn: "zooid".to_owned(),
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
@@ -5273,7 +5273,7 @@ mod tests {
         let f = fixture();
         // settlement's command, found on the unit's PATH: it leaves its
         // arguments for the test to settle with.
-        let settle = f.directory.path().join("bin").join("spawn");
+        let settle = f.directory.path().join("bin").join("zooid");
         std::fs::write(
             &settle,
             "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/../settle-$2.args\"\n",
@@ -6553,11 +6553,11 @@ mod tests {
                 "PostToolUse": hook("post", INBOX_POST_TIMEOUT_SECS),
             }})
         );
-        // The script answers them through `spawn inbox`, for this run, in the
+        // The script answers them through `zooid inbox`, for this run, in the
         // CLI's environment and before the agent's own exports.
         let inbox = script
             .find(&format!(
-                "if [ \"${{1:-}}\" = inbox ]; then exec spawn inbox {} --run {:x} --hook \"${{2:-}}\" 2>> {}; fi\n",
+                "if [ \"${{1:-}}\" = inbox ]; then exec zooid inbox {} --run {:x} --hook \"${{2:-}}\" 2>> {}; fi\n",
                 launched.name,
                 launched.run,
                 unit.log.display()
@@ -7106,7 +7106,7 @@ mod tests {
         );
         assert!(
             script.contains(
-                " || { echo \"spawn: reading MISTRAL_API_KEY from Secrets failed\" >&2; \
+                " || { echo \"zooid: reading MISTRAL_API_KEY from Secrets failed\" >&2; \
                  exit 77; }\nexport MISTRAL_API_KEY\n"
             ),
             "{script}"
@@ -7519,7 +7519,7 @@ mod tests {
             super::super::unit_for_request(spawn_request)
         );
         assert!(ignited_list(&f).contains(&goal));
-        // An ordinary spawn request keep understands, rendered as `spawn goal`
+        // An ordinary spawn request keep understands, rendered as `zooid goal`
         // renders it, with the goal on its spawn record.
         let view = f.request_view(spawn_request);
         assert_eq!(view.goal.as_ref().map(|(g, _)| *g), Some(goal));

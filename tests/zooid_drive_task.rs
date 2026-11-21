@@ -1,5 +1,5 @@
-//! `spawn drive-task`, the local executor for a finite Drive task, run as
-//! the real `spawn` binary against a fake `drive` script. Nothing here
+//! `zooid drive-task`, the local executor for a finite Drive task, run as
+//! the real `zooid` binary against a fake `drive` script. Nothing here
 //! starts Drive, a model or a provider.
 
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use faculties::spawn::{
 };
 use faculties::storage::{initialize_signer, Storage};
 
-const SPAWN: &str = env!("CARGO_BIN_EXE_spawn");
+const SPAWN: &str = env!("CARGO_BIN_EXE_zooid");
 const DESCRIPTOR: &str = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MODEL_DESCRIPTOR: &str =
     "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -130,7 +130,7 @@ fn route(role: &str) -> (String, String) {
     (variable, DESCRIPTOR.to_owned())
 }
 
-/// Run `spawn drive-task` as a unit script would: a scrubbed environment,
+/// Run `zooid drive-task` as a unit script would: a scrubbed environment,
 /// the routes and the run's pile and key exported, the prompt on stdin.
 fn adapter(setup: &Setup, routes: &[(String, String)], runtime: u64, mode: &str) -> Output {
     let mut command = Command::new(SPAWN);
@@ -241,7 +241,7 @@ fn the_adapter_execs_drive_task_with_the_whole_argv() {
         log.contains("deadline-ms 3570000 (runtime 3600 s less 30 s"),
         "{log}"
     );
-    assert!(log.contains("spawn drive-task: exec "), "{log}");
+    assert!(log.contains("zooid drive-task: exec "), "{log}");
 }
 
 #[test]
@@ -433,7 +433,7 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         colony_env: Some(base.join("colony.env")),
         path: format!("/usr/bin:/bin:{}", base.join("bin").display()),
         memory_max: "1G".to_owned(),
-        spawn: "spawn".to_owned(),
+        spawn: "zooid".to_owned(),
         faculties: PathBuf::from("faculties"),
         local: Some(template.split_whitespace().map(str::to_owned).collect()),
         local_max_runtime: Some(600),

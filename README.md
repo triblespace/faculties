@@ -727,13 +727,13 @@ schemas describe exact arguments and effects.
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
 | `search` | One grouped lexical query: current Wiki text, selected Memory summaries and Files metadata; exact source identities and unavailable-source diagnostics |
 | `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |
-| `spawn` | Task zooids named by their brief, each a headless Claude session in its own systemd user unit; runs, exits and reports |
 | `teams` | Resident Graph archive, explicit sync/actions and professional context |
 | `triage` | Execution-loop, timeline and context diagnostics |
 | `voice` | Resident speech synthesis and routing policy; host playback separately |
 | `web` | Explicit web search/fetch and optional evidence recording |
 | `wiki` | Typst knowledge, revisions/frontiers, links, tags, search and audits |
 | `viewer` and `*-capture` | Shared notebooks; one finite `viewer_capture` MCP tool |
+| `zooid` | Task zooids named by their brief, each a headless Claude session in its own systemd user unit; runs, exits and reports |
 
 Thin binaries live under [`src/bin/`](src/bin/); domain logic, schemas and
 explicit frontend modules live in the library. `habit` uses the `habits`

@@ -342,8 +342,6 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "relations_list",
         "secrets_list",
         "secrets_grant",
-        "spawn_goal",
-        "spawn_run",
         "teams_read",
         "triage_scan",
         "viewer_capture",
@@ -351,6 +349,8 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "web_search",
         "world_look",
         "world_move_to",
+        "zooid_goal",
+        "zooid_spawn",
     ] {
         assert!(names.contains(name), "missing native tool {name}");
     }

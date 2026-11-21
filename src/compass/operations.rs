@@ -115,7 +115,7 @@ pub struct AddedNote {
 }
 
 /// One goal as a structured reading, for a caller that renders its own text
-/// from it (`spawn goal`). Lists hold what the facts hold: the schema does not
+/// from it (`zooid goal`). Lists hold what the facts hold: the schema does not
 /// constrain cardinality, so a goal may have several titles.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalReading {

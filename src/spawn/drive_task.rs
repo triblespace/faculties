@@ -1,4 +1,4 @@
-//! `spawn drive-task`: the local executor that runs one finite Drive task.
+//! `zooid drive-task`: the local executor that runs one finite Drive task.
 //!
 //! A local run's unit script exports the run's pinned collection routes and
 //! then execs the host's executor template. This turns that run into exactly
@@ -410,7 +410,7 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
     );
     let plan = plan(&parsed, run, prompt.len())?;
     eprintln!(
-        "spawn drive-task: binding {} blake3:{}; deadline-ms {} (runtime {} s less {} s \
+        "zooid drive-task: binding {} blake3:{}; deadline-ms {} (runtime {} s less {} s \
          teardown); prompt {} bytes",
         binding.display(),
         blake3::hash(&bytes).to_hex(),
@@ -420,7 +420,7 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
         prompt.len()
     );
     eprintln!(
-        "spawn drive-task: exec {} {}",
+        "zooid drive-task: exec {} {}",
         plan.program.display(),
         plan.args
             .iter()

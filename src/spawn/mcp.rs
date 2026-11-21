@@ -1,4 +1,4 @@
-//! Spawn MCP: launch from brief text, read what was spawned. No waiting tool:
+//! Zooid MCP: launch from brief text, read what was spawned. No waiting tool:
 //! a call must be finite, and a launched zooid messages its spawner itself.
 
 use std::path::PathBuf;
@@ -16,32 +16,32 @@ use crate::out::Out;
 
 const TOOLS: &[Tool] = &[
     Tool {
-        name: "spawn_run",
+        name: "zooid_spawn",
         description: "Start a task zooid on the MCP server's host: a headless agent session (Claude by default) in its own systemd user unit that outlives the caller. The brief text is the prompt, verbatim, and names the zooid (its hash as two proquints); an identical brief relaunches the same zooid once its last run settled, and refuses while it is still running. The zooid wakes into the shared self plus recollection chosen for the brief. When it exits, its report is recorded and the spawner is messaged by the zooid. Returns the zooid's name.",
         input_schema: r#"{"type":"object","properties":{"brief":{"type":"string","minLength":1,"description":"The whole brief as text."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"],"description":"The agent. mistral runs Mistral Large 4 through vibe and bills money per token, capped per run; it is only used when named. auto picks whichever of claude and codex the latest fresh quota readings show with the most headroom, never mistral; local runs the host's own executor, configured by SPAWN_LOCAL_EXECUTOR (an argv template with {prompt}, {message}, {name}, {effort}, {script} and {runtime}; it reads the prompt on stdin and may write the zooid's closing message to the {message} file, which is optional), and is refused on a host without one, never falling back to a hosted model; SPAWN_LOCAL_MAX_RUNTIME (seconds) optionally bounds a local unit, and a run stopped by it settles as a failure. Default claude."},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Best effort: beliefs and goals render whole, so the cover may come out larger; the sizing is returned and recorded. Omitted: the plain cover of 240,000 memory characters."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["brief","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "spawn_goal",
-        description: "Start a task zooid for a Compass goal, like spawn_run, with the brief rendered from the goal's current revision: its title, its parent chain, its latest notes, and the zooid's authority to note, move and check off that goal itself. The spawn records the goal and the revision, and the zooid notes its launch on the goal; nothing moves the goal when the zooid exits. A new note on the goal makes a new brief and so a new zooid. Returns the zooid's name.",
+        name: "zooid_goal",
+        description: "Start a task zooid for a Compass goal, like zooid_spawn, with the brief rendered from the goal's current revision: its title, its parent chain, its latest notes, and the zooid's authority to note, move and check off that goal itself. The spawn records the goal and the revision, and the zooid notes its launch on the goal; nothing moves the goal when the zooid exits. A new note on the goal makes a new brief and so a new zooid. Returns the zooid's name.",
         input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Best effort: beliefs and goals render whole, so the cover may come out larger; the sizing is returned and recorded. Omitted: the plain cover of 240,000 memory characters."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "spawn_request",
-        description: "Ask one host's keeper to start a run of a zooid there, by writing a run request into the spawn collection, which syncs like any other. Name an existing zooid, or give a new brief. The request names no workdir, command or budget: the target host resolves those and records accepted, running, refused or task-terminal. local is refused by a host whose SPAWN_LOCAL_EXECUTOR is unset; nothing falls back to a hosted model. mistral is refused too: it spends money, and a request runs unattended; only spawn_run may choose it. A request with a handoff is refused by today's keeper, which has no disclosure check; every reader of the spawn collection can read a handoff. Returns the request id.",
+        name: "zooid_request",
+        description: "Ask one host's keeper to start a run of a zooid there, by writing a run request into the spawn collection, which syncs like any other. Name an existing zooid, or give a new brief. The request names no workdir, command or budget: the target host resolves those and records accepted, running, refused or task-terminal. local is refused by a host whose SPAWN_LOCAL_EXECUTOR is unset; nothing falls back to a hosted model. mistral is refused too: it spends money, and a request runs unattended; only zooid_spawn may choose it. A request with a handoff is refused by today's keeper, which has no disclosure check; every reader of the spawn collection can read a handoff. Returns the request id.",
         input_schema: r#"{"type":"object","properties":{"zooid":{"type":"string","minLength":1,"description":"An existing zooid's name."},"brief":{"type":"string","minLength":1,"description":"A new zooid's whole brief, as text."},"host":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"The target host's node key. Default: the MCP server's host."},"host_label":{"type":"string","minLength":1,"description":"A readable name beside the key."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The asking persona, messaged when the run ends."},"previous":{"type":"string","description":"The run this one continues (hex id), for a move."},"handoff":{"type":"string","description":"Text delivered once, after the brief."},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent (best effort). The target host finds the window."}},"required":["spawner"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "spawn_requests",
+        name: "zooid_requests",
         description: "Every run request with its outcomes: accepted, running, refused with its reason, task-terminal.",
         input_schema: r#"{"type":"object","properties":{"here":{"type":"boolean","description":"Only requests addressed to the MCP server's host."}},"additionalProperties":false}"#,
     },
     Tool {
-        name: "spawn_list",
+        name: "zooid_list",
         description: "Every spawned zooid, one line each: name, number of runs, how the latest ended, the brief's first line.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
-        name: "spawn_show",
+        name: "zooid_show",
         description: "One spawned zooid by name with all its runs: start and end, exit, unit, workdir, persona, spawner, and the latest report.",
         input_schema: r#"{"type":"object","properties":{"name":{"type":"string","minLength":1},"brief":{"type":"boolean","description":"Also print the brief."}},"required":["name"],"additionalProperties":false}"#,
     },
@@ -166,7 +166,7 @@ impl Spawn {
         Self::with_storage(crate::storage::Storage::new(pile, key))
     }
 
-    /// The launch layout is read from `$HOME` when `spawn_run` is called,
+    /// The launch layout is read from `$HOME` when `zooid_spawn` is called,
     /// never at construction or discovery.
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self {
@@ -196,7 +196,7 @@ impl Faculty for Spawn {
 
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
         match name {
-            "spawn_run" => {
+            "zooid_spawn" => {
                 let args: Run = decode_arguments(arguments)?;
                 if args.brief.trim().is_empty() {
                     return Err(invalid_arguments("brief is empty"));
@@ -215,7 +215,7 @@ impl Faculty for Spawn {
                 })?;
                 out.line(launched_line(&launched))
             }
-            "spawn_goal" => {
+            "zooid_goal" => {
                 let args: Goal = decode_arguments(arguments)?;
                 let provider = provider(args.provider.as_deref())?;
                 let launched = self.operations()?.goal(&GoalRequest {
@@ -232,7 +232,7 @@ impl Faculty for Spawn {
                 })?;
                 out.line(launched_line(&launched))
             }
-            "spawn_request" => {
+            "zooid_request" => {
                 let args: Request = decode_arguments(arguments)?;
                 let zooid = match (args.zooid, args.brief) {
                     (Some(name), None) => ZooidRef::Name(name),
@@ -277,7 +277,7 @@ impl Faculty for Spawn {
                     requested.unit
                 ))
             }
-            "spawn_requests" => {
+            "zooid_requests" => {
                 let args: Requests = decode_arguments(arguments)?;
                 let spawn = self.operations()?;
                 let host = if args.here {
@@ -287,18 +287,18 @@ impl Faculty for Spawn {
                 };
                 out.text(render_requests(&spawn.requests(host)?))
             }
-            "spawn_list" => {
+            "zooid_list" => {
                 let Empty {} = decode_arguments(arguments)?;
                 out.text(render_list(&self.operations()?.list()?))
             }
-            "spawn_show" => {
+            "zooid_show" => {
                 let args: Show = decode_arguments(arguments)?;
                 out.text(render_show(
                     &self.operations()?.show(&args.name)?,
                     args.brief,
                 ))
             }
-            _ => bail!("Spawn MCP has no tool {name:?}"),
+            _ => bail!("Zooid MCP has no tool {name:?}"),
         }
     }
 }

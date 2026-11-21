@@ -4,7 +4,7 @@
 //! spawn (the first 32 bits of the handle as two proquints), it
 //! tints the memory cover the zooid wakes into, and it is the prompt. An
 //! identical brief relaunches the same zooid; a changed brief is a new one.
-//! `spawn goal` renders the brief from a Compass goal's current revision, so
+//! `zooid goal` renders the brief from a Compass goal's current revision, so
 //! a new note on the goal makes a new zooid.
 //!
 //! This module holds the pure parts: naming, the fragments a launch and a
@@ -806,7 +806,7 @@ pub struct ScriptFacts<'a> {
 /// the prompt, writing the report. Run as `settle` it is the stop-post step,
 /// which systemd runs however the main process ended. Run as `inbox stop` or
 /// `inbox post` it is the agent's Stop or PostToolUse hook, showing the zooid
-/// the messages it has not read (`spawn inbox`). Run as `mcp` it is the
+/// the messages it has not read (`zooid inbox`). Run as `mcp` it is the
 /// zooid's faculties MCP server: the agent starts it as a child, so it runs
 /// inside the unit and ends with it, and the environment it gets is the one
 /// exported here for the CLI, not a second copy that could drift.
@@ -815,7 +815,7 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     let mut script = String::new();
     script.push_str("#!/bin/bash\n");
     script.push_str(&format!(
-        "# Written by `spawn run` for zooid {}, run {:x}. The unit runs it twice:\n\
+        "# Written by `zooid spawn` for zooid {}, run {:x}. The unit runs it twice:\n\
          # bare as the zooid, and with `settle` as its ExecStopPost step.\n",
         facts.name, facts.run
     ));
@@ -883,7 +883,7 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     for (variable, version) in facts.agent_secrets {
         script.push_str(&format!(
             "{variable}=$({} get --secret {}) && [ -n \"${variable}\" ] || \
-             {{ echo \"spawn: reading {variable} from Secrets failed\" >&2; exit 77; }}\n\
+             {{ echo \"zooid: reading {variable} from Secrets failed\" >&2; exit 77; }}\n\
              export {variable}\n",
             q(facts.secrets),
             q(version)
@@ -1251,7 +1251,7 @@ mod tests {
             prompt: "/s/n.prompt",
             report: "/s/n.report",
             log: "/s/n.log",
-            spawn: "spawn",
+            spawn: "zooid",
             faculties: "/b/faculties",
         });
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
@@ -1276,17 +1276,17 @@ mod tests {
             .unwrap();
         assert!(settle < mcp && mcp < script.find("exec /c/claude").unwrap());
         // Run as `inbox stop|post` it is the agent's hook, answered by
-        // `spawn inbox` for this run, its stderr in the log.
+        // `zooid inbox` for this run, its stderr in the log.
         let inbox = script
             .find(&format!(
-                "if [ \"${{1:-}}\" = inbox ]; then exec spawn inbox lusab-babad --run {run:x} \
+                "if [ \"${{1:-}}\" = inbox ]; then exec zooid inbox lusab-babad --run {run:x} \
                  --hook \"${{2:-}}\" 2>> /s/n.log; fi\n"
             ))
             .unwrap_or_else(|| panic!("{script}"));
         assert!(pinned < inbox && inbox < script.find("exec /c/claude").unwrap());
     }
 
-    /// The `inbox` dispatch, run: the hook's stdin reaches `spawn inbox`, its
+    /// The `inbox` dispatch, run: the hook's stdin reaches `zooid inbox`, its
     /// stdout is the hook's answer, its stderr goes to the log, and neither
     /// the agent nor settlement runs.
     #[test]
@@ -1301,7 +1301,7 @@ mod tests {
             file.display().to_string()
         };
         let spawn = fake(
-            "spawn",
+            "zooid",
             "echo \"args: $*\"; echo \"persona: $PERSONA\"; echo \"stdin: $(cat)\"; echo oops >&2",
         );
         let agent = fake("agent", "echo agent ran");
@@ -1377,7 +1377,7 @@ mod tests {
             prompt: "/s/n.prompt",
             report: "/s/n.report",
             log: "/s/n.log",
-            spawn: "spawn",
+            spawn: "zooid",
             faculties: "/b/faculties",
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));

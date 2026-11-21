@@ -6,7 +6,7 @@
 //! Nothing here is authored state. [`colony_view`] is one pure projection
 //! over facts a caller already holds: the routed Spawn, Message, Relations
 //! and Compass collections, the Compass status register, and a blob reader.
-//! The CLI (`spawn colony`) and the viewer both call it; they differ only in
+//! The CLI (`zooid colony`) and the viewer both call it; they differ only in
 //! how they obtained those facts and in whether they can observe units.
 //! Each role can be unavailable on its own, and the view says which.
 //!
@@ -150,7 +150,7 @@ pub struct ParentView {
     /// Ended, and the report message to this persona is unread.
     pub unreviewed: Vec<WorkerLine>,
     /// Ended runs whose report message is not unread: acknowledged, or
-    /// never sent (see `spawn show`).
+    /// never sent (see `zooid show`).
     pub settled: usize,
     /// Ended runs whose review state cannot be read here (Message or
     /// Relations unavailable).
@@ -682,7 +682,7 @@ fn time(value: Option<IntervalValue>) -> String {
 fn evidence_text(evidence: &Evidence) -> String {
     match evidence {
         Evidence::WaitingOnZooids(n) => format!(
-            "waiting on {n} running zooid(s) (spawn run with no end, unit active on this host)"
+            "waiting on {n} running zooid(s) (a run with no end, unit active on this host)"
         ),
         Evidence::ReviewOutstanding(n) => format!(
             "{n} finished zooid report(s) unread (Message; unread means not acknowledged, not that nothing was done with it)"
