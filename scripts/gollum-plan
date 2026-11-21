@@ -43,7 +43,8 @@ What becomes what:
 Everything the plan cannot represent is a finding in report.json, with its
 commit and path. Findings marked `loss` (a construct converted lossily, a page
 deletion, two pages merged into one path, a link pinned to a concurrent
-branch's revision, a page in an unsupported markup, a symbolic link) make
+branch's revision, a page in an unsupported markup, a symbolic link, a page
+that is not valid UTF-8, a file mode other than 100644) make
 `plan` refuse to write plan.json unless --accept-loss is given. The bundle
 keeps all of it.
 """
@@ -81,7 +82,9 @@ def tree(repo, commit):
     A symbolic link is a blob too, with mode 120000, and its blob is the link
     target text, not file content. It goes under "\0symlink" (path -> blob),
     never into the file map, so it can become neither a page nor an
-    attachment. Gitlinks go under "\0unsupported"."""
+    attachment. Gitlinks go under "\0unsupported". A regular file whose mode
+    is not the default 100644 (an executable bit) is also listed under
+    "\0mode" (path -> mode): the Wiki and Files keep bytes, not modes."""
     out = {}
     for line in git(repo, "ls-tree", "-r", "-z", commit).split("\0"):
         if not line:
@@ -92,6 +95,8 @@ def tree(repo, commit):
             out.setdefault("\0symlink", {})[path] = sha
         elif kind == "blob":
             out[path] = sha
+            if mode != "100644":
+                out.setdefault("\0mode", {})[path] = mode
         else:
             out.setdefault("\0unsupported", []).append((kind, path))
     return out
@@ -585,8 +590,15 @@ class Driver:
             links_here = t.pop("\0symlink", {})
             parent_trees = {p: tree(self.repo, p) for p in parents}
             parent_links = {p: parent_trees[p].pop("\0symlink", {}) for p in parents}
+            modes_here = t.pop("\0mode", {})
+            parent_modes = {p: parent_trees[p].pop("\0mode", {}) for p in parents}
             for p in parent_trees:
                 parent_trees[p].pop("\0unsupported", None)
+            for path, mode in sorted(modes_here.items()):
+                if not any(parent_modes[p].get(path) == mode for p in parents):
+                    self.finding("mode", commit, path,
+                                 f"file mode {mode} not carried (the Wiki and Files keep bytes only); "
+                                 f"the bundle keeps it", True)
             for path, blob in sorted(links_here.items()):
                 if not any(parent_links[p].get(path) == blob for p in parents):
                     target = git(self.repo, "cat-file", "blob", blob, binary=True).decode("utf-8", errors="replace")
@@ -667,7 +679,14 @@ class Driver:
                 if not needs:
                     page_state.setdefault(commit, {})[path] = (page_key, preds[0])
                     continue
-                md = git(self.repo, "cat-file", "blob", t[path], binary=True).decode("utf-8", errors="replace")
+                raw = git(self.repo, "cat-file", "blob", t[path], binary=True)
+                try:
+                    md = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    self.finding("not-utf8", commit, path,
+                                 f"page is not valid UTF-8 (first bad byte at offset {error.start}); "
+                                 f"converted with U+FFFD replacements; the bundle keeps the original bytes", True)
+                    md = raw.decode("utf-8", errors="replace")
                 page = Page(self, commit, path, tree_pages, tree_files)
                 converted[path] = (page.convert(md), page.links)
             order, fixups = self.order(converted, tree_pages, plan_pages)

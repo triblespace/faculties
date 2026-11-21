@@ -42,6 +42,26 @@ set +e; "$G" plan "$S" "$W/symlink-refused" 2>"$W/symlink-refused.err"; rc=$?; s
   || fail "symlink-only refusal does not name exactly Alias.md"
 ok "a repository whose only loss is a symlink is refused, naming its commit and path"
 
+# A Latin-1 page and an executable file: each is a loss, reported before any
+# import, and the bundle keeps the raw bytes and the mode.
+L=$W/latin1-mode; git init -q -b master "$L"
+printf '# Gr\xfc\xdfe\n\nSch\xf6ne Gr\xfc\xdfe aus Bremen.\n' > "$L/Willkommen.md"
+printf '#!/bin/sh\necho hi\n' > "$L/build.sh"; chmod 755 "$L/build.sh"
+git -C "$L" add -A; git -C "$L" -c user.name=n -c user.email=n@example.test commit -q -m latin1-and-mode
+set +e; "$G" plan "$L" "$W/latin1-refused" 2>"$W/latin1-refused.err"; rc=$?; set -e
+[ $rc = 2 ] && [ ! -e "$W/latin1-refused/plan.json" ] || fail "latin1/mode loss was not refused (rc=$rc)"
+[ "$(grep -c '^LOSS' "$W/latin1-refused.err")" = 2 ] \
+  && grep -q '^LOSS not-utf8 .* Willkommen.md: page is not valid UTF-8 (first bad byte at offset 4)' "$W/latin1-refused.err" \
+  && grep -q '^LOSS mode .* build.sh: file mode 100755 not carried' "$W/latin1-refused.err" \
+  || fail "latin1/mode refusal does not name exactly Willkommen.md and build.sh"
+"$G" bundle "$L" "$W/latin1.bundle" >/dev/null
+git clone -q "$W/latin1.bundle" "$W/latin1-clone"
+git -C "$W/latin1-clone" cat-file blob master:Willkommen.md | cmp -s - "$L/Willkommen.md" || fail "bundle changed the Latin-1 bytes"
+git -C "$W/latin1-clone" ls-tree master -- build.sh | grep -q '^100755 blob ' || fail "bundle lost the 100755 mode"
+"$G" plan "$L" "$W/latin1-plan" --accept-loss 2>/dev/null >/dev/null
+grep -q $'\xef\xbf\xbd' "$W/latin1-plan/pages/"*.typ || fail "accepted Latin-1 page does not carry the U+FFFD it was reported for"
+ok "a Latin-1 page and a 100755 file are each refused as a loss naming the path; the bundle keeps their bytes and mode"
+
 mkdir -p "$W/pile"
 clean "$TRIBLE" pile create "$P" >/dev/null
 clean "$TRIBLE" pile signing-key init "$P" >/dev/null
