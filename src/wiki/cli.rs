@@ -152,6 +152,9 @@ enum Command {
         /// `ImportPlan`. Content and attachment paths are relative to the plan.
         #[arg(long, conflicts_with = "path")]
         plan: Option<PathBuf>,
+        /// Stage the entire plan in memory and publish Files then Wiki once each.
+        #[arg(long, requires = "plan")]
+        batch_publications: bool,
         #[arg(long)]
         tag: Vec<String>,
     },
@@ -462,8 +465,9 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         Command::Import {
             plan: Some(plan),
             tag,
+            batch_publications,
             ..
-        } => import_plan(&wiki, &plan, &tag, out),
+        } => import_plan(&wiki, &plan, &tag, batch_publications, out),
         Command::Import { path, tag, .. } => import(
             &wiki,
             &path.expect("clap requires a path without --plan"),
@@ -685,8 +689,19 @@ pub(crate) fn read_plan(path: &Path) -> Result<ImportPlan> {
     Ok(ImportPlan { bundle, commits })
 }
 
-fn import_plan(wiki: &Wiki, path: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
-    let report = wiki.import_plan(read_plan(path)?, tags)?;
+fn import_plan(
+    wiki: &Wiki,
+    path: &Path,
+    tags: &[String],
+    batch_publications: bool,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    let plan = read_plan(path)?;
+    let report = if batch_publications {
+        wiki.import_plan_batched(plan, tags)?
+    } else {
+        wiki.import_plan(plan, tags)?
+    };
     for (key, id) in &report.revisions {
         out.line(format!("{id:x}  {key}"))?;
     }

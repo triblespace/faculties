@@ -242,7 +242,13 @@ impl Wiki {
     }
     /// Replay a translated foreign history; see [`ImportPlan`].
     pub fn import_plan(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
-        cmd_import_plan(self.storage(), plan, tags.to_vec())
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), false)
+    }
+
+    /// Stage the full plan before publishing its Files and Wiki fragments.
+    /// Native revision identities and source provenance match per-commit replay.
+    pub fn import_plan_batched(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), true)
     }
     pub fn export_all(&self) -> Result<Vec<(Id, String)>> {
         cmd_batch_export(self.storage())
@@ -1944,6 +1950,7 @@ fn cmd_import_plan(
     storage: WikiStorage<'_>,
     plan: ImportPlan,
     tags: Vec<String>,
+    batch_publications: bool,
 ) -> Result<PlanReport> {
     check_plan(&plan)?;
     let (wiki_facts, files_facts, known_files, tags, tag_fragment) =
@@ -1985,6 +1992,8 @@ fn cmd_import_plan(
     let mut staged_files = BTreeSet::new();
     let mut staged_revisions = BTreeSet::new();
     let mut staged_provenance = BTreeSet::new();
+    let mut all_files = Fragment::empty();
+    let mut all_revisions = Fragment::empty();
     let mut pending_tags = Some(tag_fragment);
     for commit in &plan.commits {
         // Attachments first, in their own Files commit, so a page that links
@@ -2018,7 +2027,9 @@ fn cmd_import_plan(
                 report.new_files += 1;
             }
         }
-        if !files_fragment.facts().is_empty() {
+        if batch_publications {
+            all_files += files_fragment;
+        } else if !files_fragment.facts().is_empty() {
             files.publish(files_fragment).with_context(|| {
                 format!("publish attachments of source commit {}", commit.commit)
             })?;
@@ -2072,12 +2083,28 @@ fn cmd_import_plan(
             pages.insert(revision.page.clone(), id);
             report.revisions.push((revision.key.clone(), id));
         }
-        if !fragment.facts().is_empty() {
+        if batch_publications {
+            all_revisions += fragment;
+        } else if !fragment.facts().is_empty() {
             storage
                 .publish(fragment)
                 .with_context(|| format!("publish revisions of source commit {}", commit.commit))?;
             report.publications += 1;
         }
+    }
+    // Publish only after every input has been staged. If the second publication
+    // fails, a retry discovers the already cataloged Files and resumes at Wiki.
+    if !all_files.facts().is_empty() {
+        files
+            .publish(all_files)
+            .context("publish plan attachments")?;
+        report.publications += 1;
+    }
+    if !all_revisions.facts().is_empty() {
+        storage
+            .publish(all_revisions)
+            .context("publish plan revisions")?;
+        report.publications += 1;
     }
     Ok(report)
 }
