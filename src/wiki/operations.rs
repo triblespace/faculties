@@ -242,13 +242,35 @@ impl Wiki {
     }
     /// Replay a translated foreign history; see [`ImportPlan`].
     pub fn import_plan(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
-        cmd_import_plan(self.storage(), plan, tags.to_vec(), false)
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), false, None)
     }
 
     /// Stage the full plan before publishing its Files and Wiki fragments.
     /// Native revision identities and source provenance match per-commit replay.
     pub fn import_plan_batched(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
-        cmd_import_plan(self.storage(), plan, tags.to_vec(), true)
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), true, None)
+    }
+    /// Bind a translated plan to its exact source bundle and import both.
+    pub fn import_plan_with_source(
+        &self,
+        mut plan: ImportPlan,
+        tags: &[String],
+        name: &str,
+        bytes: anybytes::Bytes,
+    ) -> Result<(Id, PlanReport)> {
+        let (file, id, _) = crate::files::operations::stage_byte_import(
+            bytes,
+            name,
+            "application/octet-stream",
+            &[],
+            name,
+        )?;
+        if plan.bundle.is_some_and(|original| original != id) {
+            anyhow::bail!("translated plan names a different source bundle");
+        }
+        plan.bundle = Some(id);
+        let report = cmd_import_plan(self.storage(), plan, tags.to_vec(), true, Some(file))?;
+        Ok((id, report))
     }
     pub fn export_all(&self) -> Result<Vec<(Id, String)>> {
         cmd_batch_export(self.storage())
@@ -1921,6 +1943,7 @@ fn check_plan(plan: &ImportPlan) -> Result<()> {
 fn resolve_plan_links(
     content: &str,
     pages: &HashMap<String, Id>,
+    revisions: &HashMap<String, Id>,
     attachments: &HashMap<String, String>,
     revision: &str,
 ) -> Result<String> {
@@ -1933,6 +1956,8 @@ fn resolve_plan_links(
             format!("#link(\"wiki:{id:x}\")")
         } else if let Some(hash) = attachments.get(key) {
             format!("#link(\"files:{hash}\")")
+        } else if let Some(id) = revisions.get(key) {
+            format!("#link(\"wiki:{id:x}\")")
         } else {
             missing.get_or_insert_with(|| key.to_owned());
             captures[0].to_owned()
@@ -1951,6 +1976,7 @@ fn cmd_import_plan(
     plan: ImportPlan,
     tags: Vec<String>,
     batch_publications: bool,
+    source_bundle: Option<Fragment>,
 ) -> Result<PlanReport> {
     check_plan(&plan)?;
     let (wiki_facts, files_facts, known_files, tags, tag_fragment) =
@@ -1971,7 +1997,7 @@ fn cmd_import_plan(
             ))
         })?;
     if let Some(bundle) = plan.bundle {
-        if !known_files.contains(&bundle) {
+        if source_bundle.is_none() && !known_files.contains(&bundle) {
             bail!("plan bundle {bundle:x} names no cataloged file");
         }
     }
@@ -1993,6 +2019,13 @@ fn cmd_import_plan(
     let mut staged_revisions = BTreeSet::new();
     let mut staged_provenance = BTreeSet::new();
     let mut all_files = Fragment::empty();
+    if let (Some(id), Some(file)) = (plan.bundle, source_bundle) {
+        if !known_files.contains(&id) {
+            staged_files.insert(id);
+            all_files += file;
+            report.new_files += 1;
+        }
+    }
     let mut all_revisions = Fragment::empty();
     let mut pending_tags = Some(tag_fragment);
     for commit in &plan.commits {
@@ -2041,7 +2074,8 @@ fn cmd_import_plan(
             wiki_model::check_revision_inputs(&revision.title, &tags)?;
             let content = prepare_content(&revision.content, &wiki_facts, Some(&files_facts), true)
                 .with_context(|| format!("plan revision '{}'", revision.key))?;
-            let content = resolve_plan_links(&content, &pages, &attachments, &revision.key)?;
+            let content =
+                resolve_plan_links(&content, &pages, &revisions, &attachments, &revision.key)?;
             let predecessors: Vec<Id> = revision
                 .predecessors
                 .iter()

@@ -261,8 +261,7 @@ mary = { package = "maryml", version = "0.1.0", path = "../mary", default-featur
 # Files presentation codecs; also matches the image type returned by Mary FLUX.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff"] } # files view; imagine
 
-[dev-dependencies]
-tempfile = "3"
+tempfile = "3"              # private staging for local Gollum repository imports
 
 # SOURCE-BUILD-ONLY: retain the tested network readiness repair.
 # Registry consumers intentionally use upstream netwatch without these fixes.

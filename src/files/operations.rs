@@ -919,7 +919,7 @@ fn cmd_fetch(
     out.line(format!("Import: {}", fmt_id(import_id)))
 }
 
-fn stage_byte_import(
+pub(crate) fn stage_byte_import(
     bytes: anybytes::Bytes,
     name: &str,
     mime: &str,

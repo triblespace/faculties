@@ -145,7 +145,10 @@ enum Command {
         #[command(subcommand)]
         command: TagCommand,
     },
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Import {
+        #[command(subcommand)]
+        source: Option<ImportSource>,
         #[arg(required_unless_present = "plan")]
         path: Option<PathBuf>,
         /// Replay a translated foreign history from a JSON plan instead; see
@@ -367,6 +370,17 @@ fn transfer(cli: &Cli, command: &Command, out: &mut Out<'_>) -> Result<()> {
     transfer_report(&report, out)
 }
 
+#[derive(Subcommand)]
+enum ImportSource {
+    /// Import a local Gollum Git repository or self-contained Git bundle, including history and files.
+    Gollum {
+        #[arg(value_name = "REPO_OR_BUNDLE")]
+        source: PathBuf,
+        #[arg(long)]
+        tag: Vec<String>,
+    },
+}
+
 fn revision(out: &mut Out<'_>, id: Id) -> Result<()> {
     out.line(format!("revision {id:x}"))
 }
@@ -462,6 +476,10 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 name.trim().to_ascii_lowercase()
             )),
         },
+        Command::Import {
+            source: Some(ImportSource::Gollum { source, tag }),
+            ..
+        } => super::gollum::import(&wiki, &source, &tag, out),
         Command::Import {
             plan: Some(plan),
             tag,
@@ -702,6 +720,10 @@ fn import_plan(
     } else {
         wiki.import_plan(plan, tags)?
     };
+    report_import(&report, out)
+}
+
+pub(super) fn report_import(report: &super::PlanReport, out: &mut Out<'_>) -> Result<()> {
     for (key, id) in &report.revisions {
         out.line(format!("{id:x}  {key}"))?;
     }

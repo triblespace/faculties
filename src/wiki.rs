@@ -19,6 +19,7 @@
 //! inputs ([`revision_record`], [`tag_record`]); no read refuses a union.
 
 pub mod cli;
+mod gollum;
 pub mod mcp;
 pub mod operations;
 

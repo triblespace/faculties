@@ -89,6 +89,23 @@ wiki create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
 
+### Import a Gollum wiki
+
+Give Wiki a local Git working tree, bare repository, or self-contained Git bundle.
+Use the workspace revision from `faculties workspace list` to select the destination.
+
+```sh
+wiki --workspace "$workspace_revision" import gollum "/path/to/studio wiki.bundle"
+```
+
+The command requires Git and Python 3. It stores the original bundle in Files
+and imports committed page history, source files and attachments into the
+workspace’s Wiki and Files collections. Each Wiki revision records its source
+commit, path, author, date and bundle. A repeated import of the same bundle
+with the same signer and tags reuses the existing records. The adapter ships
+inside the Wiki binary. `wiki import <file.typ>` and `wiki import --plan plan.json`
+remain available for other sources.
+
 ### Use an existing Erlkonig workspace from the CLI
 
 The ordinary faculty CLIs can read the same pile-backed workspace
