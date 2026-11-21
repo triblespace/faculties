@@ -506,10 +506,18 @@ fn a_routed_workspace_storage_runs_the_openai_path_through_its_routes() {
 }
 
 fn call(adapter: &super::mcp::Imagine, arguments: serde_json::Value) -> Result<Vec<Part>> {
+    call_tool(adapter, "imagine_generate", arguments)
+}
+
+fn call_tool(
+    adapter: &super::mcp::Imagine,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> Result<Vec<Part>> {
     use crate::mcp::Faculty;
     let mut parts = Vec::new();
     adapter.call(
-        "imagine_generate",
+        tool,
         serde_json::to_vec(&arguments)?.into(),
         &mut Out::new(&mut |part| {
             parts.push(part);
@@ -598,16 +606,34 @@ fn the_tool_schema_carries_no_encoded_bytes() {
     use crate::mcp::Faculty;
     let adapter = super::mcp::Imagine::new(PathBuf::from("/nonexistent.pile"), None);
     let tools = adapter.tools();
-    assert_eq!(tools.len(), 1);
-    let schema: serde_json::Value = serde_json::from_str(tools[0].input_schema).unwrap();
-    let properties = schema["properties"].as_object().unwrap();
-    for name in properties.keys() {
-        for forbidden in ["b64", "base64", "bytes", "data", "image", "url", "path"] {
-            assert!(!name.contains(forbidden), "{name}");
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name).collect();
+    assert_eq!(
+        names,
+        [
+            "imagine_auth_status",
+            "imagine_auth_set",
+            "imagine_generate"
+        ]
+    );
+    for tool in tools {
+        let schema: serde_json::Value = serde_json::from_str(tool.input_schema).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        for name in properties.keys() {
+            for forbidden in [
+                "b64", "base64", "bytes", "data", "image", "url", "path", "key", "token",
+            ] {
+                assert!(!name.contains(forbidden), "{}: {name}", tool.name);
+            }
         }
+        let text = format!("{}{}", tool.description, tool.input_schema).to_ascii_lowercase();
+        assert!(
+            !text.contains("base64") && !text.contains("b64_json"),
+            "{}",
+            tool.name
+        );
     }
-    let text = format!("{}{}", tools[0].description, tools[0].input_schema).to_ascii_lowercase();
-    assert!(!text.contains("base64") && !text.contains("b64_json"));
+    let generate: serde_json::Value = serde_json::from_str(tools[2].input_schema).unwrap();
+    let properties = generate["properties"].as_object().unwrap();
     assert!(properties.contains_key("provider") && properties.contains_key("quality"));
 }
 
@@ -796,4 +822,82 @@ fn an_unconfirmed_commit_keeps_a_local_copy_and_says_the_commit_happened() {
     assert_eq!(std::fs::read(&saved[0]).unwrap(), png);
     assert_eq!(commits_to(&storage, FILES), 1);
     assert_eq!(server.count(), 1, "never retried");
+}
+
+fn texts(parts: &[Part]) -> String {
+    parts
+        .iter()
+        .map(|part| match part {
+            Part::Text { text } => text.trim_end(),
+            _ => panic!("auth tools emit text only: {parts:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn mcp_binds_a_secrets_version_shows_it_and_never_shows_the_key() {
+    let (_directory, pile, key) = fresh();
+    let storage = Storage::new(pile, Some(key));
+    let png = fake::provider_png();
+    let server = Server::start(Reply::Json(200, fake::success(&png, "png")));
+    let operations = Imagine::with_storage(storage.clone())
+        .with_openai_endpoint(Endpoint::new(&server.base))
+        .with_unstored_directory(unstored(&storage));
+    let adapter = super::mcp::Imagine::from_operations(operations);
+    let status =
+        |adapter| texts(&call_tool(adapter, "imagine_auth_status", serde_json::json!({})).unwrap());
+    assert_eq!(status(&adapter), "openai: unbound");
+
+    let secret = crate::secrets::Secrets::with_storage(storage.clone())
+        .add("openai", KEY.as_bytes())
+        .unwrap();
+    let hex = format!("{secret:x}");
+    let bindings = commits_to(&storage, IMAGINE);
+    for wrong in [
+        serde_json::json!({"secret_version": "openai"}),
+        serde_json::json!({"secret_version": hex, "field": hex}),
+        serde_json::json!({"secret_version": hex, "body": "blake3:00", "field": hex}),
+        serde_json::json!({"secret_version": hex, "provider": "firefly"}),
+        serde_json::json!({"secret_version": hex, "key": KEY}),
+    ] {
+        let error = call_tool(&adapter, "imagine_auth_set", wrong.clone()).unwrap_err();
+        assert!(!format!("{error:#}").contains(KEY), "{wrong}: {error:#}");
+    }
+    assert_eq!(
+        commits_to(&storage, IMAGINE),
+        bindings,
+        "a refused call binds nothing"
+    );
+
+    let bound = texts(
+        &call_tool(
+            &adapter,
+            "imagine_auth_set",
+            serde_json::json!({"secret_version": hex}),
+        )
+        .unwrap(),
+    );
+    assert!(
+        bound.starts_with(&format!("openai: secret {hex} (revision ")),
+        "{bound}"
+    );
+    assert!(!bound.contains(KEY));
+    assert_eq!(status(&adapter), format!("openai: secret {hex}"));
+    let after = commits_to(&storage, IMAGINE);
+    call_tool(
+        &adapter,
+        "imagine_auth_set",
+        serde_json::json!({"secret_version": hex.to_uppercase(), "provider": "openai"}),
+    )
+    .unwrap();
+    assert_eq!(
+        commits_to(&storage, IMAGINE),
+        after,
+        "rebinding the settled credential publishes nothing"
+    );
+    assert_eq!(server.count(), 0, "binding sends nothing to the provider");
+
+    call(&adapter, serde_json::json!({"prompt": "a lantern"})).unwrap();
+    assert!(server.heads()[0].contains(&format!("bearer {}", KEY.to_ascii_lowercase())));
 }

@@ -326,6 +326,8 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "home_rooms",
         "home_on",
         "home_scene",
+        "imagine_auth_status",
+        "imagine_auth_set",
         "imagine_generate",
         "linkedin_import",
         "mail_list",

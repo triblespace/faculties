@@ -85,7 +85,7 @@ fn discovery_and_malformed_calls_never_scan_models_or_open_the_pile() {
         None,
         sources(directory.path()),
     );
-    assert_eq!(adapter.tools().len(), 1);
+    assert_eq!(adapter.tools().len(), 3);
     for input in [
         "[]",
         "{}",

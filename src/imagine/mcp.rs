@@ -7,6 +7,7 @@
 //! optional perception: when it would push the response over the MCP ceiling
 //! it is omitted with a line saying so, and the call still succeeds. No
 //! field of the tool schema carries base64 or any other encoded bytes.
+use super::auth::{Provider, Selector};
 use super::openai::{self, Background, Moderation, OutputFormat, Quality, Size};
 use super::{
     operations::remember_range, FluxOptions, Imagine as Operations, ModelSources, Request, Variant,
@@ -14,15 +15,74 @@ use super::{
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 use anybytes::Bytes;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
+use triblespace::prelude::{Id, Inline};
 
 const TOOLS: &[Tool] = &[Tool {
+    name: "imagine_auth_status",
+    description: "Show each image provider's bound credential: the exact Secrets references it names, unbound, or every concurrent binding when unsettled. Metadata only; never opens or returns credential plaintext.",
+    input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+}, Tool {
+    name: "imagine_auth_set",
+    description: "Bind an image provider's credential to an existing encrypted Secrets selection: an exact raw Secrets version (secret_version alone), or one private field of an exact structured item version (secret_version, body and field, as secrets_item_open and secrets_item_inspect show them). The credential is opened once to prove it is a usable key, and nothing is sent to the provider; binding the credential already settled publishes nothing. Never takes plaintext, names or tokens.",
+    input_schema: r#"{"type":"object","properties":{"provider":{"type":"string","enum":["openai"],"default":"openai"},"secret_version":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex Secrets version id (raw secret or structured item); never a key or secret name."},"body":{"type":"string","pattern":"^(blake3:)?[0-9a-fA-F]{64}$","description":"Exact item body handle, with or without the blake3: prefix. Requires field."},"field":{"type":"string","pattern":"^[0-9a-fA-F]{32}$","description":"Exact 32-hex id of the item's private text field. Requires body."}},"required":["secret_version"],"dependentRequired":{"body":["field"],"field":["body"]},"additionalProperties":false}"#,
+}, Tool {
     name: "imagine_generate",
     description: "Generate one image and store it in Files with its provenance (provider, model, prompt, every option, the provider's answer metadata) in one commit; the first output line is the Files id, then the image as an attachment when it fits the response. provider openai (default) uses OpenAI's Image API with the bound credential (imagine auth set openai); options: model, size (auto or WIDTHxHEIGHT, multiples of 16, edge <= 3840, aspect 1:3..3:1, 655360..8294400 pixels), quality, output_format, output_compression (jpeg/webp), background (transparent needs png/webp), moderation. One request, never retried; calls can take about two minutes and cost money. provider flux uses the launcher's local FLUX.2 model (needs the imagine build feature and weights; not available in workspaces); options: variant, steps 1-200, seed, width/height multiples of 16 up to 4096, guidance. Options of the other provider are refused. Optional remember also stores the original bytes as a Memory: a TAI timestamp (a 3-second moment ending then) or from..to range. No file paths, downloads, or playback are requested.",
     input_schema: r#"{"type":"object","properties":{"prompt":{"type":"string","minLength":1},"provider":{"type":"string","enum":["openai","flux"],"default":"openai"},"model":{"type":"string","default":"gpt-image-2.5-sunburst"},"size":{"type":"string","default":"auto"},"quality":{"type":"string","enum":["low","medium","high","xhigh","max","auto"],"default":"auto"},"output_format":{"type":"string","enum":["png","jpeg","webp"],"default":"png"},"output_compression":{"type":"integer","minimum":0,"maximum":100},"background":{"type":"string","enum":["transparent","opaque","auto"],"default":"auto"},"moderation":{"type":"string","enum":["auto","low"],"default":"auto"},"variant":{"type":"string","enum":["klein","dev"]},"steps":{"type":"integer","minimum":1,"maximum":200},"seed":{"type":"integer","minimum":0},"width":{"type":"integer","minimum":16,"maximum":4096,"multipleOf":16},"height":{"type":"integer","minimum":16,"maximum":4096,"multipleOf":16},"guidance":{"type":"number","minimum":0},"remember":{"type":"string"}},"required":["prompt"],"additionalProperties":false}"#,
 }];
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Empty {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthSet {
+    #[serde(default)]
+    provider: AuthProvider,
+    secret_version: String,
+    body: Option<String>,
+    field: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum AuthProvider {
+    #[default]
+    OpenAi,
+}
+
+impl AuthSet {
+    fn selector(&self) -> Result<(Provider, Selector)> {
+        let provider = match self.provider {
+            AuthProvider::OpenAi => Provider::OpenAi,
+        };
+        let id = |raw: &str, what: &str| {
+            Id::from_hex(raw.trim()).ok_or_else(|| anyhow!("{what}: expected an exact 32-hex id"))
+        };
+        let secret = id(&self.secret_version, "secret_version")?;
+        let selector = match (&self.body, &self.field) {
+            (None, None) => Selector::Version(secret),
+            (Some(body), Some(field)) => {
+                let raw = body.trim();
+                let body: [u8; 32] = hex::decode(raw.strip_prefix("blake3:").unwrap_or(raw))
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| anyhow!("body: expected a 64-hex blake3 handle"))?;
+                Selector::ItemField {
+                    secret,
+                    body: Inline::new(body),
+                    field: id(field, "field")?,
+                }
+            }
+            _ => bail!("body and field are given together, or neither"),
+        };
+        Ok((provider, selector))
+    }
+}
 
 /// What the response may hold besides the image: the receipt, diagnostic and
 /// remember lines and the JSON-RPC envelope, with room to spare.
@@ -155,8 +215,31 @@ impl Faculty for Imagine {
         TOOLS
     }
     fn call(&self, name: &str, arguments: Bytes, out: &mut Out<'_>) -> Result<()> {
-        if name != "imagine_generate" {
-            bail!("Imagine MCP has no tool {name:?}");
+        match name {
+            "imagine_generate" => {}
+            "imagine_auth_status" => {
+                let _: Empty = decode_arguments(arguments)?;
+                for provider in Provider::ALL {
+                    let status = self.operations.auth_status(*provider)?;
+                    out.line(format!(
+                        "{}: {}",
+                        provider.label(),
+                        status.describe(*provider)
+                    ))?;
+                }
+                return Ok(());
+            }
+            "imagine_auth_set" => {
+                let args: AuthSet = decode_arguments(arguments)?;
+                let (provider, selector) = args.selector().map_err(invalid_arguments)?;
+                let (revision, credential) = self.operations.auth_set(provider, selector)?;
+                return out.line(format!(
+                    "{}: {} (revision {revision:x})",
+                    provider.label(),
+                    credential.describe()
+                ));
+            }
+            _ => bail!("Imagine MCP has no tool {name:?}"),
         }
         let args: Generate = decode_arguments(arguments)?;
         let (request, remember) = args.request().map_err(invalid_arguments)?;

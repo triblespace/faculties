@@ -1,4 +1,4 @@
-use super::auth::{Credential, Provider, Selector};
+use super::auth::{Provider, Selector};
 use super::openai::{self, Background, Moderation, OutputFormat, Quality, Size};
 use super::{
     operations::remember_range, Flux, FluxOptions, Imagine, ModelSources, Request, Variant,
@@ -214,20 +214,7 @@ fn run_auth(cli: &Cli, command: &AuthCommand) -> Result<()> {
         AuthCommand::Status => {
             for provider in Provider::ALL {
                 let status = imagine.auth_status(*provider)?;
-                let line = match status.selected(*provider) {
-                    Ok(credential) => credential.describe(),
-                    Err(_) if status.heads.is_empty() => "unbound".to_owned(),
-                    Err(_) => format!(
-                        "unsettled: {} revisions naming {}",
-                        status.heads.len(),
-                        status
-                            .credentials
-                            .iter()
-                            .map(Credential::describe)
-                            .collect::<Vec<_>>()
-                            .join("; ")
-                    ),
-                };
+                let line = status.describe(*provider);
                 out.line(format!("{}: {line}", provider.label()))?;
             }
             Ok(())

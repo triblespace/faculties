@@ -111,6 +111,24 @@ pub struct AuthStatus {
 }
 
 impl AuthStatus {
+    /// One line for `provider`: the settled credential's public references,
+    /// `unbound`, or every concurrent binding when unsettled.
+    pub fn describe(&self, provider: Provider) -> String {
+        match self.selected(provider) {
+            Ok(credential) => credential.describe(),
+            Err(_) if self.heads.is_empty() => "unbound".to_owned(),
+            Err(_) => format!(
+                "unsettled: {} revisions naming {}",
+                self.heads.len(),
+                self.credentials
+                    .iter()
+                    .map(Credential::describe)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        }
+    }
+
     /// A settled binding, never an arbitrary winner among concurrent ones.
     pub fn selected(&self, provider: Provider) -> Result<Credential> {
         let label = provider.label();
