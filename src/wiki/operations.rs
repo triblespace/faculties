@@ -250,6 +250,16 @@ impl Wiki {
     pub fn import_revisions(&self, imports: Vec<(Id, String)>) -> Result<()> {
         cmd_batch_import(self.storage(), imports)
     }
+    /// Republish one exact revision of this Wiki's workspace into
+    /// `destination`'s, with only the opted-in history, links and files.
+    pub fn transfer(
+        &self,
+        destination: &Wiki,
+        revision: Id,
+        options: TransferOptions,
+    ) -> Result<TransferReport> {
+        transfer::transfer(&self.storage, &destination.storage, revision, options)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2611,9 +2621,19 @@ mod typst_validate {
     }
 }
 
+#[path = "transfer.rs"]
+mod transfer;
+pub use transfer::{
+    Carried, Presence, Reason, Reference, ReferenceKind, TransferOptions, TransferReport,
+};
+
 #[cfg(test)]
 #[path = "plan_tests.rs"]
 mod plan_tests;
+
+#[cfg(test)]
+#[path = "transfer_tests.rs"]
+mod transfer_tests;
 
 #[cfg(test)]
 mod tests {

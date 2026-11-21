@@ -176,6 +176,37 @@ enum Command {
         #[arg(long)]
         compile: bool,
     },
+    /// Republish one exact revision from one workspace's Wiki into another's.
+    ///
+    /// The revision keeps its id, author and authorship time; the destination
+    /// commit only records that this node curated it there. By default only
+    /// that revision crosses: its parent revision ids stay in its identity as
+    /// references, and its links and files stay references too. Every relation
+    /// is listed as carried or as a reference. Repeating converges. The
+    /// source is never written. `--workspace` does not apply here.
+    Transfer {
+        /// Exact 32-hex revision id; never a prefix.
+        #[arg(value_parser = parse_exact_revision)]
+        revision: Id,
+        /// Exact source workspace revision from `faculties workspace list`.
+        #[arg(long, value_parser = crate::cli_workspace::parse_revision)]
+        from: Id,
+        /// Exact destination workspace revision from `faculties workspace list`.
+        #[arg(long, value_parser = crate::cli_workspace::parse_revision)]
+        to: Id,
+        /// Also carry every source ancestor of the revision.
+        #[arg(long)]
+        with_history: bool,
+        /// Also carry the exact source revisions it cites (one hop).
+        #[arg(long)]
+        with_links: bool,
+        /// Also carry the Files leaves it links, with their bytes.
+        #[arg(long)]
+        with_files: bool,
+        /// Report the exact scope without publishing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Resolve one scheme:prefix line per input line.
     FixTruncated {
         input: String,
@@ -223,6 +254,116 @@ where
     execute(Cli::try_parse_from(arguments)?, out)
 }
 
+fn parse_exact_revision(value: &str) -> Result<Id, String> {
+    if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("a transfer names an exact 32-hex revision id, never a prefix".into());
+    }
+    Id::from_hex(value).ok_or_else(|| "invalid revision id".into())
+}
+
+fn transfer_report(report: &super::TransferReport, out: &mut Out<'_>) -> Result<()> {
+    use super::Presence;
+    let outcome = if report.dry_run {
+        "dry run, nothing published".to_owned()
+    } else if report.publications == 0 {
+        "nothing new to publish".to_owned()
+    } else {
+        format!("published {} commit(s)", report.publications)
+    };
+    out.line(format!(
+        "transfer {:x} from {:X} to {:X}: {outcome}",
+        report.revision, report.from, report.to
+    ))?;
+    if report.same_root() {
+        out.line("both workspaces bind the same Wiki root")?;
+    }
+    out.line("carried:")?;
+    for item in &report.carried {
+        let kind = if item.reason == super::Reason::Attachment {
+            "file"
+        } else {
+            "revision"
+        };
+        out.line(format!(
+            "  {kind} {:x} ({}) {}: {} facts, {} new",
+            item.id,
+            item.reason.label(),
+            serde_json::to_string(&item.label)?,
+            item.facts,
+            item.new_facts
+        ))?;
+    }
+    if report.references.is_empty() {
+        out.line("references: none")?;
+    } else {
+        out.line("references (only the id or hash crosses, never facts or bytes):")?;
+        for reference in &report.references {
+            let at = match reference.at_destination {
+                Presence::Present => "present at destination",
+                Presence::Absent => "absent at destination",
+                Presence::Unknown => "destination has no Files role",
+            };
+            out.line(format!(
+                "  {} {} from {:x}: {at}",
+                reference.kind.label(),
+                reference.target,
+                reference.from
+            ))?;
+        }
+    }
+    out.line(format!(
+        "new facts: {} Wiki, {} Files",
+        report.new_wiki_facts, report.new_file_facts
+    ))?;
+    if report.verified {
+        out.line("read back from the destination: every carried fact and text")?;
+    }
+    out.line(format!(
+        "the source is unchanged; archiving it is separate: `wiki --workspace {:X} archive {:x}` archives that entry's whole source frontier, not only this revision",
+        report.from, report.revision
+    ))
+}
+
+fn transfer(cli: &Cli, command: &Command, out: &mut Out<'_>) -> Result<()> {
+    let Command::Transfer {
+        revision,
+        from,
+        to,
+        with_history,
+        with_links,
+        with_files,
+        dry_run,
+    } = command
+    else {
+        unreachable!("only called for transfer");
+    };
+    if cli.workspace.workspace.is_some() {
+        anyhow::bail!(
+            "wiki transfer binds only --from and --to; unset --workspace / FACULTIES_WORKSPACE"
+        );
+    }
+    let bind = |workspace: Id| {
+        crate::cli_workspace::WorkspaceArgs {
+            workspace: Some(workspace),
+        }
+        .storage(cli.pile.clone(), cli.key.clone())
+        .map(Wiki::with_storage)
+    };
+    let source = bind(*from).context("bind the source workspace")?;
+    let destination = bind(*to).context("bind the destination workspace")?;
+    let report = source.transfer(
+        &destination,
+        *revision,
+        super::TransferOptions {
+            history: *with_history,
+            links: *with_links,
+            files: *with_files,
+            dry_run: *dry_run,
+        },
+    )?;
+    transfer_report(&report, out)
+}
+
 fn revision(out: &mut Out<'_>, id: Id) -> Result<()> {
     out.line(format!("revision {id:x}"))
 }
@@ -238,6 +379,12 @@ fn tag_change(out: &mut Out<'_>, result: Option<Id>, name: &str, add: bool) -> R
 }
 
 fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
+    let Some(command) = &cli.command else {
+        return Ok(());
+    };
+    if matches!(command, Command::Transfer { .. }) {
+        return transfer(&cli, command, out);
+    }
     let Some(command) = cli.command else {
         return Ok(());
     };
@@ -360,6 +507,7 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             wiki.fix_truncated(&crate::text_arg(&input, "input")?, out)
         }
         Command::Lint { fix, check } => wiki.lint(fix, check, out),
+        Command::Transfer { .. } => unreachable!("transfer binds its own workspaces"),
     }
 }
 
