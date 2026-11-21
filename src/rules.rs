@@ -57,8 +57,10 @@ use crate::schemas::rules::{
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
 
-/// Tags that keep a goal out of ignition, as `ignite.sh` has them.
-pub const IGNITE_SKIP: [&str; 9] = [
+/// Tags that keep a goal out of ignition, as `ignite.sh` has them. A
+/// `horizon` goal is moved by its owner in idle moments, never dispatched.
+pub const IGNITE_SKIP: [&str; 10] = [
+    "horizon",
     "parking",
     "later",
     "idea",
@@ -447,6 +449,7 @@ mod tests {
         };
         let ready = state("todo", &["focus", "zooid-a"]);
         let parked = state("todo", &["zooid-a", "parking"]);
+        let horizon = state("todo", &["zooid-a", "horizon"]);
         let other = state("todo", &["zooid-b"]);
         let doing = state("doing", &["zooid-a"]);
         let ignited_goal = state("todo", &["zooid-a"]);
@@ -455,6 +458,7 @@ mod tests {
         let states = vec![
             ready.clone(),
             parked,
+            horizon,
             other,
             doing,
             ignited_goal.clone(),
