@@ -2003,12 +2003,23 @@ impl Spawn {
             let about = Some(brief.about.as_str()).filter(|about| !about.trim().is_empty());
             // The tint chooses among equal recollections; it is never worth
             // a launch. A tint that fails wakes the zooid into the untinted
-            // cover and says so; a wake that fails fails the launch.
-            let (tint, untinted) = match about.map(|about| self.renderer.tint(&self.storage, about))
-            {
+            // cover and says so; a wake that fails fails the launch. A tint
+            // that panics counts as one that failed: CubeCL unwraps a device
+            // allocation that does not fit, so a WeMM bind or forward on a
+            // full GPU panics rather than returning its error, and memory
+            // read at bind start cannot foresee what a neighbour takes.
+            let (tint, untinted) = match about.map(|about| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.renderer.tint(&self.storage, about)
+                }))
+            }) {
                 None => (None, None),
-                Some(Ok(tint)) => (Some(tint), None),
-                Some(Err(error)) => (None, Some(format!("{error:#}"))),
+                Some(Ok(Ok(tint))) => (Some(tint), None),
+                Some(Ok(Err(error))) => (None, Some(format!("{error:#}"))),
+                Some(Err(panic)) => (
+                    None,
+                    Some(format!("tint panicked: {}", panic_text(&*panic))),
+                ),
             };
             let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
             let assemble = |wake: &str| {
@@ -3374,6 +3385,15 @@ fn append_ignited(path: &Path, goal: Id) -> Result<()> {
         .with_context(|| format!("sync {}", path.display()))
 }
 
+/// A caught panic's message, as `panic!` gave it.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-text panic payload")
+}
+
 fn read_text<R: BlobStoreGet + ?Sized>(reader: &R, handle: TextHandle) -> Option<String> {
     reader
         .get::<View<str>, _>(handle)
@@ -4171,6 +4191,9 @@ mod tests {
     struct StubRenderer {
         /// Refuse a tint the way WeMM refuses an over-long query.
         refuse_tint: bool,
+        /// Panic in the tint, the way CubeCL does when a device allocation
+        /// does not fit.
+        panic_tint: bool,
         /// Fail every wake, as an unreadable pile would.
         refuse_wake: bool,
         /// Render the memory part as exactly its budget of characters, the
@@ -4186,6 +4209,9 @@ mod tests {
         fn tint(&self, _storage: &Storage, about: &str) -> Result<WakeTint> {
             if self.refuse_tint {
                 bail!("WeMM text preparation: too long");
+            }
+            if self.panic_tint {
+                panic!("CUDA allocation: BufferTooBig");
             }
             Ok(WakeTint {
                 about: about.to_owned(),
@@ -6371,6 +6397,31 @@ mod tests {
         .unwrap();
         assert!(prompt.contains("STUB-WAKE untinted"));
         assert_eq!(prompt.matches("STUB-WAKE").count(), 1);
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.untinted, [why]);
+    }
+
+    #[test]
+    fn a_tint_that_panics_falls_back_to_the_untinted_cover_and_says_so() {
+        let f = fixture_full(
+            FakeLauncher::default(),
+            StubRenderer {
+                panic_tint: true,
+                ..Default::default()
+            },
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        let launched = f.spawn.run(&f.request("Tint panics.")).unwrap();
+        let why = launched.untinted.clone().unwrap();
+        assert!(why.contains("tint panicked"), "{why}");
+        assert!(why.contains("BufferTooBig"), "{why}");
+        let prompt = std::fs::read_to_string(
+            f.launcher.started.lock().unwrap()[0]
+                .script
+                .with_extension("prompt"),
+        )
+        .unwrap();
+        assert!(prompt.contains("STUB-WAKE untinted"));
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.untinted, [why]);
     }
