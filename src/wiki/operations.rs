@@ -212,6 +212,18 @@ impl Wiki {
     pub fn similar_with(&self, session: &crate::wemm::Session, query: &str) -> Result<String> {
         cmd_similar(self.storage(), session, query.into())
     }
+    /// Every current revision's best WeMM cosine to `query`, highest first:
+    /// the scores [`Self::similar_with`] prints the top of, for a host that
+    /// colours the whole graph by them. The note names commits that have no
+    /// rows yet, so a partial index is said rather than read as low scores.
+    #[cfg(feature = "wemm")]
+    pub fn similar_scores_with(
+        &self,
+        session: &crate::wemm::Session,
+        query: &str,
+    ) -> Result<(Vec<(f64, Id)>, Option<String>)> {
+        similar_scores(self.storage(), session, query)
+    }
     #[cfg(not(feature = "wemm"))]
     pub fn similar(&self, _query: &str) -> Result<String> {
         crate::wemm_unavailable()
@@ -2170,6 +2182,31 @@ fn similar_revisions(view: &WikiView, cosines: &ReconstructedCosines) -> Vec<(f6
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     ranked
+}
+
+#[cfg(feature = "wemm")]
+fn similar_scores(
+    storage: WikiStorage<'_>,
+    session: &crate::wemm::Session,
+    query: &str,
+) -> Result<(Vec<(f64, Id)>, Option<String>)> {
+    storage.with_pile(|pile, signer, runtime| {
+        let source = storage.storage.open_collection_read(
+            pile,
+            schema::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
+            runtime,
+        )?;
+        let query = crate::wemm::Query::Text(query);
+        let scores = session.cosines(pile, source, &content_attributes(), runtime, query)?;
+        scores.require_rows("Wiki")?;
+        views_in(pile, source, signer, &[], runtime, |view, _| {
+            Ok((
+                similar_revisions(view, &scores.cosines),
+                scores.partial_note("Wiki"),
+            ))
+        })
+    })
 }
 
 #[cfg(feature = "wemm")]

@@ -23,7 +23,7 @@
 //!   writes it to `$TMPDIR/faculties-files/`, and opens it via the platform
 //!   `open` command.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::storage::WidgetReader as PileSnapshot;
 use triblespace::core::blob::Blob;
@@ -353,6 +353,105 @@ fn preview_file(
 
 // ── force-directed graph ──────────────────────────────────────────────
 
+/// How near each revision's meaning is to a typed sentence.
+///
+/// The host computes the cosines (the WeMM model runs only where its build
+/// does, today a GB10) and hands them in; the viewer only paints them. A
+/// revision absent from `cosines` has no row yet and paints as unscored,
+/// never as dissimilar.
+struct SemanticColouring {
+    query: String,
+    cosines: HashMap<Id, f32>,
+    /// The lowest and highest cosine among scored revisions. Cosines from one
+    /// embedder bunch in a narrow band, so the gradient spans this range
+    /// rather than [-1, 1], which would paint every node the same.
+    low: f32,
+    high: f32,
+    note: Option<String>,
+}
+
+impl SemanticColouring {
+    fn new(query: String, cosines: HashMap<Id, f32>, note: Option<String>) -> Self {
+        let (low, high) = cosines
+            .values()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &c| {
+                (lo.min(c), hi.max(c))
+            });
+        SemanticColouring {
+            query,
+            cosines,
+            low,
+            high,
+            note,
+        }
+    }
+
+    /// Where a revision sits between the least and most similar, in [0, 1].
+    fn position(&self, revision: Id) -> Option<f32> {
+        let cosine = *self.cosines.get(&revision)?;
+        let span = self.high - self.low;
+        Some(if span > f32::EPSILON {
+            ((cosine - self.low) / span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        })
+    }
+}
+
+/// The host's side of semantic colouring: what was asked and what came back.
+#[derive(Default)]
+enum Semantic {
+    /// The host never said it can embed a query; no button is shown.
+    #[default]
+    Unsupported,
+    Idle,
+    /// Asked for, not yet taken by the host.
+    Requested(String),
+    /// Taken by the host, answer outstanding.
+    Pending(String),
+    Shown(SemanticColouring),
+    Failed {
+        query: String,
+        error: String,
+    },
+}
+
+/// The near end of the gradient: signal yellow, the colour a search match
+/// already uses, so "near this sentence" reads like "matches this word".
+fn semantic_fill(t: f32) -> egui::Color32 {
+    GORBIE::themes::blend(
+        egui::Color32::from_rgb(0x2a, 0x3a, 0x4a),
+        GORBIE::themes::ral(1003),
+        t,
+    )
+}
+
+/// The \u{2248} button: colour by the typed sentence, or, with the field
+/// empty and a colouring up, go back to the entry colours.
+fn semantic_button(ui: &mut egui::Ui, semantic: &mut Semantic, query: &str) {
+    if matches!(semantic, Semantic::Unsupported) {
+        return;
+    }
+    let active = !matches!(semantic, Semantic::Idle);
+    if query.is_empty() && active {
+        if ui
+            .add(GORBIE::widgets::Button::new("\u{00d7}"))
+            .on_hover_text("Back to the entry colours")
+            .clicked()
+        {
+            *semantic = Semantic::Idle;
+        }
+        return;
+    }
+    if ui
+        .add_enabled(!query.is_empty(), GORBIE::widgets::Button::new("\u{2248}"))
+        .on_hover_text("Colour every note by how near its meaning is to this sentence")
+        .clicked()
+    {
+        *semantic = Semantic::Requested(query.to_string());
+    }
+}
+
 struct WikiGraph {
     nodes: Vec<GraphNode>,
     edges: Vec<(usize, usize)>,
@@ -491,6 +590,7 @@ impl WikiGraph {
         &self,
         ui: &mut egui::Ui,
         search: &mut GORBIE::search::SearchSession,
+        semantic: Option<&SemanticColouring>,
     ) -> (Option<Id>, egui::Rect) {
         // Bounded viewport height. Inside the notebook's auto_shrink
         // ScrollArea `ui.available_height()` is f32::INFINITY, and
@@ -603,8 +703,13 @@ impl WikiGraph {
             // keeps a visible size. The degree comes from the layout's own
             // adjacency rather than from a second count kept here.
             let degree = self.layout.layout().degree(index);
+            let nearness = semantic.and_then(|colouring| colouring.position(node.revision_id));
             let r = if is_match {
                 3.0
+            } else if let Some(t) = nearness {
+                // The nearest notes grow, so the answer to the sentence can
+                // be found at the framed-whole zoom where every dot is small.
+                1.0 + 2.0 * t * t
             } else if degree <= 1.0 {
                 1.0
             } else {
@@ -615,6 +720,11 @@ impl WikiGraph {
             // the graph and the floats highlight in lock-step.
             let fill = if is_match {
                 node_match_fill
+            } else if let Some(t) = nearness {
+                semantic_fill(t)
+            } else if semantic.is_some() {
+                // Colouring by meaning, but this revision has no row yet.
+                egui::Color32::from_rgb(0x44, 0x44, 0x44)
             } else if node.archived {
                 egui::Color32::from_rgb(0x66, 0x66, 0x66)
             } else {
@@ -687,6 +797,44 @@ impl WikiGraph {
             painter.galley(hint_pos, hint_galley, hint_color);
             let meta_pos = egui::pos2(hint_pos.x - gap - meta_galley.size().x, top);
             painter.galley(meta_pos, meta_galley, meta_color);
+        }
+
+        // Bottom-left legend while colouring by meaning: the sentence, the
+        // gradient, and the cosine range it spans.
+        if let Some(colouring) = semantic {
+            let font = egui::FontId::monospace(9.0);
+            let text_color = egui::Color32::from_rgb(0xc8, 0xc8, 0xc8);
+            let left = rect.left() + 8.0;
+            let bottom = rect.bottom() - 8.0;
+            let mut lines = vec![format!(
+                "\u{2248} \"{}\" · COSINE {:.3}\u{2013}{:.3} · {} SCORED",
+                colouring.query,
+                colouring.low,
+                colouring.high,
+                colouring.cosines.len()
+            )];
+            if let Some(note) = colouring.note.as_ref() {
+                lines.push(note.clone());
+            }
+            let mut y = bottom;
+            for line in lines.iter().rev() {
+                let galley = painter.layout_no_wrap(line.clone(), font.clone(), text_color);
+                y -= galley.size().y;
+                painter.galley(egui::pos2(left, y), galley, text_color);
+                y -= 2.0;
+            }
+            const STEPS: usize = 32;
+            let (width, height) = (120.0, 4.0);
+            y -= height + 2.0;
+            for step in 0..STEPS {
+                let x0 = left + width * step as f32 / STEPS as f32;
+                let x1 = left + width * (step + 1) as f32 / STEPS as f32;
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, y), egui::pos2(x1, y + height)),
+                    0.0,
+                    semantic_fill(step as f32 / (STEPS - 1) as f32),
+                );
+            }
         }
 
         (clicked, rect)
@@ -819,6 +967,8 @@ pub struct WikiViewer {
     /// build). Dropped whenever `live` is rebuilt.
     graph: Option<WikiGraph>,
     open_pages: Vec<OpenPage>,
+    /// Colouring the graph by meaning, when the host can embed a query.
+    semantic: Semantic,
 }
 
 impl WikiViewer {
@@ -826,6 +976,60 @@ impl WikiViewer {
     /// the first `render` call.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Offer colouring the graph by similarity to a typed sentence: a
+    /// \u{2248} button beside GO. The host must then poll
+    /// [`Self::take_semantic_request`] and answer with
+    /// [`Self::set_semantic_scores`] or [`Self::set_semantic_error`]; the
+    /// viewer never embeds anything itself.
+    pub fn with_semantic_colouring(mut self) -> Self {
+        self.semantic = Semantic::Idle;
+        self
+    }
+
+    /// The sentence the reader asked to colour by, once. The viewer then
+    /// waits for the host's answer to exactly that sentence.
+    pub fn take_semantic_request(&mut self) -> Option<String> {
+        match std::mem::take(&mut self.semantic) {
+            Semantic::Requested(query) => {
+                self.semantic = Semantic::Pending(query.clone());
+                Some(query)
+            }
+            other => {
+                self.semantic = other;
+                None
+            }
+        }
+    }
+
+    /// Answer a request with each revision's cosine to `query`. Revisions not
+    /// given paint as unscored. An answer to a sentence the reader has since
+    /// replaced or cleared is dropped, so a slow embed cannot paint over a
+    /// newer question.
+    pub fn set_semantic_scores(
+        &mut self,
+        query: &str,
+        cosines: impl IntoIterator<Item = (Id, f32)>,
+        note: Option<String>,
+    ) {
+        if matches!(&self.semantic, Semantic::Pending(pending) if pending == query) {
+            self.semantic = Semantic::Shown(SemanticColouring::new(
+                query.to_string(),
+                cosines.into_iter().collect(),
+                note,
+            ));
+        }
+    }
+
+    /// Answer a request with why it could not be scored.
+    pub fn set_semantic_error(&mut self, query: &str, error: String) {
+        if matches!(&self.semantic, Semantic::Pending(pending) if pending == query) {
+            self.semantic = Semantic::Failed {
+                query: query.to_string(),
+                error,
+            };
+        }
     }
 
     /// Render the viewer into a GORBIE card context. `wiki_view` is the
@@ -962,8 +1166,17 @@ impl WikiViewer {
             // visually the force-directed view becomes edge-to-edge
             // like the timeline viewport.
             let mut search = ctx.search();
+            let colouring = match &self.semantic {
+                Semantic::Shown(colouring) => Some(colouring),
+                _ => None,
+            };
             let (clicked_node, graph_rect) =
-                graph.show(ctx.ui_mut(), &mut search);
+                graph.show(ctx.ui_mut(), &mut search, colouring);
+            // The host answers from its own worker; look again until it has.
+            if matches!(self.semantic, Semantic::Requested(_) | Semantic::Pending(_)) {
+                ctx.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(200));
+            }
             if let Some(revision_id) = clicked_node {
                 if !self
                     .open_pages
@@ -1026,6 +1239,11 @@ impl WikiViewer {
                                             self.search_query.trim().to_string(),
                                         );
                                     }
+                                    semantic_button(
+                                        ui,
+                                        &mut self.semantic,
+                                        self.search_query.trim(),
+                                    );
                                     ui.with_layout(
                                         egui::Layout::left_to_right(
                                             egui::Align::Center,
@@ -1106,6 +1324,24 @@ impl WikiViewer {
             } else {
                 self.search_miss = Some(q);
             }
+        }
+
+        match &self.semantic {
+            Semantic::Requested(query) | Semantic::Pending(query) => {
+                ctx.ui_mut().label(
+                    egui::RichText::new(format!("\u{2248} embedding \"{query}\"\u{2026}"))
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+            }
+            Semantic::Failed { query, error } => {
+                render_diagnostic(
+                    ctx.ui_mut(),
+                    &format!("could not colour by \"{query}\": {error}"),
+                );
+            }
+            _ => {}
         }
 
         // Search miss banner — muted warn style, auto-dismisses on
@@ -1322,6 +1558,46 @@ mod tests {
     use triblespace::core::metadata;
     use triblespace::macros::{find, pattern};
     use triblespace::prelude::*;
+
+    fn semantic_id(byte: u8) -> Id {
+        Id::new([byte; 16]).expect("non-nil id")
+    }
+
+    #[test]
+    fn semantic_colouring_spans_the_scored_range_and_leaves_unscored_alone() {
+        let colouring = SemanticColouring::new(
+            "fp4".into(),
+            [
+                (semantic_id(1), 0.20),
+                (semantic_id(2), 0.30),
+                (semantic_id(3), 0.25),
+            ]
+            .into_iter()
+            .collect(),
+            None,
+        );
+        assert_eq!(colouring.position(semantic_id(1)), Some(0.0));
+        assert_eq!(colouring.position(semantic_id(2)), Some(1.0));
+        let middle = colouring.position(semantic_id(3)).unwrap();
+        assert!((middle - 0.5).abs() < 1e-5, "{middle}");
+        assert_eq!(colouring.position(semantic_id(4)), None);
+    }
+
+    #[test]
+    fn a_semantic_answer_to_a_replaced_sentence_is_dropped() {
+        let mut viewer = WikiViewer::new();
+        assert_eq!(viewer.take_semantic_request(), None);
+        let mut viewer = viewer.with_semantic_colouring();
+        viewer.semantic = Semantic::Requested("old".into());
+        assert_eq!(viewer.take_semantic_request().as_deref(), Some("old"));
+        assert_eq!(viewer.take_semantic_request(), None, "asked once");
+        viewer.semantic = Semantic::Requested("new".into());
+        assert_eq!(viewer.take_semantic_request().as_deref(), Some("new"));
+        viewer.set_semantic_scores("old", [(semantic_id(1), 0.9)], None);
+        assert!(matches!(viewer.semantic, Semantic::Pending(ref q) if q == "new"));
+        viewer.set_semantic_scores("new", [(semantic_id(1), 0.9)], None);
+        assert!(matches!(viewer.semantic, Semantic::Shown(ref c) if c.query == "new"));
+    }
 
     fn at(seconds: f64) -> wiki::IntervalValue {
         let instant = Epoch::from_tai_seconds(seconds);
