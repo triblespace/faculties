@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""Translate a local Gollum git repository into a `wiki import --plan` plan.
+
+This is a source adapter only. It reads git and writes the plain JSON plan
+that `wiki import --plan` (src/wiki/cli.rs `read_plan`) replays; it never
+touches a pile. Identity, convergence, provenance and link resolution are the
+importer's (src/wiki/operations.rs `cmd_import_plan`).
+
+    gollum-plan bundle <repo> <out.bundle>
+        Write a `git bundle --all` of the repository: the exact original
+        history, to be added to Files once. Its Files id goes to `plan`.
+
+    gollum-plan plan <repo> <outdir> [--ref REF] [--bundle-id HEX] [--accept-loss]
+        Write <outdir>/plan.json, its page texts and attachment bytes, and
+        <outdir>/report.json listing everything the plan cannot carry.
+
+The plan is a pure function of the repository at REF and the bundle id, so
+running `plan` again writes the same bytes, and replaying it converges. Make
+the bundle once and reuse its Files id: a re-made bundle need not be
+byte-identical, and every provenance record names the bundle.
+
+What becomes what:
+- A page is a markup file with a Markdown extension. Its entry follows it
+  through renames (git rename detection, per parent) and merges (one
+  predecessor per distinct parent state).
+- A revision is written when a commit changes a page's bytes or path, or
+  merges distinct states of it. Unchanged pages are carried, not re-stated.
+- Every other file is an attachment, keyed by its path. A version is listed
+  whenever the commit's bytes differ from what the key resolves to so far
+  in plan order, so every version reaches Files and links pin the version
+  current at their commit.
+- Gollum `[[Page]]`, `[[text|Page]]`, `[[file.png|alt=..]]`, relative Markdown
+  links and images become `#link("plan:KEY")[..]`. Images become links: the
+  Wiki has no image embed.
+- Links resolve to the target's latest revision so far in plan order. Inside
+  a commit the revisions are ordered so link targets come first; a link in a
+  cycle, or to a page new in the same commit that cannot come first, gets an
+  explicit fixup revision once every revision of the commit exists.
+
+Everything the plan cannot represent is a finding in report.json, with its
+commit and path. Findings marked `loss` (a construct converted lossily, a page
+deletion, two pages merged into one path, a link pinned to a concurrent
+branch's revision, a page in an unsupported markup) make `plan` refuse to
+write plan.json unless --accept-loss is given. The bundle keeps all of it.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+PAGE_EXTENSIONS = {".md", ".markdown", ".mkd", ".mkdn", ".mdown"}
+# Markups Gollum renders that this driver does not convert.
+OTHER_MARKUP = {".textile", ".rdoc", ".org", ".creole", ".rest", ".rst",
+                ".asciidoc", ".adoc", ".pod", ".mediawiki", ".wiki", ".txt"}
+
+
+# ---------------------------------------------------------------- git
+
+
+def git(repo, *args, binary=False):
+    p = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+    if p.returncode != 0:
+        raise SystemExit(f"git {' '.join(args)} failed ({p.returncode}): "
+                         f"{p.stderr.decode(errors='replace').strip()}")
+    return p.stdout if binary else p.stdout.decode()
+
+
+def tree(repo, commit):
+    """path -> blob sha of every file in the commit's tree."""
+    out = {}
+    for line in git(repo, "ls-tree", "-r", "-z", commit).split("\0"):
+        if not line:
+            continue
+        meta, path = line.split("\t", 1)
+        mode, kind, sha = meta.split()
+        if kind == "blob":
+            out[path] = sha
+        else:
+            out.setdefault("\0unsupported", []).append((kind, path))
+    return out
+
+
+RENAME_THRESHOLD = "50%"
+
+
+def renames(repo, parent, commit):
+    """new path -> old path for files git sees as renamed from parent.
+
+    Git records no renames: this is its similarity heuristic, at
+    RENAME_THRESHOLD (`--find-renames`)."""
+    out = {}
+    raw = git(repo, "diff-tree", "-r", f"-M{RENAME_THRESHOLD}", "-z", "--name-status", parent, commit)
+    parts = raw.split("\0")
+    i = 0
+    while i < len(parts) and parts[i]:
+        status = parts[i]
+        if status.startswith("R"):
+            out[parts[i + 2]] = parts[i + 1]
+            i += 3
+        elif status.startswith("C"):
+            i += 3
+        else:
+            i += 2
+    return out
+
+
+# ---------------------------------------------------------------- names
+
+
+def is_page(path):
+    return os.path.splitext(path)[1].lower() in PAGE_EXTENSIONS
+
+
+def is_other_markup(path):
+    return os.path.splitext(path)[1].lower() in OTHER_MARKUP
+
+
+def title_of(path):
+    return os.path.splitext(os.path.basename(path))[0].replace("-", " ")
+
+
+def norm_name(name):
+    """Gollum page-name matching: case-insensitive, dash equals space."""
+    return re.sub(r"\s+", " ", name.replace("-", " ")).strip().lower()
+
+
+def norm_path(path):
+    return "/".join(norm_name(part) for part in path.strip("/").split("/"))
+
+
+# ---------------------------------------------------------------- typst text
+
+
+def typst_string(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+PLAIN_SPECIAL = set("\\#$@<>*_`[]~")
+
+
+def escape_plain(s, after_expr):
+    out = []
+    for i, c in enumerate(s):
+        nxt = s[i + 1] if i + 1 < len(s) else ""
+        if c in PLAIN_SPECIAL:
+            out.append("\\" + c)
+        elif c == "/" and nxt in "/*":
+            out.append("\\/")
+        elif c == "-" and nxt in "-?":
+            out.append("\\-")
+        elif i == 0 and after_expr and c in "([.;":
+            out.append("\\" + c)
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+class Page:
+    """Converts one page's Markdown to Typst against one commit's tree."""
+
+    def __init__(self, driver, commit, path, tree_pages, tree_files):
+        self.driver = driver
+        self.commit = commit
+        self.path = path
+        self.dir = os.path.dirname(path)
+        self.tree_pages = tree_pages  # path -> page key at this commit
+        self.tree_files = tree_files  # set of attachment paths at this commit
+        self.links = []  # page keys linked, in order
+        self.refs = {}
+
+    def finding(self, kind, detail, loss):
+        self.driver.finding(kind, self.commit, self.path, detail, loss)
+
+    # -- targets
+
+    def page_target(self, target):
+        """Gollum page name -> path of the page at this commit, or None."""
+        target = target.strip()
+        if "#" in target:
+            target, anchor = target.split("#", 1)
+            self.finding("anchor", f"link anchor #{anchor} dropped", True)
+            if not target:
+                return None
+        stem = os.path.splitext(target)[0] if is_page(target) else target
+        want = norm_path(stem)
+        candidates = {}
+        for path in self.tree_pages:
+            key = norm_path(os.path.splitext(path)[0])
+            candidates.setdefault(key, []).append(path)
+        if not target.startswith("/") and self.dir:
+            rel = norm_path(self.dir + "/" + stem)
+            if rel in candidates:
+                return sorted(candidates[rel])[0]
+        if want in candidates:
+            hits = sorted(candidates[want])
+            if len(hits) > 1:
+                self.finding("ambiguous-link", f"[[{target}]] matches {hits}; took {hits[0]}", True)
+            return hits[0]
+        if "/" not in want:
+            hits = sorted(p for p in self.tree_pages
+                          if norm_name(os.path.splitext(os.path.basename(p))[0]) == want)
+            if len(hits) == 1:
+                return hits[0]
+            if hits:
+                self.finding("ambiguous-link", f"[[{target}]] matches {hits}; took {hits[0]}", True)
+                return hits[0]
+        return None
+
+    def file_target(self, target):
+        target = target.split("#", 1)[0].split("?", 1)[0]
+        clean = target.lstrip("/")
+        for candidate in ([self.dir + "/" + clean] if self.dir and not target.startswith("/") else []) + [clean]:
+            if candidate in self.tree_files:
+                return candidate
+        hits = sorted(p for p in self.tree_files if os.path.basename(p) == os.path.basename(clean))
+        return hits[0] if len(hits) == 1 else None
+
+    def link(self, label_typst, target, image=False):
+        """A link to a page, attachment or URL, as Typst."""
+        if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):
+            body = f"[{label_typst}]" if label_typst else ""
+            return f"#link({typst_string(target)}){body}"
+        has_ext = bool(os.path.splitext(target.split("#")[0])[1]) and not is_page(target.split("#")[0])
+        if image or has_ext:
+            path = self.file_target(target)
+            if path is not None:
+                if image:
+                    self.finding("image-as-link", f"image {path} becomes a files: link", False)
+                label = label_typst or escape_plain(os.path.basename(path), False)
+                return f"#link(\"plan:{path}\")[{label}]"
+            if image or not self.page_target(target):
+                self.finding("dangling-link", f"{target} names no file at this commit; kept as text", False)
+                return label_typst or escape_plain(target, False)
+        path = self.page_target(target)
+        if path is None:
+            self.finding("dangling-link", f"[[{target}]] names no page at this commit; kept as text", False)
+            return label_typst or escape_plain(target, False)
+        key = self.tree_pages[path]
+        self.links.append(key)
+        label = label_typst or escape_plain(title_of(path), False)
+        return f"#link(\"plan:{key}\")[{label}]"
+
+    # -- inline
+
+    def inline(self, s):
+        out = []
+        buf = []
+        state = {"after": False}
+
+        def flush():
+            if buf:
+                out.append(escape_plain("".join(buf), state["after"]))
+                buf.clear()
+                state["after"] = False
+
+        def expr(text, is_expr=True):
+            flush()
+            out.append(text)
+            state["after"] = is_expr
+
+        i = 0
+        n = len(s)
+        while i < n:
+            c = s[i]
+            rest = s[i:]
+            if c == "\\" and i + 1 < n and not s[i + 1].isalnum() and not s[i + 1].isspace():
+                buf.append(s[i + 1])
+                i += 2
+                continue
+            if c == "\\" and i + 1 == n:
+                expr("\\", False)
+                i += 1
+                continue
+            if c == "`":
+                run = len(rest) - len(rest.lstrip("`"))
+                close = s.find("`" * run, i + run)
+                while close != -1 and close + run < n and s[close + run] == "`":
+                    close = s.find("`" * run, close + run + 1)
+                if close != -1:
+                    code = s[i + run:close]
+                    if run > 1 and code.startswith(" ") and code.endswith(" "):
+                        code = code[1:-1]
+                    if "`" in code or code == "":
+                        expr(f"#raw({typst_string(code)})")
+                    else:
+                        expr(f"`{code}`", False)
+                    i = close + run
+                    continue
+            if rest.startswith("[["):
+                close = s.find("]]", i + 2)
+                if close != -1:
+                    expr(self.gollum_link(s[i + 2:close]))
+                    i = close + 2
+                    continue
+            m = re.match(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)", rest)
+            if m:
+                label = self.inline(m.group(1)) if m.group(1) else ""
+                expr(self.link(label, m.group(2), image=True))
+                i += m.end()
+                continue
+            m = re.match(r"\[((?:[^\[\]]|\[[^\]]*\])+)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)", rest)
+            if m:
+                expr(self.link(self.inline(m.group(1)), m.group(2)))
+                i += m.end()
+                continue
+            m = re.match(r"\[([^\]]+)\]\[([^\]]*)\]", rest)
+            if m and (m.group(2) or m.group(1)).lower() in self.refs:
+                expr(self.link(self.inline(m.group(1)), self.refs[(m.group(2) or m.group(1)).lower()]))
+                i += m.end()
+                continue
+            m = re.match(r"\[\^([^\]]+)\]", rest)
+            if m:
+                self.finding("footnote", f"footnote [^{m.group(1)}] kept as text", True)
+            if c == "<":
+                m = re.match(r"<(https?://[^>\s]+|mailto:[^>\s]+)>", rest)
+                if m:
+                    expr(f"#link({typst_string(m.group(1))})")
+                    i += m.end()
+                    continue
+                m = re.match(r"<([^@\s<>]+@[^@\s<>]+\.[^@\s<>]+)>", rest)
+                if m:
+                    expr(f"#link({typst_string('mailto:' + m.group(1))})[{escape_plain(m.group(1), False)}]")
+                    i += m.end()
+                    continue
+                m = re.match(r"<!--(.*?)-->", rest)
+                if m:
+                    expr("/*" + m.group(1).replace("*/", "* /") + "*/", False)
+                    i += m.end()
+                    continue
+                m = re.match(r"<br\s*/?>", rest, re.I)
+                if m:
+                    expr(" \\ ", False)
+                    i += m.end()
+                    continue
+                m = re.match(r"</?[A-Za-z][A-Za-z0-9-]*(\s[^<>]*)?/?>", rest)
+                if m:
+                    self.finding("html", f"HTML {m.group(0)!r} kept as literal text", True)
+            m = re.match(r"https?://[^\s<>\[\]]+", rest)
+            if m and (i == 0 or not s[i - 1].isalnum()):
+                url = m.group(0).rstrip(".,;:!?)'\"")
+                expr(f"#link({typst_string(url)})")
+                i += len(url)
+                continue
+            if rest.startswith("~~"):
+                close = s.find("~~", i + 2)
+                if close > i + 2:
+                    expr(f"#strike[{self.inline(s[i + 2:close])}]")
+                    i = close + 2
+                    continue
+            if c in "*_":
+                run = min(len(rest) - len(rest.lstrip(c)), 3)
+                left_ok = i == 0 or not (c == "_" and s[i - 1].isalnum())
+                if left_ok and i + run < n and not s[i + run].isspace():
+                    close = self.find_close(s, i + run, c * run, c)
+                    if close != -1:
+                        inner = self.inline(s[i + run:close])
+                        if run == 1:
+                            expr(f"#emph[{inner}]")
+                        elif run == 2:
+                            expr(f"#strong[{inner}]")
+                        else:
+                            expr(f"#strong[#emph[{inner}]]")
+                        i = close + run
+                        continue
+            buf.append(c)
+            i += 1
+        flush()
+        return "".join(out)
+
+    @staticmethod
+    def find_close(s, start, delim, c):
+        j = start
+        while True:
+            j = s.find(delim, j)
+            if j == -1:
+                return -1
+            after = j + len(delim)
+            if (not s[j - 1].isspace()
+                    and (after >= len(s) or s[after] != c)
+                    and (c != "_" or after >= len(s) or not s[after].isalnum())):
+                return j
+            j += 1
+
+    def gollum_link(self, body):
+        parts = [p.strip() for p in body.split("|")]
+        if parts[0] == "_TOC_":
+            return "#outline()"
+        if parts[0].lower().startswith("include:"):
+            self.finding("include", f"[[{body}]] (Gollum include) kept as text", True)
+            return escape_plain(f"[[{body}]]", False)
+        first_ext = os.path.splitext(parts[0])[1]
+        if first_ext and not is_page(parts[0]) and self.file_target(parts[0]) is not None:
+            alt = next((p[4:] for p in parts[1:] if p.startswith("alt=")), "")
+            return self.link(escape_plain(alt, False), parts[0], image=True)
+        if len(parts) >= 2:
+            return self.link(self.inline(parts[0]), parts[1])
+        return self.link(escape_plain(parts[0], False), parts[0])
+
+    # -- blocks
+
+    def convert(self, md):
+        lines = md.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        for line in lines:
+            m = re.match(r"^\s{0,3}\[([^\]]+)\]:\s*<?(\S+?)>?(?:\s+[\"'(].*)?$", line)
+            if m and not m.group(1).startswith("^"):
+                self.refs[m.group(1).lower()] = m.group(2)
+        out = []
+        i = 0
+        if lines and lines[0].strip() == "---":
+            end = next((j for j in range(1, len(lines)) if lines[j].strip() in ("---", "...")), None)
+            if end is not None:
+                self.finding("front-matter", "YAML front matter kept as Typst comments", False)
+                out += ["// " + l for l in lines[:end + 1]]
+                i = end + 1
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            fence = re.match(r"^(\s*)(`{3,}|~{3,})\s*([^`\s]*)", line)
+            if fence:
+                marker = fence.group(2)
+                lang = re.sub(r"[^A-Za-z0-9_+-]", "", fence.group(3))
+                j = i + 1
+                body = []
+                while j < len(lines) and not lines[j].strip().startswith(marker):
+                    body.append(lines[j])
+                    j += 1
+                ticks = "`" * max(3, max((len(r) for r in re.findall(r"`+", "\n".join(body))), default=0) + 1)
+                out.append(f"{ticks}{lang}")
+                out += body
+                out.append(ticks)
+                if lang == "mermaid":
+                    self.finding("mermaid", "mermaid diagram kept as a code block", False)
+                i = j + 1
+                continue
+            if stripped.startswith("<!--"):
+                j = i
+                while j < len(lines) and "-->" not in lines[j]:
+                    j += 1
+                if j > i:
+                    out += ["// " + l for l in lines[i:j + 1]]
+                    i = j + 1
+                    continue
+            if re.match(r"^\s{0,3}\[([^\]^]+)\]:\s*\S", line):
+                out.append("// " + line)
+                i += 1
+                continue
+            if stripped.startswith("$$") or re.search(r"(?<!\\)\$[^$\s][^$]*\$", line):
+                self.finding("math", "math kept as literal text", True)
+            m = re.match(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$", line)
+            if m:
+                out.append("=" * len(m.group(1)) + " " + self.inline(m.group(2)))
+                i += 1
+                continue
+            if (i + 1 < len(lines) and stripped and not stripped.startswith(("-", "*", "+", ">", "|"))
+                    and re.match(r"^\s{0,3}(=+|-+)\s*$", lines[i + 1])):
+                level = 1 if lines[i + 1].strip().startswith("=") else 2
+                out.append("=" * level + " " + self.inline(stripped))
+                i += 2
+                continue
+            if re.match(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$", line):
+                out.append("#line(length: 100%)")
+                i += 1
+                continue
+            if stripped.startswith(">"):
+                block = []
+                while i < len(lines) and lines[i].strip().startswith(">"):
+                    block.append(re.sub(r"^\s*>\s?", "", lines[i]))
+                    i += 1
+                inner = Page(self.driver, self.commit, self.path, self.tree_pages, self.tree_files)
+                inner.refs = self.refs
+                body = inner.convert("\n".join(block) + "\n")
+                self.links += inner.links
+                out.append("#quote(block: true)[")
+                out += body.rstrip("\n").split("\n")
+                out.append("]")
+                continue
+            if (stripped.startswith("|") and i + 1 < len(lines)
+                    and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$", lines[i + 1])):
+                rows = [line]
+                j = i + 2
+                while j < len(lines) and lines[j].strip().startswith("|"):
+                    rows.append(lines[j])
+                    j += 1
+                cells = [self.cells(r) for r in rows]
+                cols = len(cells[0])
+                out.append(f"#table(columns: {cols},")
+                for n, row in enumerate(cells):
+                    if len(row) > cols:
+                        self.finding("table-cells", f"table row {n + 1} has {len(row)} cells for {cols} "
+                                     f"columns; dropped {row[cols:]!r}", True)
+                    row = (row + [""] * cols)[:cols]
+                    out.append("  " + " ".join(f"[{self.inline(c)}]," for c in row))
+                out.append(")")
+                i = j
+                continue
+            m = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+            if m:
+                marker = m.group(2)[:-1] + "." if m.group(2)[0].isdigit() else "-"
+                indent = m.group(1).replace("\t", "  ")
+                out.append(f"{indent}{marker} {self.inline(m.group(3))}")
+                i += 1
+                continue
+            if (line.startswith(("    ", "\t")) and i > 0 and not lines[i - 1].strip()
+                    and not (out and re.match(r"^\s*[-+] ", next((o for o in reversed(out) if o.strip()), "")))):
+                self.finding("indented-code", "indented code block converted as paragraph text", True)
+            if not stripped:
+                out.append("")
+                i += 1
+                continue
+            text = self.inline(line.strip() if not line.startswith("    ") else line.strip())
+            if line.endswith("  ") and i + 1 < len(lines) and lines[i + 1].strip():
+                text += " \\"
+            if re.match(r"^(=|\+|-|/ |\d+\.)", text):
+                text = "\\" + text if not text[0].isdigit() else re.sub(r"^(\d+)\.", r"\1\\.", text)
+            lead = re.match(r"^\s*", line).group(0) if line.startswith((" ", "\t")) and out and out[-1].lstrip().startswith(("-", "+")) else ""
+            out.append(lead + text)
+            i += 1
+        return "\n".join(out) + "\n"
+
+    @staticmethod
+    def cells(row):
+        row = row.strip()
+        if row.startswith("|"):
+            row = row[1:]
+        if row.endswith("|") and not row.endswith("\\|"):
+            row = row[:-1]
+        return [c.strip() for c in re.split(r"(?<!\\)\|", row)]
+
+
+# ---------------------------------------------------------------- the plan
+
+
+class Driver:
+    def __init__(self, repo, ref, outdir, bundle_id):
+        self.repo = repo
+        self.ref = ref
+        self.outdir = outdir
+        self.bundle_id = bundle_id
+        self.findings = []
+        self.files = {}  # relative output path -> bytes
+
+    def finding(self, kind, commit, path, detail, loss):
+        item = {"kind": kind, "commit": commit, "path": path, "detail": detail, "loss": loss}
+        if item not in self.findings:
+            self.findings.append(item)
+
+    def run(self):
+        tip = git(self.repo, "rev-parse", "--verify", f"{self.ref}^{{commit}}").strip()
+        commits = git(self.repo, "rev-list", "--topo-order", "--reverse", tip).split()
+        page_state = {}   # commit -> {path: (page_key, rev_key)}
+        file_state = {}   # commit -> {path: blob}
+        revinfo = {}      # rev_key -> (blob, path)
+        ancestors = {}    # rev_key -> every earlier rev key of its page it supersedes
+        plan_pages = {}   # page key -> latest rev key in plan order
+        plan_files = {}   # attachment key -> blob in plan order
+        plan_commits = []
+        empty = 0
+        page_n = 0
+        for commit in commits:
+            meta = git(self.repo, "show", "-s", "--format=%P%x00%an <%ae>%x00%aI", commit)
+            parents_raw, author, date = meta.rstrip("\n").split("\0")
+            parents = parents_raw.split()
+            t = tree(self.repo, commit)
+            for kind, path in t.pop("\0unsupported", []):
+                self.finding("submodule", commit, path, f"{kind} entry not imported", True)
+            moved = {p: renames(self.repo, p, commit) for p in parents}
+            parent_trees = {p: tree(self.repo, p) for p in parents}
+            for p in parent_trees:
+                parent_trees[p].pop("\0unsupported", None)
+
+            pages_here = {}  # path -> (page_key, preds, needs_revision)
+            for path in sorted(t):
+                if is_other_markup(path):
+                    if not any(parent_trees[p].get(path) == t[path] for p in parents):
+                        self.finding("unsupported-markup", commit, path,
+                                     "page in a markup this driver does not convert; not imported", True)
+                    continue
+                if not is_page(path):
+                    continue
+                origins = []
+                for p in parents:
+                    old = moved[p].get(path, path)
+                    state = page_state[p].get(old)
+                    if state is not None:
+                        origins.append(state)
+                if not origins:
+                    page_key = f"page:{path}@{commit[:12]}"
+                    pages_here[path] = (page_key, [], True)
+                    continue
+                page_keys = list(dict.fromkeys(o[0] for o in origins))
+                if len(page_keys) > 1:
+                    self.finding("merged-pages", commit, path,
+                                 f"pages {page_keys} meet at one path; continued {page_keys[0]} only", True)
+                page_key = page_keys[0]
+                preds = list(dict.fromkeys(o[1] for o in origins if o[0] == page_key))
+                # A parent state another parent's state already supersedes is
+                # not a second predecessor: the page changed on one side only.
+                preds = [r for r in preds if not any(r in ancestors[q] for q in preds if q != r)]
+                needs = len(preds) > 1 or revinfo[preds[0]] != (t[path], path)
+                pages_here[path] = (page_key, preds, needs)
+
+            live_keys = {v[0] for v in pages_here.values()}
+            added = sorted(path for path, v in pages_here.items() if not v[1])
+            for p in parents:
+                for old, (key, _) in page_state[p].items():
+                    if key not in live_keys:
+                        also = f"; pages added in the same commit: {added}, none detected as its rename " \
+                               f"at {RENAME_THRESHOLD} similarity" if added else ""
+                        self.finding("deleted", commit, old,
+                                     f"page deleted here; its Wiki entry keeps the last revision{also}", True)
+                        live_keys.add(key)
+
+            attachments = []
+            files_here = {path: blob for path, blob in t.items() if not is_page(path) and not is_other_markup(path)}
+            for path, blob in sorted(files_here.items()):
+                if plan_files.get(path) != blob:
+                    out = f"blobs/{blob}"
+                    if out not in self.files:
+                        self.files[out] = git(self.repo, "cat-file", "blob", blob, binary=True)
+                    attachments.append({"key": path, "path": path, "file": out})
+                    plan_files[path] = blob
+            for p in parents:
+                for path in parent_trees[p]:
+                    if (not is_page(path) and not is_other_markup(path) and path not in files_here
+                            and moved[p].get(path) is None and path not in moved[p].values()):
+                        self.finding("deleted", commit, path, "attachment deleted here; its Files entries remain", True)
+            for p in parents:
+                for new, old in moved[p].items():
+                    if not is_page(old) and not is_other_markup(old):
+                        self.finding("attachment-renamed", commit, old,
+                                     f"renamed to {new}: the new path is a new attachment key", False)
+
+            tree_pages = {path: v[0] for path, v in pages_here.items()}
+            tree_files = set(files_here)
+            # Convert every revised page, then order them so link targets come first.
+            converted = {}
+            for path, (page_key, preds, needs) in pages_here.items():
+                if not needs:
+                    page_state.setdefault(commit, {})[path] = (page_key, preds[0])
+                    continue
+                md = git(self.repo, "cat-file", "blob", t[path], binary=True).decode("utf-8", errors="replace")
+                page = Page(self, commit, path, tree_pages, tree_files)
+                converted[path] = (page.convert(md), page.links)
+            order, fixups = self.order(converted, tree_pages, plan_pages)
+            revisions = []
+            emitted = set()
+            for path in order:
+                page_key, preds, _ = pages_here[path]
+                text, links = converted[path]
+                pending = [k for k in dict.fromkeys(links) if k in {tree_pages[q] for q in converted} and k not in emitted and k != page_key]
+                if pending:
+                    first = self.unlink(text, [k for k in pending if k not in plan_pages])
+                else:
+                    first = text
+                rev_key = f"{commit}:{path}"
+                page_n += 1
+                content = f"pages/{page_n:05}.typ"
+                self.files[content] = first.encode()
+                revisions.append({"key": rev_key, "page": page_key, "path": path, "title": title_of(path),
+                                  "content": content, "predecessors": preds})
+                self.pin_check(commit, path, links, plan_pages, page_state, parents, tree_pages, converted, emitted)
+                plan_pages[page_key] = rev_key
+                emitted.add(page_key)
+                revinfo[rev_key] = (t[path], path)
+                ancestors[rev_key] = set(preds).union(*(ancestors[q] for q in preds))
+                page_state.setdefault(commit, {})[path] = (page_key, rev_key)
+                if pending:
+                    fixups.append((path, text, rev_key, pending))
+            for path, text, prev, pending in fixups:
+                page_key = pages_here[path][0]
+                rev_key = f"{commit}:{path}:fixup"
+                page_n += 1
+                content = f"pages/{page_n:05}.typ"
+                self.files[content] = text.encode()
+                revisions.append({"key": rev_key, "page": page_key, "path": path, "title": title_of(path),
+                                  "content": content, "predecessors": [prev]})
+                self.finding("fixup", commit, path,
+                             f"links to {pending}, revised in the same commit after this page, "
+                             f"are completed by fixup revision {rev_key}", False)
+                plan_pages[page_key] = rev_key
+                revinfo[rev_key] = (t[path], path)
+                ancestors[rev_key] = {prev} | ancestors[prev]
+                page_state[commit][path] = (page_key, rev_key)
+            page_state.setdefault(commit, {})
+            file_state[commit] = files_here
+            if not attachments and not revisions:
+                empty += 1
+                continue
+            plan_commits.append({"commit": commit, "author": author, "date": date,
+                                 "attachments": attachments, "revisions": revisions})
+        plan = {"commits": plan_commits}
+        if self.bundle_id:
+            plan = {"bundle": self.bundle_id, **plan}
+        report = {"ref": self.ref, "tip": tip, "find_renames": RENAME_THRESHOLD, "commits": len(commits), "plan_commits": len(plan_commits),
+                  "commits_without_wiki_change": empty,
+                  "revisions": sum(len(c["revisions"]) for c in plan_commits),
+                  "attachment_versions": sum(len(c["attachments"]) for c in plan_commits),
+                  "bundle": self.bundle_id, "findings": self.findings}
+        return plan, report
+
+    @staticmethod
+    def order(converted, tree_pages, plan_pages):
+        """Revised pages, link targets first (stable by path); cycles by path."""
+        key_path = {tree_pages[p]: p for p in converted}
+        deps = {p: {key_path[k] for k in links if k in key_path and key_path[k] != p}
+                for p, (_, links) in converted.items()}
+        order = []
+        remaining = sorted(converted)
+        while remaining:
+            ready = [p for p in remaining if not (deps[p] - set(order))]
+            pick = ready[0] if ready else remaining[0]
+            order.append(pick)
+            remaining.remove(pick)
+        return order, []
+
+    @staticmethod
+    def unlink(text, keys):
+        """Turn links to keys no earlier revision defines into their label text."""
+        for key in keys:
+            text = re.sub(r'#link\("plan:' + re.escape(key) + r'"\)\[((?:[^\[\]]|\[[^\]]*\])*)\]', r"\1", text)
+        return text
+
+    def pin_check(self, commit, path, links, plan_pages, page_state, parents, tree_pages, converted, emitted):
+        """A link to a page not revised here resolves to its latest revision in
+        plan order; say so when that is not the revision this commit sees."""
+        revised = {tree_pages[q] for q in converted}
+        for key in set(links) - revised:
+            seen = {state[1] for p in parents for state in page_state[p].values() if state[0] == key}
+            if seen and plan_pages.get(key) not in seen:
+                self.finding("cross-branch-pin", commit, path,
+                             f"link to {key} resolves to {plan_pages.get(key)}, a concurrent branch's "
+                             f"revision, not {sorted(seen)}", True)
+
+    def write(self, plan, report):
+        os.makedirs(self.outdir, exist_ok=True)
+        for rel, data in self.files.items():
+            dest = os.path.join(self.outdir, rel)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as fh:
+                fh.write(data)
+        with open(os.path.join(self.outdir, "plan.json"), "w") as fh:
+            json.dump(plan, fh, indent=1, sort_keys=False)
+            fh.write("\n")
+
+
+def write_report(outdir, report):
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "report.json"), "w") as fh:
+        json.dump(report, fh, indent=1)
+        fh.write("\n")
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog="gollum-plan", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="command", required=True)
+    b = sub.add_parser("bundle", help="write a git bundle --all of the repository")
+    b.add_argument("repo")
+    b.add_argument("out")
+    p = sub.add_parser("plan", help="write plan.json, pages, blobs and report.json")
+    p.add_argument("repo")
+    p.add_argument("outdir")
+    p.add_argument("--ref", default="HEAD")
+    p.add_argument("--bundle-id", help="Files id (32 hex) of the bundle made by `bundle`")
+    p.add_argument("--find-renames", default="50%", metavar="N%",
+                   help="git rename similarity threshold (default 50%%)")
+    p.add_argument("--accept-loss", action="store_true",
+                   help="write the plan even when findings say something is not carried")
+    args = ap.parse_args(argv)
+    if args.command == "bundle":
+        git(args.repo, "bundle", "create", os.path.abspath(args.out), "--all")
+        print(os.path.abspath(args.out))
+        return 0
+    if args.bundle_id and not re.fullmatch(r"[0-9A-Fa-f]{32}", args.bundle_id):
+        raise SystemExit("--bundle-id must be a 32-hex Files id")
+    if os.path.exists(os.path.join(args.outdir, "plan.json")) or os.path.exists(os.path.join(args.outdir, "pages")):
+        raise SystemExit(f"{args.outdir} already holds a plan; use an empty directory")
+    global RENAME_THRESHOLD
+    if not re.fullmatch(r"\d{1,3}%", args.find_renames):
+        raise SystemExit("--find-renames takes a percentage such as 50%")
+    RENAME_THRESHOLD = args.find_renames
+    driver = Driver(args.repo, args.ref, args.outdir, args.bundle_id.lower() if args.bundle_id else None)
+    plan, report = driver.run()
+    losses = [f for f in report["findings"] if f["loss"]]
+    for f in report["findings"]:
+        print(f"{'LOSS' if f['loss'] else 'note'} {f['kind']} {f['commit'][:12]} {f['path']}: {f['detail']}",
+              file=sys.stderr)
+    write_report(args.outdir, report)
+    if losses and not args.accept_loss:
+        print(f"refusing: {len(losses)} findings mean the plan would not carry everything "
+              f"(see {args.outdir}/report.json); rerun with --accept-loss to write it anyway",
+              file=sys.stderr)
+        return 2
+    driver.write(plan, report)
+    print(f"{report['commits']} commits at {report['tip'][:12]}: {report['plan_commits']} in the plan, "
+          f"{report['revisions']} revisions, {report['attachment_versions']} attachment versions, "
+          f"{len(report['findings'])} findings ({len(losses)} loss)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
