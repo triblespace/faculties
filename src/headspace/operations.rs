@@ -247,13 +247,13 @@ impl Storage {
                 runtime,
                 true,
             )?;
-            secret_storage::add_secret(
-                pile,
+            crate::secrets::add_raw_to_colony(
+                &mut *pile,
                 &self.signer,
                 collection,
+                runtime,
                 name,
                 plaintext,
-                point_now()?,
             )
             .context("seal and publish Headspace credential version")
         })
@@ -1164,6 +1164,20 @@ mod tests {
             Some(version)
         );
         storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_headspace_credential_is_born_in_the_colony_vault() {
+        let (_directory, pile, key) = fixture();
+        run(cli(&pile, &key, add("default"))).unwrap();
+        let storage = Storage::open(&pile, Some(&key)).unwrap();
+        let id = storage
+            .add_secret("hs/model/colony", b"colony key")
+            .unwrap();
+        storage.close().unwrap();
+        let secrets = crate::secrets::Secrets::new(pile.clone(), Some(key.clone()));
+        assert!(secrets.adopt_colony(false).unwrap().adopted.is_empty());
+        assert_eq!(&*secrets.get(id).unwrap(), b"colony key");
     }
 
     #[test]

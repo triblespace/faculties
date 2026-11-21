@@ -453,13 +453,13 @@ impl Storage {
                 true,
             )?;
             let pile = store;
-            secret_storage::add_secret(
+            crate::secrets::add_raw_to_colony(
                 &mut *pile,
                 &self.signer,
                 collection,
+                runtime,
                 name,
                 plaintext,
-                point_now()?,
             )
             .context("publish mailbox credential to configured Secrets collection")
         })
@@ -1672,6 +1672,22 @@ mod tests {
             pattern!(&facts, [{ _?event @ metadata::tag: &marker }])
         ));
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn a_mailbox_credential_is_born_in_the_colony_vault() {
+        let fixture = Fixture::new();
+        let storage = fixture.storage();
+        let id = storage
+            .add_secret("mail/colony", b"colony credential")
+            .unwrap();
+        storage.close().unwrap();
+        let secrets = crate::secrets::Secrets::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let plan = secrets.adopt_colony(false).unwrap();
+        // The fixture's old credential is sealed signer-only on purpose.
+        assert!(plan.adopted.iter().any(|a| a.secret == fixture.credential));
+        assert!(!plan.adopted.iter().any(|a| a.secret == id));
+        assert_eq!(&*secrets.get(id).unwrap(), b"colony credential");
     }
 
     #[test]

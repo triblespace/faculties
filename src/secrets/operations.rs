@@ -209,17 +209,7 @@ impl Secrets {
                 runtime,
                 true,
             )?;
-            let secret = secret_storage::add_secret_to_colony(
-                pile,
-                signer,
-                collection,
-                |pile| acquiring_snapshot(pile, collection, signer, runtime, false),
-                name,
-                plaintext,
-                clock::point_now()?,
-                clock::now()?,
-            )?
-            .secret;
+            let secret = add_raw_to_colony(pile, signer, collection, runtime, name, plaintext)?;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(
@@ -274,8 +264,8 @@ impl Secrets {
         })
     }
     /// Import one byte-exact 1PUX export. Validation precedes storage access;
-    /// all encrypted versions and receipt relations publish in one commit.
-    /// Initial DEK delivery is signer-only, independent of collection READ.
+    /// all encrypted versions and receipt relations publish in one commit,
+    /// bound to the colony vault like [`Self::add`] and delivered to its hosts.
     pub fn import_1password(
         &self,
         bytes: &[u8],
@@ -290,8 +280,37 @@ impl Secrets {
                 true,
             )?;
             let observed = acquiring_snapshot(pile, collection, signer, runtime, false)?;
-            let mut report =
-                archive.import(pile, signer, collection, &observed, clock::point_now()?)?;
+            let colony = secret_storage::colony_vault(&observed, collection)?;
+            let mut report = archive.import_into(
+                pile,
+                signer,
+                collection,
+                &observed,
+                clock::point_now()?,
+                Some(colony),
+            )?;
+            if !report.reused {
+                // Deliver the new versions to every host the colony vault
+                // admits. A failure leaves them published; maintain completes it.
+                let targets = [report.archive, report.receipt]
+                    .into_iter()
+                    .chain(report.item_versions.iter().copied())
+                    .map(SecretTarget::Secret)
+                    .collect::<Vec<_>>();
+                let after = acquiring_snapshot(pile, collection, signer, runtime, false)?;
+                secret_storage::maintain_selected_recipient_envelopes(
+                    pile,
+                    signer,
+                    &after,
+                    collection,
+                    signer,
+                    &targets,
+                    clock::now()?,
+                )
+                .context(
+                    "1Password import committed into the colony vault, but delivery to its other hosts failed; run `secrets maintain`",
+                )?;
+            }
             // A failed attachment does not undo publication. Returning the
             // receipt makes committed success explicit; ordinary later reads
             // can realize the source fragments without this optional upkeep.
@@ -1048,6 +1067,30 @@ impl SecretsStorage<'_> {
     }
 }
 
+/// Seal one raw version into the colony vault and deliver it to the vault's
+/// hosts: the shared path for `secrets add` and for credentials other
+/// faculties keep in Secrets (Headspace, Mail).
+pub(crate) fn add_raw_to_colony(
+    store: &mut crate::storage::FacultyStore,
+    signer: &SigningKey,
+    collection: secret_storage::SecretsCollection,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    name: &str,
+    plaintext: &[u8],
+) -> Result<Id> {
+    Ok(secret_storage::add_secret_to_colony(
+        store,
+        signer,
+        collection,
+        |store| acquiring_snapshot(store, collection, signer, runtime, false),
+        name,
+        plaintext,
+        clock::point_now()?,
+        clock::now()?,
+    )?
+    .secret)
+}
+
 /// Preserve the ordinary local-wrap possession contract. The selected
 /// encrypted facts and delivery proofs stay fixed while exact ciphertext,
 /// envelope and definition bytes are acquired; no plaintext crosses the wire.
@@ -1224,6 +1267,8 @@ mod tests {
         let limits = super::super::onepassword::ImportLimits::default();
         let imported = operations.import_1password(&bytes, limits).unwrap();
         assert!(!imported.reused);
+        // Archive, receipt and items are born in the colony vault.
+        assert!(operations.adopt_colony(false).unwrap().adopted.is_empty());
         assert_eq!(operations.list_items().unwrap().len(), 2);
         assert_eq!(operations.list().unwrap().len(), 2);
         let retry = operations.import_1password(&bytes, limits).unwrap();

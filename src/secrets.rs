@@ -6,5 +6,5 @@ pub mod cli;
 pub mod mcp;
 pub mod onepassword;
 mod operations;
+pub(crate) use operations::{acquiring_snapshot, add_raw_to_colony};
 pub use operations::{DeliveryReport, ItemMetadata, SecretMetadata, Secrets};
-pub(crate) use operations::acquiring_snapshot;

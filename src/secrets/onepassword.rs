@@ -368,6 +368,32 @@ impl<'a> OnePasswordArchive<'a> {
         S: Store + CollectionStoreExt,
         R: StoreRead,
     {
+        self.import_into(store, signer, collection, observed, created_at, None)
+    }
+
+    /// [`Self::import`], optionally also binding every new version to the
+    /// colony vault (published in the same commit when it is new). The
+    /// receipt still pins each version's own signer-rooted resource, so
+    /// retry verification is the same with or without the vault; delivery
+    /// to the vault's other hosts is the caller's step after the commit.
+    pub fn import_into<S, R>(
+        &self,
+        store: &mut S,
+        signer: &SigningKey,
+        collection: SecretsCollection,
+        observed: &SecretsSnapshot<R>,
+        created_at: super::IntervalValue,
+        colony: Option<super::storage::ColonyVault>,
+    ) -> Result<ImportReport>
+    where
+        S: Store + CollectionStoreExt,
+        R: StoreRead,
+    {
+        let colony_resource = colony.as_ref().map(|colony| colony.resource);
+        let delivery = match colony_resource {
+            Some(vault) => crate::secrets::record::Delivery::OwnAndVault(vault),
+            None => crate::secrets::record::Delivery::Own,
+        };
         if observed.collection() != collection.handle() {
             bail!("1Password import: mismatched collection observation");
         }
@@ -380,11 +406,14 @@ impl<'a> OnePasswordArchive<'a> {
             "1Password original export",
             self.original,
             created_at,
-            crate::secrets::record::Delivery::Own,
+            delivery,
         )?;
         let archive = anchor.secret;
-        let archive_resource = prepared_resource(&anchor)?;
+        let archive_resource = own_resource(&anchor, colony_resource)?;
         let mut fragment = anchor.fragment;
+        if let Some(created) = colony.and_then(|colony| colony.created) {
+            fragment += created;
+        }
         let mut entries = Fragment::empty();
         for (ordinal, (account_path, account, vault_path, vault, item_path, source)) in
             self.items().enumerate()
@@ -406,7 +435,7 @@ impl<'a> OnePasswordArchive<'a> {
                     attachments: &projection.attachments,
                 },
                 created_at,
-                crate::secrets::record::Delivery::Own,
+                delivery,
             )?;
             // Query the newly authored fragment; opaque identifiers are never
             // reconstructed from content or validated against a derived id.
@@ -415,7 +444,7 @@ impl<'a> OnePasswordArchive<'a> {
             ]))
             .next()
             .ok_or_else(|| anyhow!("1Password import: prepared item has no body"))?;
-            let resource = prepared_resource(&sealed)?;
+            let resource = own_resource(&sealed, colony_resource)?;
             entries += entity! { item_ordinal: ordinal as u64, import_item: sealed.secret,
             imported_body: body, resource_handle: resource };
             fragment += sealed.fragment;
@@ -429,7 +458,7 @@ impl<'a> OnePasswordArchive<'a> {
             "1Password import receipt",
             plaintext.bytes.as_ref(),
             created_at,
-            crate::secrets::record::Delivery::Own,
+            delivery,
         )?;
         let receipt_id = receipt.secret;
         fragment += receipt.fragment;
@@ -836,6 +865,18 @@ fn public_title(source: &Value) -> &str {
         .filter(|title| !title.is_empty() && !title.contains('\0'))
         .unwrap_or("Untitled 1Password item")
 }
+/// The version's own signer-rooted resource: the one other than `vault`.
+fn own_resource(
+    sealed: &super::SealedVersion,
+    vault: Option<CollectionHandle>,
+) -> Result<CollectionHandle> {
+    find!(resource: CollectionHandle, pattern!(sealed.fragment.facts(), [
+        { sealed.secret @ resource_handle: ?resource }
+    ]))
+    .find(|resource| Some(*resource) != vault)
+    .ok_or_else(|| anyhow!("1Password import: prepared resource is missing"))
+}
+#[cfg(test)]
 fn prepared_resource(sealed: &super::SealedVersion) -> Result<CollectionHandle> {
     find!(resource: CollectionHandle, pattern!(sealed.fragment.facts(), [
         { sealed.secret @ resource_handle: ?resource }

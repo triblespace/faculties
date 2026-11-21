@@ -36,6 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Ordinary node/agent-readable 1PUX import; retains exact source and public item titles.
+    /// The source, items and retry receipt are sealed into the colony vault like `add`.
     /// For user-held protection, use the separate local app import instead.
     #[command(name = "import-1password")]
     Import1password {
@@ -44,8 +45,8 @@ enum Command {
         /// Validate and report counts only; never open the destination or keys.
         #[arg(long, conflicts_with = "recipient")]
         check: bool,
-        /// Explicit recipients for exact archive/item resources; no delegation
-        /// or collection access. The internal retry receipt remains owner-only.
+        /// Extra explicit recipients for exact archive/item resources; no delegation
+        /// or collection access. The retry receipt is not granted to them.
         #[arg(long, value_parser = parse_recipient)]
         recipient: Vec<VerifyingKey>,
     },
