@@ -84,24 +84,62 @@ def _inline(value, resolve_link):
     return ''.join(output)
 
 
-def _table(lines, resolve_link):
-    rows = []
+# A literal pipe, code span, Gollum link or bracketed link label can contain a
+# pipe of its own. Only standalone separator tokens start a new table cell.
+_TABLE_TOKENS = re.compile(r'\\\||\[\[[^\]\n]*\]\]|\[[^\]\n]*\]|`[^`\n]*`|\|')
+
+
+def _cells(line):
+    cells = []
+    start = 1
+    for token in _TABLE_TOKENS.finditer(line, start):
+        if token[0] == '|':
+            cells.append(line[start:token.start()].strip().replace(r'\|', '|'))
+            start = token.end()
+    cells.append(line[start:].strip().replace(r'\|', '|'))
+    return cells
+
+
+def _table(lines, resolve_link, caption=None):
+    cells = []
+    columns = 0
+    blank = False
     for line in lines:
-        if not line.strip():
-            continue
         line = line.strip()
-        if not line.startswith('|'):
+        if not line:
+            blank = True
+            continue
+        if line.startswith('|'):
+            group = _cells(line)
+            if not columns:
+                columns = len(group)
+            occupied = len(cells) % columns
+            if occupied and occupied + len(group) > columns:
+                # A new grouped row does not fit in the old one. Preserve
+                # its column positions and leave the missing cells empty.
+                cells.extend([''] * (columns - occupied))
+            cells.extend(group)
+        elif cells:
+            cells[-1] += ('\n\n' if blank else '\n') + line
+        else:
             return _literal_lines(lines, resolve_link)
-        # Protect cell separators inside Gollum links, link labels and verbatim spans.
-        parts = re.split(r'(?<!\\)\|(?!(?:[^\[\]]*?\]\]))(?!(?:[^\[\]]*?\]))', line[1:])
-        if parts and not parts[-1].strip() and line.endswith('|'):
-            parts.pop()
-        rows.append([cell.strip().replace(r'\|', '|') for cell in parts])
-    widths = {len(row) for row in rows}
-    if not rows or len(widths) != 1 or not (1 <= len(rows[0]) <= 8):
-        return _literal_lines(lines, resolve_link)
-    cells = ['[' + _inline(cell, resolve_link) + ']' for row in rows for cell in row]
-    return '#table(columns: ' + str(len(rows[0])) + ', inset: 4pt,\n' + ',\n'.join(cells) + '\n)'
+        blank = False
+    if not cells:
+        return ''
+    cells.extend([''] * (-len(cells) % columns))
+    rendered = []
+    for cell in cells:
+        paragraphs = cell.split('\n\n')
+        body = '\n\n'.join(_literal_lines(paragraph.split('\n'), resolve_link) for paragraph in paragraphs)
+        rendered.append('[' + body + ']')
+    # PSV tables without explicit attributes have an implicit header only
+    # when the first physical row is immediately followed by a blank line.
+    if len(lines) > 1 and lines[0].strip() and not lines[1].strip():
+        rendered[:columns] = ['table.header(' + ', '.join(rendered[:columns]) + ')']
+    table = 'table(columns: ' + str(columns) + ', inset: 4pt,\n' + ',\n'.join(rendered) + '\n)'
+    if caption is not None:
+        return '#figure(' + table + ', caption: figure.caption(position: top)[' + _inline(caption, resolve_link) + '])'
+    return '#' + table
 
 
 def _literal_lines(lines, resolve_link):
@@ -118,10 +156,16 @@ def convert_asciidoc(text, resolve_link=None):
         line = lines[i]
         i += 1
         mark = line.strip()
-        if re.fullmatch(r'\|={3,}', mark):
-            end = next((n for n in range(i, len(lines)) if lines[n].strip() == mark), None)
+        # A block title is attached to its table when the delimiter follows
+        # immediately; a dot-prefixed paragraph elsewhere stays ordinary text.
+        titled = (re.match(r'^\.\S', mark) and i < len(lines)
+                  and re.fullmatch(r'\|={3,}', lines[i].strip()))
+        delimiter = lines[i].strip() if titled else mark
+        if re.fullmatch(r'\|={3,}', delimiter):
+            start = i + 1 if titled else i
+            end = next((n for n in range(start, len(lines)) if lines[n].strip() == delimiter), None)
             if end is not None:
-                output.append(_table(lines[i:end], resolve_link) + '\n')
+                output.append(_table(lines[start:end], resolve_link, mark[1:] if titled else None) + '\n')
                 i = end + 1
                 continue
         if mark.startswith(ticks) or mark in ('----', '....', '++++', '====', '____', '////'):
