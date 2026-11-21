@@ -1,6 +1,6 @@
 //! Presentation of typed Relations write receipts.
 use super::{
-    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, EndedTie, GroupAddition,
+    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, ColonyMark, EndedTie, GroupAddition,
     GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange,
     ProfileReconciliation, ProfileUpdate,
 };
@@ -64,6 +64,12 @@ pub fn group_removed(receipt: &GroupRemoval, output: &mut Out<'_>) -> Result<()>
             output.line(format!("{person:x} is not represented in the group."))
         }
         GroupRemoval::Changed { old, new } => output.line(format!("snapshot: {old:x} -> {new:x}")),
+    }
+}
+pub fn group_colony(receipt: &ColonyMark, output: &mut Out<'_>) -> Result<()> {
+    match receipt {
+        ColonyMark::Marked(group) => output.line(format!("Group {group:x} is now a colony.")),
+        ColonyMark::Already(group) => output.line(format!("Group {group:x} is already a colony.")),
     }
 }
 pub fn group_renamed(receipt: &GroupRename, output: &mut Out<'_>) -> Result<()> {

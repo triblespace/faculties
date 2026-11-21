@@ -396,6 +396,11 @@ enum GroupCommand {
         group: String,
         name: String,
     },
+    /// Mark a group as a colony: new task zooids whose spawner belongs to
+    /// it get its name as a prefix (`aurora-kuvud-dajiz`). Grants nothing.
+    Colony {
+        group: String,
+    },
     /// Collapse all heads, taking the union of their exact member anchors.
     Reconcile {
         group: String,
@@ -536,6 +541,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             }
             GroupCommand::Rename { group, name } => {
                 render::group_renamed(&operations.group_rename(&group, &name)?, output)
+            }
+            GroupCommand::Colony { group } => {
+                render::group_colony(&operations.group_colony(&group)?, output)
             }
             GroupCommand::Reconcile { group, name } => render::group_reconciled(
                 &operations.group_reconcile(&group, name.as_deref())?,

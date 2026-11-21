@@ -68,6 +68,11 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"group":{"type":"string"},"name":{"type":"string"}},"required":["group","name"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "relations_group_colony",
+        description: "Mark a group as a colony: new task zooids whose spawner belongs to it get its name as a prefix. Grants no membership or authority.",
+        input_schema: r#"{"type":"object","properties":{"group":{"type":"string"}},"required":["group"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "relations_group_reconcile",
         description: "Reconcile all group heads using the exact union of their members. An explicit name is required when names disagree.",
         input_schema: r#"{"type":"object","properties":{"group":{"type":"string"},"name":{"type":"string"}},"required":["group"],"additionalProperties":false}"#,
@@ -570,6 +575,10 @@ impl Faculty for Relations {
                     &self.operations.group_rename(&args.group, &args.name)?,
                     output,
                 )
+            }
+            "relations_group_colony" => {
+                let args: GroupArguments = decode_arguments(arguments)?;
+                render::group_colony(&self.operations.group_colony(&args.group)?, output)
             }
             "relations_group_reconcile" => {
                 let args: GroupReconcileArguments = decode_arguments(arguments)?;

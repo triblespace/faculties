@@ -851,6 +851,8 @@ pub struct Launched {
     /// How the cover was sized, when the launch asked for a share
     /// (`--cover`).
     pub cover: Option<CoverRecord>,
+    /// Why a newly named zooid's name has no colony prefix (one line).
+    pub unprefixed: Option<String>,
     /// The goal note the zooid added at launch (`zooid goal`).
     pub goal_note: Option<Id>,
     /// What went wrong after the unit had started. The zooid runs anyway.
@@ -917,7 +919,14 @@ pub struct Settled {
 #[derive(Clone, Debug)]
 pub struct SpawnView {
     pub id: Id,
+    /// The zooid's name. When hosts named it apart, every stored name,
+    /// joined: see `names`.
     pub name: String,
+    /// Every stored name, sorted. Normally one; several are a conflict that
+    /// `zooid list` and `zooid show` surface and nothing resolves.
+    pub names: Vec<String>,
+    /// The colony the name was taken from, when one was recorded.
+    pub origin_colony: Vec<Id>,
     pub brief: TextHandle,
     pub brief_text: Option<String>,
     /// The Compass goal the brief was rendered from, and that revision.
@@ -1015,6 +1024,8 @@ pub struct Requested {
     pub request: Id,
     pub zooid: Id,
     pub name: String,
+    /// Why a newly named zooid's name has no colony prefix (one line).
+    pub unprefixed: Option<String>,
     pub host: HostKey,
     pub host_label: Option<String>,
     pub unit: String,
@@ -1048,6 +1059,11 @@ pub struct RequestView {
     pub cover_percent: Vec<f64>,
     pub spawner: Vec<Id>,
     pub requested_at: Vec<IntervalValue>,
+    /// The zooid's stored names: one, normally; several when disconnected
+    /// hosts named it differently, all shown.
+    pub names: Vec<String>,
+    /// A stored name's text has not arrived yet.
+    pub names_missing: bool,
     /// The zooid's brief handle and text (when here), and its goal revision.
     pub brief: Option<TextHandle>,
     pub brief_text: Option<String>,
@@ -1062,10 +1078,59 @@ impl RequestView {
         self.outcomes.iter().any(|outcome| outcome.kind == kind)
     }
 
-    /// The zooid's name, when its brief is known.
+    /// The zooid's name, when its spawn record is here. Several stored
+    /// names are all shown, joined, never one picked.
     pub fn name(&self) -> Option<String> {
-        self.brief.map(super::name_for)
+        (!self.names.is_empty()).then(|| self.names.join(" | "))
     }
+}
+
+/// The name a launch or request gives a zooid.
+#[derive(Clone, Debug)]
+struct Naming {
+    name: String,
+    /// The colony the name was taken from, recorded with a new name.
+    origin: Option<Id>,
+    /// Whether the name is new and has to be stored.
+    fresh: bool,
+    /// Why a new name has no colony prefix.
+    unprefixed: Option<String>,
+}
+
+/// The stored names of one spawn, sorted, and the name handles whose text
+/// has not arrived. Absence is not knowledge: a reader that needs the name
+/// waits for the missing text rather than acting without it.
+fn stored_names<R: BlobStoreGet + ?Sized>(
+    facts: &FactArchive,
+    reader: &R,
+    spawn: Id,
+) -> (Vec<String>, Vec<TextHandle>) {
+    let mut names = Vec::new();
+    let mut missing = Vec::new();
+    for handle in find!(
+        handle: TextHandle,
+        pattern!(facts, [{ spawn @ attrs::name: ?handle }])
+    ) {
+        match read_text(reader, handle) {
+            Some(text) => names.push(text),
+            None => missing.push(handle),
+        }
+    }
+    names.sort();
+    names.dedup();
+    (names, missing)
+}
+
+/// [`stored_names`] for display: a missing text is shown as its handle.
+fn shown_names<R: BlobStoreGet + ?Sized>(
+    facts: &FactArchive,
+    reader: &R,
+    spawn: Id,
+) -> Vec<String> {
+    let (mut names, missing) = stored_names(facts, reader, spawn);
+    names.extend(missing.into_iter().map(super::handle_text));
+    names.sort();
+    names
 }
 
 /// What `zooid keep` resolves on its own host, never from a request.
@@ -1854,6 +1919,113 @@ impl Spawn {
         })
     }
 
+    /// The name for the zooid `spawn`. A zooid that has a stored name keeps
+    /// it: a relaunch, a move or a group rename never renames it. A new one
+    /// is named after the unique colony its spawner belongs to, or failing
+    /// that the unique origin colony of the zooids the spawner ran as (task
+    /// zooids are not colony members); otherwise it gets no prefix and the
+    /// reason. Two stored names, from hosts that named it apart, refuse: the
+    /// launch would have to pick one.
+    fn naming(&self, spawn: Id, brief: TextHandle, spawner: Id) -> Result<Naming> {
+        let (names, inherited) = self.observe(|facts, reader| {
+            let (names, missing) = stored_names(facts, reader, spawn);
+            if !missing.is_empty() {
+                bail!(
+                    "zooid {spawn:x} has a name whose text is not here yet ({}); try again \
+                     once it has synced",
+                    super::handle_text(missing[0])
+                );
+            }
+            let inherited: std::collections::BTreeSet<Id> = find!(
+                origin: Id,
+                pattern!(facts, [
+                    { _?run @ metadata::tag: KIND_RUN, attrs::of: _?parent, attrs::persona: spawner },
+                    { _?parent @ attrs::origin_colony: ?origin }
+                ])
+            )
+            .collect();
+            Ok((names, inherited))
+        })?;
+        match names.as_slice() {
+            [one] => {
+                return Ok(Naming {
+                    name: one.clone(),
+                    origin: None,
+                    fresh: false,
+                    unprefixed: None,
+                })
+            }
+            [] => {}
+            several => bail!(
+                "zooid {spawn:x} has {} names, from hosts that named it apart: {}. \
+                 Nothing picks one; run it by its brief once the names are settled",
+                several.len(),
+                several.join(", ")
+            ),
+        }
+        let relations = Relations::with_storage(self.storage.clone());
+        let membership = relations.colonies_of(spawner)?;
+        let unprefixed = |reason: String| Naming {
+            name: super::name_for(brief),
+            origin: None,
+            fresh: true,
+            unprefixed: Some(reason),
+        };
+        let (origin, label) = match membership.colonies.as_slice() {
+            [(colony, label)] => (*colony, label.clone()),
+            [] => match inherited.len() {
+                1 => {
+                    let colony = *inherited.iter().next().expect("one origin");
+                    (colony, relations.colony_label(colony)?)
+                }
+                0 => {
+                    return Ok(unprefixed(
+                        "no colony prefix: the spawner is in no colony group, and no zooid it \
+                         ran as has an origin colony"
+                            .to_owned(),
+                    ))
+                }
+                n => {
+                    return Ok(unprefixed(format!(
+                        "no colony prefix: the zooids the spawner ran as come from {n} colonies \
+                         ({})",
+                        inherited
+                            .iter()
+                            .map(|id| format!("{id:x}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )))
+                }
+            },
+            several => {
+                return Ok(unprefixed(format!(
+                    "no colony prefix: the spawner is in {} colony groups ({})",
+                    several.len(),
+                    several
+                        .iter()
+                        .map(|(id, label)| match label {
+                            Ok(label) => label.clone(),
+                            Err(_) => format!("{id:x}"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
+        };
+        Ok(match label {
+            Ok(label) => Naming {
+                name: super::prefixed_name(Some(&label), brief),
+                origin: Some(origin),
+                fresh: true,
+                unprefixed: None,
+            },
+            Err(reason) => Naming {
+                origin: Some(origin),
+                ..unprefixed(format!("no colony prefix: {reason}"))
+            },
+        })
+    }
+
     fn launch(
         &self,
         brief: Brief,
@@ -1887,7 +2059,18 @@ impl Spawn {
             bail!("--window 0 is not a context window");
         }
         let (provider, provider_reason) = self.resolve_provider(provider)?;
-        let (spawn_fragment, spawn, brief_handle, name) = super::spawn_fragment(&brief.text)?;
+        let (mut spawn_fragment, spawn, brief_handle) = super::spawn_core(&brief.text)?;
+        let relations = Relations::with_storage(self.storage.clone());
+        let spawner = match relations.person_state(spawner_label)? {
+            Some(state) if !state.retired => state.person,
+            Some(_) => bail!("spawner {spawner_label} is retired"),
+            None => bail!("no persona matches spawner {spawner_label}"),
+        };
+        let naming = self.naming(spawn, brief_handle, spawner)?;
+        let name = naming.name.clone();
+        if naming.fresh {
+            spawn_fragment += super::name_fragment(spawn, &name, naming.origin);
+        }
         let unit = extras
             .unit
             .clone()
@@ -1954,12 +2137,6 @@ impl Spawn {
         let key = crate::storage::signer_path(&pile, self.storage.key_path());
         let key = std::fs::canonicalize(&key).with_context(|| format!("key {}", key.display()))?;
 
-        let relations = Relations::with_storage(self.storage.clone());
-        let spawner = match relations.person_state(spawner_label)? {
-            Some(state) if !state.retired => state.person,
-            Some(_) => bail!("spawner {spawner_label} is retired"),
-            None => bail!("no persona matches spawner {spawner_label}"),
-        };
         let persona = match relations.person_state(&name)? {
             Some(state) if !state.retired => {
                 let unit_state = self
@@ -2202,6 +2379,7 @@ impl Spawn {
                 model_unset: model_unset.clone(),
                 untinted,
                 cover,
+                unprefixed: naming.unprefixed.clone(),
                 goal_note,
                 warnings,
             })
@@ -2647,17 +2825,30 @@ impl Spawn {
                 Some(_) => bail!("spawner {} is retired", input.spawner),
                 None => bail!("no persona matches spawner {}", input.spawner),
             };
-        let (mut fragment, zooid, name) = match &input.zooid {
+        let (mut fragment, zooid, name, unprefixed) = match &input.zooid {
             ZooidRef::Name(name) => {
                 let view = self.show(name)?;
-                (Fragment::empty(), view.id, view.name)
+                if view.names.len() > 1 {
+                    bail!(
+                        "zooid {:x} has {} names, from hosts that named it apart: {}. \
+                         Nothing picks one",
+                        view.id,
+                        view.names.len(),
+                        view.names.join(", ")
+                    );
+                }
+                (Fragment::empty(), view.id, view.name, None)
             }
             ZooidRef::Brief(brief) => {
-                let (mut fragment, id, _, name) = super::spawn_fragment(brief)?;
+                let (mut fragment, id, handle) = super::spawn_core(brief)?;
+                let naming = self.naming(id, handle, spawner)?;
+                if naming.fresh {
+                    fragment += super::name_fragment(id, &naming.name, naming.origin);
+                }
                 if let Some((goal, revision)) = goal {
                     fragment += super::goal_fragment(id, goal, revision);
                 }
-                (fragment, id, name)
+                (fragment, id, naming.name, naming.unprefixed)
             }
         };
         let host = match input.host {
@@ -2694,6 +2885,7 @@ impl Spawn {
                 request: id,
                 zooid,
                 name,
+                unprefixed,
                 host,
                 host_label: input.host_label.clone(),
                 unit: super::unit_for_request(id),
@@ -3103,12 +3295,34 @@ impl Spawn {
             );
         }
         // Absence here is not knowledge: records and blobs may still arrive.
-        let (Some(brief), Some(text)) = (view.brief, view.brief_text.clone()) else {
+        let (Some(_), Some(text)) = (view.brief, view.brief_text.clone()) else {
             return Ok(KeepStep::Waiting(
                 "the zooid's spawn record or brief is not here yet".to_owned(),
             ));
         };
-        let name = super::name_for(brief);
+        if view.names_missing {
+            return Ok(KeepStep::Waiting(
+                "a name of the zooid is not here yet".to_owned(),
+            ));
+        }
+        let name = match view.names.as_slice() {
+            [one] => one.clone(),
+            [] => {
+                return Ok(KeepStep::Waiting(
+                    "the zooid's name is not here yet".to_owned(),
+                ))
+            }
+            several => {
+                return self.refuse(
+                    view,
+                    format!(
+                        "the zooid has {} names, from hosts that named it apart: {}",
+                        several.len(),
+                        several.join(", ")
+                    ),
+                )
+            }
+        };
         if let Some(state) = Relations::with_storage(self.storage.clone()).person_state(&name)? {
             if !state.retired {
                 return Ok(KeepStep::Waiting(format!(
@@ -3475,9 +3689,17 @@ fn spawn_view<R: BlobStoreGet + ?Sized>(
         .into_iter()
         .map(|(run, started)| run_view(facts, reader, run, started))
         .collect();
+    let names = shown_names(facts, reader, spawn);
     Ok(SpawnView {
         id: spawn,
-        name: super::name_for(brief),
+        name: if names.is_empty() {
+            super::name_for(brief)
+        } else {
+            names.join(" | ")
+        },
+        names,
+        origin_colony: find!(id: Id, pattern!(facts, [{ spawn @ attrs::origin_colony: ?id }]))
+            .collect(),
         brief,
         brief_text: read_text(reader, brief),
         goal: find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal: ?id }])).collect(),
@@ -3666,6 +3888,10 @@ fn request_view<R: BlobStoreGet + ?Sized>(
     let handoff: Vec<TextHandle> =
         find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::handoff: ?handle }]))
             .collect();
+    let (names, names_missing) = match zooid.as_slice() {
+        [spawn] => stored_names(facts, reader, *spawn),
+        _ => (Vec::new(), Vec::new()),
+    };
     let (brief, goal) = match zooid.as_slice() {
         [spawn] => {
             let spawn = *spawn;
@@ -3724,6 +3950,8 @@ fn request_view<R: BlobStoreGet + ?Sized>(
     .collect();
     RequestView {
         id: request,
+        names,
+        names_missing: !names_missing.is_empty(),
         host: find!(host: HostKey, pattern!(facts, [{ request @ attrs::host: ?host }])).collect(),
         host_label: texts(
             find!(handle: TextHandle, pattern!(facts, [{ request @ attrs::host_label: ?handle }]))
@@ -3986,9 +4214,14 @@ pub fn render_list(spawns: &[SpawnView]) -> String {
             .and_then(|text| text.lines().find(|line| !line.trim().is_empty()))
             .unwrap_or("(brief not here)");
         let first_line: String = first_line.trim().chars().take(80).collect();
+        let conflict = if spawn.names.len() > 1 {
+            format!("  (name conflict: {} names)", spawn.names.len())
+        } else {
+            String::new()
+        };
         writeln!(
             out,
-            "{}  runs {}  latest {}  {}",
+            "{}  runs {}  latest {}  {}{conflict}",
             spawn.name,
             spawn.runs.len(),
             latest,
@@ -4003,6 +4236,17 @@ pub fn render_list(spawns: &[SpawnView]) -> String {
 pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
     let mut out = String::new();
     writeln!(out, "spawn: {} ({:x})", spawn.name, spawn.id).unwrap();
+    if spawn.names.len() > 1 {
+        writeln!(
+            out,
+            "name conflict: hosts named this zooid apart; it answers to each of {}",
+            spawn.names.join(", ")
+        )
+        .unwrap();
+    }
+    if !spawn.origin_colony.is_empty() {
+        writeln!(out, "origin colony: {}", ids(&spawn.origin_colony)).unwrap();
+    }
     writeln!(out, "brief: {}", super::handle_text(spawn.brief)).unwrap();
     if !spawn.goal.is_empty() {
         writeln!(out, "goal: {}", ids(&spawn.goal)).unwrap();
@@ -7755,5 +7999,294 @@ mod tests {
         let step = f.spawn.keep_one(&f.keep_config(), &view).unwrap();
         assert!(matches!(step, KeepStep::Uncertain(_)), "{step:?}");
         assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    // Colony prefixes (goal 9b274eb2). A colony is a Relations group marked
+    // with KIND_COLONY; a new zooid's name starts with its label.
+
+    fn colony(f: &Fixture, name: &str, members: &[&str]) -> Id {
+        let relations = Relations::with_storage(f.storage.clone());
+        let group = relations.group_create(name).unwrap().group;
+        for member in members {
+            relations.group_add(name, member).unwrap();
+        }
+        assert!(matches!(
+            relations.group_colony(name).unwrap(),
+            crate::relations::ColonyMark::Marked(id) if id == group
+        ));
+        group
+    }
+
+    fn retire(f: &Fixture, name: &str) {
+        Relations::with_storage(f.storage.clone())
+            .retire(name)
+            .unwrap();
+    }
+
+    fn proquints_of(brief: &str) -> String {
+        super::super::name_for(super::super::text_handle(brief))
+    }
+
+    #[test]
+    fn a_spawner_in_one_colony_names_its_zooid_after_it() {
+        let f = fixture();
+        let group = colony(&f, "aurora", &["agent-cc"]);
+        let launched = f.spawn.run(&f.request("Colony task.")).unwrap();
+        assert_eq!(
+            launched.name,
+            format!("aurora-{}", proquints_of("Colony task."))
+        );
+        assert_eq!(launched.unprefixed, None);
+        assert_eq!(
+            f.launcher.started.lock().unwrap()[0].unit,
+            format!("spawn-aurora-{}", proquints_of("Colony task."))
+        );
+        // The persona and the stored name are the prefixed name.
+        assert!(f.persona(&launched.name).is_some());
+        let view = f.spawn.show(&launched.name).unwrap();
+        assert_eq!(view.names, [launched.name.clone()]);
+        assert_eq!(view.origin_colony, [group]);
+        assert!(render_show(&view, false).contains(&format!("origin colony: {group:x}")));
+        // The prefix grants nothing: the zooid is not enrolled in the group.
+        let zooid = f.persona(&launched.name).unwrap().person;
+        let membership = Relations::with_storage(f.storage.clone())
+            .colonies_of(zooid)
+            .unwrap();
+        assert!(membership.colonies.is_empty());
+        // An unmarked group the spawner is in does not count.
+        Relations::with_storage(f.storage.clone())
+            .group_create("crew")
+            .unwrap();
+        Relations::with_storage(f.storage.clone())
+            .group_add("crew", "agent-cc")
+            .unwrap();
+        let other = f.spawn.run(&f.request("Another colony task.")).unwrap();
+        assert!(other.name.starts_with("aurora-"), "{}", other.name);
+    }
+
+    #[test]
+    fn no_colony_or_two_colonies_give_no_prefix_and_say_why() {
+        let f = fixture();
+        let none = f.spawn.run(&f.request("Lonely task.")).unwrap();
+        assert_eq!(none.name, proquints_of("Lonely task."));
+        let why = none.unprefixed.expect("the missing prefix is explained");
+        assert!(why.contains("no colony group"), "{why}");
+        assert!(f.spawn.show(&none.name).unwrap().origin_colony.is_empty());
+
+        colony(&f, "aurora", &["agent-cc"]);
+        colony(&f, "juno", &["agent-cc"]);
+        let two = f.spawn.run(&f.request("Torn task.")).unwrap();
+        assert_eq!(two.name, proquints_of("Torn task."));
+        let why = two.unprefixed.expect("the missing prefix is explained");
+        assert!(why.contains("2 colony groups"), "{why}");
+        assert!(why.contains("aurora") && why.contains("juno"), "{why}");
+        assert!(f.spawn.show(&two.name).unwrap().origin_colony.is_empty());
+        // A request names a new zooid the same way and says why too.
+        let asked = f.ask("Torn request.", None, Provider::Claude);
+        assert_eq!(asked.name, proquints_of("Torn request."));
+        assert!(asked.unprefixed.unwrap().contains("2 colony groups"));
+    }
+
+    #[test]
+    fn a_colony_name_unfit_for_a_zooid_name_gives_no_prefix() {
+        let f = fixture();
+        colony(&f, "the colony", &["agent-cc"]);
+        let launched = f.spawn.run(&f.request("Spaced task.")).unwrap();
+        assert_eq!(launched.name, proquints_of("Spaced task."));
+        assert!(launched.unprefixed.unwrap().contains("not fit"));
+    }
+
+    #[test]
+    fn a_relaunch_reuses_the_stored_name() {
+        let f = fixture();
+        colony(&f, "aurora", &["agent-cc"]);
+        let first = f.spawn.run(&f.request("Twice task.")).unwrap();
+        assert!(first.name.starts_with("aurora-"));
+        retire(&f, &first.name);
+        // The colony is renamed and the spawner leaves it: the name stays.
+        let relations = Relations::with_storage(f.storage.clone());
+        relations.group_rename("aurora", "sol").unwrap();
+        relations.group_remove("sol", "agent-cc").unwrap();
+        let again = f.spawn.run(&f.request("Twice task.")).unwrap();
+        assert_eq!(again.name, first.name);
+        assert_eq!(again.persona, first.persona);
+        assert_eq!(again.unprefixed, None);
+        let view = f.spawn.show(&first.name).unwrap();
+        assert_eq!(view.names, [first.name.clone()]);
+        assert_eq!(view.runs.len(), 2);
+    }
+
+    #[test]
+    fn an_old_unprefixed_zooid_keeps_its_name_on_relaunch() {
+        let f = fixture();
+        // Named before any colony existed, as every zooid before today was.
+        let old = f.spawn.run(&f.request("Old task.")).unwrap();
+        assert_eq!(old.name, proquints_of("Old task."));
+        retire(&f, &old.name);
+        colony(&f, "aurora", &["agent-cc"]);
+        let again = f.spawn.run(&f.request("Old task.")).unwrap();
+        assert_eq!(again.name, old.name);
+        assert_eq!(again.unprefixed, None);
+        let view = f.spawn.show(&old.name).unwrap();
+        assert_eq!(view.names, [old.name.clone()]);
+        assert!(view.origin_colony.is_empty());
+        // A request by brief for it reuses the name as well.
+        retire(&f, &old.name);
+        let asked = f.ask("Old task.", None, Provider::Claude);
+        assert_eq!(asked.name, old.name);
+    }
+
+    #[test]
+    fn a_child_of_a_task_zooid_inherits_the_origin_colony() {
+        let f = fixture();
+        let group = colony(&f, "aurora", &["agent-cc"]);
+        let parent = f.spawn.run(&f.request("Parent task.")).unwrap();
+        assert!(parent.name.starts_with("aurora-"));
+        // The parent is not a colony member; its child is named from the
+        // parent's recorded origin colony, not from its name.
+        let mut child_request = f.request("Child task.");
+        child_request.spawner = parent.name.clone();
+        let child = f.spawn.run(&child_request).unwrap();
+        assert_eq!(
+            child.name,
+            format!("aurora-{}", proquints_of("Child task."))
+        );
+        assert_eq!(child.unprefixed, None);
+        assert_eq!(f.spawn.show(&child.name).unwrap().origin_colony, [group]);
+        // A grandchild inherits it through the child.
+        let mut grandchild_request = f.request("Grandchild task.");
+        grandchild_request.spawner = child.name.clone();
+        let grandchild = f.spawn.run(&grandchild_request).unwrap();
+        assert!(
+            grandchild.name.starts_with("aurora-"),
+            "{}",
+            grandchild.name
+        );
+        // A zooid with no recorded origin passes none on.
+        let mut orphan_spawner = f.request("Unnamed parent.");
+        orphan_spawner.spawner = "agent-cc".to_owned();
+        Relations::with_storage(f.storage.clone())
+            .group_remove("aurora", "agent-cc")
+            .unwrap();
+        let unprefixed = f.spawn.run(&orphan_spawner).unwrap();
+        assert!(unprefixed.unprefixed.is_some());
+        let mut orphan_child = f.request("Orphan child.");
+        orphan_child.spawner = unprefixed.name.clone();
+        let orphan = f.spawn.run(&orphan_child).unwrap();
+        assert_eq!(orphan.name, proquints_of("Orphan child."));
+        assert!(orphan.unprefixed.unwrap().contains("no zooid it ran as"));
+    }
+
+    #[test]
+    fn a_move_keeps_the_name() {
+        let f = fixture();
+        colony(&f, "aurora", &["agent-cc"]);
+        // Asked for on this host while the spawner is in `aurora`.
+        let asked = f.ask("Moving task.", None, Provider::Claude);
+        assert_eq!(
+            asked.name,
+            format!("aurora-{}", proquints_of("Moving task."))
+        );
+        // The spawner now works under another colony; the request's keeper
+        // starts the zooid under the name it was given.
+        Relations::with_storage(f.storage.clone())
+            .group_remove("aurora", "agent-cc")
+            .unwrap();
+        colony(&f, "juno", &["agent-cc"]);
+        let pass = f.keep();
+        let KeepStep::Launched { name, .. } = &pass.steps[0].1 else {
+            panic!("{pass:?}");
+        };
+        assert_eq!(name, &asked.name);
+        assert!(f.persona(&asked.name).is_some());
+        // Moved to another host by name: the same name travels.
+        let moved = f
+            .spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Name(asked.name.clone()),
+                host: Some(other_host()),
+                host_label: None,
+                provider: Provider::Claude,
+                effort: "high".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+                cover_percent: None,
+            })
+            .unwrap();
+        assert_eq!(moved.zooid, asked.zooid);
+        assert_eq!(moved.name, asked.name);
+        assert_eq!(f.request_view(moved.request).names, [asked.name.clone()]);
+        assert_eq!(f.spawn.show(&asked.name).unwrap().names, [asked.name]);
+    }
+
+    #[test]
+    fn two_names_from_a_merge_are_both_shown_and_none_is_picked() {
+        let f = fixture();
+        colony(&f, "aurora", &["agent-cc"]);
+        let here = f.spawn.run(&f.request("Merged task.")).unwrap();
+        retire(&f, &here.name);
+        // A disconnected host named the same brief under its own colony.
+        let elsewhere = format!("juno-{}", proquints_of("Merged task."));
+        f.spawn
+            .publish(super::super::name_fragment(here.spawn, &elsewhere, None))
+            .unwrap();
+        let mut both = vec![here.name.clone(), elsewhere.clone()];
+        both.sort();
+        for name in [&here.name, &elsewhere] {
+            let view = f.spawn.show(name).unwrap();
+            assert_eq!(view.id, here.spawn);
+            assert_eq!(view.names, both);
+            assert_eq!(view.name, both.join(" | "));
+            let shown = render_show(&view, false);
+            assert!(shown.contains("name conflict"), "{shown}");
+            assert!(
+                shown.contains(&here.name) && shown.contains(&elsewhere),
+                "{shown}"
+            );
+        }
+        let listed = render_list(&f.spawn.list().unwrap());
+        assert!(listed.contains("name conflict: 2 names"), "{listed}");
+        // A relaunch, a request by name and a keeper all refuse to pick one.
+        let error = f.spawn.run(&f.request("Merged task.")).unwrap_err();
+        assert!(format!("{error:#}").contains("2 names"), "{error:#}");
+        assert!(f
+            .spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Name(elsewhere.clone()),
+                host: None,
+                host_label: None,
+                provider: Provider::Claude,
+                effort: "high".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+                cover_percent: None,
+            })
+            .is_err());
+        let (fragment, _) = super::super::request_fragment(&RequestFacts {
+            zooid: here.spawn,
+            host: f.spawn.local_host().unwrap(),
+            host_label: None,
+            provider: "claude".to_owned(),
+            effort: "high".to_owned(),
+            previous: None,
+            handoff: None,
+            cover_percent: None,
+            requested_at: crate::clock::point_now().unwrap(),
+            spawner: f.persona("agent-cc").unwrap().person,
+        });
+        f.spawn.publish(fragment).unwrap();
+        // The earlier run's unit has ended, so the request's unit is free.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let started = f.launcher.started.lock().unwrap().len();
+        let pass = f.keep();
+        assert!(
+            pass.steps
+                .iter()
+                .any(|(_, step)| matches!(step, KeepStep::Refused(why) if why.contains("2 names"))),
+            "{pass:?}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
     }
 }

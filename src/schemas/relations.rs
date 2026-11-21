@@ -24,6 +24,12 @@ pub const KIND_PERSON_ID: Id = id_hex!("D8ADDE47121F4E7868017463EC860726");
 /// to every member; a watcher wakes if a message is addressed to it OR to
 /// any explicitly created group it belongs to.
 pub const KIND_GROUP: Id = id_hex!("2CEE877C6C996CE66B4572CE8863DF04");
+/// A group marked as a colony: its addressable label is the prefix of the
+/// names new task zooids get when their spawner belongs to it (`zooid
+/// spawn`). The mark is a second `metadata::tag` on the group's anchor, so
+/// any colony can mark its own group; nothing names a colony in code.
+/// Minted with `trible genid` on 2026-11-21.
+pub const KIND_COLONY: Id = id_hex!("5F55CC32689703641BC0F9BD08A6521D");
 
 /// Intrinsic full-state person profile snapshot.
 /// Minted with `trible genid` on 2026-08-08.

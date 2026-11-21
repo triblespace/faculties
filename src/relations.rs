@@ -14,10 +14,10 @@ pub mod operations;
 pub mod render;
 
 pub use operations::{
-    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, EndedTie, GroupAddition,
-    GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange, PeopleFilter,
-    PersonState, ProfileField, ProfilePatch, ProfileReconciliation, ProfileUpdate, Relations,
-    TieRequest,
+    AddedGroup, AddedOrganisation, AddedPerson, AddedTie, ColonyMark, ColonyMembership, EndedTie,
+    GroupAddition, GroupReconciliation, GroupRemoval, GroupRename, IdentityChange, LifecycleChange,
+    PeopleFilter, PersonState, ProfileField, ProfilePatch, ProfileReconciliation, ProfileUpdate,
+    Relations, TieRequest,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -33,8 +33,8 @@ use triblespace::macros::{entity, find, pattern};
 use triblespace::prelude::*;
 
 use crate::schemas::relations::{
-    group, identity, lifecycle, profile, relations as legacy, tie, KIND_GROUP, KIND_GROUP_SNAPSHOT,
-    KIND_IDENTITY_VERDICT, KIND_ORGANISATION, KIND_ORGANISATION_LIFECYCLE,
+    group, identity, lifecycle, profile, relations as legacy, tie, KIND_COLONY, KIND_GROUP,
+    KIND_GROUP_SNAPSHOT, KIND_IDENTITY_VERDICT, KIND_ORGANISATION, KIND_ORGANISATION_LIFECYCLE,
     KIND_ORGANISATION_PROFILE, KIND_PERSON_ID, KIND_PERSON_LIFECYCLE, KIND_PERSON_PROFILE,
     KIND_TIE,
 };
@@ -1772,6 +1772,97 @@ impl IdentityComponents {
 
     pub fn mixed_forked_pairs(&self) -> &BTreeSet<(Id, Id)> {
         &self.mixed_forked_pairs
+    }
+}
+
+/// Mark a group as a colony: a second tag on its anchor. Marking twice
+/// asserts the same fact again.
+pub fn colony_mark_fragment(group: Id) -> Fragment {
+    entity! { ExclusiveId::force_ref(&group) @ metadata::tag: &KIND_COLONY }
+}
+
+/// Every group anchor marked as a colony.
+pub fn colony_anchors<P>(facts: &P) -> BTreeSet<Id>
+where
+    P: TriblePattern,
+{
+    let groups = group_anchors(facts);
+    ids_of_kind(facts, KIND_COLONY)
+        .into_iter()
+        .filter(|id| groups.contains(id))
+        .collect()
+}
+
+/// Colony groups containing `person`, settled same-person components
+/// included. A forked colony counts its members across all its heads, the
+/// way reconciling it would; a colony with no snapshot contains nobody.
+/// Unlike [`groups_for_member`], an unsettled group elsewhere is not read.
+pub fn colonies_for_member<P>(facts: &P, person: Id) -> Result<BTreeSet<Id>>
+where
+    P: TriblePattern,
+{
+    let identities = IdentityComponents::from_facts(facts)?;
+    let mut colonies = BTreeSet::new();
+    'colony: for colony in colony_anchors(facts) {
+        let heads = match group_head(facts, colony)? {
+            Head::Unique(id) => vec![id],
+            Head::Forked(ids) => ids,
+            Head::Missing => continue,
+        };
+        for head in heads {
+            for member in group_snapshot(facts, head)?.members {
+                if identities.equivalent(person, member)? {
+                    colonies.insert(colony);
+                    continue 'colony;
+                }
+            }
+        }
+    }
+    Ok(colonies)
+}
+
+/// The label a colony's zooid names start with: its current group name,
+/// when that name addresses this group and nothing else and is fit for a
+/// name (ASCII letters, digits and inner hyphens). `Err` says why not.
+pub fn colony_label<Store, P>(
+    reader: &Store,
+    facts: &P,
+    colony: Id,
+) -> Result<std::result::Result<String, String>>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let snapshot = match group_head(facts, colony)? {
+        Head::Unique(id) => group_snapshot(facts, id)?,
+        Head::Forked(heads) => {
+            return Ok(Err(format!(
+                "colony group {colony:x} is forked across {} heads",
+                heads.len()
+            )))
+        }
+        Head::Missing => return Ok(Err(format!("colony group {colony:x} has no snapshot"))),
+    };
+    let label = load_text_from(reader, snapshot.name)?.trim().to_owned();
+    let fit = !label.is_empty()
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    if !fit {
+        return Ok(Err(format!(
+            "colony group {colony:x} is named {label:?}, which is not fit for a zooid name \
+             (ASCII letters, digits and inner hyphens)"
+        )));
+    }
+    match resolve_group(reader, facts, &label)? {
+        SelectorOutcome::Unique(id) if id == colony => Ok(Ok(label)),
+        outcome => Ok(Err(format!(
+            "the colony's name {label:?} does not address group {colony:x} alone ({} groups \
+             answer to it)",
+            outcome.candidates().len()
+        ))),
     }
 }
 

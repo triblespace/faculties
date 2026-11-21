@@ -370,6 +370,9 @@ fn print_launched(launched: &Launched) -> Result<()> {
             (None, Some(why)) => out.note(format!("model: none named; {why}"))?,
             (None, None) => {}
         }
+        if let Some(why) = &launched.unprefixed {
+            out.note(why)?;
+        }
         if let Some(note) = launched.goal_note {
             out.note(format!("noted the launch on the goal: {note:x}"))?;
         }
@@ -578,7 +581,11 @@ pub fn run() -> Result<()> {
                             .map(|label| format!(" ({label})"))
                             .unwrap_or_default(),
                         requested.unit
-                    ))
+                    ))?;
+                    if let Some(why) = &requested.unprefixed {
+                        out.note(why)?;
+                    }
+                    Ok(())
                 })
             }
             Command::Requests { here } => {

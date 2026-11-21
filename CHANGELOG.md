@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- New task zooids are named after their colony: `aurora-kuvud-dajiz`. A colony
+  is a Relations group marked with the new `KIND_COLONY` tag
+  (`5F55CC32689703641BC0F9BD08A6521D`, a second `metadata::tag` on the group
+  anchor), set by `relations group colony <group>` or the MCP tool
+  `relations_group_colony`; `relations group list` and `show` say which groups
+  are colonies. The prefix is the colony group's addressable name, when the
+  spawner is in exactly one colony group, or, for a spawner outside every
+  colony (a task zooid), the unique origin colony of the zooids it ran as. The
+  colony a name came from is recorded on the spawn as `spawn::origin_colony`
+  (`B0F4A5704A5D30365828287F93D41B9C`). With no colony, several, or a colony
+  name unfit for a zooid name, there is no prefix and `zooid spawn` and
+  `zooid request` say why in one line. A name is chosen once and stored:
+  relaunches, requests, moves and group renames reuse the stored name, and
+  existing zooids keep their unprefixed names. The spawn's identity is still
+  its brief alone. Two stored names for one zooid (two disconnected hosts) are
+  both kept: `zooid list` and `zooid show` surface the conflict, the zooid
+  answers to either name, and a relaunch, a request by name or a keeper refuses
+  rather than pick one. The prefix grants no membership or authority.
+
 - The `spawn` binary is now `zooid`. Its `run` subcommand is `zooid spawn`; `goal`, `request`, `requests`, `keep`,
   `list`, `colony`, `show`, `wait`, `settle`, `drive-task` and `inbox` keep
   their names and behaviour. The MCP tools `spawn_run`, `spawn_goal`,

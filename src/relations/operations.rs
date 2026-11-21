@@ -338,6 +338,20 @@ pub enum GroupRename {
     Changed { old: Id, new: Id },
 }
 
+/// What marking a group as a colony did.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ColonyMark {
+    Marked(Id),
+    Already(Id),
+}
+
+/// The colony groups containing one person, each with the label new zooid
+/// names would start with, or why it cannot be used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColonyMembership {
+    pub colonies: Vec<(Id, std::result::Result<String, String>)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GroupReconciliation {
     Settled(Id),
@@ -1006,6 +1020,19 @@ fn rename_group(
     })
 }
 
+fn mark_colony(storage: &mut RelationsStorage<'_>, group_selector: String) -> Result<ColonyMark> {
+    storage.update(|facts, reader| {
+        let group = resolve_group_anchor(reader, facts, &group_selector)?;
+        if relations::colony_anchors(facts).contains(&group) {
+            return Ok((None, ColonyMark::Already(group)));
+        }
+        Ok((
+            Some(relations::colony_mark_fragment(group)),
+            ColonyMark::Marked(group),
+        ))
+    })
+}
+
 fn reconcile_group(
     storage: &mut RelationsStorage<'_>,
     selector: String,
@@ -1076,6 +1103,9 @@ fn show_group(storage: &mut RelationsStorage<'_>, selector: String) -> Result<St
     storage.with_view(|facts, reader| {
         let group = resolve_group_anchor(reader, facts, &selector)?;
         writeln!(&mut output, "group: {}", fmt_id(group))?;
+        if relations::colony_anchors(facts).contains(&group) {
+            writeln!(&mut output, "colony: yes")?;
+        }
         match relations::group_head(facts, group)? {
             Head::Missing => writeln!(&mut output, "snapshot: missing")?,
             Head::Unique(id) => print_group_snapshot(
@@ -1103,6 +1133,7 @@ fn show_group(storage: &mut RelationsStorage<'_>, selector: String) -> Result<St
 fn list_groups(storage: &mut RelationsStorage<'_>) -> Result<String> {
     let mut output = String::new();
     storage.with_view(|facts, reader| {
+        let colonies = relations::colony_anchors(facts);
         let mut rows = Vec::new();
         for group in relations::group_anchors(facts) {
             match relations::group_head(facts, group)? {
@@ -1133,7 +1164,12 @@ fn list_groups(storage: &mut RelationsStorage<'_>) -> Result<String> {
             writeln!(&mut output, "No groups.")?;
         }
         for (name, group, state) in rows {
-            writeln!(&mut output, "[{}] {name} ({state})", fmt_id(group))?;
+            let colony = if colonies.contains(&group) {
+                ", colony"
+            } else {
+                ""
+            };
+            writeln!(&mut output, "[{}] {name} ({state}{colony})", fmt_id(group))?;
         }
         Ok(output)
     })
@@ -1441,6 +1477,28 @@ impl Relations {
     pub fn group_rename(&self, group: &str, name: &str) -> Result<GroupRename> {
         self.with_relations(false, |storage| {
             rename_group(storage, group.to_owned(), name.to_owned())
+        })
+    }
+    /// Mark a group as a colony (`relations group colony`).
+    pub fn group_colony(&self, group: &str) -> Result<ColonyMark> {
+        self.with_relations(false, |storage| mark_colony(storage, group.to_owned()))
+    }
+    /// The label new zooid names in `colony` start with, or why none can.
+    pub fn colony_label(&self, colony: Id) -> Result<std::result::Result<String, String>> {
+        self.with_relations(true, |storage| {
+            storage.with_view(|facts, reader| relations::colony_label(reader, facts, colony))
+        })
+    }
+    /// The colony groups containing `person`, with their usable labels.
+    pub fn colonies_of(&self, person: Id) -> Result<ColonyMembership> {
+        self.with_relations(true, |storage| {
+            storage.with_view(|facts, reader| {
+                let mut colonies = Vec::new();
+                for colony in relations::colonies_for_member(facts, person)? {
+                    colonies.push((colony, relations::colony_label(reader, facts, colony)?));
+                }
+                Ok(ColonyMembership { colonies })
+            })
         })
     }
     pub fn group_reconcile(&self, group: &str, name: Option<&str>) -> Result<GroupReconciliation> {

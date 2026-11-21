@@ -502,6 +502,7 @@ fn discovery_and_typed_nested_argument_errors_do_not_touch_storage() {
             "relations_group_add",
             "relations_group_remove",
             "relations_group_rename",
+            "relations_group_colony",
             "relations_group_reconcile",
             "relations_group_list",
             "relations_group_show",

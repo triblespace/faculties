@@ -1,9 +1,11 @@
 //! Task zooids started from a brief, each in its own systemd user unit.
 //!
 //! One input fixes the whole zooid: the brief. Its blob handle names the
-//! spawn (the first 32 bits of the handle as two proquints), it
-//! tints the memory cover the zooid wakes into, and it is the prompt. An
-//! identical brief relaunches the same zooid; a changed brief is a new one.
+//! spawn (the first 32 bits of the handle as two proquints, after the
+//! colony's label when the spawner has one colony), it tints the memory
+//! cover the zooid wakes into, and it is the prompt. An identical brief
+//! relaunches the same zooid under the name it was first given; a changed
+//! brief is a new one.
 //! `zooid goal` renders the brief from a Compass goal's current revision, so
 //! a new note on the goal makes a new zooid.
 //!
@@ -119,9 +121,19 @@ pub fn text_handle(text: &str) -> TextHandle {
     Fragment::empty().put::<UTF8String, _>(text.to_owned())
 }
 
-/// A spawn: the brief as its intrinsic core, the name as an annotation.
-/// Returns the fragment, the spawn id, the brief handle and the name.
-pub fn spawn_fragment(brief: &str) -> Result<(Fragment, Id, TextHandle, String)> {
+/// A zooid's name: the colony's label, when it has one, before the
+/// proquints of its brief (`aurora-kuvud-dajiz`). The name is chosen once,
+/// when the zooid is first named, and stored; nothing recomputes it.
+pub fn prefixed_name(prefix: Option<&str>, brief: TextHandle) -> String {
+    match prefix {
+        Some(prefix) => format!("{prefix}-{}", name_for(brief)),
+        None => name_for(brief),
+    }
+}
+
+/// A spawn's intrinsic core: the brief alone. Returns the fragment, the
+/// spawn id and the brief handle.
+pub fn spawn_core(brief: &str) -> Result<(Fragment, Id, TextHandle)> {
     if brief.trim().is_empty() {
         bail!("the brief is empty");
     }
@@ -133,9 +145,26 @@ pub fn spawn_fragment(brief: &str) -> Result<(Fragment, Id, TextHandle, String)>
     };
     let id = core.root().expect("a spawn has one intrinsic root");
     fragment += core;
+    Ok((fragment, id, handle))
+}
+
+/// A spawn's name, annotating it, and the colony it was taken from.
+pub fn name_fragment(spawn: Id, name: &str, origin_colony: Option<Id>) -> Fragment {
+    let mut fragment = Fragment::empty();
+    let name_handle = fragment.put::<UTF8String, _>(name.to_owned());
+    fragment += entity! { ExclusiveId::force_ref(&spawn) @
+        attrs::name: name_handle,
+        attrs::origin_colony?: origin_colony,
+    };
+    fragment
+}
+
+/// A spawn with its unprefixed name: [`spawn_core`] and [`name_fragment`].
+/// Returns the fragment, the spawn id, the brief handle and the name.
+pub fn spawn_fragment(brief: &str) -> Result<(Fragment, Id, TextHandle, String)> {
+    let (mut fragment, id, handle) = spawn_core(brief)?;
     let name = name_for(handle);
-    let name_handle = fragment.put::<UTF8String, _>(name.clone());
-    fragment += entity! { ExclusiveId::force_ref(&id) @ attrs::name: name_handle };
+    fragment += name_fragment(id, &name, None);
     Ok((fragment, id, handle, name))
 }
 

@@ -116,6 +116,13 @@ pub mod spawn {
         /// A Compass note or status event the brief was rendered from: with
         /// [`goal`], the exact goal revision. Minted 2026-11-16.
         "06295B697E2572E5FBEF9EC4C6A51EA1" as goal_revision: inlineencodings::GenId;
+        /// The colony a zooid's name was taken from: the Relations group
+        /// marked with [`crate::schemas::relations::KIND_COLONY`] that held
+        /// its spawner, or the origin colony of the zooid that spawned it.
+        /// Recorded once, when the name is chosen; a child spawned by this
+        /// zooid inherits it. It grants no membership and no authority.
+        /// Minted with `trible genid` on 2026-11-21.
+        "B0F4A5704A5D30365828287F93D41B9C" as origin_colony: inlineencodings::GenId;
         /// The Compass note the zooid added to its goal when the run launched.
         /// Minted 2026-11-16.
         "719C02B24197877361926DEA741AE59C" as goal_note: inlineencodings::GenId;

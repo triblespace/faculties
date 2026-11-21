@@ -101,6 +101,9 @@ fn launched_line(launched: &Launched) -> String {
         (None, Some(why)) => line.push_str(&format!("\nmodel: none named; {why}")),
         (None, None) => {}
     }
+    if let Some(why) = &launched.unprefixed {
+        line.push_str(&format!("\n{why}"));
+    }
     if let Some(why) = &launched.untinted {
         line.push_str(&format!("\nrecollection untinted: {why}"));
     }
@@ -275,7 +278,11 @@ impl Faculty for Spawn {
                         .map(|label| format!(" ({label})"))
                         .unwrap_or_default(),
                     requested.unit
-                ))
+                ))?;
+                if let Some(why) = &requested.unprefixed {
+                    out.line(why)?;
+                }
+                Ok(())
             }
             "zooid_requests" => {
                 let args: Requests = decode_arguments(arguments)?;
