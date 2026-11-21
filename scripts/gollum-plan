@@ -490,10 +490,7 @@ class Page:
                 while i < len(lines) and lines[i].strip().startswith(">"):
                     block.append(re.sub(r"^\s*>\s?", "", lines[i]))
                     i += 1
-                inner = Page(self.driver, self.commit, self.path, self.tree_pages, self.tree_files)
-                inner.refs = self.refs
-                body = inner.convert("\n".join(block) + "\n")
-                self.links += inner.links
+                body = self.convert("\n".join(block) + "\n")
                 out.append("#quote(block: true)[")
                 out += body.rstrip("\n").split("\n")
                 out.append("]")

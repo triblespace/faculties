@@ -118,6 +118,7 @@ fn revision(
     predecessors: &[&str],
 ) -> PlanRevision {
     PlanRevision {
+        source: None,
         key: key.into(),
         page: page.into(),
         path: path.into(),
@@ -239,6 +240,35 @@ fn replaying_a_plan_adds_nothing() {
         (0, 0, 0, 0)
     );
     assert_eq!(pile.counts(), before);
+}
+
+#[test]
+fn a_source_annotation_resumes_after_files_and_replays_without_publication() {
+    let pile = Pile::new();
+    let mut plan = fixture_plan(None);
+    plan.commits[0].revisions[0].source = Some("missing.md".into());
+    assert!(pile.wiki().import_plan_batched(plan.clone(), &[]).is_err());
+    assert_eq!(pile.counts().files, 0);
+    assert_eq!(pile.counts().revisions, 0);
+
+    let mut files_only = plan.clone();
+    for commit in &mut files_only.commits {
+        commit.revisions.clear();
+    }
+    pile.wiki().import_plan_batched(files_only, &[]).unwrap();
+    plan.commits[0].revisions[0].source = Some("uploads/floor.png".into());
+    let report = pile.wiki().import_plan_batched(plan.clone(), &[]).unwrap();
+    assert_eq!(
+        (
+            report.new_files,
+            report.new_source_references,
+            report.publications
+        ),
+        (0, 1, 1)
+    );
+    let replay = pile.wiki().import_plan_batched(plan, &[]).unwrap();
+    assert_eq!(ids(&replay), ids(&report));
+    assert_eq!((replay.new_source_references, replay.publications), (0, 0));
 }
 
 #[test]

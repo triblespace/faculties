@@ -3,9 +3,9 @@
 
 All reachable commit trees are read as Git objects, without checking out files,
 following symlinks, executing repository code, or expanding AsciiDoc includes.
-The original bundle preserves commit/tree/tag objects, file modes and raw names.
-Each original path/blob version also gets a Files row. Wiki handles the two
-common Gollum formats natively; other Gollum markup uses an inert source view.
+Recognized articles become Wiki revisions with exact source-file citations.
+Original page files and other tracked file versions are stored in Files.
+Formats without a native renderer retain their text as an inert Wiki source view.
 """
 import argparse
 import hashlib
@@ -126,9 +126,12 @@ class Converter(markdown.Page):
                 return "#link(" + asciidoc._string(target) + ")[" + (label or markdown.escape_plain(target, False)) + "]"
             self.finding("non-web-uri-as-text", "", True)
             return self.literal_target(original, label)
-        clean = target.split("#", 1)[0].split("?", 1)[0]
+        path_query, _, anchor = target.partition("#")
+        clean, _, query = path_query.partition("?")
         if not clean:
-            self.finding("local-anchor-retained-in-original", "", True)
+            if anchor:
+                self.finding("local-anchor-as-text", "", False)
+                return label or markdown.escape_plain(anchor.replace("-", " "), False)
             return self.literal_target(original, label)
         rel = posixpath.normpath(posixpath.join(self.dir, clean)).lstrip("/")
         direct = clean.lstrip("/")
@@ -138,9 +141,9 @@ class Converter(markdown.Page):
         if not match or self.tree[match][0] == "160000":
             self.finding("unresolved-source-target", "", True)
             return self.literal_target(original, label)
-        if "#" in target or "?" in target:
-            self.finding("fragment-or-query-retained-in-original", "", True)
         caption = label or markdown.escape_plain(Path(match).name, False)
+        if anchor or query:
+            self.finding("section-or-query-omitted-from-page-link", "", True)
         if match in self.tree_pages:
             key = self.tree_pages[match]
             self.links.append(key)
@@ -205,7 +208,6 @@ class Adapter:
     def render(self, sha, path, tree, targets):
         oid = tree[path][1]
         raw = (self.out / "blobs" / oid).read_bytes()
-        count = len(self.findings)
         try:
             text = raw.decode("utf8")
         except UnicodeDecodeError:
@@ -224,11 +226,9 @@ class Adapter:
         else:
             result = asciidoc._raw(text, block=True)
             self.finding("source-markup-shown-literally", sha, path, "", False)
-        if ext not in MARKDOWN or any(f["rendering_loss"] for f in self.findings[count:]):
-            result = result.rstrip() + "\n\n" + link(source_key(oid), "Originalquelle") + "\n"
-        return result, cv.links
+        return result.rstrip() + "\n\n" + link(source_key(oid), "Originalquelle") + "\n", cv.links
 
-    def emit(self, rows, key, logical, path, text, predecessors):
+    def emit(self, rows, key, logical, path, text, predecessors, source=None):
         self.order += 1
         rel = f"pages/{self.order:06}.typ"
         if not predecessors:
@@ -237,8 +237,11 @@ class Adapter:
             # without adding visible text or relying on global traversal order.
             text = "// Gollum source root " + key + "\n" + text
         (self.out / rel).write_text(text, encoding="utf8")
-        rows.append(dict(key=key, page=logical, path=path, title=markdown.title_of(path),
-                         content=rel, predecessors=list(dict.fromkeys(predecessors))))
+        revision = dict(key=key, page=logical, path=path, title=markdown.title_of(path),
+                        content=rel, predecessors=list(dict.fromkeys(predecessors)))
+        if source is not None:
+            revision["source"] = source
+        rows.append(revision)
 
     def commit(self, sha, parents, states, author, date):
         tree = read_tree(self.repo, sha)
@@ -280,19 +283,36 @@ class Adapter:
 
         targets = {path: key for path, (_, key) in pages.items()}
         native = {path: self.render(sha, path, tree, targets) for path in pending}
-        remaining = set(pending)
-        while remaining:
-            busy = {targets[path]: path for path in remaining}
-            ready = sorted(p for p in remaining if not set(native[p][1]).intersection(busy))
-            path = (ready or sorted(remaining))[0]
-            text, links = native[path]
-            for dep in sorted(set(links).intersection(busy)):
-                # Exact source links break cycles without inventing a target revision.
-                text = text.replace('"plan:' + dep + '"', '"plan:' + source_key(tree[busy[dep]][1]) + '"')
-                self.finding("cyclic-link-to-exact-original", sha, path, "", False)
-            logical, rev = pages[path]
-            self.emit(revisions, rev, logical, path, text, pending[path])
-            remaining.remove(path)
+        # Emit dependencies before their callers. Only a back-edge on the active
+        # path is impossible to pin: a content-derived ID cannot cite itself.
+        paths = {targets[path]: path for path in pending}
+        dependencies = {path: sorted({paths[key] for key in refs if key in paths})
+                        for path, (_, refs) in native.items()}
+        emitted = set()
+        for start in sorted(pending):
+            if start in emitted:
+                continue
+            stack = [(start, iter(dependencies[start]))]
+            active = {start}
+            while stack:
+                path, children = stack[-1]
+                for child in children:
+                    if child in active:
+                        text, refs = native[path]
+                        text = text.replace('"plan:' + targets[child] + '"',
+                                            '"plan:' + source_key(tree[child][1]) + '"')
+                        native[path] = text, refs
+                        self.finding("cyclic-link-to-exact-original", sha, path, "", False)
+                    elif child not in emitted:
+                        active.add(child)
+                        stack.append((child, iter(dependencies[child])))
+                        break
+                else:
+                    logical, rev = pages[path]
+                    self.emit(revisions, rev, logical, path, native[path][0], pending[path], source_key(tree[path][1]))
+                    emitted.add(path)
+                    active.remove(path)
+                    stack.pop()
 
         live = {self.canonical(key) for key, _ in pages.values()}
         deletions = {}
@@ -316,9 +336,9 @@ class Adapter:
         self.changes.append(dict(commit=sha, parents=parents, changes=changes))
         return State(tree, pages, removed)
 
-    def run(self, bundle):
+    def run(self):
         # Sort object ids rather than mutable ref labels for a reproducible topological order.
-        refs = git(self.repo, "for-each-ref", "--format=%(refname)").splitlines()
+        refs = git(self.repo, "for-each-ref", "--format=%(objectname)").splitlines()
         tips = set()
         for ref in [b"HEAD", *refs]:
             result = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
@@ -344,8 +364,6 @@ class Adapter:
             for rev in commit["revisions"]:
                 rev["page"] = self.canonical(rev["page"])
         plan = dict(commits=self.commits)
-        if bundle:
-            plan["bundle"] = bundle.lower()
         for name, obj in [("plan.json", plan), ("source-index.json", dict(tips=sorted(tips), commits=self.changes)),
                           ("render-findings.json", self.findings)]:
             with (self.out / name).open("w", encoding="utf8") as fh:
@@ -353,22 +371,18 @@ class Adapter:
                 fh.write("\n")
         losses = sum(f["rendering_loss"] for f in self.findings)
         print(f"{len(records)} original commits, {self.order} Wiki revisions, "
-              f"{len(self.versions)} path/blob versions, {losses} rendering-loss findings "
-              "(original bytes retained in Files)")
+              f"{len(self.versions)} original path/blob versions, {losses} rendering-loss findings")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--bundle-id")
     args = parser.parse_args()
-    if args.bundle_id and not re.fullmatch(r"[A-Fa-f0-9]{32}", args.bundle_id):
-        parser.error("--bundle-id must be a 32-hex Files entity id")
     os.umask(0o077)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         parser.error("output directory must be empty")
     (args.output / "pages").mkdir()
     (args.output / "blobs").mkdir()
-    Adapter(args.repo, args.output).run(args.bundle_id)
+    Adapter(args.repo, args.output).run()

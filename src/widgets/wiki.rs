@@ -1500,7 +1500,10 @@ impl WikiViewer {
                         g.full(|ctx| { ctx.separator(); });
 
                         g.full(|ctx| {
-                            match render_wiki_content(ctx, &content) {
+                            let displayed = crate::wiki::content_with_original_sources(
+                                wiki_view.facts, revision_id, content.clone(),
+                            );
+                            match render_wiki_content(ctx, &displayed) {
                                 Some(LinkClick::Wiki(id)) => {
                                     to_open_from_link.push((id, false))
                                 }

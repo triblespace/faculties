@@ -472,6 +472,50 @@ fn opt_ins_carry_history_links_and_the_linked_file_but_nothing_unrelated() {
 }
 
 #[test]
+fn transfer_preserves_an_older_articles_original_source_citation() {
+    let fixture = Fixture::new();
+    let original = crate::files::stage(
+        Bytes::from(b"Original page.".to_vec()),
+        "Guide.md",
+        "text/plain",
+    )
+    .unwrap();
+    let file_id = original.root().unwrap();
+    let content = find!(handle: ContentHandle, pattern!(original.facts(), [{ file_id @ file::content: ?handle }])).next().unwrap();
+    crate::files::Files::with_storage(fixture.storage(fixture.source).unwrap())
+        .publish(original)
+        .unwrap();
+    let facts = fixture.wiki_facts(fixture.source);
+    let origin = find!(id: Id, pattern!(&facts, [{
+        ?id @ metadata::tag: &schema::KIND_SOURCE_PROVENANCE, schema::attrs::revision: &fixture.guide,
+    }])).next().unwrap();
+    fixture.commit_source(entity! { ExclusiveId::force_ref(&origin) @ schema::attrs::references_file_content: content });
+    let opts = TransferOptions {
+        files: true,
+        ..Default::default()
+    };
+    fixture
+        .transfer(fixture.source, fixture.destination, opts)
+        .unwrap();
+    assert!(fixture.files_ids(fixture.destination).contains(&file_id));
+    let displayed = fixture
+        .wiki(fixture.destination)
+        .show(&format!("{:x}", fixture.guide), true)
+        .unwrap();
+    assert!(displayed.contains(&format!(
+        "#link(\"files:{}\")[Originalquelle]",
+        content_hash_hex(content)
+    )));
+    assert_eq!(
+        fixture
+            .transfer(fixture.source, fixture.destination, opts)
+            .unwrap()
+            .publications,
+        0
+    );
+}
+
+#[test]
 fn same_root_converges_without_publication() {
     let fixture = Fixture::new();
     let report = fixture

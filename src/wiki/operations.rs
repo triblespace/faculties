@@ -242,13 +242,19 @@ impl Wiki {
     }
     /// Replay a translated foreign history; see [`ImportPlan`].
     pub fn import_plan(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
-        cmd_import_plan(self.storage(), plan, tags.to_vec(), false, None)
+        cmd_import_plan(
+            self.storage(),
+            plan,
+            tags.to_vec(),
+            PlanMode::PerCommit,
+            None,
+        )
     }
 
     /// Stage the full plan before publishing its Files and Wiki fragments.
     /// Native revision identities and source provenance match per-commit replay.
     pub fn import_plan_batched(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
-        cmd_import_plan(self.storage(), plan, tags.to_vec(), true, None)
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), PlanMode::Batched, None)
     }
     /// Bind a translated plan to its exact source bundle and import both.
     pub fn import_plan_with_source(
@@ -269,9 +275,21 @@ impl Wiki {
             anyhow::bail!("translated plan names a different source bundle");
         }
         plan.bundle = Some(id);
-        let report = cmd_import_plan(self.storage(), plan, tags.to_vec(), true, Some(file))?;
+        let report = cmd_import_plan(
+            self.storage(),
+            plan,
+            tags.to_vec(),
+            PlanMode::Batched,
+            Some(file),
+        )?;
         Ok((id, report))
     }
+
+    /// Reuse the source occurrence of an article imported by an earlier Gollum renderer.
+    pub fn import_gollum_plan(&self, plan: ImportPlan, tags: &[String]) -> Result<PlanReport> {
+        cmd_import_plan(self.storage(), plan, tags.to_vec(), PlanMode::Gollum, None)
+    }
+
     pub fn export_all(&self) -> Result<Vec<(Id, String)>> {
         cmd_batch_export(self.storage())
     }
@@ -1082,7 +1100,11 @@ fn render_revision<P: TriblePattern>(
         writeln!(report, "tags:{tags}").unwrap();
     }
     report.push('\n');
-    report.push_str(&revision_content(reader, revision)?);
+    report.push_str(&wiki_model::content_with_original_sources(
+        facts,
+        revision.id,
+        revision_content(reader, revision)?,
+    ));
     Ok(report)
 }
 
@@ -1873,6 +1895,8 @@ pub struct PlanRevision {
     pub path: String,
     pub title: String,
     pub content: String,
+    /// Optional attachment key for the exact original article bytes.
+    pub source: Option<String>,
     /// Revision keys of the source parents' states of this page.
     pub predecessors: Vec<String>,
 }
@@ -1885,6 +1909,7 @@ pub struct PlanReport {
     pub revisions: Vec<(String, Id)>,
     pub new_revisions: usize,
     pub new_provenance: usize,
+    pub new_source_references: usize,
     pub new_files: usize,
     pub publications: usize,
 }
@@ -1915,6 +1940,14 @@ fn check_plan(plan: &ImportPlan) -> Result<()> {
                     revision.page
                 );
             }
+            if let Some(source) = &revision.source {
+                if !attachments.contains(source.as_str()) {
+                    bail!(
+                        "revision '{}' names an unavailable source attachment '{source}'",
+                        revision.key
+                    );
+                }
+            }
             for predecessor in &revision.predecessors {
                 match revision_pages.get(predecessor.as_str()) {
                     None => bail!(
@@ -1944,7 +1977,7 @@ fn resolve_plan_links(
     content: &str,
     pages: &HashMap<String, Id>,
     revisions: &HashMap<String, Id>,
-    attachments: &HashMap<String, String>,
+    attachments: &HashMap<String, ContentHandle>,
     revision: &str,
 ) -> Result<String> {
     static PLAN_LINK: OnceLock<regex::Regex> = OnceLock::new();
@@ -1954,8 +1987,8 @@ fn resolve_plan_links(
         let key = &captures[1];
         if let Some(id) = pages.get(key) {
             format!("#link(\"wiki:{id:x}\")")
-        } else if let Some(hash) = attachments.get(key) {
-            format!("#link(\"files:{hash}\")")
+        } else if let Some(handle) = attachments.get(key) {
+            format!("#link(\"files:{}\")", content_hash_hex(*handle))
         } else if let Some(id) = revisions.get(key) {
             format!("#link(\"wiki:{id:x}\")")
         } else {
@@ -1971,16 +2004,103 @@ fn resolve_plan_links(
     Ok(resolved.into_owned())
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PlanMode {
+    PerCommit,
+    Batched,
+    Gollum,
+}
+
+/// Existing imports may have rendered the same article differently. Reuse
+/// an exact source occurrence in its original page history, including its
+/// native author and prior bundle provenance. A colliding custom projection or
+/// competing histories must not silently create or splice a second history.
+fn existing_gollum_revision(
+    facts: &FactArchive,
+    reader: &FacultySnapshot,
+    commit: &PlanCommit,
+    revision: &PlanRevision,
+    candidate: Id,
+    tags: &BTreeSet<Id>,
+    predecessors: &[Id],
+) -> Result<Option<(Id, BTreeSet<Id>)>> {
+    use crate::schemas::{archive::import_schema, code::attrs as code};
+    let sha: schema::TextHandle = commit.commit.clone().to_blob().get_handle();
+    let path: schema::TextHandle = revision.path.clone().to_blob().get_handle();
+    let source_author: schema::TextHandle = commit.author.clone().to_blob().get_handle();
+    let title: schema::TextHandle = revision.title.clone().to_blob().get_handle();
+    let date = commit
+        .authored_at
+        .context("Gollum source commit has no author date")?;
+    let mut prior: BTreeMap<Id, BTreeSet<Id>> = BTreeMap::new();
+    for (id, origin) in find!((id: Id, origin: Id), pattern!(facts, [{
+        ?origin @ metadata::tag: &schema::KIND_SOURCE_PROVENANCE,
+        code::commit: sha, file::source_path: path,
+        import_schema::source_author: source_author, import_schema::source_created_at: date,
+        schema::attrs::revision: ?id,
+    }])) {
+        prior.entry(id).or_default().insert(origin);
+    }
+    if prior.is_empty() {
+        return Ok(None);
+    }
+    if let Some(origins) = prior.remove(&candidate) {
+        return Ok(Some((candidate, origins)));
+    }
+    let parents: BTreeSet<Id> = predecessors.iter().copied().collect();
+    let root_marker = format!("// Gollum source root {}\n", revision.key);
+    let mut matches = BTreeSet::new();
+    for &id in prior.keys() {
+        for old in wiki_model::revision_records(facts, id) {
+            if !old.native || old.title != title || old.tags != *tags || old.supersedes != parents {
+                continue;
+            }
+            if !parents.is_empty() || revision_content(reader, &old)?.starts_with(&root_marker) {
+                matches.insert(id);
+            }
+        }
+    }
+    if matches.len() == 1 {
+        let matched = matches.pop_first().expect("one matching history");
+        return Ok(Some((
+            matched,
+            prior.remove(&matched).expect("matched source occurrence"),
+        )));
+    }
+    bail!("source occurrence {} {} already exists, but its Wiki history is ambiguous or has a different root, title, or tags; stopped before publication", commit.commit, revision.path)
+}
+
+/// Add an original-file citation to a source occurrence as an open annotation.
+fn add_source_reference(
+    facts: &FactArchive,
+    fragment: &mut Fragment,
+    staged: &mut BTreeSet<(Id, ContentHandle)>,
+    origin: Id,
+    source: Option<ContentHandle>,
+) -> bool {
+    let Some(content) = source else { return false };
+    if !staged.insert((origin, content))
+        || exists!(
+            (),
+            pattern!(facts, [{ origin @ schema::attrs::references_file_content: content }])
+        )
+    {
+        return false;
+    }
+    *fragment += entity! { ExclusiveId::force_ref(&origin) @ schema::attrs::references_file_content: content };
+    true
+}
+
 fn cmd_import_plan(
     storage: WikiStorage<'_>,
     plan: ImportPlan,
     tags: Vec<String>,
-    batch_publications: bool,
+    mode: PlanMode,
     source_bundle: Option<Fragment>,
 ) -> Result<PlanReport> {
     check_plan(&plan)?;
-    let (wiki_facts, files_facts, known_files, tags, tag_fragment) =
-        storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
+    let (wiki_facts, reader, files_facts, known_files, tags, tag_fragment) = storage
+        .view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             let known_files: BTreeSet<Id> = find!(
@@ -1990,6 +2110,7 @@ fn cmd_import_plan(
             .collect();
             Ok((
                 view.facts.clone(),
+                view.reader.clone(),
                 files.clone(),
                 known_files,
                 tags,
@@ -2014,10 +2135,11 @@ fn cmd_import_plan(
     let mut report = PlanReport::default();
     let mut revisions: HashMap<String, Id> = HashMap::new();
     let mut pages: HashMap<String, Id> = HashMap::new();
-    let mut attachments: HashMap<String, String> = HashMap::new();
+    let mut attachments: HashMap<String, ContentHandle> = HashMap::new();
     let mut staged_files = BTreeSet::new();
     let mut staged_revisions = BTreeSet::new();
     let mut staged_provenance = BTreeSet::new();
+    let mut staged_sources = BTreeSet::new();
     let mut all_files = Fragment::empty();
     if let (Some(id), Some(file)) = (plan.bundle, source_bundle) {
         if !known_files.contains(&id) {
@@ -2046,7 +2168,7 @@ fn cmd_import_plan(
             )
             .next()
             .context("staged file content")?;
-            attachments.insert(attachment.key.clone(), content_hash_hex(content));
+            attachments.insert(attachment.key.clone(), content);
             if !known_files.contains(&file_id) && staged_files.insert(file_id) {
                 let source_path: schema::TextHandle =
                     files_fragment.put(format!("{}:{}", commit.commit, attachment.path));
@@ -2060,7 +2182,7 @@ fn cmd_import_plan(
                 report.new_files += 1;
             }
         }
-        if batch_publications {
+        if mode != PlanMode::PerCommit {
             all_files += files_fragment;
         } else if !files_fragment.facts().is_empty() {
             files.publish(files_fragment).with_context(|| {
@@ -2089,6 +2211,34 @@ fn cmd_import_plan(
                 &predecessors,
             );
             let id = record.root().expect("revision has one intrinsic root");
+            let source = revision.source.as_ref().map(|key| attachments[key]);
+            if mode == PlanMode::Gollum {
+                if let Some((previous, origins)) = existing_gollum_revision(
+                    &wiki_facts,
+                    &reader,
+                    commit,
+                    revision,
+                    id,
+                    &tags,
+                    &predecessors,
+                )? {
+                    for origin in origins {
+                        if add_source_reference(
+                            &wiki_facts,
+                            &mut fragment,
+                            &mut staged_sources,
+                            origin,
+                            source,
+                        ) {
+                            report.new_source_references += 1;
+                        }
+                    }
+                    revisions.insert(revision.key.clone(), previous);
+                    pages.insert(revision.page.clone(), previous);
+                    report.revisions.push((revision.key.clone(), previous));
+                    continue;
+                }
+            }
             // The authorship observation carries the importer's publication
             // time, so it is written once: a revision already present was
             // already published.
@@ -2113,11 +2263,20 @@ fn cmd_import_plan(
                 fragment += provenance;
                 report.new_provenance += 1;
             }
+            if add_source_reference(
+                &wiki_facts,
+                &mut fragment,
+                &mut staged_sources,
+                provenance_id,
+                source,
+            ) {
+                report.new_source_references += 1;
+            }
             revisions.insert(revision.key.clone(), id);
             pages.insert(revision.page.clone(), id);
             report.revisions.push((revision.key.clone(), id));
         }
-        if batch_publications {
+        if mode != PlanMode::PerCommit {
             all_revisions += fragment;
         } else if !fragment.facts().is_empty() {
             storage

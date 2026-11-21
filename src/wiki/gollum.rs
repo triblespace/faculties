@@ -1,5 +1,5 @@
 //! Host-side Git and Python adapter for the direct CLI. Native admission,
-//! bundle registration, and revision construction stay in Wiki operations.
+//! source provenance and revision construction stay in Wiki operations.
 
 use super::{cli, Wiki};
 use crate::out::Out;
@@ -63,54 +63,10 @@ fn refs(output: &[u8]) -> Result<BTreeMap<&[u8], &[u8]>> {
         .collect()
 }
 
-pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
-    let source = source
-        .canonicalize()
-        .context("open local Gollum repository or bundle")?;
-    let temp = tempfile::Builder::new().prefix("wiki-gollum-").tempdir()?;
-    let bundle = temp.path().join("source.bundle");
-    let repo = temp.path().join("source.git");
-    let name = if source.is_file() {
-        fs::copy(&source, &bundle).context("freeze supplied Git bundle")?;
-        source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("bundle needs a UTF-8 filename")?
-            .to_owned()
-    } else if source.is_dir() {
-        let mut create = local_git_process("git");
-        create
-            .arg("-C")
-            .arg(&source)
-            .args(["-c", "pack.threads=1", "bundle", "create"])
-            .arg(&bundle)
-            .arg("--all");
-        // A bare repository may point HEAD at an unborn branch while other refs exist.
-        if local_git_process("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-            .output()
-            .context("inspect source HEAD")?
-            .status
-            .success()
-        {
-            create.arg("HEAD");
-        }
-        run(&mut create, "create complete source Git bundle")?;
-        let directory = if source.ends_with(".git") {
-            source.parent().context("repository directory")?
-        } else {
-            &source
-        };
-        let leaf = directory
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("repository needs a UTF-8 name")?;
-        format!("{}.bundle", leaf.strip_suffix(".git").unwrap_or(leaf))
-    } else {
-        bail!("expected a local Git directory or a self-contained Git bundle");
-    };
+fn unpack_bundle(source: &Path, directory: &Path) -> Result<std::path::PathBuf> {
+    let bundle = directory.join("source.bundle");
+    let repo = directory.join("source.git");
+    fs::copy(source, &bundle).context("freeze supplied Git bundle")?;
     run(
         local_git_process("git")
             .args(["clone", "--mirror", "--quiet", "--"])
@@ -152,6 +108,21 @@ pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<
             );
         }
     }
+    Ok(repo)
+}
+
+pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
+    let source = source
+        .canonicalize()
+        .context("open local Gollum repository or bundle")?;
+    let temp = tempfile::Builder::new().prefix("wiki-gollum-").tempdir()?;
+    let repo = if source.is_dir() {
+        source
+    } else if source.is_file() {
+        unpack_bundle(&source, temp.path())?
+    } else {
+        bail!("expected a local Git directory or a self-contained Git bundle");
+    };
     for (script, bytes) in ADAPTER {
         fs::write(temp.path().join(script), bytes)?;
     }
@@ -167,9 +138,7 @@ pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<
         "translate Gollum history with python3 and git",
     )?;
     let plan = cli::read_plan(&directory.join("plan.json"))?;
-    let (id, report) =
-        wiki.import_plan_with_source(plan, tags, &name, fs::read(&bundle)?.into())?;
-    out.line(format!("Source bundle: {id:x}  {name}"))?;
+    let report = wiki.import_gollum_plan(plan, tags)?;
     let summary = std::str::from_utf8(&translation.stdout)?.trim();
     if !summary.is_empty() {
         out.line(summary)?;

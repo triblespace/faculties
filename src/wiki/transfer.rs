@@ -206,6 +206,7 @@ fn gather_revision<P: TriblePattern>(space: &P, revision: Id) -> Gathered {
         ));
         carry(space, record, &import_schema::source_created_at, &mut facts);
         carry(space, record, &attrs::references_file, &mut facts);
+        carry(space, record, &attrs::references_file_content, &mut facts);
     }
     for author in authors {
         let Ok(author) = author.try_from_inline::<Id>() else {
@@ -402,7 +403,11 @@ fn stage_source(
                 .unwrap_or_default();
             let mut texts = Vec::new();
             for record in &records {
-                texts.push(revision_content(&view.reader, record)?);
+                texts.push(wiki_model::content_with_original_sources(
+                    facts,
+                    id,
+                    revision_content(&view.reader, record)?,
+                ));
             }
             texts.sort();
             texts.dedup();

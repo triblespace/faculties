@@ -98,13 +98,18 @@ Use the workspace revision from `faculties workspace list` to select the destina
 wiki --workspace "$workspace_revision" import gollum "/path/to/studio wiki.bundle"
 ```
 
-The command requires Git and Python 3. It stores the original bundle in Files
-and imports committed page history, source files and attachments into the
-workspace’s Wiki and Files collections. Each Wiki revision records its source
-commit, path, author, date and bundle. A repeated import of the same bundle
-with the same signer and tags reuses the existing records. The adapter ships
-inside the Wiki binary. `wiki import <file.typ>` and `wiki import --plan plan.json`
-remain available for other sources.
+The command requires Git and Python 3. It imports committed articles and their
+history into Wiki. Each converted revision links to its exact original file.
+Files holds those originals, attachments and redirect metadata. The input Git
+bundle stays local. Each Wiki revision retains the source commit, path, author
+and date. Repeated imports reuse the existing history. For articles imported
+by an earlier version, Wiki adds the source citation to their provenance and
+displays it alongside the original revision text. Existing revision IDs and
+exact text exports stay stable. New commits extend those histories. A source occurrence
+that matches multiple histories is reported before anything is published.
+
+The adapter ships inside the Wiki binary. `wiki import <file.typ>` and
+`wiki import --plan plan.json` remain available for other sources.
 
 ### Use an existing Erlkonig workspace from the CLI
 

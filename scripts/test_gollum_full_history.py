@@ -80,6 +80,14 @@ class GollumHistory(unittest.TestCase):
                              {rev(left, "Home.md")["key"], rev(base, "Home.md")["key"]})
             self.assertEqual(rev(rename, "Handbook.asciidoc")["predecessors"], [rev(merge, "Home.md")["key"]])
             self.assertIn("gelöscht", text(rev(removal, "Home.md")))
+            self.assertNotIn("source", rev(removal, "Home.md"))
+            self.assertNotIn("Originalquelle", text(rev(removal, "Home.md")))
+            for sha, commit_row in commits.items():
+                for revision in commit_row["revisions"]:
+                    if "source" in revision:
+                        oid = git("rev-parse", sha + ":" + revision["path"])
+                        self.assertEqual(revision["source"], "source/" + oid)
+                        self.assertIn('plan:source/' + oid + '")[Originalquelle]', text(revision))
             self.assertIn(orphan, commits)
             self.assertEqual((first / commits[symlink]["attachments"][0]["file"]).read_bytes(), b"Unrelated.md")
 

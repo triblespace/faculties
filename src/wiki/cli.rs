@@ -574,7 +574,8 @@ fn import(wiki: &Wiki, path: &Path, tags: &[String], out: &mut Out<'_>) -> Resul
     Ok(())
 }
 
-/// The plan file: plain JSON, every path relative to the plan's directory.
+/// The plan is JSON with paths relative to its directory. Both the plan-level
+/// bundle and a revision's source attachment key are optional.
 ///
 /// ```json
 /// { "bundle": "<32-hex Files id of the git bundle>",
@@ -629,11 +630,13 @@ struct PlanFileRevision {
     title: String,
     content: PathBuf,
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     predecessors: Vec<String>,
 }
 
 /// An RFC 3339 source date (git's `%aI`) as a point interval; the offset only
-/// locates the instant, and the exact original stays in the source bundle.
+/// locates the instant.
 pub(crate) fn parse_source_date(
     raw: &str,
 ) -> Result<triblespace::prelude::Inline<triblespace::prelude::inlineencodings::NsTAIInterval>> {
@@ -693,6 +696,7 @@ pub(crate) fn read_plan(path: &Path) -> Result<ImportPlan> {
                 page: revision.page,
                 path: revision.path,
                 title: revision.title,
+                source: revision.source,
                 predecessors: revision.predecessors,
             });
         }
@@ -727,8 +731,13 @@ pub(super) fn report_import(report: &super::PlanReport, out: &mut Out<'_>) -> Re
     for (key, id) in &report.revisions {
         out.line(format!("{id:x}  {key}"))?;
     }
+    let sources = if report.new_source_references == 0 {
+        String::new()
+    } else {
+        format!("{} new source references, ", report.new_source_references)
+    };
     out.line(format!(
-        "{} revisions in plan: {} new revisions, {} new provenance records, {} new files, {} publications",
+        "{} revisions in plan: {} new revisions, {} new provenance records, {} new files, {sources}{} publications",
         report.revisions.len(),
         report.new_revisions,
         report.new_provenance,

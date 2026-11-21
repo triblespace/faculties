@@ -240,6 +240,34 @@ fn require_point(field: &str, value: IntervalValue) -> Result<()> {
     Ok(())
 }
 
+/// Include provenance citations in a displayed revision without changing its source text.
+pub fn content_with_original_sources<P: TriblePattern>(
+    facts: &P,
+    revision: Id,
+    mut content: String,
+) -> String {
+    let handles: BTreeSet<crate::files::ContentHandle> = find!(
+        handle: crate::files::ContentHandle,
+        pattern!(facts, [{
+            _?source @ metadata::tag: &crate::schemas::wiki::KIND_SOURCE_PROVENANCE,
+            attrs::revision: &revision, attrs::references_file_content: ?handle,
+        }])
+    )
+    .collect();
+    for handle in handles {
+        let citation = format!(
+            "#link(\"files:{}\")[Originalquelle]",
+            crate::files::content_hash_hex(handle)
+        );
+        if !content.contains(&citation) {
+            content.push_str("\n\n");
+            content.push_str(&citation);
+            content.push('\n');
+        }
+    }
+    content
+}
+
 /// Every queryable Wiki revision id.
 ///
 /// This is a typed projection, not a catalog load: incomplete or undecodable
