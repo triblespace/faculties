@@ -1,23 +1,30 @@
-//! `zooid drive-task`: the local executor that runs one finite Drive task.
+//! `zooid drive-task`: the local executor that launches one zooid into
+//! Drive's living loop, `drive run --mind mini`.
 //!
 //! A local run's unit script exports the run's pinned collection routes and
 //! then execs the host's executor template. This turns that run into exactly
-//! one `drive task` command line and execs it: each pinned
+//! one `drive run` command line and execs it: each pinned
 //! `TRIBLESPACE_COLLECTION_*` route becomes an explicit `--native-collection
-//! ROLE=DESCRIPTOR`, the archive route is also the `--native-archive`, and
-//! everything the run does not decide (tenant, session home, model, sizes,
-//! telemetry, provider) comes from one binding file the host provisions. No
-//! value has a default, nothing is truncated, no text is added to the
-//! prompt, and nothing falls back to a hosted model. Every pinned faculties
-//! route is passed on; a route variable that names no faculties collection,
-//! a malformed or repeated route, or a missing archive route refuses before
-//! Drive starts, naming the routes. Which roles Drive accepts is Drive's own
-//! table: a Drive pinned to an older faculties refuses a newer role itself,
-//! at argument parsing, naming it.
+//! ROLE=DESCRIPTOR`, the archive route is also the `--native-archive`, the
+//! zooid's name is its `--native-persona`, where its archived history ends
+//! is its `--native-resume`, and its brief file (`{brief}`, without the
+//! wake: Drive reads its own) and sender (`{spawner}`) are `--brief-file`
+//! and `--brief-from`. Everything the run does not decide (tenant, home,
+//! model, window, telemetry, provider) comes from one binding file the host
+//! provisions. No value has a default, nothing is truncated, and nothing
+//! falls back to a hosted model. Every pinned faculties route is passed on;
+//! a route variable that names no faculties collection, a malformed or
+//! repeated route, or a missing archive route refuses before Drive starts,
+//! naming the routes. Which roles Drive accepts is Drive's own table.
 //!
-//! The deadline Drive gets ends a stated teardown margin before the unit's
-//! `RuntimeMaxSec`, so Drive's own cooperative deadline fires first and the
-//! runtime limit stays a backstop.
+//! How the zooid ends: `drive run` with a native mind is a living loop with
+//! no turn budget or deadline. It ends when it is interrupted (SIGINT),
+//! after its ordinary teardown (the open response closed, the archive
+//! epoch published, the session ended, the piles closed), or when its mind
+//! fails. Spawn starts a local unit with `KillSignal=SIGINT` and
+//! `KillMode=mixed`, so stopping the unit, or its optional runtime limit,
+//! is that interrupt; settlement reads an exit 0 after it as a normal end.
+//! Drive writes no closing message: the zooid's words are in the archive.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -28,48 +35,38 @@ use serde::Deserialize;
 use triblespace::prelude::Id;
 
 /// The role whose route is also Drive's `--native-archive`, the collection
-/// Drive writes the task's own history to.
+/// Drive writes the zooid's own history to.
 pub const ARCHIVE_ROLE: &str = "archive";
 
-/// Everything a host provisions for its local Drive tasks. Every key is
-/// required and no other key is accepted.
+/// Everything a host provisions for its local zooids. Every key is required
+/// and no other key is accepted.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Binding {
-    /// The `drive` executable that has the `task` command.
+    /// The `drive` executable, built with the `mini-native` feature.
     pub drive: PathBuf,
     pub tenant: String,
+    /// The durable home pile: the zooid's Memory, Archive and cognition, and
+    /// the wake Drive reads.
     pub home: PathBuf,
     pub home_key: PathBuf,
     pub model: PathBuf,
     pub model_root: String,
     pub model_collection: String,
-    pub resident_bytes: u64,
-    pub chunk_bytes: u64,
     pub context_window: u64,
-    pub turns: u64,
-    pub max_prompt_bytes: u64,
-    /// The largest closing message Drive publishes, its `--max-message-bytes`.
-    pub max_message_bytes: u64,
-    /// Seconds between Drive's deadline and the unit's runtime limit.
-    pub teardown_margin_secs: u64,
+    /// The largest brief file passed on; a larger one refuses.
+    pub max_brief_bytes: u64,
     pub telemetry: Telemetry,
     pub provider: DriveProvider,
 }
 
-/// `"off"`, or `{"pile": {"pile": PATH, "key": PATH}}`.
+/// `"off"`, or `{"pile": PATH}`: Drive's `--no-telemetry` or
+/// `--telemetry-pile`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum Telemetry {
     Off,
-    Pile(TelemetryPile),
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct TelemetryPile {
-    pub pile: PathBuf,
-    pub key: PathBuf,
+    Pile(PathBuf),
 }
 
 /// `{"playground": {...}}` or `{"mcp": {...}}`.
@@ -133,20 +130,15 @@ impl Binding {
             ensure!(!text.is_empty(), "binding key {key} is empty");
         }
         for (key, value) in [
-            ("resident-bytes", self.resident_bytes),
-            ("chunk-bytes", self.chunk_bytes),
             ("context-window", self.context_window),
-            ("turns", self.turns),
-            ("max-prompt-bytes", self.max_prompt_bytes),
-            ("max-message-bytes", self.max_message_bytes),
-            ("teardown-margin-secs", self.teardown_margin_secs),
+            ("max-brief-bytes", self.max_brief_bytes),
         ] {
             ensure!(value > 0, "binding key {key} must be positive");
         }
         if let Telemetry::Pile(pile) = &self.telemetry {
             ensure!(
-                !pile.pile.as_os_str().is_empty() && !pile.key.as_os_str().is_empty(),
-                "binding telemetry pile and key must not be empty"
+                !pile.as_os_str().is_empty(),
+                "binding telemetry pile must not be empty"
             );
         }
         match &self.provider {
@@ -173,15 +165,12 @@ impl Binding {
 /// the pile and key the run is recorded in.
 #[derive(Clone, Debug)]
 pub struct RunInputs<'a> {
-    /// `{prompt}`: the prompt file, passed to Drive untouched.
-    pub prompt: &'a Path,
-    /// `{message}`: the file Drive publishes the zooid's closing message to,
-    /// passed untouched. Drive writes no file when there is no message.
-    pub message: &'a Path,
+    /// `{brief}`: the brief file, Drive's `--brief-file`, passed untouched.
+    pub brief: &'a Path,
+    /// `{spawner}`: who sent the brief, Drive's `--brief-from`.
+    pub spawner: &'a str,
     /// `{name}`: the zooid's persona.
     pub name: &'a str,
-    /// `{runtime}`: the unit's `RuntimeMaxSec`.
-    pub runtime_secs: u64,
     /// `TRIBLESPACE_COLLECTION_*` variable and value, as the unit exported.
     pub routes: &'a [(String, String)],
     /// The run's pile and signing key: Drive's native faculties owner.
@@ -208,27 +197,12 @@ pub fn parse_resume(word: &str) -> Result<Option<Id>> {
         .ok_or_else(|| anyhow!("--resume {word} is not an id"))
 }
 
-/// One `drive task` invocation.
+/// One `drive run` invocation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub program: PathBuf,
-    /// Everything after the program, starting with `task`.
+    /// Everything after the program, starting with `run`.
     pub args: Vec<OsString>,
-    pub deadline_ms: u64,
-}
-
-/// Drive's deadline: the runtime limit less the teardown margin. A missing
-/// or too short limit refuses.
-pub fn deadline_ms(runtime_secs: u64, margin_secs: u64) -> Result<u64> {
-    ensure!(margin_secs > 0, "the teardown margin must be positive");
-    ensure!(
-        runtime_secs > margin_secs,
-        "the runtime limit ({runtime_secs} s) leaves no time before the teardown margin \
-         ({margin_secs} s); raise SPAWN_LOCAL_MAX_RUNTIME or lower teardown-margin-secs"
-    );
-    (runtime_secs - margin_secs)
-        .checked_mul(1000)
-        .ok_or_else(|| anyhow!("the Drive deadline overflows"))
 }
 
 /// The pinned routes as `role -> descriptor`, every one of them passed on.
@@ -299,33 +273,26 @@ fn is_descriptor(value: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// The `drive task` command line for one run, or why there is none.
-/// `prompt_len` is the prompt file's size; a prompt larger than the binding's
+/// The `drive run` command line for one run, or why there is none.
+/// `brief_len` is the brief file's size; a brief larger than the binding's
 /// bound refuses rather than being cut.
-pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<Plan> {
+pub fn plan(binding: &Binding, run: &RunInputs<'_>, brief_len: u64) -> Result<Plan> {
     ensure!(
-        prompt_len <= binding.max_prompt_bytes,
-        "refusing to start Drive: the prompt is {prompt_len} bytes and max-prompt-bytes is {}; \
+        brief_len <= binding.max_brief_bytes,
+        "refusing to start Drive: the brief is {brief_len} bytes and max-brief-bytes is {}; \
          nothing is truncated",
-        binding.max_prompt_bytes
+        binding.max_brief_bytes
     );
+    ensure!(brief_len > 0, "refusing to start Drive: the brief is empty");
     ensure!(!run.name.is_empty(), "the zooid name is empty");
-    ensure!(
-        run.prompt != run.message,
-        "prompt and message are the same file"
-    );
-    let deadline_ms = deadline_ms(run.runtime_secs, binding.teardown_margin_secs)?;
+    ensure!(!run.spawner.is_empty(), "the spawner is empty");
     let roles = route_roles(run.routes)?;
 
-    let mut args: Vec<OsString> = Vec::new();
+    let mut args: Vec<OsString> = vec!["run".into(), "--mind".into(), "mini".into()];
     let mut flag = |name: &str, value: OsString| {
         args.push(OsString::from(name));
         args.push(value);
     };
-    let n = |value: u64| OsString::from(value.to_string());
-    flag("--prompt-file", run.prompt.into());
-    flag("--max-prompt-bytes", n(binding.max_prompt_bytes));
-    flag("--message-file", run.message.into());
     flag("--native-persona", run.name.into());
     flag("--native-faculties-pile", run.pile.into());
     flag("--native-faculties-key", run.key.into());
@@ -336,6 +303,8 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
     if let Some(node) = run.resume {
         flag("--native-resume", format!("{node:x}").into());
     }
+    flag("--brief-file", run.brief.into());
+    flag("--brief-from", run.spawner.into());
     flag("--home", binding.home.clone().into());
     flag("--home-key", binding.home_key.clone().into());
     flag("--tenant", binding.tenant.clone().into());
@@ -345,22 +314,13 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
         "--model-collection",
         binding.model_collection.clone().into(),
     );
-    flag("--resident-bytes", n(binding.resident_bytes));
-    flag("--chunk-bytes", n(binding.chunk_bytes));
-    flag("--context-window", n(binding.context_window));
-    flag("--turns", n(binding.turns));
-    flag("--deadline-ms", n(deadline_ms));
-    flag("--max-message-bytes", n(binding.max_message_bytes));
+    flag(
+        "--context-window",
+        binding.context_window.to_string().into(),
+    );
     match &binding.telemetry {
         Telemetry::Off => args.push("--no-telemetry".into()),
-        Telemetry::Pile(pile) => {
-            args.extend([
-                "--telemetry-pile".into(),
-                pile.pile.clone().into(),
-                "--telemetry-key".into(),
-                pile.key.clone().into(),
-            ]);
-        }
+        Telemetry::Pile(pile) => args.extend(["--telemetry-pile".into(), pile.clone().into()]),
     }
     match &binding.provider {
         DriveProvider::Playground(playground) => {
@@ -381,11 +341,9 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
             mcp.token_file.clone().into(),
         ]),
     }
-    args.insert(0, "task".into());
     Ok(Plan {
         program: binding.drive.clone(),
         args,
-        deadline_ms,
     })
 }
 
@@ -412,35 +370,31 @@ pub fn routes_from_env() -> Result<Vec<(String, String)>> {
 
 /// Plan the run from the binding file, the placeholders and the
 /// environment, say on stderr what Drive is given, and exec Drive. Returns
-/// only on a refusal or a failed exec. Stdin (the prompt, as spawn
-/// redirects it) passes through; Drive never reads it.
+/// only on a refusal or a failed exec. Stdin passes through; Drive never
+/// reads it.
 pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infallible> {
     use std::os::unix::process::CommandExt as _;
     let bytes = std::fs::read(binding)
         .with_context(|| format!("read the Drive binding {}", binding.display()))?;
     let parsed = Binding::parse(&bytes, binding)?;
-    let prompt = std::fs::metadata(run.prompt)
-        .with_context(|| format!("the prompt {}", run.prompt.display()))?;
+    let brief = std::fs::metadata(run.brief)
+        .with_context(|| format!("the brief {}", run.brief.display()))?;
     ensure!(
-        prompt.is_file(),
-        "the prompt {} is not a regular file",
-        run.prompt.display()
+        brief.is_file(),
+        "the brief {} is not a regular file",
+        run.brief.display()
     );
-    ensure!(
-        !run.message.try_exists()?,
-        "the message file {} already exists; Drive publishes a new file only",
-        run.message.display()
-    );
-    let plan = plan(&parsed, run, prompt.len())?;
+    let plan = plan(&parsed, run, brief.len())?;
     eprintln!(
-        "zooid drive-task: binding {} blake3:{}; deadline-ms {} (runtime {} s less {} s \
-         teardown); prompt {} bytes",
+        "zooid drive-task: binding {} blake3:{}; brief {} bytes from {}; {}",
         binding.display(),
         blake3::hash(&bytes).to_hex(),
-        plan.deadline_ms,
-        run.runtime_secs,
-        parsed.teardown_margin_secs,
-        prompt.len()
+        brief.len(),
+        run.spawner,
+        match run.resume {
+            Some(node) => format!("resuming at {node:x}"),
+            None => "fresh".to_owned(),
+        }
     );
     eprintln!(
         "zooid drive-task: exec {} {}",
@@ -477,13 +431,8 @@ mod tests {
         "model": "/fake/models/model.pile",
         "model-root": "FAKEROOT",
         "model-collection": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "resident-bytes": 1000,
-        "chunk-bytes": 100,
         "context-window": 4096,
-        "turns": 8,
-        "max-prompt-bytes": 500,
-        "max-message-bytes": 300,
-        "teardown-margin-secs": 60,
+        "max-brief-bytes": 500,
         "telemetry": "off",
         "provider": {"playground": {"path": "/fake/playground", "backend": "fake-backend",
                      "backend-args": ["--one", "two words"]}}
@@ -508,10 +457,9 @@ mod tests {
 
     fn run<'a>(routes: &'a [(String, String)]) -> RunInputs<'a> {
         RunInputs {
-            prompt: Path::new("/state dir/z.prompt"),
-            message: Path::new("/state dir/z.report"),
+            brief: Path::new("/state dir/z.brief"),
+            spawner: "tutor",
             name: "zooid-name",
-            runtime_secs: 3600,
             routes,
             pile: Path::new("/piles/colony pile.pile"),
             key: Path::new("/piles/colony.key"),
@@ -545,16 +493,11 @@ mod tests {
         let pinned = routes(&["archive", "compass", "message", "memory-journal"]);
         let plan = plan(&binding(), &run(&pinned), 500).unwrap();
         assert_eq!(plan.program, PathBuf::from("/fake/bin/drive"));
-        assert_eq!(plan.deadline_ms, 3_540_000);
         let collection = |role: &str| format!("{role}={DESCRIPTOR}");
         let expected: Vec<String> = [
-            "task",
-            "--prompt-file",
-            "/state dir/z.prompt",
-            "--max-prompt-bytes",
-            "500",
-            "--message-file",
-            "/state dir/z.report",
+            "run",
+            "--mind",
+            "mini",
             "--native-persona",
             "zooid-name",
             "--native-faculties-pile",
@@ -571,6 +514,10 @@ mod tests {
             &collection("message"),
             "--native-archive",
             DESCRIPTOR,
+            "--brief-file",
+            "/state dir/z.brief",
+            "--brief-from",
+            "tutor",
             "--home",
             "/fake/drive home/session.pile",
             "--home-key",
@@ -583,18 +530,8 @@ mod tests {
             "FAKEROOT",
             "--model-collection",
             "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "--resident-bytes",
-            "1000",
-            "--chunk-bytes",
-            "100",
             "--context-window",
             "4096",
-            "--turns",
-            "8",
-            "--deadline-ms",
-            "3540000",
-            "--max-message-bytes",
-            "300",
             "--no-telemetry",
             "--playground",
             "/fake/playground",
@@ -609,6 +546,15 @@ mod tests {
         .map(|word| word.to_string())
         .collect();
         assert_eq!(strings(&plan), expected);
+        // A living loop: none of a finite task's flags.
+        for task in [
+            "--turns",
+            "--deadline-ms",
+            "--prompt-file",
+            "--message-file",
+        ] {
+            assert!(!expected.iter().any(|arg| arg == task), "{task}");
+        }
     }
 
     #[test]
@@ -655,24 +601,19 @@ mod tests {
     #[test]
     fn telemetry_to_a_pile_and_an_mcp_provider() {
         let mut binding = binding();
-        binding.telemetry = Telemetry::Pile(TelemetryPile {
-            pile: "/t p.pile".into(),
-            key: "/t.key".into(),
-        });
+        binding.telemetry = Telemetry::Pile("/t p.pile".into());
         binding.provider = DriveProvider::Mcp(Mcp {
             url: "http://fake.invalid/mcp".into(),
             token_file: "/fake token".into(),
         });
         let pinned = routes(&["archive"]);
         let args = strings(&plan(&binding, &run(&pinned), 1).unwrap());
-        let tail = &args[args.len() - 8..];
+        let tail = &args[args.len() - 6..];
         assert_eq!(
             tail,
             [
                 "--telemetry-pile",
                 "/t p.pile",
-                "--telemetry-key",
-                "/t.key",
                 "--mcp-url",
                 "http://fake.invalid/mcp",
                 "--mcp-token-file",
@@ -727,27 +668,14 @@ mod tests {
     }
 
     #[test]
-    fn the_deadline_ends_the_margin_before_the_runtime_limit() {
-        assert_eq!(deadline_ms(3600, 60).unwrap(), 3_540_000);
-        assert_eq!(deadline_ms(61, 60).unwrap(), 1000);
-        assert!(deadline_ms(60, 60).is_err());
-        assert!(deadline_ms(10, 60).is_err());
-        assert!(deadline_ms(100, 0).is_err());
-        let pinned = routes(&["archive"]);
-        let mut short = run(&pinned);
-        short.runtime_secs = 60;
-        let error = plan(&binding(), &short, 1).unwrap_err().to_string();
-        assert!(error.contains("SPAWN_LOCAL_MAX_RUNTIME"), "{error}");
-    }
-
-    #[test]
-    fn a_prompt_over_the_bound_refuses_and_one_at_it_passes() {
+    fn a_brief_over_the_bound_or_empty_refuses_and_one_at_it_passes() {
         let pinned = routes(&["archive"]);
         assert!(plan(&binding(), &run(&pinned), 500).is_ok());
         let error = plan(&binding(), &run(&pinned), 501)
             .unwrap_err()
             .to_string();
         assert!(error.contains("nothing is truncated"), "{error}");
+        assert!(plan(&binding(), &run(&pinned), 0).is_err());
     }
 
     #[test]
@@ -765,7 +693,7 @@ mod tests {
         extra
             .as_object_mut()
             .unwrap()
-            .insert("exec-timeout".to_owned(), 5.into());
+            .insert("turns".to_owned(), 5.into());
         assert!(serde_json::from_value::<Binding>(extra).is_err());
         let mut no_args = full.clone();
         no_args["provider"]["playground"]
@@ -774,7 +702,7 @@ mod tests {
             .remove("backend-args");
         assert!(serde_json::from_value::<Binding>(no_args).is_err());
         let mut zero = full;
-        zero["turns"] = 0.into();
+        zero["max-brief-bytes"] = 0.into();
         let zero: Binding = serde_json::from_value(zero).unwrap();
         assert!(zero.check().is_err());
     }

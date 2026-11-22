@@ -1,6 +1,6 @@
-//! `zooid drive-task`, the local executor for a finite Drive task, run as
-//! the real `zooid` binary against a fake `drive` script. Nothing here
-//! starts Drive, a model or a provider.
+//! `zooid drive-task`, the local executor that launches a zooid into
+//! `drive run --mind mini`, run as the real `zooid` binary against a fake
+//! `drive` script. Nothing here starts Drive, a model or a provider.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -21,50 +21,46 @@ const DESCRIPTOR: &str = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 const MODEL_DESCRIPTOR: &str =
     "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-/// A fake `drive`: leaves its arguments one per line, the bytes it got on
-/// stdin and a copy of the prompt file it was named in `$FAKE_OUT`, then
-/// does what `$FAKE_MODE` says.
+/// A fake `drive`: leaves its arguments one per line and a copy of the
+/// brief file it was named in `$FAKE_OUT`, then does what `$FAKE_MODE`
+/// says. `live` is a living loop that tears down on SIGINT, as Drive does.
 const FAKE_DRIVE: &str = r#"#!/bin/sh
 out="$FAKE_OUT"
 : > "$out/args"
 for word in "$@"; do printf '%s\n' "$word" >> "$out/args"; done
-wc -c > "$out/stdin"
-prompt=""; message=""
+brief=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prompt-file) prompt="$2"; shift ;;
-    --message-file) message="$2"; shift ;;
+    --brief-file) brief="$2"; shift ;;
   esac
   shift
 done
-cp "$prompt" "$out/prompt-seen"
+cp "$brief" "$out/brief-seen"
 case "$FAKE_MODE" in
-  message) printf 'fake message' > "$message" ;;
   fail) exit 3 ;;
   silent) exit 0 ;;
-  sleep) exec sleep 60 ;;
+  live) trap 'echo torn-down > "$out/teardown"; exit 0' INT; sleep 60 & wait ;;
 esac
 "#;
 
 /// A directory whose path has a space in it, with a fake drive, a binding,
-/// a prompt and an output directory.
+/// a brief and an output directory.
 struct Setup {
     _directory: tempfile::TempDir,
     root: PathBuf,
     drive: PathBuf,
     binding: PathBuf,
-    prompt: PathBuf,
-    message: PathBuf,
+    brief: PathBuf,
     out: PathBuf,
     pile: PathBuf,
     key: PathBuf,
 }
 
-/// Bytes a prompt carries through untouched: multi-byte characters, a tab,
+/// Bytes a brief carries through untouched: multi-byte characters, a tab,
 /// a carriage return, trailing spaces and no final newline.
-const PROMPT: &[u8] = "# Wake\n\nGrüße, ✓ tab\there\r\nlast line   ".as_bytes();
+const BRIEF: &[u8] = "# Who you are\n\nGrüße, ✓ tab\there\r\nlast line   ".as_bytes();
 
-fn binding_json(drive: &Path, home: &Path, margin: u64, max_prompt: usize) -> String {
+fn binding_json(drive: &Path, home: &Path, max_brief: usize) -> String {
     serde_json::json!({
         "drive": drive,
         "tenant": "fake-tenant",
@@ -73,13 +69,8 @@ fn binding_json(drive: &Path, home: &Path, margin: u64, max_prompt: usize) -> St
         "model": "/fake/models/model.pile",
         "model-root": "FAKEROOT",
         "model-collection": MODEL_DESCRIPTOR,
-        "resident-bytes": 1000,
-        "chunk-bytes": 100,
         "context-window": 4096,
-        "turns": 8,
-        "max-prompt-bytes": max_prompt,
-        "max-message-bytes": 300,
-        "teardown-margin-secs": margin,
+        "max-brief-bytes": max_brief,
         "telemetry": "off",
         "provider": {"playground": {"path": "/fake/playground", "backend": "fake-backend",
                      "backend-args": ["two words"]}}
@@ -104,19 +95,18 @@ fn setup() -> Setup {
     let binding = root.join("fake binding.json");
     std::fs::write(
         &binding,
-        binding_json(&drive, &root.join("drive home"), 30, 4096),
+        binding_json(&drive, &root.join("drive home"), 4096),
     )
     .unwrap();
-    let prompt = root.join("state dir").join("z.prompt");
-    std::fs::write(&prompt, PROMPT).unwrap();
+    let brief = root.join("state dir").join("z.brief");
+    std::fs::write(&brief, BRIEF).unwrap();
     Setup {
-        message: root.join("state dir").join("z.report"),
         out: root.join("out"),
         pile: root.join("piles").join("colony pile.pile"),
         key: root.join("piles").join("colony.key"),
         drive,
         binding,
-        prompt,
+        brief,
         root,
         _directory: directory,
     }
@@ -130,11 +120,26 @@ fn route(role: &str) -> (String, String) {
     (variable, DESCRIPTOR.to_owned())
 }
 
+/// The adapter's arguments, as spawn's template substitutes them.
+fn adapter_args(setup: &Setup, resume: &str) -> Vec<String> {
+    vec![
+        "drive-task".to_owned(),
+        "--binding".to_owned(),
+        setup.binding.display().to_string(),
+        "--brief".to_owned(),
+        setup.brief.display().to_string(),
+        "--spawner".to_owned(),
+        "tutor".to_owned(),
+        "--name".to_owned(),
+        "zooid-name".to_owned(),
+        format!("--resume={resume}"),
+    ]
+}
+
 /// Run `zooid drive-task` as a unit script would: a scrubbed environment,
-/// the routes and the run's pile and key exported, the prompt on stdin.
-fn adapter(setup: &Setup, routes: &[(String, String)], runtime: u64, mode: &str) -> Output {
-    let mut command = Command::new(SPAWN);
-    command
+/// the routes and the run's pile and key exported.
+fn adapter(setup: &Setup, routes: &[(String, String)], resume: &str, mode: &str) -> Output {
+    Command::new(SPAWN)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("PILE", &setup.pile)
@@ -142,15 +147,10 @@ fn adapter(setup: &Setup, routes: &[(String, String)], runtime: u64, mode: &str)
         .env("FAKE_OUT", &setup.out)
         .env("FAKE_MODE", mode)
         .envs(routes.iter().map(|(name, value)| (name, value)))
-        .args(["drive-task", "--binding"])
-        .arg(&setup.binding)
-        .arg("--prompt")
-        .arg(&setup.prompt)
-        .arg("--message")
-        .arg(&setup.message)
-        .args(["--name", "zooid-name", "--runtime", &runtime.to_string()])
-        .stdin(std::fs::File::open(&setup.prompt).unwrap());
-    command.output().unwrap()
+        .args(adapter_args(setup, resume))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
 }
 
 fn drive_ran(setup: &Setup) -> bool {
@@ -162,23 +162,19 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn the_adapter_execs_drive_task_with_the_whole_argv() {
+fn the_adapter_execs_drive_run_with_the_whole_argv_fresh_and_resumed() {
     let setup = setup();
     let routes = [route("archive"), route("compass"), route("message")];
-    let output = adapter(&setup, &routes, 3600, "message");
+    let output = adapter(&setup, &routes, "", "silent");
     assert!(output.status.success(), "{}", stderr(&output));
     let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
     let home = setup.root.join("drive home");
     let path = |path: &Path| path.display().to_string();
     let collection = |role: &str| format!("{role}={DESCRIPTOR}");
-    let expected = [
-        "task".to_owned(),
-        "--prompt-file".to_owned(),
-        path(&setup.prompt),
-        "--max-prompt-bytes".to_owned(),
-        "4096".to_owned(),
-        "--message-file".to_owned(),
-        path(&setup.message),
+    let fresh = [
+        "run".to_owned(),
+        "--mind".to_owned(),
+        "mini".to_owned(),
         "--native-persona".to_owned(),
         "zooid-name".to_owned(),
         "--native-faculties-pile".to_owned(),
@@ -193,6 +189,10 @@ fn the_adapter_execs_drive_task_with_the_whole_argv() {
         collection("message"),
         "--native-archive".to_owned(),
         DESCRIPTOR.to_owned(),
+        "--brief-file".to_owned(),
+        path(&setup.brief),
+        "--brief-from".to_owned(),
+        "tutor".to_owned(),
         "--home".to_owned(),
         path(&home.join("session.pile")),
         "--home-key".to_owned(),
@@ -205,18 +205,8 @@ fn the_adapter_execs_drive_task_with_the_whole_argv() {
         "FAKEROOT".to_owned(),
         "--model-collection".to_owned(),
         MODEL_DESCRIPTOR.to_owned(),
-        "--resident-bytes".to_owned(),
-        "1000".to_owned(),
-        "--chunk-bytes".to_owned(),
-        "100".to_owned(),
         "--context-window".to_owned(),
         "4096".to_owned(),
-        "--turns".to_owned(),
-        "8".to_owned(),
-        "--deadline-ms".to_owned(),
-        "3570000".to_owned(),
-        "--max-message-bytes".to_owned(),
-        "300".to_owned(),
         "--no-telemetry".to_owned(),
         "--playground".to_owned(),
         "/fake/playground".to_owned(),
@@ -225,35 +215,34 @@ fn the_adapter_execs_drive_task_with_the_whole_argv() {
         "--backend-arg".to_owned(),
         "two words".to_owned(),
     ];
-    assert_eq!(args.lines().collect::<Vec<_>>(), expected);
-    // The prompt Drive reads is the bytes spawn wrote, and stdin still
-    // carries them whole.
-    assert_eq!(
-        std::fs::read(setup.out.join("prompt-seen")).unwrap(),
-        PROMPT
-    );
-    let stdin = std::fs::read_to_string(setup.out.join("stdin")).unwrap();
-    assert_eq!(stdin.trim().parse::<usize>().unwrap(), PROMPT.len());
-    assert_eq!(std::fs::read(&setup.message).unwrap(), b"fake message");
-    // The run's log says what Drive was given.
+    assert_eq!(args.lines().collect::<Vec<_>>(), fresh);
+    // The brief Drive reads is the bytes spawn wrote.
+    assert_eq!(std::fs::read(setup.out.join("brief-seen")).unwrap(), BRIEF);
     let log = stderr(&output);
-    assert!(
-        log.contains("deadline-ms 3570000 (runtime 3600 s less 30 s"),
-        "{log}"
-    );
+    assert!(log.contains("brief 50 bytes from tutor; fresh"), "{log}");
     assert!(log.contains("zooid drive-task: exec "), "{log}");
+
+    // Resumed: the same line plus where her history ends, and the same
+    // brief file, which Drive uses for the tint and does not deliver again.
+    let node = "0123456789abcdef0123456789abcdef";
+    let output = adapter(&setup, &routes, node, "silent");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
+    let at = fresh.iter().position(|arg| arg == "--brief-file").unwrap();
+    let mut resumed = fresh.to_vec();
+    resumed.splice(at..at, ["--native-resume".to_owned(), node.to_owned()]);
+    assert_eq!(args.lines().collect::<Vec<_>>(), resumed);
+    assert!(stderr(&output).contains(&format!("resuming at {node}")));
 }
 
 #[test]
-fn drive_exit_codes_pass_through_and_no_message_is_invented() {
+fn drive_exit_codes_pass_through() {
     let setup = setup();
     let routes = [route("archive")];
-    let failed = adapter(&setup, &routes, 3600, "fail");
+    let failed = adapter(&setup, &routes, "", "fail");
     assert_eq!(failed.status.code(), Some(3), "{}", stderr(&failed));
-    assert!(!setup.message.exists());
-    let silent = adapter(&setup, &routes, 3600, "silent");
+    let silent = adapter(&setup, &routes, "", "silent");
     assert_eq!(silent.status.code(), Some(0), "{}", stderr(&silent));
-    assert!(!setup.message.exists());
 }
 
 /// Each refusal exits nonzero before Drive starts, and says why.
@@ -274,9 +263,9 @@ fn route_refusals_happen_before_drive_starts() {
             DESCRIPTOR.to_owned(),
         ),
     ];
-    let output = adapter(&setup, &unknown, 3600, "message");
+    let output = adapter(&setup, &unknown, "", "silent");
     refused(&setup, &output, "TRIBLESPACE_COLLECTION_NOT_A_FACULTY");
-    let output = adapter(&setup, &[route("compass")], 3600, "message");
+    let output = adapter(&setup, &[route("compass")], "", "silent");
     refused(&setup, &output, "--native-archive");
 }
 
@@ -289,66 +278,52 @@ fn a_missing_binding_or_binding_key_refuses() {
     let mut partial = full.clone();
     partial.as_object_mut().unwrap().remove("tenant");
     std::fs::write(&setup.binding, partial.to_string()).unwrap();
-    let output = adapter(&setup, &routes, 3600, "message");
+    let output = adapter(&setup, &routes, "", "silent");
     refused(&setup, &output, "missing field `tenant`");
+    // A finite task's keys are gone, not kept alongside.
     let mut extra = full;
-    extra["exec-timeout"] = 5.into();
+    extra["turns"] = 5.into();
     std::fs::write(&setup.binding, extra.to_string()).unwrap();
-    let output = adapter(&setup, &routes, 3600, "message");
-    refused(&setup, &output, "unknown field `exec-timeout`");
+    let output = adapter(&setup, &routes, "", "silent");
+    refused(&setup, &output, "unknown field `turns`");
     std::fs::remove_file(&setup.binding).unwrap();
-    let output = adapter(&setup, &routes, 3600, "message");
+    let output = adapter(&setup, &routes, "", "silent");
     refused(&setup, &output, "read the Drive binding");
 }
 
 #[test]
-fn a_short_runtime_an_oversized_prompt_an_existing_message_file_or_no_key_refuses() {
+fn an_oversized_or_empty_brief_a_bad_resume_or_no_key_refuses() {
     let setup = setup();
     let routes = [route("archive")];
-    let output = adapter(&setup, &routes, 30, "message");
-    refused(&setup, &output, "SPAWN_LOCAL_MAX_RUNTIME");
-
+    let home = setup.root.join("drive home");
     std::fs::write(
         &setup.binding,
-        binding_json(
-            &setup.drive,
-            &setup.root.join("drive home"),
-            30,
-            PROMPT.len() - 1,
-        ),
+        binding_json(&setup.drive, &home, BRIEF.len() - 1),
     )
     .unwrap();
-    let output = adapter(&setup, &routes, 3600, "message");
+    let output = adapter(&setup, &routes, "", "silent");
     refused(&setup, &output, "nothing is truncated");
-    assert_eq!(std::fs::read(&setup.prompt).unwrap(), PROMPT);
+    assert_eq!(std::fs::read(&setup.brief).unwrap(), BRIEF);
     std::fs::write(
         &setup.binding,
-        binding_json(
-            &setup.drive,
-            &setup.root.join("drive home"),
-            30,
-            PROMPT.len(),
-        ),
+        binding_json(&setup.drive, &home, BRIEF.len()),
     )
     .unwrap();
 
-    std::fs::write(&setup.message, "an old message").unwrap();
-    let output = adapter(&setup, &routes, 3600, "message");
-    refused(&setup, &output, "already exists");
-    std::fs::remove_file(&setup.message).unwrap();
+    std::fs::write(&setup.brief, b"").unwrap();
+    let output = adapter(&setup, &routes, "", "silent");
+    refused(&setup, &output, "the brief is empty");
+    std::fs::write(&setup.brief, BRIEF).unwrap();
+
+    let output = adapter(&setup, &routes, "0123", "silent");
+    refused(&setup, &output, "32-hex");
 
     let output = Command::new(SPAWN)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("PILE", &setup.pile)
         .envs(routes.iter().map(|(name, value)| (name, value)))
-        .args(["drive-task", "--binding"])
-        .arg(&setup.binding)
-        .arg("--prompt")
-        .arg(&setup.prompt)
-        .arg("--message")
-        .arg(&setup.message)
-        .args(["--name", "zooid-name", "--runtime", "3600"])
+        .args(adapter_args(&setup, ""))
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -414,8 +389,8 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
     let binding = base.join("binding.json");
     std::fs::copy(&setup.binding, &binding).unwrap();
     let template = format!(
-        "{SPAWN} drive-task --binding {} --prompt {{prompt}} --message {{message}} --name {{name}} \
-         --runtime {{runtime}}",
+        "{SPAWN} drive-task --binding {} --brief {{brief}} --spawner {{spawner}} --name {{name}} \
+         --resume={{resume}}",
         binding.display()
     );
     let launch = LaunchConfig {
@@ -465,14 +440,16 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
             cover: Default::default(),
         })
         .unwrap();
-    assert_eq!(launcher.started.lock().unwrap()[0].runtime_max, Some(600));
+    let started = launcher.started.lock().unwrap()[0].clone();
+    assert_eq!(started.runtime_max, Some(600));
+    assert!(started.interrupt);
     let output = Command::new("/bin/bash")
         .arg(launched.report.with_extension("sh"))
         .current_dir(base.join("lane"))
         .env_clear()
         .env("HOME", base)
         .env("FAKE_OUT", &setup.out)
-        .env("FAKE_MODE", "message")
+        .env("FAKE_MODE", "silent")
         .output()
         .unwrap();
     let log = stderr(&output);
@@ -492,16 +469,16 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         })
         .unwrap();
     let run = spawn.show(&launched.name).unwrap().runs.remove(0);
-    assert!(!ended_clean(&run), "{}", describe_end(&run));
+    assert!(!ended_clean(&run, true), "{}", describe_end(&run));
     assert!(run.report_text.is_none());
 }
 
-/// The runtime limit through real systemd: the adapter derives a deadline
-/// from a three-second limit, the fake Drive ignores it and sleeps, and
-/// RuntimeMaxSec stops the unit. Its result is a timeout, never a clean end.
-/// Skipped where no systemd user manager answers.
+/// A living zooid through real systemd, stopped as spawn stops a local
+/// unit: its runtime limit interrupts the main process (SIGINT, mixed kill
+/// mode), the fake Drive tears down and exits 0, and that is a clean end
+/// noted as the limit. Skipped where no systemd user manager answers.
 #[test]
-fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
+fn a_living_drive_is_interrupted_by_the_runtime_limit_and_tears_down_cleanly() {
     let reachable = Command::new("systemctl")
         .args(["--user", "show-environment"])
         .stdout(Stdio::null())
@@ -513,11 +490,6 @@ fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
         return;
     }
     let setup = setup();
-    std::fs::write(
-        &setup.binding,
-        binding_json(&setup.drive, &setup.root.join("drive home"), 1, 4096),
-    )
-    .unwrap();
     let ended = setup.out.join("ended");
     let unit = format!(
         "spawn-drive-task-test-{}-{}",
@@ -529,7 +501,9 @@ fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
     );
     // systemd expands $VARIABLE in Exec lines itself, so the stop-post step
     // is a script that reads the variables systemd gives it.
-    let stop_post = setup.out.join("stop-post.sh");
+    // Spawn's stop-post line names an unquoted, unit-safe path (spawn's
+    // state files are checked for that), so this one has no space.
+    let stop_post = setup.root.parent().unwrap().join("stop-post.sh");
     executable(
         &stop_post,
         &format!(
@@ -537,12 +511,24 @@ fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
             faculties::spawn::shell_word(&ended.display().to_string())
         ),
     );
+    let spec = UnitSpec {
+        unit: unit.clone(),
+        workdir: setup.root.clone(),
+        script: stop_post.clone(),
+        log: setup.out.join("log"),
+        memory_max: "1G".to_owned(),
+        runtime_max: Some(3),
+        interrupt: true,
+    };
+    // spawn's own unit properties (its stop-post step runs this test's
+    // script), with this test's main command.
+    let properties: Vec<String> = spec
+        .systemd_run_args()
+        .into_iter()
+        .take_while(|arg| arg != "--")
+        .collect();
     let mut command = Command::new("systemd-run");
-    command.args(["--user", "--unit", &unit, "--collect", "--quiet"]);
-    command.args(["-p", "RuntimeMaxSec=3"]);
-    command
-        .arg("-p")
-        .arg(format!("ExecStopPost=/bin/sh \"{}\"", stop_post.display()));
+    command.args(&properties);
     // The user manager hands its own environment to the unit, routes
     // included: start from an empty one, as spawn's unit script unsets them.
     command.args(["--", "/usr/bin/env", "-i"]);
@@ -554,20 +540,12 @@ fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
             setup.key.display().to_string(),
         ),
         ("FAKE_OUT".to_owned(), setup.out.display().to_string()),
-        ("FAKE_MODE".to_owned(), "sleep".to_owned()),
+        ("FAKE_MODE".to_owned(), "live".to_owned()),
         route("archive"),
     ] {
         command.arg(format!("{name}={value}"));
     }
-    command
-        .arg(SPAWN)
-        .args(["drive-task", "--binding"])
-        .arg(&setup.binding)
-        .arg("--prompt")
-        .arg(&setup.prompt)
-        .arg("--message")
-        .arg(&setup.message)
-        .args(["--name", "zooid-name", "--runtime", "3"]);
+    command.arg(SPAWN).args(adapter_args(&setup, ""));
     assert!(command.status().unwrap().success());
     let deadline = Instant::now() + Duration::from_secs(60);
     while !ended.exists() {
@@ -579,14 +557,11 @@ fn a_drive_that_overruns_is_stopped_by_the_runtime_limit() {
     let words: Vec<&str> = words.split_whitespace().collect();
     let exit = Exit::from_systemd(words[0], words[1], words.get(2).copied().unwrap_or(""));
     assert_eq!(exit.result.as_deref(), Some("timeout"), "{words:?}");
-    assert!(!exit.clean());
-    assert!(drive_ran(&setup));
-    let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
-    let lines: Vec<&str> = args.lines().collect();
-    let at = lines
-        .iter()
-        .position(|line| *line == "--deadline-ms")
-        .unwrap();
-    assert_eq!(lines[at + 1], "2000");
-    assert!(!setup.message.exists());
+    assert_eq!(exit.code, Some(0), "{words:?}");
+    assert!(exit.clean(true), "{words:?}");
+    assert!(!exit.clean(false));
+    assert_eq!(
+        std::fs::read_to_string(setup.out.join("teardown")).unwrap(),
+        "torn-down\n"
+    );
 }

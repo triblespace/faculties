@@ -56,7 +56,7 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
-        /// {name}, {effort}, {script}, {runtime} and {resume} (where its archived history ends)
+        /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
         /// zooid ends with an optional closing message, not a report.
@@ -100,7 +100,7 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
-        /// {name}, {effort}, {script}, {runtime} and {resume} (where its archived history ends)
+        /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
         /// zooid ends with an optional closing message, not a report.
@@ -239,35 +239,33 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         usage: Option<PathBuf>,
     },
-    /// A local executor for one finite Drive task, named in
-    /// SPAWN_LOCAL_EXECUTOR as
-    /// `zooid drive-task --binding FILE --prompt {prompt} --message {message}
-    /// --name {name} --runtime {runtime} --resume={resume}`. It turns the run's pinned
+    /// A local executor that launches one zooid into Drive's living loop,
+    /// named in SPAWN_LOCAL_EXECUTOR as
+    /// `zooid drive-task --binding FILE --brief {brief} --spawner {spawner}
+    /// --name {name} --resume={resume}`. It turns the run's pinned
     /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
     /// arguments, takes everything else from the binding file, and execs
-    /// `drive task`. It opens no pile. A route variable naming no faculties
-    /// collection, a malformed or repeated route, a missing archive route, a
-    /// missing or extra binding key, a prompt over the bound or a runtime
-    /// limit too short for the teardown margin refuses before Drive starts.
-    /// A role Drive does not accept is refused by Drive itself, naming it.
+    /// `drive run --mind mini`. It opens no pile. A route variable naming no
+    /// faculties collection, a malformed or repeated route, a missing archive
+    /// route, a missing or extra binding key, or an empty brief or one over
+    /// the bound refuses before Drive starts. A role Drive does not accept is
+    /// refused by Drive itself, naming it. The zooid runs until it is
+    /// interrupted: spawn stops a local unit with SIGINT, Drive's teardown.
     DriveTask {
         /// The host's binding file (JSON): drive, tenant, home, model,
-        /// sizes, telemetry and provider. Every key is required.
+        /// window, telemetry and provider. Every key is required.
         #[arg(long, value_name = "PATH")]
         binding: PathBuf,
-        /// The run's prompt file, passed to Drive untouched.
+        /// The run's brief file, from {brief}: her first input on a fresh
+        /// start and the wake's tint, passed to Drive untouched.
         #[arg(long, value_name = "PATH")]
-        prompt: PathBuf,
-        /// The run's message file, which Drive publishes with the zooid's
-        /// closing message, and leaves unwritten when there is none.
-        #[arg(long, value_name = "PATH")]
-        message: PathBuf,
+        brief: PathBuf,
+        /// Who sent the brief, from {spawner}: Drive's --brief-from.
+        #[arg(long)]
+        spawner: String,
         /// The zooid's name, Drive's native persona.
         #[arg(long)]
         name: String,
-        /// The unit's runtime limit in seconds, from {runtime}.
-        #[arg(long, value_name = "SECONDS")]
-        runtime: u64,
         /// The archived node the zooid's history ends at, from {resume}
         /// (`--resume={resume}`): Drive's --native-resume. Empty starts the
         /// zooid fresh. Omitted, no history is continued either.
@@ -428,10 +426,9 @@ pub fn run() -> Result<()> {
     };
     if let Command::DriveTask {
         binding,
-        prompt,
-        message,
+        brief,
+        spawner,
         name,
-        runtime,
         resume,
     } = &command
     {
@@ -446,10 +443,9 @@ pub fn run() -> Result<()> {
         let never = super::drive_task::exec(
             binding,
             &super::drive_task::RunInputs {
-                prompt,
-                message,
+                brief,
+                spawner,
                 name,
-                runtime_secs: *runtime,
                 routes: &routes,
                 pile: &cli.pile,
                 key,
