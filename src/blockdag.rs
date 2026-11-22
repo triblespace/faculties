@@ -302,6 +302,164 @@ where
     Ok(fact)
 }
 
+/// Add one recovered body the source itself labels as its sanitized copy.
+///
+/// The body is a resolution like any other (`resolved_to`), and also
+/// `sanitized_to`, so [`preferred_resolution`] ranks it below an unlabelled
+/// body. The intrinsic fact root remains unchanged.
+pub fn resolve_sanitized_pointer_fact<T>(mut fact: Fragment, bytes: T) -> Result<Fragment>
+where
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
+    let root = rooted(&fact, "content fact")?;
+    let resolved = fact.put::<RawBytes, _>(bytes);
+    fact += entity! { ExclusiveId::force_ref(&root) @
+        schema::content_fact::resolved_to: resolved,
+        schema::content_fact::sanitized_to: resolved,
+    };
+    Ok(fact)
+}
+
+/// Annotate a pointer fact as a rendered page of another asset.
+///
+/// `document_pointer` is the document's own pointer in the same namespace, so
+/// it is stored as the same text blob the document's fact uses, and a reader
+/// joins on it. `page` is the number as the source spells it. Annotation
+/// only: the fact keeps its id, and no bytes are claimed for the page.
+pub fn page_of_pointer_fact<P>(
+    mut fact: Fragment,
+    document_pointer: P,
+    page: u128,
+) -> Result<Fragment>
+where
+    P: triblespace::core::blob::IntoBlob<UTF8String>,
+{
+    let root = rooted(&fact, "content fact")?;
+    let document = fact.put::<UTF8String, _>(document_pointer);
+    fact += entity! { ExclusiveId::force_ref(&root) @
+        schema::content_fact::page_of: document,
+        schema::content_fact::page: page,
+    };
+    Ok(fact)
+}
+
+/// The resolution a reader shows when a pointer fact has several.
+///
+/// Every `resolved_to` body stays a resolution; this only orders them, by a
+/// fixed rule, so every reader of the same facts picks the same body:
+///
+/// 1. a body the source did not label as sanitized (`sanitized_to`);
+/// 2. a body that `body` can read;
+/// 3. a body that still carries embedded EXIF metadata ([`carries_exif`]),
+///    because a provider's sanitized copy is one with that metadata
+///    stripped (in the ChatGPT exports the older, stripped copy is often not
+///    labelled);
+/// 4. the larger body;
+/// 5. the smallest handle.
+///
+/// `None` when the fact has no resolution.
+pub fn preferred_resolution<P, F>(
+    facts: &P,
+    fact: Id,
+    mut body: F,
+) -> Option<Inline<Handle<RawBytes>>>
+where
+    P: TriblePattern,
+    F: FnMut(Inline<Handle<RawBytes>>) -> Option<anybytes::Bytes>,
+{
+    let sanitized: BTreeSet<[u8; 32]> = find!(
+        handle: Inline<Handle<RawBytes>>,
+        pattern!(facts, [{ fact @ schema::content_fact::sanitized_to: ?handle }])
+    )
+    .map(|handle| handle.raw)
+    .collect();
+    let candidates: BTreeSet<[u8; 32]> = find!(
+        handle: Inline<Handle<RawBytes>>,
+        pattern!(facts, [{ fact @ schema::content_fact::resolved_to: ?handle }])
+    )
+    .map(|handle| handle.raw)
+    .collect();
+    candidates
+        .into_iter()
+        .map(|raw| {
+            let handle = Inline::<Handle<RawBytes>>::new(raw);
+            let bytes = body(handle);
+            let rank = (
+                !sanitized.contains(&raw),
+                bytes.is_some(),
+                bytes.as_deref().is_some_and(carries_exif),
+                bytes.as_ref().map_or(0, |bytes| bytes.len()),
+                std::cmp::Reverse(raw),
+            );
+            (rank, handle)
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, handle)| handle)
+}
+
+/// Whether an image carries an embedded EXIF block: a JPEG `APP1` segment
+/// starting `Exif\0\0`, a PNG `eXIf` chunk, or a WebP `EXIF` chunk. The
+/// container is walked by its own segment lengths; anything else, or a
+/// truncated container, is `false`.
+pub fn carries_exif(bytes: &[u8]) -> bool {
+    if let Some(mut rest) = bytes.strip_prefix(&[0xFF, 0xD8]) {
+        while let [0xFF, marker, tail @ ..] = rest {
+            match *marker {
+                // Fill bytes before a marker.
+                0xFF => rest = &rest[1..],
+                // Start of scan or end of image: no more metadata segments.
+                0xDA | 0xD9 => return false,
+                // Markers without a length.
+                0x01 | 0xD0..=0xD7 => rest = tail,
+                marker => {
+                    let [high, low, ..] = tail else { return false };
+                    let length = usize::from(u16::from_be_bytes([*high, *low]));
+                    let Some(segment) = tail.get(2..length) else {
+                        return false;
+                    };
+                    if marker == 0xE1 && segment.starts_with(b"Exif\0\0") {
+                        return true;
+                    }
+                    rest = &tail[length..];
+                }
+            }
+        }
+        return false;
+    }
+    if let Some(mut rest) = bytes.strip_prefix(b"\x89PNG\r\n\x1a\n".as_slice()) {
+        while rest.len() >= 12 {
+            let length = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            let kind = &rest[4..8];
+            if kind == b"eXIf" {
+                return true;
+            }
+            if kind == b"IEND" {
+                return false;
+            }
+            let Some(next) = length.checked_add(12).and_then(|end| rest.get(end..)) else {
+                return false;
+            };
+            rest = next;
+        }
+        return false;
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        let mut rest = &bytes[12..];
+        while rest.len() >= 8 {
+            let length = u32::from_le_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
+            if &rest[..4] == b"EXIF" {
+                return true;
+            }
+            let padded = length + (length & 1);
+            let Some(next) = padded.checked_add(8).and_then(|end| rest.get(end..)) else {
+                return false;
+            };
+            rest = next;
+        }
+    }
+    false
+}
+
 /// Construct one intrinsic node from structural predecessors, an optional
 /// genuine event interval, and the exported content facts it holds.
 ///
@@ -1155,6 +1313,159 @@ mod tests {
         )
         .collect();
         assert_eq!(handles.len(), 1);
+    }
+
+    fn jpeg(segments: &[(u8, &[u8])], scan: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xD8];
+        for (marker, data) in segments {
+            bytes.extend([0xFF, *marker]);
+            bytes.extend(u16::try_from(data.len() + 2).unwrap().to_be_bytes());
+            bytes.extend(*data);
+        }
+        bytes.extend([0xFF, 0xDA, 0x00, 0x02]);
+        bytes.extend(scan);
+        bytes.extend([0xFF, 0xD9]);
+        bytes
+    }
+
+    fn png(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, data) in chunks {
+            bytes.extend(u32::try_from(data.len()).unwrap().to_be_bytes());
+            bytes.extend(*kind);
+            bytes.extend(*data);
+            bytes.extend([0; 4]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn exif_is_found_by_walking_the_container() {
+        let jfif: (u8, &[u8]) = (0xE0, b"JFIF\0\x01\x02\0\0\x01\0\x01\0\0");
+        let exif: (u8, &[u8]) = (0xE1, b"Exif\0\0MM\0*");
+        let xmp: (u8, &[u8]) = (0xE1, b"http://ns.adobe.com/xap/1.0/\0<x/>");
+        assert!(carries_exif(&jpeg(&[jfif, exif], b"scan")));
+        assert!(!carries_exif(&jpeg(&[jfif], b"scan")));
+        assert!(!carries_exif(&jpeg(&[jfif, xmp], b"scan")));
+        // The marker's text inside compressed data is not a segment.
+        assert!(!carries_exif(&jpeg(&[jfif], b"Exif\0\0MM")));
+        // A segment that claims more bytes than there are.
+        let mut truncated = jpeg(&[jfif, exif], b"");
+        truncated.truncate(24);
+        assert!(!carries_exif(&truncated));
+
+        let ihdr: (&[u8; 4], &[u8]) = (b"IHDR", &[0; 13]);
+        assert!(carries_exif(&png(&[
+            ihdr,
+            (b"eXIf", b"MM\0*"),
+            (b"IEND", b"")
+        ])));
+        assert!(!carries_exif(&png(&[
+            ihdr,
+            (b"tEXt", b"eXIf"),
+            (b"IEND", b"")
+        ])));
+
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+        webp.extend(10u32.to_le_bytes());
+        webp.extend([0; 10]);
+        webp.extend(b"EXIF");
+        webp.extend(4u32.to_le_bytes());
+        webp.extend(b"MM\0*");
+        assert!(carries_exif(&webp));
+        assert!(!carries_exif(&webp[..30]));
+        assert!(!carries_exif(b"plain bytes"));
+    }
+
+    #[test]
+    fn the_preferred_resolution_follows_the_stated_order() {
+        let jfif: (u8, &[u8]) = (0xE0, b"JFIF\0\x01\x02\0\0\x01\0\x01\0\0");
+        let exif: (u8, &[u8]) = (0xE1, b"Exif\0\0MM\0*");
+        let original = jpeg(&[jfif, exif], b"o");
+        let stripped_large = jpeg(&[jfif], b"a much larger stripped body");
+        let stripped_small = jpeg(&[jfif], b"s");
+        let labelled = jpeg(&[jfif, exif], b"labelled but large, with metadata");
+        let handle = |bytes: &[u8]| -> Inline<Handle<RawBytes>> { bytes.to_blob().get_handle() };
+        let fact = |bodies: &[&[u8]], sanitized: &[&[u8]]| {
+            let mut fact = asset_pointer_fact(
+                schema::content_fact::modality::IMAGE,
+                schema::content_fact::direction::IN,
+                id(11),
+                "sediment://file_1",
+                Some("image/jpeg"),
+                None,
+            )
+            .unwrap();
+            for body in bodies {
+                fact = resolve_pointer_fact(fact, body.to_vec()).unwrap();
+            }
+            for body in sanitized {
+                fact = resolve_sanitized_pointer_fact(fact, body.to_vec()).unwrap();
+            }
+            fact
+        };
+        let pick = |fact: &Fragment, readable: &[&[u8]]| {
+            let root = fact.root().unwrap();
+            let readable: Vec<Vec<u8>> = readable.iter().map(|body| body.to_vec()).collect();
+            preferred_resolution(fact.facts(), root, |wanted| {
+                readable
+                    .iter()
+                    .find(|body| handle(body.as_slice()) == wanted)
+                    .map(|body| anybytes::Bytes::from_source(body.clone()))
+            })
+        };
+        let every: &[&[u8]] = &[&original, &stripped_large, &stripped_small, &labelled];
+
+        // Metadata beats size; a sanitized label beats metadata.
+        let all = fact(&[&original, &stripped_large, &stripped_small], &[&labelled]);
+        assert_eq!(pick(&all, every), Some(handle(&original)));
+        // Without metadata anywhere unlabelled, the larger body.
+        let stripped = fact(&[&stripped_large, &stripped_small], &[&labelled]);
+        assert_eq!(pick(&stripped, every), Some(handle(&stripped_large)));
+        // Only a labelled body: it is still the one shown.
+        let only = fact(&[], &[&labelled]);
+        assert_eq!(pick(&only, every), Some(handle(&labelled)));
+        // A body that cannot be read ranks below one that can.
+        assert_eq!(
+            pick(&all, &[&stripped_small, &labelled]),
+            Some(handle(&stripped_small))
+        );
+        // Nothing readable: the smallest handle, whatever the insertion order.
+        let forward = fact(&[&original, &stripped_large], &[]);
+        let reverse = fact(&[&stripped_large, &original], &[]);
+        let smallest = [handle(&original), handle(&stripped_large)]
+            .into_iter()
+            .min_by_key(|handle| handle.raw)
+            .unwrap();
+        assert_eq!(pick(&forward, &[]), Some(smallest));
+        assert_eq!(pick(&reverse, &[]), Some(smallest));
+        // No resolution at all.
+        assert_eq!(pick(&fact(&[], &[]), every), None);
+    }
+
+    #[test]
+    fn a_page_annotation_keeps_the_intrinsic_root() {
+        let fact = asset_pointer_fact(
+            schema::content_fact::modality::IMAGE,
+            schema::content_fact::direction::IN,
+            id(11),
+            "sediment://hash#file_1#p_3.jpg",
+            None,
+            Some(5),
+        )
+        .unwrap();
+        let root = fact.root().unwrap();
+        let annotated = page_of_pointer_fact(fact, "sediment://file_1".to_owned(), 3).unwrap();
+        assert_eq!(annotated.root(), Some(root));
+        let document: Inline<Handle<UTF8String>> =
+            "sediment://file_1".to_owned().to_blob().get_handle();
+        assert!(exists!(pattern!(&annotated, [{
+            root @ schema::content_fact::page_of: document,
+                schema::content_fact::page: 3u128,
+        }])));
+        assert!(!exists!(pattern!(&annotated, [{
+            root @ schema::content_fact::resolved_to: _?bytes
+        }])));
     }
 
     #[test]

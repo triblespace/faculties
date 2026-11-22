@@ -543,6 +543,9 @@ impl Attachment {
             .map(|media_type| archive_source::modality_for_media_type(media_type.as_ref()))
             .unwrap_or_else(|| modality_for_kind(self.kind.as_deref()));
         let was_resolved = resolved.is_some();
+        let sanitized =
+            resolved.is_some() && resolved_path.is_some_and(|path| is_sanitized_sidecar(path));
+        let page_of = page_of_asset_pointer(pointer.as_ref());
         Ok((
             SourcePart::Pointer {
                 modality,
@@ -552,6 +555,8 @@ impl Attachment {
                 media_type,
                 size: self.size,
                 resolved,
+                sanitized,
+                page_of,
             },
             was_resolved,
         ))
@@ -1225,6 +1230,42 @@ fn file_id_from_asset_pointer(pointer: &str) -> Option<&str> {
     (id.starts_with("file-") || id.starts_with("file_")).then_some(id)
 }
 
+/// A file_search page render, `sediment://<hash>#<file id>#p_<N>.<ext>`:
+/// the canonical pointer of the document it was rendered from, and N as the
+/// pointer spells it. Any other pointer is not a page.
+fn page_of_asset_pointer(pointer: &str) -> Option<(View<str>, u128)> {
+    let (_scheme, rest) = pointer.split_once("://")?;
+    let mut fragments = rest.split('#');
+    let (_hash, document, page) = (fragments.next()?, fragments.next()?, fragments.next()?);
+    if fragments.next().is_some()
+        || !(document.starts_with("file_") || document.starts_with("file-"))
+    {
+        return None;
+    }
+    let digits = page.strip_prefix("p_")?;
+    let digits = digits
+        .split_once('.')
+        .map_or(digits, |(digits, _extension)| digits);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((canonical_pointer(document), digits.parse().ok()?))
+}
+
+/// Whether a sidecar carries the export's own sanitized label,
+/// `<file id>-sanitized.<ext>`.
+fn is_sanitized_sidecar(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(id) = file_id_from_filename(name) else {
+        return false;
+    };
+    name.strip_prefix(id.as_str())
+        .and_then(|rest| rest.strip_prefix("-sanitized"))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 fn file_id_from_filename(filename: &str) -> Option<String> {
     if let Some(rest) = filename.strip_prefix("file_") {
         // `file_<hex>.png`, `file_<hex>-sanitized.png` and
@@ -1687,6 +1728,152 @@ mod tests {
                 _?receipt @ schema::source_projection::resolution: _?bytes
             }])));
         }
+    }
+
+    /// A file_search tool message: one rendered page of an uploaded
+    /// document, and the document itself as a metadata attachment.
+    const PAGE_EXPORT: &str = r#"[
+      {
+        "id": "page-export",
+        "current_node": "tool-node",
+        "mapping": {
+          "tool-node": {
+            "parent": null,
+            "message": {
+              "id": "message-tool",
+              "author": {"role": "tool", "name": "file_search"},
+              "content": {
+                "content_type": "multimodal_text",
+                "parts": [
+                  {"content_type": "image_asset_pointer", "asset_pointer": "sediment://36332182abccf1f#file_00000000dd11#p_41.jpg", "size_bytes": 5}
+                ]
+              },
+              "metadata": {
+                "attachments": [{"id": "file_00000000dd11", "name": "thesis.pdf", "mime_type": "application/pdf"}]
+              }
+            }
+          }
+        }
+      }
+    ]"#;
+
+    fn project_tree(root: &Path) -> Fragment {
+        let mut union = Fragment::empty();
+        project_path(root, |projection| {
+            union += projection.fragment;
+            Ok(())
+        })
+        .unwrap();
+        union
+    }
+
+    fn kind_tagged_facts(fragment: &Fragment) -> BTreeSet<Id> {
+        find!(
+            fact: Id,
+            pattern!(fragment, [{ ?fact @ metadata::tag: &schema::content_fact::KIND }])
+        )
+        .collect()
+    }
+
+    #[test]
+    fn a_page_render_names_its_document_and_claims_no_bytes() {
+        const PAGE: &str = "sediment://36332182abccf1f#file_00000000dd11#p_41.jpg";
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("conversations.json"), PAGE_EXPORT).unwrap();
+        fs::write(temp.path().join("file_00000000dd11.dat"), b"%PDF-1.7").unwrap();
+        let mut union = project_tree(temp.path());
+
+        // The page keeps exactly the identity it had before it was annotated.
+        let page = crate::blockdag::asset_pointer_fact(
+            schema::content_fact::modality::IMAGE,
+            schema::content_fact::direction::IN,
+            schema::source_projection::SOURCE_CHATGPT,
+            PAGE,
+            None,
+            Some(5),
+        )
+        .unwrap()
+        .root()
+        .unwrap();
+        assert!(kind_tagged_facts(&union).contains(&page));
+
+        // Its document is the same pointer blob the document's fact holds,
+        // and the document, not the page, holds the bytes.
+        let document = union.put::<UTF8String, _>("sediment://file_00000000dd11".to_owned());
+        assert!(exists!(pattern!(&union, [
+            { page @ schema::content_fact::page_of: document,
+                schema::content_fact::page: 41u128 },
+            { _?doc @ schema::content_fact::asset_pointer: document,
+                schema::content_fact::asset_namespace: &schema::source_projection::SOURCE_CHATGPT,
+                schema::content_fact::resolved_to: _?bytes },
+        ])));
+        assert!(!exists!(pattern!(&union, [{
+            page @ schema::content_fact::resolved_to: _?bytes
+        }])));
+
+        // A re-import states the same facts.
+        assert_eq!(union.facts(), project_tree(temp.path()).facts());
+    }
+
+    #[test]
+    fn page_pointers_parse_only_in_their_own_shape() {
+        let page = |pointer: &str| {
+            page_of_asset_pointer(pointer)
+                .map(|(document, page)| (document.as_ref().to_owned(), page))
+        };
+        assert_eq!(
+            page("sediment://36332182abccf1f#file_00000000dd11#p_41.jpg"),
+            Some(("sediment://file_00000000dd11".to_owned(), 41))
+        );
+        assert_eq!(
+            page("sediment://hash#file-AbC#p_0"),
+            Some(("file-service://file-AbC".to_owned(), 0))
+        );
+        for other in [
+            "sediment://file_00000000dd11",
+            "file-service://file-abc",
+            "sediment://hash#file_1",
+            "sediment://hash#notafile#p_1.jpg",
+            "sediment://hash#file_1#page_1.jpg",
+            "sediment://hash#file_1#p_.jpg",
+            "sediment://hash#file_1#p_1x.jpg",
+            "sediment://hash#file_1#p_1.jpg#more",
+        ] {
+            assert_eq!(page(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_sanitized_sidecar_is_labelled_and_changes_no_identity() {
+        let export = TINY_EXPORT.replace("file-abc", "file_00000000aa22");
+        let project = |sidecar: &str| {
+            let temp = TempDir::new().unwrap();
+            fs::write(temp.path().join("conversations.json"), &export).unwrap();
+            fs::write(temp.path().join(sidecar), [1, 2, 3, 4]).unwrap();
+            project_tree(temp.path())
+        };
+        let labelled = project("file_00000000aa22-sanitized.png");
+        let plain = project("file_00000000aa22.png");
+        let named = project("file_00000000aa22-sanitizedish.png");
+        let body: Inline<Handle<RawBytes>> = [1u8, 2, 3, 4].as_slice().to_blob().get_handle();
+        assert!(exists!(pattern!(&labelled, [{
+            _?fact @ schema::content_fact::resolved_to: body,
+                schema::content_fact::sanitized_to: body,
+        }])));
+        for unlabelled in [&plain, &named] {
+            assert!(exists!(pattern!(unlabelled, [{
+                _?fact @ schema::content_fact::resolved_to: body
+            }])));
+            assert!(!exists!(pattern!(unlabelled, [{
+                _?fact @ schema::content_fact::sanitized_to: _?bytes
+            }])));
+        }
+        assert_eq!(kind_tagged_facts(&labelled), kind_tagged_facts(&plain));
+        assert_eq!(blocks(&labelled), blocks(&plain));
+        assert_eq!(
+            labelled.facts(),
+            project("file_00000000aa22-sanitized.png").facts()
+        );
     }
 
     #[test]

@@ -1184,6 +1184,8 @@ fn variable_part(
         media_type,
         size: None,
         resolved,
+        sanitized: false,
+        page_of: None,
     }))
 }
 
@@ -1830,6 +1832,8 @@ mod tests {
                 media_type,
                 size,
                 resolved,
+                sanitized: false,
+                page_of: None,
                 ..
             } => {
                 assert_eq!(*modality, schema::content_fact::modality::IMAGE);

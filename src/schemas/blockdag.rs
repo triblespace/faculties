@@ -97,6 +97,24 @@ pub mod content_fact {
         /// NONIDENTITY, monotone. Bytes later recovered for a pointer-identified
         /// fact. Conflicting resolutions are an ambiguity, never last-write-wins.
         "61604A1C2B6AA2A6F1D36541323B0CFE" unsafe as pub resolved_to: Handle<RawBytes>;
+        /// NONIDENTITY, monotone. A `resolved_to` body the source itself
+        /// labels as a sanitized copy (a ChatGPT sidecar named
+        /// `<id>-sanitized.<ext>`). It ranks below an unlabelled body in
+        /// `blockdag::preferred_resolution`; both stay resolutions. Minted
+        /// with `trible genid` on 2026-11-22.
+        "1DCA1DECA7510D0ED5124E72E5F746DC" as pub sanitized_to: Handle<RawBytes>;
+        /// NONIDENTITY. For an asset that is a rendered page of another
+        /// asset, the document's own pointer in the same `asset_namespace`.
+        /// It is the same text blob the document's fact uses as its
+        /// `asset_pointer`, so a reader joins on it to find the document and
+        /// its bytes. Parsed from this fact's own pointer, never from bytes.
+        /// Minted with `trible genid` on 2026-11-22.
+        "84BC3A0BC74C380C1F959619F074F2E3" as pub page_of: Handle<UTF8String>;
+        /// NONIDENTITY, with `page_of`. The page number exactly as the
+        /// pointer spells it (ChatGPT's `#p_<N>.jpg`); the source does not
+        /// say whether it counts from 0 or 1. Minted with `trible genid` on
+        /// 2026-11-22.
+        "B58EEFF562E580F0AF44FEB416588FF5" as pub page: U256BE;
     }
 
     /// Nonidentity kind marker attached after intrinsic fact construction.

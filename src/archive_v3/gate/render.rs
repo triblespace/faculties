@@ -292,6 +292,9 @@ fn attribute_name(attribute: Id) -> String {
         (v3::fact::effort.id(), "effort"),
         (main::content_fact::asset_pointer.id(), "asset_pointer"),
         (main::content_fact::resolved_to.id(), "resolved_to"),
+        (main::content_fact::sanitized_to.id(), "sanitized_to"),
+        (main::content_fact::page_of.id(), "page_of"),
+        (main::content_fact::page.id(), "page"),
         (main::content_fact::asset_size.id(), "asset_size"),
         (main::content_fact::asset_namespace.id(), "asset_namespace"),
         (main::block::holds.id(), "holds"),
@@ -783,6 +786,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 ("source_uri", v3::fact::source_uri.id()),
                 ("title", v3::fact::title.id()),
                 ("asset_pointer", main::content_fact::asset_pointer.id()),
+                ("page_of", main::content_fact::page_of.id()),
             ];
             if let Some((name, _)) = text_attributes.iter().find(|(_, id)| *id == attribute) {
                 let value = self.text(raw, &format!("{at}/{name}"));
@@ -792,6 +796,7 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
             let bytes_attributes = [
                 ("blob", v3::fact::blob.id()),
                 ("resolved_to", main::content_fact::resolved_to.id()),
+                ("sanitized_to", main::content_fact::sanitized_to.id()),
             ];
             if let Some((name, _)) = bytes_attributes.iter().find(|(_, id)| *id == attribute) {
                 let value = self.bytes(raw, &format!("{at}/{name}"));
@@ -838,12 +843,16 @@ impl<'a, B: BlobStoreGet> Renderer<'a, B> {
                 values.push(("exit_code".to_owned(), value));
                 continue;
             }
-            if attribute == main::content_fact::asset_size.id() {
+            let number_attributes = [
+                ("asset_size", main::content_fact::asset_size.id()),
+                ("page", main::content_fact::page.id()),
+            ];
+            if let Some((name, _)) = number_attributes.iter().find(|(_, id)| *id == attribute) {
                 let value = match raw.transmute::<U256BE>().try_from_inline::<u128>() {
-                    Ok(size) => Value::Number(size.to_string()),
+                    Ok(number) => Value::Number(number.to_string()),
                     Err(_) => Value::Raw(hex(&raw.raw)),
                 };
-                values.push(("asset_size".to_owned(), value));
+                values.push(((*name).to_owned(), value));
                 continue;
             }
             if attribute == main::content_fact::asset_namespace.id() {
