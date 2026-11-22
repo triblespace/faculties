@@ -253,7 +253,8 @@ enum Command {
     /// interrupted: spawn stops a local unit with SIGINT, Drive's teardown.
     DriveTask {
         /// The host's binding file (JSON): drive, tenant, home, model,
-        /// window, telemetry and provider. Every key is required.
+        /// window, telemetry and provider. Optional memory-chars overrides
+        /// Drive's recalled-memory character allowance.
         #[arg(long, value_name = "PATH")]
         binding: PathBuf,
         /// The run's brief file, from {brief}: her first input on a fresh

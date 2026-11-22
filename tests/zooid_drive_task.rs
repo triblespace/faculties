@@ -236,6 +236,36 @@ fn the_adapter_execs_drive_run_with_the_whole_argv_fresh_and_resumed() {
 }
 
 #[test]
+fn an_explicit_memory_allowance_is_forwarded_independently_of_the_window() {
+    let setup = setup();
+    let routes = [route("archive")];
+    let mut binding: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&setup.binding).unwrap()).unwrap();
+    binding["context-window"] = 1_048_576.into();
+    for chars in [1_800_000, 0] {
+        binding["memory-chars"] = chars.into();
+        std::fs::write(&setup.binding, binding.to_string()).unwrap();
+
+        let output = adapter(&setup, &routes, "", "silent");
+        assert!(output.status.success(), "{}", stderr(&output));
+        let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
+        let args: Vec<_> = args.lines().collect();
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--context-window")
+                .collect::<Vec<_>>(),
+            [["--context-window", "1048576"]]
+        );
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == "--memory-chars")
+                .collect::<Vec<_>>(),
+            [["--memory-chars", chars.to_string().as_str()]]
+        );
+    }
+}
+
+#[test]
 fn drive_exit_codes_pass_through() {
     let setup = setup();
     let routes = [route("archive")];

@@ -10,9 +10,10 @@
 //! is its `--native-resume`, and its brief file (`{brief}`, without the
 //! wake: Drive reads its own) and sender (`{spawner}`) are `--brief-file`
 //! and `--brief-from`. Everything the run does not decide (tenant, home,
-//! model, window, telemetry, provider) comes from one binding file the host
-//! provisions. No value has a default, nothing is truncated, and nothing
-//! falls back to a hosted model. Every pinned faculties route is passed on;
+//! model, window, wake allowance, telemetry, provider) comes from one binding
+//! file the host provisions. An omitted wake allowance leaves Drive's default
+//! in effect. Nothing is truncated or falls back to a hosted model. Every
+//! pinned faculties route is passed on;
 //! a route variable that names no faculties collection, a malformed or
 //! repeated route, or a missing archive route refuses before Drive starts,
 //! naming the routes. Which roles Drive accepts is Drive's own table.
@@ -38,8 +39,8 @@ use triblespace::prelude::Id;
 /// Drive writes the zooid's own history to.
 pub const ARCHIVE_ROLE: &str = "archive";
 
-/// Everything a host provisions for its local zooids. Every key is required
-/// and no other key is accepted.
+/// Everything a host provisions for its local zooids. Only `memory-chars`
+/// may be omitted and no other key is accepted.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Binding {
@@ -54,6 +55,9 @@ pub struct Binding {
     pub model_root: String,
     pub model_collection: String,
     pub context_window: u64,
+    /// Override Drive's recalled-memory character allowance independently of
+    /// the full context window. Zero selects no recalled memories.
+    pub memory_chars: Option<usize>,
     /// The largest brief file passed on; a larger one refuses.
     pub max_brief_bytes: u64,
     pub telemetry: Telemetry,
@@ -94,8 +98,7 @@ pub struct Mcp {
 }
 
 impl Binding {
-    /// Read and check a binding file. A missing file, a missing or extra
-    /// key, an empty value or a zero size refuses.
+    /// Read and check a binding file.
     pub fn read(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)
             .with_context(|| format!("read the Drive binding {}", path.display()))?;
@@ -318,6 +321,9 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, brief_len: u64) -> Result<Pl
         "--context-window",
         binding.context_window.to_string().into(),
     );
+    if let Some(chars) = binding.memory_chars {
+        flag("--memory-chars", chars.to_string().into());
+    }
     match &binding.telemetry {
         Telemetry::Off => args.push("--no-telemetry".into()),
         Telemetry::Pile(pile) => args.extend(["--telemetry-pile".into(), pile.clone().into()]),
