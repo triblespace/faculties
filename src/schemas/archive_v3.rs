@@ -633,3 +633,45 @@ pub mod window {
         "D80DA6DE2D12E3E2CA9A6D842202687A" as pub experienced_by: GenId;
     }
 }
+
+/// How one context began. A window's id is shared by every context that
+/// opens at the same root under the same renderer and model, and so is its
+/// opening node, so neither can say how one particular context started.
+/// These annotate the per-context entity instead: the id a runtime's
+/// occurrences name as the context they were observed in (Drive's
+/// `runtime::in_context`). A runtime records only what it did; where it
+/// cannot tell, it writes nothing. Minted with `trible genid` 2026-11-22.
+pub mod context {
+    use super::*;
+
+    attributes! {
+        /// ANNOTATION. How the context's prefix came to be, see [`origin`].
+        "2BE3581EBD4C581E1CB268B25624F34B" as pub began: GenId;
+        /// ANNOTATION. The archived tail node this context continues from,
+        /// when it resumes an earlier context's history (a zooid picked up
+        /// by another process or host). Unlike `node::continues` on a shared
+        /// opening node, it names exactly one context.
+        "F021AD41ABB83781BB02F503DB97E2CD" as pub continues: GenId;
+    }
+
+    /// How a context's prefix came to be.
+    pub mod origin {
+        use super::*;
+        /// Exact inference state (a cache or checkpoint) was reused for the
+        /// prefix instead of computing it again.
+        pub const RESTORED: Id = id_hex!("1D9C4284110CCC9A42A13EA3040403DE");
+        /// It continues an earlier context, and its
+        /// prefix was rendered from records and computed again: no inference
+        /// state was carried over.
+        pub const RENDERED: Id = id_hex!("4F07971118C132618FCFC6AC52D1DC89");
+        /// It continues no earlier context, and its prefix was computed from
+        /// its rendering: nothing was restored.
+        pub const FRESH: Id = id_hex!("A26EDF6393B971FEF33BDECD1FD8EF7E");
+
+        pub const SPECS: &[(Id, &str)] = &[
+            (RESTORED, "restored"),
+            (RENDERED, "rendered"),
+            (FRESH, "fresh"),
+        ];
+    }
+}

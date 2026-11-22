@@ -604,6 +604,7 @@ pub fn vocabulary_fragment() -> Fragment {
         .chain(schema::fact::absent::SPECS)
         .chain(schema::fact::effort::SPECS)
         .chain(schema::node::rendering::SPECS)
+        .chain(schema::context::origin::SPECS)
         .chain(schema::gloss::category::SPECS);
     for &(id, name) in terms {
         let name = fragment.put::<UTF8String, _>(name.to_owned());

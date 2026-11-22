@@ -658,6 +658,7 @@ fn senses_glosses_and_vocabulary_are_intrinsic() {
         schema::fact::absent::SPECS,
         schema::fact::effort::SPECS,
         schema::node::rendering::SPECS,
+        schema::context::origin::SPECS,
         schema::gloss::category::SPECS,
     ] {
         all.extend(specs.iter().map(|(id, _)| *id));
