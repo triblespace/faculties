@@ -882,6 +882,8 @@ fn records_from_conversations(
                             media_type,
                             size: None,
                             resolved: None,
+                            sanitized: false,
+                            page_of: None,
                         }),
                         ContentDraft::Sealed { token, media_type } => {
                             parts.push(archive_source::sealed_part(
@@ -931,6 +933,8 @@ fn records_from_conversations(
                     media_type,
                     size: attachment.size,
                     resolved: None,
+                    sanitized: false,
+                    page_of: None,
                 });
                 if let Some(extracted) = attachment.extracted_content.and_then(nonempty) {
                     stats.extracted_contents += 1;

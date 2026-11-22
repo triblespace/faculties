@@ -1414,6 +1414,8 @@ fn project_asset(
         media_type: None,
         size: None,
         resolved: None,
+        sanitized: false,
+        page_of: None,
     })
 }
 

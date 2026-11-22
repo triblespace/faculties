@@ -397,6 +397,8 @@ fn append_assets(
             media_type: Some(archive_source::owned_text(media_type)),
             size: None,
             resolved,
+            sanitized: false,
+            page_of: None,
         });
     }
     Ok(())

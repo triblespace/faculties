@@ -1037,6 +1037,44 @@ fn render_parts(
         ) {
             writeln!(out, "  resolution: {}", hex::encode_upper(resolution.raw))?;
         }
+        for sanitized in find!(
+            sanitized: RawHandle,
+            pattern!(facts, [{ fact @ archive_schema::content_fact::sanitized_to: ?sanitized }])
+        ) {
+            writeln!(
+                out,
+                "  sanitized_resolution: {}",
+                hex::encode_upper(sanitized.raw)
+            )?;
+        }
+        let resolutions = find!(
+            resolution: RawHandle,
+            pattern!(facts, [{ fact @ archive_schema::content_fact::resolved_to: ?resolution }])
+        )
+        .count();
+        if resolutions > 1 {
+            if let Some(preferred) = crate::blockdag::preferred_resolution(facts, fact, |handle| {
+                reader.get::<anybytes::Bytes, _>(handle).ok()
+            }) {
+                writeln!(
+                    out,
+                    "  preferred_resolution: {}",
+                    hex::encode_upper(preferred.raw)
+                )?;
+            }
+        }
+        for document in find!(
+            document: TextHandle,
+            pattern!(facts, [{ fact @ archive_schema::content_fact::page_of: ?document }])
+        ) {
+            writeln!(out, "  page_of: {}", read_text(reader, document)?)?;
+        }
+        for page in find!(
+            page: u128,
+            pattern!(facts, [{ fact @ archive_schema::content_fact::page: ?page }])
+        ) {
+            writeln!(out, "  page: {page}")?;
+        }
     }
     Ok(())
 }

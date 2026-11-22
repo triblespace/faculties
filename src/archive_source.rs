@@ -114,6 +114,11 @@ pub enum SourcePart {
         media_type: Option<View<str>>,
         size: Option<u128>,
         resolved: Option<Bytes>,
+        /// The source labels `resolved` as its sanitized copy of the asset.
+        sanitized: bool,
+        /// The asset is page `.1` (as the pointer spells it) rendered from
+        /// the document whose pointer is `.0`, in the same namespace.
+        page_of: Option<(View<str>, u128)>,
     },
 }
 
@@ -878,10 +883,11 @@ pub fn modality_for_media_type(media_type: &str) -> Id {
     }
 }
 
-/// Build one content fact, and separately the recovered bytes of a pointer
-/// fact. The bytes annotate the fact and never enter the part's or block's
-/// identity: whether an export happened to include an asset file is not part
-/// of the message.
+/// Build one content fact, and separately the annotations of a pointer
+/// fact (recovered bytes, a sanitized label, the document it is a page of).
+/// They annotate the fact and never enter the part's or block's identity:
+/// whether an export happened to include an asset file is not part of the
+/// message.
 fn build_fact(part: SourcePart) -> Result<(Fragment, Option<Fragment>)> {
     let fact = match part {
         SourcePart::Text {
@@ -903,6 +909,8 @@ fn build_fact(part: SourcePart) -> Result<(Fragment, Option<Fragment>)> {
             media_type,
             size,
             resolved,
+            sanitized,
+            page_of,
         } => {
             let fact = blockdag::asset_pointer_fact_view(
                 modality,
@@ -912,17 +920,22 @@ fn build_fact(part: SourcePart) -> Result<(Fragment, Option<Fragment>)> {
                 media_type.as_ref().map(AsRef::as_ref),
                 size,
             )?;
-            let resolution = match resolved {
-                Some(bytes) => {
-                    let root = fact.root().expect("content fact is rooted");
-                    Some(blockdag::resolve_pointer_fact(
-                        Fragment::rooted(root, TribleSet::new()),
-                        bytes,
-                    )?)
-                }
-                None => None,
-            };
-            return Ok((fact, resolution));
+            if resolved.is_none() && page_of.is_none() {
+                return Ok((fact, None));
+            }
+            let root = fact.root().expect("content fact is rooted");
+            let mut annotations = Fragment::rooted(root, TribleSet::new());
+            if let Some(bytes) = resolved {
+                annotations = if sanitized {
+                    blockdag::resolve_sanitized_pointer_fact(annotations, bytes)?
+                } else {
+                    blockdag::resolve_pointer_fact(annotations, bytes)?
+                };
+            }
+            if let Some((document, page)) = page_of {
+                annotations = blockdag::page_of_pointer_fact(annotations, document, page)?;
+            }
+            return Ok((fact, Some(annotations)));
         }
     };
     Ok((fact, None))
