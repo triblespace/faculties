@@ -588,7 +588,9 @@ fn local_preamble(name: &str, spawner: &str) -> String {
     format!(
         "You are {name}, a zooid of this colony, started by {spawner} with the brief below. You \
          live in Drive's loop on this host; the host stops you. Everything you perceive and do \
-         is archived, so you can be resumed into your own history later. Your name is your \
+         is archived, so you can be resumed into your own history later. The brief is where you \
+         start, not a fence: if you find more important work, or judge the brief not worth \
+         doing, follow your judgment and say so to {spawner}. Your name is your \
          persona, and the faculties are your native tools: pass {name} wherever a write tool \
          takes `from`, `persona`, `by` or `reader`. Your name is also an address: you reach \
          {spawner} and the colony with `message_send` from {name}, and news for you arrives \
@@ -1134,6 +1136,7 @@ mod tests {
         let text = preamble("lusab-babad", "tutor", true);
         assert!(text.contains("You live in Drive's loop on this host; the host stops you."));
         assert!(text.contains("you can be resumed into your own history"));
+        assert!(text.contains("The brief is where you start, not a fence"));
         assert!(
             text.contains("you reach tutor and the colony with `message_send` from lusab-babad")
         );
