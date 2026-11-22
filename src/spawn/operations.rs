@@ -120,11 +120,20 @@ impl UnitSpec {
         }
         if self.interrupt {
             // TimeoutStopSec above bounds the teardown before SIGKILL.
+            // A local zooid's shell sandbox (playground's bubblewrap) needs a
+            // delegated cgroup: the unit's own processes live in its
+            // `supervisor` subgroup, so the unit's cgroup has no processes of
+            // its own and can hand cpu, memory and pids to the sandbox's
+            // groups beside it.
             args.extend([
                 "-p".to_owned(),
                 "KillSignal=SIGINT".to_owned(),
                 "-p".to_owned(),
                 "KillMode=mixed".to_owned(),
+                "-p".to_owned(),
+                "Delegate=cpu memory pids".to_owned(),
+                "-p".to_owned(),
+                "DelegateSubgroup=supervisor".to_owned(),
             ]);
         }
         args.extend(["--".to_owned(), "/bin/bash".to_owned(), script]);
@@ -624,8 +633,7 @@ pub fn codex_mcp_config(script: &Path) -> String {
 }
 
 /// Why a keeper refuses a request naming mistral.
-pub const MISTRAL_KEEP_REFUSAL: &str =
-    "mistral spends money; only a direct zooid spawn may choose it until JP agrees to unattended spend";
+pub const MISTRAL_KEEP_REFUSAL: &str = "mistral spends money; only a direct zooid spawn may choose it until JP agrees to unattended spend";
 
 /// Mistral Large 4's list price, US dollars per million input tokens.
 pub const MISTRAL_INPUT_PRICE: f64 = 0.70;
@@ -1260,7 +1268,7 @@ impl KeepLock {
             Ok(()) => return Ok(Self { _held: file }),
             Err(std::fs::TryLockError::WouldBlock) => {}
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(error).with_context(|| format!("lock {}", path.display()))
+                return Err(error).with_context(|| format!("lock {}", path.display()));
             }
         }
         eprintln!(
@@ -1459,7 +1467,9 @@ fn inbox_listing(messages: &[crate::message::MessageObservation]) -> String {
                 let mut chars = body.chars();
                 let cut: String = chars.by_ref().take(INBOX_BODY_CHARS).collect();
                 if chars.next().is_some() {
-                    format!("{cut}\n[cut at {INBOX_BODY_CHARS} characters; `orient_poll` shows the whole message]")
+                    format!(
+                        "{cut}\n[cut at {INBOX_BODY_CHARS} characters; `orient_poll` shows the whole message]"
+                    )
                 } else {
                     cut
                 }
@@ -1782,7 +1792,7 @@ impl Spawn {
         let mut why = Vec::new();
         match provider {
             Provider::Local => {
-                return Err("a local run takes its window from --window only".to_owned())
+                return Err("a local run takes its window from --window only".to_owned());
             }
             Provider::Mistral => {
                 return Ok(cover::Window {
@@ -1790,7 +1800,7 @@ impl Spawn {
                     source: "the max_context_length spawn writes into the run's vibe \
                              configuration"
                         .to_owned(),
-                })
+                });
             }
             Provider::Codex => match (model, &self.launch.codex_models) {
                 (Some(model), Some(path)) => match cover::codex_catalog_window(path, model) {
@@ -2027,7 +2037,7 @@ impl Spawn {
                     origin: None,
                     fresh: false,
                     unprefixed: None,
-                })
+                });
             }
             [] => {}
             several => bail!(
@@ -2057,7 +2067,7 @@ impl Spawn {
                         "no colony prefix: the spawner is in no colony group, and no zooid it \
                          ran as has an origin colony"
                             .to_owned(),
-                    ))
+                    ));
                 }
                 n => {
                     return Ok(unprefixed(format!(
@@ -2068,7 +2078,7 @@ impl Spawn {
                             .map(|id| format!("{id:x}"))
                             .collect::<Vec<_>>()
                             .join(", ")
-                    )))
+                    )));
                 }
             },
             several => {
@@ -2083,7 +2093,7 @@ impl Spawn {
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
-                )))
+                )));
             }
         };
         Ok(match label {
@@ -2565,7 +2575,7 @@ impl Spawn {
                     ),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                     Err(error) => {
-                        return Err(error).with_context(|| format!("read {}", path.display()))
+                        return Err(error).with_context(|| format!("read {}", path.display()));
                     }
                 },
                 None => None,
@@ -3330,7 +3340,7 @@ impl Spawn {
                         several.len(),
                         several.join(", ")
                     ),
-                )
+                );
             }
         };
         if provider == Provider::Local && self.launch.local.is_none() {
@@ -3357,10 +3367,10 @@ impl Spawn {
                 return self.refuse(
                     view,
                     format!("effort {one:?} is not one of {}", super::EFFORTS.join(", ")),
-                )
+                );
             }
             other => {
-                return self.refuse(view, format!("the request names {} efforts", other.len()))
+                return self.refuse(view, format!("the request names {} efforts", other.len()));
             }
         };
         let spawner = match view.spawner.as_slice() {
@@ -3369,7 +3379,7 @@ impl Spawn {
                 return self.refuse(
                     view,
                     format!("the request names {} spawners; it needs one", other.len()),
-                )
+                );
             }
         };
         let cover_percent = match view.cover_percent.as_slice() {
@@ -3379,7 +3389,7 @@ impl Spawn {
                 return self.refuse(
                     view,
                     format!("the request names {} cover percents", other.len()),
-                )
+                );
             }
         };
         if view.zooid.len() != 1 {
@@ -3407,7 +3417,7 @@ impl Spawn {
             [] => {
                 return Ok(KeepStep::Waiting(
                     "the zooid's name is not here yet".to_owned(),
-                ))
+                ));
             }
             several => {
                 return self.refuse(
@@ -3417,7 +3427,7 @@ impl Spawn {
                         several.len(),
                         several.join(", ")
                     ),
-                )
+                );
             }
         };
         if let Some(state) = Relations::with_storage(self.storage.clone()).person_state(&name)? {
@@ -5475,6 +5485,19 @@ mod tests {
         };
         assert_eq!(stop(&started[0]), [true, true]);
         assert_eq!(stop(&started[1]), [false, false]);
+        // And only a local unit delegates a cgroup for its shell sandbox,
+        // each property after its own -p and before the command.
+        let delegation = |spec: &UnitSpec| {
+            let args = spec.systemd_run_args();
+            let command = args.iter().position(|arg| arg == "--").unwrap();
+            ["Delegate=cpu memory pids", "DelegateSubgroup=supervisor"].map(|property| {
+                args.iter()
+                    .position(|arg| arg == property)
+                    .is_some_and(|at| at < command && args[at - 1] == "-p")
+            })
+        };
+        assert_eq!(delegation(&started[0]), [true, true]);
+        assert_eq!(delegation(&started[1]), [false, false]);
     }
 
     #[test]

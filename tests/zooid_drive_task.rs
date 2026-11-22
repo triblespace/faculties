@@ -40,6 +40,11 @@ case "$FAKE_MODE" in
   fail) exit 3 ;;
   silent) exit 0 ;;
   live) trap 'echo torn-down > "$out/teardown"; exit 0' INT; sleep 60 & wait ;;
+  cgroup)
+    own=$(sed -n 's/^0:://p' /proc/self/cgroup)
+    echo "$own" > "$out/own"
+    cat "/sys/fs/cgroup${own%/supervisor}/cgroup.subtree_control" > "$out/subtree_control"
+    exit 0 ;;
 esac
 "#;
 
@@ -594,4 +599,121 @@ fn a_living_drive_is_interrupted_by_the_runtime_limit_and_tears_down_cleanly() {
         std::fs::read_to_string(setup.out.join("teardown")).unwrap(),
         "torn-down\n"
     );
+}
+
+/// A binding whose playground backend-args name the tenant and the cgroup.
+fn delegating(setup: &Setup) {
+    let mut binding: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&setup.binding).unwrap()).unwrap();
+    binding["tenant"] = "zooid-a".into();
+    binding["provider"]["playground"]["backend-args"] = serde_json::json!([
+        "--bubblewrap-tenant",
+        "{tenant}",
+        "--bubblewrap-cgroup-parent",
+        "{cgroup}"
+    ]);
+    std::fs::write(&setup.binding, binding.to_string()).unwrap();
+}
+
+#[test]
+fn a_cgroup_placeholder_refuses_outside_a_delegated_unit_before_drive_starts() {
+    let setup = setup();
+    delegating(&setup);
+    let output = adapter(&setup, &[route("archive")], "", "silent");
+    refused(&setup, &output, "supervisor subgroup");
+}
+
+/// The delegation through real systemd: spawn's local unit properties
+/// delegate cpu, memory and pids with a `supervisor` subgroup, and the
+/// adapter, inside it, enables the controllers for the unit's children and
+/// passes the unit's cgroup and the binding's tenant on. Skipped where no
+/// systemd user manager answers.
+#[test]
+fn inside_a_local_unit_the_adapter_passes_its_delegated_cgroup_with_controllers() {
+    let reachable = Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if !reachable {
+        eprintln!("skipped: no systemd user manager here");
+        return;
+    }
+    let setup = setup();
+    delegating(&setup);
+    let unit = format!(
+        "spawn-drive-task-cgroup-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let stop_post = setup.root.parent().unwrap().join("stop-post.sh");
+    executable(&stop_post, "#!/bin/sh\nexit 0\n");
+    let spec = UnitSpec {
+        unit: unit.clone(),
+        workdir: setup.root.clone(),
+        script: stop_post,
+        log: setup.out.join("log"),
+        memory_max: "1G".to_owned(),
+        runtime_max: Some(60),
+        interrupt: true,
+    };
+    let properties: Vec<String> = spec
+        .systemd_run_args()
+        .into_iter()
+        .take_while(|arg| arg != "--")
+        .collect();
+    let mut command = Command::new("systemd-run");
+    command.args(&properties).args(["--wait", "--"]);
+    command.args(["/usr/bin/env", "-i"]);
+    for (name, value) in [
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("PILE".to_owned(), setup.pile.display().to_string()),
+        (
+            "TRIBLESPACE_KEY".to_owned(),
+            setup.key.display().to_string(),
+        ),
+        ("FAKE_OUT".to_owned(), setup.out.display().to_string()),
+        ("FAKE_MODE".to_owned(), "cgroup".to_owned()),
+        route("archive"),
+    ] {
+        command.arg(format!("{name}={value}"));
+    }
+    command.arg(SPAWN).args(adapter_args(&setup, ""));
+    let status = command.status().unwrap();
+    let log = std::fs::read_to_string(setup.out.join("log")).unwrap_or_default();
+    assert!(status.success(), "{unit}: {log}");
+    let own = std::fs::read_to_string(setup.out.join("own")).unwrap();
+    let own = own.trim();
+    assert!(
+        own.ends_with(&format!("/{unit}.service/supervisor")),
+        "{own}"
+    );
+    let parent = format!("/sys/fs/cgroup{}", own.strip_suffix("/supervisor").unwrap());
+    let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let backend: Vec<&str> = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--backend-arg")
+        .map(|pair| pair[1])
+        .collect();
+    assert_eq!(
+        backend,
+        [
+            "--bubblewrap-tenant",
+            "zooid-a",
+            "--bubblewrap-cgroup-parent",
+            parent.as_str()
+        ]
+    );
+    let enabled = std::fs::read_to_string(setup.out.join("subtree_control")).unwrap();
+    for controller in ["cpu", "memory", "pids"] {
+        assert!(
+            enabled.split_whitespace().any(|word| word == controller),
+            "{controller}: {enabled:?}"
+        );
+    }
 }

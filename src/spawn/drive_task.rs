@@ -17,6 +17,9 @@
 //! a route variable that names no faculties collection, a malformed or
 //! repeated route, or a missing archive route refuses before Drive starts,
 //! naming the routes. Which roles Drive accepts is Drive's own table.
+//! A playground backend-arg may name `{tenant}`, the binding's tenant, and
+//! `{cgroup}`, the delegated cgroup of the zooid's own unit, which this
+//! prepares for the shell sandbox before Drive starts ([`delegated_cgroup`]).
 //!
 //! How the zooid ends: `drive run` with a native mind is a living loop with
 //! no turn budget or deadline. It ends when it is interrupted (SIGINT),
@@ -276,10 +279,116 @@ fn is_descriptor(value: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
+/// `{tenant}` in a playground backend-arg: the binding's tenant, the
+/// provisioned sandbox principal Drive's `--tenant` names.
+pub const TENANT_PLACEHOLDER: &str = "{tenant}";
+/// `{cgroup}` in a playground backend-arg: the delegated cgroup this unit
+/// owns, found by [`delegated_cgroup`].
+pub const CGROUP_PLACEHOLDER: &str = "{cgroup}";
+
+/// Whether the binding's provider asks for the delegated cgroup.
+pub fn wants_cgroup(binding: &Binding) -> bool {
+    match &binding.provider {
+        DriveProvider::Playground(playground) => playground
+            .backend_args
+            .iter()
+            .any(|arg| arg.contains(CGROUP_PLACEHOLDER)),
+        DriveProvider::Mcp(_) => false,
+    }
+}
+
+/// The delegated cgroup for a local zooid's shell sandbox, prepared from
+/// inside the unit. Spawn starts a local unit with `Delegate=cpu memory
+/// pids` and `DelegateSubgroup=supervisor`, so this process lives in
+/// `<unit>/supervisor` (`own` is `/proc/self/cgroup`) and the unit's cgroup
+/// is the parent. The parent must hold no process, and cpu, memory and pids
+/// are enabled for its children, which playground requires before it makes
+/// its own groups there. `root` is the cgroup-v2 mount, `/sys/fs/cgroup`.
+/// Anything else refuses, naming what it found.
+pub fn delegated_cgroup(own: &str, root: &Path) -> Result<PathBuf> {
+    let found = own
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| anyhow!("refusing to start Drive: no cgroup-v2 line in {own:?}"))?;
+    let parent = found
+        .strip_suffix("/supervisor")
+        .filter(|parent| parent.starts_with('/') && parent.len() > 1)
+        .ok_or_else(|| {
+            anyhow!(
+                "refusing to start Drive: {{cgroup}} needs a delegated unit, and this process is \
+                 in {found:?}, not a unit's supervisor subgroup"
+            )
+        })?;
+    let parent = root.join(parent.trim_start_matches('/'));
+    let procs = std::fs::read_to_string(parent.join("cgroup.procs"))
+        .with_context(|| format!("read {}/cgroup.procs", parent.display()))?;
+    ensure!(
+        procs.trim().is_empty(),
+        "refusing to start Drive: the delegated cgroup {} holds processes ({}), so it cannot \
+         enable controllers for its children",
+        parent.display(),
+        procs.split_whitespace().collect::<Vec<_>>().join(" ")
+    );
+    let control = parent.join("cgroup.subtree_control");
+    std::fs::write(&control, "+cpu +memory +pids\n").with_context(|| {
+        format!(
+            "refusing to start Drive: could not enable cpu, memory and pids in {}",
+            control.display()
+        )
+    })?;
+    let enabled =
+        std::fs::read_to_string(&control).with_context(|| format!("read {}", control.display()))?;
+    // The kernel reads back `cpu memory pids`; a plain file (the tests'
+    // fake mount) echoes what was written.
+    for controller in ["cpu", "memory", "pids"] {
+        ensure!(
+            enabled
+                .split_whitespace()
+                .any(|word| word.trim_start_matches('+') == controller),
+            "refusing to start Drive: {} enables {:?} after the write, without {controller}",
+            control.display(),
+            enabled.trim()
+        );
+    }
+    Ok(parent)
+}
+
+/// One backend-arg with `{tenant}` and `{cgroup}` substituted. A tenant
+/// substituted must be one playground can provision.
+fn substitute(arg: &str, tenant: &str, cgroup: Option<&Path>) -> Result<String> {
+    if arg.contains(TENANT_PLACEHOLDER) {
+        ensure!(
+            !tenant.is_empty()
+                && tenant.len() <= 64
+                && tenant
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "refusing to start Drive: the tenant {tenant:?} is not a sandbox tenant \
+             (1..64 ASCII letters, digits, '-' or '_')"
+        );
+    }
+    let arg = arg.replace(TENANT_PLACEHOLDER, tenant);
+    if !arg.contains(CGROUP_PLACEHOLDER) {
+        return Ok(arg);
+    }
+    let cgroup = cgroup
+        .ok_or_else(|| anyhow!("refusing to start Drive: {arg:?} needs the delegated cgroup"))?;
+    let cgroup = cgroup
+        .to_str()
+        .ok_or_else(|| anyhow!("the delegated cgroup {} is not UTF-8", cgroup.display()))?;
+    Ok(arg.replace(CGROUP_PLACEHOLDER, cgroup))
+}
+
 /// The `drive run` command line for one run, or why there is none.
 /// `brief_len` is the brief file's size; a brief larger than the binding's
-/// bound refuses rather than being cut.
-pub fn plan(binding: &Binding, run: &RunInputs<'_>, brief_len: u64) -> Result<Plan> {
+/// bound refuses rather than being cut. `cgroup` is the delegated cgroup a
+/// `{cgroup}` backend-arg names, when one does.
+pub fn plan(
+    binding: &Binding,
+    run: &RunInputs<'_>,
+    brief_len: u64,
+    cgroup: Option<&Path>,
+) -> Result<Plan> {
     ensure!(
         brief_len <= binding.max_brief_bytes,
         "refusing to start Drive: the brief is {brief_len} bytes and max-brief-bytes is {}; \
@@ -337,6 +446,7 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, brief_len: u64) -> Result<Pl
                 playground.backend.clone().into(),
             ]);
             for arg in &playground.backend_args {
+                let arg = substitute(arg, &binding.tenant, cgroup)?;
                 args.extend(["--backend-arg".into(), arg.into()]);
             }
         }
@@ -390,7 +500,13 @@ pub fn exec(binding: &Path, run: &RunInputs<'_>) -> Result<std::convert::Infalli
         "the brief {} is not a regular file",
         run.brief.display()
     );
-    let plan = plan(&parsed, run, brief.len())?;
+    let cgroup = if wants_cgroup(&parsed) {
+        let own = std::fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
+        Some(delegated_cgroup(&own, Path::new("/sys/fs/cgroup"))?)
+    } else {
+        None
+    };
+    let plan = plan(&parsed, run, brief.len(), cgroup.as_deref())?;
     eprintln!(
         "zooid drive-task: binding {} blake3:{}; brief {} bytes from {}; {}",
         binding.display(),
@@ -497,7 +613,7 @@ mod tests {
     #[test]
     fn the_whole_argv_from_routes_and_a_binding() {
         let pinned = routes(&["archive", "compass", "message", "memory-journal"]);
-        let plan = plan(&binding(), &run(&pinned), 500).unwrap();
+        let plan = plan(&binding(), &run(&pinned), 500, None).unwrap();
         assert_eq!(plan.program, PathBuf::from("/fake/bin/drive"));
         let collection = |role: &str| format!("{role}={DESCRIPTOR}");
         let expected: Vec<String> = [
@@ -566,7 +682,7 @@ mod tests {
     #[test]
     fn a_found_continuation_is_drives_native_resume_and_none_adds_nothing() {
         let pinned = routes(&["archive", "compass"]);
-        let fresh = strings(&plan(&binding(), &run(&pinned), 500).unwrap());
+        let fresh = strings(&plan(&binding(), &run(&pinned), 500, None).unwrap());
         assert!(
             !fresh.iter().any(|arg| arg == "--native-resume"),
             "{fresh:?}"
@@ -575,7 +691,7 @@ mod tests {
         let node = Id::from_hex("0123456789abcdef0123456789abcdef").unwrap();
         let mut resumed = run(&pinned);
         resumed.resume = Some(node);
-        let args = strings(&plan(&binding(), &resumed, 500).unwrap());
+        let args = strings(&plan(&binding(), &resumed, 500, None).unwrap());
         let at = args
             .iter()
             .position(|arg| arg == "--native-resume")
@@ -613,7 +729,7 @@ mod tests {
             token_file: "/fake token".into(),
         });
         let pinned = routes(&["archive"]);
-        let args = strings(&plan(&binding, &run(&pinned), 1).unwrap());
+        let args = strings(&plan(&binding, &run(&pinned), 1, None).unwrap());
         let tail = &args[args.len() - 6..];
         assert_eq!(
             tail,
@@ -633,7 +749,7 @@ mod tests {
         // Drive, not this adapter, decides which roles it accepts; a Drive
         // pinned to an older faculties refuses the newer ones itself.
         let pinned = routes(&["archive", "compass", "spawn", "alarm"]);
-        let args = strings(&plan(&binding(), &run(&pinned), 1).unwrap());
+        let args = strings(&plan(&binding(), &run(&pinned), 1, None).unwrap());
         for role in ["archive", "compass", "spawn", "alarm"] {
             let collection = format!("{role}={DESCRIPTOR}");
             assert!(args.contains(&collection), "{role}: {args:?}");
@@ -647,7 +763,9 @@ mod tests {
             "TRIBLESPACE_COLLECTION_NOT_A_FACULTY".to_owned(),
             DESCRIPTOR.to_owned(),
         ));
-        let error = plan(&binding(), &run(&pinned), 1).unwrap_err().to_string();
+        let error = plan(&binding(), &run(&pinned), 1, None)
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("TRIBLESPACE_COLLECTION_NOT_A_FACULTY"),
             "{error}"
@@ -657,7 +775,9 @@ mod tests {
     #[test]
     fn a_missing_archive_route_refuses() {
         let pinned = routes(&["compass"]);
-        let error = plan(&binding(), &run(&pinned), 1).unwrap_err().to_string();
+        let error = plan(&binding(), &run(&pinned), 1, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("TRIBLESPACE_COLLECTION_ARCHIVE"), "{error}");
         assert!(error.contains("--native-archive"), "{error}");
     }
@@ -666,22 +786,24 @@ mod tests {
     fn a_malformed_or_repeated_route_refuses() {
         let mut pinned = routes(&["archive", "compass"]);
         pinned[1].1 = "blake3:12".to_owned();
-        assert!(plan(&binding(), &run(&pinned), 1).is_err());
+        assert!(plan(&binding(), &run(&pinned), 1, None).is_err());
         let mut twice = routes(&["archive", "compass"]);
         twice.push(twice[1].clone());
-        let error = plan(&binding(), &run(&twice), 1).unwrap_err().to_string();
+        let error = plan(&binding(), &run(&twice), 1, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("given twice"), "{error}");
     }
 
     #[test]
     fn a_brief_over_the_bound_or_empty_refuses_and_one_at_it_passes() {
         let pinned = routes(&["archive"]);
-        assert!(plan(&binding(), &run(&pinned), 500).is_ok());
-        let error = plan(&binding(), &run(&pinned), 501)
+        assert!(plan(&binding(), &run(&pinned), 500, None).is_ok());
+        let error = plan(&binding(), &run(&pinned), 501, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("nothing is truncated"), "{error}");
-        assert!(plan(&binding(), &run(&pinned), 0).is_err());
+        assert!(plan(&binding(), &run(&pinned), 0, None).is_err());
     }
 
     #[test]
@@ -711,6 +833,119 @@ mod tests {
         zero["max-brief-bytes"] = 0.into();
         let zero: Binding = serde_json::from_value(zero).unwrap();
         assert!(zero.check().is_err());
+    }
+
+    fn playground(binding: &mut Binding, args: &[&str]) {
+        let DriveProvider::Playground(playground) = &mut binding.provider else {
+            unreachable!()
+        };
+        playground.backend_args = args.iter().map(|arg| arg.to_string()).collect();
+    }
+
+    #[test]
+    fn tenant_and_cgroup_placeholders_are_substituted_in_backend_args() {
+        let mut binding = binding();
+        binding.tenant = "zooid-a".to_owned();
+        playground(
+            &mut binding,
+            &[
+                "--bubblewrap-tenant",
+                "{tenant}",
+                "--bubblewrap-cgroup-parent={cgroup}",
+                "{name}",
+            ],
+        );
+        assert!(wants_cgroup(&binding));
+        let pinned = routes(&["archive"]);
+        let cgroup = Path::new("/sys/fs/cgroup/user.slice/z.service");
+        let args = strings(&plan(&binding, &run(&pinned), 1, Some(cgroup)).unwrap());
+        let backend: Vec<&str> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--backend-arg")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        // No other placeholder: `{name}` passes as written.
+        assert_eq!(
+            backend,
+            [
+                "--bubblewrap-tenant",
+                "zooid-a",
+                "--bubblewrap-cgroup-parent=/sys/fs/cgroup/user.slice/z.service",
+                "{name}"
+            ]
+        );
+        // Without the cgroup a {cgroup} arg refuses; without one, nothing is asked.
+        assert!(plan(&binding, &run(&pinned), 1, None).is_err());
+        assert!(!wants_cgroup(&self::binding()));
+        // A tenant playground could not provision refuses where it is named.
+        binding.tenant = "two words".to_owned();
+        let error = plan(&binding, &run(&pinned), 1, Some(cgroup))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a sandbox tenant"), "{error}");
+        playground(&mut binding, &["--plain"]);
+        assert!(plan(&binding, &run(&pinned), 1, None).is_ok());
+    }
+
+    /// A fake cgroup mount: the unit's cgroup with its two control files.
+    fn cgroup_root(procs: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let unit = root.path().join("user.slice/z.service");
+        std::fs::create_dir_all(unit.join("supervisor")).unwrap();
+        std::fs::write(unit.join("cgroup.procs"), procs).unwrap();
+        std::fs::write(unit.join("cgroup.subtree_control"), "").unwrap();
+        (root, unit)
+    }
+
+    #[test]
+    fn the_delegated_cgroup_is_the_supervisors_parent_with_controllers_enabled() {
+        let (root, unit) = cgroup_root("");
+        let own = "0::/user.slice/z.service/supervisor\n";
+        assert_eq!(delegated_cgroup(own, root.path()).unwrap(), unit);
+        assert_eq!(
+            std::fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap(),
+            "+cpu +memory +pids\n"
+        );
+    }
+
+    #[test]
+    fn the_delegated_cgroup_refuses_outside_a_supervisor_subgroup_or_with_processes() {
+        let (root, unit) = cgroup_root("");
+        for own in [
+            "0::/user.slice/z.service\n",
+            "0::/supervisor\n",
+            "1:name=x:/a\n",
+        ] {
+            let error = delegated_cgroup(own, root.path()).unwrap_err().to_string();
+            assert!(
+                error.contains("refusing to start Drive"),
+                "{own:?}: {error}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap(),
+            ""
+        );
+        let (root, unit) = cgroup_root("4242\n");
+        let error = delegated_cgroup("0::/user.slice/z.service/supervisor", root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("holds processes (4242)"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(unit.join("cgroup.subtree_control")).unwrap(),
+            ""
+        );
+        // A failed write refuses: here the control file is a directory.
+        let (root, unit) = cgroup_root("");
+        std::fs::remove_file(unit.join("cgroup.subtree_control")).unwrap();
+        std::fs::create_dir(unit.join("cgroup.subtree_control")).unwrap();
+        let error = delegated_cgroup("0::/user.slice/z.service/supervisor", root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("could not enable cpu, memory and pids"),
+            "{error}"
+        );
     }
 
     #[test]
