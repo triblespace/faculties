@@ -4,17 +4,26 @@
 use super::*;
 use crate::out::Part;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use triblespace::core::collection::CollectionDescriptorError;
 use triblespace::core::repo::async_store::{AcquiringReadControl, AcquiringReadInterrupted};
 use triblespace::core::repo::ReadFailure;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NextKind { Report, Timeout }
+pub enum NextKind {
+    Report,
+    Timeout,
+}
 
 /// The outcome of joining the exact call, not acceptance of its output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NextCompletion { Completed, CancelledBeforeReport }
+pub enum NextCompletion {
+    Completed,
+    CancelledBeforeReport,
+}
 
 /// Exact complete output, not a clipped preview. Holding or dropping this
 /// value does not acknowledge news. The owning PendingNext retains the worker.
@@ -26,8 +35,12 @@ pub struct PreparedReport {
 }
 
 impl PreparedReport {
-    pub fn parts(&self) -> &[Part] { &self.parts }
-    pub fn kind(&self) -> NextKind { self.kind }
+    pub fn parts(&self) -> &[Part] {
+        &self.parts
+    }
+    pub fn kind(&self) -> NextKind {
+        self.kind
+    }
 }
 
 /// Configuration for one finite call; construction performs no I/O.
@@ -73,21 +86,30 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
     type BorrowError = <crate::storage::BorrowedStore as SnapshotSource>::SnapshotError;
     let mut error: &(dyn std::error::Error + 'static) = error.as_ref();
     if let Some(registration) = error.downcast_ref::<OrientRegistrationError<BorrowError>>() {
-        let CollectionRegistrationError::DependencyPut(borrow) = &registration.cause else { return false; };
+        let CollectionRegistrationError::DependencyPut(borrow) = &registration.cause else {
+            return false;
+        };
         error = borrow;
     } else if let Some(snapshot) = error.downcast_ref::<WaitSnapshotError>() {
         error = snapshot.0.as_ref();
     } else if let Some(resolution) = error.downcast_ref::<CollectionRealizationError>() {
-        return descriptor_fetch_interruption(resolution).is_some_and(|interrupted| matches!(
-            interrupted.downcast_ref::<AcquiringReadInterrupted>(),
-            Some(AcquiringReadInterrupted::Cancelled)));
+        return descriptor_fetch_interruption(resolution).is_some_and(|interrupted| {
+            matches!(
+                interrupted.downcast_ref::<AcquiringReadInterrupted>(),
+                Some(AcquiringReadInterrupted::Cancelled)
+            )
+        });
     }
     if let Some(borrow) = error.downcast_ref::<BorrowError>() {
-        let Some(cause) = std::error::Error::source(borrow) else { return false; };
+        let Some(cause) = std::error::Error::source(borrow) else {
+            return false;
+        };
         error = cause;
     }
-    matches!(error.downcast_ref::<AcquiringReadInterrupted>(),
-        Some(AcquiringReadInterrupted::Cancelled))
+    matches!(
+        error.downcast_ref::<AcquiringReadInterrupted>(),
+        Some(AcquiringReadInterrupted::Cancelled)
+    )
 }
 
 /// The nested selection's own descriptor fetch, interrupted by its control:
@@ -97,10 +119,14 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
 fn descriptor_fetch_interruption(
     error: &CollectionRealizationError,
 ) -> Option<&(dyn std::error::Error + 'static)> {
-    let CollectionRealizationError::Resolution { .. } = error else { return None; };
+    let CollectionRealizationError::Resolution { .. } = error else {
+        return None;
+    };
     let fetch = std::error::Error::source(error)?
         .downcast_ref::<CollectionDescriptorError<ReadFailure>>()?;
-    let CollectionDescriptorError::Get { source, .. } = fetch else { return None; };
+    let CollectionDescriptorError::Get { source, .. } = fetch else {
+        return None;
+    };
     std::error::Error::source(source)
 }
 
@@ -113,16 +139,30 @@ pub(super) fn completion(result: Result<()>, offered: bool) -> Result<NextComple
 }
 
 pub(super) fn deadline(options: &WaitOptions) -> Result<Option<Instant>> {
-    options.timeout.map(|duration| Instant::now().checked_add(duration)
-        .ok_or_else(|| anyhow!("Orient wait deadline is out of range"))).transpose()
+    options
+        .timeout
+        .map(|duration| {
+            Instant::now()
+                .checked_add(duration)
+                .ok_or_else(|| anyhow!("Orient wait deadline is out of range"))
+        })
+        .transpose()
 }
 
 impl Orient {
     pub fn begin_next(&self, persona: &str, options: &WaitOptions) -> Result<Next> {
-        if persona.trim().is_empty() { bail!("Orient next requires an explicit zooid persona"); }
-        if options.timeout.is_none() { bail!("Orient next requires a finite timeout"); }
-        Ok(Next { orient: self.clone(), persona: persona.to_owned(), options: options.clone(),
-            control: AcquiringReadControl::new(deadline(options)?), owner: Arc::new(()),
+        if persona.trim().is_empty() {
+            bail!("Orient next requires an explicit zooid persona");
+        }
+        if options.timeout.is_none() {
+            bail!("Orient next requires a finite timeout");
+        }
+        Ok(Next {
+            orient: self.clone(),
+            persona: persona.to_owned(),
+            options: options.clone(),
+            control: AcquiringReadControl::new(deadline(options)?),
+            owner: Arc::new(()),
             #[cfg(test)]
             quiet_snapshot: None,
             #[cfg(test)]
@@ -186,12 +226,18 @@ impl Next {
 
 /// How the wait's settled result becomes this call's output: a quiet or
 /// deadline-ended wait publishes a timeout, anything else is completion.
-fn conclude(result: Result<WaitOutcome>, offered: bool, mut parts: Vec<Part>,
-    send: &Sender<PreparedReport>, owner: Arc<()>,
+fn conclude(
+    result: Result<WaitOutcome>,
+    offered: bool,
+    mut parts: Vec<Part>,
+    send: &Sender<PreparedReport>,
+    owner: Arc<()>,
 ) -> Result<NextCompletion> {
     match result {
         Ok(outcome) if !outcome.news_printed => {
-            parts.push(Part::Text { text: format!("{}\n", outcome.timeout_text()) });
+            parts.push(Part::Text {
+                text: format!("{}\n", outcome.timeout_text()),
+            });
             offer_timeout(send, owner, parts).map(|()| NextCompletion::Completed)
         }
         Ok(_) => Ok(NextCompletion::Completed),
@@ -207,15 +253,29 @@ fn conclude(result: Result<WaitOutcome>, offered: bool, mut parts: Vec<Part>,
 /// A deadline Orient itself reached. Neither a failed selection settlement
 /// nor a Resolution's diagnostic cause counts ([`super::recovery_causes`]).
 pub(super) fn is_deadline(error: &anyhow::Error) -> bool {
-    super::recovery_causes(error).any(|source| matches!(source.downcast_ref::<AcquiringReadInterrupted>(),
-        Some(AcquiringReadInterrupted::DeadlineExceeded)))
+    super::recovery_causes(error).any(|source| {
+        matches!(
+            source.downcast_ref::<AcquiringReadInterrupted>(),
+            Some(AcquiringReadInterrupted::DeadlineExceeded)
+        )
+    })
 }
 
-fn offer(send: &Sender<PreparedReport>, owner: Arc<()>, parts: Vec<Part>, control: &AcquiringReadControl) -> Result<()> {
+fn offer(
+    send: &Sender<PreparedReport>,
+    owner: Arc<()>,
+    parts: Vec<Part>,
+    control: &AcquiringReadControl,
+) -> Result<()> {
     control.check()?;
     let (accept, accepted) = tokio::sync::oneshot::channel();
-    send.send(PreparedReport { parts, kind: NextKind::Report, accept, owner })
-        .map_err(|_| anyhow!("Orient result owner closed before publication"))?;
+    send.send(PreparedReport {
+        parts,
+        kind: NextKind::Report,
+        accept,
+        owner,
+    })
+    .map_err(|_| anyhow!("Orient result owner closed before publication"))?;
     Err(super::super::delivery::PreparedAcceptance::new(accepted, control.clone()).into())
 }
 
@@ -223,24 +283,41 @@ fn offer_timeout(send: &Sender<PreparedReport>, owner: Arc<()>, parts: Vec<Part>
     // No pending Presented commit follows a quiet timeout. Its output remains
     // owned by the caller even though the observation worker can now finish.
     let (accept, _) = tokio::sync::oneshot::channel();
-    send.send(PreparedReport { parts, kind: NextKind::Timeout, accept, owner })
-        .map_err(|_| anyhow!("Orient result owner closed before timeout delivery"))
+    send.send(PreparedReport {
+        parts,
+        kind: NextKind::Timeout,
+        accept,
+        owner,
+    })
+    .map_err(|_| anyhow!("Orient result owner closed before timeout delivery"))
 }
 
 impl PendingNext {
-    fn spawn(control: AcquiringReadControl, owner: Arc<()>,
+    fn spawn(
+        control: AcquiringReadControl,
+        owner: Arc<()>,
         run: impl FnOnce(Sender<PreparedReport>) -> Result<NextCompletion> + Send + 'static,
     ) -> Result<Self> {
         let (send, ready) = mpsc::channel();
-        let worker = std::thread::Builder::new().name("orient-next".to_owned())
-            .spawn(move || run(send)).context("start owned Orient next call")?;
-        Ok(Self { control, owner, ready, worker: Some(worker), settled: None })
+        let worker = std::thread::Builder::new()
+            .name("orient-next".to_owned())
+            .spawn(move || run(send))
+            .context("start owned Orient next call")?;
+        Ok(Self {
+            control,
+            owner,
+            ready,
+            worker: Some(worker),
+            settled: None,
+        })
     }
 
     /// A prepared complete result is available before worker completion. This
     /// lets Shell publish it before releasing Out's acceptance boundary.
     pub fn poll(&mut self) -> Result<Option<PreparedReport>> {
-        if self.settled.is_some() { self.completed()?; }
+        if self.settled.is_some() {
+            self.completed()?;
+        }
         match self.ready.try_recv() {
             Ok(report) => Ok(Some(report)),
             Err(TryRecvError::Empty) => Ok(None),
@@ -259,7 +336,9 @@ impl PendingNext {
         if !Arc::ptr_eq(&self.owner, &report.owner) {
             bail!("prepared Orient report belongs to another pending call");
         }
-        if self.settled.is_some() { self.completed()?; }
+        if self.settled.is_some() {
+            self.completed()?;
+        }
         if report.kind == NextKind::Report && report.accept.send(()).is_err() {
             self.completed()?;
             bail!("Orient receipt worker ended before acceptance");
@@ -272,21 +351,34 @@ impl PendingNext {
         self.join()
     }
 
-    pub fn is_settled(&self) -> bool { self.worker.is_none() }
+    pub fn is_settled(&self) -> bool {
+        self.worker.is_none()
+    }
 
     fn completed(&mut self) -> Result<()> {
         match self.join()? {
             NextCompletion::Completed => Ok(()),
-            NextCompletion::CancelledBeforeReport => Err(AcquiringReadInterrupted::Cancelled.into()),
+            NextCompletion::CancelledBeforeReport => {
+                Err(AcquiringReadInterrupted::Cancelled.into())
+            }
         }
     }
 
     fn join(&mut self) -> Result<NextCompletion> {
         if self.settled.is_none() {
-            let worker = self.worker.take().expect("unsettled Orient owns its worker");
-            self.settled = Some(worker.join()
-                .map_err(|panic| anyhow!("Orient next worker panicked: {}", super::panic_text(&panic)))
-                .and_then(|result| result).map_err(Arc::new));
+            let worker = self
+                .worker
+                .take()
+                .expect("unsettled Orient owns its worker");
+            self.settled = Some(
+                worker
+                    .join()
+                    .map_err(|panic| {
+                        anyhow!("Orient next worker panicked: {}", super::panic_text(&panic))
+                    })
+                    .and_then(|result| result)
+                    .map_err(Arc::new),
+            );
         }
         match self.settled.as_ref().expect("joined outcome retained") {
             Ok(outcome) => Ok(*outcome),
@@ -314,7 +406,10 @@ pub(super) mod quiet_snapshot_test {
     use super::*;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(in crate::orient::operations) enum Boundary { Health, Ordinary }
+    pub(in crate::orient::operations) enum Boundary {
+        Health,
+        Ordinary,
+    }
 
     pub(in crate::orient::operations) struct Rendezvous {
         boundary: Boundary,
@@ -326,25 +421,42 @@ pub(super) mod quiet_snapshot_test {
     impl Drop for Release {
         fn drop(&mut self) {
             // Also release on a failed assertion or a timed-out observation.
-            if let Some(send) = self.0.take() { let _ = send.send(()); }
+            if let Some(send) = self.0.take() {
+                let _ = send.send(());
+            }
         }
     }
 
     impl Rendezvous {
-        pub(super) fn new(boundary: Boundary)
-            -> (Self, Receiver<Boundary>, tokio::sync::oneshot::Sender<()>)
-        {
+        pub(super) fn new(
+            boundary: Boundary,
+        ) -> (Self, Receiver<Boundary>, tokio::sync::oneshot::Sender<()>) {
             let (entered, ready) = mpsc::channel();
             let (release, go) = tokio::sync::oneshot::channel();
-            (Self { boundary, entered, release: std::sync::Mutex::new(Some(go)) }, ready, release)
+            (
+                Self {
+                    boundary,
+                    entered,
+                    release: std::sync::Mutex::new(Some(go)),
+                },
+                ready,
+                release,
+            )
         }
 
         pub(in crate::orient::operations) async fn pause(&self, boundary: Boundary) -> Result<()> {
-            if boundary != self.boundary { return Ok(()); }
+            if boundary != self.boundary {
+                return Ok(());
+            }
             let go = self.release.lock().unwrap().take();
-            let Some(go) = go else { return Ok(()); };
-            self.entered.send(boundary).context("observe quiet snapshot rendezvous")?;
-            tokio::time::timeout(Duration::from_secs(10), go).await
+            let Some(go) = go else {
+                return Ok(());
+            };
+            self.entered
+                .send(boundary)
+                .context("observe quiet snapshot rendezvous")?;
+            tokio::time::timeout(Duration::from_secs(10), go)
+                .await
                 .context("quiet snapshot rendezvous release timed out")?
                 .context("quiet snapshot rendezvous release dropped")?;
             Ok(())
@@ -355,59 +467,101 @@ pub(super) mod quiet_snapshot_test {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{CollectionRoutes, initialize_signer};
+    use crate::storage::{initialize_signer, CollectionRoutes};
     use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 
     #[test]
     fn next_health_relations_registration_cancellation_settles_without_output() {
         let fixture = Fixture::new();
         let quiet_persona = genid().id;
-        fixture.storage.with_store(|store, signer, runtime| {
-            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
-            let (person, _, _) = relations::person_fragment(quiet_persona,
-                crate::relations::ProfileInput { label: "quiet-registration-zooid".into(), ..Default::default() })?;
-            store.commit(sources.relations.source, signer, person)?;
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                let sources =
+                    runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+                let (person, _, _) = relations::person_fragment(
+                    quiet_persona,
+                    crate::relations::ProfileInput {
+                        label: "quiet-registration-zooid".into(),
+                        ..Default::default()
+                    },
+                )?;
+                store.commit(sources.relations.source, signer, person)?;
+                Ok(())
+            })
+            .unwrap();
         let (hook, ready, release) = crate::storage::registration_test::Rendezvous::new();
         let mut call = Orient::with_storage(fixture.storage.clone())
-            .begin_next(&fmt_id(quiet_persona), &WaitOptions {
-                timeout: Some(Duration::from_secs(30)), ..Default::default()
-            }).unwrap();
+            .begin_next(
+                &fmt_id(quiet_persona),
+                &WaitOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         call.registration = Some(hook);
         let mut next = call.start().unwrap();
         // On unwind, release first, then let PendingNext own cancellation/join.
         let release = crate::storage::registration_test::Release(Some(release));
         // observe_wait opens HealthSources before OrientSources. This first
         // Relations Rank9 boundary is in health opening, not a quiet snapshot.
-        assert_eq!(ready.recv_timeout(Duration::from_secs(10)).unwrap(), "Relations");
+        assert_eq!(
+            ready.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "Relations"
+        );
         assert!(!next.is_settled());
         assert!(matches!(next.ready.try_recv(), Err(TryRecvError::Empty)));
-        fixture.storage.try_with_store(|_, _, _| Ok(())).unwrap()
+        fixture
+            .storage
+            .try_with_store(|_, _, _| Ok(()))
+            .unwrap()
             .expect("registration rendezvous must not hold the shared Storage borrow");
         next.control.cancel();
         drop(release); // The hook returns Ok; real attach/put sees cancellation.
         for _ in 0..2 {
-            assert_eq!(next.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
+            assert_eq!(
+                next.cancel_and_join().unwrap(),
+                NextCompletion::CancelledBeforeReport
+            );
             assert!(next.is_settled());
-            assert!(is_cancelled(&next.poll().err().expect("cancelled is not delivered output")));
-            assert!(matches!(next.ready.try_recv(), Err(TryRecvError::Disconnected)));
+            assert!(is_cancelled(
+                &next
+                    .poll()
+                    .err()
+                    .expect("cancelled is not delivered output")
+            ));
+            assert!(matches!(
+                next.ready.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
         }
-        fixture.storage.with_store(|store, signer, runtime| {
-            let source = runtime.block_on(ReceiptSource::open(&fixture.storage, store, signer))?.source;
-            let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
-            assert!(!exists!(pattern!(&facts, [{ metadata::tag: &KIND_PRESENTED }])));
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                let source = runtime
+                    .block_on(ReceiptSource::open(&fixture.storage, store, signer))?
+                    .source;
+                let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
+                assert!(!exists!(
+                    pattern!(&facts, [{ metadata::tag: &KIND_PRESENTED }])
+                ));
+                Ok(())
+            })
+            .unwrap();
     }
 
     // Helper-level error fixtures, not injected failures of a real store.
     fn registration_error(cause: anyhow::Error) -> anyhow::Error {
         type BorrowError = <crate::storage::BorrowedStore as SnapshotSource>::SnapshotError;
         OrientRegistrationError {
-            label: "Relations", projection: "Rank9",
-            cause: CollectionRegistrationError::DependencyPut(BorrowError::for_classification_test(cause)),
-        }.into()
+            label: "Relations",
+            projection: "Rank9",
+            cause: CollectionRegistrationError::DependencyPut(
+                BorrowError::for_classification_test(cause),
+            ),
+        }
+        .into()
     }
 
     #[test]
@@ -415,20 +569,33 @@ mod tests {
         type BorrowError = <crate::storage::BorrowedStore as SnapshotSource>::SnapshotError;
         let canceled = || registration_error(AcquiringReadInterrupted::Cancelled.into());
         assert!(is_cancelled(&canceled()));
-        assert_eq!(completion(Err(canceled()), false).unwrap(), NextCompletion::CancelledBeforeReport);
-        assert!(completion(Err(canceled()), true).is_err(), "offered output must not be retired");
+        assert_eq!(
+            completion(Err(canceled()), false).unwrap(),
+            NextCompletion::CancelledBeforeReport
+        );
+        assert!(
+            completion(Err(canceled()), true).is_err(),
+            "offered output must not be retired"
+        );
         for error in [
             registration_error(anyhow!("unrelated put failure")),
-            registration_error(anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
-                .context("independent inner failure")),
+            registration_error(
+                anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
+                    .context("independent inner failure"),
+            ),
             canceled().context("independent outer failure"),
             // No permission to peel a bare core registration error either.
             anyhow::Error::from(CollectionRegistrationError::DependencyPut(
-                BorrowError::for_classification_test(AcquiringReadInterrupted::Cancelled.into()))),
+                BorrowError::for_classification_test(AcquiringReadInterrupted::Cancelled.into()),
+            )),
             anyhow::Error::from(OrientRegistrationError::<BorrowError> {
-                label: "Relations", projection: "Rank9",
+                label: "Relations",
+                projection: "Rank9",
                 cause: CollectionRegistrationError::WrongType(
-                    triblespace::core::collection::CollectionTypeError::WrongEncoding { expected: genid().id }),
+                    triblespace::core::collection::CollectionTypeError::WrongEncoding {
+                        expected: genid().id,
+                    },
+                ),
             }),
         ] {
             assert!(!is_cancelled(&error));
@@ -436,9 +603,15 @@ mod tests {
         }
         let deadline = registration_error(AcquiringReadInterrupted::DeadlineExceeded.into());
         assert!(!is_cancelled(&deadline));
-        assert!(is_deadline(&deadline), "registration must preserve the existing timeout cause");
-        assert_eq!(crate::orient::delivery::exit_code(&canceled()), 1,
-            "non-Next delivery must not normalize cancellation");
+        assert!(
+            is_deadline(&deadline),
+            "registration must preserve the existing timeout cause"
+        );
+        assert_eq!(
+            crate::orient::delivery::exit_code(&canceled()),
+            1,
+            "non-Next delivery must not normalize cancellation"
+        );
         assert_eq!(crate::orient::delivery::exit_code(&deadline), 1);
         assert!(format!("{}", canceled()).starts_with("register Relations Rank9 collection:"));
     }
@@ -451,23 +624,36 @@ mod tests {
                 let (release, go) = mpsc::channel();
                 let task = tokio::task::spawn_blocking(move || -> Result<()> {
                     entered.send(()).unwrap();
-                    go.recv_timeout(Duration::from_secs(10)).context("selection fixture release")?;
-                    if panic { panic!("independent selection panic"); }
+                    go.recv_timeout(Duration::from_secs(10))
+                        .context("selection fixture release")?;
+                    if panic {
+                        panic!("independent selection panic");
+                    }
                     bail!("independent selection failure");
                 });
                 // Release also on assertion failure; the spawned task's wait is bounded.
                 let release = crate::storage::registration_test::Release(Some(release));
                 ready.recv_timeout(Duration::from_secs(5)).unwrap();
                 drop(release);
-                let joined = task.await.context("settle frozen Orient selection")
+                let joined = task
+                    .await
+                    .context("settle frozen Orient selection")
                     .and_then(|result| result);
                 let error = finish_wait_selection::<()>(
-                    Err(registration_error(AcquiringReadInterrupted::Cancelled.into())), joined).unwrap_err();
+                    Err(registration_error(
+                        AcquiringReadInterrupted::Cancelled.into(),
+                    )),
+                    joined,
+                )
+                .unwrap_err();
                 assert!(!is_cancelled(&error));
                 let diagnostic = format!("{error:#}");
                 assert!(diagnostic.contains("register Relations Rank9 collection"));
-                assert!(diagnostic.contains(if panic { "independent selection panic" }
-                    else { "independent selection failure" }));
+                assert!(diagnostic.contains(if panic {
+                    "independent selection panic"
+                } else {
+                    "independent selection failure"
+                }));
                 assert!(completion(Err(error), false).is_err());
             });
         }
@@ -478,7 +664,10 @@ mod tests {
         // Exercise the actual helper, not a poisoned store or failed disk write.
         let canceled = || registration_error(AcquiringReadInterrupted::Cancelled.into());
         let error = crate::storage::finish_close_for_test::<()>(
-            Err(canceled()), Err(anyhow!("independent close failure"))).unwrap_err();
+            Err(canceled()),
+            Err(anyhow!("independent close failure")),
+        )
+        .unwrap_err();
         assert!(!is_cancelled(&error));
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("register Relations Rank9 collection"));
@@ -487,7 +676,10 @@ mod tests {
         // Next normalizes inside scope, so a later close can still fail.
         let normalized = completion(Err(canceled()), false);
         let error = crate::storage::finish_close_for_test(
-            normalized, Err(anyhow!("close after normalized cancellation"))).unwrap_err();
+            normalized,
+            Err(anyhow!("close after normalized cancellation")),
+        )
+        .unwrap_err();
         assert!(!is_cancelled(&error));
         assert_eq!(error.to_string(), "close after normalized cancellation");
     }
@@ -495,44 +687,81 @@ mod tests {
     fn cancel_after_quiet_frame(boundary: quiet_snapshot_test::Boundary) {
         let fixture = Fixture::new();
         let quiet_persona = genid().id;
-        fixture.storage.with_store(|store, signer, runtime| {
-            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
-            let (person, _, _) = relations::person_fragment(quiet_persona,
-                crate::relations::ProfileInput { label: "quiet-snapshot-zooid".into(), ..Default::default() })?;
-            store.commit(sources.relations.source, signer, person)?;
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                let sources =
+                    runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+                let (person, _, _) = relations::person_fragment(
+                    quiet_persona,
+                    crate::relations::ProfileInput {
+                        label: "quiet-snapshot-zooid".into(),
+                        ..Default::default()
+                    },
+                )?;
+                store.commit(sources.relations.source, signer, person)?;
+                Ok(())
+            })
+            .unwrap();
         let (hook, ready, release) = quiet_snapshot_test::Rendezvous::new(boundary);
         let mut call = Orient::with_storage(fixture.storage.clone())
-            .begin_next(&fmt_id(quiet_persona), &WaitOptions {
-                timeout: Some(Duration::from_secs(30)),
-                poll_interval: Duration::from_millis(1), ..Default::default()
-            }).unwrap();
+            .begin_next(
+                &fmt_id(quiet_persona),
+                &WaitOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    poll_interval: Duration::from_millis(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         call.quiet_snapshot = Some(hook);
         let mut next = call.start().unwrap();
         // Declared after Next so unwinding releases the rendezvous before
         // PendingNext's Drop cancels and joins. Both rendezvous waits are bounded.
         let release = quiet_snapshot_test::Release(Some(release));
-        assert_eq!(ready.recv_timeout(Duration::from_secs(10)).unwrap(), boundary);
+        assert_eq!(
+            ready.recv_timeout(Duration::from_secs(10)).unwrap(),
+            boundary
+        );
         assert!(!next.is_settled());
-        assert!(matches!(next.ready.try_recv(), Err(TryRecvError::Empty)), "no offered output");
+        assert!(
+            matches!(next.ready.try_recv(), Err(TryRecvError::Empty)),
+            "no offered output"
+        );
         assert!(!fixture.presented());
         next.control.cancel();
         drop(release);
         for _ in 0..2 {
-            assert_eq!(next.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
+            assert_eq!(
+                next.cancel_and_join().unwrap(),
+                NextCompletion::CancelledBeforeReport
+            );
             assert!(next.is_settled());
-            assert!(is_cancelled(&next.poll().err().expect("cancelled is not delivered output")));
-            assert!(matches!(next.ready.try_recv(), Err(TryRecvError::Disconnected)),
-                "neither a queued report nor a timeout may be silently retired");
+            assert!(is_cancelled(
+                &next
+                    .poll()
+                    .err()
+                    .expect("cancelled is not delivered output")
+            ));
+            assert!(
+                matches!(next.ready.try_recv(), Err(TryRecvError::Disconnected)),
+                "neither a queued report nor a timeout may be silently retired"
+            );
         }
         // No receipt of any kind, not merely no receipt for fixture.event.
-        fixture.storage.with_store(|store, signer, runtime| {
-            let source = runtime.block_on(ReceiptSource::open(&fixture.storage, store, signer))?.source;
-            let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
-            assert!(!exists!(pattern!(&facts, [{ metadata::tag: &KIND_PRESENTED }])));
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                let source = runtime
+                    .block_on(ReceiptSource::open(&fixture.storage, store, signer))?
+                    .source;
+                let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
+                assert!(!exists!(
+                    pattern!(&facts, [{ metadata::tag: &KIND_PRESENTED }])
+                ));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -550,8 +779,11 @@ mod tests {
         let fixture = Fixture::new();
         let control = AcquiringReadControl::new(None);
         let (mut store, _, _) = crate::storage::BorrowedStore::open(
-            fixture.storage.clone(), control.clone(), Arc::new(AtomicBool::new(false)),
-        ).unwrap();
+            fixture.storage.clone(),
+            control.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         control.cancel();
         let wrapped = || anyhow::Error::from(AcquiringReadInterrupted::Cancelled);
         assert!(is_cancelled(&wrapped()));
@@ -560,23 +792,46 @@ mod tests {
         let borrowed = store.snapshot().err().expect("cancelled snapshot");
         assert!(is_cancelled(&WaitSnapshotError(borrowed.into()).into()));
         let borrowed = store.snapshot().err().expect("cancelled snapshot");
-        assert!(!is_cancelled(&anyhow::Error::from(borrowed).context("independent close failure")));
+        assert!(!is_cancelled(
+            &anyhow::Error::from(borrowed).context("independent close failure")
+        ));
         let borrowed = store.snapshot().err().expect("cancelled snapshot");
-        assert!(!is_cancelled(&WaitSnapshotError(
-            anyhow::Error::from(borrowed).context("independent settlement failure")).into()));
-        assert!(!is_cancelled(&WaitSnapshotError(anyhow!("unrelated snapshot failure")).into()));
-        assert!(!is_cancelled(&WaitSnapshotError(wrapped().context("other failure")).into()));
-        assert!(!is_cancelled(&WaitSnapshotError(
-            AcquiringReadInterrupted::DeadlineExceeded.into()).into()));
-        assert!(is_deadline(&WaitSnapshotError(AcquiringReadInterrupted::DeadlineExceeded.into()).into()),
-            "the preserved snapshot deadline must still offer timeout output");
-        for interruption in [AcquiringReadInterrupted::Cancelled, AcquiringReadInterrupted::DeadlineExceeded] {
+        assert!(!is_cancelled(
+            &WaitSnapshotError(
+                anyhow::Error::from(borrowed).context("independent settlement failure")
+            )
+            .into()
+        ));
+        assert!(!is_cancelled(
+            &WaitSnapshotError(anyhow!("unrelated snapshot failure")).into()
+        ));
+        assert!(!is_cancelled(
+            &WaitSnapshotError(wrapped().context("other failure")).into()
+        ));
+        assert!(!is_cancelled(
+            &WaitSnapshotError(AcquiringReadInterrupted::DeadlineExceeded.into()).into()
+        ));
+        assert!(
+            is_deadline(
+                &WaitSnapshotError(AcquiringReadInterrupted::DeadlineExceeded.into()).into()
+            ),
+            "the preserved snapshot deadline must still offer timeout output"
+        );
+        for interruption in [
+            AcquiringReadInterrupted::Cancelled,
+            AcquiringReadInterrupted::DeadlineExceeded,
+        ] {
             let error = anyhow::Error::from(WaitSnapshotError(interruption.into()));
-            assert_eq!(crate::orient::delivery::exit_code(&error), 1,
-                "non-Next frontends still report snapshot interruption as an error");
+            assert_eq!(
+                crate::orient::delivery::exit_code(&error),
+                1,
+                "non-Next frontends still report snapshot interruption as an error"
+            );
         }
-        assert!(completion(Err(WaitSnapshotError(wrapped()).into()), true).is_err(),
-            "even typed cancellation cannot retire an offered report");
+        assert!(
+            completion(Err(WaitSnapshotError(wrapped()).into()), true).is_err(),
+            "even typed cancellation cannot retire an offered report"
+        );
     }
 
     #[test]
@@ -589,10 +844,15 @@ mod tests {
                 let cause = if contextual {
                     anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
                         .context("independent failure")
-                } else { anyhow!("unrelated borrowed operation failure") };
+                } else {
+                    anyhow!("unrelated borrowed operation failure")
+                };
                 let borrowed: anyhow::Error = BorrowError::for_classification_test(cause).into();
-                let error = if snapshot_wrapper { WaitSnapshotError(borrowed).into() }
-                    else { borrowed };
+                let error = if snapshot_wrapper {
+                    WaitSnapshotError(borrowed).into()
+                } else {
+                    borrowed
+                };
                 assert!(!is_cancelled(&error));
                 assert!(completion(Err(error), false).is_err());
             }
@@ -609,33 +869,48 @@ mod tests {
             let mut next = PendingNext::spawn(control, Arc::new(()), move |_| {
                 entered.send(()).unwrap();
                 go.recv().unwrap();
-                if fail { anyhow::bail!("independent worker failure"); }
+                if fail {
+                    anyhow::bail!("independent worker failure");
+                }
                 completion(worker_control.check().map_err(Into::into), false)
-            }).unwrap();
+            })
+            .unwrap();
             ready.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(!next.is_settled());
             next.control.cancel();
             release.send(()).unwrap();
             for _ in 0..2 {
                 let result = next.cancel_and_join();
-                if fail { assert!(result.unwrap_err().to_string().contains("independent worker failure")); }
-                else { assert_eq!(result.unwrap(), NextCompletion::CancelledBeforeReport); }
+                if fail {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("independent worker failure"));
+                } else {
+                    assert_eq!(result.unwrap(), NextCompletion::CancelledBeforeReport);
+                }
                 assert!(next.is_settled());
             }
             assert!(next.poll().is_err());
         }
         let (entered, ready) = mpsc::channel();
         let (release, go) = mpsc::channel();
-        let mut next = PendingNext::spawn(AcquiringReadControl::new(None), Arc::new(()), move |_| {
-            entered.send(()).unwrap();
-            go.recv().unwrap();
-            panic!("owned worker panic");
-        }).unwrap();
+        let mut next =
+            PendingNext::spawn(AcquiringReadControl::new(None), Arc::new(()), move |_| {
+                entered.send(()).unwrap();
+                go.recv().unwrap();
+                panic!("owned worker panic");
+            })
+            .unwrap();
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         next.control.cancel();
         release.send(()).unwrap();
         for _ in 0..2 {
-            assert!(next.cancel_and_join().unwrap_err().to_string().contains("owned worker panic"));
+            assert!(next
+                .cancel_and_join()
+                .unwrap_err()
+                .to_string()
+                .contains("owned worker panic"));
             assert!(next.is_settled());
         }
     }
@@ -654,20 +929,35 @@ mod tests {
                     sent.send(()).unwrap(); // The complete report is already queued.
                     result
                 };
-                let result = crate::storage::runtime()?.block_on(
-                    crate::orient::delivery::complete_report(&mut Out::new(&mut emit),
-                        "complete report", "fixture", &mut |_| {}));
+                let result =
+                    crate::storage::runtime()?.block_on(crate::orient::delivery::complete_report(
+                        &mut Out::new(&mut emit),
+                        "complete report",
+                        "fixture",
+                        &mut |_| {},
+                    ));
                 completion(result, true)
-            }).unwrap();
+            })
+            .unwrap();
             ready.recv_timeout(Duration::from_secs(5)).unwrap();
-            let report = if poll_first { next.poll().unwrap() } else { None };
+            let report = if poll_first {
+                next.poll().unwrap()
+            } else {
+                None
+            };
             assert!(!next.is_settled());
             assert!(next.cancel_and_join().is_err());
             assert!(next.is_settled());
-            assert!(next.cancel_and_join().is_err(), "second join must retain the failure");
+            assert!(
+                next.cancel_and_join().is_err(),
+                "second join must retain the failure"
+            );
             assert!(next.poll().is_err());
             let report = report.unwrap_or_else(|| next.ready.try_recv().unwrap());
-            assert!(next.acknowledge(report).is_err(), "cancellation must not become acceptance");
+            assert!(
+                next.acknowledge(report).is_err(),
+                "cancellation must not become acceptance"
+            );
         }
     }
 
@@ -677,10 +967,17 @@ mod tests {
         let worker_owner = owner.clone();
         let (sent, ready) = mpsc::channel();
         let mut next = PendingNext::spawn(AcquiringReadControl::new(None), owner, move |send| {
-            offer_timeout(&send, worker_owner, vec![Part::Text { text: "timeout".into() }])?;
+            offer_timeout(
+                &send,
+                worker_owner,
+                vec![Part::Text {
+                    text: "timeout".into(),
+                }],
+            )?;
             sent.send(()).unwrap();
             Ok(NextCompletion::Completed)
-        }).unwrap();
+        })
+        .unwrap();
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(next.cancel_and_join().unwrap(), NextCompletion::Completed);
         assert!(next.is_settled());
@@ -705,39 +1002,74 @@ mod tests {
             std::fs::File::create(&pile).unwrap();
             let signer = initialize_signer(&pile, Some(&key)).unwrap();
             let storage = Storage::shared_local(pile, Some(key));
-            let routes = storage.with_store(|store, signer, _| {
-                let mut routes = CollectionRoutes::new(); // Fixture's explicit config, not cached facts.
-                for (scope, name) in crate::collection_names::table() {
-                    let authority = AdmissionPolicy::direct(signer.verifying_key());
-                    routes.insert(scope, store.collection(name,
-                        CollectionPolicy::new(authority.clone(), authority))?.handle());
-                }
-                Ok(routes)
-            }).unwrap();
-            let storage = storage.with_collections(routes).with_expected_signer(signer.verifying_key());
+            let routes = storage
+                .with_store(|store, signer, _| {
+                    let mut routes = CollectionRoutes::new(); // Fixture's explicit config, not cached facts.
+                    for (scope, name) in crate::collection_names::table() {
+                        let authority = AdmissionPolicy::direct(signer.verifying_key());
+                        routes.insert(
+                            scope,
+                            store
+                                .collection(
+                                    name,
+                                    CollectionPolicy::new(authority.clone(), authority),
+                                )?
+                                .handle(),
+                        );
+                    }
+                    Ok(routes)
+                })
+                .unwrap();
+            let storage = storage
+                .with_collections(routes)
+                .with_expected_signer(signer.verifying_key());
             let persona = genid().id;
             let sender = genid().id;
-            let event = storage.with_store(|store, signer, runtime| {
-                let sources = runtime.block_on(OrientSources::open(&storage, store, signer, true))?;
-                for (person, label) in [(persona, "isolated-zooid"), (sender, "sender")] {
-                    let (fragment, _, _) = relations::person_fragment(person,
-                        crate::relations::ProfileInput { label: label.to_owned(), ..Default::default() })?;
-                    store.commit(sources.relations.source, signer, fragment)?;
-                }
-                let (fragment, event) = message::message_fragment(sender,
-                    &message::Recipient::Person(persona), "complete native report\nwith second line",
-                    clock::point_now()?);
-                store.commit(sources.messages.source, signer, fragment)?;
-                Ok(event)
-            }).unwrap();
-            Self { storage, persona, event, _directory: directory }
+            let event = storage
+                .with_store(|store, signer, runtime| {
+                    let sources =
+                        runtime.block_on(OrientSources::open(&storage, store, signer, true))?;
+                    for (person, label) in [(persona, "isolated-zooid"), (sender, "sender")] {
+                        let (fragment, _, _) = relations::person_fragment(
+                            person,
+                            crate::relations::ProfileInput {
+                                label: label.to_owned(),
+                                ..Default::default()
+                            },
+                        )?;
+                        store.commit(sources.relations.source, signer, fragment)?;
+                    }
+                    let (fragment, event) = message::message_fragment(
+                        sender,
+                        &message::Recipient::Person(persona),
+                        "complete native report\nwith second line",
+                        clock::point_now()?,
+                    );
+                    store.commit(sources.messages.source, signer, fragment)?;
+                    Ok(event)
+                })
+                .unwrap();
+            Self {
+                storage,
+                persona,
+                event,
+                _directory: directory,
+            }
         }
 
         fn start(&self) -> PendingNext {
-            Orient::with_storage(self.storage.clone()).begin_next(&fmt_id(self.persona),
-                &WaitOptions { timeout: Some(Duration::from_secs(20)),
-                    poll_interval: Duration::from_millis(10), ..Default::default() })
-                .unwrap().start().unwrap()
+            Orient::with_storage(self.storage.clone())
+                .begin_next(
+                    &fmt_id(self.persona),
+                    &WaitOptions {
+                        timeout: Some(Duration::from_secs(20)),
+                        poll_interval: Duration::from_millis(10),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .start()
+                .unwrap()
         }
 
         fn presented(&self) -> bool {
@@ -745,17 +1077,26 @@ mod tests {
         }
 
         fn presented_event(&self, selected: Id) -> bool {
-            self.storage.try_with_store(|store, signer, runtime| {
-                let source = runtime.block_on(ReceiptSource::open(&self.storage, store, signer))?.source;
-                let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
-                Ok(find!(event: Id, pattern!(&facts, [{ presentation::event: ?event }]))
-                    .any(|event| event == selected))
-            }).unwrap().expect("prepared output must not hold the shared Storage borrow")
+            self.storage
+                .try_with_store(|store, signer, runtime| {
+                    let source = runtime
+                        .block_on(ReceiptSource::open(&self.storage, store, signer))?
+                        .source;
+                    let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
+                    Ok(
+                        find!(event: Id, pattern!(&facts, [{ presentation::event: ?event }]))
+                            .any(|event| event == selected),
+                    )
+                })
+                .unwrap()
+                .expect("prepared output must not hold the shared Storage borrow")
         }
     }
 
     impl Drop for Fixture {
-        fn drop(&mut self) { self.storage.close().unwrap(); }
+        fn drop(&mut self) {
+            self.storage.close().unwrap();
+        }
     }
 
     #[test]
@@ -763,15 +1104,31 @@ mod tests {
         use crate::mcp::catalog::{Catalog, Config};
         for name in ["orient_show", "orient_wake", "orient_poll"] {
             let fixture = Fixture::new();
-            let goal = fixture.storage.with_store(|store, signer, runtime| {
-                let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
-                let (fragment, goal) = compass::goal_fragment("native overview goal",
-                    vec!["isolated-zooid".into()], None, clock::point_now()?)?;
-                store.commit(sources.compass.source, signer, fragment)?;
-                Ok(goal)
-            }).unwrap();
-            let native = Catalog::with_native_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
-            let generic = Catalog::with_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
+            let goal = fixture
+                .storage
+                .with_store(|store, signer, runtime| {
+                    let sources = runtime.block_on(OrientSources::open(
+                        &fixture.storage,
+                        store,
+                        signer,
+                        true,
+                    ))?;
+                    let (fragment, goal) = compass::goal_fragment(
+                        "native overview goal",
+                        vec!["isolated-zooid".into()],
+                        None,
+                        clock::point_now()?,
+                    )?;
+                    store.commit(sources.compass.source, signer, fragment)?;
+                    Ok(goal)
+                })
+                .unwrap();
+            let native = Catalog::with_native_storage(
+                Config::new(fixture.storage.path()),
+                fixture.storage.clone(),
+            );
+            let generic =
+                Catalog::with_storage(Config::new(fixture.storage.path()), fixture.storage.clone());
             let args = |peek: bool| {
                 let mut args = serde_json::json!({"persona": fmt_id(fixture.persona)});
                 match name {
@@ -784,16 +1141,36 @@ mod tests {
             let cancelled = AtomicBool::new(false);
             assert!(!fixture.presented());
             assert!(!fixture.presented_event(goal));
-            let result = native.invoke(name, args(true), crate::mcp::Limits::default(), &cancelled).unwrap();
+            let result = native
+                .invoke(name, args(true), crate::mcp::Limits::default(), &cancelled)
+                .unwrap();
             assert!(!result.is_error);
-            assert!(result.parts.iter().any(|part| matches!(part, Part::Text { text }
+            assert!(result
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Text { text }
                 if text.contains("native overview goal"))));
-            assert!(!fixture.presented(), "native {name} must not consume message attention");
-            assert!(!fixture.presented_event(goal), "native {name} must not consume goal attention");
-            let result = generic.invoke(name, args(false), crate::mcp::Limits::default(), &cancelled).unwrap();
+            assert!(
+                !fixture.presented(),
+                "native {name} must not consume message attention"
+            );
+            assert!(
+                !fixture.presented_event(goal),
+                "native {name} must not consume goal attention"
+            );
+            let result = generic
+                .invoke(name, args(false), crate::mcp::Limits::default(), &cancelled)
+                .unwrap();
             assert!(!result.is_error);
-            assert!(fixture.presented_event(goal), "generic {name} keeps its accepted-output receipt");
-            assert_eq!(fixture.presented(), name != "orient_wake", "wake presents goals, not messages");
+            assert!(
+                fixture.presented_event(goal),
+                "generic {name} keeps its accepted-output receipt"
+            );
+            assert_eq!(
+                fixture.presented(),
+                name != "orient_wake",
+                "wake presents goals, not messages"
+            );
         }
     }
 
@@ -802,14 +1179,24 @@ mod tests {
         use crate::mcp::catalog::{Catalog, Config};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("must-not-open.pile");
-        let catalog = Catalog::with_native_storage(Config::new(&path), Storage::shared(path.clone(), None));
-        let (tool, schema) = catalog.tools().find(|(tool, _)| tool.name == "orient_poll").unwrap();
+        let catalog =
+            Catalog::with_native_storage(Config::new(&path), Storage::shared(path.clone(), None));
+        let (tool, schema) = catalog
+            .tools()
+            .find(|(tool, _)| tool.name == "orient_poll")
+            .unwrap();
         let schema: serde_json::Value = serde_json::from_str(schema).unwrap();
         assert_eq!(schema["properties"]["peek"]["const"], true);
         assert!(tool.description.contains("Only peek=true"));
-        let error = catalog.invoke("orient_poll", anybytes::Bytes::from(
-            br#"{"persona":"fixture-zooid","peek":false}"#.to_vec()),
-            crate::mcp::Limits::default(), &AtomicBool::new(false)).err().expect("consuming bypass must reject");
+        let error = catalog
+            .invoke(
+                "orient_poll",
+                anybytes::Bytes::from(br#"{"persona":"fixture-zooid","peek":false}"#.to_vec()),
+                crate::mcp::Limits::default(),
+                &AtomicBool::new(false),
+            )
+            .err()
+            .expect("consuming bypass must reject");
         assert!(error.is::<crate::mcp::InvalidArguments>());
         assert!(error.to_string().contains("only peek=true"));
         assert!(!path.exists(), "rejection must precede Storage/output");
@@ -821,7 +1208,10 @@ mod tests {
         let mut next = fixture.start();
         let report = next.ready.recv_timeout(Duration::from_secs(10)).unwrap();
         assert_eq!(report.kind(), NextKind::Report);
-        assert!(report.parts().iter().any(|part| matches!(part, Part::Text { text }
+        assert!(report
+            .parts()
+            .iter()
+            .any(|part| matches!(part, Part::Text { text }
             if text.contains("complete native report\nwith second line"))));
         assert!(!fixture.presented());
         // Simulate successful complete Archive/ledger publication. This is
@@ -856,12 +1246,20 @@ mod tests {
         assert_eq!(report.kind(), NextKind::Report);
         for _ in 0..2 {
             let result = next.cancel_and_join();
-            assert!(!matches!(result, Ok(NextCompletion::CancelledBeforeReport)),
-                "an offered report must not be retired as idle cancellation");
-            assert!(result.is_err(), "cancellation after an offer is not completion either");
+            assert!(
+                !matches!(result, Ok(NextCompletion::CancelledBeforeReport)),
+                "an offered report must not be retired as idle cancellation"
+            );
+            assert!(
+                result.is_err(),
+                "cancellation after an offer is not completion either"
+            );
             assert!(next.is_settled());
         }
-        assert!(next.acknowledge(report).is_err(), "cancellation must not become acceptance");
+        assert!(
+            next.acknowledge(report).is_err(),
+            "cancellation must not become acceptance"
+        );
         assert!(!fixture.presented());
     }
 
@@ -870,23 +1268,28 @@ mod tests {
         for error in [
             anyhow!("independent worker failure"),
             AcquiringReadInterrupted::DeadlineExceeded.into(),
-            anyhow::Error::from(AcquiringReadInterrupted::Cancelled).context("independent close failure"),
+            anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
+                .context("independent close failure"),
         ] {
             let text = format!("{error:#}");
             let (entered, ready) = mpsc::channel();
             let (release, go) = mpsc::channel();
             // Not cancelled: the worker fails on its own.
-            let mut next = PendingNext::spawn(AcquiringReadControl::new(None), Arc::new(()),
-                move |_| {
+            let mut next =
+                PendingNext::spawn(AcquiringReadControl::new(None), Arc::new(()), move |_| {
                     entered.send(()).unwrap();
                     go.recv().unwrap();
                     completion(Err(error), false)
-                }).unwrap();
+                })
+                .unwrap();
             ready.recv_timeout(Duration::from_secs(5)).unwrap();
             release.send(()).unwrap();
             for _ in 0..2 {
                 let error = next.cancel_and_join().unwrap_err();
-                assert!(format!("{error:#}").contains(&text), "the retained error is the worker's own");
+                assert!(
+                    format!("{error:#}").contains(&text),
+                    "the retained error is the worker's own"
+                );
                 assert!(!is_cancelled(&error));
                 assert!(next.is_settled());
             }
@@ -898,12 +1301,18 @@ mod tests {
     fn next_rejected_or_cancelled_publication_never_presents() {
         let fixture = Fixture::new();
         let mut rejected = fixture.start();
-        let report = rejected.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let report = rejected
+            .ready
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         drop(report); // Archive publication failed; Out acceptance is withheld.
         assert!(rejected.join().is_err());
         assert!(!fixture.presented());
         let mut cancelled = fixture.start();
-        let report = cancelled.ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        let report = cancelled
+            .ready
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
         cancelled.control.cancel(); // Even if publication just succeeded, ack may fail.
         assert!(cancelled.acknowledge(report).is_err());
         assert!(cancelled.is_settled());
@@ -913,17 +1322,23 @@ mod tests {
     #[test]
     fn next_prepared_report_survives_selection_deadline_until_accepted() {
         let fixture = Fixture::new();
-        let next = Orient::with_storage(fixture.storage.clone()).begin_next(
-            &fmt_id(fixture.persona), &WaitOptions {
-                timeout: Some(Duration::from_secs(5)),
-                poll_interval: Duration::from_millis(10), ..Default::default()
-            }).unwrap();
+        let next = Orient::with_storage(fixture.storage.clone())
+            .begin_next(
+                &fmt_id(fixture.persona),
+                &WaitOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    poll_interval: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let deadline = next.control.deadline().unwrap();
         let mut next = next.start().unwrap();
         let report = next.ready.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(report.kind(), NextKind::Report);
-        std::thread::sleep(deadline.saturating_duration_since(Instant::now())
-            + Duration::from_millis(10));
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+        );
         assert!(!fixture.presented());
         // Simulate a slow tokenizer/rollover and publication. The same body
         // and worker survive; there is no second timeout or observation.
@@ -936,15 +1351,27 @@ mod tests {
     #[test]
     fn next_busy_owner_can_cancel_without_entering_or_closing_another_store() {
         let fixture = Fixture::new();
-        fixture.storage.with_store(|_, _, _| {
-            let mut next = fixture.start();
-            next.control.cancel();
-            assert_eq!(next.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
-            assert!(next.is_settled());
-            assert_eq!(next.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
-            assert!(next.poll().is_err(), "cancellation is not a delivered report");
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .with_store(|_, _, _| {
+                let mut next = fixture.start();
+                next.control.cancel();
+                assert_eq!(
+                    next.cancel_and_join().unwrap(),
+                    NextCompletion::CancelledBeforeReport
+                );
+                assert!(next.is_settled());
+                assert_eq!(
+                    next.cancel_and_join().unwrap(),
+                    NextCompletion::CancelledBeforeReport
+                );
+                assert!(
+                    next.poll().is_err(),
+                    "cancellation is not a delivered report"
+                );
+                Ok(())
+            })
+            .unwrap();
         assert!(!fixture.presented());
     }
 
@@ -954,18 +1381,36 @@ mod tests {
         let mut first = fixture.start();
         let report = first.ready.recv_timeout(Duration::from_secs(10)).unwrap();
         let quiet_persona = genid().id;
-        fixture.storage.with_store(|store, signer, runtime| {
-            let sources = runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
-            let (person, _, _) = relations::person_fragment(quiet_persona,
-                crate::relations::ProfileInput { label: "quiet-other-zooid".into(), ..Default::default() })?;
-            store.commit(sources.relations.source, signer, person)?;
-            Ok(())
-        }).unwrap();
-        let start = |seconds| Orient::with_storage(fixture.storage.clone())
-            .begin_next(&fmt_id(quiet_persona), &WaitOptions {
-                timeout: Some(Duration::from_secs(seconds)), poll_interval: Duration::from_millis(10),
-                ..Default::default()
-            }).unwrap().start().unwrap();
+        fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                let sources =
+                    runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))?;
+                let (person, _, _) = relations::person_fragment(
+                    quiet_persona,
+                    crate::relations::ProfileInput {
+                        label: "quiet-other-zooid".into(),
+                        ..Default::default()
+                    },
+                )?;
+                store.commit(sources.relations.source, signer, person)?;
+                Ok(())
+            })
+            .unwrap();
+        let start = |seconds| {
+            Orient::with_storage(fixture.storage.clone())
+                .begin_next(
+                    &fmt_id(quiet_persona),
+                    &WaitOptions {
+                        timeout: Some(Duration::from_secs(seconds)),
+                        poll_interval: Duration::from_millis(10),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .start()
+                .unwrap()
+        };
         // The wait's deadline also bounds acquiring its snapshot, and under a
         // loaded whole suite one second was not always enough to acquire
         // (2026-11-12: "exact acquisition deadline exceeded"). Five seconds
@@ -977,9 +1422,15 @@ mod tests {
         assert!(second.is_settled());
         let mut cancelled = start(20);
         std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(cancelled.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
+        assert_eq!(
+            cancelled.cancel_and_join().unwrap(),
+            NextCompletion::CancelledBeforeReport
+        );
         assert!(cancelled.is_settled());
-        assert_eq!(cancelled.cancel_and_join().unwrap(), NextCompletion::CancelledBeforeReport);
+        assert_eq!(
+            cancelled.cancel_and_join().unwrap(),
+            NextCompletion::CancelledBeforeReport
+        );
         assert!(cancelled.poll().is_err());
         assert!(!first.is_settled());
         assert!(!fixture.presented());
@@ -995,7 +1446,11 @@ mod tests {
         let first_report = first.ready.recv_timeout(Duration::from_secs(10)).unwrap();
         let mut second = fixture.start();
         let second_report = second.ready.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(first.acknowledge(second_report).unwrap_err().to_string().contains("another pending call"));
+        assert!(first
+            .acknowledge(second_report)
+            .unwrap_err()
+            .to_string()
+            .contains("another pending call"));
         assert!(second.join().is_err());
         assert!(second.is_settled());
         assert!(!fixture.presented());
@@ -1012,14 +1467,27 @@ mod tests {
         let worker_owner = owner.clone();
         let mut next = PendingNext::spawn(AcquiringReadControl::new(None), owner, move |send| {
             conclude(result, false, Vec::new(), &send, worker_owner)
-        }).unwrap();
+        })
+        .unwrap();
         let completion = next.join();
         let published = next.ready.try_recv().ok().map(|report| report.kind());
         (completion, published)
     }
 
-    fn quiet() -> WaitOutcome { WaitOutcome { news_printed: false, view_pending: false, had_ready_frame: true } }
-    fn printed() -> WaitOutcome { WaitOutcome { news_printed: true, view_pending: false, had_ready_frame: true } }
+    fn quiet() -> WaitOutcome {
+        WaitOutcome {
+            news_printed: false,
+            view_pending: false,
+            had_ready_frame: true,
+        }
+    }
+    fn printed() -> WaitOutcome {
+        WaitOutcome {
+            news_printed: true,
+            view_pending: false,
+            had_ready_frame: true,
+        }
+    }
 
     #[test]
     fn nested_selection_deadline_is_a_failed_settlement_through_next() {
@@ -1028,8 +1496,10 @@ mod tests {
             // The descriptor fetch, interrupted by the real acquiring reader.
             || interrupted_descriptor_fetch(AcquiringReadInterrupted::DeadlineExceeded),
             // Any other selection read that met the deadline.
-            || anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
-                .context("settle frozen Orient selection"),
+            || {
+                anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
+                    .context("settle frozen Orient selection")
+            },
         ];
         for nested in nested {
             for outcome in [quiet(), printed()] {
@@ -1038,7 +1508,10 @@ mod tests {
                 let error = completion.expect_err("a failed settlement fails the call");
                 assert_eq!(published, None, "no timeout is published: {error:#}");
                 // The deadline stays in the diagnostic text.
-                assert!(format!("{error:#}").contains("deadline exceeded"), "{error:#}");
+                assert!(
+                    format!("{error:#}").contains("deadline exceeded"),
+                    "{error:#}"
+                );
             }
         }
     }
@@ -1062,12 +1535,18 @@ mod tests {
         // The selection we cancelled, ending in its own descriptor-fetch
         // cancellation, leaves the quiet wait's timeout in place.
         let (completion, published) = concluded(finish_wait_selection(
-            Ok(quiet()), Err(interrupted_descriptor_fetch(AcquiringReadInterrupted::Cancelled))));
+            Ok(quiet()),
+            Err(interrupted_descriptor_fetch(
+                AcquiringReadInterrupted::Cancelled,
+            )),
+        ));
         assert_eq!(completion.unwrap(), NextCompletion::Completed);
         assert_eq!(published, Some(NextKind::Timeout));
         // A cancellation inside another failure is refused.
-        let (completion, published) = concluded(Err(anyhow::Error::from(AcquiringReadInterrupted::Cancelled)
-            .context("closing storage also failed")));
+        let (completion, published) = concluded(Err(anyhow::Error::from(
+            AcquiringReadInterrupted::Cancelled,
+        )
+        .context("closing storage also failed")));
         assert!(completion.is_err());
         assert_eq!(published, None);
     }
@@ -1084,17 +1563,31 @@ mod tests {
         // not drive operations.rs itself.
         use triblespace::core::repo::SnapshotSource;
         let fixture = Fixture::new();
-        fixture.storage.scope(|storage| {
-            let control = AcquiringReadControl::new(Some(Instant::now() + Duration::from_millis(200)));
-            let (mut store, _, _) = crate::storage::BorrowedStore::open(storage.clone(), control, Arc::new(AtomicBool::new(false)))?;
-            std::thread::sleep(Duration::from_millis(250));
-            let error: anyhow::Error = store.snapshot()
-                .map_err(|error| WaitSnapshotError(error.into())).err()
-                .expect("a refresh past its deadline fails").into();
-            assert!(is_deadline(&error), "{error:#}");
-            assert!(!is_cancelled(&error), "{error:#}");
-            assert!(completion(Err(error), false).is_err(), "a deadline is not a cancellation");
-            Ok(())
-        }).unwrap();
+        fixture
+            .storage
+            .scope(|storage| {
+                let control =
+                    AcquiringReadControl::new(Some(Instant::now() + Duration::from_millis(200)));
+                let (mut store, _, _) = crate::storage::BorrowedStore::open(
+                    storage.clone(),
+                    control,
+                    Arc::new(AtomicBool::new(false)),
+                )?;
+                std::thread::sleep(Duration::from_millis(250));
+                let error: anyhow::Error = store
+                    .snapshot()
+                    .map_err(|error| WaitSnapshotError(error.into()))
+                    .err()
+                    .expect("a refresh past its deadline fails")
+                    .into();
+                assert!(is_deadline(&error), "{error:#}");
+                assert!(!is_cancelled(&error), "{error:#}");
+                assert!(
+                    completion(Err(error), false).is_err(),
+                    "a deadline is not a cancellation"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 }

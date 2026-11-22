@@ -56,7 +56,8 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
-        /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
+        /// {name}, {effort}, {script}, {runtime} and {resume} (where its archived history ends)
+        /// replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
@@ -99,7 +100,8 @@ enum Command {
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
         /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
-        /// {name}, {effort}, {script} and {runtime} replaced; refused without it, never a hosted
+        /// {name}, {effort}, {script}, {runtime} and {resume} (where its archived history ends)
+        /// replaced; refused without it, never a hosted
         /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
@@ -240,7 +242,7 @@ enum Command {
     /// A local executor for one finite Drive task, named in
     /// SPAWN_LOCAL_EXECUTOR as
     /// `zooid drive-task --binding FILE --prompt {prompt} --message {message}
-    /// --name {name} --runtime {runtime}`. It turns the run's pinned
+    /// --name {name} --runtime {runtime} --resume={resume}`. It turns the run's pinned
     /// TRIBLESPACE_COLLECTION_* routes into Drive's --native-collection
     /// arguments, takes everything else from the binding file, and execs
     /// `drive task`. It opens no pile. A route variable naming no faculties
@@ -266,6 +268,11 @@ enum Command {
         /// The unit's runtime limit in seconds, from {runtime}.
         #[arg(long, value_name = "SECONDS")]
         runtime: u64,
+        /// The archived node the zooid's history ends at, from {resume}
+        /// (`--resume={resume}`): Drive's --native-resume. Empty starts the
+        /// zooid fresh. Omitted, no history is continued either.
+        #[arg(long, value_name = "NODE", allow_hyphen_values = false)]
+        resume: Option<String>,
     },
     /// A claude zooid's inbox hook, run by its unit script as `inbox stop` or
     /// `inbox post`: reads the hook's JSON on stdin and prints the answer.
@@ -425,6 +432,7 @@ pub fn run() -> Result<()> {
         message,
         name,
         runtime,
+        resume,
     } = &command
     {
         // The run's pile and key are Drive's native faculties owner; no
@@ -434,6 +442,7 @@ pub fn run() -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow!("drive-task needs the run's TRIBLESPACE_KEY"))?;
         let routes = super::drive_task::routes_from_env()?;
+        let resume = super::drive_task::parse_resume(resume.as_deref().unwrap_or(""))?;
         let never = super::drive_task::exec(
             binding,
             &super::drive_task::RunInputs {
@@ -444,6 +453,7 @@ pub fn run() -> Result<()> {
                 routes: &routes,
                 pile: &cli.pile,
                 key,
+                resume,
             },
         )?;
         match never {}

@@ -153,6 +153,10 @@ pub mod spawn {
         "0775A8E50E6CFAC1091331B441D1A354" as handoff: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The request a run serves, or an outcome is about. Minted 2026-11-17.
         "AC8D99BE158EBBE0D88236E01D1ABBFB" as request: inlineencodings::GenId;
+        /// The archived node a local run's zooid continued its history from
+        /// (Drive's `--native-resume`), as the launch found it in the archive.
+        /// Absent when the zooid had no history there. Minted 2026-11-22.
+        "D253320ACDE8B68B6CD46D0E98F95222" as resumes: inlineencodings::GenId;
         /// Which outcome an outcome entity is (`OUTCOME_*`). Minted 2026-11-17.
         "8BE0475206CD7D95B03FE7D1EB27609A" as outcome: inlineencodings::GenId;
         /// Why a keeper refused a request, or what it observed beside an

@@ -59,9 +59,12 @@ impl HealthSources {
         let relations =
             OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let presentations = ReceiptSource::open(routing, pile, signer).await?;
-        let latest = pile.with_local(|local| Ok(local.attach::<LwwRegisterBlob>(
-            health.source, (attrs::node.id(), metadata::created_at.id()),
-        )?))?;
+        let latest = pile.with_local(|local| {
+            Ok(local.attach::<LwwRegisterBlob>(
+                health.source,
+                (attrs::node.id(), metadata::created_at.id()),
+            )?)
+        })?;
         Ok(Self {
             health,
             latest,
@@ -92,41 +95,49 @@ impl HealthSources {
         Ok(self)
     }
 
-    fn maintain(&self, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<Option<String>> {
+    fn maintain(
+        &self,
+        pile: &mut impl FacultyAccess,
+        signer: &SigningKey,
+    ) -> Result<Option<String>> {
         #[cfg(test)]
         self.maintenance_passes
             .set(self.maintenance_passes.get() + 1);
         // Pile acquisition is immediately resident-only. Run these local
         // mapping futures to completion without yielding a Peer store guard
         // across network I/O or re-entering a Peer operation.
-        pile.with_local(|local| pollster::block_on(async {
-            for source in [&self.health, &self.relations]
-                .into_iter()
-                .chain(self.service_events.as_ref())
-            {
-                // A report left unattached is read from its own bytes.
+        pile.with_local(|local| {
+            pollster::block_on(async {
+                for source in [&self.health, &self.relations]
+                    .into_iter()
+                    .chain(self.service_events.as_ref())
+                {
+                    // A report left unattached is read from its own bytes.
+                    crate::storage::tolerate_own_lag(
+                        local.maintain_attached(source.succinct, signer).await,
+                    )?;
+                    crate::storage::tolerate_own_lag(
+                        local.maintain_attached(source.rank9, signer).await,
+                    )?;
+                }
                 crate::storage::tolerate_own_lag(
-                    local.maintain_attached(source.succinct, signer).await,
+                    local.maintain_attached(self.latest, signer).await,
                 )?;
-                crate::storage::tolerate_own_lag(
-                    local.maintain_attached(source.rank9, signer).await,
-                )?;
-            }
-            crate::storage::tolerate_own_lag(local.maintain_attached(self.latest, signer).await)?;
-            // As on the ordinary Orient path, receipt freshness avoids a
-            // repeat but is not a precondition of reporting resident health.
-            // Only this optional projection is best effort; health, Relations
-            // and latest-target failures above still propagate unchanged. It
-            // is the ordinary path's own upkeep on the resident-only store,
-            // so a receipt left unattached is read from its own bytes here
-            // too.
-            let receipt_result = self.presentations.maintain(local, signer).await;
-            Ok(receipt_result.err().map(|error| {
-                format!(
+                // As on the ordinary Orient path, receipt freshness avoids a
+                // repeat but is not a precondition of reporting resident health.
+                // Only this optional projection is best effort; health, Relations
+                // and latest-target failures above still propagate unchanged. It
+                // is the ordinary path's own upkeep on the resident-only store,
+                // so a receipt left unattached is read from its own bytes here
+                // too.
+                let receipt_result = self.presentations.maintain(local, signer).await;
+                Ok(receipt_result.err().map(|error| {
+                    format!(
                     "Orient receipt membership not refreshed ({error:#}); a recent event may repeat"
                 )
-            }))
-        }))
+                }))
+            })
+        })
     }
 
     pub(super) fn observe(
@@ -4093,7 +4104,11 @@ mod tests {
         let report_id = report.root().unwrap();
         f.publish(report);
         // Complete local production before the counted polling observation.
-        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
+        assert!(f
+            .sources
+            .maintain(&mut f.store, &f.signer)
+            .unwrap()
+            .is_none());
         let watermark = f.store.snapshot().unwrap();
         for (instant, stale, next) in [
             (59.0, false, Some(60.0)),
@@ -4122,7 +4137,11 @@ mod tests {
                 .record(at(0.0), [condition(State::Current, false)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
+        assert!(f
+            .sources
+            .maintain(&mut f.store, &f.signer)
+            .unwrap()
+            .is_none());
         let before = f.store.snapshot().unwrap();
         f.sources
             .refresh_poll_view(before.clone(), at(1.0))
@@ -4171,7 +4190,11 @@ mod tests {
                 .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
+        assert!(f
+            .sources
+            .maintain(&mut f.store, &f.signer)
+            .unwrap()
+            .is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();
@@ -4239,7 +4262,11 @@ mod tests {
                 .record(at(0.0), [store_condition(State::Stalled, true)])
                 .unwrap(),
         );
-        assert!(f.sources.maintain(&mut f.store, &f.signer).unwrap().is_none());
+        assert!(f
+            .sources
+            .maintain(&mut f.store, &f.signer)
+            .unwrap()
+            .is_none());
         f.sources
             .refresh_poll_view(f.store.snapshot().unwrap(), at(1.0))
             .unwrap();

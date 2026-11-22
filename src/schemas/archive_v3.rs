@@ -652,6 +652,18 @@ pub mod context {
         /// by another process or host). Unlike `node::continues` on a shared
         /// opening node, it names exactly one context.
         "F021AD41ABB83781BB02F503DB97E2CD" as pub continues: GenId;
+        /// ANNOTATION. The zooid that lived this context, by the persona
+        /// name its runtime was given (Drive's `--native-persona`), exactly
+        /// as given. A window is shared by every context that opens the same
+        /// way and says only which model read it; this says who did, so a
+        /// later run of the same zooid can find where its history ends.
+        /// Minted with `trible genid` 2026-11-22.
+        "AB30C81708521FE4AAC46892FCFFD22E" as pub zooid: Handle<UTF8String>;
+        /// ANNOTATION on an occurrence. The context it was observed in. The
+        /// same attribute as Drive's `runtime::in_context`, which writes it;
+        /// declared here so a reader of the archive can join an occurrence
+        /// to its context without Drive's schema.
+        "6BD8278F49B57ED2C86A2450C6A0B1AA" as pub in_context: GenId;
     }
 
     /// How a context's prefix came to be.

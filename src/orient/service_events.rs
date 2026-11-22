@@ -418,7 +418,9 @@ mod tests {
             &mut Out::new(&mut |part| {
                 failed_parts.push(part);
                 bail!("fixture callback rejected complete stdin report")
-            }), &mut |_, _, _| {}))
+            }),
+            &mut |_, _, _| {},
+        ))
         .unwrap_err();
         assert!(format!("{error:#}").contains("fixture callback rejected"));
         assert_eq!(
@@ -441,7 +443,9 @@ mod tests {
             &mut Out::new(&mut |part| {
                 accepted.push(part);
                 Ok(())
-            }), &mut |_, _, _| {}))
+            }),
+            &mut |_, _, _| {},
+        ))
         .unwrap();
         assert_eq!(accepted, failed_parts);
         assert!(f.presented(first.id));
@@ -513,7 +517,9 @@ mod tests {
             &mut Out::new(&mut |part| {
                 output.push(part);
                 Ok(())
-            }), &mut |_, _, _| {}))
+            }),
+            &mut |_, _, _| {},
+        ))
         .unwrap();
         assert!(output.is_empty());
         assert!(!f.presented(event.id));

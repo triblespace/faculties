@@ -15,6 +15,7 @@
 
 pub mod cli;
 pub mod colony;
+pub mod continuation;
 pub mod cover;
 pub mod drive_task;
 pub mod mcp;
@@ -198,6 +199,8 @@ pub struct RunFacts {
     pub untinted: Option<String>,
     /// The request this run serves, when a keeper started it.
     pub request: Option<Id>,
+    /// The archived node a local run continues its zooid's history from.
+    pub resumes: Option<Id>,
     /// How the cover was sized, when the launch asked for a share of the
     /// context window (`--cover`).
     pub cover: Option<cover::CoverRecord>,
@@ -245,6 +248,7 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::model?: model,
         attrs::model_unset?: model_unset,
         attrs::request?: run.request,
+        attrs::resumes?: run.resumes,
     };
     if let Some(cover) = &run.cover {
         fragment += cover_fragment(id, cover);

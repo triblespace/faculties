@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::Deserialize;
+use triblespace::prelude::Id;
 
 /// The role whose route is also Drive's `--native-archive`, the collection
 /// Drive writes the task's own history to.
@@ -186,6 +187,25 @@ pub struct RunInputs<'a> {
     /// The run's pile and signing key: Drive's native faculties owner.
     pub pile: &'a Path,
     pub key: &'a Path,
+    /// `{resume}`: the archived node the zooid's history ends at, Drive's
+    /// `--native-resume`; `None` for a zooid with no history, which Drive
+    /// starts fresh.
+    pub resume: Option<Id>,
+}
+
+/// `{resume}` as spawn substituted it: 32 hex digits, or empty for a zooid
+/// with no archived history. Anything else refuses.
+pub fn parse_resume(word: &str) -> Result<Option<Id>> {
+    if word.is_empty() {
+        return Ok(None);
+    }
+    ensure!(
+        word.len() == 32 && word.bytes().all(|b| b.is_ascii_hexdigit()),
+        "--resume takes the 32-hex archived node spawn found, or nothing; got {word:?}"
+    );
+    Id::from_hex(word)
+        .map(Some)
+        .ok_or_else(|| anyhow!("--resume {word} is not an id"))
 }
 
 /// One `drive task` invocation.
@@ -313,6 +333,9 @@ pub fn plan(binding: &Binding, run: &RunInputs<'_>, prompt_len: u64) -> Result<P
         flag("--native-collection", format!("{role}={descriptor}").into());
     }
     flag("--native-archive", roles[ARCHIVE_ROLE].clone().into());
+    if let Some(node) = run.resume {
+        flag("--native-resume", format!("{node:x}").into());
+    }
     flag("--home", binding.home.clone().into());
     flag("--home-key", binding.home_key.clone().into());
     flag("--tenant", binding.tenant.clone().into());
@@ -492,6 +515,7 @@ mod tests {
             routes,
             pile: Path::new("/piles/colony pile.pile"),
             key: Path::new("/piles/colony.key"),
+            resume: None,
         }
     }
 
@@ -585,6 +609,47 @@ mod tests {
         .map(|word| word.to_string())
         .collect();
         assert_eq!(strings(&plan), expected);
+    }
+
+    #[test]
+    fn a_found_continuation_is_drives_native_resume_and_none_adds_nothing() {
+        let pinned = routes(&["archive", "compass"]);
+        let fresh = strings(&plan(&binding(), &run(&pinned), 500).unwrap());
+        assert!(
+            !fresh.iter().any(|arg| arg == "--native-resume"),
+            "{fresh:?}"
+        );
+
+        let node = Id::from_hex("0123456789abcdef0123456789abcdef").unwrap();
+        let mut resumed = run(&pinned);
+        resumed.resume = Some(node);
+        let args = strings(&plan(&binding(), &resumed, 500).unwrap());
+        let at = args
+            .iter()
+            .position(|arg| arg == "--native-resume")
+            .unwrap();
+        assert_eq!(args[at + 1], "0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "--native-resume").count(),
+            1
+        );
+        // Everything else is the fresh plan's, in order.
+        let mut without = args.clone();
+        without.drain(at..at + 2);
+        assert_eq!(without, fresh);
+
+        assert_eq!(parse_resume("").unwrap(), None);
+        assert_eq!(
+            parse_resume("0123456789abcdef0123456789abcdef").unwrap(),
+            Some(node)
+        );
+        for bad in [
+            "0123",
+            "zz23456789abcdef0123456789abcdef",
+            " 0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(parse_resume(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

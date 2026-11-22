@@ -299,14 +299,18 @@ pub struct LaunchConfig {
 /// unit script, which run as `{script} mcp` is the zooid's own faculties MCP
 /// server, and the unit's
 /// runtime limit in seconds (`SPAWN_LOCAL_MAX_RUNTIME`), which a template
-/// may name only when the limit is set.
-pub const LOCAL_PLACEHOLDERS: [&str; 6] = [
+/// may name only when the limit is set, and the archived node the zooid's
+/// history ends at (32 hex digits), or nothing when it has none: a template
+/// that names `{resume}` makes the launch look the zooid up in the archive,
+/// and a lookup that refuses fails the launch.
+pub const LOCAL_PLACEHOLDERS: [&str; 7] = [
     "{prompt}",
     "{message}",
     "{name}",
     "{effort}",
     "{script}",
     "{runtime}",
+    "{resume}",
 ];
 
 /// Why a template that names `{runtime}` cannot run without a limit.
@@ -316,7 +320,7 @@ const RUNTIME_UNSET: &str = "SPAWN_LOCAL_EXECUTOR names {runtime}, but SPAWN_LOC
 /// What to do when a host has no local executor.
 const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
      SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
-     {message}, {name}, {effort}, {script} and {runtime} replaced at launch; the executor reads the \
+     {message}, {name}, {effort}, {script}, {runtime} and {resume} replaced at launch; the executor reads the \
      prompt on stdin and may write the zooid's closing message to {message}. Nothing falls back \
      to a hosted model";
 
@@ -352,6 +356,11 @@ fn parse_local_executor(template: &str) -> Result<Vec<String>> {
 /// Whether a local executor template names `{runtime}`.
 fn names_runtime(template: &[String]) -> bool {
     template.iter().any(|word| word.contains("{runtime}"))
+}
+
+/// Whether a local executor template names `{resume}`.
+fn names_resume(template: &[String]) -> bool {
+    template.iter().any(|word| word.contains("{resume}"))
 }
 
 impl LaunchConfig {
@@ -875,6 +884,8 @@ pub struct Launched {
     pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
+    /// The archived node a local run continues its zooid's history from.
+    pub resumes: Option<Id>,
     /// How the cover was sized, when the launch asked for a share
     /// (`--cover`).
     pub cover: Option<CoverRecord>,
@@ -900,6 +911,8 @@ struct RunFiles {
     codex_home: PathBuf,
     vibe_home: PathBuf,
     vibe_out: PathBuf,
+    /// The archived node a local run continues from, for `{resume}`.
+    resume: Option<Id>,
 }
 
 /// An agent command line and what the unit gives it.
@@ -987,6 +1000,8 @@ pub struct RunView {
     pub model: Vec<String>,
     pub model_unset: Vec<String>,
     pub untinted: Vec<String>,
+    /// The archived node(s) a local run continued its zooid's history from.
+    pub resumes: Vec<Id>,
     pub message: Vec<Id>,
     pub settle_failure: Vec<String>,
     pub goal_note: Vec<Id>,
@@ -1921,6 +1936,13 @@ impl Spawn {
                     ("{effort}", effort.to_owned()),
                     ("{script}", text(&files.script)),
                     ("{runtime}", runtime),
+                    (
+                        "{resume}",
+                        files
+                            .resume
+                            .map(|node| format!("{node:x}"))
+                            .unwrap_or_default(),
+                    ),
                 ];
                 let argv = template
                     .iter()
@@ -2236,6 +2258,15 @@ impl Spawn {
                 extras.cover,
                 &assemble,
             )?;
+            // A local executor that names {resume} continues the zooid's own
+            // history. Where it ends is read from the archive; a lookup that
+            // refuses fails the launch rather than starting the zooid fresh.
+            let resumes = match &self.launch.local {
+                Some(template) if provider == Provider::Local && names_resume(template) => {
+                    self.continuation(&name)?
+                }
+                _ => None,
+            };
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -2251,6 +2282,7 @@ impl Spawn {
                 model_unset: model_unset.clone(),
                 untinted: untinted.clone(),
                 request: extras.request,
+                resumes,
                 cover: cover.clone(),
             });
             let text = |path: &Path| path.display().to_string();
@@ -2268,6 +2300,7 @@ impl Spawn {
                     codex_home: codex_home.clone(),
                     vibe_home: vibe_home.clone(),
                     vibe_out: vibe_out.clone(),
+                    resume: resumes,
                 },
             )?;
             let script = super::unit_script(&ScriptFacts {
@@ -2405,6 +2438,7 @@ impl Spawn {
                 model: model.clone(),
                 model_unset: model_unset.clone(),
                 untinted,
+                resumes,
                 cover,
                 unprefixed: naming.unprefixed.clone(),
                 goal_note,
@@ -3557,13 +3591,32 @@ impl Spawn {
         &self,
         read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
     ) -> Result<T> {
+        self.observe_scope(DEFAULT_SCOPE_ID, "Spawn", read)
+    }
+
+    /// Where the zooid `name`'s archived history ends, for a local run that
+    /// continues it: read from the archive collection's own facts
+    /// ([`super::continuation::zooid_tail`]). `None` when no context names
+    /// it; an archive that cannot say refuses.
+    pub fn continuation(&self, name: &str) -> Result<Option<Id>> {
+        self.observe_scope(
+            crate::schemas::blockdag::DEFAULT_SCOPE_ID,
+            "Archive",
+            |facts, _| super::continuation::zooid_tail(facts, name),
+        )
+        .with_context(|| format!("find where zooid {name}'s archived history ends"))
+    }
+
+    fn observe_scope<T>(
+        &self,
+        scope: Id,
+        label: &str,
+        read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
+    ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
-            let source = self.storage.open_collection_read(
-                pile,
-                DEFAULT_SCOPE_ID,
-                signer.verifying_key(),
-                runtime,
-            )?;
+            let source =
+                self.storage
+                    .open_collection_read(pile, scope, signer.verifying_key(), runtime)?;
             let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
             let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             runtime
@@ -3573,10 +3626,10 @@ impl Spawn {
                     )?;
                     crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
                 })
-                .context("maintain Spawn fact collection")?;
+                .with_context(|| format!("maintain {label} fact collection"))?;
             let snapshot = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime));
             let facts = crate::storage::acquire_facts(&snapshot, rank9)
-                .context("read Spawn Rank9 collection")?;
+                .with_context(|| format!("read {label} Rank9 collection"))?;
             read(&facts, &snapshot)
         })
     }
@@ -3807,6 +3860,7 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::untinted: ?handle }]))
                 .collect(),
         ),
+        resumes: find!(node: Id, pattern!(facts, [{ run @ attrs::resumes: ?node }])).collect(),
         model: texts(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }])).collect(),
         ),
@@ -4314,6 +4368,9 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         }
         for why in &run.untinted {
             writeln!(out, "  untinted recollection: {why}").unwrap();
+        }
+        if !run.resumes.is_empty() {
+            writeln!(out, "  continues archived node: {}", ids(&run.resumes)).unwrap();
         }
         for sizing in &run.cover_sizing {
             writeln!(out, "  cover sizing: {sizing}").unwrap();
@@ -5472,6 +5529,151 @@ mod tests {
                 "{} --runtime 90 --deadline-of=90s",
                 launched.report.display()
             )
+        );
+    }
+
+    /// Publish archive facts into the fixture's archive collection, as a
+    /// native Drive writes them.
+    fn publish_archive(f: &Fixture, facts: Fragment) {
+        f.storage
+            .with_store(|pile, signer, runtime| {
+                let collection = f.storage.open_collection_write(
+                    pile,
+                    crate::schemas::blockdag::DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                pile.commit(collection, signer, facts)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_local_template_naming_resume_continues_the_zooids_archived_history() {
+        use crate::spawn::continuation::tests::{ctx, Archive};
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor("/opt/drive/zooid {message} --resume={resume}").unwrap())
+        });
+        // Someone else's history is in the archive; this zooid has none yet.
+        let mut archive = Archive::default();
+        let other = ctx();
+        archive.named(other, "zooid-someone-else");
+        let foreign = archive.chain(None, other, 3);
+        publish_archive(&f, archive.facts.clone());
+        let first = spawn.run(&local_request(&f, "Lives twice.")).unwrap();
+        assert_eq!(first.resumes, None);
+        let script = f.script(0);
+        assert!(
+            script.split_whitespace().any(|word| word == "--resume="),
+            "{script}"
+        );
+        assert!(!script.contains(&format!("{foreign:x}")), "{script}");
+        assert!(newest_run(&spawn, &first).resumes.is_empty());
+        spawn
+            .settle(&SettleRequest {
+                name: first.name.clone(),
+                run: first.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(first.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+
+        // Its first life is archived, then it is asked to run again.
+        let mut archive = Archive::default();
+        let lived = ctx();
+        archive.named(lived, &first.name);
+        let tail = archive.chain(None, lived, 4);
+        publish_archive(&f, archive.facts);
+        let asked = spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Name(first.name.clone()),
+                host: None,
+                host_label: Some("testhost".to_owned()),
+                provider: Provider::Local,
+                effort: "medium".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+                cover_percent: None,
+            })
+            .unwrap();
+        // The first unit has ended; the fake launcher's one state says so.
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let pass = spawn.keep_once(&f.keep_config()).unwrap();
+        assert!(
+            matches!(&pass.steps[0], (request, KeepStep::Launched { .. }) if *request == asked.request),
+            "{:?}",
+            pass.steps
+        );
+        let script = f.script(1);
+        let word = format!("--resume={tail:x}");
+        assert!(script.split_whitespace().any(|w| w == word), "{script}");
+        let view = spawn.show(&first.name).unwrap();
+        let resumed: Vec<_> = view
+            .runs
+            .iter()
+            .flat_map(|run| run.resumes.clone())
+            .collect();
+        assert_eq!(resumed, [tail]);
+    }
+
+    #[test]
+    fn a_local_launch_whose_archive_cannot_say_where_the_zooid_ends_starts_nothing() {
+        use crate::spawn::continuation::tests::{ctx, Archive};
+        let f = fixture();
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(parse_local_executor("/opt/drive/zooid --resume={resume}").unwrap())
+        });
+        let first = spawn.run(&local_request(&f, "Diverged.")).unwrap();
+        spawn
+            .settle(&SettleRequest {
+                name: first.name.clone(),
+                run: first.run,
+                request: None,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(first.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        // Two contexts of the zooid whose tails neither continue the other.
+        let mut archive = Archive::default();
+        let (one, two) = (ctx(), ctx());
+        archive.named(one, &first.name);
+        archive.named(two, &first.name);
+        archive.chain(None, one, 2);
+        archive.chain(None, two, 2);
+        publish_archive(&f, archive.facts);
+        let asked = spawn
+            .request(&RequestInput {
+                zooid: ZooidRef::Name(first.name.clone()),
+                host: None,
+                host_label: Some("testhost".to_owned()),
+                provider: Provider::Local,
+                effort: "medium".to_owned(),
+                spawner: "agent-cc".to_owned(),
+                previous: None,
+                handoff: None,
+                cover_percent: None,
+            })
+            .unwrap();
+        let _ = asked;
+        *f.launcher.state.lock().unwrap() = "inactive".to_owned();
+        let pass = spawn.keep_once(&f.keep_config()).unwrap();
+        assert!(
+            matches!(&pass.steps[..], [(_, KeepStep::Refused(why))]
+                if why.contains("diverges") && why.contains(&first.name)),
+            "{:?}",
+            pass.steps
+        );
+        assert_eq!(
+            f.launcher.started.lock().unwrap().len(),
+            1,
+            "nothing else started"
         );
     }
 
@@ -7325,6 +7527,7 @@ mod tests {
             codex_home: PathBuf::from("/s/n.codex"),
             vibe_home: PathBuf::from("/s/n.vibe"),
             vibe_out: PathBuf::from("/s/n.vibe-out"),
+            resume: None,
         };
         for provider in [Provider::Auto, Provider::Local] {
             assert!(f.spawn.agent(provider, "high", &files).is_err());
