@@ -2145,3 +2145,87 @@ fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
         assert_eq!(&replay(&f, command), output, "{command}");
     }
 }
+
+/// `--about` chooses among recollections of exactly the same span by exact
+/// BM25, in the pairs and in the plain report alike, and binds no model.
+/// The cover's shape does not move: the same spans are recalled either way.
+#[test]
+fn wake_about_chooses_among_equal_span_recollections_by_bm25() {
+    use faculties::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+    use std::collections::BTreeSet;
+    let f = Fixture::new();
+    f.wake_self();
+    let chunk = |text: &str| {
+        chunk_fragment(ChunkDraft {
+            content: ChunkDraftContent::Text(text.to_owned()),
+            start_at: wake_at(30_000),
+            end_at: wake_at(30_100),
+            tags: BTreeSet::new(),
+            references: BTreeSet::new(),
+            about_exec_result: None,
+            about_archive_message: None,
+            observed_at: BTreeSet::from([wake_at(30_100)]),
+            aliases: BTreeSet::new(),
+        })
+        .unwrap()
+        .0
+    };
+    let orchard = "We picked apples in the orchard until the baskets were full.";
+    let violin = "The violin rehearsal ran late and the concert hall was cold.";
+    f.publish(
+        faculties::schemas::memory::DEFAULT_SCOPE_ID,
+        chunk(orchard) + chunk(violin),
+    );
+    f.maintain();
+
+    let recalled = |args: &[&str]| -> (Vec<String>, String) {
+        let output = wake_pairs(&f, args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pairs = parse_pairs_with_ranges(&output.stdout);
+        let ranges = pairs
+            .iter()
+            .filter_map(|(_, _, range)| range.clone())
+            .collect();
+        let shown = pairs
+            .iter()
+            .map(|(_, output, _)| output.as_str())
+            .collect::<String>();
+        (ranges, shown)
+    };
+    let (plain_ranges, _) = recalled(&[]);
+    for (about, chosen, other) in [
+        ("violin concert", violin, orchard),
+        ("apples orchard", orchard, violin),
+    ] {
+        let (ranges, shown) = recalled(&["--about", about]);
+        assert_eq!(ranges, plain_ranges, "the tint moved the cover's shape");
+        assert!(
+            shown.contains(chosen),
+            "--about {about:?} did not recall {chosen:?}"
+        );
+        assert!(
+            !shown.contains(other),
+            "--about {about:?} recalled both tellings"
+        );
+
+        let report = f
+            .faculty(env!("CARGO_BIN_EXE_orient"))
+            .args(["wake", "--about", about])
+            .output()
+            .unwrap();
+        assert!(
+            report.status.success(),
+            "{}",
+            String::from_utf8_lossy(&report.stderr)
+        );
+        let report = String::from_utf8(report.stdout).unwrap();
+        assert!(
+            report.contains(chosen) && !report.contains(other),
+            "{report}"
+        );
+    }
+}

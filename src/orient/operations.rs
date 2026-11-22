@@ -78,6 +78,10 @@ pub struct WakePairsOptions {
     pub raw_memory: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
+    /// A topic for the memory cover, as [`WakeTint::about`] with exact BM25
+    /// scores: among recollections of exactly the same span, the closest is
+    /// chosen; the cover's shape does not change and no model is bound.
+    pub about: Option<String>,
 }
 impl Default for WakePairsOptions {
     fn default() -> Self {
@@ -88,6 +92,7 @@ impl Default for WakePairsOptions {
             raw_memory: false,
             doing_limit: wake.doing_limit,
             todo_limit: wake.todo_limit,
+            about: None,
         }
     }
 }
@@ -6440,6 +6445,7 @@ async fn cmd_wake_pairs(
     let mut cover_opts = CoverOpts::plain(options.chars);
     cover_opts.chunk_overhead = options.chunk_overhead;
     cover_opts.raw_memory = options.raw_memory;
+    cover_opts.about = options.about.clone();
     let selection = wake_selection(
         routing,
         storage,

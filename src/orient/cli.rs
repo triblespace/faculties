@@ -150,6 +150,12 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
+        /// A topic for the memory cover: among recollections of exactly the
+        /// same span, the one closest to it by exact BM25 is chosen
+        /// (`memory context --about`). The cover's shape does not change,
+        /// and no model is bound.
+        #[arg(long)]
+        about: Option<String>,
     },
     /// The Compass section of `orient wake`: priority-ranked doing and todo
     /// goals, then every not-done `horizon` goal, longest unmoved first.
@@ -439,6 +445,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             pairs: true,
             raw_memory,
             chunk_overhead,
+            about,
         } => {
             // Diagnostics are about the memory selection, not part of any
             // pair, and stdout carries nothing but the pairs.
@@ -449,6 +456,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                     raw_memory,
                     doing_limit,
                     todo_limit,
+                    about,
                 },
                 out,
             )?;
@@ -466,6 +474,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
             doing_limit,
             todo_limit,
             pairs: false,
+            about,
             ..
         } => orient.wake(
             cli.persona.as_deref(),
@@ -473,7 +482,10 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 chars,
                 doing_limit,
                 todo_limit,
-                tint: None,
+                tint: about.map(|about| super::WakeTint {
+                    about,
+                    scores: None,
+                }),
             },
             out,
         ),
