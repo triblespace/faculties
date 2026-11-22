@@ -35,6 +35,29 @@ All notable changes to this project will be documented in this file.
   touched. A second run finds nothing to do. Plans carry `legacy_content` and
   `images` for this.
 
+- `zooid drive-task` launches a local zooid into Drive's living loop,
+  `drive run --mind mini`, instead of the finite `drive task`, which Drive
+  never had on main. Its arguments are `--binding FILE --brief {brief}
+  --spawner {spawner} --name {name} --resume={resume}`; `--prompt`,
+  `--message` and `--runtime` are gone. The binding loses the task keys
+  (`resident-bytes`, `chunk-bytes`, `turns`, `max-prompt-bytes`,
+  `max-message-bytes`, `teardown-margin-secs`) and gains `max-brief-bytes`;
+  `telemetry` is `"off"` or `{"pile": PATH}`. Rewrite a host's binding and
+  `SPAWN_LOCAL_EXECUTOR` template before this is active.
+- Local executor templates can name `{brief}`, a file holding the zooid's
+  first input without the wake (who she is, the brief, any handoff; spawn
+  writes it next to the prompt), and `{spawner}`, the spawning persona.
+- A local unit is stopped by interrupting it: `KillSignal=SIGINT` with
+  `KillMode=mixed`, so stopping it, or its optional `SPAWN_LOCAL_MAX_RUNTIME`
+  limit, is Drive's ordinary teardown. Settlement reads a local run's exit 0
+  after its runtime limit as a clean end (still noted as the limit); a hosted
+  run on its limit still fails. `Exit::clean` and `ended_clean` take whether
+  the run is local.
+- A local zooid's preamble says what is true in Drive's loop: she lives on
+  this host until the host stops her, her history is archived and she can be
+  resumed, and she reaches her spawner and the colony through her faculties.
+  It no longer mentions `despawn` or forbids `orient_next`.
+
 - New task zooids are named after their colony: `aurora-kuvud-dajiz`. A colony
   is a Relations group marked with the new `KIND_COLONY` tag
   (`5F55CC32689703641BC0F9BD08A6521D`, a second `metadata::tag` on the group

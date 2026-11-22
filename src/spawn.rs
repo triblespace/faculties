@@ -447,11 +447,13 @@ impl Exit {
         }
     }
 
-    /// Whether the run ended as a success: exit 0, and not stopped by its
-    /// runtime limit (an agent that exits 0 on the limit's SIGTERM did not
-    /// finish).
-    pub fn clean(&self) -> bool {
-        self.code == Some(0) && self.result.as_deref() != Some(TIMEOUT_RESULT)
+    /// Whether the run ended as a success: exit 0, and, for a hosted run,
+    /// not stopped by its runtime limit (an agent that exits 0 on the
+    /// limit's SIGTERM did not finish). A `local` run lives in Drive's loop
+    /// until it is interrupted, by its limit too, so exit 0 after that
+    /// interrupt is its ordinary teardown.
+    pub fn clean(&self, local: bool) -> bool {
+        self.code == Some(0) && (local || self.result.as_deref() != Some(TIMEOUT_RESULT))
     }
 }
 
@@ -559,38 +561,42 @@ pub fn settlement_fragment(
 
 /// The fixed preamble that tells a zooid who it is.
 pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
-    // A local zooid runs in Drive, not a hosted agent: it ends its task with
-    // the `despawn` tool, whose optional `message` is its closing words, and
-    // its faculties are Drive's native tools rather than an MCP server.
-    let (report, tools) = if local {
-        (
-            "When the task is done, call `despawn` once, alone and not beside other tool calls, \
-             optionally with a `message`: your closing words (\"done\" is fine). That call ends \
-             the run and {spawner} is messaged. Your work belongs in ordinary notes and messages \
-             as you go, not in a final report."
-                .replace("{spawner}", spawner),
-            "You have the faculties as native tools served through this Drive instance",
-        )
-    } else {
-        (
-            "Your final reply is your report: it is recorded in the pile and {spawner} is \
-             messaged when you exit, so make it the answer, not a farewell."
-                .replace("{spawner}", spawner),
-            "You have the faculties MCP tools, served for you alone",
-        )
-    };
+    if local {
+        return local_preamble(name, spawner);
+    }
     format!(
         "You are {name}, a task zooid of this colony, spawned by {spawner} to do the one task in the \
          brief below. Your name is your persona: PERSONA is set to it, and your faculty writes \
-         are attributed to it. Your context ends when the task ends. {report} Do not arm a \
-         colony watcher (no `orient wait`, no `orient_next`): you are not a window, and news \
-         would fire into a context that ends with this task. {tools}. Their write tools never \
-         read PERSONA, so pass {name} wherever a write tool takes `from`, `persona`, `by` or \
-         `reader`. Your name is \
-         also an address: {spawner} or another zooid may message you while you work. On a \
-         longer task, check between steps with `orient_poll` (persona {name}, peek true), answer \
-         with `message_send` from {name}, and `message_ack` what you have handled. The wake \
-         above is the shared self, its memories recalled with this brief in mind.\n"
+         are attributed to it. Your context ends when the task ends. Your final reply is your \
+         report: it is recorded in the pile and {spawner} is messaged when you exit, so make it \
+         the answer, not a farewell. Do not arm a colony watcher (no `orient wait`, no \
+         `orient_next`): you are not a window, and news would fire into a context that ends \
+         with this task. You have the faculties MCP tools, served for you alone. Their write \
+         tools never read PERSONA, so pass {name} wherever a write tool takes `from`, \
+         `persona`, `by` or `reader`. Your name is also an address: {spawner} or another zooid \
+         may message you while you work. On a longer task, check between steps with \
+         `orient_poll` (persona {name}, peek true), answer with `message_send` from {name}, and \
+         `message_ack` what you have handled. The wake above is the shared self, its memories \
+         recalled with this brief in mind.\n"
+    )
+}
+
+/// A local zooid lives in Drive's loop on this host, which reads its own
+/// wake: only what is true there. No task end, no closing tool; the host
+/// stops her, and her history lets her be resumed.
+fn local_preamble(name: &str, spawner: &str) -> String {
+    format!(
+        "You are {name}, a zooid of this colony, started by {spawner} with the brief below. You \
+         live in Drive's loop on this host; the host stops you. Everything you perceive and do \
+         is archived, so you can be resumed into your own history later. The brief is where you \
+         start, not a fence: if you find more important work, or judge the brief not worth \
+         doing, follow your judgment and say so to {spawner}. Your name is your \
+         persona, and the faculties are your native tools: pass {name} wherever a write tool \
+         takes `from`, `persona`, `by` or `reader`. Your name is also an address: you reach \
+         {spawner} and the colony with `message_send` from {name}, and news for you arrives \
+         through Orient; check with `orient_poll` (persona {name}, peek true) and \
+         `message_ack` what you have handled. The wake before this is the shared self, its \
+         memories recalled with this brief in mind.\n"
     )
 }
 
@@ -618,6 +624,27 @@ pub fn assemble_prompt(wake: &str, preamble: &str, brief: &str, handoff: Option<
         prompt.push_str("\n\n");
     }
     prompt
+}
+
+/// A local zooid's first input: [`assemble_prompt`] without the wake, for
+/// an executor that reads its own (Drive's `--brief-file`).
+pub fn assemble_brief(preamble: &str, brief: &str, handoff: Option<&str>) -> String {
+    let mut text = String::new();
+    for (title, body) in [
+        ("Who you are", Some(preamble)),
+        ("Brief", Some(brief)),
+        ("Handoff", handoff),
+    ]
+    .into_iter()
+    .filter_map(|(title, body)| body.map(|body| (title, body)))
+    {
+        text.push_str("# ");
+        text.push_str(title);
+        text.push_str("\n\n");
+        text.push_str(body.trim_end());
+        text.push_str("\n\n");
+    }
+    text
 }
 
 /// The longest prefix of a topic that fits [`ABOUT_BYTES`], ending on a
@@ -1053,18 +1080,21 @@ mod tests {
             Exit::from_systemd("", "", "oom-kill").describe(),
             "oom-kill"
         );
-        assert!(Exit::from_systemd("exited", "0", "success").clean());
-        assert!(!Exit::from_systemd("exited", "3", "exit-code").clean());
+        assert!(Exit::from_systemd("exited", "0", "success").clean(false));
+        assert!(!Exit::from_systemd("exited", "3", "exit-code").clean(false));
         // The runtime limit fired: never a success, even if the agent caught
         // the SIGTERM and exited 0.
         let stopped = Exit::from_systemd("killed", "TERM", "timeout");
-        assert!(!stopped.clean());
+        assert!(!stopped.clean(false));
+        assert!(!stopped.clean(true));
         assert_eq!(
             stopped.describe(),
             "signal TERM, stopped at its runtime limit"
         );
         let caught = Exit::from_systemd("exited", "0", "timeout");
-        assert!(!caught.clean());
+        assert!(!caught.clean(false));
+        // A local zooid's interrupt is her ordinary end: exit 0 after it is clean.
+        assert!(caught.clean(true));
         assert_eq!(caught.describe(), "exit 0, stopped at its runtime limit");
         assert_eq!(
             Exit::from_systemd("", "", "timeout").describe(),
@@ -1102,22 +1132,36 @@ mod tests {
     }
 
     #[test]
-    fn a_local_zooid_is_told_to_end_with_despawn_and_an_optional_message() {
+    fn a_local_zooid_is_told_she_lives_in_drive_and_is_stopped_by_the_host() {
         let text = preamble("lusab-babad", "tutor", true);
-        assert!(text.contains("call `despawn` once, alone and not beside other tool calls"));
-        assert!(text.contains("optionally with a `message`"));
-        assert!(text.contains("tutor is messaged"));
-        assert!(text.contains("not in a final report"));
-        assert!(!text.contains("task_finish"));
-        assert!(text.contains("native tools served through this Drive instance"));
-        assert!(text.contains("no `orient_next`"));
-        assert!(!text.contains("Your final reply is your report"));
-        assert!(!text.contains("MCP"));
-        // The shared parts stay identical for every provider.
+        assert!(text.contains("You live in Drive's loop on this host; the host stops you."));
+        assert!(text.contains("you can be resumed into your own history"));
+        assert!(text.contains("The brief is where you start, not a fence"));
+        assert!(
+            text.contains("you reach tutor and the colony with `message_send` from lusab-babad")
+        );
+        // Nothing Drive does not have, and no ban on the Orient it arms.
+        for absent in [
+            "despawn",
+            "task_finish",
+            "no `orient_next`",
+            "final reply",
+            "MCP",
+        ] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
         assert!(text.contains(
             "pass lusab-babad wherever a write tool takes `from`, `persona`, `by` or `reader`"
         ));
         assert!(text.contains("`orient_poll` (persona lusab-babad, peek true)"));
+    }
+
+    #[test]
+    fn a_local_first_input_is_the_prompt_without_its_wake() {
+        let prompt = assemble_prompt("THE WAKE", "who", "the brief", Some("the handoff"));
+        let first = assemble_brief("who", "the brief", Some("the handoff"));
+        assert_eq!(prompt, format!("# Wake\n\nTHE WAKE\n\n{first}"));
+        assert!(!first.contains("THE WAKE"));
     }
 
     #[test]

@@ -81,6 +81,11 @@ pub struct UnitSpec {
     /// `RuntimeMaxSec`, when the unit has a runtime limit. Only local units
     /// have one ([`LaunchConfig::local_max_runtime`]).
     pub runtime_max: Option<u64>,
+    /// Stop the unit by interrupting its main process (`KillSignal=SIGINT`,
+    /// `KillMode=mixed`): a local zooid lives in Drive's loop, which ends
+    /// on SIGINT after its ordinary teardown. Any stop, its runtime limit
+    /// included, is then that end; the rest of the unit goes after it.
+    pub interrupt: bool,
 }
 
 impl UnitSpec {
@@ -112,6 +117,15 @@ impl UnitSpec {
             // Settlement runs after the limit fires: ExecStopPost is not
             // counted against RuntimeMaxSec.
             args.extend(["-p".to_owned(), format!("RuntimeMaxSec={seconds}")]);
+        }
+        if self.interrupt {
+            // TimeoutStopSec above bounds the teardown before SIGKILL.
+            args.extend([
+                "-p".to_owned(),
+                "KillSignal=SIGINT".to_owned(),
+                "-p".to_owned(),
+                "KillMode=mixed".to_owned(),
+            ]);
         }
         args.extend(["--".to_owned(), "/bin/bash".to_owned(), script]);
         args
@@ -302,8 +316,11 @@ pub struct LaunchConfig {
 /// may name only when the limit is set, and the archived node the zooid's
 /// history ends at (32 hex digits), or nothing when it has none: a template
 /// that names `{resume}` makes the launch look the zooid up in the archive,
-/// and a lookup that refuses fails the launch.
-pub const LOCAL_PLACEHOLDERS: [&str; 7] = [
+/// and a lookup that refuses fails the launch. `{brief}` is a file holding
+/// the zooid's first input without the wake (who she is, the brief and any
+/// handoff), for an executor that reads its own wake, as Drive does;
+/// `{spawner}` is the spawning persona's label.
+pub const LOCAL_PLACEHOLDERS: [&str; 9] = [
     "{prompt}",
     "{message}",
     "{name}",
@@ -311,6 +328,8 @@ pub const LOCAL_PLACEHOLDERS: [&str; 7] = [
     "{script}",
     "{runtime}",
     "{resume}",
+    "{brief}",
+    "{spawner}",
 ];
 
 /// Why a template that names `{runtime}` cannot run without a limit.
@@ -320,7 +339,7 @@ const RUNTIME_UNSET: &str = "SPAWN_LOCAL_EXECUTOR names {runtime}, but SPAWN_LOC
 /// What to do when a host has no local executor.
 const LOCAL_UNCONFIGURED: &str = "no local executor is configured on this host. Set \
      SPAWN_LOCAL_EXECUTOR to its argv template, words separated by whitespace, with {prompt}, \
-     {message}, {name}, {effort}, {script}, {runtime} and {resume} replaced at launch; the executor reads the \
+     {message}, {name}, {effort}, {script}, {runtime}, {resume}, {brief} and {spawner} replaced at launch; the executor reads the \
      prompt on stdin and may write the zooid's closing message to {message}. Nothing falls back \
      to a hosted model";
 
@@ -913,6 +932,10 @@ struct RunFiles {
     vibe_out: PathBuf,
     /// The archived node a local run continues from, for `{resume}`.
     resume: Option<Id>,
+    /// A local run's first input without the wake, for `{brief}`.
+    brief: PathBuf,
+    /// The spawning persona's label, for `{spawner}`.
+    spawner: String,
 }
 
 /// An agent command line and what the unit gives it.
@@ -1943,6 +1966,8 @@ impl Spawn {
                             .map(|node| format!("{node:x}"))
                             .unwrap_or_default(),
                     ),
+                    ("{brief}", text(&files.brief)),
+                    ("{spawner}", files.spawner.clone()),
                 ];
                 let argv = template
                     .iter()
@@ -2130,11 +2155,13 @@ impl Spawn {
             ("script", launch.file(&name, "sh")),
             ("report", launch.file(&name, "report")),
             ("log", launch.file(&name, "log")),
+            ("brief", launch.file(&name, "brief")),
         ];
         for (what, path) in &files {
             super::require_unit_safe(what, &path.display().to_string())?;
         }
-        let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path)] = files;
+        let [(_, prompt_path), (_, script_path), (_, report_path), (_, log_path), (_, brief_path)] =
+            files;
         let mcp_config = launch.file(&name, "mcp.json");
         let settings = launch.file(&name, "settings.json");
         super::require_unit_safe("settings", &settings.display().to_string())?;
@@ -2251,6 +2278,9 @@ impl Spawn {
             let assemble = |wake: &str| {
                 super::assemble_prompt(wake, &preamble, &brief.text, extras.handoff.as_deref())
             };
+            // A local executor reads its own wake: its first input is the rest.
+            let first_input = (provider == Provider::Local)
+                .then(|| super::assemble_brief(&preamble, &brief.text, extras.handoff.as_deref()));
             let (prompt, cover) = self.size_cover(
                 provider,
                 model.as_deref(),
@@ -2301,6 +2331,8 @@ impl Spawn {
                     vibe_home: vibe_home.clone(),
                     vibe_out: vibe_out.clone(),
                     resume: resumes,
+                    brief: brief_path.clone(),
+                    spawner: spawner_label.to_owned(),
                 },
             )?;
             let script = super::unit_script(&ScriptFacts {
@@ -2359,6 +2391,9 @@ impl Spawn {
                 Provider::Auto => bail!("{} reached the launch unresolved", provider.name()),
             }
             std::fs::write(&prompt_path, &prompt)?;
+            if let Some(first_input) = &first_input {
+                std::fs::write(&brief_path, first_input)?;
+            }
             std::fs::write(&script_path, script)?;
             match std::fs::remove_file(&report_path) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -2375,6 +2410,7 @@ impl Spawn {
                 runtime_max: (provider == Provider::Local)
                     .then_some(launch.local_max_runtime)
                     .flatten(),
+                interrupt: provider == Provider::Local,
             })?;
             started = true;
             let mut record = spawn_fragment;
@@ -2640,13 +2676,13 @@ impl Spawn {
             Ok(Some(view)) => (
                 view.spawner.first().copied().or_else(request_spawner),
                 describe_end(view),
-                ended_clean(view),
+                ended_clean(view, local),
                 view.report.first().copied().or(report_handle),
             ),
             Ok(None) => (
                 request_spawner(),
                 request.exit.describe(),
-                request.exit.clean(),
+                request.exit.clean(local),
                 report_handle,
             ),
             Err(error) => {
@@ -2654,7 +2690,7 @@ impl Spawn {
                 (
                     request_spawner(),
                     request.exit.describe(),
-                    request.exit.clean(),
+                    request.exit.clean(local),
                     report_handle,
                 )
             }
@@ -4259,16 +4295,19 @@ fn lifecycle_text(local: bool, report: Option<TextHandle>, clean: bool) -> Strin
     }
 }
 
-/// Whether a recorded run ended as a success: exit 0 alone, and not stopped
-/// by its runtime limit. A local run's closing message is optional and plays
+/// Whether a recorded run ended as a success: exit 0 alone, and, for a
+/// hosted run, not stopped by its runtime limit. A local run lives until it
+/// is interrupted, its limit included, so its exit 0 after the limit is its
+/// ordinary teardown. A local run's closing message is optional and plays
 /// no part.
-pub fn ended_clean(run: &RunView) -> bool {
+pub fn ended_clean(run: &RunView, local: bool) -> bool {
     run.exit_code == [0]
         && run.signal.is_empty()
-        && !run
-            .result
-            .iter()
-            .any(|result| result == super::TIMEOUT_RESULT)
+        && (local
+            || !run
+                .result
+                .iter()
+                .any(|result| result == super::TIMEOUT_RESULT))
 }
 
 /// One line per spawn: name, runs, how the latest ended, the brief's first line.
@@ -5169,7 +5208,7 @@ mod tests {
         assert!(run.report.is_empty());
         assert!(run.report_text.is_none());
         assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
-        assert!(ended_clean(&run));
+        assert!(ended_clean(&run, true));
         assert_eq!(describe_end(&run), "exit 0");
         let told = f.told(&launched.name);
         assert!(
@@ -5190,7 +5229,7 @@ mod tests {
         let run = newest_run(&spawn, &launched);
         assert!(run.report.is_empty());
         assert_eq!(run.result, ["success"]);
-        assert!(ended_clean(&run));
+        assert!(ended_clean(&run, true));
         assert_eq!(describe_end(&run), "exit 0");
         let told = f.told(&launched.name);
         assert!(told.contains("no closing message"), "{told}");
@@ -5210,7 +5249,7 @@ mod tests {
         assert_eq!(run.report.len(), 1);
         assert_eq!(settled.report, Some(run.report[0]));
         assert_eq!(run.result, ["success"]);
-        assert!(ended_clean(&run));
+        assert!(ended_clean(&run, true));
         let told = f.told(&launched.name);
         assert!(
             told.contains(&format!(
@@ -5229,7 +5268,7 @@ mod tests {
         let (spawn, launched, _) = settle_local(&f, "Fails.", exit, Some(&b"half\n"[..]));
         let run = newest_run(&spawn, &launched);
         assert_eq!(run.exit_code, [3]);
-        assert!(!ended_clean(&run));
+        assert!(!ended_clean(&run, true));
         assert_eq!(describe_end(&run), "exit 3");
         assert_eq!(run.report_text.as_deref(), Some("half\n"));
         assert_eq!(run.result, ["exit-code"]);
@@ -5245,15 +5284,20 @@ mod tests {
     }
 
     #[test]
-    fn a_local_run_stopped_by_its_runtime_limit_is_still_a_timeout() {
+    fn a_local_run_that_ends_cleanly_on_its_runtime_limit_is_noted_not_failed() {
         let f = fixture();
         let exit = Exit::from_systemd("exited", "0", super::super::TIMEOUT_RESULT);
         let (spawn, launched, _) = settle_local(&f, "Timed out.", exit, Some(&b"almost\n"[..]));
         let run = newest_run(&spawn, &launched);
         assert_eq!(run.result, [super::super::TIMEOUT_RESULT]);
+        // The limit interrupts her (SIGINT) and exit 0 is Drive's teardown.
         assert!(
-            !ended_clean(&run),
-            "exit 0 on the limit's SIGTERM is no success"
+            ended_clean(&run, true),
+            "exit 0 after the limit's interrupt is her ordinary end"
+        );
+        assert!(
+            !ended_clean(&run, false),
+            "a hosted run on its limit did not finish"
         );
         assert_eq!(
             describe_end(&run),
@@ -5263,7 +5307,7 @@ mod tests {
         let told = f.told(&launched.name);
         assert!(told.contains(super::super::RUNTIME_LIMIT_NOTE), "{told}");
         assert!(
-            told.contains("(partial: the run did not end cleanly)"),
+            !told.contains("(partial: the run did not end cleanly)"),
             "{told}"
         );
     }
@@ -5298,7 +5342,7 @@ mod tests {
         assert_eq!(after.report, before.report);
         assert_eq!(after.report_text.as_deref(), Some("done"));
         assert_eq!(after.message, before.message);
-        assert!(ended_clean(&after));
+        assert!(ended_clean(&after, true));
         assert_eq!(f.inbox().len(), 1);
     }
 
@@ -5375,8 +5419,62 @@ mod tests {
             .unwrap();
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert!(run.report.is_empty());
-        assert!(ended_clean(run));
+        assert!(ended_clean(run, true));
         assert_eq!(describe_end(run), "exit 0");
+    }
+
+    #[test]
+    fn a_local_executor_gets_the_brief_without_the_wake_and_who_sent_it() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-brief", "true");
+        let spawn = f.relaunch(|launch| {
+            launch.local = Some(
+                parse_local_executor(&format!(
+                    "{} {{message}} --brief {{brief}} --spawner {{spawner}} --name {{name}}",
+                    executor.display()
+                ))
+                .unwrap(),
+            )
+        });
+        let launched = spawn.run(&local_request(&f, "Briefed work.")).unwrap();
+        run_unit_and_settle(&f, &spawn, &launched);
+        let brief = launched.report.with_extension("brief");
+        let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
+        assert_eq!(
+            args.trim(),
+            format!(
+                "{} --brief {} --spawner agent-cc --name {}",
+                launched.report.display(),
+                brief.display(),
+                launched.name
+            )
+        );
+        // Who she is and the brief, exactly; the wake only in the prompt.
+        let text = std::fs::read_to_string(&brief).unwrap();
+        assert_eq!(
+            text,
+            super::super::assemble_brief(
+                &super::super::preamble(&launched.name, "agent-cc", true),
+                "Briefed work.",
+                None
+            )
+        );
+        let prompt = std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap();
+        assert!(
+            prompt.starts_with("# Wake\n\n") && prompt.ends_with(&text),
+            "{prompt}"
+        );
+        assert!(!text.contains("# Wake"));
+        // And a local unit is stopped by interrupting it, a hosted one is not.
+        spawn.run(&f.request("Hosted.")).unwrap();
+        let started = f.launcher.started.lock().unwrap().clone();
+        let stop = |spec: &UnitSpec| {
+            let args = spec.systemd_run_args();
+            ["KillSignal=SIGINT", "KillMode=mixed"]
+                .map(|property| args.iter().any(|arg| arg == property))
+        };
+        assert_eq!(stop(&started[0]), [true, true]);
+        assert_eq!(stop(&started[1]), [false, false]);
     }
 
     #[test]
@@ -5474,7 +5572,7 @@ mod tests {
         assert_eq!(run.exit_code, [0]);
         assert!(run.report.is_empty());
         assert!(run.report_text.is_none());
-        assert!(ended_clean(&run));
+        assert!(ended_clean(&run, true));
         let told = f.told(&launched.name);
         assert!(told.contains("no closing message"), "{told}");
     }
@@ -5727,12 +5825,14 @@ mod tests {
         assert!(at < args.iter().position(|arg| arg == "--").unwrap());
     }
 
-    /// The runtime limit through real systemd: a local executor that sleeps
-    /// past a two-second limit, and one that catches the SIGTERM, writes a
-    /// partial message and exits 0. Neither settles as a success. Skipped
-    /// where no systemd user manager answers.
+    /// The runtime limit through real systemd: the limit interrupts a local
+    /// unit's main process with SIGINT. An executor that sleeps past a
+    /// two-second limit dies of it and settles as a failure; one that tears
+    /// down on the interrupt, as Drive does, writes its message and exits 0,
+    /// and settles as a normal end noted as the limit. Skipped where no
+    /// systemd user manager answers.
     #[test]
-    fn a_local_unit_stopped_at_its_runtime_limit_settles_as_a_failure() {
+    fn a_local_unit_is_interrupted_at_its_runtime_limit_and_a_teardown_ends_cleanly() {
         let reachable = std::process::Command::new("systemctl")
             .args(["--user", "show-environment"])
             .stdout(std::process::Stdio::null())
@@ -5760,7 +5860,7 @@ mod tests {
         let catcher = local_executor(
             &f,
             "local-catch",
-            "trap 'echo partial > \"$1\"; exit 0' TERM\nsleep 60 &\nwait",
+            "trap 'echo partial > \"$1\"; exit 0' INT\nsleep 60 &\nwait",
         );
         let real = |executor: &Path| {
             let mut launch = f.spawn.launch.clone();
@@ -5804,7 +5904,10 @@ mod tests {
             };
             let exit = Exit::from_systemd(after("--code"), after("--status"), after("--result"));
             assert_eq!(exit.result.as_deref(), Some("timeout"), "{args}");
-            assert!(!exit.clean(), "{args}");
+            assert_eq!(exit.clean(true), report.is_some(), "{args}");
+            if report.is_none() {
+                assert_eq!(exit.signal.as_deref(), Some("INT"), "{args}");
+            }
             spawn
                 .settle(&SettleRequest {
                     name: launched.name.clone(),
@@ -5816,7 +5919,7 @@ mod tests {
                 })
                 .unwrap();
             let run = &spawn.show(&launched.name).unwrap().runs[0];
-            assert!(!ended_clean(run));
+            assert_eq!(ended_clean(run, true), report.is_some());
             assert!(
                 describe_end(run).ends_with("stopped at its runtime limit"),
                 "{}",
@@ -5827,7 +5930,8 @@ mod tests {
             assert!(told.contains("stopped at its runtime limit"), "{told}");
             match report {
                 Some(_) => assert!(
-                    told.contains("(partial: the run did not end cleanly)"),
+                    told.contains("closing message")
+                        && !told.contains("(partial: the run did not end cleanly)"),
                     "{told}"
                 ),
                 None => assert!(told.contains("no closing message"), "{told}"),
@@ -7528,6 +7632,8 @@ mod tests {
             vibe_home: PathBuf::from("/s/n.vibe"),
             vibe_out: PathBuf::from("/s/n.vibe-out"),
             resume: None,
+            brief: PathBuf::from("/s/n.brief"),
+            spawner: "s".to_owned(),
         };
         for provider in [Provider::Auto, Provider::Local] {
             assert!(f.spawn.agent(provider, "high", &files).is_err());
