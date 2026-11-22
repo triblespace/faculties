@@ -24,9 +24,9 @@ pub mod mcp;
 pub mod operations;
 
 pub use operations::{
-    Carried, Export, ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit,
-    PlanReport, PlanRevision, Presence, Reason, Reference, ReferenceKind, TransferOptions,
-    TransferReport, Wiki,
+    Carried, Export, HeadRepair, ImageRepairReport, ImportDocument, ImportPlan, ListOptions,
+    PlanAttachment, PlanCommit, PlanImage, PlanReport, PlanRevision, Presence, Reason, Reference,
+    ReferenceKind, TransferOptions, TransferReport, Wiki,
 };
 
 use crate::storage::FactRead;

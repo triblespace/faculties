@@ -125,6 +125,8 @@ fn revision(
         title: title.into(),
         content: content.into(),
         predecessors: predecessors.iter().map(|key| (*key).to_owned()).collect(),
+        legacy_content: None,
+        images: Vec::new(),
     }
 }
 

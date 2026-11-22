@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Wiki has an inline image contract: `#image("files:<64-hex content hash>",
+  alt: "...")`, optionally inside `#figure(..)` or `#link(..)[..]`. Writes
+  (`wiki create`, `edit`, `import`, plan imports) read the named bytes from the
+  selected Files collection, or from the plan's own attachments, and Typst
+  validation decodes them; a hash that names no file there, bytes not yet on
+  the device, or bytes that are not an image refuse the write. `wiki check
+  --compile` reads them the same way. Any other image path is refused as
+  before. Showing the image is the viewer's part.
+
+- `wiki import gollum` embeds images the source shows inline (Markdown
+  `![alt](src)`, including inside links, tables and headings; Gollum
+  `[[x.png|alt=..]]`, with `frame` as caption; AsciiDoc `image:`/`image::`,
+  with a `.Title` line or `title=` as caption) when they name PNG, JPEG, GIF,
+  WebP or SVG bytes in the same commit's tree. `--source-base URL` (repeatable)
+  names where the wiki was served, so an absolute image URL under it resolves
+  to the repository's own file; other hosts, undisplayable files and unresolved
+  targets keep the earlier link rendering. A page that did not change keeps the
+  image bytes of its own commit. Revisions imported before this keep their
+  text: a repeated import reuses them.
+
+- `wiki import gollum SRC --repair-images` corrects histories imported before
+  images were embedded. It prints one successor per current head that still
+  shows an earlier image link, superseding exactly that head with its own text
+  and each image replaced; `--apply` publishes them as one Wiki commit and
+  nothing in Files. An unedited head is replaced at each image's exact
+  position; on an edited head an image is only replaced where its whole lines
+  occur exactly once in the imported ancestor and in the head. Everything else
+  is reported and left alone, and heads that moved while planning are not
+  touched. A second run finds nothing to do. Plans carry `legacy_content` and
+  `images` for this.
+
 - New task zooids are named after their colony: `aurora-kuvud-dajiz`. A colony
   is a Relations group marked with the new `KIND_COLONY` tag
   (`5F55CC32689703641BC0F9BD08A6521D`, a second `metadata::tag` on the group

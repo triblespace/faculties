@@ -108,6 +108,21 @@ displays it alongside the original revision text. Existing revision IDs and
 exact text exports stay stable. New commits extend those histories. A source occurrence
 that matches multiple histories is reported before anything is published.
 
+Images the wiki shows inline become `#image("files:<content hash>")`, read
+from the same commit. If pages link images by absolute URL, name where the wiki
+was served so those URLs resolve to the repository's own files:
+
+```sh
+wiki --workspace "$workspace_revision" import gollum "/path/to/studio wiki.bundle" \
+  --source-base https://wiki.example.org/
+```
+
+A wiki imported before images were embedded keeps its revisions. To correct
+it, run the same command with `--repair-images`. It lists one successor per
+current page head, with the images it replaces and any it leaves alone, and
+publishes nothing. Add `--apply` to publish them. Text written after the import
+is kept, and a second run finds nothing to do.
+
 The adapter ships inside the Wiki binary. `wiki import <file.typ>` and
 `wiki import --plan plan.json` remain available for other sources.
 

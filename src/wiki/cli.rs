@@ -4,7 +4,7 @@ use super::operations::{
     ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit, PlanRevision, Wiki,
 };
 use crate::out::Out;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -378,6 +378,19 @@ enum ImportSource {
         source: PathBuf,
         #[arg(long)]
         tag: Vec<String>,
+        /// Where the wiki was served, e.g. `https://wiki.example.org/` or `/wiki/`.
+        /// An image linked by absolute URL under it is embedded from the
+        /// repository's own file. Repeatable.
+        #[arg(long, value_name = "URL")]
+        source_base: Vec<String>,
+        /// Instead of importing, correct the current heads of histories already
+        /// imported, embedding images an earlier converter rendered as links.
+        /// Prints what it would publish; nothing is written without --apply.
+        #[arg(long, conflicts_with = "tag")]
+        repair_images: bool,
+        /// Publish the corrections --repair-images lists, as one Wiki commit.
+        #[arg(long, requires = "repair_images")]
+        apply: bool,
     },
 }
 
@@ -477,9 +490,19 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             )),
         },
         Command::Import {
-            source: Some(ImportSource::Gollum { source, tag }),
+            source:
+                Some(ImportSource::Gollum {
+                    source,
+                    tag,
+                    source_base,
+                    repair_images,
+                    apply,
+                }),
             ..
-        } => super::gollum::import(&wiki, &source, &tag, out),
+        } => {
+            let repair = repair_images.then_some(apply);
+            super::gollum::import(&wiki, &source, &tag, &source_base, repair, out)
+        }
         Command::Import {
             plan: Some(plan),
             tag,
@@ -633,6 +656,21 @@ struct PlanFileRevision {
     source: Option<String>,
     #[serde(default)]
     predecessors: Vec<String>,
+    /// An earlier converter's rendering, for correcting imported histories.
+    #[serde(default)]
+    legacy_content: Option<PathBuf>,
+    #[serde(default)]
+    images: Vec<PlanFileImage>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanFileImage {
+    legacy: String,
+    display: String,
+    ordinal: Option<usize>,
+    anchor: String,
+    anchor_ordinal: Option<usize>,
 }
 
 /// An RFC 3339 source date (git's `%aI`) as a point interval; the offset only
@@ -689,7 +727,34 @@ pub(crate) fn read_plan(path: &Path) -> Result<ImportPlan> {
         let mut revisions = Vec::with_capacity(commit.revisions.len());
         for revision in commit.revisions {
             let source = base.join(&revision.content);
+            let legacy_content = revision
+                .legacy_content
+                .map(|legacy| {
+                    let legacy = base.join(legacy);
+                    fs::read_to_string(&legacy)
+                        .with_context(|| format!("read {}", legacy.display()))
+                })
+                .transpose()?;
+            if legacy_content.is_some() == revision.images.is_empty() {
+                bail!(
+                    "plan revision '{}' must list images exactly when it names legacy content",
+                    revision.key
+                );
+            }
+            let images = revision
+                .images
+                .into_iter()
+                .map(|image| super::operations::PlanImage {
+                    legacy: image.legacy,
+                    display: image.display,
+                    ordinal: image.ordinal,
+                    anchor: image.anchor,
+                    anchor_ordinal: image.anchor_ordinal,
+                })
+                .collect();
             revisions.push(PlanRevision {
+                legacy_content,
+                images,
                 content: fs::read_to_string(&source)
                     .with_context(|| format!("read {}", source.display()))?,
                 key: revision.key,

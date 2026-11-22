@@ -6,6 +6,15 @@ following symlinks, executing repository code, or expanding AsciiDoc includes.
 Recognized articles become Wiki revisions with exact source-file citations.
 Original page files and other tracked file versions are stored in Files.
 Formats without a native renderer retain their text as an inert Wiki source view.
+
+An image the source shows inline (Markdown `![alt](src)`, a Gollum `[[x.png]]`
+tag, an AsciiDoc `image:` macro) is embedded as `#image("plan:source/<oid>")`,
+which the importer resolves to `#image("files:<content hash>")`, when it names
+displayable bytes in the commit's own tree: a relative or root path, or an
+absolute URL under a `--source-base` the wiki was served from. Anything else
+keeps the earlier link rendering. Every revision with an embedded image also
+lists, per image, the earlier rendering and its exact place in that earlier
+body, so already imported histories can be corrected in place.
 """
 import argparse
 import hashlib
@@ -19,7 +28,7 @@ import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 HERE = Path(__file__).resolve().parent
 
@@ -45,6 +54,59 @@ MIME = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
         ".css": "text/css", ".js": "text/javascript", ".json": "application/json",
         ".gollum": "text/plain", **{s: "text/markdown" for s in MARKDOWN},
         **{s: "text/asciidoc" for s in ASCIIDOC}, **{s: "text/plain" for s in OTHER}}
+
+
+SITE_OPEN, SITE_CLOSE = asciidoc.SITE_OPEN, "\ue001"
+SITE = re.compile(SITE_OPEN + r"(\d+)" + SITE_CLOSE)
+
+
+def image_kind(data):
+    """The raster or vector format Typst can show, sniffed from the bytes."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    head = data[:4096].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head.startswith(b"<") and b"<svg" in head:
+        return "svg"
+    return None
+
+
+class SourceBase:
+    """Where the original wiki was served, so absolute links back to it name
+    files in its own tree. `http://host/wiki/` or a root path such as `/wiki/`."""
+
+    def __init__(self, raw):
+        parts = urlsplit(raw)
+        if parts.scheme:
+            if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+                raise SystemExit(f"--source-base {raw!r}: expected http(s)://host/ or /path/")
+            self.host = (parts.hostname.lower(), parts.port)
+        elif raw.startswith("/") and not raw.startswith("//"):
+            self.host = None
+        else:
+            raise SystemExit(f"--source-base {raw!r}: expected http(s)://host/ or /path/")
+        if parts.query or parts.fragment:
+            raise SystemExit(f"--source-base {raw!r}: no query or fragment")
+        self.path = unquote(parts.path or "/").rstrip("/") + "/"
+
+    def relative(self, target):
+        """The tree path an absolute target names under this base, or None."""
+        parts = urlsplit(target)
+        if self.host is None:
+            if parts.scheme or parts.netloc:
+                return None
+        elif (parts.scheme.lower() not in ("http", "https") or not parts.hostname
+              or (parts.hostname.lower(), parts.port) != self.host):
+            return None
+        path = unquote(parts.path)
+        if not (path + "/").startswith(self.path) or path + "/" == self.path:
+            return None
+        return path[len(self.path):]
 
 
 def git(repo, *args):
@@ -106,6 +168,52 @@ def renames(repo, parent, sha):
     return result
 
 
+class Rendering:
+    """A page body with embedded images marked, rendered both ways."""
+
+    def __init__(self, body, sites):
+        self.body = body
+        self.sites = sites
+
+    def replace(self, old, new):
+        return Rendering(self.body.replace(old, new),
+                         [(a.replace(old, new), b.replace(old, new)) for a, b in self.sites])
+
+    def text(self, legacy=False):
+        return SITE.sub(lambda m: self.sites[int(m[1])][0 if legacy else 1], self.body)
+
+    def images(self, prefix=""):
+        """Each embedded image with its earlier rendering and that rendering's
+        exact place in the earlier body: its ordinal among equal snippets in the
+        whole body, and the lines it spans with its ordinal among them there."""
+        rows, cursor, start = [], 0, len(prefix)
+        for m in SITE.finditer(self.body):
+            snippet, shown = self.sites[int(m[1])]
+            start += m.start() - cursor
+            rows.append((start, snippet, shown))
+            start += len(snippet)
+            cursor = m.end()
+        whole = prefix + self.text(legacy=True)
+        result = []
+        for start, snippet, shown in rows:
+            first = whole.rfind("\n", 0, start) + 1
+            last = whole.find("\n", start + len(snippet))
+            anchor = whole[first:last if last != -1 else len(whole)]
+            result.append(dict(legacy=snippet, display=shown,
+                               ordinal=occurrence(whole, snippet, start),
+                               anchor=anchor, anchor_ordinal=occurrence(anchor, snippet, start - first)))
+        return result
+
+
+def occurrence(text, snippet, start):
+    """Index of the non-overlapping occurrence of `snippet` at `start`, or None."""
+    index, at = 0, text.find(snippet)
+    while at != -1 and at < start:
+        index += 1
+        at = text.find(snippet, at + len(snippet))
+    return index if at == start else None
+
+
 @dataclass
 class State:
     tree: dict
@@ -117,8 +225,67 @@ class Converter(markdown.Page):
     def __init__(self, owner, sha, path, tree, pages):
         super().__init__(owner, sha, path, pages, {p for p, v in tree.items() if not page(p, v) and v[0] != "160000"})
         self.tree = tree
+        self.sites = []  # (earlier rendering, embedded rendering)
+        self.quiet = 0
 
-    def link(self, label, target, image=False):
+    def finding(self, kind, detail, loss):
+        if not self.quiet:
+            super().finding(kind, detail, loss)
+
+    def link(self, label, target, image=False, display=None):
+        if display is not None:
+            shown = self.show(display)
+            if shown is not None:
+                # The earlier rendering of the same construct, without its
+                # findings or link dependencies: only its text is recorded.
+                self.quiet += 1
+                links = list(self.links)
+                try:
+                    legacy = self.plain_link(label, target, image)
+                finally:
+                    self.quiet -= 1
+                    self.links = links
+                self.sites.append((display.get("legacy_prefix", "") + legacy, shown))
+                return SITE_OPEN + str(len(self.sites) - 1) + SITE_CLOSE
+        return self.plain_link(label, target, image)
+
+    def show(self, display):
+        """Typst embedding the image `display` names, or None to keep a link."""
+        target = unquote(display["target"].strip().strip("<>"))
+        clean = target.split("#", 1)[0].split("?", 1)[0]
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target) or clean.startswith("//"):
+            relative = next((r for r in (b.relative(clean) for b in self.driver.bases) if r is not None), None)
+            if relative is None:
+                self.finding("external-image-kept-as-link", "", False)
+                return None
+            candidates = [relative.lstrip("/")]
+        else:
+            relative = next((r for r in (b.relative(clean) for b in self.driver.bases if b.host is None)
+                             if r is not None), None)
+            direct = (relative if relative is not None else clean).lstrip("/")
+            candidates = [posixpath.normpath(posixpath.join(self.dir, clean)).lstrip("/"), direct]
+            fallback = self.file_target(direct)
+            if fallback:
+                candidates.append(fallback)
+        match = next((c for c in candidates if c in self.tree), None)
+        if not match or self.tree[match][0] not in ("100644", "100755") or page(match, self.tree[match]):
+            self.finding("unresolved-image-kept-as-link", "", False)
+            return None
+        oid = self.tree[match][1]
+        if image_kind((self.driver.out / "blobs" / oid).read_bytes()) is None:
+            self.finding("undisplayable-image-kept-as-link", "", False)
+            return None
+        args = asciidoc._string("plan:" + source_key(oid))
+        if display.get("alt"):
+            args += ", alt: " + asciidoc._string(display["alt"])
+        caption = display.get("caption_typst")
+        if caption is None and display.get("caption"):
+            caption = markdown.escape_plain(display["caption"], False)
+        if caption:
+            return "#figure(image(" + args + "), caption: [" + caption + "])"
+        return "#image(" + args + ")"
+
+    def plain_link(self, label, target, image=False):
         original = target
         target = unquote(target.strip().strip("<>"))
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
@@ -162,15 +329,17 @@ class Converter(markdown.Page):
 
 
 class Adapter:
-    def __init__(self, repo, out):
+    def __init__(self, repo, out, bases=()):
         self.repo = repo
         self.out = out
+        self.bases = list(bases)
         self.commits = []
         self.changes = []
         self.findings = []
         self.aliases = {}
         self.versions = set()
         self.order = 0
+        self.images = 0
 
     def finding(self, kind, commit, path, detail, loss):
         self.findings.append(dict(kind=kind, commit=commit, path=path, rendering_loss=loss))
@@ -216,7 +385,8 @@ class Adapter:
         cv = Converter(self, sha, path, tree, targets)
         ext = Path(path).suffix.lower()
         if ext in ASCIIDOC:
-            result = asciidoc.convert_asciidoc(text, lambda t, s: cv.link(markdown.escape_plain(s, False), t))
+            result = asciidoc.convert_asciidoc(
+                text, lambda t, s, d=None: cv.link(markdown.escape_plain(s, False), t, display=d))
         elif ext in MARKDOWN:
             # Gollum accepts literal spaces in unquoted local Markdown hrefs.
             text = re.sub(r'\]\((/[^()\n]* [^()\n]*)\)',
@@ -226,21 +396,31 @@ class Adapter:
         else:
             result = asciidoc._raw(text, block=True)
             self.finding("source-markup-shown-literally", sha, path, "", False)
-        return result.rstrip() + "\n\n" + link(source_key(oid), "Originalquelle") + "\n", cv.links
+        body = result.rstrip() + "\n\n" + link(source_key(oid), "Originalquelle") + "\n"
+        return Rendering(body, cv.sites), cv.links
 
     def emit(self, rows, key, logical, path, text, predecessors, source=None):
         self.order += 1
         rel = f"pages/{self.order:06}.typ"
+        if not isinstance(text, Rendering):
+            text = Rendering(text, [])
+        prefix = ""
         if not predecessors:
             # Native unanchored revisions derive identity from title/body/author.
             # Separate identical original roots (including re-created paths)
             # without adding visible text or relying on global traversal order.
-            text = "// Gollum source root " + key + "\n" + text
-        (self.out / rel).write_text(text, encoding="utf8")
+            prefix = "// Gollum source root " + key + "\n"
+        (self.out / rel).write_text(prefix + text.text(), encoding="utf8")
         revision = dict(key=key, page=logical, path=path, title=markdown.title_of(path),
                         content=rel, predecessors=list(dict.fromkeys(predecessors)))
         if source is not None:
             revision["source"] = source
+        if text.sites:
+            legacy = f"pages/{self.order:06}.legacy.typ"
+            (self.out / legacy).write_text(prefix + text.text(legacy=True), encoding="utf8")
+            revision["legacy_content"] = legacy
+            revision["images"] = text.images(prefix)
+            self.images += len(text.sites)
         rows.append(revision)
 
     def commit(self, sha, parents, states, author, date):
@@ -371,18 +551,22 @@ class Adapter:
                 fh.write("\n")
         losses = sum(f["rendering_loss"] for f in self.findings)
         print(f"{len(records)} original commits, {self.order} Wiki revisions, "
-              f"{len(self.versions)} original path/blob versions, {losses} rendering-loss findings")
+              f"{len(self.versions)} original path/blob versions, {self.images} embedded images, "
+              f"{losses} rendering-loss findings")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--source-base", action="append", default=[], metavar="URL",
+                        help="where the wiki was served (http(s)://host/ or /path/); repeatable")
     args = parser.parse_args()
+    bases = [SourceBase(raw) for raw in args.source_base]
     os.umask(0o077)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         parser.error("output directory must be empty")
     (args.output / "pages").mkdir()
     (args.output / "blobs").mkdir()
-    Adapter(args.repo, args.output).run()
+    Adapter(args.repo, args.output, bases).run()

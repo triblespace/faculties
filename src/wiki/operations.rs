@@ -290,6 +290,13 @@ impl Wiki {
         cmd_import_plan(self.storage(), plan, tags.to_vec(), PlanMode::Gollum, None)
     }
 
+    /// Correct the current heads of histories an earlier Gollum converter
+    /// imported, embedding the images it rendered as links. Without `apply`
+    /// nothing is published; the report names every successor either way.
+    pub fn repair_gollum_images(&self, plan: ImportPlan, apply: bool) -> Result<ImageRepairReport> {
+        gollum_repair::repair(self.storage(), plan, apply)
+    }
+
     pub fn export_all(&self) -> Result<Vec<(Id, String)>> {
         cmd_batch_export(self.storage())
     }
@@ -982,8 +989,110 @@ fn lint_line<P: TriblePattern>(line: &str, resolver: ReferenceResolver<'_, P>) -
     }
 }
 
+/// Every `files:` or `plan:` path an `image(...)` call in `content` names.
+///
+/// This is the Wiki's inline image contract: `#image("files:<64-hex content
+/// hash>", alt: "...")`, optionally inside `#figure(..)` or `#link(..)[..]`.
+/// A viewer resolves the path against its Files collection; a writer checks
+/// the same bytes decode before it publishes.
+fn image_paths(content: &str) -> BTreeSet<&str> {
+    static IMAGE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = IMAGE
+        .get_or_init(|| regex::Regex::new(r#"\bimage\(\s*"((?:files|plan):[^"\\]+)""#).unwrap());
+    re.captures_iter(content)
+        .map(|captures| captures.get(1).expect("one capture group").as_str())
+        .collect()
+}
+
+/// Where a writer finds the bytes its body's images name.
+trait ImageBytes {
+    /// The exact bytes of a `files:` or `plan:` image path, or why there are none.
+    fn image_bytes(&self, path: &str) -> Result<anybytes::Bytes>;
+}
+
+/// A body with no image source: any `files:` image is refused.
+#[cfg(test)]
+struct NoImages;
+
+#[cfg(test)]
+impl ImageBytes for NoImages {
+    fn image_bytes(&self, path: &str) -> Result<anybytes::Bytes> {
+        bail!("image {path}: no Files collection to read it from")
+    }
+}
+
+/// Images named by full content hash, read from the pile. With a Files
+/// observation the hash must also be the content of one of its files.
+struct FilesImages<'a> {
+    files: Option<&'a FactArchive>,
+    reader: &'a PileSnapshot,
+}
+
+fn image_handle(path: &str) -> Result<ContentHandle> {
+    let token = path
+        .strip_prefix("files:")
+        .ok_or_else(|| anyhow!("image {path}: not a files: reference"))?;
+    if token.len() != 64 {
+        bail!("image {path}: an image names a full 64-hex content hash");
+    }
+    let hash =
+        inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(&token.to_ascii_lowercase())
+            .map_err(|_| anyhow!("image {path}: invalid content hash"))?;
+    Ok(inlineencodings::Handle::from_hash(hash))
+}
+
+impl ImageBytes for FilesImages<'_> {
+    fn image_bytes(&self, path: &str) -> Result<anybytes::Bytes> {
+        let handle = image_handle(path)?;
+        if let Some(files) = self.files {
+            if !exists!(
+                (),
+                pattern!(files, [{ _?file @ metadata::tag: &KIND_FILE, file::content: &handle }])
+            ) {
+                bail!("image {path} names no file in the selected Files collection");
+            }
+        }
+        let blob: Blob<blobencodings::RawBytes> = self.reader.get(handle).map_err(|_| {
+            anyhow!("image {path}: its file is cataloged, but its bytes are not on this device yet")
+        })?;
+        Ok(blob.bytes)
+    }
+}
+
+/// A plan's own attachments, by plan key or content hash, before Files.
+struct PlanImages<'a> {
+    attachments: &'a HashMap<String, ContentHandle>,
+    bytes: &'a BTreeMap<ContentHandle, anybytes::Bytes>,
+    files: FilesImages<'a>,
+}
+
+impl ImageBytes for PlanImages<'_> {
+    fn image_bytes(&self, path: &str) -> Result<anybytes::Bytes> {
+        if let Some(key) = path.strip_prefix("plan:") {
+            let handle = self
+                .attachments
+                .get(key)
+                .ok_or_else(|| anyhow!("image {path} names no earlier plan attachment"))?;
+            return Ok(self.bytes[handle].clone());
+        }
+        match self.bytes.get(&image_handle(path)?) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => self.files.image_bytes(path),
+        }
+    }
+}
+
+#[cfg(test)]
 fn validate_typst(content: &str) -> Result<()> {
-    let world = typst_validate::ValidateWorld::new(content);
+    validate_typst_with(content, &NoImages)
+}
+
+fn validate_typst_with(content: &str, source: &dyn ImageBytes) -> Result<()> {
+    let mut images = BTreeMap::new();
+    for path in image_paths(content) {
+        images.insert(path.to_owned(), source.image_bytes(path)?);
+    }
+    let world = typst_validate::ValidateWorld::with_images(content, images);
     world
         .validate()
         .map_err(|errors| anyhow!("typst compilation failed:\n{}", errors.join("\n")))
@@ -994,9 +1103,10 @@ fn prepare_content(
     wiki: &FactArchive,
     files: Option<&FactArchive>,
     allow_dangling: bool,
+    images: &dyn ImageBytes,
 ) -> Result<String> {
     let content = lint_fix(raw, ReferenceResolver { wiki, files });
-    validate_typst(&content)?;
+    validate_typst_with(&content, images)?;
     validate_links(&content, wiki, allow_dangling)?;
     validate_file_links(&content, files, allow_dangling)?;
     Ok(content)
@@ -1020,7 +1130,11 @@ fn cmd_create(
     let raw = content;
     let (content, tags, mut fragment) =
         storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
-            let content = prepare_content(&raw, &view.facts, Some(files), force)?;
+            let images = FilesImages {
+                files: Some(files),
+                reader: &view.reader,
+            };
+            let content = prepare_content(&raw, &view.facts, Some(files), force, &images)?;
             let mut fragment = Fragment::empty();
             let tags = resolve_tags(&view.facts, &view.reader, &tags, &mut fragment)?;
             Ok((content, tags, fragment))
@@ -1054,7 +1168,13 @@ fn cmd_edit(
             None => read_string(&view.reader, agreed(&entry, |head| head.title, "title")?)?,
         };
         let content = match &content {
-            Some(raw) => prepare_content(raw, &view.facts, files.first(), force)?,
+            Some(raw) => {
+                let images = FilesImages {
+                    files: files.first(),
+                    reader: &view.reader,
+                };
+                prepare_content(raw, &view.facts, files.first(), force, &images)?
+            }
             None => read_string(
                 &view.reader,
                 agreed(&entry, |head| head.content, "content")?,
@@ -1833,7 +1953,11 @@ fn cmd_import(
     let mut ids = Vec::new();
     for document in documents {
         let content = document.content;
-        let content = prepare_content(&content, &view.facts, Some(&files_catalog), true)?;
+        let images = FilesImages {
+            files: Some(&files_catalog),
+            reader: &view.reader,
+        };
+        let content = prepare_content(&content, &view.facts, Some(&files_catalog), true, &images)?;
         let title = content
             .lines()
             .find_map(|line| line.strip_prefix("= "))
@@ -1899,6 +2023,26 @@ pub struct PlanRevision {
     pub source: Option<String>,
     /// Revision keys of the source parents' states of this page.
     pub predecessors: Vec<String>,
+    /// The same page as an earlier converter rendered it, before images were
+    /// embedded. Present exactly when `images` is not empty.
+    pub legacy_content: Option<String>,
+    /// Every image embedded in `content`, with its place in `legacy_content`.
+    pub images: Vec<PlanImage>,
+}
+
+/// One image an earlier converter rendered as a link, and where.
+///
+/// `legacy` occurs in `legacy_content` as its `ordinal`-th non-overlapping
+/// occurrence; `anchor` is the whole run of lines it spans there, and
+/// `anchor_ordinal` its place among `legacy` occurrences in that run. An
+/// ordinal is absent when the occurrences overlap and so cannot be counted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanImage {
+    pub legacy: String,
+    pub display: String,
+    pub ordinal: Option<usize>,
+    pub anchor: String,
+    pub anchor_ordinal: Option<usize>,
 }
 
 /// What one plan run published. A replay of a completed plan reports zero
@@ -1981,9 +2125,22 @@ fn resolve_plan_links(
     revision: &str,
 ) -> Result<String> {
     static PLAN_LINK: OnceLock<regex::Regex> = OnceLock::new();
-    let re = PLAN_LINK.get_or_init(|| regex::Regex::new(r#"#link\("plan:([^"]+)"\)"#).unwrap());
+    let re = PLAN_LINK.get_or_init(|| {
+        regex::Regex::new(r#"#link\("plan:([^"]+)"\)|(#image\(|#figure\(image\()"plan:([^"]+)""#)
+            .unwrap()
+    });
     let mut missing = None;
     let resolved = re.replace_all(content, |captures: &regex::Captures| {
+        if let (Some(call), Some(key)) = (captures.get(2), captures.get(3)) {
+            // An image names attachment bytes, never a page.
+            return match attachments.get(key.as_str()) {
+                Some(handle) => format!("{}\"files:{}\"", call.as_str(), content_hash_hex(*handle)),
+                None => {
+                    missing.get_or_insert_with(|| key.as_str().to_owned());
+                    captures[0].to_owned()
+                }
+            };
+        }
         let key = &captures[1];
         if let Some(id) = pages.get(key) {
             format!("#link(\"wiki:{id:x}\")")
@@ -2136,6 +2293,7 @@ fn cmd_import_plan(
     let mut revisions: HashMap<String, Id> = HashMap::new();
     let mut pages: HashMap<String, Id> = HashMap::new();
     let mut attachments: HashMap<String, ContentHandle> = HashMap::new();
+    let mut attachment_bytes: BTreeMap<ContentHandle, anybytes::Bytes> = BTreeMap::new();
     let mut staged_files = BTreeSet::new();
     let mut staged_revisions = BTreeSet::new();
     let mut staged_provenance = BTreeSet::new();
@@ -2169,6 +2327,7 @@ fn cmd_import_plan(
             .next()
             .context("staged file content")?;
             attachments.insert(attachment.key.clone(), content);
+            attachment_bytes.insert(content, attachment.bytes.clone());
             if !known_files.contains(&file_id) && staged_files.insert(file_id) {
                 let source_path: schema::TextHandle =
                     files_fragment.put(format!("{}:{}", commit.commit, attachment.path));
@@ -2194,8 +2353,22 @@ fn cmd_import_plan(
         let mut fragment = pending_tags.take().unwrap_or_else(Fragment::empty);
         for revision in &commit.revisions {
             wiki_model::check_revision_inputs(&revision.title, &tags)?;
-            let content = prepare_content(&revision.content, &wiki_facts, Some(&files_facts), true)
-                .with_context(|| format!("plan revision '{}'", revision.key))?;
+            let images = PlanImages {
+                attachments: &attachments,
+                bytes: &attachment_bytes,
+                files: FilesImages {
+                    files: Some(&files_facts),
+                    reader: &reader,
+                },
+            };
+            let content = prepare_content(
+                &revision.content,
+                &wiki_facts,
+                Some(&files_facts),
+                true,
+                &images,
+            )
+            .with_context(|| format!("plan revision '{}'", revision.key))?;
             let content =
                 resolve_plan_links(&content, &pages, &revisions, &attachments, &revision.key)?;
             let predecessors: Vec<Id> = revision
@@ -2446,7 +2619,11 @@ fn cmd_check(storage: WikiStorage<'_>, compile: bool, out: &mut Out<'_>) -> Resu
                     }
                 }
                 if compile {
-                    if let Err(error) = validate_typst(&content) {
+                    let images = FilesImages {
+                        files: None,
+                        reader: &view.reader,
+                    };
+                    if let Err(error) = validate_typst_with(&content, &images) {
                         writeln!(diagnostics, "TYPST_ERROR  {:x}  {error}", head.id).unwrap();
                         issues += 1;
                     }
@@ -2778,16 +2955,31 @@ mod typst_validate {
         book: LazyHash<FontBook>,
         main_id: FileId,
         source: Source,
+        /// Exact bytes for the `files:` / `plan:` image paths the body names,
+        /// gathered by the caller from its own Files observation.
+        images: std::collections::BTreeMap<String, Bytes>,
     }
 
     impl ValidateWorld {
+        #[cfg(test)]
         pub fn new(content: &str) -> Self {
+            Self::with_images(content, Default::default())
+        }
+
+        pub fn with_images(
+            content: &str,
+            images: std::collections::BTreeMap<String, anybytes::Bytes>,
+        ) -> Self {
             let main_id = FileId::new(None, VirtualPath::new("main.typ"));
             Self {
                 library: LazyHash::new(Library::default()),
                 book: LazyHash::new(FontBook::new()),
                 main_id,
                 source: Source::new(main_id, content.to_owned()),
+                images: images
+                    .into_iter()
+                    .map(|(path, bytes)| (path, Bytes::new(bytes.to_vec())))
+                    .collect(),
             }
         }
         pub fn validate(&self) -> Result<(), Vec<String>> {
@@ -2828,9 +3020,13 @@ mod typst_validate {
             }
         }
         fn file(&self, id: FileId) -> FileResult<Bytes> {
-            Err(typst::diag::FileError::NotFound(
-                id.vpath().as_rootless_path().into(),
-            ))
+            let path = id.vpath().as_rootless_path();
+            if id.package().is_none() {
+                if let Some(bytes) = path.to_str().and_then(|path| self.images.get(path)) {
+                    return Ok(bytes.clone());
+                }
+            }
+            Err(typst::diag::FileError::NotFound(path.into()))
         }
         fn font(&self, _index: usize) -> Option<Font> {
             None
@@ -2843,6 +3039,10 @@ mod typst_validate {
 
 #[path = "transfer.rs"]
 mod transfer;
+
+#[path = "gollum_repair.rs"]
+mod gollum_repair;
+pub use gollum_repair::{HeadRepair, ImageRepairReport};
 pub use transfer::{
     Carried, Presence, Reason, Reference, ReferenceKind, TransferOptions, TransferReport,
 };
@@ -2876,6 +3076,89 @@ mod tests {
         assert!(world.source(world.main()).is_ok());
         assert!(validate_typst("#include \"external.typ\"").is_err());
         assert!(validate_typst("#read(\"external.typ\")").is_err());
+    }
+
+    /// A real one-pixel PNG, encoded here so no fixture bytes are invented.
+    fn png() -> anybytes::Bytes {
+        let mut bytes = Vec::new();
+        image::RgbImage::from_pixel(1, 1, image::Rgb([9, 90, 200]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes.into()
+    }
+
+    struct Images(BTreeMap<String, anybytes::Bytes>);
+
+    impl ImageBytes for Images {
+        fn image_bytes(&self, path: &str) -> Result<anybytes::Bytes> {
+            self.0
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow!("image {path} is not here"))
+        }
+    }
+
+    #[test]
+    fn typst_validation_decodes_the_images_a_body_names() {
+        let hash = "ab".repeat(32);
+        let body = format!(
+            "#link(\"wiki:{}\")[#image(\"files:{hash}\", alt: \"A rack\")]\n\n\
+             #figure(image(\"files:{hash}\"), caption: [Front])",
+            "0".repeat(32)
+        );
+        assert_eq!(
+            image_paths(&body),
+            BTreeSet::from([format!("files:{hash}").as_str()])
+        );
+        let real = Images(BTreeMap::from([(format!("files:{hash}"), png())]));
+        validate_typst_with(&body, &real).unwrap();
+        // Bytes that are not an image fail to decode, as a truncated one does.
+        let garbage = Images(BTreeMap::from([(
+            format!("files:{hash}"),
+            b"not a picture".to_vec().into(),
+        )]));
+        assert!(validate_typst_with(&body, &garbage).is_err());
+        let truncated = png().slice(0..20);
+        let truncated = Images(BTreeMap::from([(format!("files:{hash}"), truncated)]));
+        assert!(validate_typst_with(&body, &truncated).is_err());
+        let error = validate_typst_with(&body, &Images(BTreeMap::new())).unwrap_err();
+        assert!(format!("{error:#}").contains("is not here"), "{error:#}");
+        assert!(validate_typst(&body).is_err());
+        // Any other image path stays unresolvable, exactly as before.
+        assert!(validate_typst_with("#image(\"uploads/rack.png\")", &real).is_err());
+        assert!(image_handle("files:abcdef").is_err());
+        assert!(image_handle(&format!("files:{}", "AB".repeat(32))).is_ok());
+    }
+
+    #[test]
+    fn plan_images_resolve_to_attachment_content_never_to_pages() {
+        let handle: ContentHandle = png().to_blob().get_handle();
+        let hash = content_hash_hex(handle);
+        let attachments = HashMap::from([("source/1".to_owned(), handle)]);
+        let pages = HashMap::from([("page/1".to_owned(), Id::from_hex(&"1".repeat(32)).unwrap())]);
+        let body = "#image(\"plan:source/1\", alt: \"x\") #figure(image(\"plan:source/1\"), caption: [c]) \
+                    #link(\"plan:source/1\")[file] #link(\"plan:page/1\")[page]";
+        let resolved =
+            resolve_plan_links(body, &pages, &HashMap::new(), &attachments, "r").unwrap();
+        assert_eq!(
+            resolved,
+            format!(
+                "#image(\"files:{hash}\", alt: \"x\") #figure(image(\"files:{hash}\"), caption: [c]) \
+                 #link(\"files:{hash}\")[file] #link(\"wiki:{}\")[page]",
+                "1".repeat(32)
+            )
+        );
+        assert!(resolve_plan_links(
+            "#image(\"plan:page/1\")",
+            &pages,
+            &HashMap::new(),
+            &attachments,
+            "r"
+        )
+        .is_err());
     }
 
     struct Fixture {

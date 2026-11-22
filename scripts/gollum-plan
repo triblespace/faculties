@@ -33,8 +33,8 @@ What becomes what:
   a loss finding wherever a commit adds or retargets it, and a link to its
   path stays text. The bundle keeps it.
 - Gollum `[[Page]]`, `[[text|Page]]`, `[[file.png|alt=..]]`, relative Markdown
-  links and images become `#link("plan:KEY")[..]`. Images become links: the
-  Wiki has no image embed.
+  links and images become `#link("plan:KEY")[..]`. This driver keeps images
+  as links; `gollum-full-plan.py` (`wiki import gollum`) embeds them.
 - Links resolve to the target's latest revision so far in plan order. Inside
   a commit the revisions are ordered so link targets come first; a link in a
   cycle, or to a page new in the same commit that cannot come first, gets an
@@ -137,6 +137,14 @@ def is_other_markup(path):
     return os.path.splitext(path)[1].lower() in OTHER_MARKUP
 
 
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+
+
+def plain_alt(alt):
+    """Markdown image alt text as the plain string it describes."""
+    return " ".join(re.sub(r"\\([^\w\s])", r"\1", alt).split())
+
+
 def title_of(path):
     return os.path.splitext(os.path.basename(path))[0].replace("-", " ")
 
@@ -237,8 +245,12 @@ class Page:
         hits = sorted(p for p in self.tree_files if os.path.basename(p) == os.path.basename(clean))
         return hits[0] if len(hits) == 1 else None
 
-    def link(self, label_typst, target, image=False):
-        """A link to a page, attachment or URL, as Typst."""
+    def link(self, label_typst, target, image=False, display=None):
+        """A link to a page, attachment or URL, as Typst.
+
+        `display` describes an image the source intends to show inline. This
+        driver renders it as a link; the full-history adapter may embed it.
+        """
         if re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):
             body = f"[{label_typst}]" if label_typst else ""
             return f"#link({typst_string(target)}){body}"
@@ -317,7 +329,8 @@ class Page:
             m = re.match(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)", rest)
             if m:
                 label = self.inline(m.group(1)) if m.group(1) else ""
-                expr(self.link(label, m.group(2), image=True))
+                expr(self.link(label, m.group(2), image=True,
+                               display=dict(target=m.group(2), alt=plain_alt(m.group(1)))))
                 i += m.end()
                 continue
             m = re.match(r"\[((?:[^\[\]]|\[[^\]]*\])+)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)", rest)
@@ -410,13 +423,19 @@ class Page:
         if parts[0].lower().startswith("include:"):
             self.finding("include", f"[[{body}]] (Gollum include) kept as text", True)
             return escape_plain(f"[[{body}]]", False)
-        first_ext = os.path.splitext(parts[0])[1]
+        first_ext = os.path.splitext(parts[0].split("?", 1)[0])[1]
+        display = None
+        if first_ext.lower() in IMAGE_EXTENSIONS:
+            # Gollum shows a tag naming an image file as the image itself;
+            # `frame` puts its alt text underneath as a caption.
+            alt = next((p[4:] for p in parts[1:] if p.startswith("alt=")), "")
+            display = dict(target=parts[0], alt=alt, caption=alt if "frame" in parts[1:] and alt else None)
         if first_ext and not is_page(parts[0]) and self.file_target(parts[0]) is not None:
             alt = next((p[4:] for p in parts[1:] if p.startswith("alt=")), "")
-            return self.link(escape_plain(alt, False), parts[0], image=True)
+            return self.link(escape_plain(alt, False), parts[0], image=True, display=display)
         if len(parts) >= 2:
-            return self.link(self.inline(parts[0]), parts[1])
-        return self.link(escape_plain(parts[0], False), parts[0])
+            return self.link(self.inline(parts[0]), parts[1], display=display)
+        return self.link(escape_plain(parts[0], False), parts[0], display=display)
 
     # -- blocks
 

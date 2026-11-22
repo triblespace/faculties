@@ -22,6 +22,27 @@ def _text(value):
     return '#text(' + _string(value) + ')' if value else ''
 
 
+# A resolver may return an embedded image as an opaque site marker that it
+# expands later; block-level handling below only needs to recognise one.
+SITE_OPEN = '\ue000'
+_IMAGE_FILE = re.compile(r'\.(?:png|jpe?g|gif|webp|svg)$', re.I)
+
+
+def _image_attributes(label):
+    """Alt text and title of an AsciiDoc image macro's attribute list."""
+    positional = []
+    named = {}
+    for part in re.findall(r'(?:[^,"]|"[^"]*")+', label):
+        part = part.strip()
+        key = re.match(r'^([A-Za-z][\w-]*)\s*=\s*(.*)$', part)
+        if key:
+            named[key[1].lower()] = key[2].strip().strip('"')
+        else:
+            positional.append(part.strip('"'))
+    alt = named.get('alt', positional[0] if positional else '')
+    return alt, named.get('title')
+
+
 def _raw(value, block=False):
     return '#raw(' + _string(value) + (', block: true)' if block else ')')
 
@@ -36,9 +57,13 @@ _TOKEN = re.compile(
 )
 
 
-def _inline(value, resolve_link):
-    def link(target, label):
+def _inline(value, resolve_link, caption=None):
+    """Render one line. `caption` (Typst, with the old rendering of the block
+    title that carried it) applies to a block image macro that is shown."""
+    def link(target, label, display=None):
         if resolve_link:
+            if display is not None:
+                return resolve_link(target, label, display)
             return resolve_link(target, label)
         if target.lower().startswith(('http://', 'https://', 'mailto:')):
             return '#link(' + _string(target) + ')[' + _text(label) + ']'
@@ -55,9 +80,9 @@ def _inline(value, resolve_link):
                 output.append(_text(m[0]))
             elif re.search(r'\.(?:pdf|jpe?g|png|gz|swi)$', parts[0], re.I):
                 label = next((p[4:] for p in parts[1:] if p.startswith('alt=')), parts[0])
-                output.append(link(parts[0], label))
+                output.append(link(parts[0], label, _tag_display(parts)))
             elif len(parts) <= 2 and parts[-1]:
-                output.append(link(parts[-1], parts[0]))
+                output.append(link(parts[-1], parts[0], _tag_display(parts)))
             else:
                 output.append(_text(m[0]))
         elif m['macro']:
@@ -68,9 +93,18 @@ def _inline(value, resolve_link):
             elif prefix == 'mailto:':
                 target = prefix + target
             label = m['label']
+            display = None
+            if prefix == 'image:':
+                alt, title = _image_attributes(label)
+                display = dict(target=target, alt=alt)
+                if m['macro'].lower().startswith('image::'):
+                    if title:
+                        display['caption'] = title
+                    elif caption is not None:
+                        display['caption_typst'], display['legacy_prefix'] = caption
             if prefix == 'image:' and ',' in label:
                 label = label.partition(',')[0].strip('" ')
-            output.append(link(target, label or target))
+            output.append(link(target, label or target, display))
         elif m['url']:
             target = m['url'].rstrip('.,;!')
             output.append(link(target, target) + _text(m['url'][len(target):]))
@@ -82,6 +116,14 @@ def _inline(value, resolve_link):
             output.append('#emph[' + _text(m['etext']) + ']')
     output.append(_text(value[end:]))
     return ''.join(output)
+
+
+def _tag_display(parts):
+    """A Gollum tag naming an image file is shown as that image."""
+    if not _IMAGE_FILE.search(parts[0].split('?', 1)[0]):
+        return None
+    alt = next((p[4:] for p in parts[1:] if p.startswith('alt=')), '')
+    return dict(target=parts[0], alt=alt, caption=alt if 'frame' in parts[1:] and alt else None)
 
 
 # A literal pipe, code span, Gollum link or bracketed link label can contain a
@@ -175,6 +217,22 @@ def convert_asciidoc(text, resolve_link=None):
                 # Listing/source/passthrough/comment blocks remain inert and visible.
                 output.append(_raw('\n'.join(lines[i:end]), True) + '\n')
                 i = end + 1
+                continue
+        if (line.startswith('.') and re.match(r'^\.[^.\s]', line) and i < len(lines)
+                and re.fullmatch(r'image::[^\s\[\]]+\[[^\]\n]*\]', lines[i].rstrip())):
+            # A block title above a block image is its caption when the image
+            # is shown; otherwise both lines render exactly as before.
+            title = _inline(line, resolve_link)
+            caption = _inline(line[1:], resolve_link)
+            if SITE_OPEN not in title + caption:
+                image = _inline(lines[i], resolve_link, (caption, title + '\n'))
+                if image.startswith(SITE_OPEN):
+                    output.append(image)
+                    i += 1
+                    continue
+                output.append(title)
+                output.append(image)
+                i += 1
                 continue
         if not mark:
             output.append('')

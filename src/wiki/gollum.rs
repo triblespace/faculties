@@ -111,7 +111,16 @@ fn unpack_bundle(source: &Path, directory: &Path) -> Result<std::path::PathBuf> 
     Ok(repo)
 }
 
-pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<'_>) -> Result<()> {
+/// Translate a Gollum history and import it, or with `repair` (`Some(apply)`)
+/// correct the histories an earlier import left with image links.
+pub(super) fn import(
+    wiki: &Wiki,
+    source: &Path,
+    tags: &[String],
+    bases: &[String],
+    repair: Option<bool>,
+    out: &mut Out<'_>,
+) -> Result<()> {
     let source = source
         .canonicalize()
         .context("open local Gollum repository or bundle")?;
@@ -133,15 +142,63 @@ pub(super) fn import(wiki: &Wiki, source: &Path, tags: &[String], out: &mut Out<
         .arg(temp.path().join("gollum-full-plan.py"))
         .arg(&repo)
         .arg(&directory);
+    for base in bases {
+        translate.arg(format!("--source-base={base}"));
+    }
     let translation = run(
         &mut translate,
         "translate Gollum history with python3 and git",
     )?;
     let plan = cli::read_plan(&directory.join("plan.json"))?;
+    let summary = std::str::from_utf8(&translation.stdout)?.trim().to_owned();
+    if let Some(apply) = repair {
+        let report = wiki.repair_gollum_images(plan, apply)?;
+        if !summary.is_empty() {
+            out.line(summary)?;
+        }
+        return report_repair(&report, apply, out);
+    }
     let report = wiki.import_gollum_plan(plan, tags)?;
-    let summary = std::str::from_utf8(&translation.stdout)?.trim();
     if !summary.is_empty() {
         out.line(summary)?;
     }
     cli::report_import(&report, out)
+}
+
+fn report_repair(report: &super::ImageRepairReport, apply: bool, out: &mut Out<'_>) -> Result<()> {
+    let mut applied = 0;
+    let mut skipped = 0;
+    for head in &report.heads {
+        applied += head.successor.map_or(0, |_| head.applied);
+        skipped += head.skipped.len();
+        match head.successor {
+            Some(successor) => out.line(format!(
+                "CORRECT  {:x} -> {successor:x}  {} images  entry {:x}  {}",
+                head.head, head.applied, head.entry, head.title
+            ))?,
+            None if head.skipped.is_empty() => continue,
+            None => out.line(format!(
+                "KEEP     {:x}  entry {:x}  {}",
+                head.head, head.entry, head.title
+            ))?,
+        }
+        for reason in &head.skipped {
+            out.line(format!("  skipped: {reason}"))?;
+        }
+    }
+    for head in &report.moved {
+        out.line(format!(
+            "MOVED    {head:x}  gained a successor while planning; not corrected"
+        ))?;
+    }
+    out.line(format!(
+        "{} heads with imported images: {} corrected ({applied} images), {skipped} images left as links, {}",
+        report.heads.len(),
+        report.corrected(),
+        if apply {
+            format!("{} publications", report.publications)
+        } else {
+            "dry run: nothing published (add --apply)".to_owned()
+        }
+    ))
 }
