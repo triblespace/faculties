@@ -394,12 +394,39 @@ impl LaunchConfig {
     }
 
     /// [`Self::under_home`] for `$HOME`, read when a frontend calls this,
-    /// with the overrides [`Self::override_from`] reads from the environment.
+    /// with the overrides [`Self::override_from`] reads from the environment,
+    /// and the directory of the running executable first on the zooid's PATH
+    /// ([`Self::own_build_first`]).
     pub fn from_home_env() -> Result<Self> {
         let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
         let mut config = Self::under_home(Path::new(&home));
         config.override_from(|name| std::env::var(name).ok())?;
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .as_deref()
+            .and_then(Path::parent)
+        {
+            config.own_build_first(dir);
+        }
         Ok(config)
+    }
+
+    /// Put `dir`, the directory of the program launching the zooid, first on
+    /// its PATH, so its settlement, inbox hook and `faculties` MCP server come
+    /// from the same build that started it, not from whatever the host has
+    /// installed. A release generation copied to a host without activating it
+    /// (for example one whose installed tools predate `zooid`) then works as
+    /// it is.
+    fn own_build_first(&mut self, dir: &Path) {
+        let dir = dir.display().to_string();
+        if !self
+            .path
+            .split(':')
+            .next()
+            .is_some_and(|first| first == dir)
+        {
+            self.path = format!("{dir}:{}", self.path);
+        }
     }
 
     /// The codex model from `SPAWN_CODEX_MODEL`, the codex login file from
@@ -7018,6 +7045,26 @@ mod tests {
             "x".repeat(INBOX_BODY_CHARS)
         )));
         assert!(!reason.contains(&"x".repeat(INBOX_BODY_CHARS + 1)));
+    }
+
+    #[test]
+    fn the_launching_build_comes_first_on_the_zooid_path() {
+        let home = Path::new("/h");
+        let mut config = LaunchConfig::under_home(home);
+        let installed = config.path.clone();
+        config.own_build_first(Path::new("/g/releases/x/bin"));
+        assert_eq!(config.path, format!("/g/releases/x/bin:{installed}"));
+        // Launching again from the same build does not stack it twice.
+        config.own_build_first(Path::new("/g/releases/x/bin"));
+        assert_eq!(config.path, format!("/g/releases/x/bin:{installed}"));
+        // And `faculties` is then found in that build, not on the host.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("faculties");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        config.own_build_first(dir.path());
+        assert_eq!(config.faculties_binary().unwrap(), bin);
     }
 
     #[test]
