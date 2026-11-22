@@ -14,7 +14,7 @@ mod next;
 mod receipt_import;
 #[path = "service_events.rs"]
 mod service_events;
-pub use next::{Next, NextKind, NextCompletion, PendingNext, PreparedReport};
+pub use next::{Next, NextCompletion, NextKind, PendingNext, PreparedReport};
 
 #[derive(Clone, Debug)]
 pub struct Orient {
@@ -432,8 +432,7 @@ use triblespace::core::collection::records::CollectionHandle;
 use triblespace::core::collection::Support;
 use triblespace::core::collection::{
     AttachedSnapshot, Collection, CollectionEncoding, CollectionRealizationError,
-    CollectionRegistrationError,
-    CollectionSnapshotExt, CollectionStoreExt, Cover,
+    CollectionRegistrationError, CollectionSnapshotExt, CollectionStoreExt, Cover,
 };
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
@@ -792,11 +791,17 @@ struct OrientRegistrationError<E> {
 
 impl<E: std::fmt::Display> std::fmt::Display for OrientRegistrationError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "register {} {} collection: {}", self.label, self.projection, self.cause)
+        write!(
+            f,
+            "register {} {} collection: {}",
+            self.label, self.projection, self.cause
+        )
     }
 }
 impl<E: std::error::Error + 'static> std::error::Error for OrientRegistrationError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
 }
 
 /// One Orient input's authored collection and explicit query projections.
@@ -845,12 +850,20 @@ impl OrientSource {
     {
         let succinct = pile
             .attach::<SuccinctArchiveBlob>(source, ())
-            .map_err(|cause| OrientRegistrationError { label, projection: "Succinct", cause })?;
+            .map_err(|cause| OrientRegistrationError {
+                label,
+                projection: "Succinct",
+                cause,
+            })?;
         #[cfg(test)]
         pile.before_orient_rank9_registration(label)?;
         let rank9 = pile
             .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-            .map_err(|cause| OrientRegistrationError { label, projection: "Rank9", cause })?;
+            .map_err(|cause| OrientRegistrationError {
+                label,
+                projection: "Rank9",
+                cause,
+            })?;
         Ok(Self {
             source,
             succinct,
@@ -5656,7 +5669,8 @@ async fn observe_wait(
             routing.validate_workspace_at(pile, signer.verifying_key())?;
             #[cfg(test)]
             if let Some(hook) = quiet_snapshot {
-                hook.pause(next::quiet_snapshot_test::Boundary::Health).await?;
+                hook.pause(next::quiet_snapshot_test::Boundary::Health)
+                    .await?;
             }
             let (fired, deadline) = health
                 .poll_in(pile, signer, persona_input, false, form, output)
@@ -5672,7 +5686,8 @@ async fn observe_wait(
             let now = clock::now()?;
             #[cfg(test)]
             if let Some(hook) = quiet_snapshot {
-                hook.pause(next::quiet_snapshot_test::Boundary::Ordinary).await?;
+                hook.pause(next::quiet_snapshot_test::Boundary::Ordinary)
+                    .await?;
             }
             let sampled = pile
                 .snapshot()
@@ -5924,7 +5939,9 @@ impl std::fmt::Display for WaitSnapshotError {
     }
 }
 impl std::error::Error for WaitSnapshotError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 /// A nested selection that failed after the operation owning it completed.
@@ -5941,7 +5958,9 @@ impl std::fmt::Display for SelectionSettlementError {
     }
 }
 impl std::error::Error for SelectionSettlementError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 /// The causes Orient may base recovery on: retrying, waiting for a blob or
@@ -5949,15 +5968,20 @@ impl std::error::Error for SelectionSettlementError {
 /// beneath a Resolution, stopping also at a failed selection settlement.
 /// Exact known wrappers are recognised by exact downcasts instead
 /// ([`next::is_cancelled`]).
-fn recovery_causes(error: &anyhow::Error) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> + '_ {
+fn recovery_causes(
+    error: &anyhow::Error,
+) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> + '_ {
     let error: &(dyn std::error::Error + 'static) = error.as_ref();
     triblespace::core::repo::recovery_chain(error)
         .take_while(|cause| !cause.is::<SelectionSettlementError>())
 }
 
 fn panic_text(panic: &Box<dyn std::any::Any + Send>) -> &str {
-    panic.downcast_ref::<String>().map(String::as_str)
-        .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-text panic payload")
+    panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("non-text panic payload")
 }
 
 fn finish_wait_selection<T>(result: Result<T>, settlement: Result<()>) -> Result<T> {
@@ -5969,8 +5993,10 @@ fn finish_wait_selection<T>(result: Result<T>, settlement: Result<()>) -> Result
             Ok(_) => Err(SelectionSettlementError(error).into()),
             // Do not retain Cancelled as the type of a mixed failure: the
             // owner must not normalize away the other failed settlement.
-            Err(operation) => Err(anyhow!("Orient operation failed: {operation:#}; \
-                settling its selection also failed: {error:#}")),
+            Err(operation) => Err(anyhow!(
+                "Orient operation failed: {operation:#}; \
+                settling its selection also failed: {error:#}"
+            )),
         },
     }
 }
@@ -5989,20 +6015,34 @@ mod settlement_tests {
                 let task = tokio::task::spawn_blocking(move || -> Result<()> {
                     entered.send(()).unwrap();
                     go.recv().unwrap();
-                    if panic { panic!("nested selection panic"); }
+                    if panic {
+                        panic!("nested selection panic");
+                    }
                     anyhow::bail!("nested selection failure");
                 });
                 ready.recv_timeout(Duration::from_secs(5)).unwrap();
                 assert!(!task.is_finished());
                 release.send(()).unwrap();
-                let joined = task.await.context("settle frozen Orient selection")
+                let joined = task
+                    .await
+                    .context("settle frozen Orient selection")
                     .and_then(|result| result);
                 let error = finish_wait_selection::<()>(
-                    Err(AcquiringReadInterrupted::Cancelled.into()), joined).unwrap_err();
-                assert!(!next::is_cancelled(&error), "mixed failure must not normalize to cancellation");
+                    Err(AcquiringReadInterrupted::Cancelled.into()),
+                    joined,
+                )
+                .unwrap_err();
+                assert!(
+                    !next::is_cancelled(&error),
+                    "mixed failure must not normalize to cancellation"
+                );
                 let text = format!("{error:#}");
                 assert!(text.contains("exact acquisition cancelled"));
-                assert!(text.contains(if panic { "nested selection panic" } else { "nested selection failure" }));
+                assert!(text.contains(if panic {
+                    "nested selection panic"
+                } else {
+                    "nested selection failure"
+                }));
             });
         }
     }
@@ -6011,30 +6051,46 @@ mod settlement_tests {
     fn only_nested_cancellation_is_expected_settlement() {
         let canceled = || anyhow::Error::from(AcquiringReadInterrupted::Cancelled);
         assert!(finish_wait_selection(Ok(()), Err(canceled())).is_ok());
-        assert!(next::is_cancelled(&finish_wait_selection::<()>(Err(canceled()), Ok(())).unwrap_err()));
+        assert!(next::is_cancelled(
+            &finish_wait_selection::<()>(Err(canceled()), Ok(())).unwrap_err()
+        ));
         assert!(finish_wait_selection(Ok(()), Err(anyhow!("selection failed"))).is_err());
-        assert!(!next::is_cancelled(&canceled().context("closing storage also failed")),
-            "an interruption inside another failure is not bare cancellation");
+        assert!(
+            !next::is_cancelled(&canceled().context("closing storage also failed")),
+            "an interruption inside another failure is not bare cancellation"
+        );
     }
 
     #[test]
     fn nested_deadline_settlement_stays_a_failure() {
-        let deadline = || anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
-            .context("settle frozen Orient selection");
+        let deadline = || {
+            anyhow::Error::from(AcquiringReadInterrupted::DeadlineExceeded)
+                .context("settle frozen Orient selection")
+        };
         for result in [Ok(()), Err(AcquiringReadInterrupted::Cancelled.into())] {
             let error = finish_wait_selection::<()>(result, Err(deadline())).unwrap_err();
-            assert!(!next::is_cancelled(&error), "a nested deadline is not a cancellation: {error:#}");
+            assert!(
+                !next::is_cancelled(&error),
+                "a nested deadline is not a cancellation: {error:#}"
+            );
             assert!(format!("{error:#}").contains("deadline"), "{error:#}");
-            assert!(!matches!(next::completion(Err(error), false), Ok(next::NextCompletion::CancelledBeforeReport)),
-                "a nested deadline must not become CancelledBeforeReport");
+            assert!(
+                !matches!(
+                    next::completion(Err(error), false),
+                    Ok(next::NextCompletion::CancelledBeforeReport)
+                ),
+                "a nested deadline must not become CancelledBeforeReport"
+            );
         }
         // Alone, the nested deadline stays a failed settlement, not a timeout.
         let error = finish_wait_selection::<()>(Ok(()), Err(deadline())).unwrap_err();
         assert!(!next::is_deadline(&error), "{error:#}");
         assert!(error.is::<SelectionSettlementError>());
         // The deadline is still reachable for diagnostics.
-        assert!(error.chain().any(|cause| matches!(cause.downcast_ref::<AcquiringReadInterrupted>(),
-            Some(AcquiringReadInterrupted::DeadlineExceeded))));
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<AcquiringReadInterrupted>(),
+            Some(AcquiringReadInterrupted::DeadlineExceeded)
+        )));
     }
 }
 
@@ -7990,12 +8046,19 @@ mod tests {
     /// a_descriptor_reported_resident_whose_get_fails_stays_a_fault drives
     /// that with a real reader; this side cannot construct core's ReadFailure,
     /// so the get error here is the MissingBlob itself.
-    fn resident_descriptor_get_failure(collection: triblespace::core::collection::CollectionHandle) -> anyhow::Error {
+    fn resident_descriptor_get_failure(
+        collection: triblespace::core::collection::CollectionHandle,
+    ) -> anyhow::Error {
         CollectionRealizationError::resolution_from(
-            format!("load collection descriptor {}", hex::encode_upper(collection.raw)),
+            format!(
+                "load collection descriptor {}",
+                hex::encode_upper(collection.raw)
+            ),
             triblespace::core::collection::CollectionDescriptorError::Get {
                 collection,
-                source: MissingBlob { handle: Inline::new(collection.raw) },
+                source: MissingBlob {
+                    handle: Inline::new(collection.raw),
+                },
             },
         )
         .into()
@@ -8005,7 +8068,10 @@ mod tests {
     fn a_descriptor_reported_resident_whose_get_fails_is_no_pending_read() {
         let collection = Inline::new([0x5A; 32]);
         let fault = || resident_descriptor_get_failure(collection);
-        for error in [fault(), finish_wait_selection::<()>(Ok(()), Err(fault())).unwrap_err()] {
+        for error in [
+            fault(),
+            finish_wait_selection::<()>(Ok(()), Err(fault())).unwrap_err(),
+        ] {
             assert!(!is_preparation_pending(&error), "{error:#}");
             assert!(pending_blob(&error).is_none(), "{error:#}");
             assert!(!is_payload_pending(&error), "{error:#}");
@@ -8022,11 +8088,19 @@ mod tests {
     fn an_absent_dependency_is_still_a_pending_read() {
         let raw = [0x6B; 32];
         for error in [
-            anyhow::Error::from(CollectionRealizationError::MissingDependency { member: Inline::new(raw) }),
-            anyhow::Error::from(MissingBlob { handle: Inline::new(raw) }).context("read selected payload"),
+            anyhow::Error::from(CollectionRealizationError::MissingDependency {
+                member: Inline::new(raw),
+            }),
+            anyhow::Error::from(MissingBlob {
+                handle: Inline::new(raw),
+            })
+            .context("read selected payload"),
         ] {
             assert!(is_preparation_pending(&error), "{error:#}");
-            assert_eq!(pending_blob(&error).map(|missing| missing.handle.raw), Some(raw));
+            assert_eq!(
+                pending_blob(&error).map(|missing| missing.handle.raw),
+                Some(raw)
+            );
         }
     }
 
