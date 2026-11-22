@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Wiki pages show inline images from Files. `#image("files:<64-hex content
+  hash>", alt: "...")`, also inside `#link` or `#figure`, displays the picture
+  when a file in the selected Files collection has that content and its bytes
+  are on this device. Otherwise a box with the alt text stands in and the page
+  still renders. Entity ids and prefixes are refused; every other path stays
+  not found, so a page never reads disk or network.
 - New task zooids are named after their colony: `aurora-kuvud-dajiz`. A colony
   is a Relations group marked with the new `KIND_COLONY` tag
   (`5F55CC32689703641BC0F9BD08A6521D`, a second `metadata::tag` on the group

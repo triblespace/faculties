@@ -875,9 +875,15 @@ fn parse_wiki_link_target(target: &str) -> Option<(Id, bool)> {
 /// output queue; we peek at the commands added during `ctx.typst(…)`,
 /// keep the non-matching ones (so e.g. `https:` links still open the
 /// browser), and pull out the `wiki:` / `files:` ones as `LinkClick`s.
-pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Option<LinkClick> {
+pub(crate) fn render_wiki_content(
+    ctx: &mut CardCtx<'_>,
+    content: &str,
+    files: Option<DatasetView<'_>>,
+    images: &InlineImages,
+) -> Option<LinkClick> {
     let cmd_count_before = ctx.ctx().output(|o| o.commands.len());
-    ctx.typst(content);
+    let files = files.map(|files| (files.facts, files.reader));
+    ctx.typst_with_files(content, &|path: &str| images.bytes(files, path));
 
     let mut clicked = None;
     ctx.ctx().output_mut(|o| {
@@ -913,6 +919,98 @@ pub(crate) fn render_wiki_content(ctx: &mut CardCtx<'_>, content: &str) -> Optio
         }
     });
     clicked
+}
+
+// ── inline images ────────────────────────────────────────────────────
+
+/// Largest Files payload a page decodes as an inline image.
+const MAX_INLINE_IMAGE_BYTES: usize = 64 << 20;
+
+/// Clear the byte memo once it holds this many images.
+const MAX_INLINE_IMAGE_MEMO: usize = 256;
+
+/// Typst byte wrappers for inline images, keyed by content digest.
+///
+/// Typst re-reads every file a page names on each frame to see whether the
+/// page must be laid out again, and hashes what it gets. Handing it the same
+/// wrapper for the same digest keeps that hash computed once. The memo holds
+/// only bytes of an immutable digest, so it can never go stale; the scope
+/// check runs on every read before the memo is consulted. Bounded and dropped
+/// with the viewer.
+#[derive(Default)]
+pub(crate) struct InlineImages(std::sync::Mutex<HashMap<FileHandle, typst::foundations::Bytes>>);
+
+impl InlineImages {
+    /// The bytes for `path` as a page names it, from `files` only.
+    ///
+    /// Only `files:<64-hex content hash>` names anything. The digest must be
+    /// the content of a file in the selected Files collection, and its bytes
+    /// must have arrived and look like an image; otherwise the page gets
+    /// GORBIE's unavailable placeholder and still renders. Every other path is
+    /// not found: nothing is read from disk or network.
+    fn bytes<P: TriblePattern, R: BlobStoreGet>(
+        &self,
+        files: Option<(&P, &R)>,
+        path: &str,
+    ) -> typst::diag::FileResult<typst::foundations::Bytes> {
+        use typst::diag::FileError;
+        use typst::foundations::Bytes;
+
+        let Some(hex) = path.strip_prefix("files:") else {
+            return Err(FileError::NotFound(path.into()));
+        };
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FileError::Other(Some(
+                "an inline image names its Files content by the full 64-hex hash: files:<hash>"
+                    .into(),
+            )));
+        }
+        let unavailable = || {
+            Ok(Bytes::new(
+                GORBIE::widgets::typst_render::world::UNAVAILABLE_IMAGE,
+            ))
+        };
+        let Some((facts, reader)) = files else {
+            return unavailable();
+        };
+        let Ok(crate::files::FileReference::Content(content)) =
+            crate::files::resolve_reference(facts, hex)
+        else {
+            return unavailable();
+        };
+        let in_scope = triblespace::macros::find!(
+            file: Id,
+            triblespace::macros::pattern!(facts, [{
+                ?file @ metadata::tag: &crate::schemas::files::KIND_FILE,
+                crate::schemas::files::file::content: &content,
+            }])
+        )
+        .next()
+        .is_some();
+        if !in_scope {
+            return unavailable();
+        }
+        let mut memo = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(bytes) = memo.get(&content) {
+            return Ok(bytes.clone());
+        }
+        let blob: Result<Blob<RawBytes>, _> = reader.get(content);
+        let Ok(blob) = blob else {
+            // Not on this device yet; the next frame asks again.
+            return unavailable();
+        };
+        if blob.bytes.len() > MAX_INLINE_IMAGE_BYTES
+            || typst::visualize::ImageFormat::detect(&blob.bytes).is_none()
+        {
+            return unavailable();
+        }
+        if memo.len() >= MAX_INLINE_IMAGE_MEMO {
+            memo.clear();
+        }
+        let bytes = Bytes::new(blob.bytes);
+        memo.insert(content, bytes.clone());
+        Ok(bytes)
+    }
 }
 
 // ── browser state (absorbed into WikiViewer) ─────────────────────────
@@ -969,6 +1067,8 @@ pub struct WikiViewer {
     open_pages: Vec<OpenPage>,
     /// Colouring the graph by meaning, when the host can embed a query.
     semantic: Semantic,
+    /// Bytes of the `files:` images open pages show.
+    inline_images: InlineImages,
 }
 
 impl WikiViewer {
@@ -1503,7 +1603,12 @@ impl WikiViewer {
                             let displayed = crate::wiki::content_with_original_sources(
                                 wiki_view.facts, revision_id, content.clone(),
                             );
-                            match render_wiki_content(ctx, &displayed) {
+                            match render_wiki_content(
+                                ctx,
+                                &displayed,
+                                files_view,
+                                &self.inline_images,
+                            ) {
                                 Some(LinkClick::Wiki(id)) => {
                                     to_open_from_link.push((id, false))
                                 }
@@ -1825,5 +1930,186 @@ mod tests {
             resolved_file_name(&resolved),
             crate::files::content_hash_hex(content)
         );
+    }
+
+    /// A 4x2 red PNG.
+    const RED_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xf0,
+        0xca, 0xea, 0x34, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xbc,
+        0x23, 0x22, 0xc7, 0x00, 0x03, 0x4c, 0x0c, 0x48, 0x00, 0x00, 0x1a, 0x5c, 0x01, 0x12, 0x03,
+        0x1a, 0x1c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn staged_hex(fragment: &Fragment) -> String {
+        let content = find!(
+            value: crate::files::ContentHandle,
+            pattern!(fragment.facts(), [{ _?file @ file_attrs::content: ?value }])
+        )
+        .next()
+        .unwrap();
+        crate::files::content_hash_hex(content)
+    }
+
+    fn is_placeholder(bytes: &typst::foundations::Bytes) -> bool {
+        bytes.as_slice() == GORBIE::widgets::typst_render::world::UNAVAILABLE_IMAGE
+    }
+
+    #[test]
+    fn inline_images_serve_only_in_scope_digests() {
+        let fragment = crate::files::stage(RED_PNG.to_vec(), "red.png", "image/png").unwrap();
+        let hex = staged_hex(&fragment);
+        // Another collection's picture: its bytes are on this device, but no
+        // file in the selected collection has that content.
+        let elsewhere =
+            crate::files::stage([RED_PNG, b"other"].concat(), "x.png", "image/png").unwrap();
+        let elsewhere_hex = staged_hex(&elsewhere);
+        let mut both = fragment.clone();
+        both += elsewhere;
+        let mut blobs = both.blobs().clone();
+        let reader = blobs.snapshot().unwrap();
+        let files = Some((fragment.facts(), &reader));
+        let images = InlineImages::default();
+
+        let served = images.bytes(files, &format!("files:{hex}")).unwrap();
+        assert_eq!(served.as_slice(), RED_PNG);
+        let upper = images.bytes(files, &format!("files:{}", hex.to_ascii_uppercase()));
+        assert_eq!(upper.unwrap().as_slice(), RED_PNG);
+
+        // A digest no file in this collection has, no Files view at all, and
+        // a file whose bytes have not arrived all show the placeholder.
+        assert!(is_placeholder(
+            &images
+                .bytes(files, &format!("files:{elsewhere_hex}"))
+                .unwrap()
+        ));
+        assert!(is_placeholder(
+            &images
+                .bytes::<TribleSet, triblespace::core::blob::MemoryBlobStoreSnapshot>(
+                    None,
+                    &format!("files:{hex}"),
+                )
+                .unwrap()
+        ));
+        let mut empty = triblespace::core::blob::MemoryBlobStore::new();
+        let empty_reader = empty.snapshot().unwrap();
+        let unsynced = InlineImages::default();
+        assert!(is_placeholder(
+            &unsynced
+                .bytes(
+                    Some((fragment.facts(), &empty_reader)),
+                    &format!("files:{hex}")
+                )
+                .unwrap()
+        ));
+
+        // Bytes in scope that are not an image are not handed to Typst.
+        let text = crate::files::stage(b"plain words".to_vec(), "notes.txt", "text/plain").unwrap();
+        let text_hex = staged_hex(&text);
+        let mut text_blobs = text.blobs().clone();
+        let text_reader = text_blobs.snapshot().unwrap();
+        assert!(is_placeholder(
+            &images
+                .bytes(
+                    Some((text.facts(), &text_reader)),
+                    &format!("files:{text_hex}")
+                )
+                .unwrap()
+        ));
+
+        // Nothing else names anything: no disk, no network, no packages.
+        for path in [
+            "red.png",
+            "etc/passwd",
+            "https://example.org/a.png",
+            "files",
+            "x/files:00",
+        ] {
+            assert!(
+                matches!(
+                    images.bytes(files, path),
+                    Err(typst::diag::FileError::NotFound(_))
+                ),
+                "{path}"
+            );
+        }
+        // Entity ids and prefixes are refused with a reason, never expanded.
+        for selector in [&hex[..32], &hex[..8], "zz"] {
+            assert!(matches!(
+                images.bytes(files, &format!("files:{selector}")),
+                Err(typst::diag::FileError::Other(Some(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_wiki_page_lays_out_its_files_images() {
+        use typst::layout::{Frame, FrameItem};
+        use typst::visualize::ImageKind;
+
+        let fragment = crate::files::stage(RED_PNG.to_vec(), "red.png", "image/png").unwrap();
+        let hex = staged_hex(&fragment);
+        let missing =
+            staged_hex(&crate::files::stage(b"gone".to_vec(), "g.png", "image/png").unwrap());
+        let mut blobs = fragment.blobs().clone();
+        let reader = blobs.snapshot().unwrap();
+        let images = InlineImages::default();
+
+        let mut world = GORBIE::widgets::typst_render::world::GorbieWorld::new();
+        world.set_source(format!(
+            "#link(\"files:{hex}\")[#image(\"files:{hex}\", alt: \"a \\\"red\\\" pixel\", width: 40pt)]\n\
+             #figure(image(\"files:{missing}\", alt: \"gone\"), caption: [Missing])\n"
+        ));
+        let resolve = |path: &str| images.bytes(Some((fragment.facts(), &reader)), path);
+        let document = world
+            .compile_with_files(&resolve)
+            .ok()
+            .expect("page compiles");
+
+        fn walk(
+            frame: &Frame,
+            found: &mut Vec<(typst::visualize::Image, f64, f64)>,
+            links: &mut usize,
+        ) {
+            for (_, item) in frame.items() {
+                match item {
+                    FrameItem::Group(group) => walk(&group.frame, found, links),
+                    FrameItem::Image(image, size, _) => {
+                        found.push((image.clone(), size.x.to_pt(), size.y.to_pt()))
+                    }
+                    FrameItem::Link(..) => *links += 1,
+                    _ => {}
+                }
+            }
+        }
+        let (mut found, mut links) = (Vec::new(), 0);
+        for page in &document.pages {
+            walk(&page.frame, &mut found, &mut links);
+        }
+        assert_eq!(found.len(), 2);
+        assert!(links >= 1, "the linked image keeps its link");
+
+        let (red, width, height) = &found[0];
+        let ImageKind::Raster(raster) = red.kind() else {
+            panic!("raster")
+        };
+        assert_eq!(raster.data().as_slice(), RED_PNG);
+        assert_eq!((raster.width(), raster.height()), (4, 2));
+        assert_eq!(red.alt(), Some("a \"red\" pixel"));
+        assert!(
+            (width - 40.0).abs() < 1e-6 && (height - 20.0).abs() < 1e-6,
+            "{width}x{height}"
+        );
+
+        let (gone, _, _) = &found[1];
+        let ImageKind::Raster(placeholder) = gone.kind() else {
+            panic!("raster")
+        };
+        assert!(is_placeholder(placeholder.data()));
+        assert_eq!(gone.alt(), Some("gone"));
+
+        // A path outside files: stays an error, as before images rendered.
+        world.set_source("#image(\"red.png\")".to_owned());
+        assert!(world.compile_with_files(&resolve).is_err());
     }
 }
