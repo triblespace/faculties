@@ -58,7 +58,8 @@ enum Command {
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
-        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit, and
+        /// SPAWN_LOCAL_MEMORY_MAX replaces its 24G MemoryMax). A local
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
@@ -102,7 +103,8 @@ enum Command {
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
-        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit). A local
+        /// fallback; SPAWN_LOCAL_MAX_RUNTIME, in seconds, optionally bounds the unit, and
+        /// SPAWN_LOCAL_MEMORY_MAX replaces its 24G MemoryMax). A local
         /// zooid ends with an optional closing message, not a report.
         #[arg(long, default_value = "claude")]
         provider: String,
@@ -254,7 +256,9 @@ enum Command {
     DriveTask {
         /// The host's binding file (JSON): drive, tenant, home, model,
         /// window, telemetry and provider. Optional memory-chars overrides
-        /// Drive's recalled-memory character allowance.
+        /// Drive's recalled-memory character allowance; optional mini-vision
+        /// and organ ({key, peers, port}) are Drive's --mini-vision and
+        /// --organ-key/--organ-peer/--organ-port.
         #[arg(long, value_name = "PATH")]
         binding: PathBuf,
         /// The run's brief file, from {brief}: her first input on a fresh

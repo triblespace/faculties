@@ -271,6 +271,39 @@ fn an_explicit_memory_allowance_is_forwarded_independently_of_the_window() {
 }
 
 #[test]
+fn vision_and_an_organ_in_the_binding_reach_drive() {
+    let setup = setup();
+    let routes = [route("archive")];
+    let mut binding: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&setup.binding).unwrap()).unwrap();
+    binding["mini-vision"] = true.into();
+    binding["organ"] = serde_json::json!({
+        "key": "/organ/organ.key",
+        "peers": ["sender-id"],
+        "port": 41_000
+    });
+    std::fs::write(&setup.binding, binding.to_string()).unwrap();
+
+    let output = adapter(&setup, &routes, "", "silent");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let args = std::fs::read_to_string(setup.out.join("args")).unwrap();
+    let args: Vec<_> = args.lines().collect();
+    assert_eq!(args.iter().filter(|arg| **arg == "--mini-vision").count(), 1);
+    for (flag, value) in [
+        ("--organ-key", "/organ/organ.key"),
+        ("--organ-peer", "sender-id"),
+        ("--organ-port", "41000"),
+    ] {
+        assert_eq!(
+            args.windows(2)
+                .filter(|pair| pair[0] == flag)
+                .collect::<Vec<_>>(),
+            [[flag, value]]
+        );
+    }
+}
+
+#[test]
 fn drive_exit_codes_pass_through() {
     let setup = setup();
     let routes = [route("archive")];
@@ -447,6 +480,7 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         faculties: PathBuf::from("faculties"),
         local: Some(template.split_whitespace().map(str::to_owned).collect()),
         local_max_runtime: Some(600),
+        local_memory_max: None,
         codex_models: None,
         claude_projects: None,
     };

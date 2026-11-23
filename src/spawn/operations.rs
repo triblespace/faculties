@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anybytes::View;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -307,6 +307,13 @@ pub struct LaunchConfig {
     /// `None` is no limit. Units of other providers never get one.
     /// `SPAWN_LOCAL_MAX_RUNTIME` sets it.
     pub local_max_runtime: Option<u64>,
+    /// A local unit's `MemoryMax`, instead of [`Self::memory_max`]: a local
+    /// executor's host-side model needs more than an agent CLI. `None` keeps
+    /// [`Self::memory_max`]. Units of other providers never get it.
+    /// `SPAWN_LOCAL_MEMORY_MAX` sets it. MemoryMax caps host memory and page
+    /// cache, not CUDA device allocations (measured 2026-10-26), so it is no
+    /// GPU admission: a local executor still checks device memory itself.
+    pub local_memory_max: Option<String>,
     /// codex's model catalog (`models_cache.json` of the ambient codex
     /// home), read for a `--cover` launch's window when a codex model is
     /// named. `None` reads none.
@@ -425,6 +432,7 @@ impl LaunchConfig {
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
+            local_memory_max: None,
             codex_models: Some(home.join(".codex/models_cache.json")),
             claude_projects: Some(home.join(".claude/projects")),
         }
@@ -470,11 +478,13 @@ impl LaunchConfig {
     /// `SPAWN_CODEX_AUTH`, the vibe command from `SPAWN_VIBE`, the Mistral
     /// key's Secrets version from `SPAWN_MISTRAL_KEY_SECRET`, a mistral
     /// run's price cap from `SPAWN_MISTRAL_MAX_PRICE`, the local executor
-    /// from `SPAWN_LOCAL_EXECUTOR` and a local unit's runtime limit from
-    /// `SPAWN_LOCAL_MAX_RUNTIME`, each when set and not blank. A price cap
-    /// that is not a positive number, a malformed executor template and a
-    /// runtime limit that is not a positive whole number of seconds are
-    /// refused.
+    /// from `SPAWN_LOCAL_EXECUTOR`, a local unit's runtime limit from
+    /// `SPAWN_LOCAL_MAX_RUNTIME` and its memory limit from
+    /// `SPAWN_LOCAL_MEMORY_MAX`, each when set and not blank. A price cap
+    /// that is not a positive number, a malformed executor template, a
+    /// runtime limit that is not a positive whole number of seconds and a
+    /// memory limit that is not a positive whole number with an optional
+    /// K, M, G or T suffix are refused.
     fn override_from(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<()> {
         let set = |name: &str| {
             var(name)
@@ -499,6 +509,17 @@ impl LaunchConfig {
         }
         if let Some(template) = set("SPAWN_LOCAL_EXECUTOR") {
             self.local = Some(parse_local_executor(&template)?);
+        }
+        if let Some(size) = set("SPAWN_LOCAL_MEMORY_MAX") {
+            let digits = size.strip_suffix(['K', 'M', 'G', 'T']).unwrap_or(&size);
+            ensure!(
+                !digits.is_empty()
+                    && digits.bytes().all(|b| b.is_ascii_digit())
+                    && digits.bytes().any(|b| b != b'0'),
+                "SPAWN_LOCAL_MEMORY_MAX {size:?} is not a positive whole number with an optional \
+                 K, M, G or T suffix"
+            );
+            self.local_memory_max = Some(size);
         }
         if let Some(seconds) = set("SPAWN_LOCAL_MAX_RUNTIME") {
             self.local_max_runtime = match seconds.parse::<u64>() {
@@ -2416,7 +2437,10 @@ impl Spawn {
                 workdir: workdir.clone(),
                 script: script_path.clone(),
                 log: log_path.clone(),
-                memory_max: launch.memory_max.clone(),
+                memory_max: match (provider, &launch.local_memory_max) {
+                    (Provider::Local, Some(size)) => size.clone(),
+                    _ => launch.memory_max.clone(),
+                },
                 runtime_max: (provider == Provider::Local)
                     .then_some(launch.local_max_runtime)
                     .flatten(),
@@ -4667,6 +4691,7 @@ mod tests {
             faculties: PathBuf::from("faculties"),
             local: None,
             local_max_runtime: None,
+            local_memory_max: None,
             codex_models: Some(directory.path().join("codex-models.json")),
             claude_projects: Some(directory.path().join("claude-projects")),
         };
@@ -5626,6 +5651,26 @@ mod tests {
     }
 
     #[test]
+    fn a_local_memory_limit_bounds_only_local_units() {
+        let f = fixture();
+        let executor = local_executor(&f, "local-memory", "printf 'ok' > \"$1\"");
+        let spawn = f.relaunch(|launch| {
+            launch.local =
+                Some(parse_local_executor(&format!("{} {{message}}", executor.display())).unwrap());
+            launch.local_memory_max = Some("48G".to_owned());
+        });
+        spawn.run(&local_request(&f, "Memory bounded.")).unwrap();
+        spawn.run(&f.request("A hosted run keeps the ordinary limit.")).unwrap();
+        let started = f.launcher.started.lock().unwrap().clone();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0].memory_max, "48G");
+        assert!(started[0]
+            .systemd_run_args()
+            .contains(&"MemoryMax=48G".to_owned()));
+        assert_eq!(started[1].memory_max, "24G");
+    }
+
+    #[test]
     fn a_local_template_gets_the_runtime_limit_it_names() {
         let f = fixture();
         let executor = local_executor(&f, "local-runtime", "printf 'ok' > \"$1\"");
@@ -6008,6 +6053,20 @@ mod tests {
         assert_eq!(limit(" 90 ").unwrap(), Some(90));
         for bad in ["0", "-5", "1.5", "an hour"] {
             assert!(limit(bad).is_err(), "{bad}");
+        }
+        let memory = |value: &'static str| {
+            let mut config = LaunchConfig::under_home(home);
+            config
+                .override_from(move |name: &str| {
+                    (name == "SPAWN_LOCAL_MEMORY_MAX").then(|| value.to_owned())
+                })
+                .map(|()| config.local_memory_max)
+        };
+        assert_eq!(memory(" ").unwrap(), None);
+        assert_eq!(memory(" 48G ").unwrap().as_deref(), Some("48G"));
+        assert_eq!(memory("51539607552").unwrap().as_deref(), Some("51539607552"));
+        for bad in ["0", "0G", "G", "-4G", "1.5G", "48GB", "48g", "infinity", "48 G"] {
+            assert!(memory(bad).is_err(), "{bad}");
         }
     }
 

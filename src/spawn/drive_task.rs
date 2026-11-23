@@ -12,7 +12,10 @@
 //! and `--brief-from`. Everything the run does not decide (tenant, home,
 //! model, window, wake allowance, telemetry, provider) comes from one binding
 //! file the host provisions. An omitted wake allowance leaves Drive's default
-//! in effect. Nothing is truncated or falls back to a hosted model. Every
+//! in effect. The binding may also show a Mini mind images (`mini-vision`,
+//! Drive's `--mini-vision`) and serve her an organ senses push into (`organ`,
+//! Drive's `--organ-key`, `--organ-peer` and `--organ-port`); omitted, Drive
+//! runs without either. Nothing is truncated or falls back to a hosted model. Every
 //! pinned faculties route is passed on;
 //! a route variable that names no faculties collection, a malformed or
 //! repeated route, or a missing archive route refuses before Drive starts,
@@ -42,8 +45,8 @@ use triblespace::prelude::Id;
 /// Drive writes the zooid's own history to.
 pub const ARCHIVE_ROLE: &str = "archive";
 
-/// Everything a host provisions for its local zooids. Only `memory-chars`
-/// may be omitted and no other key is accepted.
+/// Everything a host provisions for its local zooids. Only `memory-chars`,
+/// `mini-vision` and `organ` may be omitted and no other key is accepted.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Binding {
@@ -61,6 +64,13 @@ pub struct Binding {
     /// Override Drive's recalled-memory character allowance independently of
     /// the full context window. Zero selects no recalled memories.
     pub memory_chars: Option<usize>,
+    /// Drive's `--mini-vision`: the Mini mind is shown the images in tool
+    /// results and senses. Omitted or false: she is told what she was not
+    /// shown, as without it.
+    #[serde(default)]
+    pub mini_vision: bool,
+    /// Drive's organ: the endpoint senses push media into. Omitted: no organ.
+    pub organ: Option<Organ>,
     /// The largest brief file passed on; a larger one refuses.
     pub max_brief_bytes: u64,
     pub telemetry: Telemetry,
@@ -91,6 +101,20 @@ pub struct Playground {
     pub backend: String,
     /// Required, possibly empty: each becomes one `--backend-arg`.
     pub backend_args: Vec<String>,
+}
+
+/// `{"key": PATH, "peers": [ID...], "port": N}`: Drive's `--organ-key`, one
+/// `--organ-peer` per peer and `--organ-port`. The binding names the key
+/// file; its bytes are never read here.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Organ {
+    pub key: PathBuf,
+    /// Required, possibly empty: the endpoint ids allowed to push. Empty is
+    /// Drive's own meaning, every peer that can reach the organ.
+    pub peers: Vec<String>,
+    /// A fixed UDP port; omitted lets iroh choose.
+    pub port: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -140,6 +164,16 @@ impl Binding {
             ("max-brief-bytes", self.max_brief_bytes),
         ] {
             ensure!(value > 0, "binding key {key} must be positive");
+        }
+        if let Some(organ) = &self.organ {
+            ensure!(
+                !organ.key.as_os_str().is_empty(),
+                "binding organ key must not be empty"
+            );
+            ensure!(
+                organ.peers.iter().all(|peer| !peer.is_empty()),
+                "binding organ peers must not hold an empty peer"
+            );
         }
         if let Telemetry::Pile(pile) = &self.telemetry {
             ensure!(
@@ -433,6 +467,18 @@ pub fn plan(
     if let Some(chars) = binding.memory_chars {
         flag("--memory-chars", chars.to_string().into());
     }
+    if binding.mini_vision {
+        args.push("--mini-vision".into());
+    }
+    if let Some(organ) = &binding.organ {
+        args.extend(["--organ-key".into(), organ.key.clone().into()]);
+        for peer in &organ.peers {
+            args.extend(["--organ-peer".into(), peer.into()]);
+        }
+        if let Some(port) = organ.port {
+            args.extend(["--organ-port".into(), port.to_string().into()]);
+        }
+    }
     match &binding.telemetry {
         Telemetry::Off => args.push("--no-telemetry".into()),
         Telemetry::Pile(pile) => args.extend(["--telemetry-pile".into(), pile.clone().into()]),
@@ -677,6 +723,73 @@ mod tests {
         ] {
             assert!(!expected.iter().any(|arg| arg == task), "{task}");
         }
+    }
+
+    #[test]
+    fn vision_and_an_organ_are_drives_own_flags_and_omitted_add_nothing() {
+        let pinned = routes(&["archive"]);
+        let plain = strings(&plan(&binding(), &run(&pinned), 500, None).unwrap());
+        for flag in ["--mini-vision", "--organ-key", "--organ-peer", "--organ-port"] {
+            assert!(!plain.iter().any(|arg| arg == flag), "{flag}: {plain:?}");
+        }
+
+        let mut json: serde_json::Value = serde_json::from_str(FAKE_BINDING).unwrap();
+        json["mini-vision"] = true.into();
+        json["organ"] = serde_json::json!({
+            "key": "/fake/organ dir/organ.key",
+            "peers": ["peer-one", "peer-two"],
+            "port": 41_000
+        });
+        let seen: Binding = serde_json::from_value(json.clone()).unwrap();
+        seen.check().unwrap();
+        let args = strings(&plan(&seen, &run(&pinned), 500, None).unwrap());
+        let tail: Vec<&str> = args
+            .iter()
+            .skip_while(|arg| *arg != "--mini-vision")
+            .take_while(|arg| *arg != "--no-telemetry")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "--mini-vision",
+                "--organ-key",
+                "/fake/organ dir/organ.key",
+                "--organ-peer",
+                "peer-one",
+                "--organ-peer",
+                "peer-two",
+                "--organ-port",
+                "41000",
+            ]
+        );
+        // The prefix before them is exactly the plain argv's.
+        let at = args.iter().position(|arg| arg == "--mini-vision").unwrap();
+        assert_eq!(args[..at], plain[..at]);
+        assert_eq!(args[at + tail.len()..], plain[at..]);
+
+        // An open organ (no peers) on an iroh-chosen port, and vision false.
+        json["mini-vision"] = false.into();
+        json["organ"] = serde_json::json!({"key": "/k", "peers": []});
+        let open: Binding = serde_json::from_value(json.clone()).unwrap();
+        open.check().unwrap();
+        let args = strings(&plan(&open, &run(&pinned), 500, None).unwrap());
+        assert!(!args.iter().any(|arg| arg == "--mini-vision"));
+        assert!(!args.iter().any(|arg| arg == "--organ-peer" || arg == "--organ-port"));
+        let at = args.iter().position(|arg| arg == "--organ-key").unwrap();
+        assert_eq!(args[at + 1], "/k");
+
+        // peers is required, the key must name a file, and nothing else is accepted.
+        json["organ"] = serde_json::json!({"key": "/k"});
+        assert!(serde_json::from_value::<Binding>(json.clone()).is_err());
+        json["organ"] = serde_json::json!({"key": "/k", "peers": [], "secret": "x"});
+        assert!(serde_json::from_value::<Binding>(json.clone()).is_err());
+        json["organ"] = serde_json::json!({"key": "", "peers": []});
+        let empty: Binding = serde_json::from_value(json.clone()).unwrap();
+        assert!(empty.check().is_err());
+        json["organ"] = serde_json::json!({"key": "/k", "peers": [""]});
+        let blank: Binding = serde_json::from_value(json).unwrap();
+        assert!(blank.check().is_err());
     }
 
     #[test]
