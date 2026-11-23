@@ -10376,7 +10376,7 @@ mod tests {
             // The established wait's timer path observes Waiting and retains
             // that result in the *same newer* context before the body arrives.
             fs::remove_file(marker).unwrap();
-            let seen = sweep_wait_habits(
+            let (seen, swept_persona, swept_frame) = sweep_wait_habits(
                 &current.observation,
                 current.persona,
                 &mut pending,
@@ -10384,6 +10384,10 @@ mod tests {
                 200,
             )
             .unwrap();
+            // The sweep says whose habits, in which frame, it evaluated, so
+            // its receipts are read and written for exactly that.
+            assert_eq!(swept_persona, persona);
+            assert!(matches!(swept_frame, SweptFrame::Pending));
             assert!(!seen.due.contains_key(&probe_id));
             assert!(
                 render_habit_transitions(&current.habits, &seen, nothing_presented().seen()).is_none()
