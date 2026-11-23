@@ -228,11 +228,12 @@ enum Command {
         #[arg(long)]
         peek: bool,
     },
-    /// Mark every attention event currently visible to this routing selector
-    /// in the signing zooid's receipt history. This is an explicit subscription
-    /// baseline for operators who do not want existing backlog reported.
+    /// Mark every attention event currently visible to this persona as
+    /// presented to it. This is an explicit subscription baseline for
+    /// operators who do not want existing backlog reported.
     Baseline,
-    /// Import resident legacy receipt facts into this key's private history.
+    /// Import one persona's resident legacy receipt facts, persona kept, into
+    /// the receipt collection (the routed or private Spawn root).
     /// Keeps existing IDs and timestamps; does not baseline unseen events or
     /// maintain either projection.
     ImportReceipts {

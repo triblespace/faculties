@@ -5078,13 +5078,20 @@ fn observe_habits_in_observation(
 /// evaluation it replaces. A newer pending frame may already have readable
 /// habits even while its news body is missing; never copy an evaluation of
 /// `current` into that frame. Pure payload retries do not call this function.
+/// Which frame a habit sweep evaluated, so its receipts are read from and
+/// written for the same observation and persona that decided what is due.
+enum SweptFrame {
+    Current,
+    Pending,
+}
+
 fn sweep_wait_habits(
     current: &OrientObservation,
     persona: Id,
     pending: &mut Option<PendingWaitFrame>,
     pile_path: &Path,
     now_secs: i64,
-) -> Result<HabitObservation> {
+) -> Result<(HabitObservation, Id, SweptFrame)> {
     if let Some(pending) = pending.as_mut() {
         if let (Some(persona), Some(_), Some(observation)) = (
             pending.persona,
@@ -5093,10 +5100,11 @@ fn sweep_wait_habits(
         ) {
             let habits = observe_habits_in_observation(observation, pile_path, now_secs, persona)?;
             pending.habits = Some(habits.clone());
-            return Ok(habits);
+            return Ok((habits, persona, SweptFrame::Pending));
         }
     }
-    observe_habits_in_observation(current, pile_path, now_secs, persona)
+    let habits = observe_habits_in_observation(current, pile_path, now_secs, persona)?;
+    Ok((habits, persona, SweptFrame::Current))
 }
 
 /// Selected payload acquisition yields at a local health
@@ -5946,17 +5954,29 @@ async fn observe_wait(
             // Habit readiness is independent of a selected news body's
             // availability. Sweep the ready pending Habit context when there
             // is one, otherwise retain the last fully readable context.
-            let current_habits = sweep_wait_habits(
+            let (current_habits, swept_persona, swept_frame) = sweep_wait_habits(
                 &current,
                 persona_id,
                 &mut pending_frame,
                 pile_path,
                 now_secs,
             )?;
+            // The receipts of the frame the habits were evaluated in, read for
+            // the persona they were evaluated for: a pending frame can hold a
+            // re-resolved persona and a newer receipt view than `current`.
+            let swept_receipts = match swept_frame {
+                SweptFrame::Pending => &pending_frame
+                    .as_ref()
+                    .and_then(|pending| pending.observation.as_ref())
+                    .expect("a pending sweep evaluated a pending observation")
+                    .facts
+                    .presentations,
+                SweptFrame::Current => &current.facts.presentations,
+            };
             let (habit_report, due_events) = render_habit_transitions(
                 &habit_seen,
                 &current_habits,
-                current.facts.presentations.for_observer(persona_id),
+                swept_receipts.for_observer(swept_persona),
             )
             .unwrap_or_default();
             let habit_fired = !habit_report.is_empty();
@@ -5973,7 +5993,7 @@ async fn observe_wait(
                     pile,
                     signer,
                     sources.presentations.source,
-                    persona_id,
+                    swept_persona,
                     &due_events,
                 )?;
             }

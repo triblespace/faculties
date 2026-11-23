@@ -1,6 +1,7 @@
 //! Finite explicit Orient tools; no persistent watcher or ambient persona.
-//! Persona selects routing; receipt history belongs to the storage signing key.
-//! Admitted reporting calls maintain the receipt ID-set before selecting it.
+//! Persona selects routing and whose receipts count: each receipt names the
+//! zooid it was presented to, whichever node key signed it. Admitted reporting
+//! calls maintain the receipt projection before selecting it.
 use super::{ShowOptions, WakeOptions};
 use crate::mcp::{decode_arguments, Faculty, Tool};
 use crate::out::Out;
