@@ -100,6 +100,8 @@ mod tests {
         sources: HealthSources,
         metrics: Collection<SimpleArchive>,
         signer: SigningKey,
+        /// The one zooid this fixture reports to and receipts for.
+        reader: Id,
         path: PathBuf,
         key: PathBuf,
         directory: tempfile::TempDir,
@@ -140,6 +142,7 @@ mod tests {
                 sources,
                 metrics,
                 signer,
+                reader: genid().id,
                 path,
                 key,
                 directory,
@@ -162,7 +165,7 @@ mod tests {
             let observation = self.sources.observe(&mut self.store, &self.signer).unwrap();
             let report = observation.report();
             assert_eq!(report.attention, observation.attention().attention);
-            let news = observation.news(genid().id, &report);
+            let news = observation.news(self.reader, &report);
             (report, news)
         }
 
@@ -174,7 +177,7 @@ mod tests {
                 .presentations
                 .observe(&self.store.snapshot().unwrap())
                 .unwrap();
-            event_presented(receipts.view(), event)
+            event_presented(receipts.for_observer(self.reader), event)
         }
     }
 
@@ -644,7 +647,11 @@ mod tests {
             .presentations
             .observe(&reopened.snapshot().unwrap())
             .unwrap();
-        assert!(event_presented(receipts.view(), event.id));
+        assert!(event_presented(receipts.for_observer(persona), event.id));
+        assert!(
+            !event_presented(receipts.for_observer(genid().id), event.id),
+            "the daemon's receipt names the persona it delivered to"
+        );
         reopened.close().unwrap();
     }
 }

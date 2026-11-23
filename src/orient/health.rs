@@ -1494,7 +1494,7 @@ impl HealthObservation {
     pub(super) fn news(&self, persona: Id, report: &HealthReport) -> News {
         let mut pending = report
             .attention
-            .pending_health(self.facts.view(), self.presentations.view());
+            .pending_health(self.facts.view(), self.presentations.for_observer(persona));
         // A window is not told about its own news path: it is the one party
         // that cannot hear it, and its peers are the ones who can act.
         let own = IdentityIndex::from_relations(self.relations.view())
@@ -1539,6 +1539,7 @@ impl HealthObservation {
             push_stream_line(&mut stream, &reason);
         }
         News::Report {
+            observer: persona,
             text,
             stream,
             events: pending.ids().collect(),
@@ -1625,10 +1626,12 @@ fn attention_state_name(component: Id, state: Id, recovered: bool) -> &'static s
 /// two collections on the stable episode fields and deliberately leave those
 /// counters out. This is why receipts are a queryable Rank9 projection rather
 /// than an entity-id membership set.
-fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event: Id) -> bool {
+fn health_episode_presented(facts: &FactArchive, presented: Presented<'_>, event: Id) -> bool {
     if event_presented(presented, event) {
         return true;
     }
+    let observer = presented.observer;
+    let presented = presented.facts;
 
     for (node, session, state, started_at) in find!(
         (node: Id, session: Id, state: Id, started_at: IntervalValue),
@@ -1659,7 +1662,11 @@ fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event:
                             attrs::state: &state,
                             metadata::started_at: &started_at,
                         }]),
-                        pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                        pattern!(presented, [{ _?receipt @
+                            metadata::tag: &KIND_PRESENTED,
+                            presentation::persona: &observer,
+                            presentation::event: ?prior,
+                        }]),
                     )) {
                         return true;
                     }
@@ -1689,7 +1696,11 @@ fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event:
                                     attrs::collection: &collection,
                                     metadata::started_at: &started_at,
                                 }]),
-                                pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                                pattern!(presented, [{ _?receipt @
+                            metadata::tag: &KIND_PRESENTED,
+                            presentation::persona: &observer,
+                            presentation::event: ?prior,
+                        }]),
                             )
                         ) {
                             if !exists!(pattern!(facts, [{ prior @ attrs::peer: _?peer }])) {
@@ -1710,7 +1721,11 @@ fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event:
                                     attrs::peer: peer,
                                     metadata::started_at: &started_at,
                                 }]),
-                                pattern!(presented, [{ _?receipt @ presentation::event: ?prior }]),
+                                pattern!(presented, [{ _?receipt @
+                            metadata::tag: &KIND_PRESENTED,
+                            presentation::persona: &observer,
+                            presentation::event: ?prior,
+                        }]),
                             )) {
                                 return true;
                             }
@@ -1724,7 +1739,7 @@ fn health_episode_presented(facts: &FactArchive, presented: &FactArchive, event:
 }
 
 impl AttentionView {
-    fn pending_health(&self, facts: &FactArchive, presented: &FactArchive) -> Self {
+    fn pending_health(&self, facts: &FactArchive, presented: Presented<'_>) -> Self {
         Self {
             events: self
                 .events
@@ -1960,7 +1975,7 @@ mod tests {
 
     #[test]
     fn explicit_workspace_health_retains_all_selected_roots() {
-        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 
         test_block_on(async {
@@ -1973,7 +1988,7 @@ mod tests {
             for scope in [
                 schema::DEFAULT_SCOPE_ID,
                 RELATIONS_SCOPE_ID,
-                RECEIPTS_SCOPE_ID,
+                SPAWN_SCOPE_ID,
             ] {
                 let source = store
                     .collection(
@@ -2001,7 +2016,7 @@ mod tests {
             );
             assert_eq!(
                 sources.presentations.source.handle(),
-                routes[&RECEIPTS_SCOPE_ID]
+                routes[&SPAWN_SCOPE_ID]
             );
             assert_eq!(
                 sources.latest,
@@ -2180,7 +2195,7 @@ mod tests {
             .commit(
                 f.sources.presentations.source,
                 &f.signer,
-                orient_model::receipt_fragment(events, clock::point_now().unwrap()),
+                orient_model::receipt_fragment(reader, events, clock::point_now().unwrap()),
             )
             .unwrap();
         let later = f.observe_at(at(40.0 * 60.0));
@@ -2561,12 +2576,12 @@ mod tests {
     }
 
     /// Record that `events` were shown, as a watcher does after news.
-    fn present(f: &mut Fixture, events: Vec<Id>) {
+    fn present(f: &mut Fixture, observer: Id, events: Vec<Id>) {
         f.store
             .commit(
                 f.sources.presentations.source,
                 &f.signer,
-                orient_model::receipt_fragment(events, clock::point_now().unwrap()),
+                orient_model::receipt_fragment(observer, events, clock::point_now().unwrap()),
             )
             .unwrap();
     }
@@ -2591,7 +2606,7 @@ mod tests {
             news_text(degraded.news(reader, &degraded.attention())).expect("a deferral is news");
         assert!(text.contains("attempt 1"), "{text}");
         assert_eq!(events, vec![first_id]);
-        present(&mut f, events);
+        present(&mut f, reader, events);
 
         // Later attempts of the same stretch: the dashboard follows each
         // one, and none is news again.
@@ -2634,7 +2649,7 @@ mod tests {
             .expect("an acceptance is news");
         assert!(text.contains("callback accepting again"), "{text}");
         assert_eq!(events, vec![delivered_id]);
-        present(&mut f, events);
+        present(&mut f, reader, events);
 
         // The first deferral after it starts a new stretch, and wakes again.
         let next = path_retry(window, session, at(400.0), at(400.0), 1, 60.0, reason);
@@ -2674,7 +2689,7 @@ mod tests {
         let (_, events) =
             news_text(observed.news(reader, &observed.attention())).expect("the deferral is news");
         assert_eq!(events, vec![first_id]);
-        present(&mut f, events);
+        present(&mut f, reader, events);
 
         let mut emit = |_part| Ok(());
         let mut out = crate::out::Out::new(&mut emit);
@@ -2693,7 +2708,7 @@ mod tests {
             let (text, events) = news_text(observed.news(reader, &observed.attention()))
                 .expect("the restart itself is news");
             assert!(text.contains("polling resumed"), "{restart}: {text}");
-            present(&mut f, events);
+            present(&mut f, reader, events);
             let path = f.sources.news_path_target().expect("persona resolved");
             for attempt in 1..=2 {
                 on_delivery_notice(&mut f.store, &f.signer, &path, deferred(attempt)).unwrap();
@@ -2720,7 +2735,7 @@ mod tests {
         let (text, events) = news_text(observed.news(reader, &observed.attention()))
             .expect("the acceptance is news");
         assert!(text.contains("callback accepting again"), "{text}");
-        present(&mut f, events);
+        present(&mut f, reader, events);
         on_delivery_notice(&mut f.store, &f.signer, &path, deferred(1)).unwrap();
         let observed = f.sources.observe(&mut f.store, &f.signer).unwrap();
         let (text, events) = news_text(observed.news(reader, &observed.attention()))
@@ -2775,7 +2790,7 @@ mod tests {
         let (text, event) = only_news(&degraded, reader);
         assert!(text.contains("degraded since"), "{text}");
         assert_eq!(event, retry_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         assert!(degraded.report().text.contains("degraded since"));
 
         let silent = f.observe_at(at(next_try + 21.0 * MIN));
@@ -2803,7 +2818,7 @@ mod tests {
         assert!(quiet(&silent, window), "a window is not told about itself");
         // The stretch's escalation deadline is still ahead.
         assert_eq!(silent.attention().next_change, Some(at(20.0 + 60.0 * MIN)));
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         assert!(quiet(&f.observe_at(at(next_try + 30.0 * MIN)), reader));
     }
 
@@ -2824,7 +2839,7 @@ mod tests {
         f.publish(first);
         let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
         assert_eq!(event, first_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         // Still retrying a minute before the hour: nothing new, and the
         // reader's next wake is the hour itself.
@@ -2848,7 +2863,7 @@ mod tests {
         assert!(text.contains(&utc(at(20.0))), "{text}");
         assert_ne!(escalation, first_id);
         assert!(quiet(&after, window), "a window is not told about itself");
-        present(&mut f, vec![escalation]);
+        present(&mut f, reader, vec![escalation]);
 
         // Later attempts and renders add nothing.
         for attempt in 61..=63u128 {
@@ -2882,7 +2897,7 @@ mod tests {
         f.publish(first);
         let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
         assert_eq!(event, first_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         // Each restart resumes polling without an acceptance, then defers
         // again under the same stretch start.
@@ -2898,7 +2913,7 @@ mod tests {
             });
             let resumption = f.observe_at(at(resumed + 1.0));
             if let News::Report { events, .. } = resumption.news(reader, &resumption.attention()) {
-                present(&mut f, events.into_iter().collect());
+                present(&mut f, reader, events.into_iter().collect());
             }
             f.publish(path_retry(
                 window,
@@ -2915,7 +2930,7 @@ mod tests {
                 News::Report { text, events, .. } => {
                     assert!(text.contains("still degraded after 60 min"), "{text}");
                     escalations.extend(events.iter().copied());
-                    present(&mut f, events.into_iter().collect());
+                    present(&mut f, reader, events.into_iter().collect());
                 }
             }
         }
@@ -2946,7 +2961,7 @@ mod tests {
         assert!(events.contains(&exit_id));
         assert!(!events.contains(&beat_id), "a silence has its own event");
         assert_eq!(first.attention().next_change, Some(at(60.0 * MIN)));
-        present(&mut f, events);
+        present(&mut f, reader, events);
 
         let before = f.observe_at(at(60.0 * MIN - 1.0));
         assert!(quiet(&before, reader), "not before the hour");
@@ -2959,14 +2974,14 @@ mod tests {
         let (text, event) = only_news(&silent_hour, reader);
         assert!(text.contains("still silent after 60 min"), "{text}");
         assert_ne!(event, beat_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         let exit_hour = f.observe_at(at(10.0 + 60.0 * MIN + 1.0));
         let (text, event) = only_news(&exit_hour, reader);
         assert!(text.contains("still exited after 60 min"), "{text}");
         assert!(text.contains("callback failed"), "{text}");
         assert_ne!(event, exit_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         assert!(quiet(&f.observe_at(at(120.0 * MIN)), reader), "said once");
     }
@@ -2987,7 +3002,7 @@ mod tests {
         let mut seen = Vec::new();
         let (_, event) = only_news(&degraded, reader);
         seen.push(event);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         let overdue = degraded
             .attention()
             .next_change
@@ -2998,7 +3013,7 @@ mod tests {
         let (text, event) = only_news(&silent, reader);
         assert!(text.contains("has not beaten"), "{text}");
         seen.push(event);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         let hour = silent
             .attention()
             .next_change
@@ -3009,7 +3024,7 @@ mod tests {
         let (text, event) = only_news(&escalated, reader);
         assert!(text.contains("still silent after 60 min"), "{text}");
         assert!(!seen.contains(&event));
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         assert!(quiet(&f.observe_at(at(5.0 * 60.0 * MIN)), reader));
     }
 
@@ -3028,13 +3043,13 @@ mod tests {
         let retry_id = retry.root().unwrap();
         f.publish(retry);
         let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         let delivered = path_delivered(window, session, at(600.0), Some(retry_id));
         f.publish(delivered);
         let (text, event) = only_news(&f.observe_at(at(601.0)), reader);
         assert!(text.contains("callback accepting again"), "{text}");
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         f.publish(path_beat(window, session, at(3500.0)));
         let past_hour = f.observe_at(at(3700.0));
         assert!(
@@ -3048,7 +3063,7 @@ mod tests {
         f.publish(next);
         let (_, event) = only_news(&f.observe_at(at(4001.0)), reader);
         assert_eq!(event, next_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         f.publish(path_retry(
             window,
             session,
@@ -3127,7 +3142,7 @@ mod tests {
             reason,
         ));
         let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         let gone = f
             .store
             .put::<blobencodings::UTF8String, _>("callback failed".to_owned())
@@ -3137,7 +3152,7 @@ mod tests {
         f.publish(exit);
         let (_, event) = only_news(&f.observe_at(at(3001.0)), reader);
         assert_eq!(event, exit_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         // Past the degraded stretch's hour: the exit ended that stretch and
         // its own hour runs from the exit.
@@ -3164,14 +3179,14 @@ mod tests {
         let retry_id = retry.root().unwrap();
         f.publish(retry);
         let (_, event) = only_news(&f.observe_at(at(21.0)), reader);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         let delivered = path_delivered(window, session, at(60.0), Some(retry_id));
         let delivered_id = delivered.root().unwrap();
         f.publish(delivered);
         let (text, event) = only_news(&f.observe_at(at(61.0)), reader);
         assert!(text.contains("callback accepting again"), "{text}");
         assert_eq!(event, delivered_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         // No beat follows the acceptance: the path goes silent.
         let silent = f.observe_at(at(60.0 + 21.0 * MIN));
@@ -3179,7 +3194,7 @@ mod tests {
         assert!(text.contains("has not beaten"), "{text}");
         assert_ne!(event, delivered_id, "the silence is not the acceptance");
         assert!(quiet(&silent, window), "a window is not told about itself");
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         assert!(quiet(&f.observe_at(at(60.0 + 30.0 * MIN)), reader));
     }
 
@@ -3196,7 +3211,7 @@ mod tests {
         let exit_id = exit.root().unwrap();
         f.publish(exit);
         let (_, event) = only_news(&f.observe_at(at(11.0)), reader);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         let resumed = *fucid();
         let beat = entity! {
             metadata::tag*: [KIND_NEWS_PATH_BEAT, schema::KIND_RECOVERED],
@@ -3209,14 +3224,14 @@ mod tests {
         f.publish(beat);
         let (text, event) = only_news(&f.observe_at(at(101.0)), reader);
         assert!(text.contains("polling resumed"), "{text}");
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
 
         // The resumed session never beats again.
         let (text, event) = only_news(&f.observe_at(at(100.0 + 21.0 * MIN)), reader);
         assert!(text.contains("has not beaten"), "{text}");
         assert_ne!(event, resumed);
         assert_ne!(event, beat_id);
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         assert!(quiet(&f.observe_at(at(100.0 + 30.0 * MIN)), reader));
     }
 
@@ -3234,7 +3249,7 @@ mod tests {
             vec![event],
             "every render names the silence the same way"
         );
-        present(&mut f, vec![event]);
+        present(&mut f, reader, vec![event]);
         for minutes in [26.0, 40.0, 59.0] {
             assert!(
                 quiet(&f.observe_at(at(minutes * MIN)), reader),
@@ -3572,8 +3587,8 @@ mod tests {
         let events: Vec<_> = health.report().attention.ids().collect();
         assert!(!events.is_empty());
 
-        // Receipt ownership is the signing zooid, independent of the selected
-        // contact. An earlier source COMMIT must be carried before reporting.
+        // A receipt counts for the persona it names, whichever node signed
+        // it. An earlier source COMMIT must be carried before reporting.
         let reader_key = SigningKey::from_bytes(&[73; 32]);
         f.sources.presentations = {
             let mut local = f.store.store();
@@ -3585,6 +3600,7 @@ mod tests {
                 &reader_key,
                 entity! {
                     metadata::tag: &KIND_PRESENTED,
+                    presentation::persona: &persona,
                     presentation::event*: events.iter().copied(),
                 },
             )
@@ -3600,7 +3616,7 @@ mod tests {
         let lagging = f.sources.at(before, clock::now().unwrap()).unwrap();
         assert!(events
             .iter()
-            .all(|event| lagging.presentations.contains(*event)));
+            .all(|event| lagging.presentations.contains(persona, *event)));
         assert!(matches!(
             lagging.news(persona, &lagging.report()),
             News::Quiet
@@ -3608,7 +3624,7 @@ mod tests {
         let ready = f.sources.observe(&mut f.store, &reader_key).unwrap();
         assert!(events
             .iter()
-            .all(|event| ready.presentations.contains(*event)));
+            .all(|event| ready.presentations.contains(persona, *event)));
         assert!(matches!(ready.news(persona, &ready.report()), News::Quiet));
         let mut parts = Vec::new();
         let mut emit = |part| {
@@ -3919,7 +3935,8 @@ mod tests {
                 .unwrap(),
         );
         // A receipt of this signer's arrives without its archive.
-        let cold = orient_model::receipt_fragment([*fucid()], clock::point_now().unwrap());
+        let cold =
+            orient_model::receipt_fragment(persona, [*fucid()], clock::point_now().unwrap());
         let cold = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
         f.store
             .insert(CollectionRecord::Commit(CollectionCommit::sign(
@@ -4088,7 +4105,7 @@ mod tests {
         assert!(after.text.contains("last sample only"));
         assert_eq!(after.next_change, None);
         let persona = *fucid();
-        save_test_presentations(&mut f.store, &f.signer, [report_id]).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, persona, [report_id]).unwrap();
         let next = f.observe_at(at(100.0));
         assert!(matches!(next.news(persona, &next.report()), News::Quiet));
         assert!(next.snapshot.wants().unwrap().next().is_none());
@@ -4287,6 +4304,7 @@ mod tests {
                 &f.signer,
                 entity! {
                     metadata::tag: &KIND_PRESENTED,
+                    presentation::persona: &persona,
                     presentation::event*: events.iter().copied(),
                 },
             )
@@ -4309,7 +4327,7 @@ mod tests {
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(events
             .iter()
-            .all(|event| observed.presentations.contains(*event)));
+            .all(|event| observed.presentations.contains(persona, *event)));
         assert!(matches!(
             observed.news(persona, &observed.report()),
             News::Quiet
@@ -4349,7 +4367,7 @@ mod tests {
         let observed = &f.sources.poll_view.as_ref().unwrap().1;
         assert!(events
             .iter()
-            .all(|event| observed.presentations.contains(*event)));
+            .all(|event| observed.presentations.contains(persona, *event)));
         assert!(matches!(
             observed.news(persona, &observed.report()),
             News::Quiet
@@ -4433,7 +4451,7 @@ mod tests {
         );
         let failure = f.observe_at(at(1.0)).report();
         assert_eq!(failure.attention.ids().len(), 1);
-        save_test_presentations(&mut f.store, &f.signer, failure.attention.ids()).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, persona, failure.attention.ids()).unwrap();
         f.publish(
             recorder
                 .record(at(10.0), [store_condition(State::Stalled, true)])
@@ -4459,7 +4477,7 @@ mod tests {
         assert!(
             matches!(&recovery_news, News::Report { text, .. } if text.contains("recovered; current"))
         );
-        save_test_presentations(&mut f.store, &f.signer, recovery_ids).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, persona, recovery_ids).unwrap();
         f.publish(
             recorder
                 .record(at(30.0), [store_condition(State::Current, false)])
@@ -4508,7 +4526,7 @@ mod tests {
         let first_report = first.report();
         let first_ids: Vec<_> = first_report.attention.ids().collect();
         assert_eq!(first_ids.len(), 1);
-        save_test_presentations(&mut f.store, &f.signer, first_ids.clone()).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, persona, first_ids.clone()).unwrap();
 
         f.publish(
             recorder
@@ -4541,7 +4559,7 @@ mod tests {
             recovered.news(persona, &recovered_report),
             News::Report { .. }
         ));
-        save_test_presentations(&mut f.store, &f.signer, recovered_ids).unwrap();
+        save_test_presentations(&mut f.store, &f.signer, persona, recovered_ids).unwrap();
 
         f.publish(
             recorder

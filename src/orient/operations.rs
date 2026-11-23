@@ -14,6 +14,9 @@ mod next;
 mod receipt_import;
 #[path = "service_events.rs"]
 mod service_events;
+#[cfg(test)]
+#[path = "recipient_tests.rs"]
+mod recipient_tests;
 pub use next::{Next, NextCompletion, NextKind, PendingNext, PreparedReport};
 
 #[derive(Clone, Debug)]
@@ -901,7 +904,17 @@ impl OrientSource {
 }
 
 /// Receipt facts, projected the same way every other Orient input is.
-/// The signing key is the observer's identity; routing aliases are not authority.
+///
+/// Receipts live in the colony's shared Spawn collection (JP, 2026-11-23): the
+/// collection every zooid's runs and requests already travel in, so one
+/// zooid's seen state reaches every node that syncs it. Each receipt names the
+/// zooid it was presented to; the signing key is only the node that wrote it.
+/// The Spawn scope is resolved exactly as Spawn resolves it -- an explicit
+/// workspace route, else `TRIBLESPACE_COLLECTION_SPAWN`, else the signer-private
+/// default -- so Orient and Spawn can never disagree about which root that is.
+/// Spawn's own facts carry no `KIND_PRESENTED` tag and no presentation
+/// attributes, so they are never read as receipts, and receipts are facts
+/// Spawn's readers do not select.
 ///
 /// This used to derive an `EntityIdSetBlob` over `presentation::event`, and a
 /// set of ids can answer exactly one question: is THIS id present. Every
@@ -923,15 +936,12 @@ impl ReceiptSource {
         pile: &mut impl FacultyAccess,
         signer: &SigningKey,
     ) -> Result<Self> {
-        if routing.collection_routes().is_none() {
-            return Self::register(pile, signer);
-        }
         let source = OrientSource::open(
             routing,
             pile,
             signer,
-            crate::schemas::orient::RECEIPTS_SCOPE_ID,
-            "Orient receipts",
+            crate::schemas::spawn::DEFAULT_SCOPE_ID,
+            "Orient receipts (Spawn)",
         )
         .await?;
         Ok(Self {
@@ -941,13 +951,13 @@ impl ReceiptSource {
         })
     }
 
-    /// The standalone CLI retains its signer-owned receipt collection.
-    /// Explicit workspaces reach their exact receipt root through `open`.
+    /// The standalone CLI default: this signer's private Spawn root, the same
+    /// one `open` reaches with no route and no environment override.
     fn register<S: CollectionStoreExt>(pile: &mut S, signer: &SigningKey) -> Result<Self> {
-        let policy = crate::collection_names::private_policy(signer.verifying_key());
-        let source = pile.collection(
-            crate::schemas::orient::RECEIPT_COLLECTION_NAME,
-            policy.clone(),
+        let source = crate::collection_names::open(
+            pile,
+            crate::schemas::spawn::DEFAULT_SCOPE_ID,
+            signer.verifying_key(),
         )?;
         let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
         let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
@@ -1021,17 +1031,26 @@ impl ReceiptObservation {
         &self.view
     }
 
-    #[cfg(test)]
-    fn contains(&self, event: Id) -> bool {
-        event_presented(&self.view, event)
+    /// This observer's reading of the receipts.
+    fn for_observer(&self, observer: Id) -> Presented<'_> {
+        Presented::new(&self.view, observer)
     }
 
-    /// Every event id this signer holds a receipt for.
     #[cfg(test)]
-    fn presented_events(&self) -> BTreeSet<Id> {
+    fn contains(&self, observer: Id, event: Id) -> bool {
+        event_presented(self.for_observer(observer), event)
+    }
+
+    /// Every event id this observer holds a receipt for.
+    #[cfg(test)]
+    fn presented_events(&self, observer: Id) -> BTreeSet<Id> {
         find!(
             event: Id,
-            pattern!(&self.view, [{ _?receipt @ presentation::event: ?event }])
+            pattern!(&self.view, [{ _?receipt @
+                metadata::tag: &KIND_PRESENTED,
+                presentation::persona: &observer,
+                presentation::event: ?event,
+            }])
         )
         .collect()
     }
@@ -3374,7 +3393,7 @@ fn push_due_detail(out: &mut String, due: &[(Id, DueHabit)]) {
 fn render_habit_transitions(
     previous: &HabitObservation,
     current: &HabitObservation,
-    presented: &FactArchive,
+    presented: Presented<'_>,
 ) -> Option<(Rendered, Vec<(Id, i64)>)> {
     use std::fmt::Write as _;
     let (due, events) = render_due_habits_unreceipted(current, presented).unwrap_or_default();
@@ -3419,7 +3438,7 @@ fn render_habit_transitions(
 /// presented once more.
 fn render_due_habits_unreceipted(
     current: &HabitObservation,
-    presented: &FactArchive,
+    presented: Presented<'_>,
 ) -> Option<(Rendered, Vec<(Id, i64)>)> {
     let due: Vec<(Id, DueHabit)> = current
         .due
@@ -3443,20 +3462,46 @@ fn render_due_habits_unreceipted(
     Some((out, presented_now))
 }
 
+/// One observer's reading of the receipt facts.
+///
+/// The receipt collection may be shared by every zooid of the colony, and the
+/// signing key belongs to the node, so a receipt counts for an observer only
+/// when it names that observer's Relations persona. A receipt naming nobody
+/// (written while the key stood in for the observer) counts for nobody: its
+/// owner is not provable, and guessing it would let one zooid's delivery
+/// silence another's news.
+#[derive(Clone, Copy)]
+pub(super) struct Presented<'a> {
+    pub(super) facts: &'a FactArchive,
+    pub(super) observer: Id,
+}
+
+impl<'a> Presented<'a> {
+    pub(super) fn new(facts: &'a FactArchive, observer: Id) -> Self {
+        Self { facts, observer }
+    }
+}
+
+/// Has this observer already been shown this exact event?
+fn event_presented(presented: Presented<'_>, event: Id) -> bool {
+    exists!(pattern!(presented.facts, [{ _?receipt @
+        metadata::tag: &KIND_PRESENTED,
+        presentation::persona: &presented.observer,
+        presentation::event: &event,
+    }]))
+}
+
 /// Has this observer already been shown this intention's due occurrence?
 ///
 /// An ordinary join on what identifies the occurrence -- the intention and the
-/// instant its due began. The receipt collection is private to this signing
-/// key, so the observer is the descriptor's authority and needs no clause.
-fn event_presented(presented: &FactArchive, event: Id) -> bool {
-    exists!(pattern!(presented, [{ _?receipt @ presentation::event: &event }]))
-}
-
-fn habit_due_presented(presented: &FactArchive, habit: Id, since: i64) -> bool {
+/// instant its due began -- and on the observer it was shown to.
+fn habit_due_presented(presented: Presented<'_>, habit: Id, since: i64) -> bool {
     let Ok(due_at) = clock::point(Epoch::from_tai_seconds(since as f64)) else {
         return false;
     };
-    exists!(pattern!(presented, [{ _?receipt @
+    exists!(pattern!(presented.facts, [{ _?receipt @
+        metadata::tag: &KIND_PRESENTED,
+        presentation::persona: &presented.observer,
         presentation::habit: &habit,
         presentation::due_at: &due_at,
     }]))
@@ -3750,7 +3795,7 @@ impl AttentionView {
     /// so obliged every caller to have an id in hand before it could ask --
     /// fine for a message, which is a record with an identity, and the reason
     /// a habit's due occurrence had to be given a derived one it did not want.
-    fn pending(&self, presented: &FactArchive) -> Self {
+    fn pending(&self, presented: Presented<'_>) -> Self {
         Self {
             events: self
                 .events
@@ -3906,9 +3951,10 @@ fn save_presentations(
     pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
+    observer: Id,
     events: impl IntoIterator<Item = Id>,
 ) -> Result<()> {
-    let fragment = orient_model::receipt_fragment(events, clock::point_now()?);
+    let fragment = orient_model::receipt_fragment(observer, events, clock::point_now()?);
     if fragment.facts().is_empty() {
         return Ok(());
     }
@@ -3957,6 +4003,7 @@ async fn cmd_baseline(
             pile,
             signer,
             sources.presentations.source,
+            persona,
             events.iter().copied(),
         )?;
         Ok(BaselineReceipt {
@@ -4001,10 +4048,11 @@ async fn cmd_show(
         .await?;
         if let Some(input) = persona.filter(|_| record_presented) {
             match health.persona_acquiring(pile, input).await {
-                Ok(_) => save_presentations(
+                Ok(persona) => save_presentations(
                     pile,
                     signer,
                     health_sources.presentations.source,
+                    persona,
                     health_report.attention.ids(),
                 )?,
                 Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => {}
@@ -4083,8 +4131,8 @@ async fn cmd_show(
 
         write_complete_report(output, &report, "Orient overview", &mut |_| {}).await?;
 
-        if record_presented && persona_id.is_some() {
-            save_presentations(pile, signer, sources.presentations.source, shown)?;
+        if let Some(persona) = persona_id.filter(|_| record_presented) {
+            save_presentations(pile, signer, sources.presentations.source, persona, shown)?;
         }
         Ok(())
     }
@@ -4403,7 +4451,12 @@ enum News {
     Quiet,
     /// `text` is the [`NewsForm::Report`] form, `stream` the
     /// [`NewsForm::Stream`] form of the same events.
+    ///
+    /// `observer` is the Relations persona the report was prepared for. The
+    /// receipt written after its accepted delivery names exactly that persona,
+    /// whichever path (CLI, daemon, native next) accepts it.
     Report {
+        observer: Id,
         text: String,
         stream: String,
         events: Vec<Id>,
@@ -4540,7 +4593,7 @@ async fn write_complete_report(
 
 fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
     let candidates = load_attention_view(query, persona_id)?;
-    let pending = candidates.pending(query.presentations);
+    let pending = candidates.pending(Presented::new(query.presentations, persona_id));
     if pending.is_empty() {
         return Ok(News::Quiet);
     }
@@ -4567,6 +4620,7 @@ fn prepare_news_once(query: &OrientQuery<'_>, persona_id: Id) -> Result<News> {
     }
     let stream = render_news_stream(query, &ordered, persona_id)?;
     Ok(News::Report {
+        observer: persona_id,
         text,
         stream,
         events: pending.ids().collect(),
@@ -4583,6 +4637,7 @@ fn commit_habit_receipts(
     pile: &mut impl FacultyAccess,
     signer: &SigningKey,
     collection: Collection<SimpleArchive>,
+    observer: Id,
     due: &[(Id, i64)],
 ) -> Result<()> {
     if due.is_empty() {
@@ -4596,7 +4651,7 @@ fn commit_habit_receipts(
         ));
     }
     let collection = presentation_collection_for_write(pile, signer, collection)?;
-    let fragment = orient_model::habit_receipt_fragment(pairs, clock::point_now()?);
+    let fragment = orient_model::habit_receipt_fragment(observer, pairs, clock::point_now()?);
     pile.commit(collection, signer, fragment)
         .map_err(|error| anyhow!("commit Orient habit presentation facts: {error}"))?;
     Ok(())
@@ -4615,10 +4670,12 @@ async fn apply_prepared_news<S: FacultyAccess>(
 ) -> Result<()> {
     match prepared {
         News::Report {
+            observer,
             text,
             stream,
             events,
         } => {
+            let observer = *observer;
             let text = match form {
                 NewsForm::Report => text,
                 NewsForm::Stream => stream,
@@ -4640,8 +4697,11 @@ async fn apply_prepared_news<S: FacultyAccess>(
             if let Some(collection) = receipt_collection {
                 // Observation bytes stay frozen; Presented time is after the
                 // accepted output. A failed receipt commit never replays here.
-                let fragment =
-                    orient_model::receipt_fragment(events.iter().copied(), clock::point_now()?);
+                let fragment = orient_model::receipt_fragment(
+                    observer,
+                    events.iter().copied(),
+                    clock::point_now()?,
+                );
                 pile.commit(collection, signer, fragment)
                     .map_err(|error| anyhow!("commit Orient presentation facts: {error}"))?;
             }
@@ -5460,7 +5520,7 @@ async fn observe_wait(
             }
             // Whether the read returned pending or was cut at the boundary,
             // the retained frame is what the persona's clocks run against.
-            let mut swept: Option<(HabitObservation, Rendered, Vec<(Id, i64)>)> = None;
+            let mut swept: Option<(Id, HabitObservation, Rendered, Vec<(Id, i64)>)> = None;
             if let Some(pending) = pending_frame.as_ref() {
                 if let (Some(persona), Some(habits), Some(observation)) = (
                     pending.persona,
@@ -5476,7 +5536,7 @@ async fn observe_wait(
                             // the same occurrence again.
                             let (due_report, due_events) = render_due_habits_unreceipted(
                                 habits,
-                                observation.facts.presentations.view(),
+                                observation.facts.presentations.for_observer(persona),
                             )
                             .unwrap_or_default();
                             pending_habits_seen = Some(habits.clone());
@@ -5494,6 +5554,7 @@ async fn observe_wait(
                                     pile,
                                     signer,
                                     sources.presentations.source,
+                                    persona,
                                     &due_events,
                                 )?;
                                 if !continuous {
@@ -5522,10 +5583,10 @@ async fn observe_wait(
                                 let (habit_report, due_events) = render_habit_transitions(
                                     seen,
                                     &current_habits,
-                                    observation.facts.presentations.view(),
+                                    observation.facts.presentations.for_observer(persona),
                                 )
                                 .unwrap_or_default();
-                                swept = Some((current_habits, habit_report, due_events));
+                                swept = Some((persona, current_habits, habit_report, due_events));
                             } else if continuous {
                                 // A newly readable pending frame may contain
                                 // a completion or a new due occurrence even
@@ -5533,18 +5594,18 @@ async fn observe_wait(
                                 let (report, due_events) = render_habit_transitions(
                                     seen,
                                     habits,
-                                    observation.facts.presentations.view(),
+                                    observation.facts.presentations.for_observer(persona),
                                 )
                                 .unwrap_or_default();
                                 if seen != habits {
-                                    swept = Some((habits.clone(), report, due_events));
+                                    swept = Some((persona, habits.clone(), report, due_events));
                                 }
                             }
                         }
                     }
                 }
             }
-            if let Some((current_habits, habit_report, swept_events)) = swept {
+            if let Some((swept_persona, current_habits, habit_report, swept_events)) = swept {
                 // The sweep's observation is what the retained frame carries
                 // into Ready, so Ready compares against what was last seen and
                 // never against the observation its first preparation cached.
@@ -5567,6 +5628,7 @@ async fn observe_wait(
                         pile,
                         signer,
                         sources.presentations.source,
+                        swept_persona,
                         &swept_events,
                     )?;
                     if !continuous {
@@ -5627,7 +5689,7 @@ async fn observe_wait(
         // With a baseline taken while news was pending, what fell due since is
         // news at this frame and the fresh observation is kept; without one,
         // an owned intention already due is reported at arm.
-        let presented = current.facts.presentations.view();
+        let presented = current.facts.presentations.for_observer(persona_id);
         let (arm_report, arm_due_events) = match pending_habits_seen.take() {
             Some(seen) => render_habit_transitions(&seen, &habit_seen, presented),
             None => render_due_habits_unreceipted(&habit_seen, presented),
@@ -5646,7 +5708,13 @@ async fn observe_wait(
             &mut health::path_observer(health.news_path_target()),
         )
         .await?;
-        commit_habit_receipts(pile, signer, sources.presentations.source, &arm_due_events)?;
+        commit_habit_receipts(
+            pile,
+            signer,
+            sources.presentations.source,
+            persona_id,
+            &arm_due_events,
+        )?;
         if (initial_report || arm_fired) && !continuous {
             return Ok(WaitOutcome {
                 news_printed: true,
@@ -5778,7 +5846,11 @@ async fn observe_wait(
                         let (habit_report, due_events) = render_habit_transitions(
                             &habit_seen,
                             &candidate.habits,
-                            candidate.observation.facts.presentations.view(),
+                            candidate
+                                .observation
+                                .facts
+                                .presentations
+                                .for_observer(candidate.persona),
                         )
                         .unwrap_or_default();
                         let habit_fired = !habit_report.is_empty();
@@ -5799,6 +5871,7 @@ async fn observe_wait(
                             pile,
                             signer,
                             sources.presentations.source,
+                            candidate.persona,
                             &due_events,
                         )?;
                         if (habit_fired || ordinary_fired) && !continuous {
@@ -5872,7 +5945,7 @@ async fn observe_wait(
             let (habit_report, due_events) = render_habit_transitions(
                 &habit_seen,
                 &current_habits,
-                current.facts.presentations.view(),
+                current.facts.presentations.for_observer(persona_id),
             )
             .unwrap_or_default();
             let habit_fired = !habit_report.is_empty();
@@ -5885,7 +5958,13 @@ async fn observe_wait(
                     &mut |notice| observe(&mut *pile, signer, notice),
                 )
                 .await?;
-                commit_habit_receipts(pile, signer, sources.presentations.source, &due_events)?;
+                commit_habit_receipts(
+                    pile,
+                    signer,
+                    sources.presentations.source,
+                    persona_id,
+                    &due_events,
+                )?;
             }
             habit_seen = current_habits;
             last_habit_sweep = Instant::now();
@@ -6146,7 +6225,7 @@ struct WakeSelection {
     /// The Compass section exactly as `orient goals` prints it.
     goals: String,
     /// Presentations to record: only for a persona, and only after output.
-    presented: Option<(Collection<SimpleArchive>, Vec<Id>)>,
+    presented: Option<(Collection<SimpleArchive>, Id, Vec<Id>)>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6252,7 +6331,7 @@ async fn wake_selection(
         cover,
         beliefs,
         goals,
-        presented: persona_id.map(|_| (sources.presentations.source, shown)),
+        presented: persona_id.map(|persona| (sources.presentations.source, persona, shown)),
     })
 }
 
@@ -6325,8 +6404,8 @@ async fn cmd_wake(
     }
 
     if record_presented {
-        if let Some((receipts, shown)) = selection.presented {
-            save_presentations(storage, signer, receipts, shown)?;
+        if let Some((receipts, persona, shown)) = selection.presented {
+            save_presentations(storage, signer, receipts, persona, shown)?;
         }
     }
     Ok(())
@@ -6522,10 +6601,18 @@ fn test_storage() -> Storage {
 fn save_test_presentations(
     pile: &mut FacultyStore,
     signer: &SigningKey,
+    observer: Id,
     events: impl IntoIterator<Item = Id>,
 ) -> Result<()> {
     let collection = ReceiptSource::register(pile, signer)?.source;
-    save_presentations(pile, signer, collection, events)
+    save_presentations(pile, signer, collection, observer, events)
+}
+
+/// The observer the store-level fixtures present to, unless a test names
+/// another one to show that receipts stay scoped.
+#[cfg(test)]
+fn test_observer() -> Id {
+    Id::new([0x5e; 16]).unwrap()
 }
 
 #[cfg(test)]
@@ -6597,12 +6684,27 @@ mod tests {
         FactArchive::new(vec![SuccinctArchive::from(facts)])
     }
 
-    /// No receipts at all: every due occurrence is unpresented.
-    fn nothing_presented() -> FactArchive {
-        receipts_archive(&TribleSet::new())
+    /// Receipt facts read by one observer, as the live path reads them.
+    struct TestReceipts {
+        facts: FactArchive,
+        observer: Id,
     }
 
-    fn presented_habit_due(due: impl IntoIterator<Item = (Id, i64)>) -> FactArchive {
+    impl TestReceipts {
+        fn seen(&self) -> Presented<'_> {
+            Presented::new(&self.facts, self.observer)
+        }
+    }
+
+    /// No receipts at all: every due occurrence is unpresented.
+    fn nothing_presented() -> TestReceipts {
+        TestReceipts {
+            facts: receipts_archive(&TribleSet::new()),
+            observer: test_observer(),
+        }
+    }
+
+    fn presented_habit_due(due: impl IntoIterator<Item = (Id, i64)>) -> TestReceipts {
         let pairs: Vec<_> = due
             .into_iter()
             .map(|(habit, since)| {
@@ -6612,13 +6714,24 @@ mod tests {
                 )
             })
             .collect();
-        let fragment = orient_model::habit_receipt_fragment(pairs, clock::point_now().unwrap());
-        receipts_archive(&TribleSet::from(fragment))
+        let fragment = orient_model::habit_receipt_fragment(
+            test_observer(),
+            pairs,
+            clock::point_now().unwrap(),
+        );
+        TestReceipts {
+            facts: receipts_archive(&TribleSet::from(fragment)),
+            observer: test_observer(),
+        }
     }
 
-    fn presented(events: impl IntoIterator<Item = Id>) -> FactArchive {
-        let fragment = orient_model::receipt_fragment(events, clock::point_now().unwrap());
-        receipts_archive(&TribleSet::from(fragment))
+    fn presented(events: impl IntoIterator<Item = Id>) -> TestReceipts {
+        let fragment =
+            orient_model::receipt_fragment(test_observer(), events, clock::point_now().unwrap());
+        TestReceipts {
+            facts: receipts_archive(&TribleSet::from(fragment)),
+            observer: test_observer(),
+        }
     }
 
     fn due_habit(label: &str, since: i64, targeted: bool) -> DueHabit {
@@ -6637,7 +6750,7 @@ mod tests {
         due.due
             .insert(habit, due_habit("owned reminder", 100, true));
         due.next_cooldown_at = Some(200);
-        assert!(render_due_habits_unreceipted(&due, &nothing_presented()).is_some());
+        assert!(render_due_habits_unreceipted(&due, nothing_presented().seen()).is_some());
         let mut seen = Some(due.clone());
         // All initial-pending invalidation sites use this boundary. Losing
         // inputs must stop their clock, not turn recovery into another arm.
@@ -6648,7 +6761,8 @@ mod tests {
         // occurrence, not whether it changed since something it happens to
         // hold in memory.
         assert!(
-            render_habit_transitions(seen.as_ref().unwrap(), &due, &nothing_presented()).is_some()
+            render_habit_transitions(seen.as_ref().unwrap(), &due, nothing_presented().seen())
+                .is_some()
         );
         assert_eq!(
             pending_habit_deadline(true, Some(&due), &seen),
@@ -6658,7 +6772,8 @@ mod tests {
         next.due
             .insert(habit, due_habit("owned reminder", 300, true));
         assert!(
-            render_habit_transitions(seen.as_ref().unwrap(), &next, &nothing_presented()).is_some()
+            render_habit_transitions(seen.as_ref().unwrap(), &next, nothing_presented().seen())
+                .is_some()
         );
         invalidate_pending_habit_context(false, &mut seen);
         assert!(seen.is_none(), "one-shot rearm semantics remain unchanged");
@@ -6699,13 +6814,13 @@ mod tests {
             .due
             .insert(shared, due_habit("work-ledger-grooming", 700, false));
         let (shared_report, shared_events) =
-            render_due_habits_unreceipted(&armed, &nothing_presented())
+            render_due_habits_unreceipted(&armed, nothing_presented().seen())
                 .expect("a shared due occurrence is reported");
         assert!(shared_report.text.contains("work-ledger-grooming"));
         assert_eq!(shared_events, vec![(shared, 700)]);
 
         armed.due.insert(owned, due_habit("cc-tick", 1300, true));
-        let (both, events) = render_due_habits_unreceipted(&armed, &nothing_presented())
+        let (both, events) = render_due_habits_unreceipted(&armed, nothing_presented().seen())
             .expect("both due occurrences are reported");
         assert!(both.text.contains("News: habit became due: cc-tick"));
         assert!(both.text.contains("work-ledger-grooming"));
@@ -6720,7 +6835,7 @@ mod tests {
         // Receipting ONE occurrence silences exactly that one. Targeting has
         // nothing to do with it; being shown does.
         let seen_shared = presented_habit_due([(shared, 700)]);
-        let (only_owned, owned_events) = render_due_habits_unreceipted(&armed, &seen_shared)
+        let (only_owned, owned_events) = render_due_habits_unreceipted(&armed, seen_shared.seen())
             .expect("the unreceipted occurrence is still reported");
         assert!(only_owned.text.contains("cc-tick"));
         assert!(!only_owned.text.contains("work-ledger-grooming"));
@@ -6728,14 +6843,14 @@ mod tests {
 
         // Receipt both and the watcher is quiet, however often it rearms.
         let seen_both = presented_habit_due([(shared, 700), (owned, 1300)]);
-        assert!(render_due_habits_unreceipted(&armed, &seen_both).is_none());
-        assert!(render_due_habits_unreceipted(&armed, &seen_both).is_none());
+        assert!(render_due_habits_unreceipted(&armed, seen_both.seen()).is_none());
+        assert!(render_due_habits_unreceipted(&armed, seen_both.seen()).is_none());
 
         // A fresh due of the SAME habit is a different occurrence: later
         // `since`, so the old receipt does not cover it.
         let mut again = HabitObservation::default();
         again.due.insert(owned, due_habit("cc-tick", 1900, true));
-        let (recurred, _) = render_due_habits_unreceipted(&again, &seen_both)
+        let (recurred, _) = render_due_habits_unreceipted(&again, seen_both.seen())
             .expect("a later due occurrence is presented again");
         assert!(recurred.text.contains("cc-tick"));
     }
@@ -6853,7 +6968,7 @@ mod tests {
 
     #[test]
     fn explicit_workspace_routes_inputs_indexes_and_receipts() {
-        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 
         test_block_on(async {
@@ -6871,7 +6986,7 @@ mod tests {
                 HABIT_SCOPE_ID,
                 MEMORY_SCOPE_ID,
                 WIKI_SCOPE_ID,
-                RECEIPTS_SCOPE_ID,
+                SPAWN_SCOPE_ID,
             ] {
                 let collection = pile
                     .collection(
@@ -6901,7 +7016,7 @@ mod tests {
             }
             assert_eq!(
                 sources.presentations.source.handle(),
-                routes[&RECEIPTS_SCOPE_ID]
+                routes[&SPAWN_SCOPE_ID]
             );
             assert_eq!(
                 sources.compass_status,
@@ -6909,14 +7024,23 @@ mod tests {
             );
 
             let receipts = sources.presentations.source;
-            save_presentations(&mut pile, &fixture.signer, receipts, [id(91)]).unwrap();
-            commit_habit_receipts(&mut pile, &fixture.signer, receipts, &[(id(92), 100)]).unwrap();
+            save_presentations(&mut pile, &fixture.signer, receipts, test_observer(), [id(91)])
+                .unwrap();
+            commit_habit_receipts(
+                &mut pile,
+                &fixture.signer,
+                receipts,
+                test_observer(),
+                &[(id(92), 100)],
+            )
+            .unwrap();
             apply_prepared_news(
                 &mut pile,
                 &fixture.signer,
                 receipts,
                 false,
                 &News::Report {
+                    observer: test_observer(),
                     text: "Selected workspace news\n".to_owned(),
                     stream: "Selected workspace news\n".to_owned(),
                     events: vec![id(93)],
@@ -6981,7 +7105,7 @@ mod tests {
 
     #[test]
     fn explicit_workspace_missing_roles_and_read_denial_never_fall_back() {
-        use crate::schemas::orient::RECEIPTS_SCOPE_ID;
+        use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 
         test_block_on(async {
@@ -7008,7 +7132,7 @@ mod tests {
                 .unwrap();
             let read_only_receipts = pile
                 .collection(
-                    "orient-receipts",
+                    "spawn",
                     CollectionPolicy::new(
                         AdmissionPolicy::Open,
                         AdmissionPolicy::direct(foreign.verifying_key()),
@@ -7018,7 +7142,7 @@ mod tests {
             let routing = test_storage().with_collections(BTreeMap::from([
                 (MESSAGE_SCOPE_ID, read_only.handle()),
                 (RELATIONS_SCOPE_ID, denied.handle()),
-                (RECEIPTS_SCOPE_ID, read_only_receipts.handle()),
+                (SPAWN_SCOPE_ID, read_only_receipts.handle()),
             ]));
             let source = OrientSource::open(
                 &routing,
@@ -7044,8 +7168,14 @@ mod tests {
             let receipts = ReceiptSource::open(&routing, &mut pile, &fixture.signer)
                 .await
                 .unwrap();
-            let error = save_presentations(&mut pile, &fixture.signer, receipts.source, [id(94)])
-                .unwrap_err();
+            let error = save_presentations(
+                &mut pile,
+                &fixture.signer,
+                receipts.source,
+                test_observer(),
+                [id(94)],
+            )
+            .unwrap_err();
             assert!(format!("{error:#}").contains("WRITE"));
             let missing = test_storage().with_collections(BTreeMap::new());
             let before = pile.snapshot().unwrap().blobs().count();
@@ -7064,7 +7194,7 @@ mod tests {
                 .await
                 .err()
                 .expect("no implicit private receipt root");
-            assert!(format!("{error:#}").contains("orient-receipts"));
+            assert!(format!("{error:#}").contains("spawn"), "{error:#}");
             assert_eq!(pile.snapshot().unwrap().blobs().count(), before);
             assert!(pile.snapshot().unwrap().records().unwrap().next().is_none());
             assert!(pile.health().started_at.is_none());
@@ -7399,14 +7529,14 @@ mod tests {
             );
 
             let event = id(74);
-            save_test_presentations(&mut pile, &reader_key, [event]).unwrap();
+            save_test_presentations(&mut pile, &reader_key, test_observer(), [event]).unwrap();
             sources
                 .presentations
                 .maintain(&mut pile, &reader_key)
                 .await
                 .unwrap();
             let next = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(next.facts.presentations.contains(event));
+            assert!(next.facts.presentations.contains(test_observer(), event));
             assert_eq!(
                 person_anchors(next.facts.relations.view()),
                 BTreeSet::from([known, pending])
@@ -7440,7 +7570,11 @@ mod tests {
             pile.commit(
                 sources.presentations.source,
                 &fixture.signer,
-                orient_model::receipt_fragment([id(76)], clock::point_now().unwrap()),
+                orient_model::receipt_fragment(
+                    test_observer(),
+                    [id(76)],
+                    clock::point_now().unwrap(),
+                ),
             )
             .unwrap();
             let before = pile.snapshot().unwrap();
@@ -7448,7 +7582,7 @@ mod tests {
             // An unattached receipt is read from its own bytes, without
             // upkeep and without blocking.
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(observation.facts.presentations.contains(id(76)));
+            assert!(observation.facts.presentations.contains(test_observer(), id(76)));
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -7466,7 +7600,7 @@ mod tests {
                 .await
                 .unwrap();
             let ready = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(ready.facts.presentations.contains(id(76)));
+            assert!(ready.facts.presentations.contains(test_observer(), id(76)));
             pile.close().unwrap();
         });
     }
@@ -7483,6 +7617,7 @@ mod tests {
             let persona = id(77);
             let event = id(78);
             let news = News::Report {
+                observer: persona,
                 text: "News: one delivery\n".to_owned(),
                 stream: "News: one delivery\n".to_owned(),
                 events: vec![event],
@@ -7506,7 +7641,7 @@ mod tests {
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
             assert!(attention
-                .pending(unattached.facts.presentations.view())
+                .pending(unattached.facts.presentations.for_observer(persona))
                 .is_empty());
             assert_eq!(
                 pile.snapshot()
@@ -7520,13 +7655,13 @@ mod tests {
             );
 
             // Routing aliases do not split one zooid's receipt authority.
-            save_test_presentations(&mut pile, &reader, [id(80)]).unwrap();
+            save_test_presentations(&mut pile, &reader, persona, [id(80)]).unwrap();
             let aliases = ReceiptSource::register(&mut pile, &reader).unwrap();
             assert_eq!(aliases.source, restarted.presentations.source);
             assert_eq!(aliases.rank9, restarted.presentations.rank9);
             let refreshed = observe_current_sources(&mut pile, &restarted).unwrap();
             assert_eq!(
-                refreshed.facts.presentations.presented_events(),
+                refreshed.facts.presentations.presented_events(persona),
                 BTreeSet::from([event, id(80)]),
             );
             pile.close().unwrap();
@@ -7548,6 +7683,7 @@ mod tests {
             let persona = id(77);
             let event = id(78);
             let news = News::Report {
+                observer: persona,
                 text: "News: one delivery\n".to_owned(),
                 stream: "News: one delivery\n".to_owned(),
                 events: vec![event],
@@ -7560,7 +7696,7 @@ mod tests {
             attention.insert(AttentionEvent::Message(event));
             let unattached = observe_current_sources(&mut pile, &sources).unwrap();
             assert!(attention
-                .pending(unattached.facts.presentations.view())
+                .pending(unattached.facts.presentations.for_observer(persona))
                 .is_empty());
 
             let mut text = String::new();
@@ -7584,7 +7720,7 @@ mod tests {
             let refreshed = observe_current_sources(&mut pile, &sources).unwrap();
             assert!(
                 attention
-                    .pending(refreshed.facts.presentations.view())
+                    .pending(refreshed.facts.presentations.for_observer(persona))
                     .is_empty(),
                 "after the refresh the event is presented and must not repeat",
             );
@@ -7675,7 +7811,11 @@ mod tests {
             pile.commit(
                 sources.presentations.source,
                 &fixture.signer,
-                orient_model::receipt_fragment([prior_event], clock::point_now().unwrap()),
+                orient_model::receipt_fragment(
+                    persona,
+                    [prior_event],
+                    clock::point_now().unwrap(),
+                ),
             )
             .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
@@ -7684,7 +7824,11 @@ mod tests {
 
             // An unrelated historical receipt record arrives without its
             // archive. Its absence cannot hide the existing projection.
-            let cold = orient_model::receipt_fragment([id(89)], clock::point_now().unwrap());
+            let cold = orient_model::receipt_fragment(
+                persona,
+                [id(89)],
+                clock::point_now().unwrap(),
+            );
             let cold = IntoBlob::<SimpleArchive>::to_blob(cold.facts().clone());
             let arriving = CollectionCommit::sign(
                 &fixture.signer,
@@ -7700,8 +7844,8 @@ mod tests {
                 .presentations
                 .observe(&pile.snapshot().unwrap())
                 .unwrap();
-            assert_eq!(before.presented_events(), BTreeSet::from([prior_event]),);
-            assert!(!before.contains(id(89)));
+            assert_eq!(before.presented_events(persona), BTreeSet::from([prior_event]),);
+            assert!(!before.contains(persona, id(89)));
             assert!(!pile
                 .snapshot()
                 .unwrap()
@@ -7746,14 +7890,14 @@ mod tests {
             let snapshot = pile.snapshot().unwrap();
             let after = sources.presentations.observe(&snapshot).unwrap();
             assert_eq!(
-                after.presented_events(),
+                after.presented_events(persona),
                 BTreeSet::from([prior_event, goal_id]),
             );
             assert!(observe_current_sources(&mut pile, &sources)
                 .unwrap()
                 .facts
                 .presentations
-                .contains(goal_id));
+                .contains(persona, goal_id));
             assert!(!snapshot.contains_blob(cold.get_handle()).unwrap());
             assert!(snapshot.wants().unwrap().next().is_none());
             assert!(pile.health().started_at.is_none());
@@ -7776,7 +7920,11 @@ mod tests {
                     .commit(
                         sources.presentations.source,
                         &fixture.signer,
-                        orient_model::receipt_fragment([event], clock::point_now().unwrap()),
+                        orient_model::receipt_fragment(
+                            test_observer(),
+                            [event],
+                            clock::point_now().unwrap(),
+                        ),
                     )
                     .unwrap();
                 omitted.insert(commit.data().raw);
@@ -7812,7 +7960,7 @@ mod tests {
             let observation = observe_current_sources(&mut copied, &sources).unwrap();
             let observed = &observation.facts.presentations;
             assert_eq!(
-                observed.presented_events(),
+                observed.presented_events(test_observer()),
                 BTreeSet::from([id(82), id(83)])
             );
             assert!(observation.snapshot.wants().unwrap().next().is_none());
@@ -7854,7 +8002,11 @@ mod tests {
         let source = ReceiptSource::register(&mut pile, &fixture.signer)
             .unwrap()
             .source;
-        let fragment = orient_model::receipt_fragment([id(85)], clock::point_now().unwrap());
+        let fragment = orient_model::receipt_fragment(
+            test_observer(),
+            [id(85)],
+            clock::point_now().unwrap(),
+        );
         let blob = IntoBlob::<SimpleArchive>::to_blob(fragment.facts().clone());
         let commit = CollectionCommit::sign(
             &fixture.signer,
@@ -8119,7 +8271,11 @@ mod tests {
                 .await
                 .unwrap();
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
-            let receipt = orient_model::receipt_fragment([id(87)], clock::point_now().unwrap());
+            let receipt = orient_model::receipt_fragment(
+                test_observer(),
+                [id(87)],
+                clock::point_now().unwrap(),
+            );
             let bytes = IntoBlob::<SimpleArchive>::to_blob(receipt.facts().clone());
             let commit = CollectionCommit::sign(
                 &fixture.signer,
@@ -8136,7 +8292,7 @@ mod tests {
             assert!(!observation.is_current(&cold));
             assert!(!observation.facts.presentations.is_current(&cold));
             let observation = observe_snapshot(cold, &sources).unwrap();
-            assert!(!observation.facts.presentations.contains(id(87)));
+            assert!(!observation.facts.presentations.contains(test_observer(), id(87)));
             assert!(observation.snapshot.wants().unwrap().next().is_none());
 
             let unrelated = pile
@@ -8165,7 +8321,7 @@ mod tests {
                 .unwrap()
                 .facts
                 .presentations
-                .contains(id(87)));
+                .contains(test_observer(), id(87)));
             sources
                 .presentations
                 .maintain(&mut pile, &fixture.signer)
@@ -8185,7 +8341,7 @@ mod tests {
                 assert!(fact.is_current(&advanced));
             }
             let refreshed = observe_snapshot(advanced, &sources).unwrap();
-            assert!(refreshed.facts.presentations.contains(id(87)));
+            assert!(refreshed.facts.presentations.contains(test_observer(), id(87)));
             assert!(observation.facts.presentations.is_empty());
             assert!(refreshed.snapshot.wants().unwrap().next().is_none());
             assert!(pile.health().started_at.is_none());
@@ -8777,16 +8933,17 @@ mod tests {
             observe_habits((vec![row.clone()], before.clone()), &fixture.path, 100).unwrap();
         assert!(pending.due.is_empty() && pending.attention.is_empty());
         assert!(render_native_habits(&pending).contains("refresh pending"));
-        let presented = archive(&TribleSet::new());
-        assert!(render_habit_transitions(&before, &pending, &presented).is_none());
-        assert!(render_due_habits_unreceipted(&pending, &presented).is_none());
+        let presented_facts = archive(&TribleSet::new());
+        let presented = Presented::new(&presented_facts, test_observer());
+        assert!(render_habit_transitions(&before, &pending, presented).is_none());
+        assert!(render_due_habits_unreceipted(&pending, presented).is_none());
         let mut changed_detail = pending.clone();
         changed_detail.deferred.push_str("changed detail\n");
         assert_ne!(
             pending, changed_detail,
             "rendered values participate in equality"
         );
-        assert!(render_habit_transitions(&pending, &changed_detail, &presented).is_none());
+        assert!(render_habit_transitions(&pending, &changed_detail, presented).is_none());
 
         let mut due_row = row.clone();
         due_row.condition =
@@ -8807,7 +8964,7 @@ mod tests {
         assert!(mixed.due.contains_key(&row.id));
         assert!(mixed.attention[&row.id].contains("genuine-failure"));
         assert!(!mixed.deferred.is_empty());
-        let (report, receipts) = render_habit_transitions(&pending, &mixed, &presented).unwrap();
+        let (report, receipts) = render_habit_transitions(&pending, &mixed, presented).unwrap();
         assert!(
             report.text.contains("confirmed action") && report.text.contains("genuine-failure")
         );
@@ -8820,15 +8977,15 @@ mod tests {
         let waiting =
             observe_habits((vec![false_row], before.clone()), &fixture.path, 100).unwrap();
         assert!(waiting.deferred.is_empty());
-        assert!(render_habit_transitions(&pending, &waiting, &presented).is_none());
+        assert!(render_habit_transitions(&pending, &waiting, presented).is_none());
         let failed = observe_habits((vec![error_row], before.clone()), &fixture.path, 100).unwrap();
-        let (_, receipts) = render_habit_transitions(&pending, &failed, &presented).unwrap();
+        let (_, receipts) = render_habit_transitions(&pending, &failed, presented).unwrap();
         assert!(receipts.is_empty());
         let due = observe_habits((vec![due_row], before), &fixture.path, 100).unwrap();
-        let (_, receipts) = render_habit_transitions(&pending, &due, &presented).unwrap();
+        let (_, receipts) = render_habit_transitions(&pending, &due, presented).unwrap();
         assert_eq!(receipts, vec![(row.id, 0)]);
         let already_presented = presented_habit_due(receipts);
-        assert!(render_habit_transitions(&pending, &due, &already_presented).is_none());
+        assert!(render_habit_transitions(&pending, &due, already_presented.seen()).is_none());
     }
 
     /// Only a complete, understood state assertion supersedes another. A
@@ -9214,7 +9371,7 @@ mod tests {
             .presentations
             .observe(&pile.snapshot().unwrap())
             .unwrap()
-            .contains(event));
+            .contains(reader, event));
         assert!(pile.snapshot().unwrap().wants().unwrap().next().is_none());
         pile.close().unwrap();
     }
@@ -9505,8 +9662,8 @@ mod tests {
             .presentations
             .observe(&pile.snapshot().unwrap())
             .unwrap();
-        assert!(presented.contains(first));
-        assert!(presented.contains(second));
+        assert!(presented.contains(reader, first));
+        assert!(presented.contains(reader, second));
         pile.close().unwrap();
     }
 
@@ -9937,6 +10094,7 @@ mod tests {
         // a one-shot wait returning on the first thing that happens to be
         // reportable. An intention never completed has `since` 0.
         let seen_probe = orient_model::habit_receipt_fragment(
+            cc,
             [(
                 probe_id,
                 clock::point(Epoch::from_tai_seconds(0.0)).unwrap(),
@@ -10106,7 +10264,9 @@ mod tests {
             // stayed silent because the intention was not addressed to this
             // persona -- which is exactly how a shared intention that fell due
             // unobserved was lost.
-            assert!(render_due_habits_unreceipted(&current.habits, &nothing_presented()).is_some());
+            assert!(
+                render_due_habits_unreceipted(&current.habits, nothing_presented().seen()).is_some()
+            );
 
             // A later selected frame has a missing body and a genuinely newer
             // Habit context. Its cooling row is absent from `current`, so a
@@ -10195,7 +10355,7 @@ mod tests {
             .unwrap();
             assert!(!seen.due.contains_key(&probe_id));
             assert!(
-                render_habit_transitions(&current.habits, &seen, &nothing_presented()).is_none()
+                render_habit_transitions(&current.habits, &seen, nothing_presented().seen()).is_none()
             );
             assert_eq!(fs::read(&evaluations).unwrap(), b"xxx");
             assert!(stored_presentations(&mut pile, &fixture.signer, persona).is_empty());
@@ -10223,7 +10383,7 @@ mod tests {
             };
             assert_eq!(ready.persona, persona);
             assert!(
-                render_habit_transitions(&seen, &ready.habits, &nothing_presented()).is_none(),
+                render_habit_transitions(&seen, &ready.habits, nothing_presented().seen()).is_none(),
                 "Ready must not resurrect the Due result cached before the timer sweep"
             );
             assert_eq!(ready.habits, seen);
@@ -10360,10 +10520,10 @@ mod tests {
     fn stored_presentations(
         pile: &mut FacultyStore,
         signer: &SigningKey,
-        _persona: Id,
+        persona: Id,
     ) -> BTreeSet<Id> {
         // Inspect committed receipt facts, not the asynchronously maintained
-        // projection. Routing aliases share the signing zooid's source.
+        // projection, and only those naming this persona.
         let collection = ReceiptSource::register(pile, signer).unwrap().source;
         let snapshot = pile.snapshot().unwrap();
         let facts = snapshot
@@ -10371,7 +10531,7 @@ mod tests {
             .unwrap()
             .view::<TribleSet>()
             .unwrap();
-        find!(event: Id, pattern!(&facts, [{ presentation::event: ?event }])).collect()
+        orient_model::presented_events(&facts, persona)
     }
 
     #[test]
@@ -10873,7 +11033,7 @@ mod tests {
 
         let presented = presented([first]);
         assert_eq!(
-            view.pending(&presented).ids().collect::<Vec<_>>(),
+            view.pending(presented.seen()).ids().collect::<Vec<_>>(),
             vec![second]
         );
     }
@@ -11198,6 +11358,7 @@ mod tests {
             .source;
         let event = id(4);
         let news = News::Report {
+            observer: test_observer(),
             text: "frozen report\n".to_owned(),
             stream: "frozen report\n".to_owned(),
             events: vec![event],
@@ -11254,6 +11415,7 @@ mod tests {
             .unwrap()
             .source;
         let news = News::Report {
+            observer: test_observer(),
             text: "fixed\n".to_owned(),
             stream: "fixed\n".to_owned(),
             events: vec![id(4)],
@@ -11302,6 +11464,7 @@ mod tests {
         let persona = id(3);
         let event = id(4);
         let news = News::Report {
+            observer: persona,
             text: "News: retry me\n".to_owned(),
             stream: "News: retry me\n".to_owned(),
             events: vec![event],
@@ -11345,6 +11508,7 @@ mod tests {
         let persona = id(5);
         let event = id(6);
         let news = News::Report {
+            observer: persona,
             text: "News: peek\n".to_owned(),
             stream: "News: peek\n".to_owned(),
             events: vec![event],
@@ -11378,11 +11542,11 @@ mod tests {
         view.insert(AttentionEvent::Mail(second));
         let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
 
-        save_test_presentations(&mut pile, &fixture.signer, view.ids()).unwrap();
+        save_test_presentations(&mut pile, &fixture.signer, persona, view.ids()).unwrap();
         let presented = stored_presentations(&mut pile, &fixture.signer, persona);
         assert_eq!(presented, BTreeSet::from([first, second]));
         let projected = super::tests::presented(presented);
-        assert!(view.pending(&projected).is_empty());
+        assert!(view.pending(projected.seen()).is_empty());
         pile.close().unwrap();
     }
 
@@ -11399,7 +11563,7 @@ mod tests {
             mention: false,
         });
         assert_eq!(
-            later.pending(&presented).ids().collect::<Vec<_>>(),
+            later.pending(presented.seen()).ids().collect::<Vec<_>>(),
             vec![event]
         );
     }
@@ -12727,6 +12891,7 @@ mod tests {
             text,
             stream,
             events,
+            ..
         } = news.news()
         else {
             panic!("somebody joining the voice channel is news");

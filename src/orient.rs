@@ -1,9 +1,14 @@
 //! Orient's grow-only presentation ledger.
 //!
 //! Source faculties define which events deserve attention. Orient records only
-//! the irreducible observer state: whether one signing zooid has already been
-//! presented one exact event. New receipts belong to the signing zooid's private
-//! collection; the persona field below is only the legacy import vocabulary.
+//! the irreducible observer state: whether one zooid has already been presented
+//! one exact event. Every receipt names that zooid, its stable Relations
+//! persona id, in its identity core: the signing key belongs to the node that
+//! wrote the receipt, and one node serves many zooids (JP, 2026-11-23). So one
+//! synced receipt collection can carry every zooid's seen state, and a receipt
+//! for A never suppresses the event for B. A receipt without a persona (written
+//! before 2026-11-23, when the key stood in for the observer) names nobody and
+//! suppresses nobody: its owner is a key many zooids shared.
 //! Store snapshots and collection covers are local
 //! continuation tokens, not durable facts, and therefore do not live here.
 
@@ -26,10 +31,12 @@ pub use operations::{
     WakeOptions, WakePairsOptions, WakeTint,
 };
 
-/// Receipt facts for a key-private source collection. Event identity is stable
-/// across retries; observation times annotate that identity, never qualify the
-/// derived ID set. The collection descriptor identifies the observing zooid.
+/// Receipt facts saying `persona` was presented each event. The persona is
+/// part of the receipt's identity, so the same event presented to two zooids
+/// is two receipts. Event identity is stable across retries; observation
+/// times annotate that identity, never qualify the derived ID set.
 pub fn receipt_fragment(
+    persona: Id,
     events: impl IntoIterator<Item = Id>,
     created_at: Inline<inlineencodings::NsTAIInterval>,
 ) -> Fragment {
@@ -37,6 +44,7 @@ pub fn receipt_fragment(
     for event in events {
         let receipt = entity! {
             metadata::tag: &KIND_PRESENTED,
+            presentation::persona: &persona,
             presentation::event: &event,
         };
         let id = receipt.root().expect("one receipt entity");
@@ -54,6 +62,7 @@ pub fn receipt_fragment(
 /// be computed before it can be looked up is a hash-join, and only a set of ids
 /// ever made one necessary here.
 pub fn habit_receipt_fragment(
+    persona: Id,
     due: impl IntoIterator<Item = (Id, Inline<inlineencodings::NsTAIInterval>)>,
     created_at: Inline<inlineencodings::NsTAIInterval>,
 ) -> Fragment {
@@ -61,6 +70,7 @@ pub fn habit_receipt_fragment(
     for (habit, due_at) in due {
         let receipt = entity! {
             metadata::tag: &KIND_PRESENTED,
+            presentation::persona: &persona,
             presentation::habit: &habit,
             presentation::due_at: &due_at,
         };
@@ -114,11 +124,12 @@ mod tests {
 
     #[test]
     fn receipt_time_annotates_identity_without_qualifying_membership() {
+        let persona = Id::new([7; 16]).unwrap();
         let event = Id::new([8; 16]).unwrap();
         let first_time = crate::clock::point(hifitime::Epoch::from_unix_seconds(10.0)).unwrap();
         let next_time = crate::clock::point(hifitime::Epoch::from_unix_seconds(20.0)).unwrap();
-        let first = receipt_fragment([event], first_time);
-        let next = receipt_fragment([event, event], next_time);
+        let first = receipt_fragment(persona, [event], first_time);
+        let next = receipt_fragment(persona, [event, event], next_time);
         let subjects = |facts: &TribleSet| {
             find!(id: Id, pattern!(facts, [{ ?id @ presentation::event: &event }]))
                 .collect::<BTreeSet<_>>()
@@ -135,9 +146,36 @@ mod tests {
         )
         .collect();
         assert_eq!(times, BTreeSet::from([first_time, next_time]));
-        assert!(!exists!(
-            pattern!(both.facts(), [{ _?receipt @ presentation::persona: _?persona }])
-        ));
+        assert_eq!(presented_events(both.facts(), persona), BTreeSet::from([event]));
+    }
+
+    #[test]
+    fn the_receiving_persona_is_part_of_each_receipt_identity() {
+        let first = Id::new([1; 16]).unwrap();
+        let second = Id::new([2; 16]).unwrap();
+        let event = Id::new([3; 16]).unwrap();
+        let habit = Id::new([4; 16]).unwrap();
+        let at = crate::clock::point(hifitime::Epoch::from_unix_seconds(10.0)).unwrap();
+        let due = crate::clock::point(hifitime::Epoch::from_unix_seconds(5.0)).unwrap();
+        let roots = |fragment: Fragment| {
+            find!(id: Id, pattern!(fragment.facts(), [{ ?id @ metadata::tag: &KIND_PRESENTED }]))
+                .collect::<BTreeSet<_>>()
+        };
+        let a = roots(receipt_fragment(first, [event], at));
+        let b = roots(receipt_fragment(second, [event], at));
+        assert_eq!(a.len(), 1);
+        assert!(a.is_disjoint(&b));
+        let mut shared = receipt_fragment(first, [event], at);
+        shared += receipt_fragment(second, [event], at);
+        assert_eq!(presented_events(shared.facts(), first), BTreeSet::from([event]));
+        assert_eq!(presented_events(shared.facts(), second), BTreeSet::from([event]));
+        let ha = roots(habit_receipt_fragment(first, [(habit, due)], at));
+        let hb = roots(habit_receipt_fragment(second, [(habit, due)], at));
+        assert_eq!(ha.len(), 1);
+        assert!(ha.is_disjoint(&hb));
+        // The current constructor and the legacy mixed-ledger record agree on
+        // identity, so an imported legacy receipt and a new one coincide.
+        assert_eq!(a, roots(presented_fragment(first, [event])));
     }
 
     #[test]

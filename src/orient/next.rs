@@ -1083,10 +1083,7 @@ mod tests {
                         .block_on(ReceiptSource::open(&self.storage, store, signer))?
                         .source;
                     let facts = store.snapshot()?.collection(source)?.view::<TribleSet>()?;
-                    Ok(
-                        find!(event: Id, pattern!(&facts, [{ presentation::event: ?event }]))
-                            .any(|event| event == selected),
-                    )
+                    Ok(crate::orient::presented_events(&facts, self.persona).contains(&selected))
                 })
                 .unwrap()
                 .expect("prepared output must not hold the shared Storage borrow")

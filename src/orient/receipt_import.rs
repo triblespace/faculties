@@ -39,10 +39,14 @@ pub(super) async fn import(
             presentation::event: ?event,
         }])
     ) {
-        // The existing subject is opaque. Preserve its observed facts, without
-        // reconstructing an intrinsic ID or inventing an import timestamp.
+        // The existing subject is opaque. Preserve its observed facts,
+        // including the persona it was presented to -- the receipt collection
+        // may be shared by every zooid, and a receipt without its persona
+        // would suppress nobody -- without reconstructing an intrinsic ID or
+        // inventing an import timestamp.
         fragment += entity! { ExclusiveId::force_ref(&receipt) @
             metadata::tag: &KIND_PRESENTED,
+            presentation::persona: &persona,
             presentation::event: &event,
             metadata::created_at*: find!(
                 created: IntervalValue,
@@ -133,7 +137,8 @@ mod tests {
 
     #[test]
     fn explicit_workspace_import_keeps_legacy_and_current_receipt_roles_distinct() {
-        use crate::schemas::orient::{DEFAULT_SCOPE_ID, RECEIPTS_SCOPE_ID};
+        use crate::schemas::orient::DEFAULT_SCOPE_ID;
+        use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
 
         test_block_on(async {
@@ -143,7 +148,7 @@ mod tests {
             let selected = f
                 .store
                 .collection(
-                    "orient-receipts",
+                    "spawn",
                     CollectionPolicy::new(
                         AdmissionPolicy::Open,
                         AdmissionPolicy::direct(f.signer.verifying_key()),
@@ -155,7 +160,7 @@ mod tests {
             let routes = BTreeMap::from([
                 (DEFAULT_SCOPE_ID, f.legacy.source.handle()),
                 (RELATIONS_SCOPE_ID, f.relations.source.handle()),
-                (RECEIPTS_SCOPE_ID, selected.handle()),
+                (SPAWN_SCOPE_ID, selected.handle()),
             ]);
             let routing = test_storage().with_collections(routes.clone());
             assert_eq!(
@@ -175,7 +180,11 @@ mod tests {
             let facts = FactArchive::new(vec![
                 triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(&facts),
             ]);
-            assert!(event_presented(&facts, *event));
+            assert!(event_presented(Presented::new(&facts, *persona), *event));
+            assert!(
+                !event_presented(Presented::new(&facts, *fucid()), *event),
+                "an imported receipt counts only for the persona it names"
+            );
             assert!(
                 f.imported().is_empty(),
                 "the private CLI destination remains untouched"
@@ -264,13 +273,16 @@ mod tests {
             );
             let expected = entity! { &receipt @
                 metadata::tag: &KIND_PRESENTED,
+                presentation::persona: &persona,
                 presentation::event: &event,
                 metadata::created_at*: times,
             } + entity! { &duplicate_event_receipt @
                 metadata::tag: &KIND_PRESENTED,
+                presentation::persona: &persona,
                 presentation::event: &event,
             } + entity! { &undated_receipt @
                 metadata::tag: &KIND_PRESENTED,
+                presentation::persona: &persona,
                 presentation::event: &second_event,
             };
             assert_eq!(&f.imported(), expected.facts());
