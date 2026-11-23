@@ -883,7 +883,7 @@ fn rejected_complete_report_is_retryable_and_does_not_present() {
 }
 
 #[test]
-fn routing_aliases_under_one_signer_share_projected_health_receipts() {
+fn one_signer_keeps_each_personas_health_receipts_apart() {
     let f = Fixture::new();
     let other = *fucid();
     f.person(other);
@@ -904,13 +904,21 @@ fn routing_aliases_under_one_signer_share_projected_health_receipts() {
         text(&f.call("orient_poll", json!({"persona": f.who(), "peek": false})))
             .contains("DHT publication: stalled")
     );
-    // The other routing alias is the first reader after acceptance. Its eager
-    // upkeep must observe the same signer-owned receipt without a daemon.
+    // Both zooids sign with the same node key, and a receipt names the zooid
+    // it was presented to: the other one is still told, until it is.
+    assert!(f
+        .call("orient_poll", json!({"persona": f.who()}))
+        .is_empty());
+    assert!(text(&f.call("orient_poll", json!({"persona": alias})))
+        .contains("DHT publication: stalled"));
+    assert!(
+        text(&f.call("orient_poll", json!({"persona": alias, "peek": false})))
+            .contains("DHT publication: stalled")
+    );
     assert!(f.call("orient_poll", json!({"persona": alias})).is_empty());
     assert!(f
         .call("orient_poll", json!({"persona": f.who()}))
         .is_empty());
-    assert!(f.call("orient_poll", json!({"persona": alias})).is_empty());
 }
 
 #[test]
@@ -1023,6 +1031,88 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     );
     f.maintain_receipts(&other_key);
     assert!(run_other(false).is_empty());
+}
+
+/// The env-mode path the Sparks run: `TRIBLESPACE_COLLECTION_SPAWN` names
+/// one shared root whose READ and WRITE admit both node keys. A zooid's seen
+/// state written under one key is her seen state under the other key, and a
+/// delivery to her leaves another zooid's news untouched.
+#[test]
+fn a_shared_spawn_root_carries_a_zooids_receipts_across_node_keys() {
+    use triblespace::core::capability::policy::AdmissionPolicy;
+    use triblespace::core::collection::{grant_collection_read, CollectionPolicy};
+
+    let f = Fixture::new();
+    let other_zooid = *fucid();
+    f.person(other_zooid);
+    f.message("for the fixture zooid", f.persona);
+    f.message("for the other zooid", other_zooid);
+    f.maintain();
+    let node_b_key = f.directory.path().join("node-b.key");
+    let node_b = faculties::storage::initialize_signer(&f.pile, Some(&node_b_key)).unwrap();
+    let node_a = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
+    let mut pile = faculties::storage::open_pile_strict_as(&f.pile, node_a.verifying_key()).unwrap();
+    let mut overrides = Vec::new();
+    for scope in [
+        faculties::schemas::message::DEFAULT_SCOPE_ID,
+        faculties::schemas::relations::DEFAULT_SCOPE_ID,
+    ] {
+        let source =
+            faculties::collection_names::open(&mut pile, scope, node_a.verifying_key()).unwrap();
+        grant_collection_read(&mut pile, source.handle(), &node_a, node_b.verifying_key())
+            .unwrap();
+        overrides.push((
+            faculties::collection_names::override_env_name(scope),
+            hex::encode(source.handle().raw),
+        ));
+    }
+    let quorum = || {
+        AdmissionPolicy::quorum([node_a.verifying_key(), node_b.verifying_key()], 1, None)
+            .unwrap()
+    };
+    let spawn = pile
+        .collection("spawn", CollectionPolicy::new(quorum(), quorum()))
+        .unwrap();
+    overrides.push((
+        faculties::collection_names::override_env_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
+        hex::encode(spawn.handle().raw),
+    ));
+    pile.close().unwrap();
+
+    let poll = |key: &Path, persona: &str, consume: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_orient"));
+        command
+            .args(["--pile", f.pile.to_str().unwrap(), "--key", key.to_str().unwrap()])
+            .args(["--persona", persona])
+            .env_remove("ORIENT_TRACE_REFRESH");
+        for (name, _) in std::env::vars_os() {
+            if name
+                .to_string_lossy()
+                .starts_with(faculties::collection_names::COLLECTION_OVERRIDE_PREFIX)
+            {
+                command.env_remove(name);
+            }
+        }
+        command.envs(overrides.iter().map(|(name, value)| (name, value)));
+        command.arg("poll");
+        if !consume {
+            command.arg("--peek");
+        }
+        let result = command.output().unwrap();
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        String::from_utf8(result.stdout).unwrap()
+    };
+    let other = format!("{other_zooid:x}");
+    assert!(poll(&node_b_key, &f.who(), false).contains("for the fixture zooid"));
+    assert!(poll(&f.key, &f.who(), true).contains("for the fixture zooid"));
+    assert!(poll(&f.key, &f.who(), false).is_empty());
+    assert!(
+        poll(&node_b_key, &f.who(), false).is_empty(),
+        "her receipt from node A is her seen state on node B"
+    );
+    assert!(poll(&node_b_key, &other, false).contains("for the other zooid"));
+    assert!(poll(&node_b_key, &other, true).contains("for the other zooid"));
+    assert!(poll(&f.key, &other, false).is_empty());
 }
 
 #[test]

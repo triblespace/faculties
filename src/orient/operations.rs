@@ -936,6 +936,17 @@ impl ReceiptSource {
         pile: &mut impl FacultyAccess,
         signer: &SigningKey,
     ) -> Result<Self> {
+        // With no route and no `TRIBLESPACE_COLLECTION_SPAWN`, keep today's
+        // signer-private default usable. Several keys already hold same-named
+        // private roots on one pile, so `open_configured`'s refusal to start an
+        // empty generation beside one with content would stop a fresh key's
+        // Orient altogether; receipts were never subject to it.
+        if routing.collection_routes().is_none()
+            && crate::collection_names::configured_handle(crate::schemas::spawn::DEFAULT_SCOPE_ID)?
+                .is_none()
+        {
+            return Self::register(pile, signer);
+        }
         let source = OrientSource::open(
             routing,
             pile,
