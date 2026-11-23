@@ -3,11 +3,17 @@
 //! from that conversation's newest held leaf. This is how a new window reads
 //! its retired predecessor's tail, given the session the launcher names.
 //!
+//! A native zooid's history has no importer receipt: Drive names the zooid on
+//! each context it lives (`context::zooid`). `zooid/<name>` walks back from
+//! where that history ends, found exactly as a relaunch of the zooid finds it
+//! ([`crate::spawn::continuation::zooid_tail`]), refusals included.
+//!
 //! A locator says which conversation, never how far it was imported: the
 //! line printed before the thread names the leaf found and its time, and
 //! says when other nodes follow it.
 
 use super::*;
+use crate::schemas::archive_v3 as v3;
 
 /// A conversation as its source locates it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,11 +24,14 @@ pub(crate) enum Locator {
     /// The leaves whose receipts carry this `source_thread`: exactly one
     /// thread, a subagent's included.
     Thread(String),
+    /// The node a native zooid's archived history ends at, by the name its
+    /// contexts carry.
+    Zooid(String),
 }
 
 impl Locator {
-    /// `session/<id>` or `thread/<id>`; anything else is a node or receipt
-    /// prefix.
+    /// `session/<id>`, `thread/<id>` or `zooid/<name>`; anything else is a
+    /// node or receipt prefix.
     pub(crate) fn parse(id: &str) -> Option<Self> {
         if id
             .strip_prefix("session/")
@@ -34,6 +43,11 @@ impl Locator {
             .is_some_and(|rest| !rest.is_empty())
         {
             Some(Self::Thread(id.to_owned()))
+        } else if id
+            .strip_prefix("zooid/")
+            .is_some_and(|rest| !rest.is_empty())
+        {
+            Some(Self::Zooid(id.to_owned()))
         } else {
             None
         }
@@ -41,7 +55,7 @@ impl Locator {
 
     fn name(&self) -> &str {
         match self {
-            Self::Session(locator) | Self::Thread(locator) => locator,
+            Self::Session(locator) | Self::Thread(locator) | Self::Zooid(locator) => locator,
         }
     }
 }
@@ -56,13 +70,27 @@ struct Leaf {
     continued: bool,
 }
 
-fn node_time(facts: &FactArchive, node: Id, receipt: Id) -> Option<(i128, i128)> {
+/// The times the occurrences of `node`'s witnesses claim: where a native
+/// runtime (Drive) puts a node's time.
+pub(crate) fn occurrence_times(facts: &FactArchive, node: Id) -> Vec<(i128, i128)> {
+    find!(
+        value: (i128, i128),
+        pattern!(facts, [
+            { _?witness @ v3::witness::projects_to: node },
+            { _?occurrence @ v3::occurrence::of: _?witness, v3::witness::timestamp: ?value }
+        ])
+    )
+    .collect()
+}
+
+fn node_time(facts: &FactArchive, node: Id, receipt: Option<Id>) -> Option<(i128, i128)> {
     find!(
         value: (i128, i128),
         pattern!(facts, [{ node @ archive_schema::block::timestamp: ?value }])
     )
     .max_by_key(|(_, upper)| *upper)
     .or_else(|| {
+        let receipt = receipt?;
         find!(
             value: (i128, i128),
             pattern!(facts, [{
@@ -70,6 +98,11 @@ fn node_time(facts: &FactArchive, node: Id, receipt: Id) -> Option<(i128, i128)>
             }])
         )
         .max_by_key(|(_, upper)| *upper)
+    })
+    .or_else(|| {
+        occurrence_times(facts, node)
+            .into_iter()
+            .max_by_key(|(_, upper)| *upper)
     })
 }
 
@@ -105,6 +138,7 @@ fn selected_receipts(facts: &FactArchive, locator: &Locator) -> Vec<(Id, Id)> {
             }])
         )
         .collect(),
+        Locator::Zooid(_) => unreachable!("a zooid is located by its contexts, not receipts"),
     }
 }
 
@@ -115,7 +149,7 @@ fn select_leaf(facts: &FactArchive, locator: &Locator) -> Option<Leaf> {
         .map(|(receipt, node)| Leaf {
             node,
             receipt,
-            at: node_time(facts, node, receipt),
+            at: node_time(facts, node, Some(receipt)),
             continued: exists!(pattern!(facts, [{
                 _?next @ archive_schema::block::previous: node
             }])),
@@ -136,6 +170,9 @@ fn utc(tai_ns: i128) -> String {
 
 /// The newest leaf `locator` names, and the line that says which it is.
 pub(crate) fn conversation_leaf(facts: &FactArchive, locator: &Locator) -> Result<(Id, String)> {
+    if let Locator::Zooid(_) = locator {
+        return zooid_leaf(facts, locator);
+    }
     let name = locator.name();
     let Some(leaf) = select_leaf(facts, locator) else {
         bail!("no Archive receipt carries {name}");
@@ -149,4 +186,24 @@ pub(crate) fn conversation_leaf(facts: &FactArchive, locator: &Locator) -> Resul
         line.push_str("; every leaf it names has a successor, so the material goes on past it");
     }
     Ok((leaf.node, line))
+}
+
+/// Where the zooid `zooid/<name>` names ends its archived history, and the
+/// line that says so. A refusal of [`crate::spawn::continuation::zooid_tail`]
+/// is the error, never an empty result.
+fn zooid_leaf(facts: &FactArchive, locator: &Locator) -> Result<(Id, String)> {
+    let locator = locator.name();
+    let name = &locator["zooid/".len()..];
+    let Some(node) = crate::spawn::continuation::zooid_tail(facts, name)? else {
+        bail!("no archived context names {locator}");
+    };
+    let mut line = format!("zooid: {name}, history ends at {node:X}");
+    match node_time(facts, node, None) {
+        Some((_, upper)) => write!(line, " at {}", utc(upper))?,
+        None => line.push_str(", which carries no time"),
+    }
+    if exists!(pattern!(facts, [{ _?next @ archive_schema::block::previous: node }])) {
+        line.push_str("; a node outside the zooid's own contexts follows it");
+    }
+    Ok((node, line))
 }

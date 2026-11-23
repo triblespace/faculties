@@ -1632,6 +1632,11 @@ fn render_block(
             }])
         )
         .min()
+    })
+    .or_else(|| {
+        conversation::occurrence_times(facts, block)
+            .into_iter()
+            .min()
     });
     writeln!(out, "timestamp: {}", format_interval(timestamp))?;
     for previous in find!(
@@ -1687,7 +1692,8 @@ fn run_thread(
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
     // A `session/<id>` or `thread/<id>` names that conversation's newest
-    // held leaf, said in one line before the thread.
+    // held leaf, and `zooid/<name>` where that zooid's history ends, said in
+    // one line before the thread.
     let leaf;
     let prefix = match conversation::Locator::parse(prefix) {
         Some(locator) => {
@@ -3731,6 +3737,147 @@ mod tests {
         );
         assert!(exact.contains("the worker answered"), "{exact}");
         assert!(!exact.contains("the root"), "{exact}");
+    }
+
+    /// Native nodes as Drive writes them: each held in a context, its
+    /// occurrence claiming a time, committed into the fixture's Archive.
+    #[derive(Default)]
+    struct Native {
+        fragment: Fragment,
+        moments: u32,
+    }
+
+    impl Native {
+        fn context(&mut self, zooid: &str) -> Id {
+            use triblespace::prelude::{entity, fucid};
+            let context = *fucid();
+            let name = self.fragment.put::<UTF8String, _>(zooid.to_owned());
+            self.fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&context) @
+                crate::schemas::archive_v3::context::zooid: name,
+            };
+            context
+        }
+
+        /// `len` nodes in a row after `previous`, a minute apart, in `context`;
+        /// the last one.
+        fn chain(&mut self, previous: Option<Id>, context: Id, len: usize) -> Id {
+            use triblespace::prelude::entity;
+            const NATIVE: Id = triblespace::macros::id_hex!("5A1E0C7D9B3F4E21A8C6D0B2E4F61397");
+            let mut tail = previous;
+            for _ in 0..len {
+                self.moments += 1;
+                let node = crate::archive_v3::node(
+                    tail,
+                    crate::archive_v3::sense(&format!("native moment {}", self.moments)),
+                )
+                .unwrap();
+                let node_id = node.root().unwrap();
+                let witness = crate::archive_v3::witness(NATIVE, node_id).unwrap();
+                let witness_id = witness.root().unwrap();
+                let at = hifitime::Epoch::from_unix_seconds(
+                    1_795_000_000.0 + 60.0 * f64::from(self.moments),
+                );
+                let occurrence = crate::archive_v3::occurrence(
+                    witness_id,
+                    crate::archive_v3::WitnessAnnotations {
+                        timestamp: vec![(at, at).try_to_inline().unwrap()],
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let occurrence_id = occurrence.root().unwrap();
+                self.fragment += node;
+                self.fragment += witness;
+                self.fragment += occurrence;
+                self.fragment += entity! {
+                    triblespace::core::id::ExclusiveId::force_ref(&occurrence_id) @
+                    crate::schemas::archive_v3::context::in_context: context,
+                };
+                tail = Some(node_id);
+            }
+            tail.unwrap()
+        }
+
+        fn continues(&mut self, context: Id, tail: Id) {
+            use triblespace::prelude::entity;
+            self.fragment += entity! { triblespace::core::id::ExclusiveId::force_ref(&context) @
+                crate::schemas::archive_v3::context::continues: tail,
+            };
+        }
+
+        fn commit(self, fixture: &Fixture) {
+            let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+            let mut pile = open_pile_strict(&fixture.pile).unwrap();
+            let collection = open_configured(
+                &mut pile,
+                archive_schema::DEFAULT_SCOPE_ID,
+                signer.verifying_key(),
+            )
+            .unwrap();
+            pile.commit(collection, &signer, self.fragment).unwrap();
+            pile.close().unwrap();
+        }
+    }
+
+    /// `zooid/<name>` threads back from where that native zooid's history
+    /// ends, after one line naming the node and its time: its own newest
+    /// tail, never another zooid's; a name no context carries and a history
+    /// that diverges are refused.
+    #[test]
+    fn a_zooid_locator_threads_back_from_where_its_history_ends() {
+        let fixture = fixture();
+        let mut native = Native::default();
+        // A lives twice: its second context resumes the first's tail.
+        let first = native.context("zooid-a");
+        let before = native.chain(None, first, 3);
+        let second = native.context("zooid-a");
+        native.continues(second, before);
+        let resumed = native.chain(None, second, 2);
+        // B lives once, later and longer.
+        let other = native.context("zooid-b");
+        let b_tail = native.chain(None, other, 4);
+        native.commit(&fixture);
+
+        let a = thread_of(&fixture, "zooid/zooid-a", None).unwrap();
+        let line = a.lines().next().unwrap();
+        assert_eq!(
+            line,
+            format!("zooid: zooid-a, history ends at {resumed:X} at 2026-11-18T11:11:40Z"),
+            "{a}"
+        );
+        assert!(a.contains(&format!("block: {resumed:X}")), "{a}");
+        assert!(!a.contains(&format!("block: {b_tail:X}")), "{a}");
+        assert!(!a.contains(&format!("block: {before:X}")), "{a}");
+        assert!(!a.contains("timestamp: <untimed>"), "{a}");
+
+        let b = thread_of(&fixture, "zooid/zooid-b", Some(2)).unwrap();
+        assert!(
+            b.starts_with(&format!("zooid: zooid-b, history ends at {b_tail:X} at ")),
+            "{b}"
+        );
+        assert!(b.contains("thread: the last 2 of "), "{b}");
+
+        let never = thread_of(&fixture, "zooid/zooid-unknown", None).unwrap_err();
+        assert!(
+            format!("{never:#}").contains("no archived context names zooid/zooid-unknown"),
+            "{never:#}"
+        );
+        // A name is matched exactly, not by prefix.
+        assert!(thread_of(&fixture, "zooid/zooid", None).is_err());
+
+        let diverging = self::fixture();
+        let mut native = Native::default();
+        let (one, two) = (native.context("zooid-c"), native.context("zooid-c"));
+        let left = native.chain(None, one, 2);
+        let right = native.chain(None, two, 2);
+        native.commit(&diverging);
+        let diverged = format!(
+            "{:#}",
+            thread_of(&diverging, "zooid/zooid-c", None).unwrap_err()
+        );
+        assert!(diverged.contains("diverges"), "{diverged}");
+        assert!(diverged.contains(&format!("{left:x}")), "{diverged}");
+        assert!(diverged.contains(&format!("{right:x}")), "{diverged}");
     }
 
     /// The text Claude Code writes after a classifier stop, as the session
