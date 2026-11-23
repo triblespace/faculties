@@ -1095,22 +1095,26 @@ tracks the collection and blob dependencies it consulted; an unchanged store
 prefix needs no new upkeep. Historical support is an explicit `support()`
 request, not an extra read-side certification pass.
 
-Receipt history belongs to the signing zooid, not its routing alias or host.
-Ordinary `orient-receipts` facts retain event IDs and `created_at` annotations;
-a host-local attached EntityIdSet on `presentation::event` supplies fast
-membership tests. The receipt source has READ and WRITE rooted only at that
-key; its attached index has no separate policy. This is independent of the old
-`TRIBLESPACE_COLLECTION_ORIENT` override. Two selectors using the same
-key share receipt history; separate zooids need separate keys. Reporting runs
-refresh that membership projection before observing it. Failed receipt upkeep
-is reported and may permit a repeat; it does not hold the waiter behind a
-whole-ledger completeness barrier. This receipt path does not complete Habits:
-their definitions and completion facts are carried through the Habit chain.
-The source facts keep the richer historical query.
+Receipt history belongs to the zooid that received the news, not to the key
+that signed it. Each receipt names its recipient's Relations persona in its
+identity core, and lives in the colony's shared `spawn` collection, resolved
+exactly as Spawn resolves it: an explicit workspace route, else
+`TRIBLESPACE_COLLECTION_SPAWN`, else the signer-private `spawn` default. So one
+synced root carries every zooid's seen state, a node keeps its own signing key,
+and a delivery to one zooid never silences another on the same node. No
+`orient-receipts` route is needed. Receipts written before 2026-11-23 name no
+persona; their owner was a key many zooids shared, so they suppress nobody.
+`orient import-receipts` copies a legacy mixed ledger's receipts with their
+persona. Receipts are projected through Succinct and Rank9 like every other
+input; reporting runs refresh that projection before observing it. Failed
+receipt upkeep is reported and may permit a repeat; it does not hold the waiter
+behind a whole-ledger completeness barrier. This receipt path does not complete
+Habits: their definitions and completion facts are carried through the Habit
+chain. The source facts keep the richer historical query.
 
 Background `trible pile collection maintain-all PILE TARGET... --watch` can keep
 the selected Orient targets and their dependencies current. Include each node's local
-health/latest targets and its private receipt ID-set target as well as shared inputs;
+health/latest targets and the Spawn receipt projections as well as shared inputs;
 keeping only message and goal indexes current is insufficient. Explicit target
 selection avoids reviving obsolete index descriptors. Each author's public key
 biases independent target priority, while every selected chain remains

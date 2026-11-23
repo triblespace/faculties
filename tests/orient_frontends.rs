@@ -176,7 +176,7 @@ impl Fixture {
             faculties::storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
         let source = pile
             .collection(
-                faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                faculties::collection_names::require_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
                 faculties::collection_names::private_policy(signer.verifying_key()),
             )
             .unwrap();
@@ -275,14 +275,18 @@ impl Fixture {
         let mut store = faculties::storage::open_pile_strict(&self.pile).unwrap();
         let collection = store
             .collection(
-                faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                faculties::collection_names::require_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
                 faculties::collection_names::private_policy(signer.verifying_key()),
             )
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         let (facts, _) = faculties::storage::read_fact_collection(collection, &snapshot).unwrap();
+        // Receipts name the zooid they were presented to.
         find!(event: Id, pattern!(&facts, [{
-            _?receipt @ faculties::schemas::orient::presentation::event: ?event,
+            _?receipt @
+            metadata::tag: &faculties::schemas::orient::KIND_PRESENTED,
+            faculties::schemas::orient::presentation::persona: &self.persona,
+            faculties::schemas::orient::presentation::event: ?event,
         }]))
         .collect()
     }
@@ -939,13 +943,13 @@ fn distinct_signers_keep_private_receipts_over_shared_domain_views() {
     }
     let first_receipts = pile
         .collection(
-            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::require_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
             faculties::collection_names::private_policy(owner.verifying_key()),
         )
         .unwrap();
     let second_receipts = pile
         .collection(
-            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::require_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
             faculties::collection_names::private_policy(other.verifying_key()),
         )
         .unwrap();
@@ -1033,7 +1037,7 @@ fn missing_historical_receipt_payload_does_not_block_accepted_news() {
         faculties::storage::open_pile_strict_as(&f.pile, signer.verifying_key()).unwrap();
     let receipts = pile
         .collection(
-            faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+            faculties::collection_names::require_name(faculties::schemas::spawn::DEFAULT_SCOPE_ID),
             faculties::collection_names::private_policy(signer.verifying_key()),
         )
         .unwrap();
@@ -1041,14 +1045,22 @@ fn missing_historical_receipt_payload_does_not_block_accepted_news() {
     pile.commit(
         receipts,
         &signer,
-        faculties::orient::receipt_fragment([earlier], faculties::clock::point_now().unwrap()),
+        faculties::orient::receipt_fragment(
+            f.persona,
+            [earlier],
+            faculties::clock::point_now().unwrap(),
+        ),
     )
     .unwrap();
     pile.close().unwrap();
     f.maintain();
 
     let cold =
-        faculties::orient::receipt_fragment([*fucid()], faculties::clock::point_now().unwrap());
+        faculties::orient::receipt_fragment(
+            f.persona,
+            [*fucid()],
+            faculties::clock::point_now().unwrap(),
+        );
     let cold = IntoBlob::<blobencodings::SimpleArchive>::to_blob(cold.facts().clone());
     let mut pile = faculties::storage::open_pile_strict(&f.pile).unwrap();
     pile.insert(CollectionRecord::Commit(CollectionCommit::sign(

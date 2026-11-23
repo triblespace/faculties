@@ -12,16 +12,19 @@ use triblespace::prelude::*;
 /// Minted with `trible genid` on 2026-08-11.
 pub const DEFAULT_SCOPE_ID: Id = id_hex!("F53E5FE10DC419D59973C668ACF018B4");
 
-/// Explicit routing role for the current receipt collection, distinct from
-/// the legacy mixed Orient ledger. Minted with `trible genid` on 2026-10-08.
+/// Routing role of the key-private receipt roots written until 2026-11-23.
+/// Orient now resolves receipts through the Spawn scope instead.
+/// Minted with `trible genid` on 2026-10-08.
 pub const RECEIPTS_SCOPE_ID: Id = id_hex!("13DA82B2558455D3031499CFDDBDB792");
 
-/// Key-private receipt facts. This deliberately differs from the legacy
-/// mixed-persona `orient` collection: its owner is the descriptor's authority.
+/// The name of the key-private receipt roots written until 2026-11-23, kept so
+/// those descriptors stay describable. Current receipts live in the shared
+/// Spawn collection and name their recipient; this role is no longer opened.
 pub const RECEIPT_COLLECTION_NAME: &str = "orient-receipts";
 
-/// One presented-event receipt. Legacy mixed ledgers also carry a persona;
-/// current private collections take their observer from descriptor authority.
+/// One presented-event receipt. It names the receiving zooid's persona in its
+/// identity core; a receipt without one (written before 2026-11-23) names
+/// nobody and suppresses nobody.
 ///
 /// Minted with `trible genid` on 2026-09-02:
 /// `66825BD9E1D9F71615855A96C4C60DB7`.
@@ -31,7 +34,8 @@ pub mod presentation {
     use super::*;
 
     attributes! {
-        /// Exact observer/persona anchor to whom the event was presented.
+        /// The Relations persona of the zooid the event was presented to; part
+        /// of every current receipt's identity core.
         /// Minted with `trible genid` on 2026-09-02.
         "B9290A07396C56825900D3F552969E5E" as persona: inlineencodings::GenId;
 

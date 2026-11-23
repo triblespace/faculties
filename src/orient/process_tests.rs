@@ -108,11 +108,13 @@ esac
     fn presented(&self) -> bool {
         let signer = storage::load_signer(&self.pile, Some(&self.key)).unwrap();
         let mut store = storage::open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
-        let collection = store.collection(schemas::orient::RECEIPT_COLLECTION_NAME,
-            collection_names::private_policy(signer.verifying_key())).unwrap();
+        let collection = collection_names::open(&mut store,
+            schemas::spawn::DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
         let snapshot = store.snapshot().unwrap();
         let (facts, _) = storage::read_fact_collection(collection, &snapshot).unwrap();
         let present = triblespace::macros::exists!(triblespace::macros::pattern!(&facts, [{
+            triblespace::core::metadata::tag: &schemas::orient::KIND_PRESENTED,
+            schemas::orient::presentation::persona: &self.who,
             schemas::orient::presentation::event: &self.event,
         }]));
         drop(facts);

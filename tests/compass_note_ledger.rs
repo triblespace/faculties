@@ -72,7 +72,9 @@ impl TestPile {
             let policy = faculties::collection_names::private_policy(signer.verifying_key());
             let receipts = pile
                 .collection(
-                    faculties::schemas::orient::RECEIPT_COLLECTION_NAME,
+                    faculties::collection_names::require_name(
+                        faculties::schemas::spawn::DEFAULT_SCOPE_ID,
+                    ),
                     policy.clone(),
                 )
                 .unwrap();

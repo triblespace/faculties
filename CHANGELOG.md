@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Orient receipts name the zooid that received the news and live in the
+  colony's shared `spawn` collection (JP, 2026-11-23). Every receipt carries
+  the recipient's Relations persona in its identity core, and every read
+  (news, habit due occurrences, health episodes, service events) joins on it,
+  so a delivery to one zooid no longer silences the same event for another
+  zooid on the same node. The receipt root is resolved through the Spawn scope
+  exactly as Spawn resolves it: an explicit route, else
+  `TRIBLESPACE_COLLECTION_SPAWN`, else the signer-private `spawn` default; an
+  `orient-receipts` route is no longer needed or read. Receipts written before
+  this change name no persona and suppress nobody, so a zooid's first consuming
+  run after the cutover may repeat news it was shown before. `orient
+  import-receipts` keeps the legacy persona. Readers built before this change
+  keep reading their old key-private roots and do not see the new receipts.
+
 - `zooid drive-task` launches a local zooid into Drive's living loop,
   `drive run --mind mini`, instead of the finite `drive task`, which Drive
   never had on main. Its arguments are `--binding FILE --brief {brief}
