@@ -140,7 +140,8 @@ pub(super) enum Command {
     /// Show the complete canonical ancestor DAG of one source projection
     /// (receipt) or one node, by id prefix; a search hit's leading id is a
     /// node. A conversation's source locator, `session/<id>` (subagent
-    /// threads left out) or `thread/<id>`, names its newest held leaf.
+    /// threads left out) or `thread/<id>`, names its newest held leaf;
+    /// `zooid/<name>` names where that native zooid's history ends.
     Thread {
         id: String,
         /// Maximum accepted block count. Exceeding it is an error rather than
