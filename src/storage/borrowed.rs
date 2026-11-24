@@ -27,6 +27,9 @@ pub(crate) trait FacultyAccess:
     fn before_orient_rank9_registration(&self, _label: &'static str) -> Result<()> { Ok(()) }
 
     #[cfg(test)]
+    fn before_orient_status_registration(&self) -> Result<()> { Ok(()) }
+
+    #[cfg(test)]
     fn before_orient_maintenance(&self, _label: &'static str, _projection: &'static str) -> Result<()> { Ok(()) }
 }
 
@@ -180,6 +183,12 @@ impl FacultyAccess for BorrowedStore {
     #[cfg(test)]
     fn before_orient_rank9_registration(&self, label: &'static str) -> Result<()> {
         if let Some(hook) = &self.registration { hook.pause(label, "register Rank9")?; }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn before_orient_status_registration(&self) -> Result<()> {
+        if let Some(hook) = &self.registration { hook.pause("Compass status", "register")?; }
         Ok(())
     }
 

@@ -1581,11 +1581,12 @@ mod tests {
         assert_eq!(timeout.kind(), NextKind::Timeout);
         second.acknowledge(timeout).unwrap();
         assert!(second.is_settled());
-        // Cancelled at a named step: the last registration of the opening, and
+        // Cancelled at a named step: two registrations of the opening, and
         // maintenance, which a 20 ms sleep only ever reached in a release
         // build (a debug one was still opening its collections).
         for (label, step) in [
             ("Discord", "register Rank9"),
+            ("Compass status", "register"),
             ("Discord", "maintain Succinct"),
             ("Discord", "maintain Rank9"),
             ("Compass status", "maintain register"),

@@ -1168,7 +1168,15 @@ impl OrientSources {
             None
         };
         let presentations = ReceiptSource::open(routing, pile, signer).await?;
-        let compass_status = compass::status_register_for_source(pile, compass.source)?;
+        #[cfg(test)]
+        pile.before_orient_status_registration()?;
+        let compass_status = compass::status_register_for_source(pile, compass.source).map_err(
+            |cause| OrientRegistrationError {
+                label: "Compass",
+                projection: "status register",
+                cause,
+            },
+        )?;
         Ok(Self {
             messages,
             mail,

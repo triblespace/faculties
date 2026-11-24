@@ -36,7 +36,8 @@ use anyhow::{bail, Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
-    CollectionCommit, CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
+    CollectionCommit, CollectionRead, CollectionRegistrationError, CollectionSnapshotExt,
+    CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::query::register::{resolve, StatedOrder};
@@ -103,19 +104,18 @@ where
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead + CollectionRead,
 {
     let source = crate::collection_names::open_configured(store, DEFAULT_SCOPE_ID, authority)?;
-    status_register_for_source(store, source)
+    Ok(status_register_for_source(store, source)?)
 }
 
 pub(crate) fn status_register_for_source<S>(
     store: &mut S,
     source: Collection<blobencodings::SimpleArchive>,
-) -> Result<Collection<LwwRegisterBlob>>
+) -> std::result::Result<Collection<LwwRegisterBlob>, CollectionRegistrationError<S::PutError>>
 where
     S: CollectionStoreExt + SnapshotSource,
     <S as SnapshotSource>::Snapshot: BlobStoreGet + CapabilityProofRead,
 {
-    Ok(store
-        .attach::<LwwRegisterBlob>(source, (board::status_of.id(), metadata::created_at.id()))?)
+    store.attach::<LwwRegisterBlob>(source, (board::status_of.id(), metadata::created_at.id()))
 }
 
 fn validate_label(label: &str, value: &str) -> Result<()> {
