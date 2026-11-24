@@ -1039,7 +1039,7 @@ fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<
 
 /// The journal content the WeMM index reads: chunk prose and wordless images.
 #[cfg(feature = "wemm")]
-fn content_attributes() -> [Id; 2] {
+pub(crate) fn content_attributes() -> [Id; 2] {
     [ctx::summary.id(), ctx::image.id()]
 }
 
@@ -1047,7 +1047,7 @@ fn content_attributes() -> [Id; 2] {
 /// attributes type one content differently, so the join reads both as the
 /// mapping does, as raw bytes; a chunk with several contents scores its best.
 #[cfg(feature = "wemm")]
-fn chunk_cosines<P: TriblePattern>(
+pub(crate) fn chunk_cosines<P: TriblePattern>(
     facts: &P,
     cosines: &ReconstructedCosines,
 ) -> std::collections::HashMap<Id, f64> {

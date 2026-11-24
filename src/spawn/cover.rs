@@ -1,7 +1,7 @@
 //! Best-effort cover sizing: `--cover PERCENT` of the worker's context window.
 //!
 //! The percent is a wish for the whole cover (memories, beliefs and goals),
-//! never an allocation contract. Beliefs and goals always render whole and
+//! never an allocation contract. Goals always render whole and
 //! the brief is never cut, so a cover may come out larger than its target.
 //! The one real limit is the window `W`, and every figure set against it here
 //! is an estimate: no local tokenizer exists for the hosted providers, so
@@ -13,13 +13,13 @@
 
 use std::path::Path;
 
-/// Memory characters of a launch without `--cover`, and of one with
+/// Shared Memory and Wiki characters of a launch without `--cover`, and of one with
 /// `--cover` that found no window: the former 200k wake plus 40k tail,
 /// spent on one tinted render.
 pub const PLAIN_MEMORY_CHARS: usize = 240_000;
 
 /// The smallest memory budget the target split gives, however little of
-/// the target the beliefs and goals leave: 40k characters, the size of the
+/// the target the fixed sections leave: 40k characters, the size of the
 /// former task tail, a coarse recollection of the whole life, about 15k
 /// tokens at the claude ratio. Going over the target for it is normal, not
 /// a failure. It is not a floor on the cover: when the whole prompt is
@@ -143,9 +143,9 @@ pub struct CoverRecord {
     /// converted.
     pub calibration: Option<Calibration>,
     pub target_chars: Option<usize>,
-    /// Beliefs and goals alone, from a wake with no memory budget.
+    /// Fixed sections and diagnostics measured with no recall budget.
     pub fixed_chars: Option<usize>,
-    /// The memory budget the delivered cover was rendered with.
+    /// Character allowance shared by narrative and Wiki in this wake.
     pub memory_budget: usize,
     /// The delivered wake's characters.
     pub cover_chars: usize,
@@ -171,7 +171,7 @@ pub fn target_chars(percent: f64, window: u64, chars_per_token: f64) -> usize {
     (percent / 100.0 * window as f64 * chars_per_token).round() as usize
 }
 
-/// The memory budget a target splits off: what beliefs and goals leave of
+/// The memory budget a target splits off: what fixed sections leave of
 /// it, and at least [`MIN_MEMORY_CHARS`]. The estimate check after
 /// rendering may still lower it.
 pub fn memory_budget(target_chars: usize, fixed_chars: usize) -> usize {

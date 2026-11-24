@@ -444,7 +444,10 @@ impl BindRequest {
     fn from_env() -> Result<Self> {
         // The exact descriptor TRIBLESPACE_COLLECTION_MODELS names, as for
         // every model: the root is resolved in it and nowhere else.
-        let collection = crate::model_storage::models_handle()?;
+        Self::for_collection(crate::model_storage::models_handle()?)
+    }
+
+    fn for_collection(collection: CollectionHandle) -> Result<Self> {
         let root = std::env::var("WEMM_ROOT")
             .context("WEMM_ROOT is not set; it names the WeMM model root")?;
         let root = Id::from_hex(&root).context("WEMM_ROOT is not a 32-hex-digit id")?;
@@ -993,6 +996,127 @@ impl Session {
             profile: self.profile,
         })
     }
+}
+
+/// Score a task cue against the already-derived Memory and Wiki rows. Resolve
+/// both sources under the reader's own authority before binding the model.
+/// No document is embedded on this path.
+pub(crate) fn score_wake(
+    routing: &crate::storage::Storage,
+    cue: &str,
+    tint: &mut crate::orient::WakeTint,
+) -> Result<()> {
+    use crate::schemas::{memory, models, wiki};
+    if std::env::var_os("WEMM_ROOT").is_none() {
+        anyhow::bail!("WEMM_ROOT is unset");
+    }
+    let models = match routing.collection_routes() {
+        Some(routes) => *routes
+            .get(&models::COLLECTION_SCOPE_ID)
+            .context("the selected workspace has no models role")?,
+        None => crate::model_storage::models_handle()?,
+    };
+    let request = BindRequest::for_collection(models)?;
+    let identity = WemmIdentity {
+        model_root: request.root,
+        model_collection: models,
+        kernel_profile: request.profile.id(),
+    };
+    let memory_attrs = crate::memory::operations::content_attributes();
+    let wiki_attrs = [wiki::attrs::content.id()];
+    let loaded = routing.with_store(|store, signer, runtime| {
+        let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+        if routing.collection_routes().is_some() {
+            crate::collection_names::open_workspace_read_in(
+                &reader,
+                signer.verifying_key(),
+                models,
+            )?;
+        } else {
+            crate::collection_names::open_exact_read_in(
+                &reader,
+                models::COLLECTION_SCOPE_ID,
+                signer.verifying_key(),
+                models,
+            )?;
+        }
+        let mut inputs = Vec::new();
+        for (role, scope, attrs) in [
+            ("Memory", memory::DEFAULT_SCOPE_ID, memory_attrs.as_slice()),
+            ("Wiki", wiki::DEFAULT_SCOPE_ID, wiki_attrs.as_slice()),
+        ] {
+            if routing
+                .collection_routes()
+                .is_some_and(|routes| !routes.contains_key(&scope))
+            {
+                continue;
+            }
+            let view = (|| -> Result<_> {
+                let source = if routing.collection_routes().is_some() {
+                    routing.open_collection_read(store, scope, signer.verifying_key(), runtime)?
+                } else {
+                    crate::collection_names::open_configured_read_acquiring(
+                        store,
+                        scope,
+                        signer.verifying_key(),
+                        runtime,
+                    )?
+                };
+                let mapping = Index::new(attrs.iter().copied(), identity, DEFAULT_WINDOW_CAP)?;
+                let policy = source.policy(&store.snapshot()?)?;
+                let target = store.derive_with(source, mapping.clone(), policy)?;
+                let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+                let view = reader
+                    .collection_acquiring(target)?
+                    .view::<NvFp4CosineIndex<Embedding>>()?;
+                // The query needs resident rows. Computing a coverage audit here
+                // would enumerate every admitted source foundation on each wake.
+                Ok((scope, mapping, view))
+            })();
+            match view {
+                Ok((_, _, view)) if view.is_empty() => {
+                    tint.diagnostics
+                        .push(format!("{role} WeMM index has no rows"));
+                }
+                Ok(input) => inputs.push(input),
+                Err(e) => tint
+                    .diagnostics
+                    .push(format!("{role} WeMM index unavailable: {e:#}")),
+            }
+        }
+        Ok(inputs)
+    })?;
+    if loaded.is_empty() {
+        return Ok(());
+    }
+    let session = Session::bind(routing.path(), request, &CopyHost::this_host())?;
+    let indexes: Vec<_> = loaded
+        .iter()
+        .map(|(_, mapping, index)| (mapping, index))
+        .collect();
+    let scores = with_wemm_runtime(Arc::clone(&session.runtime), || {
+        Index::reconstructed_cosines_many(&indexes, cue)
+    })??;
+    anyhow::ensure!(scores.len() == loaded.len(), "missing WeMM index result");
+    tint.diagnostics.push(format!(
+        "WeMM model {}/{:x}, profile {}",
+        collection_hex(identity.model_collection),
+        identity.model_root,
+        session.profile.label()
+    ));
+    for ((scope, _, _), scores) in loaded.into_iter().zip(scores) {
+        if scope == memory::DEFAULT_SCOPE_ID {
+            tint.memory_contents = Some(Arc::new(scores));
+        } else {
+            type Text = inlineencodings::Handle<blobencodings::UTF8String>;
+            let ranked = find!(body: crate::schemas::wiki::TextHandle,
+                scores.similar_to::<Text>(body, f64::NEG_INFINITY))
+            .map(|body| (body, scores.cosine(&body).expect("scored body") as f32))
+            .collect();
+            tint.wiki_contents = Some(Arc::new(ranked));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Session {

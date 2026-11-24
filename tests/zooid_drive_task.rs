@@ -390,6 +390,7 @@ impl Renderer for StubRenderer {
         Ok(WakeTint {
             about: about.to_owned(),
             scores: None,
+            ..Default::default()
         })
     }
     fn wake(

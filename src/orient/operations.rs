@@ -60,13 +60,26 @@ impl Default for WakeOptions {
 }
 /// A topic for the memory cover: among recollections of exactly the same
 /// span, the one closest to it is chosen (`memory context --about`); the
-/// cover's shape does not change. `scores` are the recollections' scores by
-/// meaning, computed beforehand (`Memory::about_scores`), so the wake itself
-/// never binds a model; `None` scores the topic by exact BM25.
-#[derive(Clone, Debug)]
+/// topic also retrieves current Wiki readings within the cover budget.
+/// Renderers can reuse this scoring across size estimates for one launch.
+#[derive(Clone, Debug, Default)]
 pub struct WakeTint {
     pub about: String,
     pub scores: Option<HashMap<Id, f32>>,
+    /// Content-handle scores from the admitted journal and Wiki indexes.
+    #[cfg(feature = "wemm")]
+    pub memory_contents: Option<std::sync::Arc<triblespace_search::nvfp4::ReconstructedCosines>>,
+    pub wiki_contents: Option<std::sync::Arc<Vec<(crate::schemas::wiki::TextHandle, f32)>>>,
+    pub diagnostics: Vec<String>,
+}
+impl WakeTint {
+    pub(crate) fn has_memory_scores(&self) -> bool {
+        #[cfg(feature = "wemm")]
+        if self.memory_contents.is_some() {
+            return true;
+        }
+        self.scores.is_some()
+    }
 }
 /// `orient wake --pairs`: the plain wake's selection, with the memory cover
 /// priced for a consumer that adds `chunk_overhead` characters per recall.
@@ -78,9 +91,8 @@ pub struct WakePairsOptions {
     pub raw_memory: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
-    /// A topic for the memory cover, as [`WakeTint::about`] with exact BM25
-    /// scores: among recollections of exactly the same span, the closest is
-    /// chosen; the cover's shape does not change and no model is bound.
+    /// A task cue ranks alternative journal tellings and current Wiki pages.
+    /// The two domains share one WeMM query when its index is available.
     pub about: Option<String>,
 }
 impl Default for WakePairsOptions {
@@ -245,9 +257,48 @@ impl Orient {
     /// `orient wake --pairs`: the plain wake as command/result JSON lines.
     /// Returns the memory diagnostics outside the charged cover.
     pub fn wake_pairs(&self, options: &WakePairsOptions, out: &mut Out<'_>) -> Result<Vec<String>> {
+        let tint = options
+            .about
+            .as_ref()
+            .map(|about| self.topic(about, options.chars));
         self.storage.with_store(|pile, signer, runtime| {
-            runtime.block_on(cmd_wake_pairs(&self.storage, pile, signer, options, out))
+            runtime.block_on(cmd_wake_pairs(
+                &self.storage,
+                pile,
+                signer,
+                options,
+                tint.as_ref(),
+                out,
+            ))
         })
+    }
+    /// Resolve the cue once before opening the store for a render. A missing
+    /// model or index leaves the affected domain on its lexical reader.
+    pub fn topic(&self, about: &str, chars: usize) -> WakeTint {
+        let mut tint = WakeTint {
+            about: about.to_owned(),
+            ..Default::default()
+        };
+        if about.trim().is_empty() || chars == 0 {
+            return tint;
+        }
+        #[cfg(feature = "wemm")]
+        {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::wemm::score_wake(&self.storage, about, &mut tint)
+            }));
+            match result {
+                Ok(Ok(())) => (),
+                Ok(Err(e)) => tint.diagnostics.push(format!("WeMM unavailable: {e:#}")),
+                Err(_) => tint
+                    .diagnostics
+                    .push("WeMM unavailable: inference panicked".into()),
+            }
+        }
+        #[cfg(not(feature = "wemm"))]
+        tint.diagnostics
+            .push("WeMM unavailable: this build has no WeMM support".into());
+        tint
     }
     /// `orient goals`: the Compass and Horizons sections of the wake, alone.
     pub fn goals(&self, doing_limit: usize, todo_limit: usize, out: &mut Out<'_>) -> Result<()> {
@@ -1449,6 +1500,77 @@ struct OrientQuery<'a> {
     payloads: ObservedStore<FacultySnapshot>,
 }
 
+/// Only the admitted Compass sources its overview actually reads.
+struct CompassQuery<'a> {
+    compass: &'a FactArchive,
+    compass_status: &'a LwwQuery,
+    payloads: ObservedStore<FacultySnapshot>,
+}
+
+impl OrientQuery<'_> {
+    fn goals(&self) -> CompassQuery<'_> {
+        CompassQuery {
+            compass: self.compass,
+            compass_status: self.compass_status,
+            payloads: self.payloads.clone(),
+        }
+    }
+}
+
+struct CompassSources {
+    facts: OrientSource,
+    status: Collection<LwwRegisterBlob>,
+}
+
+impl CompassSources {
+    async fn prepare(
+        routing: &Storage,
+        store: &mut FacultyStore,
+        signer: &SigningKey,
+    ) -> Result<Self> {
+        let facts = OrientSource::open(routing, store, signer, COMPASS_SCOPE_ID, "Compass").await?;
+        let status = compass::status_register_for_source(store, facts.source)?;
+        facts.maintain(store, signer).await?;
+        crate::storage::tolerate_own_lag(store.maintain_attached(status, signer).await)
+            .context("maintain Compass status register")?;
+        Ok(Self { facts, status })
+    }
+
+    async fn overview(
+        self,
+        store: &mut FacultyStore,
+        snapshot: &FacultySnapshot,
+        doing: usize,
+        todo: usize,
+    ) -> Result<String> {
+        let frozen = snapshot.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (facts, status) = tokio::task::spawn_blocking(move || {
+            let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
+            let facts = crate::storage::acquire_facts(&reader, self.facts.rank9)?;
+            let index = crate::storage::require_complete_attached_read(
+                reader
+                    .attached_acquiring(self.status)?
+                    .read_acquiring::<LwwIndex>()?,
+            )?;
+            Ok::<_, anyhow::Error>((facts, index.query()?))
+        })
+        .await
+        .context("join frozen Compass selection")??;
+        crate::storage::read_presentable(store, snapshot, |reader, unreadable| {
+            let query = CompassQuery {
+                compass: &facts,
+                compass_status: &status,
+                payloads: ObservedStore::new(reader.clone()),
+            };
+            let (mut goals, _) = render_native_compass_goals(&query, doing, todo, unreadable)?;
+            goals.push_str(&render_native_horizons(&query, unreadable)?);
+            Ok(goals)
+        })
+        .await
+    }
+}
+
 fn is_payload_pending(error: &anyhow::Error) -> bool {
     recovery_causes(error).any(|source| source.downcast_ref::<MissingBlob>().is_some())
 }
@@ -1843,7 +1965,7 @@ fn unread_messages(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<NativeMes
     Ok(rows)
 }
 
-fn native_task_title(query: &OrientQuery<'_>, task: Id) -> Result<String> {
+fn native_task_title(query: &CompassQuery<'_>, task: Id) -> Result<String> {
     find!(
         handle: compass::TextHandle,
         pattern!(query.compass, [{ task @ board::title: ?handle }])
@@ -2811,7 +2933,7 @@ fn render_native_mail(
 }
 
 fn latest_goal_status(
-    query: &OrientQuery<'_>,
+    query: &CompassQuery<'_>,
     goal: Id,
 ) -> Result<Option<(Id, String, IntervalValue)>> {
     find!(
@@ -2845,7 +2967,7 @@ fn latest_goal_status(
 /// Todo and is named under "Not placed"; an unreadable title or tag is shown
 /// as unreadable on the goal's row. Any other error still fails the section.
 fn render_native_compass_goals(
-    query: &OrientQuery<'_>,
+    query: &CompassQuery<'_>,
     doing_limit: usize,
     todo_limit: usize,
     unreadable: &crate::storage::Unreadable<'_>,
@@ -2961,7 +3083,7 @@ fn render_native_compass_goals(
 /// `unreadable` accepts is said on the row; any other error fails it. `skip`
 /// leaves one tag out, for a section that already names it.
 fn goal_row(
-    query: &OrientQuery<'_>,
+    query: &CompassQuery<'_>,
     task: Id,
     unreadable: &crate::storage::Unreadable<'_>,
     skip: Option<&str>,
@@ -3007,7 +3129,7 @@ const HORIZON_TAG: &str = "horizon";
 /// When a goal last moved: its newest status event or note, whatever the
 /// event's status word. A goal with neither falls back to its creation time;
 /// `None` when no time on it decodes.
-fn goal_last_moved(query: &OrientQuery<'_>, goal: Id) -> Option<i128> {
+fn goal_last_moved(query: &CompassQuery<'_>, goal: Id) -> Option<i128> {
     find!(
         at: IntervalValue,
         pattern!(query.compass, [{ _?event @
@@ -3070,7 +3192,7 @@ fn moved_ago(now: i128, at: Option<i128>) -> String {
 /// are shown. With none, the section is the empty string, not an empty
 /// header. A status that cannot be read is said rather than guessed at.
 fn render_native_horizons(
-    query: &OrientQuery<'_>,
+    query: &CompassQuery<'_>,
     unreadable: &crate::storage::Unreadable<'_>,
 ) -> Result<String> {
     use std::fmt::Write as _;
@@ -3808,7 +3930,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
             continue;
         }
         assigned_goals.insert(id);
-        match latest_goal_status(query, id)? {
+        match latest_goal_status(&query.goals(), id)? {
             Some((event, status, _)) => {
                 let authored = exists!((by: Id), and!(
                     own_identities.has(by),
@@ -4039,7 +4161,9 @@ async fn cmd_show(
                 // Show has its own pending path for a missing payload; it
                 // stays strict here.
                 let (goals, goal_events) =
-                    render_native_compass_goals(&query, doing_limit, todo_limit, &|_| None)?;
+                    render_native_compass_goals(&query.goals(), doing_limit, todo_limit, &|_| {
+                        None
+                    })?;
                 let shown = match persona_id {
                     Some(persona) => {
                         let candidates: BTreeSet<_> =
@@ -6142,7 +6266,8 @@ struct WakeSelection {
     cover: crate::memory_cover::CoverReport,
     /// Cover-tagged Wiki beliefs, ordered by title then revision id, and
     /// what could not be read for them.
-    beliefs: wiki_model::CoverBeliefs,
+    beliefs: Option<wiki_model::CoverBeliefs>,
+    topic: wiki_model::recall::TopicReadings,
     /// The Compass section exactly as `orient goals` prints it.
     goals: String,
     /// Presentations to record: only for a persona, and only after output.
@@ -6155,41 +6280,66 @@ async fn wake_selection(
     storage: &mut FacultyStore,
     signer: &SigningKey,
     persona: Option<&str>,
-    cover_opts: &CoverOpts,
-    about_scores: Option<&HashMap<Id, f32>>,
+    mut cover_opts: CoverOpts,
+    tint: Option<&WakeTint>,
     doing_limit: usize,
     todo_limit: usize,
 ) -> Result<WakeSelection> {
     // Register and maintain authorized inputs before freezing one query
     // boundary. Plain wake still never consults Embeddings.
-    let sources = OrientSources::open(routing, storage, signer, false).await?;
+    enum GoalSources {
+        Overview(CompassSources),
+        Attention(OrientSources),
+    }
+    let goals_source = if cover_opts.about.is_some() && persona.is_none() {
+        GoalSources::Overview(CompassSources::prepare(routing, storage, signer).await?)
+    } else {
+        let sources = OrientSources::open(routing, storage, signer, false).await?;
+        maintain_inputs(storage, signer, &sources).await?;
+        GoalSources::Attention(sources)
+    };
     let memory_collection =
         OrientSource::open(routing, storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
-    let wiki_collection =
-        OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
-    let wiki_latest = wiki_model::latest_for_source(storage, wiki_collection.source)
-        .context("register Wiki supersession index")?;
-    maintain_inputs(storage, signer, &sources).await?;
+    let topic = cover_opts.about.as_deref().map(str::trim).filter(|cue| {
+        !cue.is_empty() && cover_opts.budget_chars > wiki_model::recall::HEADING.len() * 2
+    });
     memory_collection.maintain(storage, signer).await?;
-    wiki_collection.maintain(storage, signer).await?;
-    // A revision the index cannot attach is its lag, exactly as it is for
-    // the Wiki facts just above; wake reads what is here.
-    crate::storage::tolerate_own_lag(storage.maintain_attached(wiki_latest, signer).await)
-        .context("maintain Wiki supersession index")?;
+    // A worker can recall its journal in a workspace without a Wiki role.
+    // When a role is present its exact READ admission still applies.
+    let wiki_omitted = cover_opts.about.is_some()
+        && routing
+            .collection_routes()
+            .is_some_and(|routes| !routes.contains_key(&WIKI_SCOPE_ID));
+    let wiki_inputs = if wiki_omitted {
+        None
+    } else {
+        let wiki = OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
+        let latest = wiki_model::latest_for_source(storage, wiki.source)
+            .context("register Wiki supersession index")?;
+        let index = topic
+            .filter(|_| tint.and_then(|t| t.wiki_contents.as_ref()).is_none())
+            .map(|_| wiki_model::recall::topic_index(storage, wiki.source));
+        wiki.maintain(storage, signer).await?;
+        crate::storage::tolerate_own_lag(storage.maintain_attached(latest, signer).await)
+            .context("maintain Wiki supersession index")?;
+        Some((wiki.rank9, latest, index))
+    };
     let snapshot = storage
         .snapshot()
         .map_err(|error| anyhow!("freeze shared wake observation: {error}"))?;
     // Wake renders the requested overview, not unseen news. Its output
     // does not depend on prior Presented facts; recording what this wake
     // shows afterward must not impose a historical receipt-read barrier.
-    let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
-    let frozen = observation.snapshot.clone();
+    let frozen = snapshot.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (memory_facts, wiki_facts, wiki_order) = tokio::task::spawn_blocking(move || {
+    let (memory_facts, wiki_view, topic_read) = tokio::task::spawn_blocking(move || {
         let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
         let memory_facts = crate::storage::acquire_facts(&reader, memory_collection.rank9)
             .context("read selected Memory collection")?;
-        let wiki_facts = crate::storage::acquire_facts(&reader, wiki_collection.rank9)
+        let Some((wiki_rank9, wiki_latest, topic_index)) = wiki_inputs else {
+            return Ok((memory_facts, None, None));
+        };
+        let wiki_facts = crate::storage::acquire_facts(&reader, wiki_rank9)
             .context("read selected Wiki collection")?;
         let wiki_order = crate::storage::require_complete_attached_read(
             reader
@@ -6197,62 +6347,165 @@ async fn wake_selection(
                 .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
         )
         .context("read selected Wiki supersession index")?;
-        Ok::<_, anyhow::Error>((memory_facts, wiki_facts, wiki_order))
+        // As in Archive search, keep a bounded part of a cold index. Later reads
+        // reuse those MAPs and ordinary collection maintenance can finish it.
+        let topic_read = topic_index.map(|target| -> Result<_> {
+            Ok(reader
+                .attached_acquiring(target?)?
+                .read_within::<wiki_model::recall::TopicIndex>(
+                    crate::archive_collection::SEARCH_BUILD_BUDGET,
+                )?)
+        });
+        Ok::<_, anyhow::Error>((memory_facts, Some((wiki_facts, wiki_order)), topic_read))
     })
     .await
     .context("join frozen wake input selection")??;
-    let persona_id = read(storage, &observation.snapshot, |reader| {
-        let query = observation.query(reader);
-        persona
-            .map(|input| resolve_native_persona(&query, input))
-            .transpose()
-    })
-    .await?;
-    // Prepare each independent section separately. A missing Wiki or
-    // Compass attachment must not repeat memory-cover planning/diagnostics.
-    // The wake never scores by meaning itself; a tint brings its scores, and
-    // these facts stay shard-backed.
-    let cover = read(storage, &observation.snapshot, |reader| {
-        render_cover_report(&memory_facts, reader, cover_opts, &mut |_| {
-            Ok(about_scores.cloned())
-        })
-    })
-    .await?;
-    // Beliefs and goals render what can be read: a payload no provider
-    // supplies is named in its section, never a reason to refuse the wake.
-    let beliefs =
-        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
-            wiki_model::cover_fragments(reader, &wiki_facts, &wiki_order, unreadable)
-        })
-        .await?;
-    let (goals, shown) =
-        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
-            let query = observation.query(reader);
-            let (mut goals, shown) =
-                render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?;
-            // Horizons follow Doing and Todo. They are an overview, not
-            // attention events, so nothing here is recorded as presented.
-            goals.push_str(&render_native_horizons(&query, unreadable)?);
-            let shown = match persona_id {
-                Some(persona) => {
-                    let candidates: BTreeSet<_> =
-                        load_attention_view(&query, persona)?.ids().collect();
-                    shown
-                        .into_iter()
-                        .filter(|event| candidates.contains(event))
-                        .collect::<Vec<_>>()
+    let mut diagnostics = tint.map(|t| t.diagnostics.clone()).unwrap_or_default();
+    if let Some(tint) = tint.filter(|t| !t.about.trim().is_empty() && cover_opts.budget_chars > 0) {
+        let scorer = if tint.has_memory_scores() {
+            "WeMM"
+        } else {
+            "lexical BM25"
+        };
+        diagnostics.push(format!("Journal scorer for alternative tellings: {scorer}"));
+    }
+    if wiki_omitted {
+        diagnostics.push("Wiki recall unavailable: this workspace has no Wiki role".to_owned());
+    }
+    let semantic = tint.and_then(|t| t.wiki_contents.as_deref());
+    let ranked = match (topic, semantic, topic_read) {
+        (Some(_), Some(cosines), _) => {
+            diagnostics.push(format!(
+                "Wiki topic scorer: WeMM, {} indexed content handles",
+                cosines.len()
+            ));
+            wiki_model::recall::semantic_bodies(cosines)
+        }
+        (Some(topic), None, Some(Ok(index))) => {
+            diagnostics.push("Wiki topic scorer: lexical BM25".into());
+            if !index.unread().is_empty() {
+                diagnostics.push(format!(
+                    "Wiki topic index: {} source commits pending",
+                    index.unread().len()
+                ));
+            }
+            if !index.built().is_empty() {
+                if let Err(error) =
+                    crate::storage::tolerate_own_lag(storage.keep_attached(index.built(), signer))
+                {
+                    diagnostics.push(format!(
+                        "Wiki topic index images were not retained: {error}"
+                    ));
                 }
-                None => Vec::new(),
+            }
+            wiki_model::recall::ranked_bodies(&index.into_value(), topic).unwrap_or_else(|error| {
+                diagnostics.push(format!("Wiki topic ranking unavailable: {error:#}"));
+                Vec::new()
+            })
+        }
+        (_, _, Some(Err(error))) => {
+            diagnostics.push(format!("Wiki topic index unavailable: {error:#}"));
+            Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    let (beliefs, mut topic) =
+        crate::storage::read_presentable(storage, &snapshot, |reader, unreadable| {
+            let Some((wiki_facts, wiki_order)) = &wiki_view else {
+                return Ok((None, Default::default()));
             };
-
-            Ok((goals, shown))
+            if cover_opts.about.is_some() {
+                let pages = wiki_model::recall::TopicReadings::select(
+                    reader,
+                    wiki_facts,
+                    wiki_order,
+                    &ranked,
+                    &cover_opts,
+                    unreadable,
+                );
+                Ok((None, pages))
+            } else {
+                Ok((
+                    Some(wiki_model::cover_fragments(
+                        reader, wiki_facts, wiki_order, unreadable,
+                    )?),
+                    Default::default(),
+                ))
+            }
         })
         .await?;
+    cover_opts.budget_chars -= topic.charge;
+    let mut cover = read(storage, &snapshot, |reader| {
+        render_cover_report(&memory_facts, reader, &cover_opts, &mut |_| {
+            #[cfg(feature = "wemm")]
+            if let Some(cosines) = tint.and_then(|t| t.memory_contents.as_deref()) {
+                return Ok(Some(
+                    crate::memory::operations::chunk_cosines(&memory_facts, cosines)
+                        .into_iter()
+                        .map(|(id, score)| (id, score.max(0.0) as f32))
+                        .collect(),
+                ));
+            }
+            Ok(tint.and_then(|t| t.scores.clone()))
+        })
+    })
+    .await?;
+    cover.diagnostics.extend(diagnostics);
+    cover.diagnostics.append(&mut topic.skipped);
+    let (goals, presented) = match goals_source {
+        GoalSources::Attention(sources) => {
+            let observation = observe_snapshot_acquiring(snapshot.clone(), &sources, false).await?;
+            let persona_id = read(storage, &snapshot, |reader| {
+                let query = observation.query(reader);
+                persona
+                    .map(|input| resolve_native_persona(&query, input))
+                    .transpose()
+            })
+            .await?;
+
+            crate::storage::read_presentable(storage, &snapshot, |reader, unreadable| {
+                let query = observation.query(reader);
+                let (mut goals, shown) = render_native_compass_goals(
+                    &query.goals(),
+                    doing_limit,
+                    todo_limit,
+                    unreadable,
+                )?;
+                // Horizons follow Doing and Todo. They are an overview, not
+                // attention events, so nothing here is recorded as presented.
+                goals.push_str(&render_native_horizons(&query.goals(), unreadable)?);
+                let shown = match persona_id {
+                    Some(persona) => {
+                        let candidates: BTreeSet<_> =
+                            load_attention_view(&query, persona)?.ids().collect();
+                        shown
+                            .into_iter()
+                            .filter(|event| candidates.contains(event))
+                            .collect::<Vec<_>>()
+                    }
+                    None => Vec::new(),
+                };
+
+                Ok((
+                    goals,
+                    persona_id.map(|_| (sources.presentations.source, shown)),
+                ))
+            })
+            .await?
+        }
+        GoalSources::Overview(compass) => (
+            compass
+                .overview(storage, &snapshot, doing_limit, todo_limit)
+                .await?,
+            None,
+        ),
+    };
     Ok(WakeSelection {
         cover,
+        topic,
         beliefs,
         goals,
-        presented: persona_id.map(|_| (sources.presentations.source, shown)),
+        presented,
     })
 }
 
@@ -6282,35 +6535,46 @@ async fn cmd_wake(
         storage,
         signer,
         persona,
-        &cover,
-        tint.and_then(|tint| tint.scores.as_ref()),
+        cover,
+        tint,
         doing_limit,
         todo_limit,
     )
     .await?;
 
     let mut report = selection.cover.text;
-    report.push('\n');
-    writeln!(report, "Beliefs (cover):").unwrap();
-    if selection.beliefs.beliefs.is_empty() && selection.beliefs.unreadable.is_empty() {
-        writeln!(report, "- None").unwrap();
-    } else {
-        for belief in &selection.beliefs.beliefs {
-            writeln!(report, "- {}", belief.title).unwrap();
-            for line in belief.content.lines() {
-                writeln!(report, "    {line}").unwrap();
+    if let Some(beliefs) = &selection.beliefs {
+        report.push('\n');
+        writeln!(report, "Beliefs (cover):").unwrap();
+        if beliefs.beliefs.is_empty() && beliefs.unreadable.is_empty() {
+            writeln!(report, "- None").unwrap();
+        } else {
+            for belief in &beliefs.beliefs {
+                writeln!(report, "- {}", belief.title).unwrap();
+                for line in belief.content.lines() {
+                    writeln!(report, "    {line}").unwrap();
+                }
+            }
+            if !beliefs.unreadable.is_empty() {
+                writeln!(
+                    report,
+                    "Not readable in this snapshot ({}):",
+                    beliefs.unreadable.len()
+                )
+                .unwrap();
+                for line in &beliefs.unreadable {
+                    writeln!(report, "- {line}").unwrap();
+                }
             }
         }
-        if !selection.beliefs.unreadable.is_empty() {
-            writeln!(
-                report,
-                "Not readable in this snapshot ({}):",
-                selection.beliefs.unreadable.len()
-            )
-            .unwrap();
-            for line in &selection.beliefs.unreadable {
-                writeln!(report, "- {line}").unwrap();
+    }
+    if !selection.topic.pages.is_empty() {
+        report.push_str(wiki_model::recall::HEADING);
+        for (i, (_, show)) in selection.topic.pages.iter().enumerate() {
+            if i > 0 {
+                report.push('\n');
             }
+            report.push_str(show);
         }
     }
     report.push('\n');
@@ -6403,7 +6667,7 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         });
     }
     let mut shown = BTreeSet::new();
-    for belief in &selection.beliefs.beliefs {
+    for belief in selection.beliefs.iter().flat_map(|group| &group.beliefs) {
         // `wiki show` prints the title, the revision's identity lines and the
         // content, as plain wake shows a belief's title above its content. It
         // follows the entry's frontier, which is this revision alone unless
@@ -6425,6 +6689,12 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         };
         pairs.push(WakePair::new(command, show.clone()));
     }
+    for (revision, show) in &selection.topic.pages {
+        pairs.push(WakePair::new(
+            format!("wiki show --exact {revision:x}"),
+            show.clone(),
+        ));
+    }
     pairs.push(WakePair::new(
         goals_command(doing_limit, todo_limit),
         selection.goals.clone(),
@@ -6440,6 +6710,7 @@ async fn cmd_wake_pairs(
     storage: &mut FacultyStore,
     signer: &SigningKey,
     options: &WakePairsOptions,
+    tint: Option<&WakeTint>,
     output: &mut Out<'_>,
 ) -> Result<Vec<String>> {
     let mut cover_opts = CoverOpts::plain(options.chars);
@@ -6451,8 +6722,8 @@ async fn cmd_wake_pairs(
         storage,
         signer,
         None,
-        &cover_opts,
-        None,
+        cover_opts,
+        tint,
         options.doing_limit,
         options.todo_limit,
     )
@@ -6474,8 +6745,8 @@ async fn cmd_wake_pairs(
     diagnostics.extend(
         selection
             .beliefs
-            .unreadable
             .into_iter()
+            .flat_map(|beliefs| beliefs.unreadable)
             .map(|line| format!("cover beliefs — {line}")),
     );
     Ok(diagnostics)
@@ -6491,21 +6762,12 @@ async fn cmd_goals(
     todo_limit: usize,
     output: &mut Out<'_>,
 ) -> Result<()> {
-    let sources = OrientSources::open(routing, storage, signer, false).await?;
-    maintain_inputs(storage, signer, &sources).await?;
+    let sources = CompassSources::prepare(routing, storage, signer).await?;
     let snapshot = storage
         .snapshot()
         .map_err(|error| anyhow!("freeze goals observation: {error}"))?;
-    let observation = observe_snapshot_acquiring(snapshot, &sources, false).await?;
-    // Exactly the Compass section wake shows, and read the same way.
-    let goals =
-        crate::storage::read_presentable(storage, &observation.snapshot, |reader, unreadable| {
-            let query = observation.query(reader);
-            let (mut goals, _) =
-                render_native_compass_goals(&query, doing_limit, todo_limit, unreadable)?;
-            goals.push_str(&render_native_horizons(&query, unreadable)?);
-            Ok(goals)
-        })
+    let goals = sources
+        .overview(storage, &snapshot, doing_limit, todo_limit)
         .await?;
     write_complete_report(output, &goals, "Orient goals", &mut |_| {}).await
 }
@@ -6572,7 +6834,8 @@ mod tests {
                     diagnostics: vec![],
                     entries: vec![entry],
                 },
-                beliefs: wiki_model::CoverBeliefs::default(),
+                topic: Default::default(),
+                beliefs: Some(wiki_model::CoverBeliefs::default()),
                 goals: "Compass:\n".into(),
                 presented: None,
             };
@@ -6859,6 +7122,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let wiki_writer = SigningKey::from_bytes(&[37; 32]);
             let mut routes = crate::storage::CollectionRoutes::new();
             // The alternate descriptors differ from all signer-private defaults.
             for scope in [
@@ -6878,7 +7142,11 @@ mod tests {
                         crate::collection_names::require_name(scope),
                         CollectionPolicy::new(
                             AdmissionPolicy::Open,
-                            AdmissionPolicy::direct(fixture.signer.verifying_key()),
+                            AdmissionPolicy::direct(if scope == WIKI_SCOPE_ID {
+                                wiki_writer.verifying_key()
+                            } else {
+                                fixture.signer.verifying_key()
+                            }),
                         ),
                     )
                     .unwrap();
@@ -6941,25 +7209,51 @@ mod tests {
                     .unwrap();
             let (author, author_id) = wiki_model::author_record(&fixture.signer.verifying_key());
             let (tag, tag_id, _) = wiki_model::tag_record("cover").unwrap();
-            let (revision, _) = wiki_model::revision_record(wiki_model::RevisionDraft {
+            let draft = wiki_model::RevisionDraft {
                 title: "Selected workspace belief".to_owned(),
                 content: "The selected Wiki also owns its latest index.".to_owned(),
                 tags: BTreeSet::from([tag_id]),
                 predecessors: BTreeSet::new(),
                 author: author_id,
                 authored_at: clock::point_now().unwrap(),
-            })
+            };
+            let (revision, _) = wiki_model::revision_record(draft.clone()).unwrap();
+            let reading = |title: &str| {
+                wiki_model::revision_record(wiki_model::RevisionDraft {
+                    title: title.into(),
+                    content: "An astrolabe measures altitude.".into(),
+                    tags: BTreeSet::new(),
+                    ..draft.clone()
+                })
+                .unwrap()
+                .0
+            };
+            let default_wiki =
+                open_configured(&mut pile, WIKI_SCOPE_ID, fixture.signer.verifying_key()).unwrap();
+            pile.commit(
+                default_wiki,
+                &fixture.signer,
+                author.clone() + reading("Other workspace"),
+            )
             .unwrap();
-            pile.commit(wiki.source, &fixture.signer, author + tag + revision)
-                .unwrap();
+            pile.commit(
+                wiki.source,
+                &wiki_writer,
+                author + tag + revision + reading("Selected astrolabe"),
+            )
+            .unwrap();
             let mut report = String::new();
             cmd_wake(
                 &routing,
                 &mut pile,
                 &fixture.signer,
                 None,
-                0,
-                None,
+                2048,
+                Some(&WakeTint {
+                    about: "astrolabe".into(),
+                    scores: None,
+                    ..Default::default()
+                }),
                 5,
                 5,
                 true,
@@ -6974,6 +7268,117 @@ mod tests {
             .await
             .unwrap();
             assert!(report.contains("Selected workspace belief"), "{report}");
+            assert!(report.contains("Selected astrolabe"), "{report}");
+            assert!(!report.contains("Other workspace"), "{report}");
+            let memory = OrientSource::open(
+                &routing,
+                &mut pile,
+                &fixture.signer,
+                MEMORY_SCOPE_ID,
+                "Memory",
+            )
+            .await
+            .unwrap();
+            let (chunk, _) = crate::memory::chunk_fragment(crate::memory::ChunkDraft {
+                content: crate::memory::ChunkDraftContent::Text(
+                    "A journal in this workspace.".into(),
+                ),
+                start_at: mention_moment(1.0),
+                end_at: mention_moment(2.0),
+                tags: Default::default(),
+                references: Default::default(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: Default::default(),
+                aliases: Default::default(),
+            })
+            .unwrap();
+            pile.commit(memory.source, &fixture.signer, chunk).unwrap();
+            let (goal, _) =
+                compass::goal_fragment("An owned goal", Vec::new(), None, mention_moment(1.0))
+                    .unwrap();
+            pile.commit(sources.compass.source, &fixture.signer, goal)
+                .unwrap();
+            routes.retain(|scope, _| [MEMORY_SCOPE_ID, COMPASS_SCOPE_ID].contains(scope));
+            let missing = test_storage().with_collections(routes.clone());
+            let options = WakePairsOptions {
+                chars: 2048,
+                about: Some("astrolabe".into()),
+                ..WakePairsOptions::default()
+            };
+            fn capture_text(
+                buffer: &mut String,
+            ) -> impl FnMut(crate::out::Part) -> Result<()> + '_ {
+                |part| match part {
+                    crate::out::Part::Text { text } => {
+                        buffer.push_str(&text);
+                        Ok(())
+                    }
+                    _ => bail!("expected text"),
+                }
+            }
+            let mut emitted = String::new();
+            let diagnostics = cmd_wake_pairs(
+                &missing,
+                &mut pile,
+                &fixture.signer,
+                &options,
+                None,
+                &mut Out::new(&mut capture_text(&mut emitted)),
+            )
+            .await
+            .unwrap();
+            assert!(diagnostics.iter().any(|line| line.contains("no Wiki role")));
+            let pairs: Vec<serde_json::Value> = emitted
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(pairs.len(), 2);
+            assert!(pairs[0]["command"].as_str().unwrap().starts_with("memory "));
+            assert!(pairs[0]["output"]
+                .as_str()
+                .unwrap()
+                .contains("A journal in this workspace."));
+            assert_eq!(pairs[1]["command"], goals_command(5, 5));
+            let mut goals = String::new();
+            cmd_goals(
+                &missing,
+                &mut pile,
+                &fixture.signer,
+                5,
+                5,
+                &mut Out::new(&mut capture_text(&mut goals)),
+            )
+            .await
+            .unwrap();
+            assert!(goals.contains("An owned goal"));
+            assert_eq!(pairs[1]["output"], goals);
+            let denied = pile
+                .collection(
+                    "wiki",
+                    CollectionPolicy::new(
+                        AdmissionPolicy::direct(wiki_writer.verifying_key()),
+                        AdmissionPolicy::direct(wiki_writer.verifying_key()),
+                    ),
+                )
+                .unwrap();
+            routes.insert(WIKI_SCOPE_ID, denied.handle());
+            let mut options = CoverOpts::plain(2048);
+            options.about = Some("astrolabe".into());
+            let denial = wake_selection(
+                &test_storage().with_collections(routes),
+                &mut pile,
+                &fixture.signer,
+                None,
+                options,
+                None,
+                5,
+                5,
+            )
+            .await
+            .err()
+            .unwrap();
+            assert!(format!("{denial:#}").contains("READ"));
             assert!(pile.health().started_at.is_none());
             pile.close().unwrap();
         });
@@ -10450,11 +10855,14 @@ mod tests {
             drop(status);
             let query = lagging.query(&lagging.snapshot);
             assert_eq!(
-                latest_goal_status(&query, goal).unwrap().unwrap().0,
+                latest_goal_status(&query.goals(), goal).unwrap().unwrap().0,
                 next_id
             );
             assert_eq!(
-                latest_goal_status(&query, unseen_goal).unwrap().unwrap().0,
+                latest_goal_status(&query.goals(), unseen_goal)
+                    .unwrap()
+                    .unwrap()
+                    .0,
                 unseen_id
             );
 
@@ -10465,24 +10873,33 @@ mod tests {
             let advanced = observe_sources(ready, &sources).unwrap();
             let query = advanced.query(&advanced.snapshot);
             assert_eq!(
-                latest_goal_status(&query, goal).unwrap().unwrap().0,
+                latest_goal_status(&query.goals(), goal).unwrap().unwrap().0,
                 next_id
             );
             assert_eq!(
-                latest_goal_status(&query, unseen_goal).unwrap().unwrap().0,
+                latest_goal_status(&query.goals(), unseen_goal)
+                    .unwrap()
+                    .unwrap()
+                    .0,
                 unseen_id
             );
             let frozen = lagging.query(&lagging.snapshot);
             assert_eq!(
-                latest_goal_status(&frozen, goal).unwrap().unwrap().0,
+                latest_goal_status(&frozen.goals(), goal)
+                    .unwrap()
+                    .unwrap()
+                    .0,
                 next_id
             );
             assert_eq!(
-                latest_goal_status(&frozen, unseen_goal).unwrap().unwrap().0,
+                latest_goal_status(&frozen.goals(), unseen_goal)
+                    .unwrap()
+                    .unwrap()
+                    .0,
                 unseen_id
             );
             assert_eq!(
-                latest_goal_status(&observation.query(&observation.snapshot), goal)
+                latest_goal_status(&observation.query(&observation.snapshot).goals(), goal)
                     .unwrap()
                     .unwrap()
                     .0,
@@ -10534,10 +10951,11 @@ mod tests {
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
             // Strict, the section refuses; presentable, it names the goal.
-            assert!(render_native_compass_goals(&query, 5, 5, &|_| None).is_err());
-            let (goals, _) =
-                render_native_compass_goals(&query, 5, 5, &|error| Some(format!("{error:#}")))
-                    .unwrap();
+            assert!(render_native_compass_goals(&query.goals(), 5, 5, &|_| None).is_err());
+            let (goals, _) = render_native_compass_goals(&query.goals(), 5, 5, &|error| {
+                Some(format!("{error:#}"))
+            })
+            .unwrap();
             assert!(goals.contains("readable goal"), "{goals}");
             assert!(!goals.contains("unread goal"), "{goals}");
             assert!(
@@ -10599,7 +11017,7 @@ mod tests {
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
             let calls = std::cell::Cell::new(0);
-            let (goals, _) = render_native_compass_goals(&query, 5, 5, &|error| {
+            let (goals, _) = render_native_compass_goals(&query.goals(), 5, 5, &|error| {
                 calls.set(calls.get() + 1);
                 Some(format!("{error:#}"))
             })
@@ -10640,7 +11058,10 @@ mod tests {
                 .unwrap();
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
-            assert_eq!(render_native_horizons(&query, &|_| None).unwrap(), "");
+            assert_eq!(
+                render_native_horizons(&query.goals(), &|_| None).unwrap(),
+                ""
+            );
 
             // Created first, but a note moved it last.
             let (noted, noted_id) = goal("noted horizon", &["horizon", "owner-a"], 2.0);
@@ -10680,7 +11101,7 @@ mod tests {
                 .unwrap();
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
-            let horizons = render_native_horizons(&query, &|_| None).unwrap();
+            let horizons = render_native_horizons(&query.goals(), &|_| None).unwrap();
             let lines: Vec<&str> = horizons.lines().collect();
             assert_eq!(lines.len(), 3, "{horizons}");
             assert_eq!(lines[0], "Horizons (2, longest unmoved first):");

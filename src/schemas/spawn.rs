@@ -110,6 +110,9 @@ pub mod spawn {
         /// query failed and the untinted memory tail was used instead.
         /// Minted 2026-11-16.
         "B5BD0429EB1C43D6F4135BA6BEECF09D" as untinted: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The optional semantic scorer failed and the worker used its lexical cue.
+        /// The value describes the failure. Minted with `trible genid` on 2026-11-24.
+        "41333785A26BD7647F89E83BE1979357" as lexical_fallback: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The Compass goal a spawn's brief was rendered from (`zooid goal`).
         /// Minted 2026-11-16.
         "FD3241C45361C64F87ED5A597F772BFF" as goal: inlineencodings::GenId;

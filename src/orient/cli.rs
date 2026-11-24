@@ -105,8 +105,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Session start after a compaction: the whole self — memory cover +
-    /// cover-tagged beliefs + goals
+    /// Recall the journal, read Wiki knowledge and show current goals.
     ///
     /// With `--pairs`, the same selection as JSON lines, one
     /// `{"command": ..., "output": ...}` object per line (a memory recall also
@@ -116,20 +115,20 @@ enum Command {
     /// wakes a model from commands rather than a pasted document: first one
     /// recall per cover entry, `memory <from>..<to>` when memory's range lookup
     /// selects exactly that memory and `memory <id>` otherwise (always for a
-    /// point); then one `wiki show <id>` per cover-belief revision (`wiki show
-    /// --exact <id>` for a head of a forked entry), which prints the title
-    /// above the content as the plain report does; then one `orient goals
+    /// point). In a personal wake the Wiki pairs read the cover-tagged
+    /// beliefs with `wiki show <id>` (or `--exact` for a fork). With
+    /// `--about` the Wiki pairs read the selected topic revisions with
+    /// `wiki show --exact <id>`. Both forms end with one `orient goals
     /// --doing-limit N --todo-limit M`. Each `output` is exactly what its
     /// command prints to stdout when run against the same pile; for an image
     /// memory it is the placeholder line of the cover text, without the image.
-    /// The memory selection is exactly `memory context --chars N
+    /// Without a topic the memory selection is exactly `memory context --chars N
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
     Wake {
-        /// CHARACTER budget for the memory cover — the wake ritual is for
-        /// wholeness, so the default is generous (matches the SessionStart
-        /// hook). A smaller budget gives a coarser, shorter recollection; it
-        /// never refuses.
+        /// Character budget for the journal and, with --about, selected Wiki
+        /// readings. Untinted standing beliefs, goals and diagnostics render
+        /// separately. A smaller budget gives a coarser recollection.
         #[arg(long, default_value_t = 800_000)]
         chars: usize,
         /// Max doing goals to show
@@ -150,10 +149,11 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// A topic for the memory cover: among recollections of exactly the
-        /// same span, the one closest to it by exact BM25 is chosen
-        /// (`memory context --about`). The cover's shape does not change,
-        /// and no model is bound.
+        /// Select Wiki readings for a task within the recall budget. The cover
+        /// tag is a ranking prior. An empty topic selects general readings.
+        /// Without this argument all cover-tagged personal beliefs render.
+        /// Prefer matching recollections when memories cover the same span.
+        /// Shares a semantic query across the available WeMM indexes, with lexical fallback.
         #[arg(long)]
         about: Option<String>,
     },
@@ -482,10 +482,7 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
                 chars,
                 doing_limit,
                 todo_limit,
-                tint: about.map(|about| super::WakeTint {
-                    about,
-                    scores: None,
-                }),
+                tint: about.map(|about| orient.topic(&about, chars)),
             },
             out,
         ),

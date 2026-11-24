@@ -22,6 +22,7 @@ pub mod cli;
 mod gollum;
 pub mod mcp;
 pub mod operations;
+pub(crate) mod recall;
 
 pub use operations::{
     Carried, Export, ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit,
@@ -1587,6 +1588,122 @@ mod tests {
         ));
 
         pile.close().unwrap();
+    }
+
+    #[test]
+    fn task_recall_filters_before_limiting_and_keeps_the_authored_general_prior() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("wiki.pile");
+        File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[15; 32]);
+        let (mut fragment, author) = author_record(&signer.verifying_key());
+        let name = fragment.put::<blobencodings::UTF8String, _>("CoVeR".to_owned());
+        let tag = entity! { metadata::name: name };
+        let tag_id = tag.root().unwrap();
+        fragment += tag;
+        let mut generic = draft(author, "General advice", []);
+        generic.content = "Start by reading the current workspace.".into();
+        generic.tags.insert(tag_id);
+        let (lower_tag, lower_id, _) = tag_record("cover").unwrap();
+        fragment += lower_tag;
+        generic.tags.insert(lower_id);
+        let mut shorter = draft(author, "First step", []);
+        shorter.content = "Read.".into();
+        shorter.tags.insert(lower_id);
+        let (shorter, short_id) = revision_record(shorter).unwrap();
+        fragment += shorter;
+        let (generic, general_id) = revision_record(generic).unwrap();
+        fragment += generic;
+        let mut boilerplate = draft(author, "Unendorsed advertisement", []);
+        boilerplate.content = "Everything that is useful for a broad range of topics.".into();
+        let (advertisement, advertisement_id) = revision_record(boilerplate).unwrap();
+        fragment += advertisement;
+        for i in 0..30 {
+            let mut alias = draft(author, &format!("Alias {i}"), []);
+            alias.content = "spacer calibration".into();
+            fragment += revision_record(alias).unwrap().0;
+        }
+        let mut retired = Vec::new();
+        for i in 0..140 {
+            let mut revision = draft(author, &format!("Earlier reading {i}"), []);
+            revision.content = format!("inspect report {} {i}", "clearance ".repeat(8));
+            let (old, id) = revision_record(revision).unwrap();
+            retired.push(id);
+            fragment += old;
+        }
+        // A current successor retires all those higher-scoring bodies.
+        fragment += revision_record(draft(author, "Later reading", retired))
+            .unwrap()
+            .0;
+        for i in 0..30 {
+            let mut revision = draft(author, &format!("Oversize {i}"), []);
+            revision.content = format!("inspect report {} {i}", "clearance ".repeat(550));
+            fragment += revision_record(revision).unwrap().0;
+        }
+        let mut small = draft(author, "Mount", []);
+        small.content = format!("stereo camera lens clearance {}", "spacer ".repeat(20));
+        let (small, small_id) = revision_record(small).unwrap();
+        fragment += small;
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
+        let source = open_configured(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key()).unwrap();
+        pile.commit(source, &signer, fragment).unwrap();
+        let target = recall::topic_index(&mut pile, source).unwrap();
+        pollster::block_on(pile.maintain_attached(target, &signer)).unwrap();
+        let (facts, reader) = materialize_collection(&mut pile, &signer).unwrap();
+        let index = reader
+            .attached(target)
+            .unwrap()
+            .view::<recall::TopicIndex>()
+            .unwrap();
+        let ranked = recall::ranked_bodies(&index, "clearance").unwrap();
+        let body = revision_records(&facts, small_id)[0].content;
+        assert!(ranked.iter().position(|(h, _)| *h == body).unwrap() > 140);
+        let latest = latest_index(&facts);
+        let select = |hits: &[_]| {
+            recall::TopicReadings::select(
+                &reader,
+                &facts,
+                &latest,
+                hits,
+                &crate::memory_cover::CoverOpts::plain(2200),
+                &|_| None,
+            )
+        };
+        let specific = select(&ranked);
+        assert!(specific.pages.iter().any(|(id, _)| *id == small_id));
+        for cue in [
+            "stereo camera lens clearance",
+            "everything that is useful for stereo camera lens clearance",
+        ] {
+            let selected = select(&recall::ranked_bodies(&index, cue).unwrap());
+            assert!(
+                selected.pages.iter().any(|(id, _)| *id == small_id),
+                "{cue}"
+            );
+        }
+        let aliases = select(&recall::ranked_bodies(&index, "calibration spacer stereo").unwrap());
+        assert_eq!(
+            aliases
+                .pages
+                .iter()
+                .filter(|(_, text)| text.contains("spacer calibration"))
+                .count(),
+            1
+        );
+        assert!(aliases.pages.iter().any(|(id, _)| *id == small_id));
+        // Common instruction words alone spend nothing on incidental
+        // unendorsed matches, even when both words appear in those pages.
+        assert!(recall::ranked_bodies(&index, "inspect and report")
+            .unwrap()
+            .is_empty());
+        let rare = select(&recall::ranked_bodies(&index, "inspect camera").unwrap());
+        assert_eq!(rare.pages[0].0, small_id);
+        let broad = select(&[]);
+        assert!(!broad.pages.iter().any(|(id, _)| *id == advertisement_id));
+        assert_eq!(
+            broad.pages.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [short_id, general_id]
+        );
     }
 
     #[test]

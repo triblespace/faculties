@@ -195,11 +195,9 @@ pub trait Renderer: Send + Sync {
     /// Scores the memory cover's recollections against a topic. Its own
     /// step, so a launch can tell a tint that failed from a wake that did.
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint>;
-    /// The shared self: a memory cover of `memory_chars` characters,
-    /// beliefs and goals. With a tint, the memory cover is tinted by its
-    /// topic (one cover, rendered once; JP 2026-11-20: "the tinted cover is
-    /// a different cover"). With no memory characters it is beliefs and
-    /// goals alone, which is how a `--cover` launch measures them.
+    /// Render one wake. A task's narrative and selected Wiki readings share
+    /// `memory_chars`; zero measures the fixed sections for cover sizing.
+    /// A personal wake without a tint carries the complete standing beliefs.
     fn wake(
         &self,
         storage: &Storage,
@@ -215,11 +213,7 @@ pub struct LibraryRenderer;
 
 impl Renderer for LibraryRenderer {
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint> {
-        let memory = crate::memory::Memory::with_storage(storage.clone());
-        Ok(WakeTint {
-            about: about.to_owned(),
-            scores: memory.about_scores(about)?,
-        })
+        Ok(crate::orient::Orient::with_storage(storage.clone()).topic(about, PLAIN_MEMORY_CHARS))
     }
 
     fn wake(
@@ -909,8 +903,10 @@ pub struct Launched {
     /// The model the agent was told to use, or why it names none.
     pub model: Option<String>,
     pub model_unset: Option<String>,
-    /// Why the recollection is untinted, when its topic query failed.
+    /// Why the recollection has no topic, if reported.
     pub untinted: Option<String>,
+    /// Why this launch used the lexical cue after semantic scoring failed.
+    pub lexical_fallback: Option<String>,
     /// The archived node a local run continues its zooid's history from.
     pub resumes: Option<Id>,
     /// How the cover was sized, when the launch asked for a share
@@ -1031,6 +1027,7 @@ pub struct RunView {
     pub model: Vec<String>,
     pub model_unset: Vec<String>,
     pub untinted: Vec<String>,
+    pub lexical_fallback: Vec<String>,
     /// The archived node(s) a local run continued its zooid's history from.
     pub resumes: Vec<Id>,
     pub message: Vec<Id>,
@@ -1641,8 +1638,8 @@ impl Spawn {
     /// The prompt, and how its cover was sized when the launch asked for a
     /// share of the context window. Without one the wake is the plain cover
     /// and nothing is looked up. With one, the target is `percent` of `W`;
-    /// beliefs and goals are measured by a wake with no memory budget and
-    /// always render whole; the memory part gets what they leave, and at
+    /// fixed text is measured by a wake with no recall budget. Narrative
+    /// and Wiki share the remaining target, initially receiving at
     /// least [`cover::MIN_MEMORY_CHARS`]. If the whole prompt is then
     /// estimated above `W` less the headroom, the memory part is rendered
     /// once more aimed at that line, possibly with no memory at all, and the
@@ -1666,7 +1663,7 @@ impl Spawn {
                 let delivered = wake(PLAIN_MEMORY_CHARS)?;
                 let summary = format!(
                     "cover {percent}%: no context window is known for {} {} ({why}), so it was \
-                     rendered at the plain size, {PLAIN_MEMORY_CHARS} memory characters; \
+                     rendered at the plain size, {PLAIN_MEMORY_CHARS} recall characters; \
                      --window N gives one",
                     provider.name(),
                     model.unwrap_or("(no model named)")
@@ -1736,14 +1733,14 @@ impl Spawn {
         let cover_chars = delivered.chars().count();
         let mut summary = format!(
             "cover {percent}% of a {} token window ({}): target {target} characters at {ratio} \
-             characters per token ({}); beliefs and goals {fixed} characters, memory budget \
+             characters per token ({}); fixed wake {fixed} characters, recall budget \
              {budget}, cover {cover_chars} characters{}; whole prompt estimated at {estimate} \
              tokens with {overhead} tokens of harness overhead ({overhead_basis})",
             window.tokens,
             window.source,
             calibration.basis,
             if cover_chars > target {
-                ", over its target (beliefs and goals render whole)"
+                ", over its target (fixed sections render whole)"
             } else {
                 ""
             }
@@ -2263,26 +2260,33 @@ impl Spawn {
 
         let mut started = false;
         let launched = (|| -> Result<Launched> {
-            let about = Some(brief.about.as_str()).filter(|about| !about.trim().is_empty());
-            // The tint chooses among equal recollections; it is never worth
-            // a launch. A tint that fails wakes the zooid into the untinted
-            // cover and says so; a wake that fails fails the launch. A tint
-            // that panics counts as one that failed: CubeCL unwraps a device
-            // allocation that does not fit, so a WeMM bind or forward on a
-            // full GPU panics rather than returning its error, and memory
-            // read at bind start cannot foresee what a neighbour takes.
-            let (tint, untinted) = match about.map(|about| {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let about = brief.about.as_str();
+            // With no semantic score available, both Memory and Wiki can still
+            // use the brief lexically. A failed device allocation can panic.
+            let lexical = || WakeTint {
+                about: about.to_owned(),
+                scores: None,
+                ..Default::default()
+            };
+            let (tint, lexical_fallback) = if about.trim().is_empty() {
+                (lexical(), None)
+            } else {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.renderer.tint(&self.storage, about)
-                }))
-            }) {
-                None => (None, None),
-                Some(Ok(Ok(tint))) => (Some(tint), None),
-                Some(Ok(Err(error))) => (None, Some(format!("{error:#}"))),
-                Some(Err(panic)) => (
-                    None,
-                    Some(format!("tint panicked: {}", panic_text(&*panic))),
-                ),
+                })) {
+                    Ok(Ok(tint)) => {
+                        let reason = (!tint.has_memory_scores()
+                            && tint.wiki_contents.is_none()
+                            && !tint.diagnostics.is_empty())
+                        .then(|| tint.diagnostics.join(", "));
+                        (tint, reason)
+                    }
+                    Ok(Err(error)) => (lexical(), Some(format!("{error:#}"))),
+                    Err(panic) => (
+                        lexical(),
+                        Some(format!("tint panicked: {}", panic_text(&*panic))),
+                    ),
+                }
             };
             let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
             let assemble = |wake: &str| {
@@ -2294,7 +2298,7 @@ impl Spawn {
             let (prompt, cover) = self.size_cover(
                 provider,
                 model.as_deref(),
-                tint.as_ref(),
+                Some(&tint),
                 extras.cover,
                 &assemble,
             )?;
@@ -2320,13 +2324,13 @@ impl Spawn {
                 provider_reason: provider_reason.clone(),
                 model: model.clone(),
                 model_unset: model_unset.clone(),
-                untinted: untinted.clone(),
+                untinted: None,
                 request: extras.request,
                 resumes,
                 cover: cover.clone(),
             });
             let text = |path: &Path| path.display().to_string();
-            let agent = self.agent(
+            let mut agent = self.agent(
                 provider,
                 effort,
                 &RunFiles {
@@ -2345,6 +2349,19 @@ impl Spawn {
                     spawner: spawner_label.to_owned(),
                 },
             )?;
+            if let Some(input) = &first_input {
+                // Local executors read their own wake. Bind the hosted cue to
+                // the exact file and its text, including on a resumed run.
+                let handle = super::handle_text(super::text_handle(input));
+                let workspace = self
+                    .storage
+                    .selected_workspace()
+                    .map(|w| format!("{:x}", w.id));
+                agent.env.push((
+                    "SPAWN_BRIEF_TOPIC".to_owned(),
+                    serde_json::to_string(&(&brief_path, handle, about, workspace))?,
+                ));
+            }
             let script = super::unit_script(&ScriptFacts {
                 name: &name,
                 run,
@@ -2425,6 +2442,10 @@ impl Spawn {
             started = true;
             let mut record = spawn_fragment;
             record += run_fragment;
+            if let Some(why) = &lexical_fallback {
+                record +=
+                    entity! { ExclusiveId::force_ref(&run) @ attrs::lexical_fallback: why.clone() };
+            }
             if let Some((goal, revision)) = &brief.goal {
                 record += super::goal_fragment(spawn, *goal, revision);
             }
@@ -2483,7 +2504,8 @@ impl Spawn {
                 provider_reason: provider_reason.clone(),
                 model: model.clone(),
                 model_unset: model_unset.clone(),
-                untinted,
+                untinted: None,
+                lexical_fallback,
                 resumes,
                 cover,
                 unprefixed: naming.unprefixed.clone(),
@@ -3906,6 +3928,9 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::untinted: ?handle }]))
                 .collect(),
         ),
+        lexical_fallback: texts(
+            find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::lexical_fallback: ?handle }])).collect(),
+        ),
         resumes: find!(node: Id, pattern!(facts, [{ run @ attrs::resumes: ?node }])).collect(),
         model: texts(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }])).collect(),
@@ -4418,6 +4443,13 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         for why in &run.untinted {
             writeln!(out, "  untinted recollection: {why}").unwrap();
         }
+        for why in &run.lexical_fallback {
+            writeln!(
+                out,
+                "  semantic tint unavailable (used the lexical cue): {why}"
+            )
+            .unwrap();
+        }
         if !run.resumes.is_empty() {
             writeln!(out, "  continues archived node: {}", ids(&run.resumes)).unwrap();
         }
@@ -4593,6 +4625,7 @@ mod tests {
             Ok(WakeTint {
                 about: about.to_owned(),
                 scores: None,
+                ..Default::default()
             })
         }
         fn wake(
@@ -5436,7 +5469,11 @@ mod tests {
     #[test]
     fn a_local_executor_gets_the_brief_without_the_wake_and_who_sent_it() {
         let f = fixture();
-        let executor = local_executor(&f, "local-brief", "true");
+        let executor = local_executor(
+            &f,
+            "local-brief",
+            r#"printf %s "$SPAWN_BRIEF_TOPIC" > "$1.topic""#,
+        );
         let spawn = f.relaunch(|launch| {
             launch.local = Some(
                 parse_local_executor(&format!(
@@ -5446,7 +5483,9 @@ mod tests {
                 .unwrap(),
             )
         });
-        let launched = spawn.run(&local_request(&f, "Briefed work.")).unwrap();
+        // Preserve shell metacharacters and end on a UTF-8 boundary.
+        let task = format!("Check '$HOME' and $(echo x) 🐈\n{}", "é".repeat(160));
+        let launched = spawn.run(&local_request(&f, &task)).unwrap();
         run_unit_and_settle(&f, &spawn, &launched);
         let brief = launched.report.with_extension("brief");
         let args = std::fs::read_to_string(launched.report.with_extension("report.args")).unwrap();
@@ -5465,11 +5504,25 @@ mod tests {
             text,
             super::super::assemble_brief(
                 &super::super::preamble(&launched.name, "agent-cc", true),
-                "Briefed work.",
+                &task,
                 None
             )
         );
+        let (assigned, handle, topic, workspace): (PathBuf, String, String, Option<String>) =
+            serde_json::from_slice(
+                &std::fs::read(launched.report.with_extension("report.topic")).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(assigned, brief);
+        assert_eq!(workspace, None);
+        assert_eq!(
+            handle,
+            super::super::handle_text(super::super::text_handle(&text))
+        );
+        assert_eq!(topic, super::super::about(&task));
+        assert!(topic.len() < task.len());
         let prompt = std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap();
+        assert!(prompt.starts_with(&format!("# Wake\n\nSTUB-WAKE about {topic}\n")));
         assert!(
             prompt.starts_with("# Wake\n\n") && prompt.ends_with(&text),
             "{prompt}"
@@ -6343,7 +6396,16 @@ mod tests {
         assert!(at("spawned by agent-cc") < brief_at);
         assert!(prompt.trim_end().ends_with(brief));
         assert!(prompt.contains("Do not arm a colony watcher"));
-        assert!(launched.untinted.is_none());
+        assert!(launched.untinted.is_none() && launched.lexical_fallback.is_none());
+        let ordinary = f.spawn.show(&launched.name).unwrap();
+        assert!(ordinary.runs[0].lexical_fallback.is_empty());
+        // A historical run can still say that it had no cue at all.
+        f.spawn.publish(entity! { ExclusiveId::force_ref(&launched.run) @ attrs::untinted: "earlier scorer error".to_owned() }).unwrap();
+        let historical = f.spawn.show(&launched.name).unwrap();
+        assert!(
+            render_show(&historical, false).contains("untinted recollection: earlier scorer error")
+        );
+        assert!(historical.runs[0].lexical_fallback.is_empty());
         assert_eq!(launched.prompt_chars, prompt.chars().count());
         let recorded = f.spawn.show(&launched.name).unwrap().runs[0].prompt[0];
         assert_eq!(recorded, super::super::text_handle(&prompt));
@@ -6436,7 +6498,7 @@ mod tests {
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.cover_sizing, [cover.summary.clone()]);
         assert!(
-            cover.summary.contains("memory budget 214600"),
+            cover.summary.contains("recall budget 214600"),
             "{}",
             cover.summary
         );
@@ -6960,6 +7022,7 @@ mod tests {
             let tint = WakeTint {
                 about: about.to_owned(),
                 scores: None,
+                ..Default::default()
             };
             renderer
                 .wake(&f.storage, Some(&tint), PLAIN_MEMORY_CHARS)
@@ -6977,7 +7040,147 @@ mod tests {
     }
 
     #[test]
-    fn a_tint_that_fails_falls_back_to_the_untinted_cover_and_says_so() {
+    fn a_tint_recalls_current_wiki_readings_within_the_shared_budget() {
+        let f = fixture();
+        let memory = crate::memory::Memory::with_storage(f.storage.clone());
+        for day in 1..=16 {
+            let start = hifitime::Epoch::from_gregorian_utc_hms(2026, 1, day, 8, 0, 0);
+            let end = hifitime::Epoch::from_gregorian_utc_hms(2026, 1, day, 9, 0, 0);
+            memory
+                .create(
+                    &format!(
+                        "Journal day {day:02}. The first train passed the house before sunrise."
+                    ),
+                    Some((start, end)),
+                    &[],
+                )
+                .unwrap();
+        }
+        let wiki = crate::wiki::Wiki::with_storage(f.storage.clone());
+        let curated = "Watch the warp and the orchard.";
+        let wake = |cue: &str, chars| {
+            LibraryRenderer
+                .wake(
+                    &f.storage,
+                    Some(&WakeTint {
+                        about: cue.into(),
+                        scores: None,
+                        ..Default::default()
+                    }),
+                    chars,
+                )
+                .unwrap()
+        };
+        let budget = 1100;
+        let before = wake("warp", budget);
+        assert!(!before.contains(crate::wiki::recall::HEADING));
+        wiki.create("Standing note", curated, &["cover".into()], false)
+            .unwrap();
+        let old = wiki
+            .create("Tile sizes", "The stale warp schedule.", &[], false)
+            .unwrap();
+        let fresh = wiki
+            .edit(
+                &format!("{old:x}"),
+                Some("The warp schedule uses one tile per block."),
+                None,
+                &[],
+                false,
+            )
+            .unwrap();
+        let discarded = wiki
+            .create("Discarded tile", "A retired warp experiment.", &[], false)
+            .unwrap();
+        wiki.archive(&format!("{discarded:x}")).unwrap();
+        let orchard = wiki
+            .create(
+                "Pruning",
+                "Prune an orchard after the leaves fall.",
+                &[],
+                false,
+            )
+            .unwrap();
+        for (cue, id, absent) in [
+            ("warp", fresh, "Prune an orchard"),
+            ("orchard", orchard, "one tile per block"),
+        ] {
+            let text = wake(cue, budget);
+            let exact = wiki.show(&format!("{id:x}"), true).unwrap();
+            assert!(text.contains(&exact), "{text}");
+            assert!(
+                !text.contains(absent)
+                    && !text.contains("stale warp")
+                    && !text.contains("retired warp")
+            );
+            assert_eq!(text.matches(curated).count(), 1);
+            let flexible = text.split_once("\nCompass:").unwrap().0;
+            assert!(flexible.chars().count() <= budget);
+            assert!(flexible.contains("Journal day"));
+            assert_eq!(text, wake(cue, budget));
+            let mut opts = crate::orient::WakePairsOptions::default();
+            opts.chars = budget;
+            opts.about = Some(cue.into());
+            let mut lines = String::new();
+            crate::orient::Orient::with_storage(f.storage.clone())
+                .wake_pairs(
+                    &opts,
+                    &mut Out::new(&mut |part| {
+                        if let Part::Text { text } = part {
+                            lines.push_str(&text);
+                        }
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+            assert!(lines
+                .lines()
+                .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+                .any(
+                    |pair| pair["command"] == format!("wiki show --exact {id:x}")
+                        && pair["output"] == exact
+                ));
+        }
+        // Only the current orchard body has strong semantic evidence. The
+        // higher scoring stale and archived bodies must never become readings.
+        let tint = WakeTint {
+            about: "Fruit tree care".into(),
+            wiki_contents: Some(Arc::new(
+                [
+                    ("The stale warp schedule.", 0.99),
+                    ("A retired warp experiment.", 0.98),
+                    ("Prune an orchard after the leaves fall.", 0.92),
+                ]
+                .into_iter()
+                .map(|(body, score)| (super::super::text_handle(body), score))
+                .collect(),
+            )),
+            ..Default::default()
+        };
+        let semantic = LibraryRenderer
+            .wake(&f.storage, Some(&tint), budget)
+            .unwrap();
+        assert!(semantic.contains(&wiki.show(&format!("{orchard:x}"), true).unwrap()));
+        assert!(semantic.contains("Wiki topic scorer: WeMM"));
+        assert!(!semantic.contains("stale warp schedule"));
+        assert!(!semantic.contains("retired warp experiment"));
+        assert!(!wake("warp", 80).contains(crate::wiki::recall::HEADING));
+        for cue in ["", "unmatchedkeyword"] {
+            let broad = wake(cue, budget);
+            assert!(broad.contains(curated) && !broad.contains("one tile per block"));
+        }
+        let personal = LibraryRenderer.wake(&f.storage, None, 0).unwrap();
+        assert!(personal.contains(curated) && personal.contains("Beliefs (cover):"));
+        let zero = wake("warp", 0);
+        assert!(!zero.contains(curated) && zero.contains("Compass:"));
+        assert!(!zero.contains(crate::wiki::recall::HEADING) && !zero.contains("Journal day"));
+        assert!(
+            wake("warp", budget).matches("Journal day").count()
+                < before.matches("Journal day").count()
+        );
+    }
+
+    #[test]
+    fn a_tint_that_fails_keeps_the_lexical_cue() {
         let f = fixture_full(
             FakeLauncher::default(),
             StubRenderer {
@@ -6987,7 +7190,7 @@ mod tests {
             "export TRIBLESPACE_PEERS=none\n",
         );
         let launched = f.spawn.run(&f.request("Tint refused.")).unwrap();
-        let why = launched.untinted.clone().unwrap();
+        let why = launched.lexical_fallback.clone().unwrap();
         assert!(why.contains("WeMM"), "{why}");
         let prompt = std::fs::read_to_string(
             f.launcher.started.lock().unwrap()[0]
@@ -6995,14 +7198,15 @@ mod tests {
                 .with_extension("prompt"),
         )
         .unwrap();
-        assert!(prompt.contains("STUB-WAKE untinted"));
+        assert!(prompt.contains("STUB-WAKE about Tint refused."));
         assert_eq!(prompt.matches("STUB-WAKE").count(), 1);
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
-        assert_eq!(run.untinted, [why]);
+        assert!(run.untinted.is_empty());
+        assert_eq!(run.lexical_fallback, [why]);
     }
 
     #[test]
-    fn a_tint_that_panics_falls_back_to_the_untinted_cover_and_says_so() {
+    fn a_tint_that_panics_keeps_the_lexical_cue() {
         let f = fixture_full(
             FakeLauncher::default(),
             StubRenderer {
@@ -7012,7 +7216,7 @@ mod tests {
             "export TRIBLESPACE_PEERS=none\n",
         );
         let launched = f.spawn.run(&f.request("Tint panics.")).unwrap();
-        let why = launched.untinted.clone().unwrap();
+        let why = launched.lexical_fallback.clone().unwrap();
         assert!(why.contains("tint panicked"), "{why}");
         assert!(why.contains("BufferTooBig"), "{why}");
         let prompt = std::fs::read_to_string(
@@ -7021,9 +7225,10 @@ mod tests {
                 .with_extension("prompt"),
         )
         .unwrap();
-        assert!(prompt.contains("STUB-WAKE untinted"));
+        assert!(prompt.contains("STUB-WAKE about Tint panics."));
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
-        assert_eq!(run.untinted, [why]);
+        assert!(run.untinted.is_empty());
+        assert_eq!(run.lexical_fallback, [why]);
     }
 
     #[test]

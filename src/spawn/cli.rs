@@ -64,9 +64,9 @@ enum Command {
         provider: String,
         /// The cover's wished share of the worker's context window, in
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
-        /// effort: beliefs and goals render whole, so the cover may come out
+        /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// is the plain one (240,000 memory characters).
+        /// uses 240,000 characters shared by narrative and Wiki readings.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,
         /// The worker model's context window in tokens, before any other
@@ -108,9 +108,9 @@ enum Command {
         provider: String,
         /// The cover's wished share of the worker's context window, in
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
-        /// effort: beliefs and goals render whole, so the cover may come out
+        /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// is the plain one (240,000 memory characters).
+        /// uses 240,000 characters shared by narrative and Wiki readings.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,
         /// The worker model's context window in tokens, before any other
@@ -382,8 +382,10 @@ fn print_launched(launched: &Launched) -> Result<()> {
         if let Some(note) = launched.goal_note {
             out.note(format!("noted the launch on the goal: {note:x}"))?;
         }
-        if let Some(why) = &launched.untinted {
-            out.note(format!("recollection untinted: {why}"))?;
+        if let Some(why) = &launched.lexical_fallback {
+            out.note(format!(
+                "semantic tint unavailable (used the lexical cue): {why}"
+            ))?;
         }
         if let Some(cover) = &launched.cover {
             out.note(format!("cover sizing: {}", cover.summary))?;

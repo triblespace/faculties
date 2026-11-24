@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Task wakes now share the recall allowance between journal entries and
+  current Wiki readings from the selected workspace. The brief ranks Wiki
+  bodies using one WeMM encoding shared with the journal. When the model or
+  Wiki index is unavailable, lexical BM25 supplies topic evidence. Standing
+  and onboarding tags contribute in either case. Each
+  selected reading includes its title, body and exact revision. Untinted
+  personal wakes continue to carry every standing belief.
+
 - `archive import --source chatgpt-library EXPORT_DIRECTORY` (CLI only) keeps
   the files a ChatGPT export's library holds and no conversation's nodes do,
   each as one observation in the Archive: no node, no direction and no order.
