@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Between memories over exactly the same span, the cover shows the longest
+  when no `--about` query asks for another. It showed the least id, so a short
+  stub could stand in front of the full telling. The length is the charge the
+  span already carried, so which spans are chosen, their order and their
+  charge stay as they were. Every telling stays in the journal. A concise
+  correction, or a short rewrite of a long text, can still lose.
+
 - A zooid declares where and how it lives. `zooid declare NAME` with `--here`,
   `--host KEY`, `--any-host` or `--rest` (MCP `zooid_declare`) records one
   declaration in the Spawn collection, optionally binding an immutable model

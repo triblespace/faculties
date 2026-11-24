@@ -646,11 +646,25 @@ fn recollection_class_observations<P: TriblePattern>(
 
 /// Pick one recollection for a structural position. Eligibility is decided
 /// before contextual ranking, so `--about` cannot accidentally hide a span by
-/// choosing a filtered-out alternative when an eligible one exists. Scores tie
-/// by intrinsic id for byte-stable output.
+/// choosing a filtered-out alternative when an eligible one exists, and an
+/// `--about` score decides before length does.
+///
+/// With nothing asked for, the longest telling stands: the member with the
+/// largest `costs` entry, the measure [`recollection_class_cost`] charges the
+/// whole class by, so the text shown is the one already paid for (unless the
+/// longest member is not eligible). A short stub or a placeholder then does
+/// not stand in front of the full telling. Equal costs tie by intrinsic id for
+/// byte-stable output, whatever order the members were merged in.
+///
+/// It is a neutral choice between coexisting tellings, not a verdict: no clock
+/// and no relation between them is read, and every telling stays in the
+/// journal under its own id. Length is not merit. A concise correction can
+/// still lose to the longer text it corrects, and so does a short rewrite of a
+/// long handover, however often it is written.
 fn select_recollection(
     raw_spans: &[(i128, i128, Id)],
     members: &[usize],
+    costs: &[usize],
     about_scores: Option<&HashMap<Id, f32>>,
     eligible: &[bool],
 ) -> usize {
@@ -670,8 +684,9 @@ fn select_recollection(
                 .unwrap_or(0.0);
             a_score
                 .total_cmp(&b_score)
+                .then_with(|| costs[a].cmp(&costs[b]))
                 // `max_by` should select the lexicographically least id on a
-                // score tie, hence the deliberately reversed id comparison.
+                // tie, hence the deliberately reversed id comparison.
                 .then_with(|| raw_spans[b].2.cmp(&raw_spans[a].2))
         })
         .expect("a recollection class is never empty")
@@ -1061,13 +1076,6 @@ where
         // In particular, do not bind a model for a guaranteed no-op.
         None
     };
-    let representatives: Vec<usize> = classes
-        .iter()
-        .map(|members| {
-            select_recollection(&raw_spans, members, about_scores.as_ref(), &member_eligible)
-        })
-        .collect();
-
     // The recollection. Cost is the exact-span class's conservative character
     // count plus consumer overhead, once per selected memory.
     let mut raw_costs: Vec<Option<usize>> = vec![None; raw_spans.len()];
@@ -1088,6 +1096,24 @@ where
             .saturating_add(chunk_overhead),
         );
     }
+    // Charging the classes measured every member, so the representative is
+    // chosen by the figures its class was charged from.
+    let member_costs: Vec<usize> = raw_costs
+        .into_iter()
+        .map(|cost| cost.expect("every member was measured for its class"))
+        .collect();
+    let representatives: Vec<usize> = classes
+        .iter()
+        .map(|members| {
+            select_recollection(
+                &raw_spans,
+                members,
+                &member_costs,
+                about_scores.as_ref(),
+                &member_eligible,
+            )
+        })
+        .collect();
     let cut = select_recollection_cut(&spans, &costs, &class_eligible, budget_chars);
     let used = cut.used;
     let finished = cut.finished;
@@ -1684,22 +1710,149 @@ mod recollection_tests {
     fn contextual_selection_stays_inside_one_class_and_respects_eligibility() {
         let spans = vec![(0, 10, A), (0, 10, B), (0, 10, C)];
         let members = vec![0, 1, 2];
+        let costs = [30, 10, 20];
         let scores = HashMap::from([(A, 0.1), (B, 0.8), (C, 0.5)]);
         assert_eq!(
-            select_recollection(&spans, &members, Some(&scores), &[true; 3]),
+            select_recollection(&spans, &members, &costs, Some(&scores), &[true; 3]),
             1,
-            "the most relevant equal-span recollection wins"
+            "the most relevant equal-span recollection wins, though it is the shortest"
         );
         assert_eq!(
-            select_recollection(&spans, &members, Some(&scores), &[true, false, true]),
+            select_recollection(
+                &spans,
+                &members,
+                &costs,
+                Some(&scores),
+                &[true, false, true]
+            ),
             2,
             "context cannot select an ineligible recollection"
         );
-        assert_eq!(
-            select_recollection(&spans, &members, None, &[true; 3]),
+    }
+
+    #[test]
+    fn without_context_the_longest_eligible_telling_stands() {
+        let spans = vec![(0, 10, A), (0, 10, B), (0, 10, C)];
+        for members in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let pick = |costs: &[usize; 3], eligible: &[bool; 3]| {
+                select_recollection(&spans, &members, costs, None, eligible)
+            };
+            assert_eq!(pick(&[10, 30, 20], &[true; 3]), 1, "the longest");
+            assert_eq!(pick(&[30, 10, 20], &[true; 3]), 0);
+            assert_eq!(pick(&[10, 30, 30], &[true; 3]), 1, "ties by least id");
+            assert_eq!(pick(&[20, 20, 20], &[true; 3]), 0, "ties by least id");
+            assert_eq!(
+                pick(&[10, 30, 20], &[true, false, true]),
+                2,
+                "an ineligible longest does not stand"
+            );
+            assert_eq!(
+                pick(&[10, 30, 20], &[false; 3]),
+                1,
+                "a class with nothing eligible is gated elsewhere"
+            );
+            let even = HashMap::from([(A, 0.5), (B, 0.5), (C, 0.5)]);
+            assert_eq!(
+                select_recollection(&spans, &members, &[10, 20, 30], Some(&even), &[true; 3]),
+                2,
+                "equal scores leave the choice to length"
+            );
+        }
+    }
+
+    /// A stub, a placeholder image and two full tellings of one span, rendered.
+    /// The longest is shown, it is what the class is charged, and an `--about`
+    /// score still chooses another. Lengths are compared as they are charged:
+    /// characters and not bytes, and trailing whitespace only in raw mode.
+    #[test]
+    fn the_cover_shows_the_telling_its_class_is_charged_for() {
+        use crate::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::repo::SnapshotSource;
+        let point = |seconds: f64| {
+            let epoch = Epoch::from_tai_seconds(seconds);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let long = format!("The whole evening. {}", "It went on. ".repeat(12));
+        // More bytes than `long`, fewer characters.
+        let wide = format!("Der kürzere Abend. {}", "äöü".repeat(40));
+        assert!(wide.len() > long.len() && wide.chars().count() < long.trim_end().chars().count());
+        let padded = format!("A padded stub.{}", "\n".repeat(200));
+        let contents = [
+            ChunkDraftContent::Text("@-".to_owned()),
+            ChunkDraftContent::Image(vec![1, 2, 3]),
+            ChunkDraftContent::Text(wide.clone()),
+            ChunkDraftContent::Text(long.clone()),
+            ChunkDraftContent::Text(padded.clone()),
+        ];
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let mut ids = Vec::new();
+        for content in contents {
+            let (fragment, id) = chunk_fragment(ChunkDraft {
+                content,
+                start_at: point(1_000.0),
+                end_at: point(9_000.0),
+                tags: BTreeSet::new(),
+                references: BTreeSet::new(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: BTreeSet::new(),
+                aliases: BTreeSet::new(),
+            })
+            .unwrap();
+            ids.push(id);
+            let (chunk_facts, chunk_blobs) = fragment.into_facts_and_blobs();
+            facts += chunk_facts;
+            blobs.union(chunk_blobs);
+        }
+        let reader = blobs.snapshot().unwrap();
+        let render = |opts: &CoverOpts, scores: Option<HashMap<Id, f32>>| {
+            let mut report =
+                render_cover_report(&facts, &reader, opts, &mut |_| Ok(scores.clone())).unwrap();
+            assert_eq!(report.entries.len(), 1, "one structural position");
+            (report.entries.remove(0), report.text)
+        };
+
+        let (entry, text) = render(&CoverOpts::plain(5_000), None);
+        assert_eq!(entry.body.as_deref(), Some(long.trim_end()));
+        assert_eq!(entry.chunk, ids[3]);
+        let spans = collect_chunk_spans(&facts);
+        let (_, classes) = recollection_classes(&spans);
+        let charged = recollection_class_cost(
+            &reader,
+            &facts,
+            &spans,
+            &mut vec![None; spans.len()],
+            &classes,
+            &mut [None],
             0,
-            "without context the least intrinsic id is deterministic"
-        );
+            false,
+        )
+        .unwrap();
+        assert_eq!(text.chars().count(), charged, "the shown one is charged");
+
+        let mut raw = CoverOpts::plain(5_000);
+        raw.raw_memory = true;
+        assert_eq!(render(&raw, None).0.body.as_deref(), Some(padded.as_str()));
+
+        let mut about = CoverOpts::plain(5_000);
+        about.about = Some("the stub".to_owned());
+        let scores = HashMap::from([(ids[0], 0.9), (ids[3], 0.2)]);
+        assert_eq!(render(&about, Some(scores)).0.chunk, ids[0]);
+
+        // Only the stub passes the anti-filter.
+        let mut remove = CoverOpts::plain(5_000);
+        remove.remove = Some("evenings".to_owned());
+        let scores = ids.iter().skip(1).map(|&id| (id, 0.9)).collect();
+        assert_eq!(render(&remove, Some(scores)).0.chunk, ids[0]);
     }
 
     /// `created_at` is not an input: permuting every memory's observation time
