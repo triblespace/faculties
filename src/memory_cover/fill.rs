@@ -31,8 +31,8 @@ pub const PIECE_NS: i128 = (1i128 << 16) * 1_000_000_000;
 /// lived now. It also takes whatever room they don't use.
 pub const OPEN_RESERVE: f64 = 0.04;
 
-/// The lossy recollection selected for one reader, in emitted order: the
-/// oldest bucket first, then the open piece.
+/// The lossy recollection selected for one reader, in time order: the oldest
+/// bucket first, then the open piece.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecollectionCut {
     pub cover: Vec<usize>,
@@ -70,10 +70,7 @@ fn most_listed(bucket: u32) -> usize {
 /// Each candidate's charged size turns the spot reached so far into one ideal
 /// stretch of time, and the memory whose own start and end match it best is
 /// taken. The time before the journal's first memory is not lived, so nothing
-/// is spent on it. The first best memory that doesn't fit ends the piece. The
-/// memories stand in the order they were taken: one that arrives late is often
-/// taken last, and sorting the piece by time would put it in the middle and
-/// move what a consumer keeps.
+/// is spent on it. The first best memory that doesn't fit ends the piece.
 #[allow(clippy::too_many_arguments)]
 fn fill_piece(
     spans: &[(i128, i128, Id)],
@@ -186,6 +183,9 @@ pub fn select_recollection_cut(
         }
     }
     cut.finished = cut.cover.len();
+    // A piece holds the memories that start in it, and the pieces came oldest
+    // first, so this sorts inside each piece: start, then end, then id.
+    cut.cover.sort_by_key(|&i| spans[i]);
     let mut open: Vec<usize> = (0..spans.len())
         .filter(|&i| eligible[i] && costs[i] > 0 && spans[i].0 >= now * PIECE_NS)
         .collect();
@@ -516,6 +516,16 @@ mod tests {
         assert_eq!(cut.cover, [9, 10, 11, 12, 13, 14, 16, 17, 18, 19]);
     }
 
+    /// The cover is read as a life is told: start, then end, then id, the
+    /// finished pieces and the open one alike.
+    #[test]
+    fn the_cover_is_in_time_order() {
+        let spans = journal(60 * 24 + 5, 60);
+        let cut = cut_at(&spans, 60_000);
+        assert!(cut.finished > 20 && cut.finished < cut.cover.len());
+        assert!(cut.cover.windows(2).all(|w| spans[w[0]] < spans[w[1]]));
+    }
+
     /// A journal may reach across the clock's origin (signed TAI before its
     /// epoch): the buckets end, and both sides are kept.
     #[test]
@@ -560,8 +570,7 @@ mod tests {
             let used = fill_piece(&spans, &[10; 3], &[true; 3], 0, piece, space, &mut cover);
             (cover, used)
         };
-        // The other two stand in the order they were taken, not in time order.
-        assert_eq!(fill(100).0, [0, 1, 2]);
+        assert_eq!(fill(100).0.first(), Some(&0));
         assert_eq!(fill(9), (vec![], 0));
         let cut = select_recollection_cut(&spans[..1], &[11], &[true], 10);
         assert_eq!((cut.cover.len(), cut.used), (0, 0));

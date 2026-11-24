@@ -1088,9 +1088,8 @@ where
     let used = cut.used;
     let cover = cut.cover;
 
-    // The selected order is the emitted order: the oldest bucket first, then
-    // the open piece. A piece keeps the order its memories were taken in, so
-    // ranges may overlap, leave gaps, or wobble backwards in lived time.
+    // The selected order is the emitted order, and that is time order. Ranges
+    // may overlap, leave gaps, or lie inside one another.
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("recollections about \"{q}\" within equal spans"),
