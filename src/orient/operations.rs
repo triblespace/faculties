@@ -6388,10 +6388,21 @@ async fn wake_selection(
                     ));
                 }
             }
-            wiki_model::recall::ranked_bodies(&index.into_value(), topic).unwrap_or_else(|error| {
-                diagnostics.push(format!("Wiki topic ranking unavailable: {error:#}"));
+            let index = index.into_value();
+            let needs_postings = match semantic {
+                Some(cosines) => wiki_model::recall::has_unscored_terms(&index, cosines)?,
+                None => true,
+            };
+            if needs_postings {
+                wiki_model::recall::ranked_bodies(&index, topic).unwrap_or_else(|error| {
+                    diagnostics.push(format!("Wiki topic ranking unavailable: {error:#}"));
+                    Vec::new()
+                })
+            } else {
+                diagnostics
+                    .push("All resident lexical documents with terms have semantic scores".into());
                 Vec::new()
-            })
+            }
         }
         (_, Some(Err(error))) => {
             diagnostics.push(format!("Wiki topic index unavailable: {error:#}"));

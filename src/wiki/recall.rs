@@ -263,6 +263,23 @@ fn active<P: TriblePattern>(facts: &P, revision: Id) -> bool {
         )
 }
 
+/// The resident lexical carriers expose document keys and token lengths directly.
+/// A fully covered lexical domain needs no posting traversal for a supplement.
+pub(crate) fn has_unscored_terms(
+    index: &TopicIndex,
+    cosines: &[(TextHandle, f32)],
+) -> Result<bool> {
+    let covered: std::collections::HashSet<_> = cosines.iter().map(|(body, _)| *body).collect();
+    for segment in index.segments() {
+        for (ordinal, body) in segment.document_keys().enumerate() {
+            if !covered.contains(&body) && segment.query()?.doc_len(ordinal) != Some(0) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn ranked_bodies(index: &TopicIndex, topic: &str) -> Result<Vec<(TextHandle, f32)>> {
     let query = index.query()?;
     let tokens = hash_tokens(topic);
