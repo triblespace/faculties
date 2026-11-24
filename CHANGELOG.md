@@ -14,7 +14,8 @@ All notable changes to this project will be documented in this file.
   and continues from the deepest head's cursor. A receipt that arrives before
   its predecessor, and an event of an unknown kind, are read open-world. An
   attachment several versions carry is listed once, and versions which differ
-  only in the source's etag read as one.
+  only in the source's etag read as one. A pull which brings nothing new
+  writes nothing: the next one asks again from the same cursor.
 
 - Task wakes now share the recall allowance between journal entries and
   current Wiki readings from the selected workspace. The brief ranks Wiki

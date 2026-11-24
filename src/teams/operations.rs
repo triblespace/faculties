@@ -1011,6 +1011,17 @@ fn pull_once_with_cache(
             _ => bail!("Teams delta page must contain exactly one nextLink or deltaLink"),
         };
         let incoming = parse_messages(page.messages)?;
+        // A round which brings nothing writes nothing: the same cursor asks
+        // again. A cursor which expired, a round under way, and heads which
+        // await a join each still get their receipt.
+        if incoming.is_empty()
+            && cursor_kind == "delta"
+            && coverage.as_ref().is_some_and(|coverage| {
+                coverage.settled && coverage.cursor.as_deref() == Some(request_url.as_str())
+            })
+        {
+            return Ok(receipt);
+        }
         let generation = coverage
             .as_ref()
             .map(|coverage| coverage.generation + 1)
@@ -1046,6 +1057,7 @@ fn pull_once_with_cache(
             heads: BTreeSet::from([receipt_id]),
             generation,
             cursor: Some(cursor.clone()),
+            settled: cursor_kind == "delta",
         });
         if cursor_kind == "delta" {
             return Ok(receipt);
@@ -4917,6 +4929,7 @@ mod tests {
                 heads: BTreeSet::from([advanced_id, stale_id]),
                 generation: 3,
                 cursor: some("https://graph.example/advanced"),
+                settled: false,
             })
         );
     }
@@ -4969,44 +4982,296 @@ mod tests {
         );
     }
 
-    /// Answer every request with one page, and say how many there were.
-    fn serve_page(
-        listener: std::net::TcpListener,
-        body: String,
-    ) -> std::thread::JoinHandle<Vec<String>> {
-        use std::io::{BufRead, BufReader, Write};
-        std::thread::spawn(move || {
-            let mut requested = Vec::new();
-            loop {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
-                let request = lines.next().unwrap().unwrap();
-                for line in lines {
-                    if line.unwrap().is_empty() {
-                        break;
+    /// A Graph which gives these answers in turn, and records what was asked.
+    struct Source {
+        address: std::net::SocketAddr,
+        answers: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u16, String)>>>,
+        server: std::thread::JoinHandle<Vec<String>>,
+    }
+
+    impl Source {
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let answers = std::sync::Arc::<
+                std::sync::Mutex<std::collections::VecDeque<(u16, String)>>,
+            >::default();
+            let queue = std::sync::Arc::clone(&answers);
+            let server = std::thread::spawn(move || {
+                let mut requested = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+                    let request = lines.next().unwrap().unwrap();
+                    for line in lines {
+                        if line.unwrap().is_empty() {
+                            break;
+                        }
                     }
+                    let path = request.split(' ').nth(1).unwrap().to_owned();
+                    if path == "/stop" {
+                        return requested;
+                    }
+                    requested.push(path);
+                    let (status, body) = queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or((500, "{}".to_owned()));
+                    write!(
+                        stream,
+                        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
                 }
-                if request.starts_with("GET /stop") {
-                    return requested;
-                }
-                requested.push(request);
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
+            });
+            Self {
+                address,
+                answers,
+                server,
             }
-        })
+        }
+
+        fn url(&self, name: &str) -> String {
+            format!("http://{}/{name}", self.address)
+        }
+
+        fn answer(&self, status: u16, body: JsonValue) {
+            self.answers
+                .lock()
+                .unwrap()
+                .push_back((status, body.to_string()));
+        }
+
+        /// A terminal page.
+        fn delta(&self, messages: Vec<JsonValue>, cursor: &str) {
+            self.answer(
+                200,
+                json!({ "value": messages, "@odata.deltaLink": self.url(cursor) }),
+            );
+        }
+
+        fn pull(&self, fixture: &Fixture, client_secret: Id) -> Result<PullReceipt> {
+            let source = source_fragment("tenant-a").root().unwrap();
+            let config = TeamsBridgeConfig {
+                source_id: source,
+                tenant: "tenant-a".to_owned(),
+                client_id: "client".to_owned(),
+                user_id: "user".to_owned(),
+                scopes: "offline_access".to_owned(),
+                profile: source,
+                client_secret_version: Some(client_secret),
+                delegated_token_version: None,
+                delta_url: self.url("base"),
+            };
+            let mut token = Some(AppTokenCache {
+                access_token: "test-token".to_owned(),
+                expires_at_key: i128::MAX,
+            });
+            fixture
+                .storage()
+                .with_session(|session| pull_once_with_cache(&config, &mut token, session))
+        }
+
+        /// The paths asked for, in order.
+        fn requested(self) -> Vec<String> {
+            let _ = Client::new().get(self.url("stop")).send();
+            self.server.join().unwrap()
+        }
+    }
+
+    fn commits(fixture: &Fixture) -> usize {
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict(&fixture.pile).unwrap();
+        let found =
+            crate::storage::discover_target(&mut pile, DEFAULT_SCOPE_ID, signer.verifying_key())
+                .unwrap();
+        pile.close().unwrap();
+        found.commits().len()
+    }
+
+    #[test]
+    fn a_round_which_brings_nothing_writes_nothing() {
+        let fixture = Fixture::new();
+        let (client_secret, _) = initialize_test_secrets(&fixture);
+        let source = Source::start();
+        let message = |id: &str, content: &str| {
+            graph_message(
+                "chat",
+                id,
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                content,
+            )
+        };
+
+        // The first page ever is recorded, empty or not.
+        source.delta(vec![], "one");
+        assert_eq!(source.pull(&fixture, client_secret).unwrap().pages.len(), 1);
+        let after_first = commits(&fixture);
+
+        let mut length = None;
+        for cursor in ["two", "three", "four"] {
+            source.delta(vec![], cursor);
+            let receipt = source.pull(&fixture, client_secret).unwrap();
+            assert!(receipt.pages.is_empty());
+            assert_eq!(receipt.observations, 0);
+            assert_eq!(commits(&fixture), after_first);
+            let now = fs::metadata(&fixture.pile).unwrap().len();
+            assert_eq!(*length.get_or_insert(now), now);
+        }
+
+        // What comes after quiet rounds lands once, and moves the cursor.
+        source.delta(vec![message("message", "after")], "five");
+        assert_eq!(source.pull(&fixture, client_secret).unwrap().pages.len(), 1);
+        assert_eq!(commits(&fixture), after_first + 1);
+        source.delta(vec![], "six");
+        assert!(source
+            .pull(&fixture, client_secret)
+            .unwrap()
+            .pages
+            .is_empty());
+        assert_eq!(read_all(&fixture.storage()), vec![one("after")]);
+        assert_eq!(
+            source.requested(),
+            ["/base", "/one", "/one", "/one", "/one", "/five"]
+        );
+    }
+
+    /// A cursor kept too long expires; its replacement is recorded even where
+    /// the source has nothing to say, and a re-delivery adds nothing.
+    #[test]
+    fn an_expired_cursor_is_replaced_and_its_redelivery_adds_nothing() {
+        let fixture = Fixture::new();
+        let (client_secret, _) = initialize_test_secrets(&fixture);
+        let source = Source::start();
+        let message = graph_message(
+            "chat",
+            "message",
+            "2026-08-01T10:00:00Z",
+            "2026-08-01T10:00:00Z",
+            "kept",
+        );
+        source.delta(vec![message.clone()], "one");
+        source.pull(&fixture, client_secret).unwrap();
+
+        source.answer(410, json!({}));
+        source.delta(vec![message], "two");
+        assert_eq!(source.pull(&fixture, client_secret).unwrap().pages.len(), 1);
+        assert_eq!(read_all(&fixture.storage()), vec![one("kept")]);
+        let view = load_view(&fixture);
+        assert_eq!(
+            find!(
+                observation: Id,
+                pattern!(&view.facts, [{
+                    ?observation @ metadata::tag: teams::kind_message_observation
+                }])
+            )
+            .collect::<BTreeSet<_>>()
+            .len(),
+            1
+        );
+        drop(view);
+
+        source.answer(410, json!({}));
+        source.delta(vec![], "three");
+        assert_eq!(source.pull(&fixture, client_secret).unwrap().pages.len(), 1);
+        source.delta(vec![], "four");
+        assert!(source
+            .pull(&fixture, client_secret)
+            .unwrap()
+            .pages
+            .is_empty());
+        assert_eq!(read_all(&fixture.storage()), vec![one("kept")]);
+        assert_eq!(
+            source.requested(),
+            ["/base", "/one", "/base", "/two", "/base", "/three"]
+        );
+    }
+
+    /// A round left at an intermediate page is completed by its terminal page,
+    /// empty or not.
+    #[test]
+    fn an_empty_terminal_page_still_completes_a_round_under_way() {
+        let fixture = Fixture::new();
+        let (client_secret, _) = initialize_test_secrets(&fixture);
+        let source = Source::start();
+        source.answer(
+            200,
+            json!({ "value": [], "@odata.nextLink": source.url("next") }),
+        );
+        source.answer(500, json!({}));
+        source.pull(&fixture, client_secret).unwrap_err();
+        source.delta(vec![], "done");
+        assert_eq!(source.pull(&fixture, client_secret).unwrap().pages.len(), 1);
+        source.delta(vec![], "later");
+        assert!(source
+            .pull(&fixture, client_secret)
+            .unwrap()
+            .pages
+            .is_empty());
+        assert_eq!(source.requested(), ["/base", "/next", "/next", "/done"]);
+    }
+
+    #[test]
+    fn an_empty_page_still_joins_several_heads() {
+        let fixture = Fixture::new();
+        let (client_secret, _) = initialize_test_secrets(&fixture);
+        let source = Source::start();
+        let page = |content: &str| {
+            page_fragment(
+                "tenant-a",
+                vec![graph_message(
+                    "chat",
+                    content,
+                    "2026-08-01T10:00:00Z",
+                    "2026-08-01T10:00:00Z",
+                    content,
+                )],
+                1,
+                [],
+                &source.url(content),
+            )
+        };
+        let (left, left_id) = page("left");
+        fixture.publish(left);
+        let (right, right_id) = page("right");
+        fixture.publish(right);
+        let id = source_fragment("tenant-a").root().unwrap();
+        let heads = || {
+            let view = load_view(&fixture);
+            coverage_frontier(&view.reader, &view.facts, id)
+                .unwrap()
+                .unwrap()
+                .heads
+        };
+        assert_eq!(heads(), BTreeSet::from([left_id, right_id]));
+
+        source.delta(vec![], "joined");
+        let receipt = source.pull(&fixture, client_secret).unwrap();
+        assert_eq!(heads(), receipt.pages.iter().copied().collect());
+        assert_eq!(receipt.pages.len(), 1);
+        source.delta(vec![], "later");
+        assert!(source
+            .pull(&fixture, client_secret)
+            .unwrap()
+            .pages
+            .is_empty());
+        assert_eq!(
+            sorted(read_all(&fixture.storage())),
+            vec![one("left"), one("right")]
+        );
+        assert_eq!(source.requested().last().unwrap(), "/joined");
     }
 
     /// Two hosts pull independently from one common page, their piles are
     /// concatenated, and the next pull continues from one of their cursors.
     #[test]
     fn concatenated_pulls_show_both_hosts_and_the_next_pull_joins_them() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let cursor = |name: &str| format!("http://{address}/{name}");
+        let graph = Source::start();
+        let cursor = |name: &str| graph.url(name);
         let message = |id: &str, modified: &str, content: &str| {
             graph_message("chat", id, "2026-08-01T10:00:00Z", modified, content)
         };
@@ -5112,38 +5377,19 @@ mod tests {
 
         // The continued cursor never covered the other host's pages, so the
         // source delivers them again beside what is new.
-        let body = json!({
-            "value": [
-                tied_here, only_here, tied_there, only_there, edited_there,
+        graph.delta(
+            vec![
+                tied_here,
+                only_here,
+                tied_there,
+                only_there,
+                edited_there,
                 message("new", "2026-08-01T12:00:00Z", "new"),
             ],
-            "@odata.deltaLink": cursor("joined"),
-        })
-        .to_string();
-        let server = serve_page(listener, body);
-        let config = TeamsBridgeConfig {
-            source_id: source,
-            tenant: "tenant-a".to_owned(),
-            client_id: "client".to_owned(),
-            user_id: "user".to_owned(),
-            scopes: "offline_access".to_owned(),
-            profile: source,
-            client_secret_version: Some(client_secret),
-            delegated_token_version: None,
-            delta_url: cursor("base"),
-        };
-        let mut token = Some(AppTokenCache {
-            access_token: "test-token".to_owned(),
-            expires_at_key: i128::MAX,
-        });
-        let receipt = here
-            .storage()
-            .with_session(|session| pull_once_with_cache(&config, &mut token, session))
-            .unwrap();
-        let _ = Client::new().get(cursor("stop")).send();
-        let requested = server.join().unwrap();
-        assert_eq!(requested.len(), 1, "{requested:?}");
-        assert!(requested[0].starts_with("GET /here-2 "), "{requested:?}");
+            "joined",
+        );
+        let receipt = graph.pull(&here, client_secret).unwrap();
+        assert_eq!(graph.requested(), ["/here-2"]);
         assert_eq!(receipt.pages.len(), 1);
 
         // Nothing is lost, nothing doubled, and no new conflict: what was

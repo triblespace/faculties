@@ -68,6 +68,9 @@ pub struct CoverageFrontier {
     /// Absent only for a generation-0 frozen legacy snapshot. The next pull
     /// must then use Graph's base endpoint.
     pub cursor: Option<String>,
+    /// One head which completes a round: its cursor asks what is new since,
+    /// and an empty answer tells nothing the head does not.
+    pub settled: bool,
 }
 
 /// Complete public state of one immutable Teams authentication profile.
@@ -743,10 +746,16 @@ where
     let cursor = continued
         .map(|(_, _, cursor)| read_utf8string(reader, cursor, "Teams coverage cursor"))
         .transpose()?;
+    let delta = text_handle("delta");
+    let settled = heads.len() == 1
+        && heads
+            .iter()
+            .all(|head| exists!(pattern!(catalog, [{ head @ teams::coverage_kind: &delta }])));
     Ok(Some(CoverageFrontier {
         heads,
         generation,
         cursor,
+        settled,
     }))
 }
 
@@ -2202,6 +2211,7 @@ mod tests {
                 heads: BTreeSet::from([graph_id]),
                 generation: 1,
                 cursor: Some("https://graph.microsoft.test/messages/delta?cursor=one".to_owned()),
+                settled: true,
             })
         );
         assert_eq!(
