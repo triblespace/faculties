@@ -196,6 +196,7 @@ pub(super) enum CliImportSource {
     ClaudeCode,
     ClaudeWeb,
     Codex,
+    CodexCloud,
     Copilot,
     Gemini,
 }
@@ -208,6 +209,7 @@ impl From<CliImportSource> for ImportSource {
             CliImportSource::ClaudeCode => Self::ClaudeCode,
             CliImportSource::ClaudeWeb => Self::ClaudeWeb,
             CliImportSource::Codex => Self::Codex,
+            CliImportSource::CodexCloud => Self::CodexCloud,
             CliImportSource::Copilot => Self::Copilot,
             CliImportSource::Gemini => Self::Gemini,
         }

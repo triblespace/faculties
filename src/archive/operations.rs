@@ -12,6 +12,7 @@ pub enum ImportSource {
     ClaudeCode,
     ClaudeWeb,
     Codex,
+    CodexCloud,
     Copilot,
     Gemini,
 }
@@ -22,6 +23,7 @@ pub enum ImportSummary {
     ClaudeCode(ClaudeCodeProjectionSummary),
     ClaudeWeb(ClaudeWebProjectionSummary),
     Codex(CodexProjectionSummary),
+    CodexCloud(CodexCloudProjectionSummary),
     Copilot(CopilotProjectionSummary),
     Gemini(GeminiProjectionSummary),
 }
@@ -54,6 +56,7 @@ impl ImportSummary {
             Self::ClaudeCode(s) => print_claude_code_import_summary(s, publication, out),
             Self::ClaudeWeb(s) => print_claude_web_import_summary(s, publication, out),
             Self::Codex(s) => print_codex_import_summary(s, publication, out),
+            Self::CodexCloud(s) => print_codex_cloud_import_summary(s, publication, out),
             Self::Copilot(s) => print_copilot_import_summary(s, publication, out),
             Self::Gemini(s) => print_gemini_import_summary(s, publication, out),
         }
@@ -130,6 +133,12 @@ impl Archive {
                     writer.stage(p.fragment, p.identity)
                 })
                 .map(ImportSummary::Codex),
+                ImportSource::CodexCloud => {
+                    archive_codex_cloud::project_bytes(source_name, bytes, |p| {
+                        writer.stage(p.fragment, p.identity)
+                    })
+                    .map(ImportSummary::CodexCloud)
+                }
                 ImportSource::Copilot => archive_copilot::project_bytes(source_name, bytes, |p| {
                     writer.stage(p.fragment, p.identity)
                 })
@@ -237,6 +246,7 @@ use crate::archive_chatgpt::{self, ProjectionSummary as ChatGptProjectionSummary
 use crate::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjectionSummary};
 use crate::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSummary};
 use crate::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
+use crate::archive_codex_cloud::{self, ProjectionSummary as CodexCloudProjectionSummary};
 use crate::archive_collection::{
     self as archive_collection, ArchiveImportWriter, ArchiveTimelineBlock, ArchiveTimelineCursor,
     UnitPublication,
@@ -491,6 +501,34 @@ fn print_codex_import_summary(
         summary.frozen_bytes,
         summary.trailing_bytes_ignored,
     ))?;
+    print_collection_publication(publication, out)?;
+    Ok(())
+}
+
+fn print_codex_cloud_import_summary(
+    summary: &CodexCloudProjectionSummary,
+    publication: &Publication,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    out.line(format!(
+        "projected {} Codex cloud file(s), {} task(s), {} turn(s), {} node(s), {} fact(s)",
+        summary.files_scanned,
+        summary.tasks_seen,
+        summary.turns_seen,
+        summary.stats.projections_emitted,
+        summary.stats.content_parts,
+    ))?;
+    out.line(format!(
+        "records={} contentless={} empty_texts={} unresolved_files={} missing_predecessors={}",
+        summary.stats.records_seen,
+        summary.stats.contentless_records,
+        summary.empty_texts,
+        summary.unresolved_files,
+        summary.stats.missing_predecessors,
+    ))?;
+    for (path, count) in &summary.dropped {
+        out.line(format!("left out: {path} held a value {count} time(s)"))?;
+    }
     print_collection_publication(publication, out)?;
     Ok(())
 }
@@ -2165,6 +2203,7 @@ mod tests {
             ("claude-code", CliImportSource::ClaudeCode),
             ("claude-web", CliImportSource::ClaudeWeb),
             ("codex", CliImportSource::Codex),
+            ("codex-cloud", CliImportSource::CodexCloud),
             ("copilot", CliImportSource::Copilot),
             ("gemini", CliImportSource::Gemini),
         ] {

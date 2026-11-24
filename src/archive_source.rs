@@ -1010,6 +1010,36 @@ pub fn content_key(projected: &[ProjectedSource]) -> ContentKey {
     (nodes, digest.get_handle().raw)
 }
 
+/// Emit projected units in the order of their [`ContentKey`]s.
+///
+/// Units with the same key emit the same facts and are emitted once; returned
+/// is how many nodes the ones left out held.
+pub fn emit_in_content_order<F>(
+    mut units: Vec<(ContentKey, Vec<ProjectedSource>)>,
+    mut emit: F,
+) -> Result<usize>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    units.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut repeated = 0usize;
+    let mut last: Option<ContentKey> = None;
+    for (key, fragments) in units {
+        if last.as_ref() == Some(&key) {
+            repeated += fragments
+                .iter()
+                .filter(|fragment| fragment.record.is_some())
+                .count();
+            continue;
+        }
+        last = Some(key);
+        for fragment in fragments {
+            emit(fragment)?;
+        }
+    }
+    Ok(repeated)
+}
+
 /// Project a complete source graph through the canonical node DAG.
 ///
 /// Contentless records are contracted. Every other record joins the main

@@ -44,6 +44,7 @@ pub mod archive_chatgpt;
 pub mod archive_claude_code;
 pub mod archive_claude_web;
 pub mod archive_codex;
+pub mod archive_codex_cloud;
 pub mod archive_collection;
 pub mod archive_copilot;
 pub mod archive_gemini;

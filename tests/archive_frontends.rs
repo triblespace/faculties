@@ -124,6 +124,7 @@ const CODEX: &str = concat!(
 const CHATGPT: &str = r#"[{"id":"resident-chatgpt","mapping":{"node":{"id":"node","parent":null,"message":{"id":"message","author":{"role":"user"},"content":{"content_type":"text","parts":["quasar needle"]}}}}}]"#;
 const WEB: &str = r#"[{"uuid":"resident-web","chat_messages":[{"uuid":"message","sender":"human","text":"quasar needle"}]}]"#;
 const COPILOT: &str = r#"{"sessionId":"resident-copilot","requests":[{"requestId":"request","message":{"text":"quasar needle"},"response":[{"value":"answer"}]}]}"#;
+const CODEX_CLOUD: &str = r#"[{"archived":false,"id":"task_e_68a00000000000000000000000000001","title":"A task title","turns":[{"custom_instructions":null,"id":"task_e_68a00000000000000000000000000001~usertrn_e_68a00000000000000000000000000002","input_items":[{"content":[{"content_type":"text","text":"quasar needle"}],"role":"user","type":"message"}],"role":"user"}]}]"#;
 const AGY: &str = concat!(
     r#"{"source":"USER_INPUT","content":"quasar needle","step_index":1}"#,
     "\n"
@@ -133,7 +134,7 @@ fn gemini(inner: &str) -> String {
 }
 
 #[test]
-fn all_seven_resident_scanners_preserve_file_projection_identity_and_bytes() {
+fn all_eight_resident_scanners_preserve_file_projection_identity_and_bytes() {
     let html = gemini("Prompted&nbsp;quasar needle<br>18 Sept 2025, 12:02:52 CET<br><p>answer</p>");
     for (source, spelling, name, content) in [
         (ImportSource::Agy, "agy", "transcript_full.jsonl", AGY),
@@ -151,6 +152,12 @@ fn all_seven_resident_scanners_preserve_file_projection_identity_and_bytes() {
         ),
         (ImportSource::ClaudeWeb, "claude-web", "web.json", WEB),
         (ImportSource::Codex, "codex", "rollout.jsonl", CODEX),
+        (
+            ImportSource::CodexCloud,
+            "codex-cloud",
+            "codex-000.json",
+            CODEX_CLOUD,
+        ),
         (ImportSource::Copilot, "copilot", "copilot.json", COPILOT),
         (
             ImportSource::Gemini,
@@ -529,7 +536,7 @@ const CODE_RICH: &str = concat!(
     "\n",
 );
 
-/// Every source the seven importers read, as (source, CLI spelling, file
+/// Every source the eight importers read, as (source, CLI spelling, file
 /// name, content).
 fn every_source(html: &str) -> Vec<(ImportSource, &'static str, &'static str, String)> {
     vec![
@@ -568,6 +575,12 @@ fn every_source(html: &str) -> Vec<(ImportSource, &'static str, &'static str, St
             "codex",
             "rollout.jsonl",
             CODEX.to_owned(),
+        ),
+        (
+            ImportSource::CodexCloud,
+            "codex-cloud",
+            "codex-000.json",
+            CODEX_CLOUD.to_owned(),
         ),
         (
             ImportSource::Copilot,
@@ -1021,6 +1034,13 @@ fn importers_write_only_content_derived_attributes() {
                 Ok(())
             })
             .map(drop),
+            ImportSource::CodexCloud => {
+                faculties::archive_codex_cloud::project_bytes(&name, bytes, |p| {
+                    facts += p.fragment.facts().clone();
+                    Ok(())
+                })
+                .map(drop)
+            }
             ImportSource::Copilot => faculties::archive_copilot::project_bytes(&name, bytes, |p| {
                 facts += p.fragment.facts().clone();
                 Ok(())

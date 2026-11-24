@@ -107,42 +107,20 @@ where
     Ok(summary)
 }
 
-/// Emit projected conversations in the order of their [`ContentKey`]s.
-///
-/// [`ContentKey`]: archive_source::ContentKey
-///
-/// Conversations with the same key emit the same facts and are emitted once;
-/// the nodes of the ones left out are taken off `summary`'s counts, so it
-/// counts what was emitted.
+/// [`archive_source::emit_in_content_order`], with the nodes of conversations
+/// left out as repeats taken off `summary`'s counts, so it counts what was
+/// emitted.
 fn emit_in_content_order<F>(
-    mut conversations: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)>,
+    conversations: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)>,
     summary: &mut ProjectionSummary,
     emit: &mut F,
 ) -> Result<()>
 where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
-    conversations.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut kept: Vec<(archive_source::ContentKey, Vec<ProjectedSource>)> =
-        Vec::with_capacity(conversations.len());
-    for (key, fragments) in conversations {
-        if kept.last().is_some_and(|(last, _)| *last == key) {
-            let nodes = fragments
-                .iter()
-                .filter(|fragment| fragment.record.is_some())
-                .count();
-            summary.stats.projections_emitted -= nodes;
-            summary.stats.content_parts -= nodes;
-            continue;
-        }
-        kept.push((key, fragments));
-    }
-    let conversations = kept;
-    for (_, fragments) in conversations {
-        for fragment in fragments {
-            emit(fragment)?;
-        }
-    }
+    let repeated = archive_source::emit_in_content_order(conversations, emit)?;
+    summary.stats.projections_emitted -= repeated;
+    summary.stats.content_parts -= repeated;
     Ok(())
 }
 

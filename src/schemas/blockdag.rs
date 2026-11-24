@@ -293,6 +293,10 @@ pub mod source_projection {
     /// genid` on 2026-08-17.
     pub const SOURCE_AGY: Id = id_hex!("29D3BFFAF4AC6C2AD2EFD1C7D22B60FB");
 
+    /// ChatGPT data-export Codex cloud task source namespace. Minted with
+    /// `trible genid` on 2026-11-24.
+    pub const SOURCE_CODEX_CLOUD: Id = id_hex!("7B1FBB99CE25FFB7C7068C5D31148987");
+
     /// Native Drive cognition source namespace. Minted with `trible genid` on
     /// 2026-08-27.
     pub const SOURCE_DRIVE: Id = id_hex!("3F9B847D70B5720F81DD303499F95898");
