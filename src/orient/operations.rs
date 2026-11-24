@@ -430,7 +430,7 @@ impl Orient {
     }
 }
 
-use crate::collection_names::{open_configured, open_exact_in, open_exact_read_in};
+use crate::collection_names::{open_configured, open_exact_in, open_workspace_read_in};
 use crate::memory_cover::{render_cover_report, CoverOpts};
 use crate::out::Out;
 use crate::schemas::archive::archive;
@@ -883,7 +883,7 @@ impl OrientSource {
             let snapshot = pile.snapshot()?;
             read(pile, &snapshot, |reader| {
                 if explicit {
-                    open_exact_read_in(reader, scope, authority, handle)
+                    open_workspace_read_in(reader, authority, handle)
                 } else {
                     open_exact_in(reader, scope, handle)
                 }
@@ -6316,9 +6316,7 @@ async fn wake_selection(
         let wiki = OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
         let latest = wiki_model::latest_for_source(storage, wiki.source)
             .context("register Wiki supersession index")?;
-        let index = topic
-            .filter(|_| tint.and_then(|t| t.wiki_contents.as_ref()).is_none())
-            .map(|_| wiki_model::recall::topic_index(storage, wiki.source));
+        let index = topic.map(|_| wiki_model::recall::topic_index(storage, wiki.source));
         wiki.maintain(storage, signer).await?;
         crate::storage::tolerate_own_lag(storage.maintain_attached(latest, signer).await)
             .context("maintain Wiki supersession index")?;
@@ -6373,16 +6371,8 @@ async fn wake_selection(
         diagnostics.push("Wiki recall unavailable: this workspace has no Wiki role".to_owned());
     }
     let semantic = tint.and_then(|t| t.wiki_contents.as_deref());
-    let ranked = match (topic, semantic, topic_read) {
-        (Some(_), Some(cosines), _) => {
-            diagnostics.push(format!(
-                "Wiki topic scorer: WeMM, {} indexed content handles",
-                cosines.len()
-            ));
-            wiki_model::recall::semantic_bodies(cosines)
-        }
-        (Some(topic), None, Some(Ok(index))) => {
-            diagnostics.push("Wiki topic scorer: lexical BM25".into());
+    let lexical = match (topic, topic_read) {
+        (Some(topic), Some(Ok(index))) => {
             if !index.unread().is_empty() {
                 diagnostics.push(format!(
                     "Wiki topic index: {} source commits pending",
@@ -6403,9 +6393,36 @@ async fn wake_selection(
                 Vec::new()
             })
         }
-        (_, _, Some(Err(error))) => {
+        (_, Some(Err(error))) => {
             diagnostics.push(format!("Wiki topic index unavailable: {error:#}"));
             Vec::new()
+        }
+        _ => Vec::new(),
+    };
+    let ranked = match (topic, semantic) {
+        (Some(_), Some(cosines)) => {
+            let mut supplements: std::collections::BTreeMap<_, _> = lexical
+                .into_iter()
+                .take(wiki_model::recall::MAX_INDEX_HITS)
+                .collect();
+            for (body, _) in cosines.iter() {
+                supplements.remove(body);
+                if supplements.is_empty() {
+                    break;
+                }
+            }
+            let mut scored = wiki_model::recall::semantic_bodies(cosines);
+            diagnostics.push(format!("Wiki topic scorer: WeMM, {} indexed content handles; {} lexical matches without semantic rows",
+                cosines.len(), supplements.len()));
+            if !supplements.is_empty() {
+                scored.extend(supplements);
+                scored.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            }
+            scored
+        }
+        (Some(_), None) if !wiki_omitted => {
+            diagnostics.push("Wiki topic scorer: lexical BM25".into());
+            lexical
         }
         _ => Vec::new(),
     };
@@ -6422,7 +6439,7 @@ async fn wake_selection(
                     &ranked,
                     &cover_opts,
                     unreadable,
-                );
+                )?;
                 Ok((None, pages))
             } else {
                 Ok((

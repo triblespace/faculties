@@ -1,6 +1,6 @@
 //! Shell syntax and local wall-clock parsing for Orient.
 use super::{NewsForm, Orient, ShowOptions, WaitOptions, WakeOptions, WakePairsOptions};
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{
     DateTime, Duration as ChronoDuration, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone,
 };
@@ -40,6 +40,9 @@ pub struct Cli {
     key: Option<PathBuf>,
     #[command(flatten)]
     workspace: crate::cli_workspace::WorkspaceArgs,
+    /// Explicit role IDs and descriptor handles as a JSON object. Unlisted roles remain unavailable.
+    #[arg(long, global = true, conflicts_with = "workspace", value_name = "JSON")]
+    collection_routes: Option<String>,
     /// Maximum age of a current local health report, in seconds (reader policy).
     #[arg(
         long,
@@ -415,11 +418,28 @@ pub fn execute(cli: Cli, out: &mut crate::out::Out<'_>) -> Result<()> {
         return Ok(());
     };
     let service_events_collection = cli_service_events_collection(
-        cli.workspace.workspace.is_some(),
+        cli.workspace.workspace.is_some() || cli.collection_routes.is_some(),
         cli.service_events_collection.as_deref(),
     )?;
-    let mut orient = Orient::with_storage(cli.workspace.storage(cli.pile, cli.key)?)
-        .with_health_max_age(Duration::from_secs(cli.health_max_age));
+    let mut storage = cli.workspace.storage(cli.pile, cli.key)?;
+    if let Some(raw) = cli.collection_routes {
+        let map: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&raw).context("decode explicit collection routes")?;
+        let routes = map
+            .into_iter()
+            .map(|(role, root)| {
+                let scope =
+                    crate::cli_workspace::parse_revision(&role).map_err(anyhow::Error::msg)?;
+                let mut digest = [0_u8; 32];
+                hex::decode_to_slice(&root, &mut digest)
+                    .context("parse explicit collection descriptor")?;
+                Ok((scope, triblespace::prelude::Inline::new(digest)))
+            })
+            .collect::<Result<_>>()?;
+        storage = storage.with_collections(routes);
+    }
+    let mut orient =
+        Orient::with_storage(storage).with_health_max_age(Duration::from_secs(cli.health_max_age));
     if let Some(collection) = service_events_collection {
         orient = orient.with_service_events_collection(collection);
     }

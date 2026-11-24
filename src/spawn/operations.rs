@@ -2353,13 +2353,25 @@ impl Spawn {
                 // Local executors read their own wake. Bind the hosted cue to
                 // the exact file and its text, including on a resumed run.
                 let handle = super::handle_text(super::text_handle(input));
-                let workspace = self
-                    .storage
-                    .selected_workspace()
-                    .map(|w| format!("{:x}", w.id));
+                let scope = if let Some(workspace) = self.storage.selected_workspace() {
+                    Some(serde_json::Value::String(format!("{:x}", workspace.id)))
+                } else {
+                    self.storage.collection_routes().map(|routes| {
+                        let descriptors = routes
+                            .iter()
+                            .map(|(role, root)| {
+                                (
+                                    format!("{role:x}"),
+                                    serde_json::Value::String(hex::encode(root.raw)),
+                                )
+                            })
+                            .collect();
+                        serde_json::Value::Object(descriptors)
+                    })
+                };
                 agent.env.push((
                     "SPAWN_BRIEF_TOPIC".to_owned(),
-                    serde_json::to_string(&(&brief_path, handle, about, workspace))?,
+                    serde_json::to_string(&(&brief_path, handle, about, scope))?,
                 ));
             }
             let script = super::unit_script(&ScriptFacts {
@@ -7163,6 +7175,19 @@ mod tests {
         assert!(semantic.contains("Wiki topic scorer: WeMM"));
         assert!(!semantic.contains("stale warp schedule"));
         assert!(!semantic.contains("retired warp experiment"));
+        let coverage_gap = WakeTint {
+            about: "warp".into(),
+            wiki_contents: Some(Arc::new(vec![(
+                super::super::text_handle("Prune an orchard after the leaves fall."),
+                0.1,
+            )])),
+            ..Default::default()
+        };
+        let supplemented = LibraryRenderer
+            .wake(&f.storage, Some(&coverage_gap), budget)
+            .unwrap();
+        assert!(supplemented.contains(&wiki.show(&format!("{fresh:x}"), true).unwrap()));
+        assert!(supplemented.contains("lexical matches without semantic rows"));
         assert!(!wake("warp", 80).contains(crate::wiki::recall::HEADING));
         for cue in ["", "unmatchedkeyword"] {
             let broad = wake(cue, budget);

@@ -32,7 +32,7 @@ pub(crate) const HEADING: &str = "\nWiki (about this topic):\n";
 const MAX_MATCHING_TEXTS: usize = 128;
 const MAX_HEADS: usize = 24;
 const MAX_READINGS: usize = 4;
-const MAX_INDEX_HITS: usize = MAX_MATCHING_TEXTS * MAX_READINGS;
+pub(crate) const MAX_INDEX_HITS: usize = MAX_MATCHING_TEXTS * MAX_READINGS;
 
 #[derive(Default)]
 pub(crate) struct TopicReadings {
@@ -49,11 +49,11 @@ impl TopicReadings {
         ranked: &[(TextHandle, f32)],
         options: &crate::memory_cover::CoverOpts,
         unreadable: &crate::storage::Unreadable<'_>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut selected = Self::default();
         let allowance = options.budget_chars / 2;
         if allowance <= HEADING.len() {
-            return selected;
+            return Ok(selected);
         }
         // The personal reader historically accepts every ASCII spelling of
         // "cover". Query those exact text handles; no tag bodies need scanning.
@@ -102,10 +102,15 @@ impl TopicReadings {
             let mut current = false;
             for rev in find!(rev: Id, and!(
                 latest.has(rev), pattern!(facts, [{ ?rev @ attrs::content: body }])
-            )) {
+            ))
+            .take(MAX_HEADS)
+            {
                 if active(facts, rev) {
                     current = true;
                     matched.entry(rev).or_insert(score);
+                    // One representative per matched body. Independently endorsed
+                    // siblings already participate through the tag queries above.
+                    break;
                 }
             }
             texts += usize::from(current);
@@ -169,15 +174,14 @@ impl TopicReadings {
                 break;
             }
             opened += 1;
-            let show = match operations::render_show(facts, latest, reader, revision, false) {
-                Ok(show) => show,
-                Err(error) => {
-                    let reason = unreadable(&error).unwrap_or_else(|| format!("{error:#}"));
-                    selected
-                        .skipped
-                        .push(format!("Wiki topic revision {revision:x}: {reason}"));
-                    continue;
-                }
+            let Some(show) = presentable(
+                operations::render_show(facts, latest, reader, revision, false),
+                unreadable,
+                &mut selected.skipped,
+                || format!("Wiki topic revision {revision:x}"),
+            )?
+            else {
+                continue;
             };
             // Include the section heading once, the newline between readings,
             // and the consumer's per-pair overhead. Never clip a revision.
@@ -205,7 +209,7 @@ impl TopicReadings {
                 "Wiki recall considered up to {MAX_INDEX_HITS} ranked texts and {MAX_MATCHING_TEXTS} matching current texts"
             ));
         }
-        selected
+        Ok(selected)
     }
 }
 

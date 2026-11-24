@@ -406,7 +406,32 @@ pub struct Resolved {
 /// configuration and chat template from its core (refused when it has none:
 /// a member-only root is not a complete WeMM model).
 pub fn resolve(pile: &Path, handle: CollectionHandle, root: Id) -> Result<Resolved> {
-    let snapshot = crate::model_storage::models_in(pile, handle)?;
+    resolve_snapshot(
+        pile,
+        handle,
+        root,
+        crate::model_storage::models_in(pile, handle)?,
+    )
+}
+
+fn resolve_workspace(
+    pile: &Path,
+    handle: CollectionHandle,
+    root: Id,
+    signer: ed25519_dalek::VerifyingKey,
+) -> Result<Resolved> {
+    let store = mary::persist::read_model_pile_snapshot_read_only(pile)?;
+    let collection = crate::collection_names::open_workspace_read_in(&store, signer, handle)?;
+    let snapshot = mary::model_collection::snapshot_model_collection_for(&store, collection)?;
+    resolve_snapshot(pile, handle, root, snapshot)
+}
+
+fn resolve_snapshot(
+    pile: &Path,
+    handle: CollectionHandle,
+    root: Id,
+    snapshot: mary::model_collection::ModelPileSnapshot,
+) -> Result<Resolved> {
     let collection = Collection::<SimpleArchive>::open(snapshot.store(), handle)
         .map_err(|error| anyhow::anyhow!("open the model collection: {error}"))?;
     anyhow::ensure!(
@@ -647,6 +672,15 @@ impl Session {
     }
 
     fn bind(pile: &Path, request: BindRequest, host: &CopyHost) -> Result<Self> {
+        Self::bind_resolving(pile, request, host, resolve)
+    }
+
+    fn bind_resolving(
+        pile: &Path,
+        request: BindRequest,
+        host: &CopyHost,
+        resolve: impl FnOnce(&Path, CollectionHandle, Id) -> Result<Resolved>,
+    ) -> Result<Self> {
         let BindRequest {
             collection,
             root,
@@ -1024,7 +1058,7 @@ pub(crate) fn score_wake(
     };
     let memory_attrs = crate::memory::operations::content_attributes();
     let wiki_attrs = [wiki::attrs::content.id()];
-    let loaded = routing.with_store(|store, signer, runtime| {
+    let (loaded, workspace_signer) = routing.with_store(|store, signer, runtime| {
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         if routing.collection_routes().is_some() {
             crate::collection_names::open_workspace_read_in(
@@ -1084,12 +1118,23 @@ pub(crate) fn score_wake(
                     .push(format!("{role} WeMM index unavailable: {e:#}")),
             }
         }
-        Ok(inputs)
+        Ok((
+            inputs,
+            routing.collection_routes().map(|_| signer.verifying_key()),
+        ))
     })?;
     if loaded.is_empty() {
         return Ok(());
     }
-    let session = Session::bind(routing.path(), request, &CopyHost::this_host())?;
+    let session = Session::bind_resolving(
+        routing.path(),
+        request,
+        &CopyHost::this_host(),
+        |pile, handle, root| match workspace_signer {
+            Some(signer) => resolve_workspace(pile, handle, root, signer),
+            None => resolve(pile, handle, root),
+        },
+    )?;
     let indexes: Vec<_> = loaded
         .iter()
         .map(|(_, mapping, index)| (mapping, index))
@@ -1105,6 +1150,19 @@ pub(crate) fn score_wake(
         session.profile.label()
     ));
     for ((scope, _, _), scores) in loaded.into_iter().zip(scores) {
+        let scores = match scores {
+            Ok(scores) => scores,
+            Err(error) => {
+                let role = if scope == memory::DEFAULT_SCOPE_ID {
+                    "Memory"
+                } else {
+                    "Wiki"
+                };
+                tint.diagnostics
+                    .push(format!("{role} WeMM scoring failed: {error}"));
+                continue;
+            }
+        };
         if scope == memory::DEFAULT_SCOPE_ID {
             tint.memory_contents = Some(Arc::new(scores));
         } else {
@@ -1663,7 +1721,35 @@ mod tests {
             pile.commit(collection, &key, facts).unwrap();
             models.push(collection.handle());
         }
+        let alias_key = SigningKey::from_bytes(&[0x61; 32]);
+        let alias = pile
+            .collection(
+                "team-models",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(alias_key.verifying_key()),
+                    AdmissionPolicy::direct(alias_key.verifying_key()),
+                ),
+            )
+            .unwrap();
+        let alias_handle = alias.handle();
         pile.close().unwrap();
+        // An explicitly routed models collection has its own name. The model
+        // lookup reaches the root check after READ admission on that descriptor.
+        let err = resolve_workspace(&path, alias_handle, root, alias_key.verifying_key())
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("is not stated by the model collection"),
+            "{err:#}"
+        );
+        let other_key = SigningKey::from_bytes(&[0x62; 32]);
+        let err = resolve_workspace(&path, alias_handle, root, other_key.verifying_key())
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("not admitted to READ"),
+            "{err:#}"
+        );
         assert_ne!(models[0], models[1], "two collections");
         let error = match resolve(&path, models[1], root) {
             Ok(_) => panic!("resolved a root its collection does not state"),

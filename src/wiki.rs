@@ -1668,6 +1668,7 @@ mod tests {
                 &crate::memory_cover::CoverOpts::plain(2200),
                 &|_| None,
             )
+            .unwrap()
         };
         let specific = select(&ranked);
         assert!(specific.pages.iter().any(|(id, _)| *id == small_id));
