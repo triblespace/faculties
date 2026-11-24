@@ -2,7 +2,7 @@
 //! IN-PROCESS by more than one caller.
 //!
 //! `memory context` (in `src/bin/memory.rs`) and `orient wake` (in
-//! `src/bin/orient.rs`) both need the same density-shaped recollection of a
+//! `src/bin/orient.rs`) both need the same recollection of a
 //! persona's memories, fit to a character budget and rendered to a string.
 //! Keeping the render (and the chunk accessors it needs) here means the two
 //! callers can never drift: the recollection semantics, character budget, and
@@ -32,6 +32,10 @@ use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
 
 use crate::schemas::memory::{ctx, KIND_CHUNK_ID};
+
+mod fill;
+
+pub use fill::{select_recollection_cut, RecollectionCut, PIECE_NS};
 
 // ---------------------------------------------------------------------------
 // on-demand chunk queries — moved here from memory.rs so the render is
@@ -455,7 +459,7 @@ pub struct CoverOpts {
 }
 
 impl CoverOpts {
-    /// Plain density-shaped recollection: no semantic gating or substitution.
+    /// Plain recollection: no semantic gating or substitution.
     pub fn plain(budget_chars: usize) -> Self {
         CoverOpts {
             budget_chars,
@@ -475,162 +479,11 @@ impl CoverOpts {
 /// with an ideal slot; otherwise its temporal density would be exactly zero.
 const MOMENT_NS: i128 = (crate::memory::MOMENT_SECONDS * 1_000_000_000.0) as i128;
 
-// ---------------------------------------------------------------------------
-// density-shaped recollection
-// ---------------------------------------------------------------------------
-
-/// The ideal temporal point and grain at one character position in a reader's
-/// memory space. Times are offsets from the beginning of the remembered life,
-/// avoiding precision loss from converting absolute TAI nanoseconds to `f64`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DensitySample {
-    pub time_ns: f64,
-    pub time_per_char_ns: f64,
-}
-
-/// A continuous map from a fixed character space onto an arbitrarily long
-/// remembered life.
-///
-/// Characters are uniform in `ln(moment + age)`, where age is measured back
-/// from the newest memory. Consequently the wanted temporal density grows
-/// exponentially into the past. The existing three-second memory moment is
-/// the only scale anchor; there is no calendar cell, tile width, level, or
-/// fitted detail. Integrating [`DensityGradient::sample`] from zero to `space`
-/// yields exactly `life_ns`.
-#[derive(Clone, Copy, Debug)]
-pub struct DensityGradient {
-    life_ns: f64,
-    space: usize,
-    rate: f64,
-}
-
-impl DensityGradient {
-    pub fn new(life_ns: i128, space: usize) -> Self {
-        let life_ns = life_ns.max(MOMENT_NS) as f64;
-        let space = space.max(1);
-        let moment = MOMENT_NS as f64;
-        let rate = (life_ns / moment).ln_1p() / space as f64;
-        Self {
-            life_ns,
-            space,
-            rate,
-        }
-    }
-
-    pub fn sample(&self, cursor: usize) -> DensitySample {
-        let cursor = cursor.min(self.space) as f64;
-        let behind = self.space as f64 - cursor;
-        let exponent = self.rate * behind;
-        let moment = MOMENT_NS as f64;
-        let age = moment * exponent.exp_m1();
-        DensitySample {
-            time_ns: (self.life_ns - age).clamp(0.0, self.life_ns),
-            time_per_char_ns: moment * self.rate * exponent.exp(),
-        }
-    }
-}
-
-/// The lossy recollection selected for one reader. `cover` is in greedy SPACE
-/// cursor order. Temporal centres may wobble when ranges overlap or support is
-/// sparse.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecollectionCut {
-    pub cover: Vec<usize>,
-    pub used: usize,
-}
-
-/// Greedily approximate the continuous density gradient with the memories the
-/// journal actually contains.
-///
-/// A candidate's charged size turns the cursor into one ideal temporal slot:
-/// `[gradient(cursor), gradient(cursor + cost)]`. The closest memory is the one
-/// whose actual start and end best match those two endpoints. Centre and
-/// density are therefore not separately weighted objectives: they are the
-/// midpoint and width of the same interval comparison, including the
-/// gradient's curvature across a long memory. Local overshoot is deliberate:
-/// the cursor remains on the ideal field, so subsequent memories may fall
-/// inside or leave gaps around an earlier range. This is recollection, not an
-/// interval partition.
-///
-/// Each exact-span structural class may appear once. The first best candidate
-/// which cannot fit ends the recollection, exactly as a physical
-/// reader whose remaining space is smaller than the next memory. Intrinsic id
-/// is the final tie-break, making the projection independent of input order.
-pub fn select_recollection_cut(
-    spans: &[(i128, i128, Id)],
-    costs: &[usize],
-    eligible: &[bool],
-    budget: usize,
-) -> RecollectionCut {
-    assert_eq!(spans.len(), costs.len());
-    assert_eq!(spans.len(), eligible.len());
-    let (Some(earliest), Some(latest)) = (
-        spans.iter().map(|span| span.0).min(),
-        spans.iter().map(|span| span.1).max(),
-    ) else {
-        return RecollectionCut {
-            cover: Vec::new(),
-            used: 0,
-        };
-    };
-    if budget == 0 {
-        return RecollectionCut {
-            cover: Vec::new(),
-            used: 0,
-        };
-    }
-
-    let gradient = DensityGradient::new(latest.saturating_sub(earliest), budget);
-    let mut selected = vec![false; spans.len()];
-    let mut cover = Vec::new();
-    let mut used = 0usize;
-
-    while used < budget {
-        let ideal_start = gradient.sample(used).time_ns;
-        let mut best: Option<(f64, Id, usize)> = None;
-        for (i, &(start, end, id)) in spans.iter().enumerate() {
-            let cost = costs[i];
-            if selected[i] || !eligible[i] || cost == 0 {
-                continue;
-            }
-            let width = end.saturating_sub(start).max(MOMENT_NS) as f64;
-            let actual_start = start.saturating_sub(earliest) as f64;
-            let actual_end = actual_start + width;
-            let ideal_end = gradient.sample(used.saturating_add(cost)).time_ns;
-            let start_error = actual_start - ideal_start;
-            let end_error = actual_end - ideal_end;
-            let score = start_error.mul_add(start_error, end_error * end_error);
-            let candidate = (score, id, i);
-            if best.as_ref().is_none_or(|current| {
-                candidate
-                    .0
-                    .total_cmp(&current.0)
-                    .then(candidate.1.cmp(&current.1))
-                    .is_lt()
-            }) {
-                best = Some(candidate);
-            }
-        }
-        let Some((_, _, pick)) = best else {
-            break;
-        };
-        let next = used.saturating_add(costs[pick]);
-        if next > budget {
-            break;
-        }
-        selected[pick] = true;
-        cover.push(pick);
-        used = next;
-    }
-
-    RecollectionCut { cover, used }
-}
-
 /// Gaps longer than one quarter of the currently available life which no
 /// selected memory overlaps.
 ///
 /// This is an instrument, never an admission rule: recollection remains the
-/// pure greedy projection above. A reported silent era points to missing
+/// pure projection of [`select_recollection_cut`]. A reported silent era points to missing
 /// coarse support for the comb to improve. Overlapping selected memories are
 /// unioned before gaps are measured.
 pub fn silent_life_quarters(spans: &[(i128, i128, Id)], cover: &[usize]) -> Vec<(i128, i128)> {
@@ -845,7 +698,7 @@ pub struct ReplayRow {
 /// in the recollection algorithm.
 pub const REPLAY_QUANTUM_NS: i128 = (1i128 << 14) * 1_000_000_000;
 
-/// Replay density-shaped recollection over the pile's observation history.
+/// Replay the recollection over the pile's observation history.
 pub fn replay_cover<B: BlobStoreGet, P: TriblePattern>(
     space: &P,
     ws: &B,
@@ -1235,14 +1088,13 @@ where
     let used = cut.used;
     let cover = cut.cover;
 
-    // The selected SPACE order is the emitted order. Reordering by lived time
-    // would move memories away from the ideal slots which chose them and hide
-    // where the journal lacks appropriately dense support. Ranges may therefore
-    // overlap, leave gaps, or wobble backwards in lived time.
+    // The selected order is the emitted order: the oldest bucket first, then
+    // the open piece. A piece keeps the order its memories were taken in, so
+    // ranges may overlap, leave gaps, or wobble backwards in lived time.
     let mode = {
         let mut parts = vec![match about {
             Some(q) => format!("recollections about \"{q}\" within equal spans"),
-            None => "density-shaped recollection".to_string(),
+            None => "filled buckets".to_string(),
         }];
         if let Some(q) = filter_q {
             parts.push(format!("filtered to \"{q}\""));
@@ -1263,7 +1115,7 @@ where
         if !without_tags.is_empty() {
             parts.push(format!("without tag {}", quoted(&without_tags, " or ")));
         }
-        format!("greedy SPACE order; {}", parts.join("; "))
+        format!("oldest first; {}", parts.join("; "))
     };
     // The status header goes to STDERR, not into the returned cover buffer: the
     // time-ranges are the drill key the wake ritual ingests, and this line's
@@ -1845,6 +1697,65 @@ mod recollection_tests {
         );
     }
 
+    /// `created_at` is not an input: permuting every memory's observation time
+    /// leaves the rendered cover byte-identical.
+    #[test]
+    fn permuting_created_at_leaves_the_cover_byte_identical() {
+        use crate::memory::{chunk_fragment, ChunkDraft, ChunkDraftContent};
+        use triblespace::core::blob::MemoryBlobStore;
+        use triblespace::core::repo::SnapshotSource;
+        let point = |key: i128| {
+            let epoch = key_to_epoch(key);
+            (epoch, epoch).try_to_inline().unwrap()
+        };
+        let hour = 3600 * 1_000_000_000;
+        let base: i128 = 20_000 * 24 * hour + 123_456_789;
+        let spans: Vec<(i128, i128)> = (0..30 * 24)
+            .map(|h| (base + h * hour, base + (h + 1) * hour))
+            .chain((0..25).map(|d| (base + 24 * d * hour, base + 24 * (d + 1) * hour)))
+            .collect();
+        let render = |shift: usize| {
+            let mut facts = TribleSet::new();
+            let mut blobs = MemoryBlobStore::new();
+            for (k, &(start, end)) in spans.iter().enumerate() {
+                // Observation times are a rotation of the range ends.
+                let observed = spans[(k + shift) % spans.len()].1;
+                let (fragment, _) = chunk_fragment(ChunkDraft {
+                    content: ChunkDraftContent::Text(format!("memory {k}, {}.", "x".repeat(k % 9))),
+                    start_at: point(start),
+                    end_at: point(end),
+                    tags: BTreeSet::new(),
+                    references: BTreeSet::new(),
+                    about_exec_result: None,
+                    about_archive_message: None,
+                    observed_at: BTreeSet::from([point(observed)]),
+                    aliases: BTreeSet::new(),
+                })
+                .unwrap();
+                let (chunk_facts, chunk_blobs) = fragment.into_facts_and_blobs();
+                facts += chunk_facts;
+                blobs.union(chunk_blobs);
+            }
+            let reader = blobs.snapshot().unwrap();
+            let report =
+                render_cover_report(&facts, &reader, &CoverOpts::plain(6_000), &mut |_| Ok(None))
+                    .unwrap();
+            let raw = collect_chunk_spans(&facts);
+            let (_, classes) = recollection_classes(&raw);
+            (
+                report,
+                recollection_class_observations(&facts, &raw, &classes).0,
+            )
+        };
+        let (want, observed) = render(0);
+        assert!(want.entries.len() > 10 && want.entries.len() < spans.len());
+        for shift in [1, 17, 400] {
+            let (moved, moved_observed) = render(shift);
+            assert_ne!(moved_observed, observed, "the permutation moved created_at");
+            assert_eq!(moved, want);
+        }
+    }
+
     fn ids(n: usize) -> Vec<Id> {
         (1..=n)
             .map(|k| {
@@ -1854,176 +1765,6 @@ mod recollection_tests {
                 .unwrap()
             })
             .collect()
-    }
-
-    #[test]
-    fn gradient_integrates_the_life_and_gets_finer_toward_now() {
-        let life = 1023 * MOMENT_NS;
-        let space = 10_000;
-        let gradient = DensityGradient::new(life, space);
-        let old = gradient.sample(0);
-        let young = gradient.sample(space);
-
-        assert!(old.time_ns.abs() < life as f64 * 1e-12);
-        assert!((young.time_ns - life as f64).abs() < life as f64 * 1e-12);
-        assert!(old.time_per_char_ns > young.time_per_char_ns);
-
-        // Trapezoidal integration is enough to catch a density which does not
-        // actually map the whole reader space onto the whole remembered life.
-        let mut integral = 0.0;
-        for cursor in 0..space {
-            let a = gradient.sample(cursor).time_per_char_ns;
-            let b = gradient.sample(cursor + 1).time_per_char_ns;
-            integral += (a + b) / 2.0;
-        }
-        let relative_error = (integral - life as f64).abs() / life as f64;
-        assert!(relative_error < 1e-6, "{relative_error}");
-    }
-
-    #[test]
-    fn recollection_is_deliberately_lossy() {
-        let id = ids(101);
-        let life = 1000 * MOMENT_NS;
-        let mut spans = vec![(0, life, id[0])];
-        let mut costs = vec![10usize];
-        for i in 0..100 {
-            let start = i as i128 * 10 * MOMENT_NS;
-            spans.push((start, start + 10 * MOMENT_NS, id[i + 1]));
-            costs.push(10);
-        }
-
-        let cut = select_recollection_cut(&spans, &costs, &[true; 101], 50);
-        assert_eq!(cut.used, 50);
-        assert_eq!(cut.cover.len(), 5);
-        assert!(
-            cut.cover.len() < spans.len(),
-            "the unselected memories remain losslessly journaled, not forced into active recall"
-        );
-    }
-
-    #[test]
-    fn greedy_projection_ignores_candidate_input_order() {
-        let original = [
-            (0, 100 * MOMENT_NS, A),
-            (0, 50 * MOMENT_NS, B),
-            (50 * MOMENT_NS, 100 * MOMENT_NS, C),
-        ];
-        let mut expected = None;
-        for permutation in [
-            [0usize, 1, 2],
-            [0, 2, 1],
-            [1, 0, 2],
-            [1, 2, 0],
-            [2, 0, 1],
-            [2, 1, 0],
-        ] {
-            let spans: Vec<_> = permutation.into_iter().map(|i| original[i]).collect();
-            let cut = select_recollection_cut(&spans, &[5; 3], &[true; 3], 10);
-            let ids: Vec<_> = cut.cover.iter().map(|&i| spans[i].2).collect();
-            if let Some(expected) = &expected {
-                assert_eq!(&ids, expected);
-            } else {
-                expected = Some(ids);
-            }
-        }
-    }
-
-    #[test]
-    fn greedy_space_order_is_not_chronologically_repaired() {
-        let spans = vec![
-            (0, 80 * MOMENT_NS, A),
-            (80 * MOMENT_NS, 100 * MOMENT_NS, B),
-            (50 * MOMENT_NS, 60 * MOMENT_NS, C),
-        ];
-
-        let cut = select_recollection_cut(&spans, &[5; 3], &[true; 3], 15);
-        let selected: Vec<_> = cut.cover.iter().map(|&i| spans[i].2).collect();
-
-        assert_eq!(selected, vec![A, B, C]);
-        assert!(
-            spans[cut.cover[2]].0 < spans[cut.cover[1]].0,
-            "the final fallback stays in its selected SPACE slot"
-        );
-    }
-
-    #[test]
-    fn candidate_length_defines_one_ideal_temporal_slot() {
-        let id = ids(5);
-        let life = 1000 * MOMENT_NS;
-        let budget = 101;
-        let cost = 10;
-        let gradient = DensityGradient::new(life, budget);
-        let ideal_end = gradient.sample(cost).time_ns.round() as i128;
-        let shift = ideal_end / 4;
-        let spans = vec![
-            // Ineligible boundary observations establish LIFE without taking
-            // part in the choice.
-            (0, 0, id[0]),
-            (life, life, id[1]),
-            // Exact slot, same-width shifted slot, and same-centre narrow slot.
-            (0, ideal_end, id[2]),
-            (shift, ideal_end + shift, id[3]),
-            (ideal_end / 4, ideal_end * 3 / 4, id[4]),
-        ];
-        let cut = select_recollection_cut(
-            &spans,
-            &[1, 1, cost, cost, cost],
-            &[false, false, true, true, true],
-            budget,
-        );
-
-        assert_eq!(cut.cover.first(), Some(&2));
-    }
-
-    #[test]
-    fn sampled_grain_gets_finer_toward_the_present() {
-        let id = ids(17);
-        let life = 4096 * MOMENT_NS;
-        let mut spans = vec![(0, life, id[0])];
-        let mut costs = vec![1usize];
-
-        // Abundant support at geometrically decreasing widths. Each scale has
-        // an old and young representative, so the field rather than scarcity
-        // determines the selected grain.
-        for level in 0..8 {
-            let width = (1i128 << (11 - level)) * MOMENT_NS;
-            let old_start = (1i128 << level) * MOMENT_NS;
-            let young_end = life - (1i128 << level) * MOMENT_NS;
-            spans.push((old_start, old_start + width, id[1 + level * 2]));
-            spans.push((young_end - width, young_end, id[2 + level * 2]));
-            costs.extend([8, 8]);
-        }
-
-        let cut = select_recollection_cut(&spans, &costs, &[true; 17], 49);
-        let selected: Vec<_> = cut.cover.iter().copied().filter(|&i| i != 0).collect();
-        assert!(selected.len() >= 2, "{selected:?}");
-        let oldest = selected
-            .iter()
-            .min_by_key(|&&i| spans[i].0 + (spans[i].1 - spans[i].0) / 2)
-            .copied()
-            .unwrap();
-        let youngest = selected
-            .iter()
-            .max_by_key(|&&i| spans[i].0 + (spans[i].1 - spans[i].0) / 2)
-            .copied()
-            .unwrap();
-        let old_width = spans[oldest].1 - spans[oldest].0;
-        let young_width = spans[youngest].1 - spans[youngest].0;
-        assert!(
-            old_width > young_width,
-            "old {oldest} width {old_width}, young {youngest} width {young_width}, selected {selected:?}"
-        );
-    }
-
-    #[test]
-    fn first_best_sample_that_does_not_fit_ends_the_walk() {
-        let id = ids(1);
-        let life = 100 * MOMENT_NS;
-        let spans = vec![(0, life, id[0])];
-        let cut = select_recollection_cut(&spans, &[11], &[true], 10);
-
-        assert!(cut.cover.is_empty());
-        assert_eq!(cut.used, 0);
     }
 
     #[test]

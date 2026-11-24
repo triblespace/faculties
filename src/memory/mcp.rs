@@ -90,7 +90,7 @@ static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "memory_context",
-        description: "Greedy density-shaped, deliberately lossy recollection in selected SPACE order. First text part is exact charged cover text; later diagnostic part is outside its budget. Filters are chunk-level: coarse prose can mention excluded material, and unscorable images fail open with explicit warnings. filter/remove are fuzzy (similarity over a threshold); tags/without_tags are crisp (a memory carries the tag or not); all compose.",
+        description: "Deliberately lossy recollection filled from buckets of age, oldest first. The budget is the most it may use. First text part is exact charged cover text; later diagnostic part is outside its budget. Filters are chunk-level: coarse prose can mention excluded material, and unscorable images fail open with explicit warnings. filter/remove are fuzzy (similarity over a threshold); tags/without_tags are crisp (a memory carries the tag or not); all compose.",
         input_schema: r#"{"type":"object","properties":{"budget_chars":{"type":"integer","minimum":0,"default":200000},"chunk_overhead":{"type":"integer","minimum":0,"default":0},"about":{"type":"string"},"filter":{"type":"string"},"remove":{"type":"string"},"sim_threshold":{"type":"number","minimum":0,"maximum":1,"default":0.55},"tags":{"type":"array","items":{"type":"string","minLength":1},"description":"Keep only memories carrying every one of these tags."},"without_tags":{"type":"array","items":{"type":"string","minLength":1},"description":"Drop memories carrying any of these tags."}},"required":[],"additionalProperties":false}"#,
     },
     Tool {

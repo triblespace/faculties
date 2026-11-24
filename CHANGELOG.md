@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The memory cover is filled from buckets of age, and that is the only
+  selector: `memory context`, every form of `orient wake`, zooid wakes and
+  `memory churn` use it, and the greedy density walk is gone. A bucket holds
+  pieces of one width, about 18 hours at the bottom and four times wider in
+  each bucket above. It aims for four and folds its oldest four into one piece
+  of the next bucket when it would hold its eighth. Every bucket has the same
+  share of the budget and every piece of a bucket the same size; what a piece
+  leaves goes only to the next newer piece of its bucket, so a piece that
+  finishes moves none before it. The boundaries depend on lived time alone.
+  The newest 18-hour piece is append-only. A cover uses about three quarters
+  of the characters it is given on average and leaves the rest free: the
+  requested budget is the most it may use, not what it aims for.
+
 - Teams shows every current version of a message. Two versions the source
   gave one modification time, or an edit and a removal seen by hosts which
   pulled independently, are unordered observations: `teams read` and the

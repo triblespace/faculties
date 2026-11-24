@@ -1767,7 +1767,7 @@ const PLAIN_WAKE_GOLDEN: &str = concat!(
     "- [69933ebe77fb616624ea4d4c9580732b] Todo second #later\n",
     "- [23a1295caa279a9cf697d5e26032bd1c] Todo first\n",
     "Memory diagnostics (outside the charged cover text):\n",
-    "memory context — 4 of 4 eligible memories recalled, ~360 of 800000 characters (0.0% full; greedy SPACE order; density-shaped recollection)\n",
+    "memory context — 4 of 4 eligible memories recalled, ~360 of 800000 characters (0.0% full; oldest first; filled buckets)\n",
 );
 
 #[test]

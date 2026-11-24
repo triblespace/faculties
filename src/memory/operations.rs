@@ -305,7 +305,7 @@ impl Memory {
         })
     }
     /// Exact charged text is separate from diagnostics, including fail-open
-    /// filter/remove warnings. Selection and emitted SPACE order are unchanged.
+    /// filter/remove warnings. Selection and emitted order are unchanged.
     pub fn context(&self, options: &CoverOpts) -> Result<CoverReport> {
         if !options.sim_threshold.is_finite() || !(0.0..=1.0).contains(&options.sim_threshold) {
             bail!("sim_threshold must be a finite number in [0, 1]");
@@ -1879,7 +1879,7 @@ fn list(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -> R
     Ok(())
 }
 
-/// `memory churn` replays density-shaped recollection over the journal's
+/// `memory churn` replays the recollection over the journal's
 /// observation history. The fixed step is diagnostic cadence only; it is not a
 /// boundary or quantisation in the selector.
 fn churn(storage: MemoryStorage<'_>, opts: &ChurnOptions, out: &mut Out<'_>) -> Result<()> {
@@ -2038,7 +2038,7 @@ fn check(storage: MemoryStorage<'_>, grain_raw: &str, out: &mut Out<'_>) -> Resu
 /// containment hierarchy is BUSHY: a span with many direct *leaf* children and
 /// no intermediate arc summary combing them into mid-level groups. That is a
 /// useful journal-maintenance signal: a middle-scale narrative may be missing,
-/// even though density-shaped recollection can freely sample the leaves. This
+/// even though the recollection can freely sample the leaves. This
 /// diagnostic does not drive or constrain recollection and writes nothing.
 /// Optional `<grain>` restricts the report to spans of width <= grain.
 fn density(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -> Result<()> {
@@ -3900,42 +3900,60 @@ mod tests {
         let loaded = seed_cover_cost_fixture(&pile);
 
         // Rendered costs include 43 framing characters: root=47 and each
-        // child=46. A budget of 139 admits all three candidates.
-        let intrinsic =
-            build_context_cover(&loaded, 139, 0, None, None, None, DEFAULT_SIM_THRESHOLD)
-                .expect("intrinsic recollection");
-        assert!(intrinsic.contains("root"));
-        assert!(intrinsic.contains("one"));
-        assert!(intrinsic.contains("two"));
+        // child=46. This budget admits all three.
+        let cover = |overhead| {
+            build_context_cover(
+                &loaded,
+                1_200,
+                overhead,
+                None,
+                None,
+                None,
+                DEFAULT_SIM_THRESHOLD,
+            )
+            .expect("recollection")
+        };
+        let intrinsic = cover(0);
+        assert!(["root", "one", "two"]
+            .iter()
+            .all(|text| intrinsic.contains(text)));
 
-        // Charging fifty per selected chunk makes root=97 and each child=96,
-        // so the same budget has only 42 characters of sampling space.
-        let charged =
-            build_context_cover(&loaded, 139, 50, None, None, None, DEFAULT_SIM_THRESHOLD)
-                .expect("charged recollection");
-        assert!(charged.contains("root"));
-        assert!(!charged.contains("one"));
-        assert!(!charged.contains("two"));
+        // Charging 250 per selected chunk leaves the same budget room for
+        // fewer of them, and the rendered text of those is unchanged.
+        let charged = cover(250);
+        let kept = rendered_ranges(&charged).len();
+        assert!(kept >= 1 && kept < 3, "{charged}");
+        assert!(!charged.contains("250"));
     }
 
     #[test]
-    fn chunk_overhead_is_charged_once_per_selected_chunk_at_exact_boundaries() {
+    fn chunk_overhead_is_charged_once_per_selected_chunk() {
         let pile = TestPile::new();
         let loaded = seed_cover_cost_fixture(&pile);
 
-        // The best first memory costs root(47) + one overhead(2) = 49. Below
-        // that boundary the greedy walk stops without violating the budget.
+        // The cheapest memory costs 46 + one overhead(2) = 48, and no slot of
+        // a 48 character budget is that wide.
         let below_first =
             build_context_cover(&loaded, 48, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
                 .expect("an empty in-budget recollection");
         assert!(below_first.is_empty());
 
-        // The root plus both children costs 49 + 48 + 48 = 145.
-        let exact = build_context_cover(&loaded, 145, 2, None, None, None, DEFAULT_SIM_THRESHOLD)
-            .expect("exact charged split");
-        assert!(exact.contains("root"));
-        assert!(exact.contains("one"));
-        assert!(exact.contains("two"));
+        // The root plus both children cost 49 + 48 + 48 = 145.
+        let mut options = CoverOpts::plain(1_200);
+        options.chunk_overhead = 2;
+        let report = crate::memory_cover::render_cover_report(
+            &loaded.memory.facts,
+            &loaded.memory.reader,
+            &options,
+            &mut |_| Ok(None),
+        )
+        .unwrap();
+        assert_eq!(report.entries.len(), 3);
+        assert!(
+            report.diagnostics[0].contains("~145 of 1200 characters"),
+            "{:?}",
+            report.diagnostics
+        );
     }
 
     fn rendered_ranges(cover: &str) -> Vec<&str> {

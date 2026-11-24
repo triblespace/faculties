@@ -302,7 +302,7 @@ fn library_cli_and_mcp_agree_on_resident_reads_and_exact_cover_text() {
     assert!(report
         .diagnostics
         .iter()
-        .any(|value| value.contains("greedy SPACE order")));
+        .any(|value| value.contains("oldest first")));
 }
 
 #[test]
