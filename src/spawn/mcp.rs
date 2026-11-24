@@ -1,4 +1,5 @@
-//! Zooid MCP: launch from brief text, read what was spawned. No waiting tool:
+//! Zooid MCP: launch from brief text, declare where a zooid lives, read what
+//! was spawned. No waiting tool:
 //! a call must be finite, and a launched zooid messages its spawner itself.
 
 use std::path::PathBuf;
@@ -6,9 +7,12 @@ use std::path::PathBuf;
 use anybytes::Bytes;
 use anyhow::{bail, Result};
 use serde::Deserialize;
+use triblespace::prelude::Id;
 
 use super::operations::{render_list, render_show};
-use super::{CoverWish, GoalRequest, LaunchConfig, Launched, Provider, RunRequest};
+use super::{
+    CoverWish, DeclareRequest, GoalRequest, LaunchConfig, Launched, PlaceWish, Provider, RunRequest,
+};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 
@@ -24,13 +28,18 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Ranked Wiki pages have an allowance of their own beside the journal's budget. Goals render whole. Sizing is returned and recorded. Default: 240,000 journal characters, and up to 40,000 of Wiki readings."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
+        name: "zooid_declare",
+        description: "Record where and how a zooid lives: here (the MCP server's host), on one host, on any host, or at rest. Name exactly one of them. The declaration follows every one standing in this observation; zooid_show shows it. It starts, stops and asks nothing, and is valid whether or not anything realises it. When the one standing declaration already says the same place and model, nothing is written. persona is who records it; a zooid may declare for itself. Recording needs WRITE on the Spawn collection, as every Spawn fact does: that shows who may record, not who may speak for a zooid.",
+        input_schema: r#"{"type":"object","properties":{"name":{"type":"string","minLength":1,"description":"The zooid's name."},"persona":{"type":"string","minLength":1,"description":"The active persona recording it (label or id). No PERSONA fallback."},"here":{"type":"boolean","description":"On the MCP server's host."},"host":{"type":"string","minLength":1,"description":"On the host with this node key (64 hex digits)."},"any_host":{"type":"boolean","description":"On whichever host takes it up."},"rest":{"type":"boolean","description":"Nowhere: the zooid exists and rests. Binds no model."},"model_spec":{"type":"string","minLength":1,"description":"Bind this immutable model specification (hex id), such as a model root in the Models collection. Without it the node chooses."},"model_label":{"type":"string","minLength":1,"description":"A model label to show. It binds nothing."},"why":{"type":"string","minLength":1}},"required":["name","persona"],"additionalProperties":false}"#,
+    },
+    Tool {
         name: "zooid_list",
         description: "Every spawned zooid, one line each: name, number of runs, how the latest ended, the brief's first line.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
         name: "zooid_show",
-        description: "One spawned zooid by name with all its runs: start and end, exit, unit, workdir, persona, spawner, and the latest report; and any past request of the removed host queue, with its outcomes.",
+        description: "One spawned zooid by name, where it declares that it lives, and all its runs: start and end, exit, unit, workdir, persona, spawner, and the latest report; and any past request of the removed host queue, with its outcomes.",
         input_schema: r#"{"type":"object","properties":{"name":{"type":"string","minLength":1},"brief":{"type":"boolean","description":"Also print the brief."}},"required":["name"],"additionalProperties":false}"#,
     },
 ];
@@ -104,6 +113,27 @@ fn launched_line(launched: &Launched) -> String {
         line.push_str(&format!("\nwarning: {warning}"));
     }
     line
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Declare {
+    name: String,
+    persona: String,
+    #[serde(default)]
+    here: bool,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    any_host: bool,
+    #[serde(default)]
+    rest: bool,
+    #[serde(default)]
+    model_spec: Option<String>,
+    #[serde(default)]
+    model_label: Option<String>,
+    #[serde(default)]
+    why: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +223,29 @@ impl Faculty for Spawn {
                     },
                 })?;
                 out.line(launched_line(&launched))
+            }
+            "zooid_declare" => {
+                let args: Declare = decode_arguments(arguments)?;
+                let place =
+                    PlaceWish::one_of(args.here, args.host.as_deref(), args.any_host, args.rest)
+                        .map_err(|error| invalid_arguments(format!("{error:#}")))?;
+                let model_spec = args
+                    .model_spec
+                    .map(|text| {
+                        Id::from_hex(text.trim()).ok_or_else(|| {
+                            invalid_arguments(format!("invalid model specification id {text}"))
+                        })
+                    })
+                    .transpose()?;
+                let declaring = self.operations()?.declare(&DeclareRequest {
+                    name: args.name.clone(),
+                    place,
+                    model_spec,
+                    model_label: args.model_label,
+                    reason: args.why,
+                    persona: args.persona,
+                })?;
+                out.line(declaring.line(&args.name))
             }
             "zooid_list" => {
                 let Empty {} = decode_arguments(arguments)?;

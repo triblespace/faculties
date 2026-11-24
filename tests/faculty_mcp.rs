@@ -349,6 +349,7 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
         "web_search",
         "world_look",
         "world_move_to",
+        "zooid_declare",
         "zooid_goal",
         "zooid_spawn",
     ] {

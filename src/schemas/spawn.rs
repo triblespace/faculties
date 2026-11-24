@@ -13,6 +13,15 @@
 //! time, the exit and the report to the same run. Two launches of one brief
 //! are two runs, so their exits never mix.
 //!
+//! A declaration says where and how a zooid lives: on one host, on any host,
+//! or at rest. Its intrinsic core is the zooid, that place, the model it
+//! binds when it binds one, and the declarations it follows; the reason, the
+//! persona, labels and times annotate it. It asks nothing of anyone and
+//! nothing answers it: a zooid exists either way, and a run that makes a
+//! declaration true names it. A later declaration follows the earlier ones
+//! its writer saw, so the ones nothing follows are what the zooid declares
+//! now, and two of them are two declarations, never a choice.
+//!
 //! Requests and outcomes are past vocabulary. A host-addressed queue wrote
 //! them from 2026-11-17 until it was removed on 2026-11-24: a request asked
 //! one host to run a zooid, and outcomes recorded what that host did about
@@ -75,6 +84,16 @@ pub const OUTCOME_REFUSED: Id = id_hex!("E11BF1D92608F66308A21E7FCB07B65B");
 /// process exit is not goal completion; this says only that the task's run was
 /// over. Minted 2026-11-17.
 pub const OUTCOME_TERMINAL: Id = id_hex!("A23987DE98AE18530D7CC04A2E78B432");
+
+/// Kind marker of a declaration of where and how a zooid lives.
+///
+/// Minted with `trible genid` on 2026-11-24:
+/// `A7F535F42DC69D7A690B4BD84C0525D9`.
+pub const KIND_DECLARATION: Id = id_hex!("A7F535F42DC69D7A690B4BD84C0525D9");
+/// Place of a declaration: any host. Minted 2026-11-24.
+pub const PLACE_ANY_HOST: Id = id_hex!("92D2A583D862BA9028E1E3141C12DC8B");
+/// Place of a declaration: none, the zooid rests. Minted 2026-11-24.
+pub const PLACE_AT_REST: Id = id_hex!("7483109A3C1B3560B686D8C1499DCA34");
 
 pub mod spawn {
     use super::*;
@@ -143,19 +162,22 @@ pub mod spawn {
         /// `auto` choice, or that it was asked for. Minted 2026-11-16.
         "055AE3D781937D52DAA5E9EF2E1B3770" as provider_reason: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The model the agent was told to use (`claude --model`, `codex -m`).
-        /// Minted 2026-11-17.
+        /// On a declaration, a label to show: a wish, never what binds a
+        /// model ([`model_spec`]). Minted 2026-11-17.
         "8D412C29A201ABB6CD57E13790038526" as model: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Why the run names no [`model`]: none was configured for its
         /// provider, so the agent chose its own default. Minted 2026-11-17.
         "2FC5D6F2A0327CC8A9EB4918F74BF65D" as model_unset: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The spawn a request asked to run. Like every attribute below
-        /// that speaks of a request or an outcome, past vocabulary:
-        /// nothing writes it any more. Minted 2026-11-17.
+        /// The zooid a declaration speaks about, or a past request asked to
+        /// run. Requests and outcomes are past vocabulary: of every
+        /// attribute below that speaks of one, nothing writes that use any
+        /// more. Minted 2026-11-17.
         "5AB17149BAD55FC21BAC6EC5393E767A" as zooid: inlineencodings::GenId;
-        /// The node key of the one host a request was addressed to, as custody
-        /// and the network name peers. Minted 2026-11-17.
+        /// The node key of the one host a declaration places its zooid on, or
+        /// a past request was addressed to, as custody and the network name
+        /// peers. Minted 2026-11-17.
         "ECE6C8630D9BCEB5615FFE89FFB411F2" as host: inlineencodings::ED25519PublicKey;
-        /// A readable name for a request's host (`sky`). Annotation only:
+        /// A readable name for that host (`sky`). Annotation only:
         /// the host is its key. Minted 2026-11-17.
         "7A3D448311C0572AB22E74C5F87FA7BC" as host_label: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The run a request continued, when it was a move. Minted 2026-11-17.
@@ -171,8 +193,9 @@ pub mod spawn {
         "D253320ACDE8B68B6CD46D0E98F95222" as resumes: inlineencodings::GenId;
         /// Which outcome an outcome entity is (`OUTCOME_*`). Minted 2026-11-17.
         "8BE0475206CD7D95B03FE7D1EB27609A" as outcome: inlineencodings::GenId;
-        /// Why a host refused a request, or what it observed beside an
-        /// outcome. Minted 2026-11-17.
+        /// Why, in words: why a declaration was made, why a host refused a
+        /// past request, or what it observed beside an outcome. Minted
+        /// 2026-11-17.
         "3C4380BFBC6A0149F6F62618FF1E3CC8" as reason: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The run an outcome refers to. Minted 2026-11-17.
         "3AE1B0C884653F349C65776191733A1E" as outcome_run: inlineencodings::GenId;
@@ -239,5 +262,19 @@ pub mod spawn {
         /// prompt and cover in one total, not a count of the cover.
         /// Recorded at settlement.
         "A77C832D269A2AEEAB5E3A2CF5C2BCC7" as first_call_input_tokens: inlineencodings::U256BE;
+        /// Where a declaration places its zooid, when that is not one host
+        /// (`PLACE_*`). A place is exactly one of these or one [`host`].
+        /// Minted with `trible genid` on 2026-11-24, like every attribute
+        /// below.
+        "F24D2F33F865F26FBD8675682EB382C0" as place: inlineencodings::GenId;
+        /// The immutable model specification a declaration binds, such as a
+        /// model root in the Models collection. Opaque here. Absent leaves
+        /// the choice to the node.
+        "CE06D0F62697451006B4FD7B5CAF6319" as model_spec: inlineencodings::GenId;
+        /// A declaration that this one follows.
+        "AFD4D039CB3062423ECF51B0AAFC6B62" as follows: inlineencodings::GenId;
+        /// The declaration a run made true. On the run; it says nothing
+        /// about the declaration.
+        "24F1A90CFCFB27DF1FA78B2FB10B6DB2" as realises: inlineencodings::GenId;
     }
 }

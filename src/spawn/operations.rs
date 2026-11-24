@@ -26,7 +26,7 @@ use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
@@ -960,6 +960,8 @@ pub struct SpawnView {
     /// The Compass goal the brief was rendered from, and that revision.
     pub goal: Vec<Id>,
     pub goal_revision: Vec<Id>,
+    /// What it declares about where and how it lives.
+    pub declared: super::declaration::Declared,
     /// Oldest first.
     pub runs: Vec<RunView>,
     /// What the removed host queue recorded about this zooid, oldest first.
@@ -994,6 +996,8 @@ pub struct RunView {
     pub lexical_fallback: Vec<String>,
     /// The archived node(s) a local run continued its zooid's history from.
     pub resumes: Vec<Id>,
+    /// The declaration(s) the run made true.
+    pub realises: Vec<Id>,
     pub message: Vec<Id>,
     pub settle_failure: Vec<String>,
     pub goal_note: Vec<Id>,
@@ -1067,7 +1071,7 @@ struct Naming {
 /// The stored names of one spawn, sorted, and the name handles whose text
 /// has not arrived. Absence is not knowledge: a reader that needs the name
 /// waits for the missing text rather than acting without it.
-fn stored_names<R: BlobStoreGet + ?Sized>(
+pub(super) fn stored_names<R: BlobStoreGet + ?Sized>(
     facts: &FactArchive,
     reader: &R,
     spawn: Id,
@@ -2760,7 +2764,12 @@ impl Spawn {
         &self,
         read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
     ) -> Result<T> {
-        self.observe_scope(DEFAULT_SCOPE_ID, "Spawn", read)
+        observe_scope(
+            &self.storage,
+            DEFAULT_SCOPE_ID,
+            "Spawn",
+            |facts, reader, _| read(facts, reader),
+        )
     }
 
     /// Where the zooid `name`'s archived history ends, for a local run that
@@ -2768,42 +2777,16 @@ impl Spawn {
     /// ([`super::continuation::zooid_tail`]). `None` when no context names
     /// it; an archive that cannot say refuses.
     pub fn continuation(&self, name: &str) -> Result<Option<Id>> {
-        self.observe_scope(
+        observe_scope(
+            &self.storage,
             crate::schemas::blockdag::DEFAULT_SCOPE_ID,
             "Archive",
-            |facts, _| super::continuation::zooid_tail(facts, name),
+            |facts, _, _| super::continuation::zooid_tail(facts, name),
         )
         .with_context(|| format!("find where zooid {name}'s archived history ends"))
     }
 
-    fn observe_scope<T>(
-        &self,
-        scope: Id,
-        label: &str,
-        read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
-    ) -> Result<T> {
-        self.storage.with_store(|pile, signer, runtime| {
-            let source =
-                self.storage
-                    .open_collection_read(pile, scope, signer.verifying_key(), runtime)?;
-            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
-            runtime
-                .block_on(async {
-                    crate::storage::tolerate_own_lag(
-                        pile.maintain_attached(succinct, signer).await,
-                    )?;
-                    crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
-                })
-                .with_context(|| format!("maintain {label} fact collection"))?;
-            let snapshot = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime));
-            let facts = crate::storage::acquire_facts(&snapshot, rank9)
-                .with_context(|| format!("read {label} Rank9 collection"))?;
-            read(&facts, &snapshot)
-        })
-    }
-
-    fn publish(&self, fragment: Fragment) -> Result<()> {
+    pub(super) fn publish(&self, fragment: Fragment) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             let collection = self.storage.open_collection_write(
                 pile,
@@ -2832,6 +2815,31 @@ impl Spawn {
     }
 }
 
+/// Read one scope's facts in `storage`, with the source collection they are
+/// read from.
+pub(super) fn observe_scope<T>(
+    storage: &Storage,
+    scope: Id,
+    label: &str,
+    read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>, CollectionHandle) -> Result<T>,
+) -> Result<T> {
+    storage.with_store(|pile, signer, runtime| {
+        let source = storage.open_collection_read(pile, scope, signer.verifying_key(), runtime)?;
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+        let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+        runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+            })
+            .with_context(|| format!("maintain {label} fact collection"))?;
+        let snapshot = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime));
+        let facts = crate::storage::acquire_facts(&snapshot, rank9)
+            .with_context(|| format!("read {label} Rank9 collection"))?;
+        read(&facts, &snapshot, source.handle())
+    })
+}
+
 /// A caught panic's message, as `panic!` gave it.
 fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
@@ -2841,7 +2849,10 @@ fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("non-text panic payload")
 }
 
-fn read_text<R: BlobStoreGet + ?Sized>(reader: &R, handle: TextHandle) -> Option<String> {
+pub(super) fn read_text<R: BlobStoreGet + ?Sized>(
+    reader: &R,
+    handle: TextHandle,
+) -> Option<String> {
     reader
         .get::<View<str>, _>(handle)
         .ok()
@@ -2907,6 +2918,7 @@ fn spawn_view<R: BlobStoreGet + ?Sized>(
         goal: find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal: ?id }])).collect(),
         goal_revision: find!(id: Id, pattern!(facts, [{ spawn @ attrs::goal_revision: ?id }]))
             .collect(),
+        declared: super::declaration::declared_view(facts, reader, spawn),
         runs,
         requests: requests_of(facts, reader, spawn),
     })
@@ -3016,6 +3028,7 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::lexical_fallback: ?handle }])).collect(),
         ),
         resumes: find!(node: Id, pattern!(facts, [{ run @ attrs::resumes: ?node }])).collect(),
+        realises: find!(id: Id, pattern!(facts, [{ run @ attrs::realises: ?id }])).collect(),
         model: texts(
             find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::model: ?handle }])).collect(),
         ),
@@ -3192,7 +3205,7 @@ pub fn outcome_name(kind: Id) -> String {
     }
 }
 
-fn join<T: std::fmt::Display>(values: &[T]) -> String {
+pub(super) fn join<T: std::fmt::Display>(values: &[T]) -> String {
     if values.is_empty() {
         return "-".to_owned();
     }
@@ -3203,7 +3216,7 @@ fn join<T: std::fmt::Display>(values: &[T]) -> String {
         .join(", ")
 }
 
-fn ids(values: &[Id]) -> String {
+pub(super) fn ids(values: &[Id]) -> String {
     join(
         &values
             .iter()
@@ -3386,6 +3399,7 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         writeln!(out, "goal: {}", ids(&spawn.goal)).unwrap();
         writeln!(out, "goal revision: {}", ids(&spawn.goal_revision)).unwrap();
     }
+    spawn.declared.show(&mut out);
     for run in &spawn.runs {
         writeln!(out, "\nrun {:x}", run.id).unwrap();
         if let Some(started) = run.started {
@@ -3431,6 +3445,9 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         }
         if !run.resumes.is_empty() {
             writeln!(out, "  continues archived node: {}", ids(&run.resumes)).unwrap();
+        }
+        if !run.realises.is_empty() {
+            writeln!(out, "  realises declaration: {}", ids(&run.realises)).unwrap();
         }
         for sizing in &run.cover_sizing {
             writeln!(out, "  cover sizing: {sizing}").unwrap();

@@ -9,8 +9,8 @@ use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_show};
 use super::{
-    inbox_failure, CoverWish, Exit, GoalRequest, InboxHook, InboxRequest, LaunchConfig, Launched,
-    Provider, RunRequest, SettleRequest, Spawn,
+    inbox_failure, CoverWish, DeclareRequest, Exit, GoalRequest, InboxHook, InboxRequest,
+    LaunchConfig, Launched, PlaceWish, Provider, RunRequest, SettleRequest, Spawn,
 };
 
 #[derive(Parser)]
@@ -120,6 +120,45 @@ enum Command {
         #[arg(long, value_name = "TOKENS", requires = "cover")]
         window: Option<u64>,
     },
+    /// Record where and how a zooid lives: on one host, on any host, or at
+    /// rest.
+    ///
+    /// The declaration follows every one standing here, so it is what the
+    /// zooid declares from now on; `zooid show` shows it. It starts, stops and
+    /// asks nothing, and it is valid whether or not anything realises it. When
+    /// the one standing declaration already says the same place and model,
+    /// nothing is written. Recording needs WRITE on the Spawn collection, as
+    /// every Spawn fact does; that shows who may record, not who may speak
+    /// for a zooid.
+    #[command(group(clap::ArgGroup::new("where").required(true).args(["here", "host", "any_host", "rest"])))]
+    Declare {
+        name: String,
+        /// On this host: the key this store signs with.
+        #[arg(long)]
+        here: bool,
+        /// On the host with this node key (64 hex digits).
+        #[arg(long, value_name = "KEY")]
+        host: Option<String>,
+        /// On whichever host takes it up.
+        #[arg(long)]
+        any_host: bool,
+        /// Nowhere: the zooid exists and rests.
+        #[arg(long, conflicts_with_all = ["model_spec", "model_label"])]
+        rest: bool,
+        /// Bind this immutable model specification (hex id), such as a model
+        /// root in the Models collection. Without it the node chooses.
+        #[arg(long, value_name = "ID")]
+        model_spec: Option<String>,
+        /// A model label to show. It binds nothing.
+        #[arg(long, value_name = "TEXT")]
+        model_label: Option<String>,
+        /// Why, in words.
+        #[arg(long, value_name = "TEXT")]
+        why: Option<String>,
+        /// The persona recording it. Defaults to $PERSONA.
+        #[arg(long, value_name = "PERSONA")]
+        persona: Option<String>,
+    },
     /// Every zooid, one line each.
     List,
     /// Each parent persona: its doing goals, the zooids it started that have
@@ -133,8 +172,8 @@ enum Command {
         #[arg(long = "persona", value_name = "PERSONA")]
         personas: Vec<String>,
     },
-    /// One zooid and all its runs, with the latest report, and what the
-    /// removed host queue recorded about it.
+    /// One zooid, where it declares that it lives, and all its runs, with
+    /// the latest report, and what the removed host queue recorded about it.
     Show {
         name: String,
         /// Print the brief too.
@@ -450,6 +489,36 @@ pub fn run() -> Result<()> {
                 let view = spawn.colony(&super::ColonyOptions { personas })?;
                 crate::cli::with_output("zooid", |out| out.text(super::render_colony(&view)))
             }
+            Command::Declare {
+                name,
+                here,
+                host,
+                any_host,
+                rest,
+                model_spec,
+                model_label,
+                why,
+                persona,
+            } => {
+                let persona = persona
+                    .or_else(|| std::env::var("PERSONA").ok())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow!("pass --persona or set PERSONA"))?;
+                let declaring = spawn.declare(&DeclareRequest {
+                    place: PlaceWish::one_of(here, host.as_deref(), any_host, rest)?,
+                    model_spec: model_spec
+                        .map(|text| {
+                            Id::from_hex(text.trim())
+                                .ok_or_else(|| anyhow!("invalid model specification id {text}"))
+                        })
+                        .transpose()?,
+                    model_label,
+                    reason: why,
+                    persona,
+                    name: name.clone(),
+                })?;
+                crate::cli::with_output("zooid", |out| out.line(declaring.line(&name)))
+            }
             Command::List => {
                 let spawns = spawn.list()?;
                 crate::cli::with_output("zooid", |out| out.text(render_list(&spawns)))
@@ -513,6 +582,35 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn declare_takes_exactly_one_place_and_no_model_at_rest() {
+        let parses = |arguments: &[&str]| {
+            Cli::try_parse_from(
+                ["zooid", "--pile", "p", "declare", "a-name"]
+                    .iter()
+                    .chain(arguments),
+            )
+            .is_ok()
+        };
+        for good in [
+            &["--here"][..],
+            &["--any-host"],
+            &["--rest", "--why", "tired"],
+            &["--host", "00", "--model-spec", "ab", "--model-label", "m"],
+        ] {
+            assert!(parses(good), "{good:?}");
+        }
+        for bad in [
+            &[][..],
+            &["--here", "--rest"],
+            &["--host", "00", "--any-host"],
+            &["--rest", "--model-spec", "ab"],
+            &["--rest", "--model-label", "m"],
+        ] {
+            assert!(!parses(bad), "{bad:?}");
+        }
     }
 
     #[test]

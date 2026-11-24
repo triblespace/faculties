@@ -17,6 +17,7 @@ pub mod cli;
 pub mod colony;
 pub mod continuation;
 pub mod cover;
+pub mod declaration;
 pub mod drive_task;
 pub mod mcp;
 pub mod operations;
@@ -24,6 +25,10 @@ pub mod operations;
 pub use colony::{
     colony_view, render_colony, ColonyOptions, ColonyRole, ColonyRoles, ColonyView, Evidence,
     ParentSource, ParentView,
+};
+pub use declaration::{
+    placed, Declaration, DeclareRequest, Declared, DeclaredZooid, Declaring, Place, PlaceWish,
+    Placed, Placement, Standing,
 };
 pub use operations::{
     choose_provider, inbox_failure, CoverWish, GoalRequest, InboxAnswer, InboxHook, InboxRequest,

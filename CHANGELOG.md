@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- A zooid declares where and how it lives. `zooid declare NAME` with `--here`,
+  `--host KEY`, `--any-host` or `--rest` (MCP `zooid_declare`) records one
+  declaration in the Spawn collection, optionally binding an immutable model
+  specification (`--model-spec`) and carrying a model label and a reason. It
+  follows every declaration standing there, so what nothing follows is what
+  the zooid declares now; concurrent ones all stand. Declaring the same again
+  writes nothing. It starts, stops and asks nothing. `zooid show` shows what
+  stands and which declaration a run realised.
+
+  `spawn::placed(storage, host)` is the reader for a node: each zooid whose
+  one declaration names that host, with its bound model and its archived tip,
+  and every other declared zooid with the reason nothing follows there. It
+  writes no fact and needs no launch configuration.
+
 - `memory <id>` with a whole id shows that chunk, also when another chunk
   carries the id as a historical alias. It was reported as ambiguous.
 
