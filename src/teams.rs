@@ -58,13 +58,15 @@ const RETIRED_OAUTH_SECRET_ATTRIBUTES: [Id; 3] = [
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
 
-/// One usable head of the source-scoped receipt DAG.
+/// The heads of the source-scoped receipt DAG, all of which the next page
+/// supersedes, and where its pull continues.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CoverageHead {
-    pub id: Id,
+pub struct CoverageFrontier {
+    pub heads: BTreeSet<Id>,
+    /// The greatest generation among the heads.
     pub generation: u128,
     /// Absent only for a generation-0 frozen legacy snapshot. The next pull
-    /// must then use Graph's base endpoint and supersede this head.
+    /// must then use Graph's base endpoint.
     pub cursor: Option<String>,
 }
 
@@ -92,18 +94,23 @@ pub enum AuthProfileHead {
     Forked(Vec<Id>),
 }
 
-/// Causally selected current visibility of one logical message.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CurrentMessageState {
+/// One causally current version of a logical message.
+///
+/// A message ordinarily has one. Several are unordered observations of the
+/// same message: none of them supersedes another, so all are current.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MessageVersion {
     Present(Id),
-    Deleted(Option<Id>),
+    Deleted(Id),
+    /// A source tombstone, which carries no observation.
+    Removed,
 }
 
-/// Canonical current presentation of one logical Teams message.
+/// Canonical presentation of one current version of one logical Teams message.
 ///
-/// The receipt DAG, rather than timestamps or iteration order, selects the
-/// observation. A source-level causal fork is returned as an error by
-/// [`current_messages`] and must remain visible at the caller boundary.
+/// The receipt DAG, rather than iteration order, selects the versions. Where
+/// it leaves several unordered, each is its own record, numbered by
+/// `version_index` among `version_count`, and none is chosen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CurrentMessage {
     pub message: Id,
@@ -116,6 +123,8 @@ pub struct CurrentMessage {
     pub author_names: Vec<TextHandle>,
     pub content: Option<TextHandle>,
     pub attachments: Vec<Id>,
+    pub version_index: usize,
+    pub version_count: usize,
 }
 
 /// Construct the intrinsic source entity for one concrete tenant.
@@ -698,54 +707,62 @@ where
     receipts.difference(&superseded).copied().collect()
 }
 
-pub fn coverage_head<P>(
+/// Where the next pull of a source continues. Hosts which pulled independently
+/// leave several heads; the next page supersedes all of them.
+pub fn coverage_frontier<P>(
     reader: &impl BlobStoreGet,
     catalog: &P,
     source: Id,
-) -> Result<Option<CoverageHead>>
+) -> Result<Option<CoverageFrontier>>
 where
     P: TriblePattern,
 {
-    let receipts = receipt_ids(catalog, source);
-    if receipts.is_empty() {
+    let heads = coverage_head_ids(catalog, source);
+    let mut generation = 0;
+    let mut continued = None;
+    for head in &heads {
+        let depth = receipt_generation(catalog, *head)?;
+        generation = generation.max(depth);
+        // The cursor is part of the receipt's identity; only a frozen legacy
+        // snapshot has none.
+        let cursor = find!(
+            cursor: Inline<Handle<UTF8String>>,
+            pattern!(catalog, [{ head @ teams::coverage_cursor: ?cursor }])
+        )
+        .min();
+        if let Some(cursor) = cursor {
+            continued = continued.max(Some((depth, *head, cursor)));
+        }
+    }
+    if heads.is_empty() {
         return Ok(None);
     }
-    let id = sole_head(coverage_head_ids(catalog, source))?;
-    let generation = receipt_generation(catalog, id)?;
-    // The cursor is part of the receipt's identity; only a frozen legacy
-    // snapshot has none.
-    let cursor = find!(
-        cursor: Inline<Handle<UTF8String>>,
-        pattern!(catalog, [{ id @ teams::coverage_cursor: ?cursor }])
-    )
-    .min()
-    .map(|cursor| read_utf8string(reader, cursor, "Teams coverage cursor"))
-    .transpose()?;
-    Ok(Some(CoverageHead {
-        id,
+    // Every head's cursor continues a complete history of its own, and what
+    // the other heads observed is resident: the deepest one is as complete as
+    // any, with the least to fetch again.
+    let cursor = continued
+        .map(|(_, _, cursor)| read_utf8string(reader, cursor, "Teams coverage cursor"))
+        .transpose()?;
+    Ok(Some(CoverageFrontier {
+        heads,
         generation,
         cursor,
     }))
 }
 
-/// Evaluate the receipt DAG and return one unambiguous visibility per logical
-/// message. Unversioned tombstones remain causally ordered by their receipts;
-/// full observations use Graph's source modification time.
-pub fn current_message_states<P>(
-    catalog: &P,
-    source: Id,
-) -> Result<BTreeMap<Id, CurrentMessageState>>
+/// Evaluate the receipt DAG and return every logical message's current
+/// versions: those no later receipt and no newer source modification time
+/// supersedes. The set is never empty; several versions are unordered, and
+/// the caller shows them all. Unversioned tombstones are causally ordered by
+/// their receipts; full observations use Graph's source modification time.
+///
+/// An event of a kind this reader does not know is not in the view. A
+/// receipt whose predecessor has not arrived yet speaks for itself alone.
+pub fn current_message_states<P>(catalog: &P, source: Id) -> BTreeMap<Id, BTreeSet<MessageVersion>>
 where
     P: TriblePattern,
 {
-    let heads = coverage_head_ids(catalog, source);
-    if heads.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let head = sole_head(heads)?;
-
     let mut observations = BTreeMap::new();
-    let mut unreadable = BTreeSet::new();
     for (observation, message, modified) in find!(
         (
             observation: Id,
@@ -770,7 +787,6 @@ where
         )
         .collect::<BTreeSet<_>>();
         if states.is_empty() {
-            unreadable.insert(observation);
             continue;
         }
         observations.insert(
@@ -792,132 +808,113 @@ where
     )
     .collect::<BTreeMap<_, _>>();
 
-    let mut receipts = Vec::new();
-    for receipt in receipt_ids(catalog, source) {
-        receipts.push(ReceiptOrder {
-            id: receipt,
-            generation: receipt_generation(catalog, receipt)?,
-            predecessors: find!(
-                value: Id,
-                pattern!(catalog, [{ receipt @ metadata::supersedes: ?value }])
-            )
-            .collect(),
-            events: find!(
-                value: Id,
-                pattern!(catalog, [{ receipt @ teams::coverage_observation: ?value }])
-            )
-            .collect(),
-        });
-    }
-    receipts.sort_by_key(|receipt| (receipt.generation, receipt.id));
-
-    let mut remaining_children = BTreeMap::<Id, usize>::new();
+    let receipts = receipt_ids(catalog, source);
+    let mut predecessors = BTreeMap::<Id, BTreeSet<Id>>::new();
+    let mut successors = BTreeMap::<Id, BTreeSet<Id>>::new();
     for receipt in &receipts {
-        for predecessor in &receipt.predecessors {
-            *remaining_children.entry(*predecessor).or_default() += 1;
+        let resident = find!(
+            value: Id,
+            pattern!(catalog, [{ receipt @ metadata::supersedes: ?value }])
+        )
+        .filter(|predecessor| predecessor != receipt && receipts.contains(predecessor))
+        .collect::<BTreeSet<_>>();
+        for predecessor in &resident {
+            successors.entry(*predecessor).or_default().insert(*receipt);
         }
+        predecessors.insert(*receipt, resident);
     }
 
+    let mut waiting = predecessors
+        .iter()
+        .map(|(receipt, before)| (*receipt, before.len()))
+        .collect::<BTreeMap<_, _>>();
+    let mut ready = receipts
+        .iter()
+        .filter(|receipt| waiting[*receipt] == 0)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut remaining_children = successors
+        .iter()
+        .map(|(receipt, after)| (*receipt, after.len()))
+        .collect::<BTreeMap<_, _>>();
     let mut states = BTreeMap::<Id, BTreeMap<Id, CausalMessageState>>::new();
-    for receipt in receipts {
-        let mut state = if receipt.predecessors.len() == 1 {
-            let predecessor = *receipt.predecessors.first().expect("one predecessor");
-            let remaining = remaining_children
-                .get_mut(&predecessor)
-                .expect("predecessor child count was collected");
-            let take_parent = *remaining == 1;
-            *remaining -= 1;
-            if take_parent {
-                states.remove(&predecessor).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Teams coverage {:x} names an unavailable predecessor {predecessor:x}",
-                        receipt.id
-                    )
-                })?
-            } else {
-                states.get(&predecessor).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Teams coverage {:x} names an unavailable predecessor {predecessor:x}",
-                        receipt.id
-                    )
-                })?
-            }
-        } else {
-            let mut merged = BTreeMap::new();
-            for predecessor in &receipt.predecessors {
-                let parent = states.get(predecessor).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Teams coverage {:x} names an unavailable predecessor {predecessor:x}",
-                        receipt.id
-                    )
-                })?;
-                merge_causal_states(&mut merged, parent, &observations)?;
-                let remaining = remaining_children
-                    .get_mut(predecessor)
-                    .expect("predecessor child count was collected");
-                *remaining -= 1;
-            }
-            for predecessor in &receipt.predecessors {
-                if remaining_children.get(predecessor) == Some(&0) {
-                    states.remove(predecessor);
+    // Content-derived ids cannot form a cycle. Should a writer reuse one into
+    // a cycle anyway, its members are taken smallest first.
+    while let Some(receipt) = ready.pop_first().or_else(|| waiting.keys().next().copied()) {
+        waiting.remove(&receipt);
+        for successor in successors.get(&receipt).into_iter().flatten() {
+            if let Some(count) = waiting.get_mut(successor) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*successor);
                 }
             }
-            merged
-        };
+        }
 
-        let mut page_observations = BTreeMap::<Id, BTreeSet<Id>>::new();
-        let mut page_tombstones = BTreeSet::new();
-        for event in &receipt.events {
-            if let Some(observation) = observations.get(event) {
-                page_observations
+        let mut state: Option<BTreeMap<Id, CausalMessageState>> = None;
+        for predecessor in &predecessors[&receipt] {
+            let remaining = remaining_children
+                .get_mut(predecessor)
+                .expect("predecessor child count was collected");
+            *remaining -= 1;
+            let parent = if *remaining == 0 {
+                states.remove(predecessor)
+            } else {
+                states.get(predecessor).cloned()
+            };
+            let Some(parent) = parent else { continue };
+            match &mut state {
+                None => state = Some(parent),
+                Some(state) => merge_causal_states(state, parent),
+            }
+        }
+        let mut state = state.unwrap_or_default();
+
+        let mut pages = BTreeMap::<Id, PageEvents>::new();
+        for event in find!(
+            value: Id,
+            pattern!(catalog, [{ receipt @ teams::coverage_observation: ?value }])
+        ) {
+            if let Some(observation) = observations.get(&event) {
+                pages
                     .entry(observation.message)
                     .or_default()
-                    .insert(*event);
-            } else if let Some(message) = tombstones.get(event) {
-                page_tombstones.insert(*message);
-            } else if unreadable.contains(event) {
-                continue;
-            } else {
-                bail!(
-                    "Teams coverage {:x} carries unknown event {event:x}",
-                    receipt.id
-                );
+                    .observations
+                    .push((observation.modified, event));
+            } else if let Some(message) = tombstones.get(&event) {
+                pages.entry(*message).or_default().removed = true;
             }
         }
-        if let Some(message) = page_tombstones
-            .iter()
-            .find(|message| page_observations.contains_key(*message))
-        {
-            bail!(
-                "Teams coverage {:x} carries unordered full and @removed events for message {message:x}",
-                receipt.id
-            );
+        for (message, page) in pages {
+            state.entry(message).or_default().apply_page(receipt, &page);
         }
-        for (message, page_versions) in page_observations {
-            apply_page_observations(&mut state, message, &page_versions, &observations)?;
-        }
-        for message in page_tombstones {
-            state.entry(message).or_default().visible = CausalVisible::Deleted(None);
-        }
-        states.insert(receipt.id, state);
+        states.insert(receipt, state);
     }
 
-    let current = states
-        .get(&head)
-        .ok_or_else(|| anyhow::anyhow!("Teams coverage head {head:x} was not evaluable"))?;
+    let mut current = BTreeMap::new();
+    for head in coverage_head_ids(catalog, source) {
+        if let Some(state) = states.remove(&head) {
+            merge_causal_states(&mut current, state);
+        }
+    }
     current
-        .iter()
-        .filter_map(|(message, state)| match state.visible {
-            CausalVisible::Unknown => None,
-            CausalVisible::Present(observation) => {
-                Some(Ok((*message, CurrentMessageState::Present(observation))))
-            }
-            CausalVisible::Deleted(observation) => {
-                Some(Ok((*message, CurrentMessageState::Deleted(observation))))
-            }
-            CausalVisible::Conflict => Some(Err(anyhow::anyhow!(
-                "current Teams state for message {message:x} is causally ambiguous"
-            ))),
+        .into_iter()
+        .map(|(message, state)| {
+            let versions = state
+                .current
+                .into_iter()
+                .map(|event| match event {
+                    CausalEvent::Observed(observation) => {
+                        if observations[&observation].deleted {
+                            MessageVersion::Deleted(observation)
+                        } else {
+                            MessageVersion::Present(observation)
+                        }
+                    }
+                    CausalEvent::Removed(_) => MessageVersion::Removed,
+                })
+                .collect();
+            (message, versions)
         })
         .collect()
 }
@@ -986,8 +983,8 @@ where
         .collect()
 }
 
-/// Evaluate the source receipt DAG and materialize its selected message
-/// observations as reusable presentation records.
+/// Evaluate the source receipt DAG and materialize its current message
+/// versions as reusable presentation records.
 pub fn current_messages<P>(catalog: &P, source: Id) -> Result<Vec<CurrentMessage>>
 where
     P: TriblePattern,
@@ -1018,32 +1015,47 @@ where
     }
 
     let mut rows = Vec::new();
-    for (message, state) in current_message_states(catalog, source)? {
+    for (message, versions) in current_message_states(catalog, source) {
         let chat = message_chats.get(&message).copied().ok_or_else(|| {
             anyhow::anyhow!("Teams message {message:x} chat in source {source:x} is missing")
         })?;
-        match state {
-            CurrentMessageState::Present(observation) => rows.push(current_message_record(
-                catalog,
-                message,
-                chat,
-                Some(observation),
-                false,
-            )?),
-            CurrentMessageState::Deleted(observation) => rows.push(current_message_record(
-                catalog,
-                message,
-                chat,
-                observation,
-                true,
-            )?),
+        let mut records = Vec::<CurrentMessage>::new();
+        for version in versions {
+            let (observation, deleted) = match version {
+                MessageVersion::Present(observation) => (Some(observation), false),
+                MessageVersion::Deleted(observation) => (Some(observation), true),
+                MessageVersion::Removed => (None, true),
+            };
+            let record = current_message_record(catalog, message, chat, observation, deleted)?;
+            // Versions which differ only in the source's etag present the
+            // same state, which is not a conflict.
+            if !records.iter().any(|kept| {
+                *kept
+                    == CurrentMessage {
+                        observation: kept.observation,
+                        ..record.clone()
+                    }
+            }) {
+                records.push(record);
+            }
         }
+        let version_count = records.len();
+        rows.extend(
+            records
+                .into_iter()
+                .enumerate()
+                .map(|(version_index, record)| CurrentMessage {
+                    version_index,
+                    version_count,
+                    ..record
+                }),
+        );
     }
     rows.sort_by_key(|row| {
         (
             row.created_at.map(interval_key).unwrap_or(i128::MIN),
             row.message,
-            row.observation,
+            row.version_index,
         )
     });
     Ok(rows)
@@ -1071,6 +1083,8 @@ where
             author_names: Vec::new(),
             content: None,
             attachments: Vec::new(),
+            version_index: 0,
+            version_count: 1,
         });
     };
 
@@ -1126,6 +1140,8 @@ where
         author_names,
         content,
         attachments,
+        version_index: 0,
+        version_count: 1,
     })
 }
 
@@ -1136,176 +1152,97 @@ struct ObservationOrder {
     deleted: bool,
 }
 
-#[derive(Clone, Debug)]
-struct ReceiptOrder {
-    id: Id,
-    generation: u128,
-    predecessors: BTreeSet<Id>,
-    events: BTreeSet<Id>,
+/// One message's events in one page receipt.
+#[derive(Default)]
+struct PageEvents {
+    observations: Vec<(i128, Id)>,
+    removed: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CausalVisible {
-    Unknown,
-    Present(Id),
-    Deleted(Option<Id>),
-    Conflict,
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CausalEvent {
+    Observed(Id),
+    /// A tombstone as carried by one receipt. The tombstone entity is the
+    /// same for every page; only its receipts order it.
+    Removed(Id),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// What one receipt's causal past says about one message.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CausalMessageState {
-    max_seen_modified: Option<i128>,
-    visible: CausalVisible,
+    /// The newest source modification time seen.
+    modified: Option<i128>,
+    /// The events seen: the observations of that time, and every tombstone.
+    seen: BTreeSet<CausalEvent>,
+    /// Those of them nothing seen supersedes.
+    current: BTreeSet<CausalEvent>,
 }
 
-impl Default for CausalMessageState {
-    fn default() -> Self {
-        Self {
-            max_seen_modified: None,
-            visible: CausalVisible::Unknown,
+impl CausalMessageState {
+    /// Observations older than the newest one seen are no longer versions of
+    /// the message. Tombstones carry no source time and stay.
+    fn advance(&mut self, modified: Option<i128>) {
+        if modified > self.modified {
+            self.modified = modified;
+            self.seen
+                .retain(|event| matches!(event, CausalEvent::Removed(_)));
+            self.current
+                .retain(|event| matches!(event, CausalEvent::Removed(_)));
         }
+    }
+
+    /// One page after everything this state has seen. A newer version
+    /// supersedes what was current; an unseen version of the same time, or
+    /// one beside a tombstone in its page, is unordered with it. A version
+    /// seen before adds nothing, so a replay cannot restore it.
+    fn apply_page(&mut self, receipt: Id, page: &PageEvents) {
+        let newest = page
+            .observations
+            .iter()
+            .map(|(modified, _)| *modified)
+            .max();
+        let newer = newest > self.modified;
+        self.advance(newest);
+        if newer || page.removed {
+            self.current.clear();
+        }
+        for (modified, observation) in &page.observations {
+            let event = CausalEvent::Observed(*observation);
+            if Some(*modified) == self.modified && self.seen.insert(event) {
+                self.current.insert(event);
+            }
+        }
+        if page.removed {
+            let event = CausalEvent::Removed(receipt);
+            self.seen.insert(event);
+            self.current.insert(event);
+        }
+    }
+
+    /// Two concurrent pasts. An event stays current unless the other past has
+    /// seen it and superseded it.
+    fn merge(&mut self, mut other: Self) {
+        let modified = self.modified.max(other.modified);
+        self.advance(modified);
+        other.advance(modified);
+        self.current
+            .retain(|event| other.current.contains(event) || !other.seen.contains(event));
+        for event in other.current {
+            if !self.seen.contains(&event) {
+                self.current.insert(event);
+            }
+        }
+        self.seen.extend(other.seen);
     }
 }
 
 fn merge_causal_states(
     target: &mut BTreeMap<Id, CausalMessageState>,
-    parent: &BTreeMap<Id, CausalMessageState>,
-    observations: &BTreeMap<Id, ObservationOrder>,
-) -> Result<()> {
+    parent: BTreeMap<Id, CausalMessageState>,
+) {
     for (message, incoming) in parent {
-        let entry = target.entry(*message).or_default();
-        entry.visible = merge_causal_visible(entry.visible, incoming.visible, observations)?;
-        entry.max_seen_modified = entry.max_seen_modified.max(incoming.max_seen_modified);
+        target.entry(message).or_default().merge(incoming);
     }
-    Ok(())
-}
-
-fn merge_causal_visible(
-    left: CausalVisible,
-    right: CausalVisible,
-    observations: &BTreeMap<Id, ObservationOrder>,
-) -> Result<CausalVisible> {
-    use CausalVisible::{Conflict, Deleted, Present, Unknown};
-    Ok(match (left, right) {
-        (Unknown, value) | (value, Unknown) => value,
-        (Conflict, _) | (_, Conflict) => Conflict,
-        (Present(left), Present(right)) if left == right => Present(left),
-        (Deleted(Some(left)), Deleted(Some(right))) if left == right => Deleted(Some(left)),
-        (Present(left), Present(right)) => {
-            newer_versioned_visible(Present(left), left, Present(right), right, observations)?
-        }
-        (Present(left), Deleted(Some(right))) => newer_versioned_visible(
-            Present(left),
-            left,
-            Deleted(Some(right)),
-            right,
-            observations,
-        )?,
-        (Deleted(Some(left)), Present(right)) => newer_versioned_visible(
-            Deleted(Some(left)),
-            left,
-            Present(right),
-            right,
-            observations,
-        )?,
-        (Deleted(Some(left)), Deleted(Some(right))) => newer_versioned_visible(
-            Deleted(Some(left)),
-            left,
-            Deleted(Some(right)),
-            right,
-            observations,
-        )?,
-        (Deleted(None), Deleted(None)) => Deleted(None),
-        (Deleted(None), Present(_) | Deleted(Some(_)))
-        | (Present(_) | Deleted(Some(_)), Deleted(None)) => Conflict,
-    })
-}
-
-fn newer_versioned_visible(
-    left_visible: CausalVisible,
-    left: Id,
-    right_visible: CausalVisible,
-    right: Id,
-    observations: &BTreeMap<Id, ObservationOrder>,
-) -> Result<CausalVisible> {
-    let left_order = observations
-        .get(&left)
-        .ok_or_else(|| anyhow::anyhow!("missing Teams observation {left:x}"))?;
-    let right_order = observations
-        .get(&right)
-        .ok_or_else(|| anyhow::anyhow!("missing Teams observation {right:x}"))?;
-    Ok(match left_order.modified.cmp(&right_order.modified) {
-        std::cmp::Ordering::Less => right_visible,
-        std::cmp::Ordering::Greater => left_visible,
-        std::cmp::Ordering::Equal => CausalVisible::Conflict,
-    })
-}
-
-fn apply_page_observations(
-    states: &mut BTreeMap<Id, CausalMessageState>,
-    message: Id,
-    page_versions: &BTreeSet<Id>,
-    observations: &BTreeMap<Id, ObservationOrder>,
-) -> Result<()> {
-    let newest_time = page_versions
-        .iter()
-        .map(|id| {
-            observations
-                .get(id)
-                .map(|observation| observation.modified)
-                .ok_or_else(|| anyhow::anyhow!("missing Teams observation {id:x}"))
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .max()
-        .expect("page observation group is nonempty");
-    // Two distinct versions sharing the newest source time in one page are a
-    // real divergence between observations, not a value to choose among.
-    let latest = page_versions
-        .iter()
-        .filter(|id| {
-            observations
-                .get(*id)
-                .is_some_and(|value| value.modified == newest_time)
-        })
-        .copied()
-        .collect::<Vec<_>>();
-    let &[newest] = latest.as_slice() else {
-        bail!(
-            "latest source version in one Teams page for message {message:x} has {} values; \
-             refusing arbitrary selection",
-            latest.len()
-        );
-    };
-    let order = observations
-        .get(&newest)
-        .expect("newest observation came from map");
-    let state = states.entry(message).or_default();
-    let before = state.max_seen_modified;
-    state.max_seen_modified = Some(before.map_or(newest_time, |old| old.max(newest_time)));
-
-    if before.is_none_or(|old| newest_time > old) {
-        state.visible = if order.deleted {
-            CausalVisible::Deleted(Some(newest))
-        } else {
-            CausalVisible::Present(newest)
-        };
-        return Ok(());
-    }
-    if newest_time < before.expect("checked Some above") {
-        return Ok(());
-    }
-    state.visible = match state.visible {
-        CausalVisible::Present(current) if current == newest && !order.deleted => {
-            CausalVisible::Present(current)
-        }
-        CausalVisible::Deleted(Some(current)) if current == newest && order.deleted => {
-            CausalVisible::Deleted(Some(current))
-        }
-        CausalVisible::Deleted(None) => CausalVisible::Deleted(None),
-        _ => CausalVisible::Conflict,
-    };
-    Ok(())
 }
 
 fn receipt_ids<P>(catalog: &P, source: Id) -> BTreeSet<Id>
@@ -1460,23 +1397,8 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-/// The one head of a source's receipt DAG. Several heads are a causal fork
-/// the next pull must not hide behind a choice.
-fn sole_head(heads: BTreeSet<Id>) -> Result<Id> {
-    let mut heads = heads.into_iter();
-    match (heads.next(), heads.len()) {
-        (None, _) => bail!("Teams coverage head is missing"),
-        (Some(head), 0) => Ok(head),
-        (Some(_), rest) => bail!(
-            "Teams coverage head has {} values; refusing arbitrary selection",
-            rest + 1
-        ),
-    }
-}
-
-/// A receipt's generation is part of its identity and orders the DAG; a
-/// receipt without one cannot be placed. Should a writer ever reuse a receipt
-/// id, the smallest generation is taken.
+/// A receipt's generation is part of its identity. Should a writer ever reuse
+/// a receipt id, the smallest generation is taken.
 fn receipt_generation<P>(catalog: &P, receipt: Id) -> Result<u128>
 where
     P: TriblePattern,
@@ -2275,20 +2197,18 @@ mod tests {
             BTreeSet::from([graph_id])
         );
         assert_eq!(
-            coverage_head(&reader, catalog.facts(), source).unwrap(),
-            Some(CoverageHead {
-                id: graph_id,
+            coverage_frontier(&reader, catalog.facts(), source).unwrap(),
+            Some(CoverageFrontier {
+                heads: BTreeSet::from([graph_id]),
                 generation: 1,
                 cursor: Some("https://graph.microsoft.test/messages/delta?cursor=one".to_owned()),
             })
         );
         assert_eq!(
             current_message_states(catalog.facts(), source)
-                .unwrap()
-                .values()
-                .copied()
+                .into_values()
                 .collect::<Vec<_>>(),
-            vec![CurrentMessageState::Present(observation)]
+            vec![BTreeSet::from([MessageVersion::Present(observation)])]
         );
         assert_eq!(source_ids(catalog.facts()), BTreeSet::from([source]));
         assert_eq!(
@@ -2321,6 +2241,46 @@ mod tests {
     }
 
     #[test]
+    fn an_event_of_an_unknown_kind_is_not_in_the_view_and_refuses_nothing() {
+        let tenant = "tenant.example";
+        let source = source_fragment(tenant).root().unwrap();
+        let (mut catalog, observation) = observation_fragment(
+            tenant,
+            source,
+            MessageObservationInput {
+                chat_id: "chat".to_owned(),
+                message_id: "message".to_owned(),
+                raw: BTreeSet::from(["{\"id\":\"message\"}".to_owned()]),
+                author_user_id: None,
+                author_name: None,
+                content: Some("hello".to_owned()),
+                created_at: Some(point(1.0)),
+                modified_at: point(2.0),
+                deleted_at: None,
+                etag: "etag".to_owned(),
+                attachments: Vec::new(),
+            },
+        )
+        .unwrap();
+        catalog += coverage_fragment(
+            source,
+            1,
+            [],
+            "https://graph.microsoft.test/messages/delta",
+            "https://graph.microsoft.test/messages/delta?cursor=one",
+            "delta",
+            [observation, Id::new([0x77; 16]).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(
+            current_message_states(catalog.facts(), source)
+                .into_values()
+                .collect::<Vec<_>>(),
+            vec![BTreeSet::from([MessageVersion::Present(observation)])]
+        );
+    }
+
+    #[test]
     fn graph_datetime_and_hosted_content_parsers_are_shared_source_semantics() {
         let utc = parse_graph_datetime("2026-08-09T12:34:56.1234567Z").unwrap();
         let offset = parse_graph_datetime("2026-08-09T14:34:56.1234567+02:00").unwrap();
@@ -2333,46 +2293,67 @@ mod tests {
         );
     }
 
+    fn page(observations: &[(i128, Id)], removed: bool) -> PageEvents {
+        PageEvents {
+            observations: observations.to_vec(),
+            removed,
+        }
+    }
+
+    fn merged(left: &CausalMessageState, right: &CausalMessageState) -> BTreeSet<CausalEvent> {
+        let mut one = left.clone();
+        one.merge(right.clone());
+        let mut other = right.clone();
+        other.merge(left.clone());
+        assert_eq!(one, other, "a merge has no order");
+        let mut again = one.clone();
+        again.merge(right.clone());
+        assert_eq!(again, one, "a merge is idempotent");
+        one.current
+    }
+
     #[test]
-    fn causal_merge_orders_full_versions_but_not_unversioned_tombstones() {
-        let message = Id::new([9; 16]).unwrap();
-        let present = Id::new([1; 16]).unwrap();
-        let deleted = Id::new([2; 16]).unwrap();
-        let observations = BTreeMap::from([
-            (
-                present,
-                ObservationOrder {
-                    message,
-                    modified: 10,
-                    deleted: false,
-                },
-            ),
-            (
-                deleted,
-                ObservationOrder {
-                    message,
-                    modified: 11,
-                    deleted: true,
-                },
-            ),
-        ]);
+    fn a_merge_orders_full_versions_but_not_unseen_tombstones() {
+        use CausalEvent::{Observed, Removed};
+        let [first, second, root, left, right] =
+            [1, 2, 3, 4, 5].map(|byte| Id::new([byte; 16]).unwrap());
+        let mut base = CausalMessageState::default();
+        base.apply_page(root, &page(&[(10, first)], false));
+
+        let mut edited = base.clone();
+        edited.apply_page(left, &page(&[(11, second)], false));
+        assert_eq!(merged(&base, &edited), BTreeSet::from([Observed(second)]));
+
+        // Removed knowing the version the other side still shows: removed.
+        let mut removed = base.clone();
+        removed.apply_page(right, &page(&[], true));
+        assert_eq!(merged(&base, &removed), BTreeSet::from([Removed(right)]));
+
+        // Edited and removed concurrently: unordered.
         assert_eq!(
-            merge_causal_visible(
-                CausalVisible::Present(present),
-                CausalVisible::Deleted(Some(deleted)),
-                &observations,
-            )
-            .unwrap(),
-            CausalVisible::Deleted(Some(deleted))
+            merged(&edited, &removed),
+            BTreeSet::from([Observed(second), Removed(right)])
         );
+
+        // Two versions of one time are unordered.
+        let mut tie = base.clone();
+        tie.apply_page(left, &page(&[(10, second)], false));
         assert_eq!(
-            merge_causal_visible(
-                CausalVisible::Deleted(None),
-                CausalVisible::Present(present),
-                &observations,
-            )
-            .unwrap(),
-            CausalVisible::Conflict
+            tie.current,
+            BTreeSet::from([Observed(first), Observed(second)])
+        );
+        // Seeing one of them again settles nothing; a newer version does.
+        tie.apply_page(right, &page(&[(10, first)], false));
+        assert_eq!(tie.current.len(), 2);
+        tie.apply_page(right, &page(&[(12, root)], false));
+        assert_eq!(tie.current, BTreeSet::from([Observed(root)]));
+
+        // A restoration which saw the removal supersedes it in every merge.
+        let mut restored = removed.clone();
+        restored.apply_page(left, &page(&[(11, second)], false));
+        assert_eq!(
+            merged(&removed, &restored),
+            BTreeSet::from([Observed(second)])
         );
     }
 }

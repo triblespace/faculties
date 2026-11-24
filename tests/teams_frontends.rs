@@ -203,7 +203,7 @@ fn resident_reads_need_no_auth_and_keep_owned_observations_stable() {
         .operations()
         .read(ReadOptions::default(), ArchiveAccess::Resident)
         .unwrap();
-    assert_eq!(before.value[0].content, "first");
+    assert_eq!(before.value[0].content.as_deref(), Some("first"));
     let (second, _) = page(
         TENANT,
         vec![
@@ -214,14 +214,14 @@ fn resident_reads_need_no_auth_and_keep_owned_observations_stable() {
         vec![head],
     );
     fixture.publish(second);
-    assert_eq!(before.value[0].content, "first");
+    assert_eq!(before.value[0].content.as_deref(), Some("first"));
     let current = fixture
         .operations()
         .read(ReadOptions::default(), ArchiveAccess::Resident)
         .unwrap();
     assert_eq!(current.value.len(), 2);
-    assert_eq!(current.value[0].content, "edited");
-    assert_eq!(current.value[1].content, "@- literal body");
+    assert_eq!(current.value[0].content.as_deref(), Some("edited"));
+    assert_eq!(current.value[1].content.as_deref(), Some("@- literal body"));
     let latest = call(
         &fixture.mcp(),
         "teams_read",

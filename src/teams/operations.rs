@@ -143,8 +143,14 @@ pub struct ArchivedMessage {
     pub id: Id,
     pub chat: String,
     pub author: String,
-    pub content: String,
-    pub created_at: Inline<NsTAIInterval>,
+    /// Absent where this version says the message was deleted.
+    pub content: Option<String>,
+    pub created_at: Option<Inline<NsTAIInterval>>,
+    pub modified_at: Option<Inline<NsTAIInterval>>,
+    /// Several unordered current versions of one message follow each other;
+    /// none of them is the message's one state.
+    pub version_index: usize,
+    pub version_count: usize,
 }
 #[derive(Clone, Debug)]
 pub struct AttachmentInfo {
@@ -594,29 +600,8 @@ impl TeamsSession {
             auth_sources,
         )?;
 
-        let mut receipt_sources = find!(
-            source: Id,
-            pattern!(fragment.facts(), [{
-                _?receipt @
-                metadata::tag: teams::kind_coverage,
-                teams::source: ?source,
-            }])
-        )
-        .collect::<BTreeSet<_>>();
-        receipt_sources.extend(find!(
-            source: Id,
-            pattern!(fragment.facts(), [{
-                _?receipt @
-                metadata::tag: teams::kind_legacy_snapshot,
-                teams::source: ?source,
-            }])
-        ));
-        for source in receipt_sources {
-            // This pure projection exposes coverage forks and conflicting
-            // message versions without imposing an arrival order.
-            let _ = teams_core::current_message_states(&candidate, source)?;
-        }
-
+        // Unordered versions and concurrent receipts are observations, which
+        // readers show; only what this writer itself would fork is refused.
         let context_sources = find!(
             source: Id,
             pattern!(fragment.facts(), [{
@@ -995,7 +980,7 @@ fn pull_once_with_cache(
     let (token, app_config) = get_app_token(config, app_token_cache, session)?;
     let mut known_messages =
         load_known_messages(&session.reader, &session.facts, config.source_id)?;
-    let mut coverage = coverage_head(&session.reader, &session.facts, config.source_id)?;
+    let mut coverage = coverage_frontier(&session.reader, &session.facts, config.source_id)?;
     let base_url = resolve_delta_url(&config.delta_url, &app_config.user_id)?;
     let mut request_url = coverage
         .as_ref()
@@ -1040,7 +1025,9 @@ fn pull_once_with_cache(
         let coverage_record = coverage_fragment(
             config.source_id,
             generation,
-            coverage.as_ref().map(|coverage| coverage.id).into_iter(),
+            coverage
+                .iter()
+                .flat_map(|coverage| coverage.heads.iter().copied()),
             &request_url,
             &cursor,
             cursor_kind,
@@ -1055,8 +1042,8 @@ fn pull_once_with_cache(
         receipt.observations += observations.len();
         known_messages = next_known_messages;
 
-        coverage = Some(CoverageHead {
-            id: receipt_id,
+        coverage = Some(CoverageFrontier {
+            heads: BTreeSet::from([receipt_id]),
             generation,
             cursor: Some(cursor.clone()),
         });
@@ -2335,13 +2322,37 @@ pub struct ReadOptions {
     pub descending: bool,
 }
 
+/// One logical message and its current versions, several where they are
+/// unordered. A bare source tombstone has no observation to read.
 #[derive(Debug, Clone)]
 struct ReadMessage {
     message_id: Id,
     chat_id: Id,
+    versions: Vec<Option<ReadVersion>>,
+}
+
+impl ReadMessage {
+    /// The versions which still carry the message.
+    fn live(&self) -> impl Iterator<Item = &ReadVersion> {
+        self.versions
+            .iter()
+            .flatten()
+            .filter(|version| !version.deleted)
+    }
+
+    /// When the message was sent, the earliest its versions say; absent where
+    /// every version is a deletion.
+    fn live_since(&self) -> Option<i128> {
+        self.live().map(|version| version.created_at_key).min()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadVersion {
     author_names: BTreeSet<Inline<Handle<UTF8String>>>,
     deleted: bool,
     created_at: Inline<NsTAIInterval>,
+    modified_at: Inline<NsTAIInterval>,
     created_at_key: i128,
     content: Option<Inline<Handle<UTF8String>>>,
     attachments: BTreeSet<Id>,
@@ -2434,32 +2445,43 @@ where
     )
     .collect::<BTreeMap<_, _>>();
     let mut result = Vec::new();
-    for (message, state) in teams_core::current_message_states(catalog, source_id)? {
+    for (message, versions) in teams_core::current_message_states(catalog, source_id) {
         let chat = message_chats.get(&message).copied().ok_or_else(|| {
             anyhow::anyhow!(
                 "Teams causal state names message {message:x} outside source {source_id:x}"
             )
         })?;
-        match state {
-            teams_core::CurrentMessageState::Present(observation) => result.push(
-                read_message_observation(catalog, message, chat, observation, false)?,
-            ),
-            teams_core::CurrentMessageState::Deleted(Some(observation)) => result.push(
-                read_message_observation(catalog, message, chat, observation, true)?,
-            ),
-            teams_core::CurrentMessageState::Deleted(None) => {}
+        let mut distinct = Vec::new();
+        for version in versions {
+            let version = match version {
+                teams_core::MessageVersion::Present(observation) => {
+                    read_message_observation(catalog, observation, false).map(Some)
+                }
+                teams_core::MessageVersion::Deleted(observation) => {
+                    read_message_observation(catalog, observation, true).map(Some)
+                }
+                teams_core::MessageVersion::Removed => Ok(None),
+            }?;
+            // Versions which differ only in the source's etag read the same,
+            // which is not a conflict.
+            if !distinct.contains(&version) {
+                distinct.push(version);
+            }
         }
+        result.push(ReadMessage {
+            message_id: message,
+            chat_id: chat,
+            versions: distinct,
+        });
     }
     Ok(result)
 }
 
 fn read_message_observation<P>(
     catalog: &P,
-    message_id: Id,
-    chat_id: Id,
     observation_id: Id,
     deleted: bool,
-) -> Result<ReadMessage>
+) -> Result<ReadVersion>
 where
     P: TriblePattern,
 {
@@ -2496,12 +2518,11 @@ where
         pattern!(catalog, [{ observation_id @ archive::attachment: ?attachment }])
     )
     .collect::<BTreeSet<_>>();
-    Ok(ReadMessage {
-        message_id,
-        chat_id,
+    Ok(ReadVersion {
         author_names,
         deleted,
         created_at,
+        modified_at,
         created_at_key: interval_key(created_at),
         content,
         attachments,
@@ -2519,19 +2540,15 @@ fn read_messages(
     let since_key = parse_since_key(options.since.as_deref())?;
     let mut messages = current_messages(&view.facts, source_id)?
         .into_iter()
-        .filter(|message| !message.deleted)
-        .filter(|message| {
+        .filter_map(|message| message.live_since().map(|since| (since, message)))
+        .filter(|(_, message)| {
             chat_filter_ids
                 .as_ref()
                 .is_none_or(|filter| filter.contains(&message.chat_id))
         })
-        .filter(|message| since_key.is_none_or(|since| message.created_at_key >= since))
+        .filter(|(sent, _)| since_key.is_none_or(|since| *sent >= since))
         .collect::<Vec<_>>();
-    messages.sort_by(|left, right| {
-        left.created_at_key
-            .cmp(&right.created_at_key)
-            .then_with(|| left.message_id.cmp(&right.message_id))
-    });
+    messages.sort_by_key(|(sent, message)| (*sent, message.message_id));
     if options.limit > 0 && messages.len() > options.limit {
         messages = messages.split_off(messages.len() - options.limit);
     }
@@ -2539,35 +2556,47 @@ fn read_messages(
         messages.reverse();
     }
     let mut result = Vec::new();
-    for message in messages {
-        let content = read_utf8string(
-            &view.reader,
-            message.content.expect("present observation has content"),
-            "Teams message content",
-        )?;
-        let mut author_names = message
-            .author_names
-            .into_iter()
-            .map(|handle| read_utf8string(&view.reader, handle, "Teams author display name"))
-            .collect::<Result<Vec<_>>>()?;
-        author_names.sort();
-        author_names.dedup();
-        let author = if author_names.is_empty() {
-            "unknown".to_owned()
-        } else {
-            author_names.join(" / ")
-        };
+    for (_, message) in messages {
         let chat = chat_map
             .get(&message.chat_id)
             .cloned()
             .unwrap_or_else(|| format!("{}", message.chat_id));
-        result.push(ArchivedMessage {
-            id: message.message_id,
-            created_at: message.created_at,
-            chat,
-            author,
-            content,
-        });
+        let version_count = message.versions.len();
+        for (version_index, version) in message.versions.into_iter().enumerate() {
+            let content = version
+                .as_ref()
+                .filter(|version| !version.deleted)
+                .map(|version| {
+                    read_utf8string(
+                        &view.reader,
+                        version.content.expect("present observation has content"),
+                        "Teams message content",
+                    )
+                })
+                .transpose()?;
+            let mut author_names = version
+                .iter()
+                .flat_map(|version| &version.author_names)
+                .map(|handle| read_utf8string(&view.reader, *handle, "Teams author display name"))
+                .collect::<Result<Vec<_>>>()?;
+            author_names.sort();
+            author_names.dedup();
+            let author = if author_names.is_empty() {
+                "unknown".to_owned()
+            } else {
+                author_names.join(" / ")
+            };
+            result.push(ArchivedMessage {
+                id: message.message_id,
+                created_at: version.as_ref().map(|version| version.created_at),
+                modified_at: version.as_ref().map(|version| version.modified_at),
+                chat: chat.clone(),
+                author,
+                content,
+                version_index,
+                version_count,
+            });
+        }
     }
     Ok(result)
 }
@@ -2742,16 +2771,25 @@ where
     P: TriblePattern,
 {
     let mut rows = Vec::new();
-    for message in current_messages(catalog, source_id)?
-        .into_iter()
-        .filter(|message| !message.deleted)
-    {
+    for message in current_messages(catalog, source_id)? {
         if chat_filter.is_some_and(|filter| !filter.contains(&message.chat_id))
             || message_filter.is_some_and(|filter| !filter.contains(&message.message_id))
         {
             continue;
         }
-        for attachment_id in message.attachments {
+        // An occurrence several unordered versions carry is one occurrence,
+        // listed with the version sent earliest.
+        let mut occurrences = BTreeMap::<Id, (i128, Inline<NsTAIInterval>)>::new();
+        for version in message.live() {
+            for attachment_id in &version.attachments {
+                let sent = (version.created_at_key, version.created_at);
+                occurrences
+                    .entry(*attachment_id)
+                    .and_modify(|kept| *kept = (*kept).min(sent))
+                    .or_insert(sent);
+            }
+        }
+        for (attachment_id, (created_at_key, created_at)) in occurrences {
             // Source id, kind, and name are the occurrence's identity; should
             // a writer ever reuse an id, the smallest handle is shown. An
             // occurrence without a readable source id cannot be referenced.
@@ -2824,8 +2862,8 @@ where
                 attachment_id,
                 message_id: message.message_id,
                 chat_id: message.chat_id,
-                created_at: message.created_at,
-                created_at_key: message.created_at_key,
+                created_at,
+                created_at_key,
                 source_id: Some(source_id),
                 source_kind,
                 source_pointers,
@@ -3228,7 +3266,7 @@ fn decode_base64(value: &str) -> Result<Vec<u8>> {
         .map_err(|err| anyhow::anyhow!("base64 decode failed: {err:?}"))
 }
 
-type CoverageHead = teams_core::CoverageHead;
+type CoverageFrontier = teams_core::CoverageFrontier;
 
 /// The one candidate among distinct entities, such as the sole source when no
 /// tenant is selected or the logical message a minimal record names. Several
@@ -3283,15 +3321,15 @@ fn inline_u256_to_u128(value: Inline<U256BE>) -> Result<u128> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-fn coverage_head<P>(
+fn coverage_frontier<P>(
     reader: &impl BlobStoreGet,
     catalog: &P,
     source_id: Id,
-) -> Result<Option<CoverageHead>>
+) -> Result<Option<CoverageFrontier>>
 where
     P: TriblePattern,
 {
-    teams_core::coverage_head(reader, catalog, source_id)
+    teams_core::coverage_frontier(reader, catalog, source_id)
 }
 
 fn coverage_fragment(
@@ -3349,25 +3387,6 @@ fn build_page_fragment(
             .entry(identity.message_external_id.clone())
             .or_default()
             .insert(identity.clone());
-    }
-
-    let mut page_kinds = BTreeMap::<Id, (bool, bool)>::new();
-    for message in &incoming {
-        let identity = resolve_message_identity(message, &identities, &by_external)?;
-        let kinds = page_kinds.entry(identity.message_id).or_default();
-        if message.source_removed {
-            kinds.0 = true;
-        } else {
-            kinds.1 = true;
-        }
-    }
-    if let Some((message, _)) = page_kinds
-        .iter()
-        .find(|(_, (removed, full))| *removed && *full)
-    {
-        bail!(
-            "Teams delta page carries both an unversioned @removed marker and a full source version for message {message:x}; refusing to invent their order"
-        );
     }
 
     for message in incoming {
@@ -4112,19 +4131,13 @@ mod tests {
         fixture.publish(edited);
         let view = load_view(&fixture);
         let source = source_fragment("tenant-a").root().unwrap();
-        let current = current_messages(&view.facts, source).unwrap();
-        assert_eq!(current.len(), 1);
-        assert!(!current[0].deleted);
+        assert_eq!(read_all(&fixture.storage()), vec![one("edited")]);
         assert_eq!(
-            read_utf8string(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
-            "edited"
-        );
-        assert_eq!(
-            coverage_head(&view.reader, &view.facts, source)
+            coverage_frontier(&view.reader, &view.facts, source)
                 .unwrap()
                 .unwrap()
-                .id,
-            edited_receipt
+                .heads,
+            BTreeSet::from([edited_receipt])
         );
 
         let mut deleted = graph_message(
@@ -4147,7 +4160,13 @@ mod tests {
         let view = load_view(&fixture);
         let current = current_messages(&view.facts, source).unwrap();
         assert_eq!(current.len(), 1);
-        assert!(current[0].deleted);
+        assert_eq!(current[0].live_since(), None);
+        assert!(current[0]
+            .versions
+            .iter()
+            .flatten()
+            .all(|version| version.deleted));
+        assert!(read_all(&fixture.storage()).is_empty());
     }
 
     #[test]
@@ -4185,10 +4204,7 @@ mod tests {
             &known,
         );
         fixture.publish(tombstone);
-        let deleted_view = load_view(&fixture);
-        assert!(current_messages(&deleted_view.facts, source)
-            .unwrap()
-            .is_empty());
+        assert!(read_all(&fixture.storage()).is_empty());
 
         // A cursor reset can replay the exact pre-deletion source version in
         // a descendant receipt. Receipt recency alone must not resurrect it.
@@ -4200,10 +4216,7 @@ mod tests {
             "https://graph.example/delta-3",
         );
         fixture.publish(replay);
-        let replay_view = load_view(&fixture);
-        assert!(current_messages(&replay_view.facts, source)
-            .unwrap()
-            .is_empty());
+        assert!(read_all(&fixture.storage()).is_empty());
 
         let (restore, _) = page_fragment(
             "tenant-a",
@@ -4219,18 +4232,7 @@ mod tests {
             "https://graph.example/delta-4",
         );
         fixture.publish(restore);
-        let restored_view = load_view(&fixture);
-        let current = current_messages(&restored_view.facts, source).unwrap();
-        assert_eq!(current.len(), 1);
-        assert_eq!(
-            read_utf8string(
-                &restored_view.reader,
-                current[0].content.unwrap(),
-                "restored content",
-            )
-            .unwrap(),
-            "restored"
-        );
+        assert_eq!(read_all(&fixture.storage()), vec![one("restored")]);
     }
 
     #[test]
@@ -4548,8 +4550,55 @@ mod tests {
         );
     }
 
+    /// The whole archive as a reader sees it: the text, or `None` where a
+    /// version is a deletion, and which of how many versions it is.
+    fn read_all(storage: &TeamsStorage) -> Vec<(Option<String>, usize, usize)> {
+        archived(storage)
+            .into_iter()
+            .map(|row| (row.content, row.version_index, row.version_count))
+            .collect()
+    }
+
+    fn archived(storage: &TeamsStorage) -> Vec<ArchivedMessage> {
+        let source = source_fragment("tenant-a").root().unwrap();
+        storage
+            .with_session(|session| {
+                read_messages(
+                    source,
+                    session,
+                    ReadOptions {
+                        chat_id: None,
+                        since: None,
+                        limit: 0,
+                        descending: false,
+                    },
+                )
+            })
+            .unwrap()
+    }
+
+    fn one(content: &str) -> (Option<String>, usize, usize) {
+        (Some(content.to_owned()), 0, 1)
+    }
+
+    fn sorted(
+        mut rows: Vec<(Option<String>, usize, usize)>,
+    ) -> Vec<(Option<String>, usize, usize)> {
+        rows.sort();
+        rows
+    }
+
+    /// The texts of several versions of one message, whichever comes first.
+    fn texts(rows: &[(Option<String>, usize, usize)]) -> BTreeSet<Option<String>> {
+        rows.iter().map(|(content, _, _)| content.clone()).collect()
+    }
+
+    fn some(text: &str) -> Option<String> {
+        Some(text.to_owned())
+    }
+
     #[test]
-    fn divergent_latest_message_ties_fail_closed() {
+    fn two_versions_of_one_time_are_both_stored_and_shown() {
         let fixture = Fixture::new();
         let (first, first_receipt) = page_fragment(
             "tenant-a",
@@ -4565,72 +4614,538 @@ mod tests {
             "https://graph.example/delta-1",
         );
         fixture.publish(first);
-        let (tie, _) = page_fragment(
+        let (tie, tie_receipt) = page_fragment(
+            "tenant-a",
+            vec![
+                graph_message(
+                    "chat",
+                    "message",
+                    "2026-08-01T10:00:00Z",
+                    "2026-08-01T11:00:00Z",
+                    "right",
+                ),
+                graph_message(
+                    "chat",
+                    "other",
+                    "2026-08-01T12:00:00Z",
+                    "2026-08-01T12:00:00Z",
+                    "other",
+                ),
+            ],
+            2,
+            [first_receipt],
+            "https://graph.example/delta-2",
+        );
+        fixture.publish(tie);
+
+        let rows = read_all(&fixture.storage());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            texts(&rows[..2]),
+            BTreeSet::from([some("left"), some("right")])
+        );
+        assert_eq!((rows[0].1, rows[0].2), (0, 2));
+        assert_eq!((rows[1].1, rows[1].2), (1, 2));
+        assert_eq!(rows[2], one("other"));
+
+        // Both are said to conflict, with their times and authors.
+        let mut rendered = String::new();
+        crate::teams::render::messages(
+            &archived(&fixture.storage()),
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    rendered.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        let lines = rendered.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{rendered}");
+        for (line, index) in lines[..2].iter().zip(1..) {
+            assert!(
+                line.contains(&format!("[CONFLICTING {index}/2 of message ")),
+                "{line}"
+            );
+            assert!(line.contains("modified 2026-08-01T11:00:00"), "{line}");
+            assert!(line.contains("Tester: "), "{line}");
+        }
+        assert!(!lines[2].contains("CONFLICTING"), "{rendered}");
+
+        // A conflict is one message to a limit, never half of one.
+        let source = source_fragment("tenant-a").root().unwrap();
+        let limited = fixture
+            .storage()
+            .with_session(|session| {
+                read_messages(
+                    source,
+                    session,
+                    ReadOptions {
+                        chat_id: None,
+                        since: None,
+                        limit: 2,
+                        descending: true,
+                    },
+                )
+            })
+            .unwrap();
+        assert_eq!(limited.len(), 3);
+
+        // The source's next version settles it.
+        let (later, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T13:00:00Z",
+                "settled",
+            )],
+            3,
+            [tie_receipt],
+            "https://graph.example/delta-3",
+        );
+        fixture.publish(later);
+        assert_eq!(
+            read_all(&fixture.storage()),
+            vec![one("settled"), one("other")]
+        );
+    }
+
+    /// The source may name one version anew; what it says is unchanged.
+    #[test]
+    fn versions_differing_only_in_their_etag_read_as_one() {
+        let fixture = Fixture::new();
+        let version = |etag: &str| {
+            let mut message = graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                "same",
+            );
+            message["etag"] = json!(etag);
+            message
+        };
+        let (first, receipt) = page_fragment(
+            "tenant-a",
+            vec![version("one")],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(first);
+        let (second, _) = page_fragment(
+            "tenant-a",
+            vec![version("two")],
+            2,
+            [receipt],
+            "https://graph.example/delta-2",
+        );
+        fixture.publish(second);
+        assert_eq!(read_all(&fixture.storage()), vec![one("same")]);
+        let view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        assert_eq!(
+            teams_core::current_message_states(&view.facts, source)
+                .into_values()
+                .map(|versions| versions.len())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        let presented = teams_core::current_messages(&view.facts, source).unwrap();
+        assert_eq!(presented.len(), 1);
+        assert_eq!(presented[0].version_count, 1);
+    }
+
+    #[test]
+    fn one_page_may_bring_unordered_versions_and_a_removal() {
+        let fixture = Fixture::new();
+        let version = |content| {
+            graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                content,
+            )
+        };
+        let (page, receipt) = page_fragment(
+            "tenant-a",
+            vec![version("left"), version("right")],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(page);
+        assert_eq!(
+            texts(&read_all(&fixture.storage())),
+            BTreeSet::from([some("left"), some("right")])
+        );
+
+        let mut newer = version("newer");
+        newer["lastModifiedDateTime"] = json!("2026-08-01T12:00:00Z");
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![
+                newer,
+                json!({ "id": "message", "@removed": { "reason": "deleted" } }),
+            ],
+            2,
+            [receipt],
+            "https://graph.example/delta-2",
+        );
+        fixture.publish(page);
+        assert_eq!(
+            read_all(&fixture.storage()),
+            vec![(some("newer"), 0, 2), (None, 1, 2)]
+        );
+    }
+
+    /// An occurrence both versions of a message carry is one occurrence.
+    #[test]
+    fn a_conflicting_message_lists_its_attachment_once_and_exports_it() {
+        let fixture = Fixture::new();
+        let version = |content| {
+            let mut message = graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T11:00:00Z",
+                content,
+            );
+            message["attachments"] = json!([{
+                "id": "attachment-1",
+                "name": "note.txt",
+                "contentType": "text/plain",
+                "contentBytes":
+                    base64::engine::general_purpose::STANDARD.encode(b"hello"),
+            }]);
+            message
+        };
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![version("left"), version("right")],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        fixture.publish(page);
+        let source = source_fragment("tenant-a").root().unwrap();
+        fixture
+            .storage()
+            .with_session(|session| {
+                let view = session.view();
+                let rows = attachment_rows(&view.reader, &view.facts, source, None, None)?;
+                assert_eq!(rows.len(), 1);
+                let found = get_attachment(
+                    source,
+                    session,
+                    AttachmentGetOptions {
+                        source_id: "attachment-1".to_owned(),
+                        chat_id: None,
+                        message_id: None,
+                    },
+                )?;
+                let AttachmentLookup::Found(found) = found else {
+                    panic!("one occurrence: {found:?}")
+                };
+                assert_eq!(found.bytes.as_ref(), b"hello");
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_receipts_are_both_current_whatever_their_generation() {
+        let fixture = Fixture::new();
+        let page = |content: &str, generation, predecessors: Vec<Id>| {
+            page_fragment(
+                "tenant-a",
+                vec![graph_message(
+                    "chat",
+                    content,
+                    "2026-08-01T10:00:00Z",
+                    "2026-08-01T10:00:00Z",
+                    content,
+                )],
+                generation,
+                predecessors,
+                &format!("https://graph.example/{content}"),
+            )
+        };
+        let (root, root_id) = page("root", 1, vec![]);
+        fixture.publish(root);
+        let (main, main_id) = page("main", 2, vec![root_id]);
+        fixture.publish(main);
+        let (advanced, advanced_id) = page("advanced", 3, vec![main_id]);
+        fixture.publish(advanced);
+        let (stale, stale_id) = page("stale", 2, vec![root_id]);
+        fixture.publish(stale);
+
+        assert_eq!(
+            sorted(read_all(&fixture.storage())),
+            vec![one("advanced"), one("main"), one("root"), one("stale")]
+        );
+        let view = load_view(&fixture);
+        let source = source_fragment("tenant-a").root().unwrap();
+        assert_eq!(
+            coverage_frontier(&view.reader, &view.facts, source).unwrap(),
+            Some(CoverageFrontier {
+                heads: BTreeSet::from([advanced_id, stale_id]),
+                generation: 3,
+                cursor: some("https://graph.example/advanced"),
+            })
+        );
+    }
+
+    /// Commits arrive one by one, so a page may precede the page it follows.
+    #[test]
+    fn a_page_whose_predecessor_has_not_arrived_is_readable() {
+        let fixture = Fixture::new();
+        let (first, first_receipt) = page_fragment(
+            "tenant-a",
+            vec![
+                graph_message(
+                    "chat",
+                    "message",
+                    "2026-08-01T10:00:00Z",
+                    "2026-08-01T10:00:00Z",
+                    "first",
+                ),
+                graph_message(
+                    "chat",
+                    "earlier",
+                    "2026-08-01T09:00:00Z",
+                    "2026-08-01T09:00:00Z",
+                    "earlier",
+                ),
+            ],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        let (second, _) = page_fragment(
             "tenant-a",
             vec![graph_message(
                 "chat",
                 "message",
                 "2026-08-01T10:00:00Z",
                 "2026-08-01T11:00:00Z",
-                "right",
+                "second",
             )],
             2,
             [first_receipt],
             "https://graph.example/delta-2",
         );
-        let before = fs::read(&fixture.pile).unwrap();
-        let error = fixture.storage().publish(tie, "tie").unwrap_err();
-        assert!(
-            error.to_string().contains("causally ambiguous"),
-            "unexpected rejection: {error:#}"
-        );
-        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
-        let view = load_view(&fixture);
-        let source = source_fragment("tenant-a").root().unwrap();
-        let current = current_messages(&view.facts, source).unwrap();
-        assert_eq!(current.len(), 1);
+        fixture.publish(second);
+        assert_eq!(read_all(&fixture.storage()), vec![one("second")]);
+        fixture.publish(first);
         assert_eq!(
-            read_utf8string(&view.reader, current[0].content.unwrap(), "test content").unwrap(),
-            "left"
+            read_all(&fixture.storage()),
+            vec![one("earlier"), one("second")]
         );
     }
 
+    /// Answer every request with one page, and say how many there were.
+    fn serve_page(
+        listener: std::net::TcpListener,
+        body: String,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead, BufReader, Write};
+        std::thread::spawn(move || {
+            let mut requested = Vec::new();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+                let request = lines.next().unwrap().unwrap();
+                for line in lines {
+                    if line.unwrap().is_empty() {
+                        break;
+                    }
+                }
+                if request.starts_with("GET /stop") {
+                    return requested;
+                }
+                requested.push(request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        })
+    }
+
+    /// Two hosts pull independently from one common page, their piles are
+    /// concatenated, and the next pull continues from one of their cursors.
     #[test]
-    fn causal_coverage_never_hides_a_stale_fork_behind_generation() {
-        let fixture = Fixture::new();
-        let (root, root_id) =
-            page_fragment("tenant-a", vec![], 1, [], "https://graph.example/root");
-        fixture.publish(root);
-        let (main, main_id) = page_fragment(
+    fn concatenated_pulls_show_both_hosts_and_the_next_pull_joins_them() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cursor = |name: &str| format!("http://{address}/{name}");
+        let message = |id: &str, modified: &str, content: &str| {
+            graph_message("chat", id, "2026-08-01T10:00:00Z", modified, content)
+        };
+
+        let here = Fixture::new();
+        let (client_secret, _) = initialize_test_secrets(&here);
+        let there = Fixture::new();
+        let (root, root_id) = page_fragment(
             "tenant-a",
-            vec![],
+            vec![
+                message("tied", "2026-08-01T10:00:00Z", "tied"),
+                message("kept", "2026-08-01T10:00:00Z", "kept"),
+                message("gone", "2026-08-01T10:00:00Z", "gone"),
+                message("edited", "2026-08-01T10:00:00Z", "edited"),
+            ],
+            1,
+            [],
+            &cursor("root"),
+        );
+        here.publish(root);
+        fs::copy(&here.pile, &there.pile).unwrap();
+        fs::copy(&here.key, &there.key).unwrap();
+
+        // This host: two pages, one version of `tied`, and it sees `gone` and
+        // `edited` removed.
+        let tied_here = message("tied", "2026-08-01T11:00:00Z", "tied here");
+        let only_here = message("here", "2026-08-01T11:00:00Z", "only here");
+        let view = load_view(&here);
+        let source = source_fragment("tenant-a").root().unwrap();
+        let known = load_known_messages(&view.reader, &view.facts, source).unwrap();
+        drop(view);
+        let (first, first_id) = page_fragment_with_known(
+            "tenant-a",
+            vec![
+                tied_here.clone(),
+                json!({ "id": "gone", "@removed": { "reason": "deleted" } }),
+                json!({ "id": "edited", "@removed": { "reason": "deleted" } }),
+            ],
             2,
             [root_id],
-            "https://graph.example/main",
+            &cursor("here-1"),
+            &known,
         );
-        fixture.publish(main);
-        let (advanced, _) = page_fragment(
+        here.publish(first);
+        let (second, second_id) = page_fragment(
             "tenant-a",
-            vec![],
+            vec![only_here.clone()],
             3,
-            [main_id],
-            "https://graph.example/advanced",
+            [first_id],
+            &cursor("here-2"),
         );
-        fixture.publish(advanced);
-        let (stale_fork, _) = page_fragment(
+        here.publish(second);
+
+        // The other host: one page, another version of `tied` at that time,
+        // and an edit of `edited`.
+        let tied_there = message("tied", "2026-08-01T11:00:00Z", "tied there");
+        let only_there = message("there", "2026-08-01T11:00:00Z", "only there");
+        let edited_there = message("edited", "2026-08-01T11:00:00Z", "edited there");
+        let (other, other_id) = page_fragment(
             "tenant-a",
-            vec![],
+            vec![tied_there.clone(), only_there.clone(), edited_there.clone()],
             2,
             [root_id],
-            "https://graph.example/stale-fork",
+            &cursor("there-1"),
         );
-        let before = fs::read(&fixture.pile).unwrap();
-        let error = fixture
+        there.publish(other);
+
+        // Concatenation is the merge.
+        let mut merged = fs::OpenOptions::new()
+            .append(true)
+            .open(&here.pile)
+            .unwrap();
+        std::io::Write::write_all(&mut merged, &fs::read(&there.pile).unwrap()).unwrap();
+        drop(merged);
+
+        let conflicts = BTreeSet::from([
+            some("tied here"),
+            some("tied there"),
+            some("edited there"),
+            None,
+        ]);
+        let whole = |extra: &[&str]| {
+            let mut plain = vec!["kept", "only here", "only there"];
+            plain.extend(extra);
+            sorted(plain.into_iter().map(one).collect())
+        };
+        let check = |extra: &[&str]| {
+            let rows = read_all(&here.storage());
+            let (conflicting, plain): (Vec<_>, Vec<_>) =
+                rows.into_iter().partition(|(_, _, count)| *count > 1);
+            assert_eq!(conflicting.len(), 4);
+            assert_eq!(texts(&conflicting), conflicts);
+            assert_eq!(sorted(plain), whole(extra));
+        };
+        check(&[]);
+        let view = load_view(&here);
+        let frontier = coverage_frontier(&view.reader, &view.facts, source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frontier.heads, BTreeSet::from([second_id, other_id]));
+        assert_eq!(frontier.cursor, Some(cursor("here-2")));
+        drop(view);
+
+        // The continued cursor never covered the other host's pages, so the
+        // source delivers them again beside what is new.
+        let body = json!({
+            "value": [
+                tied_here, only_here, tied_there, only_there, edited_there,
+                message("new", "2026-08-01T12:00:00Z", "new"),
+            ],
+            "@odata.deltaLink": cursor("joined"),
+        })
+        .to_string();
+        let server = serve_page(listener, body);
+        let config = TeamsBridgeConfig {
+            source_id: source,
+            tenant: "tenant-a".to_owned(),
+            client_id: "client".to_owned(),
+            user_id: "user".to_owned(),
+            scopes: "offline_access".to_owned(),
+            profile: source,
+            client_secret_version: Some(client_secret),
+            delegated_token_version: None,
+            delta_url: cursor("base"),
+        };
+        let mut token = Some(AppTokenCache {
+            access_token: "test-token".to_owned(),
+            expires_at_key: i128::MAX,
+        });
+        let receipt = here
             .storage()
-            .publish(stale_fork, "stale fork")
-            .unwrap_err();
-        assert!(error.to_string().contains("coverage head has 2 values"));
-        assert_eq!(fs::read(&fixture.pile).unwrap(), before);
+            .with_session(|session| pull_once_with_cache(&config, &mut token, session))
+            .unwrap();
+        let _ = Client::new().get(cursor("stop")).send();
+        let requested = server.join().unwrap();
+        assert_eq!(requested.len(), 1, "{requested:?}");
+        assert!(requested[0].starts_with("GET /here-2 "), "{requested:?}");
+        assert_eq!(receipt.pages.len(), 1);
+
+        // Nothing is lost, nothing doubled, and no new conflict: what was
+        // unordered before the replay still is.
+        check(&["new"]);
+        let view = load_view(&here);
+        assert_eq!(
+            coverage_frontier(&view.reader, &view.facts, source)
+                .unwrap()
+                .unwrap()
+                .heads,
+            BTreeSet::from([receipt.pages[0]])
+        );
+        assert_eq!(
+            find!(
+                observation: Id,
+                pattern!(&view.facts, [{
+                    ?observation @ metadata::tag: teams::kind_message_observation
+                }])
+            )
+            .collect::<BTreeSet<_>>()
+            .len(),
+            10
+        );
     }
 
     #[test]

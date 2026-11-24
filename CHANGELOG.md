@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Teams shows every current version of a message. Two versions the source
+  gave one modification time, or an edit and a removal seen by hosts which
+  pulled independently, are unordered observations: `teams read` and the
+  viewer show each, marked `CONFLICTING i/n` with its time and author, and a
+  pull publishes them like any other page. Before, one such message refused
+  every read and every pull. Concurrent pulls no longer refuse either: readers
+  merge all heads of the receipt DAG, and the next page supersedes all of them
+  and continues from the deepest head's cursor. A receipt that arrives before
+  its predecessor, and an event of an unknown kind, are read open-world. An
+  attachment several versions carry is listed once, and versions which differ
+  only in the source's etag read as one.
+
 - Task wakes now share the recall allowance between journal entries and
   current Wiki readings from the selected workspace. The brief ranks Wiki
   bodies using one WeMM encoding shared with the journal. When the model or

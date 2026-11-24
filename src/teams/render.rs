@@ -43,12 +43,25 @@ pub fn context(value: &PresentationContext, out: &mut Out<'_>) -> Result<()> {
 
 pub fn messages(values: &[ArchivedMessage], out: &mut Out<'_>) -> Result<()> {
     for message in values {
+        let time = |at: Option<_>| at.map_or_else(|| "time unknown".to_owned(), format_interval);
+        // Versions nothing orders are all shown, each said to be one of them.
+        let conflict = if message.version_count <= 1 {
+            String::new()
+        } else {
+            format!(
+                " [CONFLICTING {}/{} of message {:x}, modified {}]",
+                message.version_index + 1,
+                message.version_count,
+                message.id,
+                time(message.modified_at)
+            )
+        };
         out.line(format!(
-            "[{}] ({}) {}: {}",
-            format_interval(message.created_at),
+            "[{}]{conflict} ({}) {}: {}",
+            time(message.created_at),
             message.chat,
             message.author,
-            message.content
+            message.content.as_deref().unwrap_or("(deleted)")
         ))?;
     }
     Ok(())

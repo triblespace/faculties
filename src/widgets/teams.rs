@@ -1,8 +1,8 @@
 //! Read-only GORBIE-embeddable viewer for the `teams` faculty.
 //!
-//! Renders the canonical source-scoped receipt-DAG projection. A causal fork
-//! is a visible diagnostic; this widget never recreates timestamp-based
-//! latest-message arbitration.
+//! Renders the canonical source-scoped receipt-DAG projection. Unordered
+//! versions of one message are all shown and marked; this widget never
+//! recreates timestamp-based latest-message arbitration.
 //!
 //! ```ignore
 //! let mut panel = TeamsViewer::default();
@@ -63,6 +63,8 @@ struct MessageRow {
     content: String,
     deleted: bool,
     attachments: usize,
+    version_index: usize,
+    version_count: usize,
 }
 
 struct TeamsLive {
@@ -105,7 +107,20 @@ impl TeamsLive {
             }
         }
         let total_messages = messages.len();
-        messages.sort_by(|a, b| b.at.cmp(&a.at));
+        // Unordered versions of one message stay together, at the newest time
+        // any of them gives.
+        let mut newest = BTreeMap::<Id, Option<DateTime<Utc>>>::new();
+        for message in &messages {
+            let at = newest.entry(message.id).or_default();
+            *at = (*at).max(message.at);
+        }
+        messages.sort_by_key(|message| {
+            (
+                std::cmp::Reverse(newest[&message.id]),
+                message.id,
+                message.version_index,
+            )
+        });
         messages.truncate(MAX_MESSAGES);
 
         TeamsLive {
@@ -167,6 +182,8 @@ fn load_source_messages(dataset: DatasetView<'_>, source: Id) -> anyhow::Result<
                 content,
                 deleted: message.deleted,
                 attachments: message.attachments.len(),
+                version_index: message.version_index,
+                version_count: message.version_count,
             })
         })
         .collect()
@@ -443,6 +460,19 @@ fn render_message_card(
                                     .small()
                                     .strong()
                                     .color(text_on_accent),
+                            );
+                        }
+                        if msg.version_count > 1 {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "CONFLICTING {}/{}",
+                                    msg.version_index + 1,
+                                    msg.version_count
+                                ))
+                                .monospace()
+                                .small()
+                                .strong()
+                                .color(text_on_accent),
                             );
                         }
                         if msg.attachments > 0 {
