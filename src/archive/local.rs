@@ -2,8 +2,8 @@
 use super::{ImportSource, ImportSummary};
 use crate::blockdag::Identity;
 use crate::{
-    archive_agy, archive_chatgpt, archive_claude_code, archive_claude_web, archive_codex,
-    archive_codex_cloud, archive_copilot, archive_gemini,
+    archive_agy, archive_chatgpt, archive_chatgpt_library, archive_claude_code, archive_claude_web,
+    archive_codex, archive_codex_cloud, archive_copilot, archive_gemini,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -25,6 +25,10 @@ pub(super) fn project_path(
             archive_chatgpt::project_path(path, |p| emit(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::ChatGpt)
         }
+        ImportSource::ChatGptLibrary => archive_chatgpt_library::project_path(path, |p| {
+            emit(p.fragment, p.identity, &p.source_path)
+        })
+        .map(ImportSummary::ChatGptLibrary),
         ImportSource::ClaudeCode => {
             archive_claude_code::project_path_finished(path, finished_before, |p| {
                 emit(p.fragment, p.identity, &p.source_path)

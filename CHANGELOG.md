@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `archive import --source chatgpt-library EXPORT_DIRECTORY` (CLI only) keeps
+  the files a ChatGPT export's library holds and no conversation's nodes do,
+  each as one observation in the Archive: no node, no direction and no order.
+  Its identity is the source and the bytes; file name, media type, recorded
+  time, the conversation, message and generation the library names, and the
+  pointer a message would use annotate it. A record's size and SHA-256 must
+  hold of the bytes, every record is counted as observed, named by a
+  conversation or not shipped, and an unknown member, or an actor or action
+  other than the ones all records state, fails the unit with nothing emitted.
+  `archive list --library` (MCP `archive_list` with `library`) lists them by
+  conversation and time, `archive show` takes one by its whole id and names the
+  blob its bytes are. Minted: kind `248E570D72218F629637CD514A66EE84`,
+  attributes `0BA78F92C4C45BAC11E43F53FB14F4AF` (generation) and
+  `5FF682D668E5C9614EA8E4CD197F9367` (origin message). The vocabulary COMMIT's
+  attribute descriptions grow by these, so the first import by a new build
+  publishes it once.
+
 - `archive import --source codex-cloud` (MCP `archive_import` source
   `codex-cloud`) reads the Codex cloud tasks of a ChatGPT data export
   (`codex-000.json` and its siblings, or the export directory). Prompts,

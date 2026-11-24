@@ -316,3 +316,39 @@ pub mod vendor_model {
     /// Identity-core kind tag. Minted with `trible genid` on 2026-10-26.
     pub const KIND: Id = id_hex!("91BC9F19BC45C253EF16244BD198443A");
 }
+
+/// A file a data export's file library holds, as the export states it.
+///
+/// `{ metadata::tag: KIND, source_projection::source_namespace: namespace,
+/// content_fact::blob: bytes }`, intrinsic. It is no node: it has no
+/// direction and no predecessor, because the library states neither. It says
+/// only that this source's library holds these bytes; a node that holds the
+/// same bytes, or a pointer that resolves to them, is found by joining on
+/// them.
+///
+/// Everything else annotates, in the export's own words:
+/// `metadata::name` (the file name), `content_fact::media_type`,
+/// `content_fact::asset_namespace` with `content_fact::asset_pointer` (the
+/// pointer a message would name the file by, the same text blob a pointer
+/// fact of that message uses), `source_projection::source_timestamp` (when
+/// the library recorded it), `source_projection::source_locator` (the
+/// conversation it names as its origin, spelled as on that conversation's
+/// leaves) and the two below. Two records of the same bytes are one
+/// observation with both their annotations.
+pub mod library_file {
+    use super::*;
+
+    attributes! {
+        /// NONIDENTITY. The provider's id of the generation the library
+        /// records for the file. It states no direction: the source does not
+        /// say whose output it was. Minted with `trible genid` on 2026-11-24.
+        "0BA78F92C4C45BAC11E43F53FB14F4AF" as pub generation: Handle<UTF8String>;
+        /// NONIDENTITY. The provider's id of the message the library names as
+        /// the file's origin, which the export may or may not hold. Minted
+        /// with `trible genid` on 2026-11-24.
+        "5FF682D668E5C9614EA8E4CD197F9367" as pub origin_message: Handle<UTF8String>;
+    }
+
+    /// Identity-core kind tag. Minted with `trible genid` on 2026-11-24.
+    pub const KIND: Id = id_hex!("248E570D72218F629637CD514A66EE84");
+}

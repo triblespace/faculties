@@ -124,6 +124,48 @@ where
     Ok(())
 }
 
+/// Every file id the conversations of the export in `root` name, as the
+/// projection reads them into nodes: attachments, media pointers and the
+/// document a page render belongs to. A mention in text or other metadata is
+/// not one of them. An export without conversations names nothing that could
+/// be told from a missing shard, so it fails.
+pub(crate) fn named_file_ids(root: &Path) -> Result<HashSet<String>> {
+    let mut shards = Vec::new();
+    collect_conversation_files(root, &mut shards)?;
+    if shards.is_empty() {
+        bail!("no conversations in {}", root.display());
+    }
+    let mut named = HashSet::new();
+    for shard in shards {
+        let mapped = archive_source::map_immutable_file(&shard)?;
+        let conversations = scan_export(mapped)
+            .map_err(|error| anyhow!(error))
+            .with_context(|| format!("scan {}", shard.display()))?;
+        for message in conversations
+            .into_iter()
+            .flat_map(|conversation| conversation.nodes)
+            .filter_map(|node| node.message)
+        {
+            let media = message.content.iter().filter_map(|item| match item {
+                ContentItem::Attachment(attachment) => Some(attachment),
+                ContentItem::Text(_) => None,
+            });
+            for attachment in media.chain(&message.attachments) {
+                named.extend(attachment.id.as_ref().map(|id| id.as_ref().to_owned()));
+                let Some(pointer) = attachment.pointer.as_ref() else {
+                    continue;
+                };
+                let document =
+                    page_of_asset_pointer(pointer.as_ref()).map(|(document, _)| document);
+                for pointer in [Some(pointer), document.as_ref()].into_iter().flatten() {
+                    named.extend(file_id_from_asset_pointer(pointer.as_ref()).map(str::to_owned));
+                }
+            }
+        }
+    }
+    Ok(named)
+}
+
 /// Project one shard's conversations into `projected`, each with its
 /// content key; the caller orders and emits them.
 fn project_content(
@@ -548,7 +590,7 @@ enum ExportFile {
 }
 
 #[derive(Debug, Default)]
-struct ExportFiles {
+pub(crate) struct ExportFiles {
     by_id: HashMap<String, ExportFile>,
     by_name: HashMap<String, ExportFile>,
     /// Some means resident-only resolution; never fall back to opening a key.
@@ -556,7 +598,7 @@ struct ExportFiles {
 }
 
 impl ExportFiles {
-    fn index(root: &Path) -> Result<Self> {
+    pub(crate) fn index(root: &Path) -> Result<Self> {
         let mut paths = Vec::new();
         collect_files(root, &mut paths)?;
         Ok(Self::from_paths(paths))
@@ -574,6 +616,19 @@ impl ExportFiles {
             }
         }
         index
+    }
+
+    /// The one file that carries `id`, if the export ships one. More than one,
+    /// or only a sanitized copy, is not that file's bytes and fails.
+    pub(crate) fn unique(&self, id: &str) -> Result<Option<&PathBuf>> {
+        match self.by_id.get(id) {
+            None => Ok(None),
+            Some(ExportFile::Ambiguous) => bail!("several files of the export carry one file id"),
+            Some(ExportFile::Unique(path)) if is_sanitized_sidecar(path) => {
+                bail!("the export ships only a sanitized copy of a file")
+            }
+            Some(ExportFile::Unique(path)) => Ok(Some(path)),
+        }
     }
 
     /// Resolve only when every matching piece of attachment identity agrees
@@ -1190,7 +1245,7 @@ fn media_type_for_format(format: &str, kind: Option<&str>) -> Option<String> {
     files::normalize_media_type(&media_type).ok()
 }
 
-fn canonical_pointer(source_id: &str) -> View<str> {
+pub(crate) fn canonical_pointer(source_id: &str) -> View<str> {
     if source_id.starts_with("file-") {
         archive_source::owned_text(format!("file-service://{source_id}"))
     } else if source_id.starts_with("file_") {

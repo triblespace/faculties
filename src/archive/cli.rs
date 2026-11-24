@@ -127,9 +127,16 @@ pub(super) enum Command {
     List {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// List the files a source's library holds instead, by the
+        /// conversation their record names and then by time. They are no
+        /// nodes, so no conversation, thread, replay or search shows them.
+        #[arg(long)]
+        library: bool,
     },
     /// Show one source projection (receipt) or one node by id prefix; a
-    /// search hit's leading id is a node.
+    /// search hit's leading id is a node. A library file is shown by its whole
+    /// id, and its bytes are the blob its `bytes` line names (`trible pile
+    /// blob get`).
     Show {
         id: String,
         /// Print content a recorded classifier stop followed, which a read
@@ -193,6 +200,10 @@ pub(super) enum CliImportSource {
     Agy,
     #[value(name = "chatgpt")]
     ChatGpt,
+    /// The files a ChatGPT export's library holds and no conversation's nodes
+    /// do (PATH is the export directory).
+    #[value(name = "chatgpt-library")]
+    ChatGptLibrary,
     ClaudeCode,
     ClaudeWeb,
     Codex,
@@ -206,6 +217,7 @@ impl From<CliImportSource> for ImportSource {
         match value {
             CliImportSource::Agy => Self::Agy,
             CliImportSource::ChatGpt => Self::ChatGpt,
+            CliImportSource::ChatGptLibrary => Self::ChatGptLibrary,
             CliImportSource::ClaudeCode => Self::ClaudeCode,
             CliImportSource::ClaudeWeb => Self::ClaudeWeb,
             CliImportSource::Codex => Self::Codex,
@@ -499,7 +511,14 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
                 .transpose()?;
             import_paths_with_storage(&storage, &path, source, finished_before, out)
         }
-        Command::List { limit } => archive.list(limit, reading(false), out),
+        Command::List {
+            limit,
+            library: false,
+        } => archive.list(limit, reading(false), out),
+        Command::List {
+            limit,
+            library: true,
+        } => archive.list_library(limit, out),
         Command::Show { id, force } => archive.show(&id, reading(force), out),
         Command::Thread {
             id,

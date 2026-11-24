@@ -253,6 +253,114 @@ fn direct_cli_and_mcp_share_frozen_queries_and_literal_content() {
         .is_empty());
 }
 
+/// A ChatGPT export whose library holds one file no conversation names.
+fn library_export(root: &std::path::Path, bytes: &[u8]) {
+    let record = json!([{
+        "content_backing_kind": "sediment",
+        "file_extension": "png",
+        "file_id": "file_00000000000000000000000000000001",
+        "file_name": "a picture.png",
+        "file_size_bytes": bytes.len(),
+        "file_upload_time": "2026-01-02T03:04:05.000000+00:00",
+        "id": "a-key",
+        "image_gen_generation_id": "s_00000000000000000000000000000001",
+        "library_file_category": "image",
+        "mime_type": "image/png",
+        "origination_message_id": "a-message",
+        "origination_thread_id": "a-conversation",
+        "record_creation_time": "2026-01-02T03:04:05.000042+00:00",
+        "state": "ready",
+        "uploading_account_user_id": "user-x",
+        "version_created_at": "2026-01-02T03:04:05.000042+00:00",
+        "version_provenance": {
+            "action": "create", "actor": "user", "actor_id": "user-x", "reason": null,
+        },
+    }]);
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("library_files.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    fs::write(root.join("conversations-000.json"), CHATGPT).unwrap();
+    fs::write(
+        root.join("file_00000000000000000000000000000001.dat"),
+        bytes,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_library_file_is_listed_and_shown_and_belongs_to_no_node() {
+    let fixture = Fixture::new();
+    let export = fixture.directory.path().join("export");
+    library_export(&export, b"the bytes of a picture");
+    let export = export.to_str().unwrap();
+    let import = ["import", "--source", "chatgpt-library", export];
+    let first = text(&fixture.cli(&import));
+    assert!(
+        first.contains("1 record(s), 1 observed, 0 named by a conversation, 0 not shipped"),
+        "{first}"
+    );
+    assert!(!first.contains(" 0 bytes appended"), "{first}");
+    let again = text(&fixture.cli(&import));
+    assert!(again.contains(", 0 bytes appended"), "{again}");
+
+    // No node, no receipt: nothing else of the archive shows it.
+    assert!(fixture.cli(&["list"]).is_empty());
+    let listed = fixture.cli(&["list", "--library"]);
+    assert_eq!(
+        listed,
+        fixture.call("archive_list", json!({"library":true}))
+    );
+    let listed = text(&listed);
+    assert_eq!(listed.lines().count(), 1, "{listed}");
+    assert!(listed.contains("conversation/a-conversation"), "{listed}");
+    assert!(listed.contains("image/png a picture.png"), "{listed}");
+    let id = listed.split_whitespace().next().unwrap();
+    assert_eq!(id.len(), 32);
+
+    let shown = fixture.cli(&["show", id]);
+    assert_eq!(shown, fixture.call("archive_show", json!({"id":id})));
+    let shown = text(&shown);
+    let bytes = blake3::hash(b"the bytes of a picture")
+        .to_hex()
+        .to_uppercase();
+    for line in [
+        format!("library_file: {id}"),
+        "name: a picture.png".to_owned(),
+        "source_locator: conversation/a-conversation".to_owned(),
+        "origin_message: a-message".to_owned(),
+        "generation: s_00000000000000000000000000000001".to_owned(),
+        "asset_pointer: sediment://file_00000000000000000000000000000001".to_owned(),
+        "media_type: image/png".to_owned(),
+        format!("bytes: blake3:{bytes}"),
+    ] {
+        assert!(shown.lines().any(|shown| shown == line), "{line}: {shown}");
+    }
+    assert!(!shown.contains("held_by_node"), "{shown}");
+    assert!(!shown.contains("direction"), "{shown}");
+
+    fixture.call(
+        "archive_replay_start",
+        json!({"persona":"reader","from":"2026-01-01T00:00:00"}),
+    );
+    let replayed = text(&fixture.call("archive_replay", json!({"persona":"reader"})));
+    assert!(!replayed.contains("a picture"), "{replayed}");
+
+    // The conversation's message arrives in a later import, with the file.
+    let later = fixture.directory.path().join("later");
+    library_export(&later, b"the bytes of a picture");
+    fs::write(
+        later.join("conversations-000.json"),
+        r#"[{"id":"a-conversation","mapping":{"n":{"id":"n","message":{"id":"a-message","author":{"role":"tool"},"content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"sediment://file_00000000000000000000000000000001"}]}}}}}]"#,
+    )
+    .unwrap();
+    fixture.cli(&["import", "--source", "chatgpt", later.to_str().unwrap()]);
+    let shown = text(&fixture.cli(&["show", id]));
+    assert!(shown.contains("held_by_node: "), "{shown}");
+}
+
 #[test]
 fn resident_attachments_never_fall_back_to_host_files() {
     let fixture = Fixture::new();
@@ -1015,6 +1123,8 @@ fn importers_write_only_content_derived_attributes() {
                 })
                 .map(drop)
             }
+            // Read from an export directory alone, never from resident bytes.
+            ImportSource::ChatGptLibrary => continue,
             ImportSource::ClaudeCode => {
                 faculties::archive_claude_code::project_bytes(&name, bytes, |p| {
                     facts += p.fragment.facts().clone();

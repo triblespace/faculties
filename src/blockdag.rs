@@ -142,6 +142,7 @@ pub fn attribute_descriptions() -> (TribleSet, Vec<triblespace::core::blob::Blob
     let mut described = schema::block::describe();
     described += schema::content_fact::describe();
     described += schema::source_projection::describe();
+    described += schema::library_file::describe();
     let (_, facts, metafacts, mut blobs) = described.into_parts();
     let mut all = facts;
     all += metafacts;
@@ -523,6 +524,76 @@ impl Identity {
     pub fn into_facts(self) -> TribleSet {
         self.facts
     }
+}
+
+/// What an export's file library states about one file, all of it annotation.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryFileAnnotations {
+    pub name: Option<anybytes::View<str>>,
+    pub media_type: Option<String>,
+    /// The pointer a message would name the file by, in the same namespace.
+    pub asset_pointer: Option<anybytes::View<str>>,
+    pub recorded_at: Option<Inline<NsTAIInterval>>,
+    pub source_locator: Option<String>,
+    pub generation: Option<anybytes::View<str>>,
+    pub origin_message: Option<anybytes::View<str>>,
+}
+
+/// A file a source's library holds ([`schema::library_file`]), with its
+/// [`Identity`]: the namespace and the bytes. It names no node.
+pub fn library_file<T>(
+    namespace: Id,
+    bytes: T,
+    annotations: LibraryFileAnnotations,
+) -> Result<(Fragment, Identity)>
+where
+    T: triblespace::core::blob::IntoBlob<RawBytes>,
+{
+    let mut fragment = Fragment::empty();
+    let blob = fragment.put::<RawBytes, _>(bytes);
+    fragment += entity! { _ @
+        metadata::tag: &schema::library_file::KIND,
+        schema::source_projection::source_namespace: &namespace,
+        schema::content_fact::blob: blob,
+    };
+    let root = rooted(&fragment, "library file")?;
+    let identity = Identity {
+        nodes: Vec::new(),
+        facts: fragment.facts().clone(),
+    };
+    let pointer = annotations
+        .asset_pointer
+        .map(|pointer| fragment.put::<UTF8String, _>(pointer));
+    let pointer_namespace = pointer.map(|_| namespace);
+    let name = annotations
+        .name
+        .map(|name| fragment.put::<UTF8String, _>(name));
+    let locator = annotations
+        .source_locator
+        .map(|locator| fragment.put::<UTF8String, _>(locator));
+    let generation = annotations
+        .generation
+        .map(|generation| fragment.put::<UTF8String, _>(generation));
+    let origin_message = annotations
+        .origin_message
+        .map(|message| fragment.put::<UTF8String, _>(message));
+    let media_type = annotations
+        .media_type
+        .as_deref()
+        .map(files::media_type_fragment)
+        .transpose()?
+        .unwrap_or_else(Fragment::empty);
+    fragment += entity! { ExclusiveId::force_ref(&root) @
+        metadata::name?: name,
+        schema::content_fact::media_type*: media_type,
+        schema::content_fact::asset_namespace?: pointer_namespace.as_ref(),
+        schema::content_fact::asset_pointer?: pointer,
+        schema::source_projection::source_timestamp?: annotations.recorded_at,
+        schema::source_projection::source_locator?: locator,
+        schema::library_file::generation?: generation,
+        schema::library_file::origin_message?: origin_message,
+    };
+    Ok((fragment, identity))
 }
 
 /// [`block`], returning the node's fragment with its [`Identity`]: the

@@ -63,11 +63,11 @@ use std::path::{Path, PathBuf};
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
-use triblespace::core::import::scanner as sc;
 use triblespace::core::inline::TryToInline;
 use triblespace::prelude::inlineencodings::NsTAIInterval;
 use triblespace::prelude::*;
 
+use crate::archive_shape::{self, is_null, Opened, Rule, Shape};
 use crate::archive_source::{
     self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord,
 };
@@ -87,25 +87,6 @@ pub struct ProjectionSummary {
     /// Members left out that held a value, by path, with how many did.
     pub dropped: BTreeMap<&'static str, usize>,
     pub stats: ProjectionStats,
-}
-
-/// What becomes of one member.
-#[derive(Clone, Copy, Debug)]
-enum Rule {
-    /// The projection takes it.
-    Read,
-    /// The member's only value.
-    Is(&'static str),
-    /// Only ever `null`; any other value fails the unit.
-    Null,
-    /// Left out; the path it is counted under, and why.
-    Drop(&'static str, &'static str),
-}
-
-/// Every member an object of one kind holds.
-struct Shape {
-    name: &'static str,
-    members: &'static [(&'static str, Rule)],
 }
 
 use Rule::{Drop, Is, Null, Read};
@@ -301,60 +282,6 @@ const TERMINAL_CITATION: Shape = Shape {
     ],
 };
 
-/// One object opened against its shape.
-struct Opened {
-    shape: &'static Shape,
-    unread: BTreeMap<&'static str, Bytes>,
-}
-
-impl Opened {
-    /// The value of a member the shape reads.
-    fn take(&mut self, name: &'static str) -> Result<Bytes> {
-        self.unread
-            .remove(name)
-            .ok_or_else(|| anyhow!("{} has no unread member {name:?}", self.shape.name))
-    }
-
-    /// A string member.
-    fn text(&mut self, name: &'static str) -> Result<View<str>> {
-        let value = self.take(name)?;
-        archive_source::json_str(&value)
-            .ok_or_else(|| anyhow!("{}.{name} is not a string", self.shape.name))
-    }
-
-    /// An array member's elements.
-    fn elements(&mut self, name: &'static str) -> Result<Vec<Bytes>> {
-        let value = self.take(name)?;
-        archive_source::json_elements(&value)
-            .ok_or_else(|| anyhow!("{}.{name} is not an array", self.shape.name))
-    }
-
-    /// Every remaining member is kept by a caller that keeps the whole object.
-    fn whole(&mut self) {
-        self.unread.clear();
-    }
-
-    /// Fail if a member the shape reads was not taken.
-    fn finish(self) -> Result<()> {
-        if let Some(name) = self.unread.keys().next() {
-            bail!("{}.{name} was read and not projected", self.shape.name);
-        }
-        Ok(())
-    }
-}
-
-fn is_null(value: &Bytes) -> bool {
-    value.as_ref() == b"null"
-}
-
-/// Whether a left-out value held anything.
-fn holds(value: &Bytes) -> bool {
-    !matches!(
-        value.as_ref(),
-        b"null" | b"\"\"" | b"[]" | b"{}" | b"false" | b"\"None\""
-    )
-}
-
 /// A named string member of an object, before its shape is known.
 fn discriminator(value: &Bytes, name: &str) -> Result<View<str>> {
     let [found] = archive_source::json_members(value, [name]);
@@ -372,64 +299,7 @@ struct Reader {
 
 impl Reader {
     fn open(&mut self, shape: &'static Shape, value: Bytes) -> Result<Opened> {
-        if value.first().copied() != Some(b'{') {
-            bail!("{} is not an object", shape.name);
-        }
-        let mut bytes = value;
-        let members = sc::object(&mut bytes, Vec::new(), |mut members, key, member| {
-            members.push((key, sc::take_value(member)?));
-            Ok::<_, sc::ScanError>(members)
-        })
-        .map_err(|error| anyhow!(error))
-        .with_context(|| format!("scan {}", shape.name))?;
-        let mut seen = BTreeMap::new();
-        for (key, member) in members {
-            let Some((name, rule)) = shape
-                .members
-                .iter()
-                .find(|(name, _)| name.as_bytes() == key.as_ref())
-            else {
-                bail!(
-                    "{} has an unknown member {:?}",
-                    shape.name,
-                    String::from_utf8_lossy(key.as_ref())
-                );
-            };
-            if seen.insert(*name, (*rule, member)).is_some() {
-                bail!("{} repeats member {name:?}", shape.name);
-            }
-        }
-        let mut unread = BTreeMap::new();
-        for (name, _) in shape.members {
-            let Some((rule, member)) = seen.remove(name) else {
-                bail!("{} has no member {name:?}", shape.name);
-            };
-            match rule {
-                Read => {
-                    unread.insert(*name, member);
-                }
-                Is(expected) => {
-                    let value = archive_source::json_str(&member);
-                    if value.as_ref().map(AsRef::as_ref) != Some(expected) {
-                        bail!("{}.{name} is not {expected:?}", shape.name);
-                    }
-                }
-                Null => {
-                    if !is_null(&member) {
-                        bail!(
-                            "{}.{name} holds a value, and only null is understood",
-                            shape.name
-                        );
-                    }
-                }
-                Drop(path, _reason) => {
-                    if holds(&member) {
-                        *self.summary.dropped.entry(path).or_default() += 1;
-                    }
-                }
-            }
-        }
-        Ok(Opened { shape, unread })
+        archive_shape::open(shape, value, &mut self.summary.dropped)
     }
 
     /// The texts of a content list that holds text items only.

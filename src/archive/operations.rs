@@ -9,6 +9,7 @@ pub struct Archive {
 pub enum ImportSource {
     Agy,
     ChatGpt,
+    ChatGptLibrary,
     ClaudeCode,
     ClaudeWeb,
     Codex,
@@ -20,6 +21,7 @@ pub enum ImportSource {
 pub enum ImportSummary {
     Agy(AgyProjectionSummary),
     ChatGpt(ChatGptProjectionSummary),
+    ChatGptLibrary(ChatGptLibraryProjectionSummary),
     ClaudeCode(ClaudeCodeProjectionSummary),
     ClaudeWeb(ClaudeWebProjectionSummary),
     Codex(CodexProjectionSummary),
@@ -53,6 +55,7 @@ impl ImportSummary {
         match self {
             Self::Agy(s) => print_agy_import_summary(s, publication, out),
             Self::ChatGpt(s) => print_chatgpt_import_summary(s, publication, out),
+            Self::ChatGptLibrary(s) => print_chatgpt_library_import_summary(s, publication, out),
             Self::ClaudeCode(s) => print_claude_code_import_summary(s, publication, out),
             Self::ClaudeWeb(s) => print_claude_web_import_summary(s, publication, out),
             Self::Codex(s) => print_codex_import_summary(s, publication, out),
@@ -117,6 +120,9 @@ impl Archive {
                     })
                     .map(ImportSummary::ChatGpt)
                 }
+                ImportSource::ChatGptLibrary => {
+                    bail!("a ChatGPT file library is read from its export directory, not from one resident source")
+                }
                 ImportSource::ClaudeCode => {
                     archive_claude_code::project_bytes(source_name, bytes, |p| {
                         writer.stage(p.fragment, p.identity)
@@ -163,6 +169,10 @@ impl Archive {
     /// stop withholds.
     pub fn list(&self, limit: usize, reading: Reading<'_>, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_list(storage, limit, reading, out))
+    }
+    /// The files a source's library holds, by conversation and then time.
+    pub fn list_library(&self, limit: usize, out: &mut Out<'_>) -> Result<()> {
+        self.with_operation(|storage| run_list_library(storage, limit, out))
     }
     pub fn show(&self, prefix: &str, reading: Reading<'_>, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| run_show(storage, prefix, reading, out))
@@ -243,6 +253,7 @@ use triblespace::core::collection::AttachedSnapshot;
 
 use crate::archive_agy::{self, ProjectionSummary as AgyProjectionSummary};
 use crate::archive_chatgpt::{self, ProjectionSummary as ChatGptProjectionSummary};
+use crate::archive_chatgpt_library::ProjectionSummary as ChatGptLibraryProjectionSummary;
 use crate::archive_claude_code::{self, ProjectionSummary as ClaudeCodeProjectionSummary};
 use crate::archive_claude_web::{self, ProjectionSummary as ClaudeWebProjectionSummary};
 use crate::archive_codex::{self, ProjectionSummary as CodexProjectionSummary};
@@ -446,6 +457,32 @@ fn print_chatgpt_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
+    print_collection_publication(publication, out)?;
+    Ok(())
+}
+
+fn print_chatgpt_library_import_summary(
+    summary: &ChatGptLibraryProjectionSummary,
+    publication: &Publication,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    out.line(format!(
+        "projected a ChatGPT file library: {} record(s), {} observed, {} named by a conversation, {} not shipped",
+        summary.records_seen,
+        summary.observed,
+        summary.named_by_conversation,
+        summary.not_shipped,
+    ))?;
+    out.line(format!(
+        "observed {} bytes: generations={} located={}",
+        summary.bytes, summary.generations, summary.located,
+    ))?;
+    for (media_type, count) in &summary.media_types {
+        out.line(format!("observed: {media_type} {count}"))?;
+    }
+    for (path, count) in &summary.dropped {
+        out.line(format!("left out: {path} held a value {count} time(s)"))?;
+    }
     print_collection_publication(publication, out)?;
     Ok(())
 }
@@ -1337,6 +1374,164 @@ fn run_list(
     Ok(())
 }
 
+/// Every text `entity` has under `attribute`, in handle order.
+fn texts(
+    facts: &FactArchive,
+    reader: &PileSnapshot,
+    entity: Id,
+    attribute: &triblespace::core::attribute::Attribute<Handle<UTF8String>>,
+) -> Result<Vec<String>> {
+    let handles: BTreeSet<TextHandle> = find!(
+        text: TextHandle,
+        pattern!(facts, [{ entity @ attribute: ?text }])
+    )
+    .collect();
+    handles
+        .into_iter()
+        .map(|text| read_text(reader, text))
+        .collect()
+}
+
+/// The library file a whole id names. A prefix names none: files are listed
+/// by their whole id, and a prefix of one may also be a node's.
+fn library_file(facts: &FactArchive, id: &str) -> Option<Id> {
+    Id::from_hex(id.trim()).filter(|id| {
+        exists!(pattern!(facts, [{
+            id @ metadata::tag: &archive_schema::library_file::KIND
+        }]))
+    })
+}
+
+/// When a library recorded the file: the earliest time it states.
+fn library_file_time(facts: &FactArchive, file: Id) -> Option<(i128, i128)> {
+    find!(
+        time: (i128, i128),
+        pattern!(facts, [{ file @ archive_schema::source_projection::source_timestamp: ?time }])
+    )
+    .min()
+}
+
+fn library_media_types(
+    facts: &FactArchive,
+    reader: &PileSnapshot,
+    file: Id,
+) -> Result<Vec<String>> {
+    let media_types: BTreeSet<Id> = find!(
+        media_type: Id,
+        pattern!(facts, [{ file @ archive_schema::content_fact::media_type: ?media_type }])
+    )
+    .collect();
+    media_types
+        .into_iter()
+        .map(|media_type| entity_label(facts, reader, media_type, "media-type"))
+        .collect()
+}
+
+fn run_list_library(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Result<()> {
+    let observed = storage.load()?;
+    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let reader = observed.snapshot();
+    let held: BTreeSet<Id> = find!(
+        file: Id,
+        pattern!(&facts, [{ ?file @ metadata::tag: &archive_schema::library_file::KIND }])
+    )
+    .collect();
+    let mut files = Vec::new();
+    for file in held {
+        let conversation = texts(
+            &facts,
+            reader,
+            file,
+            &archive_schema::source_projection::source_locator,
+        )?;
+        files.push((conversation, library_file_time(&facts, file), file));
+    }
+    files.sort();
+    let total = files.len();
+    for (conversation, time, file) in files.into_iter().take(limit) {
+        out.line(format!(
+            "{file:X} {} {} {} {}",
+            match conversation.is_empty() {
+                true => "<no conversation>".to_owned(),
+                false => conversation.join(" / "),
+            },
+            format_interval(time),
+            library_media_types(&facts, reader, file)?.join(" / "),
+            texts(&facts, reader, file, &metadata::name)?.join(" / "),
+        ))?;
+    }
+    if total > limit {
+        out.line(format!("{limit} of {total} library files"))?;
+    }
+    Ok(())
+}
+
+/// What a source's library states of one file, and the blob that is it.
+fn render_library_file(facts: &FactArchive, reader: &PileSnapshot, file: Id) -> Result<String> {
+    let mut out = String::new();
+    writeln!(out, "library_file: {file:X}")?;
+    for namespace in find!(
+        namespace: Id,
+        pattern!(facts, [{ file @ archive_schema::source_projection::source_namespace: ?namespace }])
+    ) {
+        writeln!(out, "source_namespace: {namespace:X}")?;
+    }
+    for (label, attribute) in [
+        ("name", &*metadata::name),
+        (
+            "source_locator",
+            &*archive_schema::source_projection::source_locator,
+        ),
+        (
+            "origin_message",
+            &*archive_schema::library_file::origin_message,
+        ),
+        ("generation", &*archive_schema::library_file::generation),
+        (
+            "asset_pointer",
+            &*archive_schema::content_fact::asset_pointer,
+        ),
+    ] {
+        for text in texts(facts, reader, file, attribute)? {
+            writeln!(out, "{label}: {text}")?;
+        }
+    }
+    for time in find!(
+        time: (i128, i128),
+        pattern!(facts, [{ file @ archive_schema::source_projection::source_timestamp: ?time }])
+    ) {
+        writeln!(out, "source_timestamp: {}", format_interval(Some(time)))?;
+    }
+    for media_type in library_media_types(facts, reader, file)? {
+        writeln!(out, "media_type: {media_type}")?;
+    }
+    for bytes in find!(
+        bytes: RawHandle,
+        pattern!(facts, [{ file @ archive_schema::content_fact::blob: ?bytes }])
+    ) {
+        writeln!(out, "bytes: blake3:{}", hex::encode_upper(bytes.raw))?;
+        let nodes: BTreeSet<Id> = find!(
+            node: Id,
+            pattern!(facts, [
+                { ?node @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::resolved_to: bytes },
+            ])
+        )
+        .chain(find!(
+            node: Id,
+            pattern!(facts, [
+                { ?node @ archive_schema::block::holds: _?fact },
+                { _?fact @ archive_schema::content_fact::blob: bytes },
+            ])
+        ))
+        .collect();
+        for node in nodes {
+            writeln!(out, "held_by_node: {node:X}")?;
+        }
+    }
+    Ok(out)
+}
+
 /// A source projection's time: its earliest source timestamp, falling back
 /// to the earliest timestamp of a block it projects to.
 fn projection_time(facts: &FactArchive, projection: Id) -> Option<i128> {
@@ -1488,6 +1683,9 @@ fn run_show(
 ) -> Result<()> {
     let observed = storage.load()?;
     let facts = crate::storage::acquire_attached_facts(&observed)?;
+    if let Some(file) = library_file(&facts, prefix) {
+        return out.text(render_library_file(&facts, observed.snapshot(), file)?);
+    }
     out.text(match resolve_in(&facts, prefix)? {
         Named::Projection(projection) => {
             render_projection(&facts, observed.snapshot(), projection, reading)?
