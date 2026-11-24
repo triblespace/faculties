@@ -6646,6 +6646,12 @@ struct WakePair {
     /// is the consumer's bookkeeping (where the memory sits in lived time),
     /// never something the reader is shown as output.
     range: Option<String>,
+    /// For a memory recall only: it stands in a finished piece of the cover
+    /// ([`crate::memory_cover::CoverEntry::sealed`]). Such recalls lead the
+    /// pairs. A structural hint for a consumer that keeps a prefix, never shown
+    /// to the reader, and no promise about text: the consumer compares what it
+    /// kept.
+    sealed: bool,
 }
 
 impl WakePair {
@@ -6661,6 +6667,7 @@ impl WakePair {
             command,
             output,
             range: None,
+            sealed: false,
         }
     }
 }
@@ -6691,6 +6698,7 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
         // placeholder line the cover text shows (as Drive always has).
         pairs.push(WakePair {
             range: Some(format!("{}..{}", entry.start, entry.end)),
+            sealed: entry.sealed,
             ..WakePair::new(
                 entry.recall.clone(),
                 if raw {
@@ -6771,6 +6779,9 @@ async fn cmd_wake_pairs(
         });
         if let Some(range) = pair.range {
             object["range"] = serde_json::Value::String(range);
+        }
+        if pair.sealed {
+            object["sealed"] = serde_json::Value::Bool(true);
         }
         lines.push_str(&serde_json::to_string(&object)?);
         lines.push('\n');
@@ -6862,6 +6873,7 @@ mod tests {
                 chunk: id,
                 recall: command.clone(),
                 body: Some(text.into()),
+                sealed: false,
             };
             let selection = WakeSelection {
                 cover: CoverReport {
@@ -6886,6 +6898,41 @@ mod tests {
             assert_eq!(pairs[0].command, format!("memory {id:x}"));
             assert_eq!(pairs[0].output, "[image memory @ synthetic range]\n");
         }
+    }
+
+    /// Finished entries become sealed recalls, a leading run, and nothing else
+    /// is sealed. One without a body prints no pair and leaves the run whole.
+    #[test]
+    fn finished_entries_become_a_leading_run_of_sealed_recalls() {
+        let entry = |k: u8, sealed: bool, body: &str| crate::memory_cover::CoverEntry {
+            start: "2026-01-01T00:00:00".into(),
+            end: "2026-01-01T01:00:00".into(),
+            chunk: Id::new([k; 16]).unwrap(),
+            recall: "memory 2026-01-01T00:00:00..2026-01-01T01:00:00".into(),
+            body: Some(body.into()),
+            sealed,
+        };
+        let selection = WakeSelection {
+            cover: crate::memory_cover::CoverReport {
+                text: String::new(),
+                diagnostics: vec![],
+                entries: vec![
+                    entry(1, true, "old"),
+                    entry(2, true, ""),
+                    entry(3, true, "older than a day"),
+                    entry(4, false, "now"),
+                ],
+            },
+            topic: Default::default(),
+            beliefs: Some(wiki_model::CoverBeliefs::default()),
+            goals: "Compass:\n".into(),
+            presented: None,
+        };
+        let sealed: Vec<bool> = wake_pairs(&selection, 5, 5)
+            .iter()
+            .map(|pair| pair.sealed)
+            .collect();
+        assert_eq!(sealed, [true, true, false, false]);
     }
 
     /// Project receipt facts the way the live path does, so tests exercise the

@@ -1802,8 +1802,9 @@ fn parse_pairs(stdout: &[u8]) -> Vec<(String, String)> {
 }
 
 /// Every line: exactly `command` and `output`, plus `range` on exactly the
-/// memory recalls.
+/// memory recalls, and `"sealed": true` on a leading run of them.
 fn parse_pairs_with_ranges(stdout: &[u8]) -> Vec<(String, String, Option<String>)> {
+    let mut sealing = true;
     std::str::from_utf8(stdout)
         .unwrap()
         .lines()
@@ -1812,12 +1813,15 @@ fn parse_pairs_with_ranges(stdout: &[u8]) -> Vec<(String, String, Option<String>
                 panic!("one JSON object per line: {line}")
             };
             let recall = object["command"].as_str().unwrap().starts_with("memory ");
+            let sealed = object.get("sealed").is_some();
+            assert!(!sealed || (sealing && object["sealed"] == true), "{line}");
+            sealing = sealed;
             assert_eq!(
                 object.keys().collect::<Vec<_>>(),
-                if recall {
-                    vec!["command", "output", "range"]
-                } else {
-                    vec!["command", "output"]
+                match (recall, sealed) {
+                    (true, true) => vec!["command", "output", "range", "sealed"],
+                    (true, false) => vec!["command", "output", "range"],
+                    _ => vec!["command", "output"],
                 },
                 "{line}"
             );

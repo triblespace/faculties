@@ -114,7 +114,8 @@ enum Command {
     /// `{"command": ..., "output": ...}` object per line (a memory recall also
     /// carries `"range": "<from>..<to>"`, the memory's range as the cover
     /// prints it, for the harness's own bookkeeping: a `memory <id>` recall
-    /// prints no time), for a harness that
+    /// prints no time; and a leading run of recalls carries `"sealed": true`,
+    /// those that stand in finished pieces of the cover), for a harness that
     /// wakes a model from commands rather than a pasted document: first one
     /// recall per cover entry, `memory <from>..<to>` when memory's range lookup
     /// selects exactly that memory and `memory <id>` otherwise (always for a

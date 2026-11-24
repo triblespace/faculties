@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `orient wake --pairs` marks the recalls that stand in finished pieces of the
+  cover with `"sealed": true`, always a leading run. A consumer that keeps a
+  prompt prefix can end it there and compare what it kept. A reader that
+  rejects unknown fields must be updated before this one.
+
 - The memory cover is filled from buckets of age, and that is the only
   selector: `memory context`, every form of `orient wake`, zooid wakes and
   `memory churn` use it, and the greedy density walk is gone. A bucket holds

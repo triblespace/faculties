@@ -826,6 +826,10 @@ pub struct CoverEntry {
     /// whitespace (unchanged bytes in raw mode), or the `[image memory @ <range>]` placeholder. `None` when
     /// the chosen chunk has neither, in which case only the range is printed.
     pub body: Option<String>,
+    /// Whether it stands in a finished piece ([`RecollectionCut::finished`]).
+    /// Such entries lead the cover and stay as they are between wakes, so a
+    /// consumer can keep them as one prefix.
+    pub sealed: bool,
 }
 
 fn unscorable_warning(label: &str, unscorable: &[Id]) -> Option<String> {
@@ -1086,6 +1090,7 @@ where
     }
     let cut = select_recollection_cut(&spans, &costs, &class_eligible, budget_chars);
     let used = cut.used;
+    let finished = cut.finished;
     let cover = cut.cover;
 
     // The selected order is the emitted order, and that is time order. Ranges
@@ -1122,7 +1127,7 @@ where
     // prefix-stable cover on every call. Keep it visible to a human on stderr,
     // out of the stored/ingested cover text.
     let mut entries = Vec::with_capacity(cover.len());
-    for &i in &cover {
+    for (at, &i) in cover.iter().enumerate() {
         let (s, e, _) = spans[i];
         let id = raw_spans[representatives[i]].2;
         writeln!(out)?;
@@ -1174,6 +1179,7 @@ where
             start,
             end,
             body,
+            sealed: at < finished,
         });
     }
     let fill = if budget_chars == 0 {
