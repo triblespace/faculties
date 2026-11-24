@@ -108,10 +108,13 @@ fn task() -> Value {
                 }),
                 json!({"type": "follow_up_diff", "output_diff": diff(None, Some("file_00000000000000000000000000000002"))}),
                 message("assistant", vec![
-                    text("I rounded them"),
+                    text("I rounded them → all"),
                     json!({"content_type": "repo_file_citation", "path": "w.rs", "line_range_start": 3, "line_range_end": null}),
+                    text(""),
                     text(" and ran the tests"),
                     json!({"content_type": "terminal_chunk_citation", "terminal_chunk_id": "0a1b2c", "line_range_start": 1, "line_range_end": 4}),
+                    json!({"content_type": "repo_file_citation", "path": "t.rs", "line_range_start": 9, "line_range_end": 9}),
+                    text(".\n"),
                 ]),
                 json!({"type": "partial_repo_snapshot", "files": [{"path": "w.rs"}]}),
             ]),
@@ -217,6 +220,7 @@ const UNRENDERED: &[&str] = &[
     ".turns[].input_items[].role",
     ".turns[].input_items[].type",
     ".turns[].output_items[].content[].content_type",
+    ".turns[].output_items[].content[].text", // only the empty text
     ".turns[].output_items[].files",
     ".turns[].output_items[].output_diff.type",
     ".turns[].output_items[].role",
@@ -311,14 +315,22 @@ fn expected(task: &mut Value) -> Vec<Datum> {
             for item in turn["output_items"].as_array_mut().unwrap() {
                 match item["type"].as_str().unwrap() {
                     "message" => {
+                        let mut said = String::new();
+                        let mut cited = Vec::new();
                         for piece in item["content"].as_array_mut().unwrap() {
-                            if piece["content_type"] == "text" {
-                                if piece["text"] != "" {
-                                    out.push((modality::TEXT, OUT, taken_text(&mut piece["text"])));
-                                }
-                            } else {
-                                out.push((modality::EVENT, OUT, piece.take().to_string()));
+                            if piece["content_type"] != "text" {
+                                cited.push(
+                                    json!({"citation": piece.take(), "byte_offset": said.len()}),
+                                );
+                            } else if piece["text"] != "" {
+                                said += &taken_text(&mut piece["text"]);
                             }
+                        }
+                        if !said.is_empty() {
+                            out.push((modality::TEXT, OUT, said));
+                        }
+                        if !cited.is_empty() {
+                            out.push((modality::EVENT, OUT, Value::Array(cited).to_string()));
                         }
                     }
                     "pr" => expect_change(item, &["pr_message", "pr_title"], OUT, &mut out),
@@ -330,6 +342,54 @@ fn expected(task: &mut Value) -> Vec<Datum> {
         }
     }
     out
+}
+
+/// The export's items of one message, cut back out of its text and citations.
+fn cut(said: &str, citations: &str) -> Vec<Value> {
+    let citations: Vec<Value> = serde_json::from_str(citations).unwrap();
+    let mut items = Vec::new();
+    let mut from = 0;
+    for entry in citations {
+        let at = entry["byte_offset"].as_u64().unwrap() as usize;
+        if at > from {
+            items.push(text(&said[from..at]));
+        }
+        from = at;
+        items.push(entry["citation"].clone());
+    }
+    if from < said.len() {
+        items.push(text(&said[from..]));
+    }
+    items
+}
+
+/// Every message that cites, cut back, beside the same messages of the export.
+fn cut_back(task: &Value, data: &[Datum]) -> (Vec<Vec<Value>>, Vec<Vec<Value>>) {
+    let found = data
+        .windows(2)
+        // A citation event is the only one that is an array.
+        .filter(|pair| pair[1].0 == modality::EVENT && pair[1].2.starts_with('['))
+        .map(|pair| cut(&pair[0].2, &pair[1].2))
+        .collect();
+    let mut held = Vec::new();
+    for turn in task["turns"].as_array().unwrap() {
+        for item in turn["output_items"].as_array().into_iter().flatten() {
+            if item["type"] != "message" {
+                continue;
+            }
+            let pieces: Vec<Value> = item["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|piece| piece["text"] != "")
+                .cloned()
+                .collect();
+            if pieces.iter().any(|piece| piece["content_type"] != "text") {
+                held.push(pieces);
+            }
+        }
+    }
+    (found, held)
 }
 
 /// Count what is left in the tree, by path. `files` is counted whole.
@@ -370,6 +430,8 @@ fn gate(tasks: &Value, counts: &mut BTreeMap<String, usize>) -> usize {
                 .map(|leaf| blockdag::thread_to(&found.facts, *leaf))
                 .unwrap_or_default();
             assert!(chain == found.nodes, "task {index} is not one chain");
+            let (cut, held) = cut_back(task, &found.data);
+            assert!(cut == held, "task {index} does not cut back into its runs");
         } else {
             data.sort();
             expected.sort();
@@ -391,10 +453,11 @@ fn gate(tasks: &Value, counts: &mut BTreeMap<String, usize>) -> usize {
 fn every_value_is_rendered_or_left_out_by_name() {
     let mut counts = BTreeMap::new();
     let nodes = gate(&json!([task()]), &mut counts);
-    assert_eq!(nodes, 15);
+    assert_eq!(nodes, 13);
     assert_eq!(counts[".turns[].output_items[].files"], 1);
     assert_eq!(counts[".title"], 1);
     assert_eq!(counts[".turns[].input_items[].content[].text"], 1);
+    assert_eq!(counts[".turns[].output_items[].content[].text"], 1);
 }
 
 #[test]
@@ -407,6 +470,30 @@ fn the_gate_notices_a_value_the_importer_does_not_render() {
         .unwrap()
         .push(text("One more sentence."));
     assert_ne!(projected.data, expected(&mut longer));
+}
+
+#[test]
+fn the_gate_notices_a_citation_at_another_place_or_in_another_order() {
+    let projected = project(&json!([task()])).unwrap();
+    let (cut, held) = cut_back(&task(), &projected.data);
+    assert_eq!(cut, held);
+    let at = projected
+        .data
+        .iter()
+        .position(|(kind, _, value)| *kind == modality::EVENT && value.starts_with('['))
+        .unwrap();
+    let citations: Vec<Value> = serde_json::from_str(&projected.data[at].2).unwrap();
+    let mut moved = citations.clone();
+    moved[0]["byte_offset"] = json!(moved[0]["byte_offset"].as_u64().unwrap() - 1);
+    let mut swapped = citations;
+    swapped.swap(1, 2);
+    for planted in [moved, swapped] {
+        let mut data = projected.data.clone();
+        data[at].2 = Value::Array(planted).to_string();
+        assert_ne!(data, expected(&mut task()));
+        let (cut, held) = cut_back(&task(), &data);
+        assert_ne!(cut, held);
+    }
 }
 
 /// The gate over a real export: `CODEX_CLOUD_EXPORT` names its directory.
@@ -456,6 +543,42 @@ fn a_prior_conversation_comes_before_the_message() {
             (false, "Please round the widget's corners."),
         ]
     );
+}
+
+#[test]
+fn a_message_is_one_text_and_its_citations_follow_by_place() {
+    let projected = project(&json!([task()])).unwrap();
+    let at = projected
+        .data
+        .iter()
+        .position(|(_, _, value)| value == "I rounded them → all and ran the tests.\n")
+        .unwrap();
+    assert_eq!(projected.data[at].0, modality::TEXT);
+    let (kind, facing, citations) = &projected.data[at + 1];
+    assert_eq!((*kind, *facing), (modality::EVENT, direction::OUT));
+    assert_eq!(
+        citations,
+        concat!(
+            r#"[{"byte_offset":22,"citation":{"content_type":"repo_file_citation","#,
+            r#""line_range_end":null,"line_range_start":3,"path":"w.rs"}},"#,
+            r#"{"byte_offset":40,"citation":{"content_type":"terminal_chunk_citation","#,
+            r#""line_range_end":4,"line_range_start":1,"terminal_chunk_id":"0a1b2c"}},"#,
+            r#"{"byte_offset":40,"citation":{"content_type":"repo_file_citation","#,
+            r#""line_range_end":9,"line_range_start":9,"path":"t.rs"}}]"#,
+        )
+    );
+}
+
+#[test]
+fn a_message_without_citations_is_its_text_alone() {
+    let mut plain = task();
+    plain["turns"][1]["output_items"][2]["content"] = json!([text("Done."), text(" Really.")]);
+    let mut counts = BTreeMap::new();
+    assert_eq!(gate(&json!([plain]), &mut counts), 12);
+    let projected = project(&json!([plain])).unwrap();
+    assert!(projected
+        .data
+        .contains(&(modality::TEXT, direction::OUT, "Done. Really.".to_owned())));
 }
 
 #[test]
@@ -544,7 +667,7 @@ fn the_same_task_twice_is_emitted_once_and_shard_order_does_not_matter() {
 #[test]
 fn what_is_left_out_is_counted() {
     let summary = project(&json!([task()])).unwrap().summary;
-    assert_eq!(summary.empty_texts, 1);
+    assert_eq!(summary.empty_texts, 2);
     assert_eq!(summary.unresolved_files, 2);
     assert_eq!(summary.dropped["partial_repo_snapshot.files"], 1);
     assert_eq!(summary.dropped["task.title"], 1);

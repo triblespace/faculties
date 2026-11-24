@@ -7,10 +7,12 @@ All notable changes to this project will be documented in this file.
 - `archive import --source codex-cloud` (MCP `archive_import` source
   `codex-cloud`) reads the Codex cloud tasks of a ChatGPT data export
   (`codex-000.json` and its siblings, or the export directory). Prompts,
-  review comments and handed-over context are perceived; the agent's message
-  runs, citations and proposed changes are produced. Every member the export
-  may hold is named in a shape table; an unknown, missing or repeated one
-  fails the unit with nothing emitted, and what is left out is counted by
+  review comments and handed-over context are perceived; the agent's messages,
+  citations and proposed changes are produced. A message is one text, its runs
+  joined, followed where it cites by one event that holds its citations in
+  order, each whole and with its byte offset in that text. Every member the
+  export may hold is named in a shape table; an unknown, missing or repeated
+  one fails the unit with nothing emitted, and what is left out is counted by
   path in the summary. Diffs the export names without shipping are unresolved
   pointers. Times are the creation seconds task and turn ids carry: an
   annotation, never identity, and an id that does not decode fails the unit.

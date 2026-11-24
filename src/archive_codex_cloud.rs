@@ -27,11 +27,14 @@
 //! - An IDE context is perceived text. A prior conversation handed to the task
 //!   comes before the message, as its name says, each message in its own
 //!   role's direction. A patch applied before the turn is a perceived file.
-//! - An agent message is a list of text runs with citations between them, all
-//!   produced: each run is a text node and each citation an event node, in the
-//!   message's order. A citation keeps its `terminal_chunk_id`: it is what the
-//!   agent wrote in the citation (it sometimes names a file there), not an id
-//!   the export gave.
+//! - An agent message is one utterance, which the export cuts into text runs at
+//!   its citations. Its runs joined in order, with nothing between them, are
+//!   one produced text. Where it cites, one produced event follows: a canonical
+//!   JSON array of its citations in order, each `{"byte_offset": n,
+//!   "citation": {..}}` with the citation whole and the place it stood in the
+//!   joined text. Cutting the text at those offsets gives the runs back. A
+//!   citation keeps its `terminal_chunk_id`: it is what the agent wrote in the
+//!   citation (it sometimes names a file there), not an id the export gave.
 //! - A proposed change (`pr`, `follow_up_diff`) is a produced event with the
 //!   words and the place of the change (title, message, commit message,
 //!   repository, base commit, line counts) and then the change itself, a
@@ -445,13 +448,15 @@ impl Reader {
         Ok(texts)
     }
 
-    /// An agent message's text runs and citations, in order.
+    /// An agent message: its text runs joined, then its citations by place.
     fn message(&mut self, items: Vec<Bytes>, parts: &mut Vec<SourcePart>) -> Result<()> {
+        let mut said = String::new();
+        let mut citations = Vec::new();
         for item in items {
             let shape = match discriminator(&item, "content_type")?.as_ref() {
                 "text" => {
                     for text in self.texts(vec![item])? {
-                        parts.push(SourcePart::text(modality::TEXT, direction::OUT, text));
+                        said.push_str(text.as_ref());
                     }
                     continue;
                 }
@@ -462,7 +467,18 @@ impl Reader {
             let mut citation = self.open(shape, item.clone())?;
             citation.whole();
             citation.finish()?;
-            parts.push(event(direction::OUT, canonical(item)?));
+            citations.push(object(&BTreeMap::from([
+                ("byte_offset", said.len().to_string()),
+                ("citation", canonical(item)?),
+            ])));
+        }
+        if !said.is_empty() {
+            let said = archive_source::owned_text(said);
+            parts.push(SourcePart::text(modality::TEXT, direction::OUT, said));
+        }
+        if !citations.is_empty() {
+            let citations = format!("[{}]", citations.join(","));
+            parts.push(event(direction::OUT, citations));
         }
         Ok(())
     }
