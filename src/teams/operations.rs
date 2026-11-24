@@ -4577,6 +4577,23 @@ mod tests {
             .unwrap()
     }
 
+    /// The shared presentation records, in the same terms.
+    fn presented(storage: &TeamsStorage) -> Vec<(Option<String>, usize, usize)> {
+        let source = source_fragment("tenant-a").root().unwrap();
+        let view = storage.view().unwrap();
+        teams_core::current_messages(&view.facts, source)
+            .unwrap()
+            .into_iter()
+            .map(|record| {
+                let content = record
+                    .content
+                    .filter(|_| !record.deleted)
+                    .map(|handle| read_utf8string(&view.reader, handle, "test content").unwrap());
+                (content, record.version_index, record.version_count)
+            })
+            .collect()
+    }
+
     fn one(content: &str) -> (Option<String>, usize, usize) {
         (Some(content.to_owned()), 0, 1)
     }
@@ -4647,6 +4664,8 @@ mod tests {
         assert_eq!((rows[0].1, rows[0].2), (0, 2));
         assert_eq!((rows[1].1, rows[1].2), (1, 2));
         assert_eq!(rows[2], one("other"));
+
+        assert_eq!(presented(&fixture.storage()), rows);
 
         // Both are said to conflict, with their times and authors.
         let mut rendered = String::new();
@@ -4753,9 +4772,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2]
         );
-        let presented = teams_core::current_messages(&view.facts, source).unwrap();
-        assert_eq!(presented.len(), 1);
-        assert_eq!(presented[0].version_count, 1);
+        drop(view);
+        assert_eq!(presented(&fixture.storage()), vec![one("same")]);
     }
 
     #[test]
@@ -4796,9 +4814,13 @@ mod tests {
             "https://graph.example/delta-2",
         );
         fixture.publish(page);
+        let versions = vec![(some("newer"), 0, 2), (None, 1, 2)];
+        assert_eq!(read_all(&fixture.storage()), versions);
         assert_eq!(
-            read_all(&fixture.storage()),
-            vec![(some("newer"), 0, 2), (None, 1, 2)]
+            presented(&fixture.storage())
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            versions.into_iter().collect()
         );
     }
 
