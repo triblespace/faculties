@@ -28,9 +28,7 @@ use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
 
-use super::operations::{
-    describe_end, is_running, requests_in, spawns_in, RequestView, RunView, Spawn, SpawnView,
-};
+use super::operations::{describe_end, is_running, spawns_in, RunView, Spawn, SpawnView};
 use super::IntervalValue;
 use crate::compass::operations::{goal_reading_in, goal_states_in, GoalState};
 use crate::message::operations::{envelope_id, inbox, outbox, read_by, settled_identity};
@@ -169,17 +167,6 @@ pub struct ParentView {
     pub unreadable: Vec<String>,
 }
 
-/// A run request no keeper has answered: its host may have no keeper, or
-/// its keeper has not seen it yet.
-#[derive(Clone, Debug)]
-pub struct UnansweredRequest {
-    pub request: Id,
-    pub name: Option<String>,
-    pub host: String,
-    pub spawner: Vec<Id>,
-    pub requested_at: Option<IntervalValue>,
-}
-
 #[derive(Clone, Debug)]
 pub struct ColonyView {
     pub observed_at: IntervalValue,
@@ -188,7 +175,6 @@ pub struct ColonyView {
     pub parents: Vec<ParentView>,
     /// Runs with no recorded spawner.
     pub unparented: Vec<WorkerLine>,
-    pub unanswered: Vec<UnansweredRequest>,
     /// Roles that could not be read at all, each with its reason.
     pub unavailable: Vec<(ColonyRole, String)>,
     /// What else could not be read, in words (the zooid roster, a selector).
@@ -545,21 +531,11 @@ pub fn colony_view<R: BlobStoreGet>(
     }
     parents.sort_by(|a, b| a.label.cmp(&b.label));
 
-    let unanswered = match roles.spawn {
-        Ok(facts) => requests_in(facts, reader, None)
-            .iter()
-            .filter(|request| request.outcomes.is_empty())
-            .map(unanswered_request)
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
     ColonyView {
         observed_at,
         units_observed: unit_state.is_some(),
         parents,
         unparented,
-        unanswered,
         unavailable,
         unreadable,
     }
@@ -658,21 +634,6 @@ impl Spawn {
     }
 }
 
-fn unanswered_request(request: &RequestView) -> UnansweredRequest {
-    let host = match (request.host_label.first(), request.host.first()) {
-        (Some(label), _) => label.clone(),
-        (None, Some(key)) => super::host_text(*key),
-        (None, None) => "(no host)".to_owned(),
-    };
-    UnansweredRequest {
-        request: request.id,
-        name: request.name(),
-        host,
-        spawner: request.spawner.clone(),
-        requested_at: newest(request.requested_at.iter().copied()),
-    }
-}
-
 fn time(value: Option<IntervalValue>) -> String {
     value
         .map(crate::care::format_time)
@@ -728,7 +689,7 @@ pub fn render_colony(view: &ColonyView) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "colony at {} (Spawn runs and requests, Compass, Message, Relations; {})",
+        "colony at {} (Spawn runs, Compass, Message, Relations; {})",
         crate::care::format_time(view.observed_at),
         if view.units_observed {
             "unit states from this host's systemd"
@@ -841,24 +802,6 @@ pub fn render_colony(view: &ColonyView) -> String {
             worker_text(&mut out, line, view.units_observed);
         }
     }
-    if !view.unanswered.is_empty() {
-        writeln!(
-            out,
-            "\nrun requests no keeper has answered (no keeper on that host, or not yet seen):"
-        )
-        .unwrap();
-        for request in &view.unanswered {
-            writeln!(
-                out,
-                "  {:x}  {}  on {}  requested {}",
-                request.request,
-                request.name.as_deref().unwrap_or("(brief not here)"),
-                request.host,
-                time(request.requested_at)
-            )
-            .unwrap();
-        }
-    }
     out
 }
 
@@ -959,7 +902,6 @@ mod tests {
                 model: None,
                 model_unset: Some("none".to_owned()),
                 untinted: None,
-                request: None,
                 resumes: None,
                 cover: None,
             });

@@ -12,11 +12,11 @@
 //! never pair with a newly eligible goal. Conclusions carry no tick in their
 //! core, so evaluating the same facts again names the same request.
 //!
-//! A concluded request is a request, never permission: an effector revalidates
-//! under its own lock before acting. The ignite effector (`rules tick
-//! --effect`, through `Spawn::ignite`) records each decision as an effect
-//! entity beside the request: launched, with the spawn request it wrote, or
-//! skipped, with the reason.
+//! A concluded request is a request, never permission. The ignite effector
+//! that once acted on these recorded each decision as an effect entity beside
+//! the request: launched, with the spawn request it wrote, or skipped, with
+//! the reason. It was removed on 2026-11-24; the effect vocabulary stays so
+//! its facts keep their meaning, and nothing writes it any more.
 //!
 //! Every id below was minted with `trible genid` on 2026-11-17. Attributes use
 //! the explicit-anchor form, so each value encoding participates in identity;
@@ -51,7 +51,8 @@ pub const IGNITE_REVISION: Id = id_hex!("CD7AE21BC2F0E6D765466116C73DF819");
 /// The ask-jp rule's revision, as written in `src/rules/ask_jp.rules`.
 pub const ASK_JP_REVISION: Id = id_hex!("CDE937E729EEDD5B56BA737AECCC1039");
 
-/// Kind marker of one effector decision about one concluded request.
+/// Kind marker of one effector decision about one concluded request. Past
+/// vocabulary: nothing writes it any more.
 ///
 /// Minted with `trible genid` on 2026-11-20:
 /// `BB26DE3AF498FE2A477689A58C27C90C`.
@@ -82,7 +83,8 @@ pub mod rules {
         /// Conclusion annotation: a tick whose observations supported the nudge.
         "4923B4217188AF87C62297E3EEC92EA1" as nudge_in: inlineencodings::GenId;
         /// Effect core: the concluded request this decision is about (minted
-        /// 2026-11-20).
+        /// 2026-11-20). Past vocabulary, like the two below it: nothing
+        /// writes them any more.
         "CBCB8BC516EA38AB31FAA7A947451535" as effect_on: inlineencodings::GenId;
         /// Effect annotation: what the effector did, or why it did nothing.
         "BB912A75C195BC84EC5B80A55369C2AA" as effect_reason: inlineencodings::Handle<blobencodings::UTF8String>;

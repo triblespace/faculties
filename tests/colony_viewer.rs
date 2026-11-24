@@ -16,6 +16,7 @@ use faculties::{clock, compass, message, relations, schemas, spawn};
 use hifitime::Epoch;
 use triblespace::core::collection::observed_store::DependencyTracker;
 use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{SnapshotSource, StoreChanges, StoreSnapshot};
 use triblespace::prelude::*;
@@ -29,6 +30,7 @@ struct Fixture {
     child: String,
     ended_child: String,
     title_hash: [u8; 32],
+    spawner: Id,
 }
 
 impl Fixture {
@@ -129,7 +131,6 @@ impl Fixture {
                 model_unset: None,
                 untinted: None,
                 resumes: None,
-                request: None,
                 cover: None,
             });
             workers += start;
@@ -211,6 +212,7 @@ impl Fixture {
             child: names[0].clone(),
             ended_child: names[1].clone(),
             title_hash,
+            spawner: rowan,
         }
     }
 
@@ -354,21 +356,48 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
         fixture.routes[&schemas::spawn::DEFAULT_SCOPE_ID],
     )
     .unwrap();
-    let (mut appended, selected, _, name) =
+    let (mut appended, worker, _, name) =
         spawn::spawn_fragment("A new fixture brief after the observation").unwrap();
-    appended += spawn::request_fragment(&spawn::RequestFacts {
-        zooid: selected,
-        host: Inline::new(fixture.signer.verifying_key().to_bytes()),
-        host_label: Some("studio fixture".to_owned()),
-        provider: "fixture".into(),
+    appended += spawn::run_fragment(&spawn::RunFacts {
+        spawn: worker,
+        started_at: clock::point_now().unwrap(),
+        persona: genid().id,
+        spawner: fixture.spawner,
+        unit: "fixture-later.service".into(),
+        workdir: "/fixture".into(),
         effort: "medium".into(),
-        previous: None,
-        handoff: None,
-        cover_percent: None,
-        requested_at: clock::point_now().unwrap(),
-        spawner: genid().id,
+        prompt: "fixture".into(),
+        provider: "fixture".into(),
+        provider_reason: "testing".into(),
+        model: None,
+        model_unset: None,
+        untinted: None,
+        resumes: None,
+        cover: None,
     })
     .0;
+    // A request of the removed host queue that nothing ever answered, as it
+    // was written then: history, which this view does not list.
+    let (asked, zooid, _, unanswered) =
+        spawn::spawn_fragment("A fixture brief once asked of a host").unwrap();
+    appended += asked;
+    let provider = appended.put::<blobencodings::UTF8String, _>("fixture".to_owned());
+    let effort = appended.put::<blobencodings::UTF8String, _>("medium".to_owned());
+    let label = appended.put::<blobencodings::UTF8String, _>("studio fixture".to_owned());
+    let core = entity! { _ @
+        metadata::tag: schemas::spawn::KIND_REQUEST,
+        schemas::spawn::spawn::zooid: zooid,
+        schemas::spawn::spawn::host: Inline::new(fixture.signer.verifying_key().to_bytes()),
+        schemas::spawn::spawn::provider: provider,
+        schemas::spawn::spawn::effort: effort,
+        metadata::created_at: clock::point_now().unwrap(),
+    };
+    let request = core.root().unwrap();
+    appended += core;
+    appended += entity! { ExclusiveId::force_ref(&request) @
+        schemas::archive::archive::author: fixture.spawner,
+        schemas::spawn::spawn::host_label: label,
+    };
     fixture
         .pile
         .commit(runs, &fixture.signer, appended)
@@ -387,7 +416,12 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
     frame();
     host.open.set(true);
     let updated = wait(&mut frame, &name);
-    assert!(updated.contains("Requests without a recorded outcome"));
+    for past in [unanswered.as_str(), "studio fixture", "Requests without"] {
+        assert!(
+            !updated.contains(past),
+            "a past request is not work waiting: {past} in {updated:?}"
+        );
+    }
     host.open.set(false);
     fixture.routes.remove(&schemas::spawn::DEFAULT_SCOPE_ID);
     let (partial, _) = fixture.observe(3);
@@ -401,13 +435,7 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
     // Relations still names these people. Only Spawn supplied their runs.
     assert!(remaining.contains(&fixture.child));
     for frame in [&first, &remaining] {
-        for stale in [
-            "Run ended",
-            "Started ·",
-            "Assigned goal",
-            "Requests without a recorded outcome",
-            &name,
-        ] {
+        for stale in ["Run ended", "Started ·", "Assigned goal", &name] {
             assert!(!frame.contains(stale), "stale Spawn evidence: {stale}");
         }
     }
@@ -420,7 +448,6 @@ fn resident_observation_defers_an_unreadable_spawn_payload_until_requested() {
     use triblespace::core::collection::{
         empty_metadata_handle, CollectionCommit, CollectionRecord, CollectionStore,
     };
-    use triblespace::core::metadata;
     use triblespace::prelude::inlineencodings::Handle;
 
     let mut fixture = Fixture::new();

@@ -13,6 +13,12 @@
 //! time, the exit and the report to the same run. Two launches of one brief
 //! are two runs, so their exits never mix.
 //!
+//! Requests and outcomes are past vocabulary. A host-addressed queue wrote
+//! them from 2026-11-17 until it was removed on 2026-11-24: a request asked
+//! one host to run a zooid, and outcomes recorded what that host did about
+//! it. Nothing writes them any more and nothing answers one; `zooid show`
+//! reads them as the zooid's history.
+//!
 //! Times reuse `metadata::started_at` and `metadata::finished_at`; the
 //! spawner reuses the shared author relation `archive::author`.
 //!
@@ -41,31 +47,32 @@ pub const KIND_SPAWN: Id = id_hex!("8F02DF7BB6C50FF3F3BC5024329B4932");
 /// `A44B774609F22742FEE22457D8268CFE`.
 pub const KIND_RUN: Id = id_hex!("A44B774609F22742FEE22457D8268CFE");
 
-/// Kind marker of a run request: a record asking one host's keeper to start
-/// a run of a zooid there (`zooid request`, `zooid keep`).
+/// Kind marker of a run request: a record that asked one host to start a run
+/// of a zooid there. Past vocabulary: nothing writes it any more.
 ///
 /// Minted with `trible genid` on 2026-11-17:
 /// `C19ED05A4C53CDA5645CE2D8897B6119`.
 pub const KIND_REQUEST: Id = id_hex!("C19ED05A4C53CDA5645CE2D8897B6119");
 
-/// Kind marker of an outcome: what a keeper observed and did about one
+/// Kind marker of an outcome: what a host observed and did about one
 /// request. Its intrinsic core is the request and the outcome kind, so the
-/// same outcome recorded again is the same entity.
+/// same outcome recorded again is the same entity. Past vocabulary: nothing
+/// writes it, or any outcome kind below, any more.
 ///
 /// Minted with `trible genid` on 2026-11-17:
 /// `BB838A2D0051B0C5EDD7264AA79A9E27`.
 pub const KIND_OUTCOME: Id = id_hex!("BB838A2D0051B0C5EDD7264AA79A9E27");
 
-/// Outcome: the keeper admitted the request and is starting its run.
+/// Outcome: the host admitted the request and was starting its run.
 /// Minted with `trible genid` on 2026-11-17.
 pub const OUTCOME_ACCEPTED: Id = id_hex!("DF057A01A2C09442B42BEBB61960C4DD");
-/// Outcome: the request's unit is running. Minted 2026-11-17.
+/// Outcome: the request's unit was running. Minted 2026-11-17.
 pub const OUTCOME_RUNNING: Id = id_hex!("2EB86EBD334839E3CE5AE52120D935B1");
-/// Outcome: the keeper will not run the request; the reason says why.
+/// Outcome: the host would not run the request; the reason says why.
 /// Minted 2026-11-17.
 pub const OUTCOME_REFUSED: Id = id_hex!("E11BF1D92608F66308A21E7FCB07B65B");
 /// Outcome: the request's run ended and settlement recorded the end. A
-/// process exit is not goal completion; this says only that the task's run is
+/// process exit is not goal completion; this says only that the task's run was
 /// over. Minted 2026-11-17.
 pub const OUTCOME_TERMINAL: Id = id_hex!("A23987DE98AE18530D7CC04A2E78B432");
 
@@ -141,20 +148,22 @@ pub mod spawn {
         /// Why the run names no [`model`]: none was configured for its
         /// provider, so the agent chose its own default. Minted 2026-11-17.
         "2FC5D6F2A0327CC8A9EB4918F74BF65D" as model_unset: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The spawn a request asks to run. Minted 2026-11-17.
+        /// The spawn a request asked to run. Like every attribute below
+        /// that speaks of a request or an outcome, past vocabulary:
+        /// nothing writes it any more. Minted 2026-11-17.
         "5AB17149BAD55FC21BAC6EC5393E767A" as zooid: inlineencodings::GenId;
-        /// The node key of the one host a request is addressed to, as custody
+        /// The node key of the one host a request was addressed to, as custody
         /// and the network name peers. Minted 2026-11-17.
         "ECE6C8630D9BCEB5615FFE89FFB411F2" as host: inlineencodings::ED25519PublicKey;
         /// A readable name for a request's host (`sky`). Annotation only:
         /// the host is its key. Minted 2026-11-17.
         "7A3D448311C0572AB22E74C5F87FA7BC" as host_label: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The run a request continues, when it is a move. Minted 2026-11-17.
+        /// The run a request continued, when it was a move. Minted 2026-11-17.
         "95FB4132EA689E333A81FD35CAB47CF8" as previous: inlineencodings::GenId;
-        /// Text delivered once, after the brief, in the prompt of the run that
-        /// serves a request. Minted 2026-11-17.
+        /// Text to deliver once, after the brief, in the prompt of the run that
+        /// served a request. Minted 2026-11-17.
         "0775A8E50E6CFAC1091331B441D1A354" as handoff: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The request a run serves, or an outcome is about. Minted 2026-11-17.
+        /// The request a run served, or an outcome is about. Minted 2026-11-17.
         "AC8D99BE158EBBE0D88236E01D1ABBFB" as request: inlineencodings::GenId;
         /// The archived node a local run's zooid continued its history from
         /// (Drive's `--native-resume`), as the launch found it in the archive.
@@ -162,7 +171,7 @@ pub mod spawn {
         "D253320ACDE8B68B6CD46D0E98F95222" as resumes: inlineencodings::GenId;
         /// Which outcome an outcome entity is (`OUTCOME_*`). Minted 2026-11-17.
         "8BE0475206CD7D95B03FE7D1EB27609A" as outcome: inlineencodings::GenId;
-        /// Why a keeper refused a request, or what it observed beside an
+        /// Why a host refused a request, or what it observed beside an
         /// outcome. Minted 2026-11-17.
         "3C4380BFBC6A0149F6F62618FF1E3CC8" as reason: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The run an outcome refers to. Minted 2026-11-17.
@@ -180,7 +189,7 @@ pub mod spawn {
         /// The share of the worker's context window, in percent, asked for
         /// the whole cover (memories, beliefs, goals): a best-effort wish,
         /// not an allocation (`zooid spawn --cover`). On a run and on a
-        /// request. Minted with `trible genid` on 2026-11-20, like every
+        /// past request. Minted with `trible genid` on 2026-11-20, like every
         /// attribute below.
         "2760EF854F5B4200EE6DD3FB5C025486" as cover_percent: inlineencodings::F64;
         /// The worker model's effective context window in tokens, as the

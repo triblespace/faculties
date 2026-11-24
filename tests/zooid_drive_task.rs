@@ -378,9 +378,6 @@ impl Launcher for FakeLauncher {
     fn state(&self, _unit: &str) -> Result<String> {
         Ok("active".to_owned())
     }
-    fn active(&self, _prefix: &str) -> Result<usize> {
-        Ok(self.started.lock().unwrap().len())
-    }
 }
 
 struct StubRenderer;
@@ -498,7 +495,6 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         .settle(&SettleRequest {
             name: launched.name.clone(),
             run: launched.run,
-            request: None,
             exit: Exit::from_systemd("exited", &code, "exit-code"),
             report: Some(launched.report.clone()),
             usage: None,

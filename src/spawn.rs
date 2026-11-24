@@ -26,11 +26,9 @@ pub use colony::{
     ParentSource, ParentView,
 };
 pub use operations::{
-    choose_provider, inbox_failure, keep_lock_path, CoverWish, GoalRequest, IgniteDecision,
-    Ignition, InboxAnswer, InboxHook, InboxRequest, KeepConfig, KeepPass, KeepStep, LaunchConfig,
-    Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestInput, RequestView, Requested,
-    RunRequest, RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
-    ZooidRef,
+    choose_provider, inbox_failure, CoverWish, GoalRequest, InboxAnswer, InboxHook, InboxRequest,
+    LaunchConfig, Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestView, RunRequest,
+    RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
 };
 
 use anyhow::{bail, Result};
@@ -42,7 +40,7 @@ use triblespace::prelude::*;
 use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::blockdag;
 use crate::schemas::imagine::imagine as imagine_attrs;
-use crate::schemas::spawn::{spawn as attrs, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN};
+use crate::schemas::spawn::{spawn as attrs, KIND_RUN, KIND_SPAWN};
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
 pub type IntervalValue = Inline<NsTAIInterval>;
@@ -91,25 +89,9 @@ pub fn unit_for(name: &str) -> String {
     format!("{UNIT_PREFIX}{name}")
 }
 
-/// The unit a request's run runs in, derived from the request alone, so
-/// systemd itself refuses a second start of one request while it runs.
-pub fn unit_for_request(request: Id) -> String {
-    format!("{UNIT_PREFIX}req-{request:x}")
-}
-
 /// A host key as 64 hex digits, the way `TRIBLESPACE_PEERS` writes it.
 pub fn host_text(host: HostKey) -> String {
     hex::encode(host.raw)
-}
-
-/// A host key from 64 hex digits.
-pub fn parse_host(text: &str) -> Result<HostKey> {
-    let bytes = hex::decode(text.trim())
-        .map_err(|_| anyhow::anyhow!("host {text:?} is not a hex node key"))?;
-    let raw: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("host {text:?} is not a 32-byte node key"))?;
-    Ok(Inline::new(raw))
 }
 
 /// `blake3:<hex>` for a handle, as other faculties print one.
@@ -197,8 +179,6 @@ pub struct RunFacts {
     pub model_unset: Option<String>,
     /// Why the recollection is untinted, when its topic query failed.
     pub untinted: Option<String>,
-    /// The request this run serves, when a keeper started it.
-    pub request: Option<Id>,
     /// The archived node a local run continues its zooid's history from.
     pub resumes: Option<Id>,
     /// How the cover was sized, when the launch asked for a share of the
@@ -247,7 +227,6 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::untinted?: untinted,
         attrs::model?: model,
         attrs::model_unset?: model_unset,
-        attrs::request?: run.request,
         attrs::resumes?: run.resumes,
     };
     if let Some(cover) = &run.cover {
@@ -286,103 +265,6 @@ pub fn cover_fragment(run: Id, cover: &cover::CoverRecord) -> Fragment {
         attrs::cover_sizing: summary,
     };
     fragment
-}
-
-/// What a run request says. It names no workdir, command, tool or budget:
-/// the host that runs it resolves those itself.
-#[derive(Clone, Debug)]
-pub struct RequestFacts {
-    pub zooid: Id,
-    pub host: HostKey,
-    pub host_label: Option<String>,
-    /// The provider policy asked for: `claude`, `codex`, `auto` or `local`.
-    pub provider: String,
-    pub effort: String,
-    pub previous: Option<Id>,
-    pub handoff: Option<String>,
-    /// The cover share asked for (`--cover`), carried like the provider and
-    /// effort. Absent keeps the identity a request had before it existed.
-    pub cover_percent: Option<f64>,
-    pub requested_at: IntervalValue,
-    /// The persona that asked, messaged when the run ends. A reply route,
-    /// not authority: authority is the COMMIT signer's WRITE admission.
-    pub spawner: Id,
-}
-
-/// A request: everything it asks for is its intrinsic core (known when it is
-/// written, the same for every reader), the label and the asker annotate it.
-/// Returns the fragment and the request id.
-pub fn request_fragment(request: &RequestFacts) -> (Fragment, Id) {
-    let mut fragment = Fragment::empty();
-    let provider = fragment.put::<UTF8String, _>(request.provider.clone());
-    let effort = fragment.put::<UTF8String, _>(request.effort.clone());
-    let handoff = request
-        .handoff
-        .as_ref()
-        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
-    let core = entity! { _ @
-        metadata::tag: KIND_REQUEST,
-        attrs::zooid: request.zooid,
-        attrs::host: request.host,
-        attrs::provider: provider,
-        attrs::effort: effort,
-        attrs::previous?: request.previous,
-        attrs::handoff?: handoff,
-        attrs::cover_percent?: request.cover_percent,
-        metadata::created_at: request.requested_at,
-    };
-    let id = core.root().expect("a request has one intrinsic root");
-    fragment += core;
-    let label = request
-        .host_label
-        .as_ref()
-        .map(|text| fragment.put::<UTF8String, _>(text.clone()));
-    fragment += entity! { ExclusiveId::force_ref(&id) @
-        archive_attrs::author: request.spawner,
-        attrs::host_label?: label,
-    };
-    (fragment, id)
-}
-
-/// One outcome of a request: the request and the outcome kind are its
-/// core, so recording it again names the same entity; when it was observed,
-/// the run, the unit and the reason annotate it.
-pub fn outcome_fragment(
-    request: Id,
-    outcome: Id,
-    at: IntervalValue,
-    run: Option<Id>,
-    unit: Option<&str>,
-    reason: Option<&str>,
-) -> (Fragment, Id) {
-    let core = entity! { _ @
-        metadata::tag: KIND_OUTCOME,
-        attrs::request: request,
-        attrs::outcome: outcome,
-    };
-    let id = core.root().expect("an outcome has one intrinsic root");
-    let mut fragment = Fragment::empty();
-    fragment += core;
-    let unit = unit.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
-    let reason = reason.map(|text| fragment.put::<UTF8String, _>(text.to_owned()));
-    fragment += entity! { ExclusiveId::force_ref(&id) @
-        metadata::created_at: at,
-        attrs::outcome_run?: run,
-        attrs::unit?: unit,
-        attrs::reason?: reason,
-    };
-    (fragment, id)
-}
-
-/// The run's link to the request it serves, with the tag a keeper looks for.
-/// Launch publishes the same two facts in the run record; settlement
-/// publishes them again from inside the unit, so a keeper that stopped
-/// between starting the unit and publishing the record still finds the run.
-pub fn run_request_link(run: Id, request: Id) -> Fragment {
-    entity! { ExclusiveId::force_ref(&run) @
-        metadata::tag: KIND_RUN,
-        attrs::request: request,
-    }
 }
 
 /// A note about a run that is not part of its end: the message settlement
@@ -601,22 +483,10 @@ fn local_preamble(name: &str, spawner: &str) -> String {
 }
 
 /// The opening context in its fixed order: wake (one cover, tinted by the
-/// brief), preamble, brief, and a request's handoff last, once, when there
-/// is one.
-pub fn assemble_prompt(wake: &str, preamble: &str, brief: &str, handoff: Option<&str>) -> String {
-    let mut prompt = String::with_capacity(
-        wake.len() + preamble.len() + brief.len() + handoff.map_or(0, str::len),
-    );
-    let sections = [
-        ("Wake", Some(wake)),
-        ("Who you are", Some(preamble)),
-        ("Brief", Some(brief)),
-        ("Handoff", handoff),
-    ];
-    for (title, body) in sections
-        .into_iter()
-        .filter_map(|(title, body)| body.map(|body| (title, body)))
-    {
+/// brief), preamble, brief.
+pub fn assemble_prompt(wake: &str, preamble: &str, brief: &str) -> String {
+    let mut prompt = String::with_capacity(wake.len() + preamble.len() + brief.len());
+    for (title, body) in [("Wake", wake), ("Who you are", preamble), ("Brief", brief)] {
         prompt.push_str("# ");
         prompt.push_str(title);
         prompt.push_str("\n\n");
@@ -628,16 +498,9 @@ pub fn assemble_prompt(wake: &str, preamble: &str, brief: &str, handoff: Option<
 
 /// A local zooid's first input: [`assemble_prompt`] without the wake, for
 /// an executor that reads its own (Drive's `--brief-file`).
-pub fn assemble_brief(preamble: &str, brief: &str, handoff: Option<&str>) -> String {
+pub fn assemble_brief(preamble: &str, brief: &str) -> String {
     let mut text = String::new();
-    for (title, body) in [
-        ("Who you are", Some(preamble)),
-        ("Brief", Some(brief)),
-        ("Handoff", handoff),
-    ]
-    .into_iter()
-    .filter_map(|(title, body)| body.map(|body| (title, body)))
-    {
+    for (title, body) in [("Who you are", preamble), ("Brief", brief)] {
         text.push_str("# ");
         text.push_str(title);
         text.push_str("\n\n");
@@ -820,9 +683,6 @@ pub fn require_unit_safe(what: &str, path: &str) -> Result<()> {
 pub struct ScriptFacts<'a> {
     pub name: &'a str,
     pub run: Id,
-    /// The request the run serves, when a keeper started it. Settlement
-    /// links the run to it, whatever happened to the keeper.
-    pub request: Option<Id>,
     pub pile: &'a str,
     pub key: &'a str,
     pub path: &'a str,
@@ -905,12 +765,8 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         q(facts.path)
     ));
     script.push_str("if [ \"${1:-}\" = settle ]; then\n");
-    let request = facts
-        .request
-        .map(|request| format!(" --request {request:x}"))
-        .unwrap_or_default();
     script.push_str(&format!(
-        "  exec {} settle {} --run {:x}{request} --code \"${{EXIT_CODE:-}}\" --status \"${{EXIT_STATUS:-}}\" \
+        "  exec {} settle {} --run {:x} --code \"${{EXIT_CODE:-}}\" --status \"${{EXIT_STATUS:-}}\" \
          --result \"${{SERVICE_RESULT:-}}\" --report {}{}\n",
         q(facts.spawn),
         q(facts.name),
@@ -1018,49 +874,6 @@ mod tests {
     }
 
     #[test]
-    fn a_request_is_what_it_asks_for_and_an_outcome_is_its_request_and_kind() {
-        let at = |n: u64| -> IntervalValue {
-            crate::clock::point(hifitime::Epoch::from_tai_seconds(n as f64)).unwrap()
-        };
-        let facts = |label: &str, spawner: u8, when: u64| RequestFacts {
-            zooid: Id::new([1; 16]).unwrap(),
-            host: Inline::new([2; 32]),
-            host_label: Some(label.to_owned()),
-            provider: "claude".to_owned(),
-            effort: "high".to_owned(),
-            previous: None,
-            handoff: Some("h".to_owned()),
-            cover_percent: None,
-            requested_at: at(when),
-            spawner: Id::new([spawner; 16]).unwrap(),
-        };
-        let (_, first) = request_fragment(&facts("sky", 3, 10));
-        // The label and the asker annotate; they are not identity.
-        assert_eq!(request_fragment(&facts("other", 4, 10)).1, first);
-        // A request asked at another time is another request.
-        assert_ne!(request_fragment(&facts("sky", 3, 11)).1, first);
-        // A cover share is part of what a request asks for.
-        let mut covered = facts("sky", 3, 10);
-        covered.cover_percent = Some(20.0);
-        assert_ne!(request_fragment(&covered).1, first);
-        let mut different = facts("sky", 3, 10);
-        different.provider = "codex".to_owned();
-        assert_ne!(request_fragment(&different).1, first);
-        let kind = Id::new([9; 16]).unwrap();
-        let (_, a) = outcome_fragment(first, kind, at(1), None, None, Some("x"));
-        let (_, b) = outcome_fragment(first, kind, at(2), Some(first), Some("u"), None);
-        assert_eq!(a, b);
-        assert_ne!(
-            outcome_fragment(first, Id::new([8; 16]).unwrap(), at(1), None, None, None).1,
-            a
-        );
-        assert_eq!(unit_for_request(first), format!("spawn-req-{first:x}"));
-        let host = parse_host(&"ab".repeat(32)).unwrap();
-        assert_eq!(host_text(host), "ab".repeat(32));
-        assert!(parse_host("abcd").is_err() && parse_host(&"zz".repeat(32)).is_err());
-    }
-
-    #[test]
     fn systemd_exit_values_map_to_a_code_or_a_signal() {
         assert_eq!(
             Exit::from_systemd("exited", "3", "exit-code"),
@@ -1104,17 +917,12 @@ mod tests {
 
     #[test]
     fn prompt_order_is_wake_preamble_brief() {
-        let prompt = assemble_prompt("WAKE", "PREAMBLE", "BRIEF", None);
+        let prompt = assemble_prompt("WAKE", "PREAMBLE", "BRIEF");
         let at = |needle: &str| prompt.find(needle).unwrap();
         assert!(at("WAKE") < at("PREAMBLE"));
         assert!(!prompt.contains("# Recollection for this task"));
         assert!(at("PREAMBLE") < at("BRIEF"));
         assert!(prompt.ends_with("BRIEF\n\n"));
-        assert!(!prompt.contains("# Handoff"));
-        let prompt = assemble_prompt("WAKE", "PREAMBLE", "BRIEF", Some("HANDOFF"));
-        assert!(prompt.find("BRIEF").unwrap() < prompt.find("# Handoff").unwrap());
-        assert_eq!(prompt.matches("HANDOFF").count(), 1);
-        assert!(prompt.ends_with("HANDOFF\n\n"));
     }
 
     #[test]
@@ -1158,8 +966,8 @@ mod tests {
 
     #[test]
     fn a_local_first_input_is_the_prompt_without_its_wake() {
-        let prompt = assemble_prompt("THE WAKE", "who", "the brief", Some("the handoff"));
-        let first = assemble_brief("who", "the brief", Some("the handoff"));
+        let prompt = assemble_prompt("THE WAKE", "who", "the brief");
+        let first = assemble_brief("who", "the brief");
         assert_eq!(prompt, format!("# Wake\n\nTHE WAKE\n\n{first}"));
         assert!(!first.contains("THE WAKE"));
     }
@@ -1310,7 +1118,6 @@ mod tests {
         let script = unit_script(&ScriptFacts {
             name: "lusab-babad",
             run,
-            request: None,
             pile: "/p/self.pile",
             key: "/p/self.key",
             path: "/bin",
@@ -1387,7 +1194,6 @@ mod tests {
         let script_text = unit_script(&ScriptFacts {
             name: "lusab-babad",
             run,
-            request: None,
             pile: "/p/self.pile",
             key: "/p/self.key",
             path: "/usr/bin:/bin",
@@ -1439,7 +1245,6 @@ mod tests {
         let script = unit_script(&ScriptFacts {
             name: "lusab-babad",
             run: Id::new([7; 16]).unwrap(),
-            request: None,
             pile: "/p/self.pile",
             key: "/p/self.key",
             path: "/bin",

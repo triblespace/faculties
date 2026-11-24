@@ -7,11 +7,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use triblespace::prelude::Id;
 
-use super::operations::{describe_end, render_list, render_pass, render_requests, render_show};
+use super::operations::{describe_end, render_list, render_show};
 use super::{
-    inbox_failure, keep_lock_path, CoverWish, Exit, GoalRequest, InboxHook, InboxRequest,
-    KeepConfig, LaunchConfig, Launched, Provider, RequestInput, RunRequest, SettleRequest, Spawn,
-    ZooidRef,
+    inbox_failure, CoverWish, Exit, GoalRequest, InboxHook, InboxRequest, LaunchConfig, Launched,
+    Provider, RunRequest, SettleRequest, Spawn,
 };
 
 #[derive(Parser)]
@@ -121,66 +120,6 @@ enum Command {
         #[arg(long, value_name = "TOKENS", requires = "cover")]
         window: Option<u64>,
     },
-    /// Ask one host's keeper to start a run of a zooid there: writes a run
-    /// request into the spawn collection, which syncs like any other. The
-    /// request names no workdir, command or budget; the host decides those.
-    Request {
-        /// An existing zooid, by name.
-        #[arg(long, value_name = "NAME", required_unless_present = "brief")]
-        zooid: Option<String>,
-        /// A new zooid's brief: a file, or `-` for stdin.
-        #[arg(long, value_name = "PATH", conflicts_with = "zooid")]
-        brief: Option<String>,
-        /// The target host's node key (64 hex digits). Defaults to this host.
-        #[arg(long, value_name = "KEY")]
-        host: Option<String>,
-        /// A readable name beside the key. Defaults to this host's name when
-        /// --host is omitted.
-        #[arg(long)]
-        label: Option<String>,
-        /// The agent: claude, codex, mistral (opt-in; bills money), auto or local
-        /// (refused by a target host without SPAWN_LOCAL_EXECUTOR).
-        #[arg(long, default_value = "claude")]
-        provider: String,
-        /// Effort: low, medium, high, xhigh or max.
-        #[arg(long, default_value = "high")]
-        effort: String,
-        /// The asking persona, messaged when the run ends. Defaults to $PERSONA.
-        #[arg(long, value_name = "PERSONA")]
-        spawner: Option<String>,
-        /// The run this one continues (hex id), when it is a move.
-        #[arg(long, value_name = "RUN")]
-        previous: Option<String>,
-        /// Text delivered once after the brief: a file, or `-` for stdin.
-        /// This keeper refuses a request that carries one: there is no
-        /// disclosure check yet.
-        #[arg(long, value_name = "PATH")]
-        handoff: Option<String>,
-        /// The cover's wished share of the worker's context window, in
-        /// percent (best effort). The target host finds the window.
-        #[arg(long, value_name = "PERCENT")]
-        cover: Option<f64>,
-    },
-    /// Every run request with its outcomes.
-    Requests {
-        /// Only those addressed to this host.
-        #[arg(long)]
-        here: bool,
-    },
-    /// This host's keeper: start the runs requested of this host, and
-    /// record accepted, running, refused and task-terminal for each.
-    /// A run's unit is named from its request, so a request is started once.
-    Keep {
-        /// One pass, then exit.
-        #[arg(long)]
-        once: bool,
-        /// The directory every run starts in. Defaults to $HOME.
-        #[arg(long, value_name = "DIR", env = "SPAWN_KEEP_WORKDIR")]
-        workdir: Option<PathBuf>,
-        /// Seconds between passes, without --once.
-        #[arg(long, default_value_t = 60)]
-        poll: u64,
-    },
     /// Every zooid, one line each.
     List,
     /// Each parent persona: its doing goals, the zooids it started that have
@@ -194,7 +133,8 @@ enum Command {
         #[arg(long = "persona", value_name = "PERSONA")]
         personas: Vec<String>,
     },
-    /// One zooid and all its runs, with the latest report.
+    /// One zooid and all its runs, with the latest report, and what the
+    /// removed host queue recorded about it.
     Show {
         name: String,
         /// Print the brief too.
@@ -218,11 +158,6 @@ enum Command {
         /// The run being settled (hex id), as `zooid spawn` wrote it into the script.
         #[arg(long, value_name = "ID")]
         run: String,
-        /// The request the run serves (hex id), when a keeper started it.
-        /// Settlement links the run to it, so a keeper that stopped before
-        /// publishing the run record still sees that the request ran.
-        #[arg(long, value_name = "ID")]
-        request: Option<String>,
         /// `exited`, `killed` or `dumped` (systemd's EXIT_CODE).
         #[arg(long, default_value = "")]
         code: String,
@@ -399,17 +334,6 @@ fn print_launched(launched: &Launched) -> Result<()> {
     })
 }
 
-fn keep_config(workdir: Option<PathBuf>) -> Result<KeepConfig> {
-    let workdir = match workdir {
-        Some(workdir) => workdir,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?),
-    };
-    Ok(KeepConfig {
-        workdir,
-        lock: keep_lock_path()?,
-    })
-}
-
 fn read_brief(source: &str) -> Result<String> {
     let mut bytes = Vec::new();
     if source == "-" {
@@ -463,24 +387,6 @@ pub fn run() -> Result<()> {
         return run_inbox(&cli.workspace, cli.pile, cli.key, name, run, hook);
     }
     let storage = cli.workspace.storage(cli.pile, cli.key)?;
-    if let Command::Keep {
-        once: false,
-        workdir,
-        poll,
-    } = &command
-    {
-        // A pass opens the pile afresh, so the loop holds no store between.
-        let spawn = Spawn::new(storage, LaunchConfig::from_home_env()?);
-        let config = keep_config(workdir.clone())?;
-        spawn.keep(
-            &config,
-            Duration::from_secs((*poll).max(1)),
-            |pass| match pass {
-                Ok(pass) => print!("{}", render_pass(pass)),
-                Err(error) => eprintln!("keep pass failed: {error:#}"),
-            },
-        );
-    }
     if let Command::Wait { name, poll } = &command {
         // Each check opens the pile afresh, so a wait that lasts hours keeps
         // no store open and reads the settlement another process wrote.
@@ -540,78 +446,6 @@ pub fn run() -> Result<()> {
                 })?;
                 print_launched(&launched)
             }
-            Command::Request {
-                zooid,
-                brief,
-                host,
-                label,
-                provider,
-                effort,
-                spawner,
-                previous,
-                handoff,
-                cover,
-            } => {
-                let zooid = match (zooid, brief) {
-                    (Some(name), None) => ZooidRef::Name(name),
-                    (None, Some(brief)) => ZooidRef::Brief(read_brief(&brief)?),
-                    _ => return Err(anyhow!("pass --zooid or --brief")),
-                };
-                let label = match (&host, label) {
-                    (_, Some(label)) => Some(label),
-                    (None, None) => std::fs::read_to_string("/etc/hostname")
-                        .ok()
-                        .map(|name| name.trim().to_owned())
-                        .filter(|name| !name.is_empty()),
-                    (Some(_), None) => None,
-                };
-                let requested = spawn.request(&RequestInput {
-                    zooid,
-                    host: host.as_deref().map(super::parse_host).transpose()?,
-                    host_label: label,
-                    provider: Provider::parse(&provider)?,
-                    effort,
-                    spawner: spawner_or_persona(spawner)?,
-                    previous: previous
-                        .map(|run| {
-                            Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))
-                        })
-                        .transpose()?,
-                    handoff: handoff.as_deref().map(read_brief).transpose()?,
-                    cover_percent: cover,
-                })?;
-                crate::cli::with_output("zooid", |out| {
-                    out.line(format!("{:x}", requested.request))?;
-                    out.note(format!(
-                        "requested {} on host {}{}; its keeper starts it in {}",
-                        requested.name,
-                        super::host_text(requested.host),
-                        requested
-                            .host_label
-                            .as_deref()
-                            .map(|label| format!(" ({label})"))
-                            .unwrap_or_default(),
-                        requested.unit
-                    ))?;
-                    if let Some(why) = &requested.unprefixed {
-                        out.note(why)?;
-                    }
-                    Ok(())
-                })
-            }
-            Command::Requests { here } => {
-                let host = if here {
-                    Some(spawn.local_host()?)
-                } else {
-                    None
-                };
-                let requests = spawn.requests(host)?;
-                crate::cli::with_output("zooid", |out| out.text(render_requests(&requests)))
-            }
-            Command::Keep { workdir, .. } => {
-                let pass = spawn.keep_once(&keep_config(workdir)?)?;
-                crate::cli::with_output("zooid", |out| out.text(render_pass(&pass)))
-            }
             Command::Colony { personas } => {
                 let view = spawn.colony(&super::ColonyOptions { personas })?;
                 crate::cli::with_output("zooid", |out| out.text(super::render_colony(&view)))
@@ -630,7 +464,6 @@ pub fn run() -> Result<()> {
             Command::Settle {
                 name,
                 run,
-                request,
                 code,
                 status,
                 result,
@@ -639,17 +472,10 @@ pub fn run() -> Result<()> {
             } => {
                 let run =
                     Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
-                let request = request
-                    .map(|text| {
-                        Id::from_hex(text.trim())
-                            .ok_or_else(|| anyhow!("invalid request id {text}"))
-                    })
-                    .transpose()?;
                 let exit = Exit::from_systemd(&code, &status, &result);
                 let settled = spawn.settle(&SettleRequest {
                     name: name.clone(),
                     run,
-                    request,
                     exit: exit.clone(),
                     report,
                     usage,

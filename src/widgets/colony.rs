@@ -133,7 +133,7 @@ fn draw(ui: &mut Ui, view: &ColonyView) {
     for reason in &view.unreadable {
         ui.weak(reason);
     }
-    if view.parents.is_empty() && view.unparented.is_empty() && view.unanswered.is_empty() {
+    if view.parents.is_empty() && view.unparented.is_empty() {
         ui.label("Current activity unknown. No parent or worker evidence is visible.");
     }
     for parent in &view.parents {
@@ -147,20 +147,6 @@ fn draw(ui: &mut Ui, view: &ColonyView) {
         ui.strong("Workers without a recorded parent");
         for worker in &view.unparented {
             draw_worker(ui, worker, None);
-        }
-    }
-    if !view.unanswered.is_empty() {
-        ui.separator();
-        ui.strong("Requests without a recorded outcome");
-        for request in &view.unanswered {
-            ui.label(format!(
-                "{} · {}",
-                request.name.as_deref().unwrap_or("Unnamed request"),
-                request.host
-            ));
-            if let Some(at) = request.requested_at {
-                ui.small(format!("Spawn · {}", format_time(at)));
-            }
         }
     }
 }

@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The host-addressed run queue is removed, with the automatic dispatch built
+  on it. `zooid request`, `zooid requests`, `zooid keep` and `zooid settle
+  --request` are gone, and so are the MCP tools `zooid_request` and
+  `zooid_requests` (called `spawn_request` and `spawn_requests` before the
+  rename); `SPAWN_KEEP_WORKDIR` means nothing any more. So are `rules tick
+  --effect` and its flags (`--workdir`, `--extra`, `--effort`,
+  `--max-running`, and their `RULES_IGNITE_*` variables): the two-hourly
+  automatic dispatch that started a zooid for a ready Compass goal ends here,
+  and a unit that still passes `--effect` fails on the unknown argument.
+  `rules tick` keeps its sensors, its driver and its report, and nothing acts
+  on a conclusion. `zooid spawn` and `zooid goal` still start a zooid
+  directly. What a zooid's declaration of where and how it lives looks like,
+  and what realises one, is future work.
+
+  Requests and outcomes already recorded stay readable: `zooid show` (MCP
+  `zooid_show`) lists a zooid's past requests with their host, asker, earlier
+  run or handoff, runs, outcomes and reasons, beside its goal. A request that
+  nothing answered is history there, and `zooid colony` and the viewer's
+  Colony no longer list one as waiting.
+
 - `orient wake --pairs` marks the recalls that stand in finished pieces of the
   cover with `"sealed": true`, always a leading run. A consumer that keeps a
   prompt prefix can end it there and compare what it kept. A reader that

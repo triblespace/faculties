@@ -7,10 +7,8 @@ use anybytes::Bytes;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
-use super::operations::{render_list, render_requests, render_show};
-use super::{
-    CoverWish, GoalRequest, LaunchConfig, Launched, Provider, RequestInput, RunRequest, ZooidRef,
-};
+use super::operations::{render_list, render_show};
+use super::{CoverWish, GoalRequest, LaunchConfig, Launched, Provider, RunRequest};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
 use crate::out::Out;
 
@@ -26,23 +24,13 @@ const TOOLS: &[Tool] = &[
         input_schema: r#"{"type":"object","properties":{"goal":{"type":"string","minLength":1,"description":"The goal id or a unique prefix."},"workdir":{"type":"string","minLength":1,"description":"Directory on the MCP server's host the zooid starts in."},"extra":{"type":"string","description":"The spawner's own instructions, appended to the rendered brief."},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The spawning persona (label or id), messaged when the zooid ends."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent, for memories, beliefs and goals together (e.g. 20). Ranked Wiki pages have an allowance of their own beside the journal's budget. Goals render whole. Sizing is returned and recorded. Default: 240,000 journal characters, and up to 40,000 of Wiki readings."},"window":{"type":"integer","minimum":1,"description":"The worker model's context window in tokens, before any other source. Only used with cover_percent."}},"required":["goal","workdir","spawner"],"additionalProperties":false}"#,
     },
     Tool {
-        name: "zooid_request",
-        description: "Ask one host's keeper to start a run of a zooid there, by writing a run request into the spawn collection, which syncs like any other. Name an existing zooid, or give a new brief. The request names no workdir, command or budget: the target host resolves those and records accepted, running, refused or task-terminal. local is refused by a host whose SPAWN_LOCAL_EXECUTOR is unset; nothing falls back to a hosted model. mistral is refused too: it spends money, and a request runs unattended; only zooid_spawn may choose it. A request with a handoff is refused by today's keeper, which has no disclosure check; every reader of the spawn collection can read a handoff. Returns the request id.",
-        input_schema: r#"{"type":"object","properties":{"zooid":{"type":"string","minLength":1,"description":"An existing zooid's name."},"brief":{"type":"string","minLength":1,"description":"A new zooid's whole brief, as text."},"host":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"The target host's node key. Default: the MCP server's host."},"host_label":{"type":"string","minLength":1,"description":"A readable name beside the key."},"provider":{"type":"string","enum":["claude","codex","mistral","auto","local"]},"effort":{"type":"string","enum":["low","medium","high","xhigh","max"]},"spawner":{"type":"string","minLength":1,"description":"The asking persona, messaged when the run ends."},"previous":{"type":"string","description":"The run this one continues (hex id), for a move."},"handoff":{"type":"string","description":"Text delivered once, after the brief."},"cover_percent":{"type":"number","exclusiveMinimum":0,"maximum":100,"description":"The cover's wished share of the worker's context window, in percent (best effort). The target host finds the window."}},"required":["spawner"],"additionalProperties":false}"#,
-    },
-    Tool {
-        name: "zooid_requests",
-        description: "Every run request with its outcomes: accepted, running, refused with its reason, task-terminal.",
-        input_schema: r#"{"type":"object","properties":{"here":{"type":"boolean","description":"Only requests addressed to the MCP server's host."}},"additionalProperties":false}"#,
-    },
-    Tool {
         name: "zooid_list",
         description: "Every spawned zooid, one line each: name, number of runs, how the latest ended, the brief's first line.",
         input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     },
     Tool {
         name: "zooid_show",
-        description: "One spawned zooid by name with all its runs: start and end, exit, unit, workdir, persona, spawner, and the latest report.",
+        description: "One spawned zooid by name with all its runs: start and end, exit, unit, workdir, persona, spawner, and the latest report; and any past request of the removed host queue, with its outcomes.",
         input_schema: r#"{"type":"object","properties":{"name":{"type":"string","minLength":1},"brief":{"type":"boolean","description":"Also print the brief."}},"required":["name"],"additionalProperties":false}"#,
     },
 ];
@@ -116,37 +104,6 @@ fn launched_line(launched: &Launched) -> String {
         line.push_str(&format!("\nwarning: {warning}"));
     }
     line
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Request {
-    #[serde(default)]
-    zooid: Option<String>,
-    #[serde(default)]
-    brief: Option<String>,
-    #[serde(default)]
-    host: Option<String>,
-    #[serde(default)]
-    host_label: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    effort: Option<String>,
-    spawner: String,
-    #[serde(default)]
-    previous: Option<String>,
-    #[serde(default)]
-    handoff: Option<String>,
-    #[serde(default)]
-    cover_percent: Option<f64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Requests {
-    #[serde(default)]
-    here: bool,
 }
 
 #[derive(Deserialize)]
@@ -236,65 +193,6 @@ impl Faculty for Spawn {
                     },
                 })?;
                 out.line(launched_line(&launched))
-            }
-            "zooid_request" => {
-                let args: Request = decode_arguments(arguments)?;
-                let zooid = match (args.zooid, args.brief) {
-                    (Some(name), None) => ZooidRef::Name(name),
-                    (None, Some(brief)) if !brief.trim().is_empty() => ZooidRef::Brief(brief),
-                    _ => return Err(invalid_arguments("give exactly one of zooid and brief")),
-                };
-                let host = args
-                    .host
-                    .as_deref()
-                    .map(super::parse_host)
-                    .transpose()
-                    .map_err(|error| invalid_arguments(format!("{error:#}")))?;
-                let previous = args
-                    .previous
-                    .as_deref()
-                    .map(|run| {
-                        triblespace::prelude::Id::from_hex(run.trim())
-                            .ok_or_else(|| invalid_arguments(format!("invalid run id {run}")))
-                    })
-                    .transpose()?;
-                let requested = self.operations()?.request(&RequestInput {
-                    zooid,
-                    host,
-                    host_label: args.host_label,
-                    provider: provider(args.provider.as_deref())?,
-                    effort: args.effort.unwrap_or_else(|| "high".to_owned()),
-                    spawner: args.spawner,
-                    previous,
-                    handoff: args.handoff,
-                    cover_percent: args.cover_percent,
-                })?;
-                out.line(format!(
-                    "request {:x}: {} on host {}{}; its keeper starts it in {}",
-                    requested.request,
-                    requested.name,
-                    super::host_text(requested.host),
-                    requested
-                        .host_label
-                        .as_deref()
-                        .map(|label| format!(" ({label})"))
-                        .unwrap_or_default(),
-                    requested.unit
-                ))?;
-                if let Some(why) = &requested.unprefixed {
-                    out.line(why)?;
-                }
-                Ok(())
-            }
-            "zooid_requests" => {
-                let args: Requests = decode_arguments(arguments)?;
-                let spawn = self.operations()?;
-                let host = if args.here {
-                    Some(spawn.local_host()?)
-                } else {
-                    None
-                };
-                out.text(render_requests(&spawn.requests(host)?))
             }
             "zooid_list" => {
                 let Empty {} = decode_arguments(arguments)?;

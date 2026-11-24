@@ -12,16 +12,10 @@
 //!   and conclude requests whose identity derives from the conclusion alone.
 //! - **The driver** is triblespace's `CollectionDriver`, stepped by [`settle`].
 //! - **Effectors** act on conclusions. A conclusion is a request, never
-//!   permission; an effector revalidates under its own lock. The ignite
-//!   effector is `Spawn::ignite`, run by `rules tick --effect`: under spawn
-//!   keep's lock it rereads the goal with [`ineligibility`], the quota with
-//!   [`quota_ok`] and the room, then writes an ordinary spawn request and
-//!   keeps it. Each decision is an [`effect_fragment`]. The nudge has no
-//!   effector yet.
-//!
-//! The first two rules replace `ignite.sh` and the ask-jp habit's condition.
-//! Without `--effect` they run in shadow mode: conclusions are published and
-//! nothing acts on them.
+//!   permission; an effector revalidates before acting. There is none here:
+//!   the ignite effector that started a run for a concluded goal was removed
+//!   on 2026-11-24, and the nudge never had one. Conclusions are published
+//!   and nothing acts on them.
 //!
 //! The driver runs whatever the pile's current reading selects. The text in
 //! `src/rules/*.rules` is a seed, published by `rules tick` only when no
@@ -29,8 +23,7 @@
 //!
 //! Requests are tick-free: `run_for(goal)` is one enduring request per goal
 //! (ignite ignites a goal once), and `nudge_after(last asking)` is one
-//! aggregate reminder per quiet period. Neither is fresh at execution time;
-//! the effector revalidates eligibility, quota and observation age.
+//! aggregate reminder per quiet period. Neither is fresh when it is read.
 
 pub mod cli;
 
@@ -52,7 +45,7 @@ use crate::quota::operations::QuotaView;
 use crate::quota::{self, Pace};
 use crate::schemas::quota::PROVIDER_CLAUDE;
 use crate::schemas::rules::{
-    rules, ASK_JP_REVISION, ENVIRONMENT_ANCHOR, IGNITE_REVISION, KIND_EFFECT, KIND_TICK,
+    rules, ASK_JP_REVISION, ENVIRONMENT_ANCHOR, IGNITE_REVISION, KIND_TICK,
 };
 
 pub type IntervalValue = Inline<inlineencodings::NsTAIInterval>;
@@ -93,51 +86,28 @@ pub struct Sensed {
 }
 
 /// Goals `ignite.sh` would consider: todo, tagged `#owner`, none of
-/// [`IGNITE_SKIP`], not ignited before. Ranking is the effector's.
+/// [`IGNITE_SKIP`], not ignited before. Tags are the goal's tag facts only:
+/// words in a title that look like tags are not tags.
 pub fn eligible_goals(states: &[GoalState], owner: &str, ignited: &BTreeSet<Id>) -> Vec<Id> {
     let mut goals: Vec<Id> = states
         .iter()
-        .filter(|state| ineligibility(Some(state), owner, ignited).is_none())
+        .filter(|state| state.status.as_deref() == Some("todo"))
+        .filter(|state| state.tags.iter().any(|tag| tag == owner))
+        .filter(|state| {
+            !state
+                .tags
+                .iter()
+                .any(|tag| IGNITE_SKIP.contains(&tag.as_str()))
+        })
+        .filter(|state| !ignited.contains(&state.goal))
         .map(|state| state.goal)
         .collect();
     goals.sort();
     goals
 }
 
-/// Why a goal is not eligible for ignition, or `None` when it is. The one
-/// predicate behind both the sensor ([`eligible_goals`]) and the effector's
-/// revalidation. Tags are the goal's tag facts only: words in a title that
-/// look like tags are not tags.
-pub fn ineligibility(
-    state: Option<&GoalState>,
-    owner: &str,
-    ignited: &BTreeSet<Id>,
-) -> Option<String> {
-    let Some(state) = state else {
-        return Some("the goal is not on the board".to_owned());
-    };
-    match state.status.as_deref() {
-        Some("todo") => {}
-        Some(status) => return Some(format!("the goal is {status} now, not todo")),
-        None => return Some("the goal has no status".to_owned()),
-    }
-    if !state.tags.iter().any(|tag| tag == owner) {
-        return Some(format!("the goal is not tagged #{owner}"));
-    }
-    if let Some(tag) = state
-        .tags
-        .iter()
-        .find(|tag| IGNITE_SKIP.contains(&tag.as_str()))
-    {
-        return Some(format!("the goal is tagged #{tag}"));
-    }
-    if ignited.contains(&state.goal) {
-        return Some("the goal was ignited before".to_owned());
-    }
-    None
-}
-
-/// The ignited list: one goal id per line, as `ignite.sh` writes it.
+/// The ignited list: one goal id per line, as `ignite.sh` writes it. Read
+/// only: nothing here appends to it.
 /// A missing file is an empty list; a line that is not an id is ignored.
 pub fn read_ignited(path: &std::path::Path) -> Result<BTreeSet<Id>> {
     let text = match std::fs::read_to_string(path) {
@@ -204,26 +174,6 @@ pub fn tick_fragment(at: IntervalValue, sensed: &Sensed) -> Result<Fragment> {
         rules::ask_open*: sensed.ask_open.iter().copied(),
         rules::ask_quiet_since?: quiet,
     })
-}
-
-/// One effector decision about one concluded request: when, what it did or
-/// why it did nothing, and the spawn request it wrote when it launched.
-pub fn effect_fragment(
-    request: Id,
-    at: IntervalValue,
-    reason: &str,
-    spawn_request: Option<Id>,
-) -> Fragment {
-    let mut fragment = Fragment::empty();
-    let reason = fragment.put::<blobencodings::UTF8String, _>(reason.to_owned());
-    fragment += entity! { _ @
-        metadata::tag: &KIND_EFFECT,
-        rules::effect_on: request,
-        metadata::created_at: at,
-        rules::effect_reason: reason,
-        rules::effect_spawn_request?: spawn_request,
-    };
-    fragment
 }
 
 /// Both rule revisions, parsed from their text with the attribute aliases
@@ -408,36 +358,6 @@ mod tests {
                 .next()
                 .is_none()
         );
-    }
-
-    #[test]
-    fn an_effect_names_its_request_its_reason_and_its_spawn_request() {
-        let (request, spawn) = (*genid(), *genid());
-        let at = quota::unix_point(5).unwrap();
-        let launched = effect_fragment(request, at, "launched x", Some(spawn));
-        let found: Vec<(Id, Id)> = find!(
-            (effect: Id, spawn_request: Id),
-            pattern!(launched.facts(), [{ ?effect @
-                metadata::tag: &KIND_EFFECT,
-                rules::effect_on: &request,
-                rules::effect_spawn_request: ?spawn_request,
-            }])
-        )
-        .collect();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1, spawn);
-        let skipped = effect_fragment(request, at, "skipped, stale", None);
-        assert_ne!(
-            skipped.root(),
-            launched.root(),
-            "another decision, another effect"
-        );
-        assert!(find!(
-            s: Id,
-            pattern!(skipped.facts(), [{ _?e @ rules::effect_spawn_request: ?s }])
-        )
-        .next()
-        .is_none());
     }
 
     #[test]

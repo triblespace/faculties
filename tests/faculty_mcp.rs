@@ -354,7 +354,13 @@ fn executable_stdio_exposes_native_faculties_without_opening_the_pile_or_drive()
     ] {
         assert!(names.contains(name), "missing native tool {name}");
     }
-    for removed in ["status_set", "status_list", "status_show"] {
+    for removed in [
+        "status_set",
+        "status_list",
+        "status_show",
+        "zooid_request",
+        "zooid_requests",
+    ] {
         assert!(
             !names.contains(removed),
             "retired tool {removed} is still registered"
