@@ -128,6 +128,7 @@ impl Fixture {
                 model: None,
                 model_unset: None,
                 untinted: None,
+                resumes: None,
                 request: None,
                 cover: None,
             });
