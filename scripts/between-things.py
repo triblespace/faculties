@@ -7,6 +7,7 @@ No foreground wait. Existing flock is passed continuously to the refresher.
 Do not install or evaluate against live paths without separate migration authority.
 """
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -421,9 +422,17 @@ def main(argv=None):
             raise ValueError('predicate PILE is missing')
         pile = os.path.abspath(pile)
         os.environ['PILE'] = pile
-        context = {'version': 3, 'pile': pile, 'fresh': fresh, 'lock_tag': lock_tag}
+        # Readers may reach this file through different symlinks. Scope the
+        # verdict and its refresh lock to the file and the routes decide() uses.
+        pile_stat = os.stat(pile)
+        context = {'version': 4, 'pile': [pile_stat.st_dev, pile_stat.st_ino],
+                   'workspace': os.environ.get('FACULTIES_WORKSPACE'),
+                   'relations': os.environ.get('TRIBLESPACE_COLLECTION_RELATIONS'),
+                   'compass': os.environ.get('TRIBLESPACE_COLLECTION_COMPASS'),
+                   'fresh': fresh, 'cache_secs': cache_secs, 'lock_tag': lock_tag}
+        scope = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
         cache_dir = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'), 'colony-coverage')
-        cache = os.path.join(cache_dir, persona + '.json')
+        cache = os.path.join(cache_dir, scope, persona + '.json')
         producer = Producer(NativeIO(cache, argv), context, cache_secs)
         refresh_fd = arg('--refresh-fd')
         outcome = (refresh_worker(producer, int(refresh_fd), arg('--attempt'))

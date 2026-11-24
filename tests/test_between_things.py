@@ -210,6 +210,43 @@ class PredicateTests(unittest.TestCase):
         code, _, error, spawns = self.invoke(False)
         self.assertEqual((code, error, spawns), (0, "", 0))
 
+    def test_cache_is_shared_only_within_the_same_pile_and_routes(self):
+        Path(self.pile).touch()
+        alias = self.root / "alias"
+        alias.symlink_to(self.pile)
+        other = self.root / "other.pile"
+        other.touch()
+        stores = {}
+
+        def open_cache(path, argv):
+            return stores.setdefault(path, FakeIO())
+
+        def evaluate(pile, **routes):
+            with patch.dict(os.environ, PILE=str(pile), **routes):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    code = self.module.main(["--result-v1", "--persona", "tester"])
+                self.assertEqual(code, 0)
+                return json.loads(out.getvalue())["result"]
+
+        self.module.NativeIO.side_effect = open_cache
+        self.module.real_clock.side_effect = lambda: (1000, 100, "fixture-boot")
+        self.assertEqual(evaluate(alias), "deferred")
+        store, = stores.values()
+        producer = self.module.Producer(store, store.state["context"], 600)
+        producer.finish(store.state["attempt"]["id"], "covered", "fixture")
+        store.child = False
+        published = store.read()
+        self.assertEqual(evaluate(self.pile), "false")
+        self.assertEqual(evaluate(other), "deferred")
+        self.assertEqual(evaluate(alias, FACULTIES_WORKSPACE="1" * 32), "deferred")
+        self.assertEqual(evaluate(alias, FACULTIES_WORKSPACE="2" * 32), "deferred")
+        self.assertEqual(evaluate(alias, TRIBLESPACE_COLLECTION_COMPASS="a" * 64), "deferred")
+        self.assertEqual(evaluate(alias, TRIBLESPACE_COLLECTION_RELATIONS="b" * 64), "deferred")
+        self.assertEqual(evaluate(alias), "false")
+        self.assertEqual(store.read(), published)
+        self.assertEqual(len(stores), 6)
+
     def test_exact_persona_never_calls_status_or_relations(self):
         def command(argv, **kwargs):
             self.assertEqual(Path(argv[0]).name, "compass")
