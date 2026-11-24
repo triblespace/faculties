@@ -152,7 +152,8 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// Select Wiki readings for a task within the recall budget. The cover
+        /// Select Wiki readings for a task, beside the memory budget and at most
+        /// 40,000 characters or half of it. The cover
         /// tag is a ranking prior. An empty topic selects general readings.
         /// Without this argument all cover-tagged personal beliefs render.
         /// Prefer matching recollections when memories cover the same span.

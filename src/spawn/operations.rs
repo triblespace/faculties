@@ -195,8 +195,9 @@ pub trait Renderer: Send + Sync {
     /// Scores the memory cover's recollections against a topic. Its own
     /// step, so a launch can tell a tint that failed from a wake that did.
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint>;
-    /// Render one wake. A task's narrative and selected Wiki readings share
-    /// `memory_chars`; zero measures the fixed sections for cover sizing.
+    /// Render one wake. `memory_chars` is the journal's budget; a task's Wiki
+    /// readings come beside it, in an allowance of their own. Zero measures the
+    /// fixed sections for cover sizing.
     /// A personal wake without a tint carries the complete standing beliefs.
     fn wake(
         &self,
@@ -1638,9 +1639,10 @@ impl Spawn {
     /// The prompt, and how its cover was sized when the launch asked for a
     /// share of the context window. Without one the wake is the plain cover
     /// and nothing is looked up. With one, the target is `percent` of `W`;
-    /// fixed text is measured by a wake with no recall budget. Narrative
-    /// and Wiki share the remaining target, initially receiving at
-    /// least [`cover::MIN_MEMORY_CHARS`]. If the whole prompt is then
+    /// fixed text is measured by a wake with no journal budget. The journal
+    /// gets the remaining target, initially at least
+    /// [`cover::MIN_MEMORY_CHARS`], and a task's Wiki readings their own
+    /// allowance beside it. If the whole prompt is then
     /// estimated above `W` less the headroom, the memory part is rendered
     /// once more aimed at that line, possibly with no memory at all, and the
     /// second render replaces the first. Every figure is an estimate, the
@@ -1663,7 +1665,7 @@ impl Spawn {
                 let delivered = wake(PLAIN_MEMORY_CHARS)?;
                 let summary = format!(
                     "cover {percent}%: no context window is known for {} {} ({why}), so it was \
-                     rendered at the plain size, {PLAIN_MEMORY_CHARS} recall characters; \
+                     rendered at the plain size, {PLAIN_MEMORY_CHARS} journal characters; \
                      --window N gives one",
                     provider.name(),
                     model.unwrap_or("(no model named)")
@@ -1701,6 +1703,12 @@ impl Spawn {
         if estimate > aim {
             let rendered = delivered.chars().count().saturating_sub(fixed);
             let smaller = cover::reduced_budget(rendered, estimate, aim, ratio);
+            // What was rendered over the fixed sections is journal and
+            // readings together; a task's wake has both.
+            let smaller = match tint {
+                Some(_) => cover::journal_budget(smaller),
+                None => smaller,
+            };
             let again = wake(smaller)?;
             let again_prompt = assemble(&again);
             let again_estimate =
@@ -1731,10 +1739,17 @@ impl Spawn {
             estimate = again_estimate;
         }
         let cover_chars = delivered.chars().count();
+        let readings = match tint {
+            Some(_) => format!(
+                " and up to {} for Wiki readings",
+                crate::wiki::recall::readings_allowance(budget)
+            ),
+            None => String::new(),
+        };
         let mut summary = format!(
             "cover {percent}% of a {} token window ({}): target {target} characters at {ratio} \
-             characters per token ({}); fixed wake {fixed} characters, recall budget \
-             {budget}, cover {cover_chars} characters{}; whole prompt estimated at {estimate} \
+             characters per token ({}); fixed wake {fixed} characters, journal budget \
+             {budget}{readings}, cover {cover_chars} characters{}; whole prompt estimated at {estimate} \
              tokens with {overhead} tokens of harness overhead ({overhead_basis})",
             window.tokens,
             window.source,
@@ -6510,7 +6525,9 @@ mod tests {
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.cover_sizing, [cover.summary.clone()]);
         assert!(
-            cover.summary.contains("recall budget 214600"),
+            cover
+                .summary
+                .contains("journal budget 214600 and up to 40000 for Wiki readings"),
             "{}",
             cover.summary
         );
@@ -7052,7 +7069,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tint_recalls_current_wiki_readings_within_the_shared_budget() {
+    fn a_tint_recalls_current_wiki_readings_beside_the_journal() {
         let f = fixture();
         let memory = crate::memory::Memory::with_storage(f.storage.clone());
         for day in 1..=16 {
@@ -7125,9 +7142,16 @@ mod tests {
                     && !text.contains("retired warp")
             );
             assert_eq!(text.matches(curated).count(), 1);
+            // Whatever a brief reads, its journal is the same, byte for byte,
+            // and within the whole budget; the readings have their own.
             let flexible = text.split_once("\nCompass:").unwrap().0;
-            assert!(flexible.chars().count() <= budget);
-            assert!(flexible.contains("Journal day"));
+            let (journal, readings) = flexible.split_once(crate::wiki::recall::HEADING).unwrap();
+            assert_eq!(journal, before.split_once("\nCompass:").unwrap().0);
+            assert!(journal.contains("Journal day"));
+            assert!(journal.chars().count() <= budget);
+            let allowance = crate::wiki::recall::readings_allowance(budget);
+            assert!(readings.chars().count() <= allowance);
+            assert!(text.contains(&format!("of up to {allowance} characters, beside")));
             assert_eq!(text, wake(cue, budget));
             let mut opts = crate::orient::WakePairsOptions::default();
             opts.chars = budget;
@@ -7198,10 +7222,13 @@ mod tests {
         let zero = wake("warp", 0);
         assert!(!zero.contains(curated) && zero.contains("Compass:"));
         assert!(!zero.contains(crate::wiki::recall::HEADING) && !zero.contains("Journal day"));
-        assert!(
-            wake("warp", budget).matches("Journal day").count()
-                < before.matches("Journal day").count()
-        );
+        // A reading too long for the allowance is named, never clipped.
+        let long = wiki
+            .create("Warp manual", &"warp ".repeat(400), &[], false)
+            .unwrap();
+        let text = wake("warp", budget);
+        assert!(!text.contains("Warp manual"));
+        assert!(text.contains("didn't fit the") && text.contains(&format!("{long:x}")));
     }
 
     #[test]

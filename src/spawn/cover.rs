@@ -13,9 +13,9 @@
 
 use std::path::Path;
 
-/// Shared Memory and Wiki characters of a launch without `--cover`, and of one with
-/// `--cover` that found no window: the former 200k wake plus 40k tail,
-/// spent on one tinted render.
+/// The journal's characters in a launch without `--cover`, and in one with
+/// `--cover` that found no window: the former 200k wake plus 40k tail, spent on
+/// one tinted render. Wiki readings have their own allowance beside it.
 pub const PLAIN_MEMORY_CHARS: usize = 240_000;
 
 /// The smallest memory budget the target split gives, however little of
@@ -143,9 +143,10 @@ pub struct CoverRecord {
     /// converted.
     pub calibration: Option<Calibration>,
     pub target_chars: Option<usize>,
-    /// Fixed sections and diagnostics measured with no recall budget.
+    /// Fixed sections and diagnostics measured with no journal budget.
     pub fixed_chars: Option<usize>,
-    /// Character allowance shared by narrative and Wiki in this wake.
+    /// The journal's character budget in this wake. Wiki readings come beside
+    /// it, within `readings_allowance`.
     pub memory_budget: usize,
     /// The delivered wake's characters.
     pub cover_chars: usize,
@@ -196,6 +197,18 @@ pub fn aim_tokens(window: u64) -> u64 {
 pub fn reduced_budget(memory_chars: usize, estimate: u64, aim: u64, chars_per_token: f64) -> usize {
     let excess = (estimate.saturating_sub(aim) as f64 * chars_per_token).ceil() as usize;
     memory_chars.saturating_sub(excess)
+}
+
+/// The journal budget whose cover and Wiki readings together stay within
+/// `chars`. The readings take up to a fixed allowance, or half the journal's
+/// budget in a small wake, so a hard limit has to leave room for both.
+pub fn journal_budget(chars: usize) -> usize {
+    use crate::wiki::recall::READINGS_CHARS;
+    if chars >= 3 * READINGS_CHARS {
+        chars - READINGS_CHARS
+    } else {
+        chars - chars.div_ceil(3)
+    }
 }
 
 /// What claude's `--output-format json` result says. The report is its
@@ -286,6 +299,19 @@ mod tests {
         // An excess larger than the memory part leaves an empty one.
         assert_eq!(reduced_budget(10_000, 200_000, aim, ratio), 0);
         assert_eq!(estimate_tokens(10, 2.0, 100), 105);
+    }
+
+    #[test]
+    fn a_hard_limit_leaves_room_for_the_journal_and_its_readings() {
+        use crate::wiki::recall::readings_allowance;
+        for chars in [
+            0, 1, 2, 3, 100, 119_999, 120_000, 120_001, 240_000, 2_520_000,
+        ] {
+            let journal = journal_budget(chars);
+            let total = journal + readings_allowance(journal);
+            assert!(total <= chars, "{chars}: {total}");
+            assert!(total + 2 >= chars, "{chars}: {total}");
+        }
     }
 
     #[test]

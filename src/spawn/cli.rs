@@ -66,7 +66,8 @@ enum Command {
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
         /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// uses 240,000 characters shared by narrative and Wiki readings.
+        /// uses 240,000 journal characters, and up to 40,000 of Wiki readings
+        /// beside them.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,
         /// The worker model's context window in tokens, before any other
@@ -110,7 +111,8 @@ enum Command {
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
         /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// uses 240,000 characters shared by narrative and Wiki readings.
+        /// uses 240,000 journal characters, and up to 40,000 of Wiki readings
+        /// beside them.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,
         /// The worker model's context window in tokens, before any other

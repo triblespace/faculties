@@ -60,7 +60,7 @@ impl Default for WakeOptions {
 }
 /// A topic for the memory cover: among recollections of exactly the same
 /// span, the one closest to it is chosen (`memory context --about`); the
-/// topic also retrieves current Wiki readings within the cover budget.
+/// topic also retrieves current Wiki readings, in an allowance of their own.
 /// Renderers can reuse this scoring across size estimates for one launch.
 #[derive(Clone, Debug, Default)]
 pub struct WakeTint {
@@ -6303,6 +6303,7 @@ async fn wake_selection(
     let topic = cover_opts.about.as_deref().map(str::trim).filter(|cue| {
         !cue.is_empty() && cover_opts.budget_chars > wiki_model::recall::HEADING.len() * 2
     });
+    let topic_wanted = topic.is_some();
     memory_collection.maintain(storage, signer).await?;
     // A worker can recall its journal in a workspace without a Wiki role.
     // When a role is present its exact READ admission still applies.
@@ -6462,7 +6463,13 @@ async fn wake_selection(
             }
         })
         .await?;
-    cover_opts.budget_chars -= topic.charge;
+    if topic_wanted {
+        diagnostics.push(format!(
+            "Wiki readings: {} of up to {} characters, beside the memory cover's own budget",
+            topic.charge,
+            wiki_model::recall::readings_allowance(cover_opts.budget_chars)
+        ));
+    }
     let mut cover = read(storage, &snapshot, |reader| {
         render_cover_report(&memory_facts, reader, &cover_opts, &mut |_| {
             #[cfg(feature = "wemm")]

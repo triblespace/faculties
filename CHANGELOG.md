@@ -30,8 +30,12 @@ All notable changes to this project will be documented in this file.
   only in the source's etag read as one. A pull which brings nothing new
   writes nothing: the next one asks again from the same cursor.
 
-- Task wakes now share the recall allowance between journal entries and
-  current Wiki readings from the selected workspace. The brief ranks Wiki
+- Task wakes carry current Wiki readings from the selected workspace beside
+  the journal, in an allowance of their own: up to four whole readings within
+  40,000 characters or half the journal's budget, whichever is smaller. The
+  journal is selected from its whole budget, so two briefs carry the same
+  journal. The wake's diagnostics state what the readings cost and which
+  ranked readings didn't fit. The brief ranks Wiki
   bodies using one WeMM encoding shared with the journal. When the model or
   Wiki index is unavailable, lexical BM25 supplies topic evidence. Standing
   and onboarding tags contribute in either case. Each

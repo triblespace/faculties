@@ -32,6 +32,19 @@ pub(crate) const HEADING: &str = "\nWiki (about this topic):\n";
 const MAX_MATCHING_TEXTS: usize = 128;
 const MAX_HEADS: usize = 24;
 const MAX_READINGS: usize = 4;
+
+/// The readings' own allowance, beside the journal's budget and never out of
+/// it: the cover's shares come from its whole budget, so briefs with different
+/// readings carry the same journal. 40,000 characters is a starting choice:
+/// the readings of 14 frozen wakes cost 8,500 to 35,246 (24 Nov 2026). Half the
+/// journal's budget bounds it for small wakes.
+pub(crate) const READINGS_CHARS: usize = 40_000;
+
+/// The characters the readings of a wake whose journal has `budget_chars` may
+/// cost, framing included.
+pub(crate) fn readings_allowance(budget_chars: usize) -> usize {
+    READINGS_CHARS.min(budget_chars / 2)
+}
 pub(crate) const MAX_INDEX_HITS: usize = MAX_MATCHING_TEXTS * MAX_READINGS;
 
 #[derive(Default)]
@@ -51,7 +64,7 @@ impl TopicReadings {
         unreadable: &crate::storage::Unreadable<'_>,
     ) -> Result<Self> {
         let mut selected = Self::default();
-        let allowance = options.budget_chars / 2;
+        let allowance = readings_allowance(options.budget_chars);
         if allowance <= HEADING.len() {
             return Ok(selected);
         }
@@ -148,6 +161,9 @@ impl TopicReadings {
         });
         let mut seen = BTreeSet::new();
         let mut opened = 0;
+        // Whole readings that ranked high enough and didn't fit, so a reader
+        // is told what its allowance left out.
+        let mut dropped: Vec<Id> = Vec::new();
         for (_, bytes, _, revision, bodies) in candidates {
             let left = allowance - selected.charge;
             if bodies.iter().all(|body| seen.contains(body)) {
@@ -157,6 +173,7 @@ impl TopicReadings {
             // size inspect only enough characters to prove the body won't fit.
             if bytes != u64::MAX && bytes > left as u64 {
                 if bytes > (left as u64).saturating_mul(4) {
+                    dropped.push(revision);
                     continue;
                 }
                 if bodies.iter().any(|&body| {
@@ -164,6 +181,7 @@ impl TopicReadings {
                         .get::<View<str>, _>(body)
                         .is_ok_and(|text| text.chars().take(left.saturating_add(1)).count() > left)
                 }) {
+                    dropped.push(revision);
                     continue;
                 }
             }
@@ -202,7 +220,22 @@ impl TopicReadings {
                 if selected.pages.len() == MAX_READINGS {
                     break;
                 }
+            } else {
+                dropped.push(revision);
             }
+        }
+        if !dropped.is_empty() {
+            let named: Vec<String> = dropped
+                .iter()
+                .take(MAX_READINGS)
+                .map(|revision| format!("{revision:x}"))
+                .collect();
+            selected.skipped.push(format!(
+                "Wiki readings: {} ranked revision(s) didn't fit the {allowance} character allowance: {}{}",
+                dropped.len(),
+                named.join(", "),
+                if dropped.len() > named.len() { ", ..." } else { "" }
+            ));
         }
         if more_matches && selected.pages.len() < MAX_READINGS {
             selected.skipped.push(format!(
