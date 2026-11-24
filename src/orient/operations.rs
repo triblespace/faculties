@@ -860,6 +860,26 @@ impl<E: std::error::Error + 'static> std::error::Error for OrientRegistrationErr
     }
 }
 
+/// Diagnostic context for one maintenance step, without erasing its typed
+/// cause: Next has to recognise its own cancellation beneath exactly this.
+#[derive(Debug)]
+struct OrientMaintenanceError {
+    label: &'static str,
+    projection: &'static str,
+    cause: CollectionRealizationError,
+}
+
+impl std::fmt::Display for OrientMaintenanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "maintain {} {}", self.label, self.projection)
+    }
+}
+impl std::error::Error for OrientMaintenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// One Orient input's authored collection and explicit query projections.
 #[derive(Clone, Copy)]
 struct OrientSource {
@@ -933,10 +953,22 @@ impl OrientSource {
     /// no WRITE: the store is opened as this signer, whose MAPs are the ones
     /// believed. A foundation left unattached is read from its own bytes.
     async fn maintain(&self, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<()> {
+        #[cfg(test)]
+        pile.before_orient_maintenance(self.label, "maintain Succinct")?;
         crate::storage::tolerate_own_lag(pile.maintain_attached(self.succinct, signer).await)
-            .with_context(|| format!("maintain {} Succinct collection", self.label))?;
+            .map_err(|cause| OrientMaintenanceError {
+                label: self.label,
+                projection: "Succinct collection",
+                cause,
+            })?;
+        #[cfg(test)]
+        pile.before_orient_maintenance(self.label, "maintain Rank9")?;
         crate::storage::tolerate_own_lag(pile.maintain_attached(self.rank9, signer).await)
-            .with_context(|| format!("maintain {} Rank9 collection", self.label))?;
+            .map_err(|cause| OrientMaintenanceError {
+                label: self.label,
+                projection: "Rank9 collection",
+                cause,
+            })?;
         Ok(())
     }
 
@@ -1274,8 +1306,14 @@ async fn maintain_inputs(
     {
         source.maintain(pile, signer).await?;
     }
+    #[cfg(test)]
+    pile.before_orient_maintenance("Compass status", "maintain register")?;
     crate::storage::tolerate_own_lag(pile.maintain_attached(sources.compass_status, signer).await)
-        .context("maintain Compass status register")?;
+        .map_err(|cause| OrientMaintenanceError {
+            label: "Compass",
+            projection: "status register",
+            cause,
+        })?;
     Ok(())
 }
 

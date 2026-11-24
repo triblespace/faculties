@@ -57,6 +57,11 @@ All notable changes to this project will be documented in this file.
   nothing answered is history there, and `zooid colony` and the viewer's
   Colony no longer list one as waiting.
 
+- An Orient call cancelled while it maintains its collections, before any
+  report, ends as `NextCompletion::CancelledBeforeReport`. It was returned as
+  the maintenance step's error ("exact acquisition cancelled"). A maintenance
+  failure of its own stays an error, and a deadline stays a timeout.
+
 - `orient wake --pairs` marks the recalls that stand in finished pieces of the
   cover with `"sealed": true`, always a leading run. A consumer that keeps a
   prompt prefix can end it there and compare what it kept. A reader that

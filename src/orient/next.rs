@@ -90,6 +90,16 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
             return false;
         };
         error = borrow;
+    } else if let Some(maintenance) = error.downcast_ref::<OrientMaintenanceError>() {
+        // A store operation of this one maintenance step. Its other variants,
+        // and any other source, are failures of the step itself.
+        let CollectionRealizationError::Storage { source, .. } = &maintenance.cause else {
+            return false;
+        };
+        if !source.is::<BorrowError>() {
+            return false;
+        }
+        error = source.as_ref();
     } else if let Some(snapshot) = error.downcast_ref::<WaitSnapshotError>() {
         error = snapshot.0.as_ref();
     } else if let Some(resolution) = error.downcast_ref::<CollectionRealizationError>() {
@@ -614,6 +624,159 @@ mod tests {
         );
         assert_eq!(crate::orient::delivery::exit_code(&deadline), 1);
         assert!(format!("{}", canceled()).starts_with("register Relations Rank9 collection:"));
+    }
+
+    /// A store operation of one maintenance step, as BorrowedStore reports it.
+    fn maintenance_error(cause: anyhow::Error) -> anyhow::Error {
+        type BorrowError = <crate::storage::BorrowedStore as SnapshotSource>::SnapshotError;
+        maintenance_failure(CollectionRealizationError::Storage {
+            operation: "freeze operation control snapshot",
+            source: Box::new(BorrowError::for_classification_test(cause)),
+        })
+    }
+
+    fn maintenance_failure(cause: CollectionRealizationError) -> anyhow::Error {
+        OrientMaintenanceError {
+            label: "Discord",
+            projection: "Rank9 collection",
+            cause,
+        }
+        .into()
+    }
+
+    #[test]
+    fn maintenance_classifier_preserves_variants_context_deadline_and_offered_output() {
+        use AcquiringReadInterrupted::{Cancelled, DeadlineExceeded};
+        let canceled = || maintenance_error(Cancelled.into());
+        assert!(is_cancelled(&canceled()));
+        assert!(!is_deadline(&canceled()));
+        assert_eq!(
+            completion(Err(canceled()), false).unwrap(),
+            NextCompletion::CancelledBeforeReport
+        );
+        assert!(
+            completion(Err(canceled()), true).is_err(),
+            "offered output must not be retired"
+        );
+        let data = triblespace::core::inline::Inline::new([7; 32]);
+        for error in [
+            maintenance_error(anyhow!("unrelated store failure")),
+            maintenance_error(anyhow!("exact acquisition cancelled")),
+            maintenance_error(anyhow::Error::from(Cancelled).context("independent inner failure")),
+            canceled().context("independent outer failure"),
+            // A storage failure this call's own borrow did not report.
+            maintenance_failure(CollectionRealizationError::Storage {
+                operation: "freeze operation control snapshot",
+                source: Box::new(Cancelled),
+            }),
+            // The step's other variants are faults, whatever their diagnosis.
+            maintenance_failure(CollectionRealizationError::resolution_from(
+                "load collection descriptor",
+                Cancelled,
+            )),
+            maintenance_failure(CollectionRealizationError::Derive {
+                input: data,
+                reason: Cancelled.to_string(),
+            }),
+            maintenance_failure(CollectionRealizationError::Merge {
+                inputs: vec![data],
+                reason: Cancelled.to_string(),
+            }),
+            // No permission to peel a bare core realization error either.
+            CollectionRealizationError::Storage {
+                operation: "freeze operation control snapshot",
+                source: Box::new(Cancelled),
+            }
+            .into(),
+        ] {
+            assert!(!is_cancelled(&error), "{error:#}");
+            assert!(completion(Err(error), false).is_err());
+        }
+        let settled =
+            finish_wait_selection::<()>(Err(canceled()), Err(anyhow!("selection failed")))
+                .unwrap_err();
+        assert!(!is_cancelled(&settled), "{settled:#}");
+        // A deadline in maintenance is the call's timeout, never a cancel.
+        let deadline = || maintenance_error(DeadlineExceeded.into());
+        assert!(!is_cancelled(&deadline()));
+        assert!(is_deadline(&deadline()));
+        assert!(completion(Err(deadline()), false).is_err());
+        let (completion, published) = concluded(Err(deadline()));
+        assert_eq!(completion.unwrap(), NextCompletion::Completed);
+        assert_eq!(published, Some(NextKind::Timeout));
+        // A nested selection's deadline beside it stays a failed settlement.
+        let nested = finish_wait_selection::<()>(Err(canceled()), Err(deadline())).unwrap_err();
+        assert!(
+            !is_cancelled(&nested) && !is_deadline(&nested),
+            "{nested:#}"
+        );
+        assert_eq!(
+            format!("{:#}", canceled()),
+            "maintain Discord Rank9 collection: freeze operation control snapshot: \
+             exact acquisition cancelled: exact acquisition cancelled: exact acquisition cancelled"
+        );
+    }
+
+    /// Every store operation of a real maintenance step, interrupted in turn.
+    #[test]
+    fn a_cancel_at_any_store_operation_of_a_maintenance_step_is_a_cancellation() {
+        let fixture = Fixture::new();
+        let sources = fixture
+            .storage
+            .with_store(|store, signer, runtime| {
+                runtime.block_on(OrientSources::open(&fixture.storage, store, signer, true))
+            })
+            .unwrap();
+        let mut operations = std::collections::BTreeSet::new();
+        // The first pass interrupts the step while it still has work to
+        // publish, the second when it finds everything attached.
+        for _ in 0..2 {
+            let mut finished = false;
+            for borrow in 1..200 {
+                let control = AcquiringReadControl::new(None);
+                let (mut store, signer, runtime) = crate::storage::BorrowedStore::open(
+                    fixture.storage.clone(),
+                    control.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+                store.cancel_in = Some(std::sync::atomic::AtomicUsize::new(borrow));
+                let Err(error) = runtime.block_on(sources.relations.maintain(&mut store, &signer))
+                else {
+                    assert!(
+                        control.check().is_ok(),
+                        "a step swallowed its cancellation at borrow {borrow}"
+                    );
+                    finished = true;
+                    break;
+                };
+                let step = error
+                    .downcast_ref::<OrientMaintenanceError>()
+                    .expect("maintenance keeps its typed cause");
+                let CollectionRealizationError::Storage { operation, .. } = &step.cause else {
+                    panic!("{error:#}");
+                };
+                operations.insert(*operation);
+                assert!(is_cancelled(&error), "{error:#}");
+                assert_eq!(
+                    completion(Err(error), false).unwrap(),
+                    NextCompletion::CancelledBeforeReport
+                );
+            }
+            assert!(finished, "maintenance did not finish");
+        }
+        // The two operations a timed cancel was seen to land on, and others.
+        for operation in [
+            "freeze operation control snapshot",
+            "freeze realized root snapshot",
+            "observe attached lineage",
+            "freeze post-attach snapshot",
+        ] {
+            assert!(
+                operations.contains(operation),
+                "{operation}: {operations:?}"
+            );
+        }
     }
 
     #[test]
@@ -1397,7 +1560,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let start = |seconds| {
+        let configured = |seconds| {
             Orient::with_storage(fixture.storage.clone())
                 .begin_next(
                     &fmt_id(quiet_persona),
@@ -1408,30 +1571,52 @@ mod tests {
                     },
                 )
                 .unwrap()
-                .start()
-                .unwrap()
         };
         // The wait's deadline also bounds acquiring its snapshot, and under a
         // loaded whole suite one second was not always enough to acquire
         // (2026-11-12: "exact acquisition deadline exceeded"). Five seconds
         // still exercises a real timeout.
-        let mut second = start(5);
+        let mut second = configured(5).start().unwrap();
         let timeout = second.ready.recv_timeout(Duration::from_secs(30)).unwrap();
         assert_eq!(timeout.kind(), NextKind::Timeout);
         second.acknowledge(timeout).unwrap();
         assert!(second.is_settled());
-        let mut cancelled = start(20);
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(
-            cancelled.cancel_and_join().unwrap(),
-            NextCompletion::CancelledBeforeReport
-        );
-        assert!(cancelled.is_settled());
-        assert_eq!(
-            cancelled.cancel_and_join().unwrap(),
-            NextCompletion::CancelledBeforeReport
-        );
-        assert!(cancelled.poll().is_err());
+        // Cancelled at a named step: the last registration of the opening, and
+        // maintenance, which a 20 ms sleep only ever reached in a release
+        // build (a debug one was still opening its collections).
+        for (label, step) in [
+            ("Discord", "register Rank9"),
+            ("Discord", "maintain Succinct"),
+            ("Discord", "maintain Rank9"),
+            ("Compass status", "maintain register"),
+        ] {
+            let (hook, ready, release) =
+                crate::storage::registration_test::Rendezvous::at(label, step);
+            let mut call = configured(20);
+            call.registration = Some(hook);
+            let mut cancelled = call.start().unwrap();
+            let release = crate::storage::registration_test::Release(Some(release));
+            assert_eq!(
+                ready.recv_timeout(Duration::from_secs(30)).unwrap(),
+                label,
+                "{label} {step}"
+            );
+            cancelled.control.cancel();
+            drop(release); // The hook returns Ok; the real step sees cancellation.
+            for _ in 0..2 {
+                assert_eq!(
+                    cancelled.cancel_and_join().unwrap(),
+                    NextCompletion::CancelledBeforeReport,
+                    "{label} {step}"
+                );
+                assert!(cancelled.is_settled());
+            }
+            assert!(cancelled.poll().is_err());
+            assert!(matches!(
+                cancelled.ready.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
+        }
         assert!(!first.is_settled());
         assert!(!fixture.presented());
         first.acknowledge(report).unwrap();

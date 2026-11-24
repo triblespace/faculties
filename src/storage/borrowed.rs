@@ -25,6 +25,9 @@ pub(crate) trait FacultyAccess:
 
     #[cfg(test)]
     fn before_orient_rank9_registration(&self, _label: &'static str) -> Result<()> { Ok(()) }
+
+    #[cfg(test)]
+    fn before_orient_maintenance(&self, _label: &'static str, _projection: &'static str) -> Result<()> { Ok(()) }
 }
 
 impl FacultyAccess for FacultyStore {
@@ -43,6 +46,10 @@ pub(crate) struct BorrowedStore {
     remote: bool,
     #[cfg(test)]
     pub(crate) registration: Option<registration_test::Rendezvous>,
+    /// Borrows until the call cancels itself, for a deterministic
+    /// interruption at each store operation of one step.
+    #[cfg(test)]
+    pub(crate) cancel_in: Option<std::sync::atomic::AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -71,6 +78,8 @@ impl BorrowedStore {
         Ok((Self { storage, control, prepared, runtime: runtime.clone(), remote,
             #[cfg(test)]
             registration: None,
+            #[cfg(test)]
+            cancel_in: None,
         }, signer, runtime))
     }
 
@@ -83,6 +92,10 @@ impl BorrowedStore {
     }
 
     fn local<T>(&self, operation: impl FnOnce(&mut FacultyStore) -> Result<T>) -> Result<T> {
+        #[cfg(test)]
+        if let Some(left) = &self.cancel_in {
+            if left.fetch_sub(1, Ordering::Relaxed) == 1 { self.control.cancel(); }
+        }
         borrow(&self.storage, &self.control(), |store, _, _| operation(store))
     }
 }
@@ -166,18 +179,27 @@ impl FacultyAccess for BorrowedStore {
 
     #[cfg(test)]
     fn before_orient_rank9_registration(&self, label: &'static str) -> Result<()> {
-        if let Some(hook) = &self.registration { hook.pause(label)?; }
+        if let Some(hook) = &self.registration { hook.pause(label, "register Rank9")?; }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn before_orient_maintenance(&self, label: &'static str, projection: &'static str) -> Result<()> {
+        if let Some(hook) = &self.registration { hook.pause(label, projection)?; }
         Ok(())
     }
 }
 
-/// Per-call equipment for the real descriptor-write path, never a global hook.
+/// Per-call equipment for the real registration and maintenance paths, never a
+/// global hook. A call pauses at one named step, once.
 #[cfg(test)]
 pub(crate) mod registration_test {
     use super::*;
     use std::sync::mpsc::{self, Receiver, Sender};
 
     pub(crate) struct Rendezvous {
+        label: &'static str,
+        step: &'static str,
         entered: Sender<&'static str>,
         release: std::sync::Mutex<Option<Receiver<()>>>,
     }
@@ -191,20 +213,24 @@ pub(crate) mod registration_test {
 
     impl Rendezvous {
         pub(crate) fn new() -> (Self, Receiver<&'static str>, Sender<()>) {
-            let (entered, ready) = mpsc::channel();
-            let (release, go) = mpsc::channel();
-            (Self { entered, release: std::sync::Mutex::new(Some(go)) }, ready, release)
+            Self::at("Relations", "register Rank9")
         }
 
-        pub(super) fn pause(&self, label: &'static str) -> Result<()> {
-            if label != "Relations" { return Ok(()); }
+        pub(crate) fn at(label: &'static str, step: &'static str) -> (Self, Receiver<&'static str>, Sender<()>) {
+            let (entered, ready) = mpsc::channel();
+            let (release, go) = mpsc::channel();
+            (Self { label, step, entered, release: std::sync::Mutex::new(Some(go)) }, ready, release)
+        }
+
+        pub(super) fn pause(&self, label: &'static str, step: &'static str) -> Result<()> {
+            if (label, step) != (self.label, self.step) { return Ok(()); }
             // Neither this mutex nor the Storage owner spans the wait.
             let go = self.release.lock().unwrap().take();
             let Some(go) = go else { return Ok(()); };
-            self.entered.send(label).context("observe Relations Rank9 registration rendezvous")?;
+            self.entered.send(label).context("observe Orient step rendezvous")?;
             go.recv_timeout(Duration::from_secs(10))
-                .context("Relations Rank9 registration rendezvous release")?;
-            // Do not check cancellation here: the real attach/put must observe it.
+                .context("Orient step rendezvous release")?;
+            // Do not check cancellation here: the real store operation must observe it.
             Ok(())
         }
     }
