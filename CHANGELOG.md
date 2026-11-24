@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `memory <id>` with a whole id shows that chunk, also when another chunk
+  carries the id as a historical alias. It was reported as ambiguous.
+
 - The host-addressed run queue is removed, with the automatic dispatch built
   on it. `zooid request`, `zooid requests`, `zooid keep` and `zooid settle
   --request` are gone, and so are the MCP tools `zooid_request` and

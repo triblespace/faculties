@@ -2618,6 +2618,15 @@ fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
     let prefix = normalize_prefix(raw)?;
     let space = &loaded.memory.facts;
 
+    // An exact id names its own chunk, even when another chunk carries it as
+    // a historical alias: there is no longer prefix to ask for.
+    if let Some(chunk_id) = all_chunk_ids(space)
+        .into_iter()
+        .find(|&chunk_id| fmt_id(chunk_id) == prefix)
+    {
+        return Ok(chunk_id);
+    }
+
     // Entity ids and historical aliases are both stable names for one
     // immutable episode. Resolve them into target ids before deciding
     // ambiguity, so an id that is also recorded as its own alias still
@@ -3621,6 +3630,33 @@ mod tests {
             resolve_chunk_id(&loaded, &format!("{alias:x}")[..12]).unwrap(),
             intrinsic
         );
+    }
+
+    /// An exact id names its own chunk, also when another chunk carries that
+    /// id as a historical alias. A shorter prefix of both stays ambiguous.
+    #[test]
+    fn an_exact_id_names_its_own_chunk_before_any_alias() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let draft = || {
+            text_draft(
+                "one text, two chunks",
+                "2026-03-01T00:00:00",
+                "2026-03-01T01:00:00",
+            )
+        };
+        let own = publish_chunk(storage, draft());
+        let mut twin = draft();
+        twin.start_at = point("2026-03-01T00:30:00");
+        twin.aliases.insert(own);
+        let twin = publish_chunk(storage, twin);
+        let loaded = storage.load().unwrap();
+        assert_eq!(resolve_chunk_id(&loaded, &format!("{own:x}")).unwrap(), own);
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{twin:x}")).unwrap(),
+            twin
+        );
+        assert!(resolve_chunk_id(&loaded, &format!("{own:x}")[..31]).is_err());
     }
 
     #[test]
