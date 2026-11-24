@@ -277,6 +277,97 @@ class WorktreeAuditTest(unittest.TestCase):
         finally:
             other.chmod(0o700)
 
+    def test_unreadable_loose_refs_from_linked_worktree(self) -> None:
+        origin = "refs/remotes/origin/"
+        self.git("update-ref", origin + "main", "main")
+        self.git("pack-refs", "--all")
+        tip = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "topic")
+        self.git("update-ref", origin + "lane/topic", tip)
+        linked = self.root / "linked"
+        self.git("worktree", "add", "-q", "--force", str(linked), "main")
+        refs = self.repo / ".git/refs"
+        hidden = refs / "remotes/origin/lane"
+        self.repo = linked  # Audit through the .git file, with shared refs elsewhere.
+        for directory, mode in ((hidden, 0), (refs, 0o111)):
+            directory.chmod(mode)
+            try:
+                if os.access(directory, os.R_OK):
+                    self.skipTest("process can read inaccessible directories")
+                for command in ("report", "due"):
+                    result = self.invoke(command, "--jsonl")
+                    self.assertEqual(result.returncode, 126, result.stdout)
+                    record = json.loads(result.stdout)
+                    self.assertEqual(record["state"], "INDETERMINATE")
+                    self.assertIn(str(directory), record["diagnostic"])
+            finally:
+                directory.chmod(0o700)
+        # Other loose namespaces do not participate in this audit.
+        tags = refs / "tags"
+        tags.mkdir(exist_ok=True)
+        tags.chmod(0)
+        try:
+            report, records = self.json_records()
+        finally:
+            tags.chmod(0o700)
+        self.assertEqual(report.returncode, 0, report.stdout)
+        self.assertIn(origin + "lane/topic", [r["name"] for r in records[0]["lineage"]])
+
+    def test_missing_parent_is_a_read_failure(self) -> None:
+        parent = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "parent")
+        tip = self.git("commit-tree", "main^{tree}", "-p", parent, "-m", "tip")
+        self.git("update-ref", "refs/remotes/origin/topic", tip)
+        (self.repo / ".git/objects" / parent[:2] / parent[2:]).unlink()
+        for command in ("report", "due"):
+            result = self.invoke(command, "--jsonl")
+            self.assertEqual(result.returncode, 126, result.stdout)
+            record = json.loads(result.stdout)
+            self.assertEqual(record["state"], "INDETERMINATE")
+            self.assertIn(parent, record["diagnostic"])
+
+    def test_pruned_upstream_keeps_its_configured_namespace(self) -> None:
+        self.git("remote", "add", "team/up", "unused")
+        upstream = "refs/remotes/team/up/"
+        self.git("update-ref", upstream + "stable", "main")
+        self.git("branch", "--set-upstream-to=team/up/stable", "main")
+        self.git("update-ref", "-d", upstream + "stable")
+        tip = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "topic")
+        self.git("update-ref", "refs/remotes/fork/other", tip)
+        for expected in ([], [upstream + "topic"]):
+            if expected:
+                self.git("update-ref", upstream + "topic", tip)
+            with self.subTest(expected=expected):
+                result, records = self.json_records()
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(records[0]["remote_subject_scope"]["namespace"], "team/up")
+                names = [r["name"] for r in records[0]["lineage"] if r["kind"] == "remote_ref"]
+                self.assertEqual(names, expected)
+                self.assertEqual(self.invoke("due").returncode, 0 if expected else 1)
+
+    def test_nondefault_symbolic_refs_represent_and_witness_tips(self) -> None:
+        origin = "refs/remotes/origin/"
+        self.git("update-ref", origin + "main", "main")
+        tip = self.git("commit-tree", "main^{tree}", "-p", "main", "-m", "topic")
+        self.git("tag", "saved", tip)
+        self.git("symbolic-ref", origin + "a-alias", "refs/tags/saved")
+        self.git("pack-refs", "--all")
+        witnesses = [origin + "a-alias"]
+        for stage in ("tag", "other remote", "direct"):
+            with self.subTest(stage=stage):
+                if stage == "other remote":
+                    self.git("update-ref", "refs/remotes/fork/other", tip)
+                    self.git("symbolic-ref", origin + "a-alias", "refs/remotes/fork/other")
+                    witnesses.append("refs/remotes/fork/other")
+                if stage == "direct":
+                    self.git("update-ref", origin + "topic", tip)
+                    witnesses.append(origin + "topic")
+                result, records = self.json_records()
+                self.assertEqual(result.returncode, 0, result.stdout)
+                rows = [r for r in records[0]["lineage"] if r["kind"] == "remote_ref"]
+                name = origin + ("topic" if stage == "direct" else "a-alias")
+                self.assertEqual([r["name"] for r in rows], [name])
+                self.assertEqual(rows[0]["exact_sha_witnesses"]["refs"], sorted(witnesses))
+                self.assertEqual(self.invoke("due").returncode, 0)
+
     def test_broken_cached_ref_is_indeterminate(self) -> None:
         ref = self.repo / ".git/refs/remotes/origin/topic"
         ref.parent.mkdir(parents=True)

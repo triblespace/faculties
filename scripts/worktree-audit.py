@@ -9,7 +9,7 @@ direct child main checkouts and their registered worktrees; pass nested
 independent clone paths explicitly. This is local evidence, not a definitive
 cross-machine or remote-publication audit. Cached remote-only tips are compared
 within the selected base's refs/remotes/<namespace>/. For a local base use
-its cached upstream or the sole cached namespace. Ambiguous coverage is
+its configured upstream namespace or the sole cached namespace. Ambiguous coverage is
 flagged for review. Exact aliases remain visible as ref witnesses.
 """
 
@@ -113,11 +113,47 @@ class Git:
             )
         return result
 
+    def check_loose_ref_directories(self) -> None:
+        # for-each-ref can silently skip an unreadable directory, even when
+        # other refs from the same namespace are packed and read successfully.
+        raw = self.run("rev-parse", "--path-format=absolute", "--git-common-dir").stdout
+        common = Path(display_bytes(raw.removesuffix(b"\n")))
+
+        root = common / "refs"
+        pending = [(root, frozenset())]
+        while pending:
+            directory, ancestors = pending.pop()
+            info = directory.stat()
+            identity = (info.st_dev, info.st_ino)
+            if identity in ancestors:
+                raise AuditFailure(f"cycle in loose ref directories at {directory}")
+            if not os.access(directory, os.X_OK):
+                raise AuditFailure(f"cannot traverse loose ref directory {directory}")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if directory == root and entry.name not in {"heads", "remotes"}:
+                        continue
+                    if entry.name.startswith(".") or entry.name.endswith(".lock"):
+                        continue
+                    if entry.is_dir():
+                        pending.append((Path(entry.path), ancestors | {identity}))
+
     def refs(self) -> dict[str, dict[str, str | None]]:
+        self.check_loose_ref_directories()
         # A configured name can contain slashes. Prefer its full namespace
         # over the enclosing remote when both are present in the cache.
         names = display_bytes(self.run("remote").stdout).splitlines()
         remotes = sorted(names, key=len, reverse=True)
+
+        def namespace(ref: str) -> str | None:
+            if not ref.startswith("refs/remotes/"):
+                return None
+            path = ref.removeprefix("refs/remotes/")
+            return next(
+                (name for name in remotes if path.startswith(name + "/")),
+                path.partition("/")[0],
+            )
+
         result = self.run(
             "for-each-ref",
             "--format=%(refname)%09%(objectname)%09%(symref)%09%(upstream)",
@@ -135,18 +171,13 @@ class Git:
             ref = display_bytes(fields[0])
             if ref in refs:
                 raise AuditFailure(f"git for-each-ref repeated {ref!r}")
-            remote = None
-            if ref.startswith("refs/remotes/"):
-                path = ref.removeprefix("refs/remotes/")
-                remote = next(
-                    (name for name in remotes if path.startswith(name + "/")),
-                    path.partition("/")[0],
-                )
+            upstream = display_bytes(fields[3])
             refs[ref] = {
                 "sha": fields[1].decode("ascii", "strict"),
                 "symref": display_bytes(fields[2]) if fields[2] else None,
-                "upstream": display_bytes(fields[3]) if fields[3] else None,
-                "remote": remote,
+                "upstream": upstream or None,
+                "upstream_remote": namespace(upstream),
+                "remote": namespace(ref),
             }
         return refs
 
@@ -396,9 +427,8 @@ def remote_subject_scope(
     entry = refs.get(base["resolved_ref"], {})
     if entry.get("remote"):
         return entry["remote"], "selected comparison base"
-    upstream = refs.get(entry.get("upstream"), {})
-    if upstream.get("remote"):
-        return upstream["remote"], "selected base's cached upstream"
+    if entry.get("upstream_remote"):
+        return entry["upstream_remote"], "selected base's configured upstream"
     namespaces = {entry["remote"] for entry in refs.values() if entry["remote"]}
     if len(namespaces) == 1:
         return next(iter(namespaces)), "sole cached remote namespace"
@@ -430,9 +460,15 @@ def make_subjects(
         )
     if remote_namespace is not None:
         represented = {subject["sha"] for subject in subjects}
-        for ref, entry in sorted(refs.items()):
+        # Prefer a direct name when present, but a non-default symbolic
+        # ref may be the only in-scope name for its commit.
+        ordered = sorted(refs, key=lambda ref: (bool(refs[ref]["symref"]), ref))
+        for ref in ordered:
+            entry = refs[ref]
             sha = entry["sha"]
-            if entry["remote"] != remote_namespace or entry["symref"] or sha in represented:
+            if entry["remote"] != remote_namespace or sha in represented:
+                continue
+            if entry["symref"] and ref == f"refs/remotes/{remote_namespace}/HEAD":
                 continue
             subjects.append({"kind": "remote_ref", "name": ref, "sha": sha})
             represented.add(sha)
@@ -481,6 +517,8 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
         sha = subject["sha"]
         if sha not in common_ancestors:
             result = git.run("merge-base", sha, base["sha"], allowed=(0, 1))
+            if result.stderr.strip():
+                raise AuditFailure(f"git merge-base: {display_bytes(result.stderr).strip()}")
             common_ancestors[sha] = (
                 result.stdout.decode("ascii").strip() if result.returncode == 0 else None
             )
