@@ -147,6 +147,156 @@ class WorktreeAuditTest(unittest.TestCase):
         human = self.invoke("report")
         self.assertIn("detached space\\nline", human.stdout)
 
+    def test_remote_only_tips_change_the_normal_report_and_due_result(self) -> None:
+        base = self.git("rev-parse", "main")
+        prefix = "refs/remotes/origin/"
+        self.git("update-ref", prefix + "main", base)
+        self.git("symbolic-ref", prefix + "HEAD", prefix + "main")
+        # Two related branch tips with no local branch or worktree. One forked
+        # before main, the other after. Empty commits preserve the same tree.
+        self.git("commit", "--allow-empty", "-qm", "advance main")
+        self.git("update-ref", prefix + "main", "main")
+        self.git("update-ref", prefix + "landed", base)
+        self.git("checkout", "-q", "--detach", base)
+        self.git("commit", "--allow-empty", "-qm", "first experiment")
+        self.git("update-ref", prefix + "lane/first", "HEAD")
+        self.git("update-ref", prefix + "lane/first-copy", "HEAD")
+        self.git("checkout", "-q", "--detach", "main")
+        self.git("commit", "--allow-empty", "-qm", "second experiment")
+        self.git("update-ref", prefix + "lane/second", "HEAD")
+        self.git("checkout", "-q", "main")
+
+        result, records = self.json_records()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = records[0]
+        self.assertEqual(record["state"], "ATTENTION")
+        rows = {row["name"]: row for row in record["lineage"] if row["kind"] == "remote_ref"}
+        self.assertEqual(set(rows), {prefix + "lane/first", prefix + "lane/second"})
+        self.assertEqual(rows[prefix + "lane/first"]["state"], "diverged")
+        self.assertEqual(rows[prefix + "lane/second"]["state"], "descendant_of_base")
+        self.assertEqual(
+            rows[prefix + "lane/first"]["exact_sha_witnesses"]["refs"],
+            [prefix + "lane/first", prefix + "lane/first-copy"],
+        )
+        self.assertEqual(rows[prefix + "lane/second"]["exact_sha_witnesses"]["worktrees"], [])
+        self.assertEqual(len(record["attention"]), 2)
+        self.assertEqual(record["remote_freshness"]["status"], "not_checked")
+        human = self.invoke("report")
+        self.assertIn("cached remote", human.stdout)
+        self.assertEqual(self.invoke("due").returncode, 0)
+
+        # Same tips on the owning host already have subjects, even with a
+        # different local branch name or only a detached checkout.
+        self.git("branch", "different-name", prefix + "lane/first")
+        clean = self.root / "clean"
+        dirty = self.root / "dirty"
+        for path in (clean, dirty):
+            self.git("worktree", "add", "-q", "--detach", str(path), prefix + "lane/second")
+        (dirty / "untracked").write_text("only here\n")
+        report, records = self.json_records()
+        self.assertEqual(report.returncode, 0, report.stderr)
+        lineage = records[0]["lineage"]
+        self.assertFalse(any(row["kind"] == "remote_ref" for row in lineage))
+        detached = [row for row in lineage if row.get("detached")]
+        self.assertEqual({row["path"] for row in detached}, {str(clean.resolve()), str(dirty.resolve())})
+        for row in detached:
+            self.assertIn(prefix + "lane/second", row["exact_sha_witnesses"]["refs"])
+        custody = {row["path"]: row["dirty"]["dirty"] for row in records[0]["custody"]}
+        self.assertFalse(custody[str(clean.resolve())])
+        self.assertTrue(custody[str(dirty.resolve())])
+
+    def test_other_remotes_and_unrelated_history(self) -> None:
+        base = self.git("rev-parse", "main")
+        self.git("update-ref", "refs/remotes/origin/main", base)
+        tree = self.git("rev-parse", "main^{tree}")
+        orphan = self.git("commit-tree", tree, "-m", "independent root")
+        self.git("update-ref", "refs/remotes/fork/topic", orphan)
+        self.assertEqual(self.invoke("due").returncode, 1)
+        self.git("update-ref", "refs/remotes/origin/topic", orphan)
+        report, records = self.json_records()
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rows = [row for row in records[0]["lineage"] if row["kind"] == "remote_ref"]
+        self.assertEqual([row["name"] for row in rows], ["refs/remotes/origin/topic"])
+        self.assertEqual(rows[0]["state"], "no_observed_merge_base")
+        self.assertEqual(rows[0]["patch_evidence"]["status"], "not_checked")
+        self.assertEqual(self.invoke("due").returncode, 0)
+
+    def test_base_upstream_selects_its_namespace_and_uses_the_observed_sha(self) -> None:
+        self.git("remote", "add", "team", "unused")
+        self.git("remote", "add", "team/fork", "also-unused")
+        base = self.git("rev-parse", "main")
+        prefix = "refs/remotes/team/"
+        self.git("update-ref", prefix + "stable", base)
+        self.git("branch", "--set-upstream-to=team/stable", "main")
+        self.git("commit", "--allow-empty", "-qm", "local commit")
+        self.git("update-ref", prefix + "lane/nested/main", "HEAD")
+        self.git("commit", "--allow-empty", "-qm", "branch advances")
+        self.git("update-ref", prefix + "fork/topic", "HEAD")
+        self.git("update-ref", prefix + "topic", "HEAD")
+        self.git("checkout", "-qb", "topic", base)
+        self.git("branch", "--set-upstream-to=team/topic", "topic")
+        self.git("checkout", "-q", "main")
+        self.git("commit", "--allow-empty", "-qm", "local integration")
+
+        report, records = self.json_records()
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertEqual(records[0]["base"]["ref"], "refs/heads/main")
+        self.assertEqual(records[0]["remote_subject_scope"]["namespace"], "team")
+        self.assertFalse(any(row["kind"] == "remote_ref" for row in records[0]["lineage"]))
+
+        # Relative to the older, explicitly selected cached base, the same
+        # tips are outside it. A same-named tracking branch with a different
+        # SHA does not account for the remote tip.
+        report, records = self.json_records("--base", prefix + "stable")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        rows = [row["name"] for row in records[0]["lineage"] if row["kind"] == "remote_ref"]
+        self.assertEqual(rows, [prefix + "lane/nested/main", prefix + "topic"])
+        self.assertEqual(records[0]["base"]["freshness"], "not_checked")
+
+        report, records = self.json_records("--base", base)
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIsNone(records[0]["remote_subject_scope"]["namespace"])
+        self.assertTrue(any("coverage unresolved" in reason for reason in records[0]["attention"]))
+
+    def test_discovery_permission_error_is_not_quiet_due(self) -> None:
+        other = self.root / "inaccessible"
+        self.git("init", "-q", str(other))
+        other.chmod(0)
+        try:
+            if os.access(other, os.X_OK):
+                self.skipTest("process can traverse mode-000 directories")
+            for command in ("report", "due"):
+                result = subprocess.run(
+                    [str(SCRIPT), command, "--jsonl", "--root", str(self.root)],
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode, 126, result.stderr)
+                record = json.loads(result.stdout)
+                self.assertEqual(record["state"], "INDETERMINATE")
+                self.assertIn(str(other), record["diagnostic"])
+        finally:
+            other.chmod(0o700)
+
+    def test_broken_cached_ref_is_indeterminate(self) -> None:
+        ref = self.repo / ".git/refs/remotes/origin/topic"
+        ref.parent.mkdir(parents=True)
+        for content in ("broken", "1" * 40):
+            with self.subTest(content=content):
+                ref.write_text(content + "\n")
+                report, records = self.json_records()
+                self.assertEqual(report.returncode, 126, report.stderr)
+                self.assertEqual(records[0]["state"], "INDETERMINATE")
+
+    def test_missing_repository_takes_precedence_over_healthy_peer(self) -> None:
+        missing = self.root / "missing"
+        for command in ("report", "due"):
+            result = self.invoke(command, "--jsonl", str(missing))
+            self.assertEqual(result.returncode, 126)
+            missing_record, healthy = map(json.loads, result.stdout.splitlines())
+            self.assertEqual(missing_record["state"], "INDETERMINATE")
+            self.assertIn(str(missing), missing_record["diagnostic"])
+            self.assertEqual(healthy["state"], "QUIET")
+
     def test_origin_head_precedence_is_exact_and_freshness_is_not_checked(self) -> None:
         head = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/remotes/origin/main", head)
@@ -270,7 +420,7 @@ class WorktreeAuditTest(unittest.TestCase):
             "    n=0; [ ! -f \"$counter\" ] || n=$(cat \"$counter\")\n"
             "    n=$((n + 1)); printf '%s' \"$n\" > \"$counter\"\n"
             "    \"$real\" \"$@\"; rc=$?\n"
-            f"    [ \"$n\" -lt 2 ] || printf 'refs/heads/raced\\t{head}\\t\\n'\n"
+            f"    [ \"$n\" -lt 2 ] || printf 'refs/heads/raced\\t{head}\\t\\t\\n'\n"
             "    exit \"$rc\";;\n"
             "esac\n"
             "exec \"$real\" \"$@\"\n"
@@ -328,6 +478,7 @@ class WorktreeAuditTest(unittest.TestCase):
             "cherry",
             "for-each-ref",
             "merge-base",
+            "remote",
             "rev-list",
             "rev-parse",
             "status",
@@ -339,6 +490,8 @@ class WorktreeAuditTest(unittest.TestCase):
                 continue
             self.assertEqual(arguments[0], "-C")
             self.assertIn(arguments[2], allowed)
+            if arguments[2] == "remote":
+                self.assertEqual(arguments[2:], ["remote"])
             if arguments[2] == "worktree":
                 self.assertEqual(arguments[3], "list")
 

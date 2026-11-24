@@ -7,7 +7,10 @@ deliberately incapable of cleanup: its only commands are ``report`` and
 It never fetches or contacts other machines. Default discovery inventories
 direct child main checkouts and their registered worktrees; pass nested
 independent clone paths explicitly. This is local evidence, not a definitive
-cross-machine or remote-publication audit.
+cross-machine or remote-publication audit. Cached remote-only tips are compared
+within the selected base's refs/remotes/<namespace>/. For a local base use
+its cached upstream or the sole cached namespace. Ambiguous coverage is
+flagged for review. Exact aliases remain visible as ref witnesses.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 from typing import Any, Iterable
@@ -30,6 +34,7 @@ READ_ONLY_GIT_COMMANDS = frozenset(
         "cherry",
         "for-each-ref",
         "merge-base",
+        "remote",
         "rev-list",
         "rev-parse",
         "status",
@@ -71,6 +76,7 @@ class Git:
         # A partial clone may otherwise fetch an absent object as a side effect
         # of an apparently read-only ancestry/tree query.
         self.environment["GIT_NO_LAZY_FETCH"] = "1"
+        self.environment["GIT_ALLOW_PROTOCOL"] = ""
         self.environment["GIT_NO_REPLACE_OBJECTS"] = "1"
         self.environment["LC_ALL"] = "C"
 
@@ -86,6 +92,8 @@ class Git:
             raise AssertionError(
                 f"mutating Git worktree command refused: {arguments!r}"
             )
+        if arguments[0] == "remote" and len(arguments) != 1:
+            raise AssertionError(f"only git remote with no arguments is allowed: {arguments!r}")
         location = at if at is not None else self.repository
         try:
             result = subprocess.run(
@@ -106,23 +114,39 @@ class Git:
         return result
 
     def refs(self) -> dict[str, dict[str, str | None]]:
+        # A configured name can contain slashes. Prefer its full namespace
+        # over the enclosing remote when both are present in the cache.
+        names = display_bytes(self.run("remote").stdout).splitlines()
+        remotes = sorted(names, key=len, reverse=True)
         result = self.run(
             "for-each-ref",
-            "--format=%(refname)%09%(objectname)%09%(symref)",
+            "--format=%(refname)%09%(objectname)%09%(symref)%09%(upstream)",
             "refs/heads",
             "refs/remotes",
         )
+        # Git can skip a broken ref with a warning and still return success.
+        if result.stderr.strip():
+            raise AuditFailure(display_bytes(result.stderr).strip())
         refs: dict[str, dict[str, str | None]] = {}
         for raw_line in result.stdout.splitlines():
             fields = raw_line.split(b"\t")
-            if len(fields) != 3 or not fields[0] or not fields[1]:
+            if len(fields) != 4 or not fields[0] or not fields[1]:
                 raise AuditFailure("git for-each-ref returned malformed output")
             ref = display_bytes(fields[0])
             if ref in refs:
                 raise AuditFailure(f"git for-each-ref repeated {ref!r}")
+            remote = None
+            if ref.startswith("refs/remotes/"):
+                path = ref.removeprefix("refs/remotes/")
+                remote = next(
+                    (name for name in remotes if path.startswith(name + "/")),
+                    path.partition("/")[0],
+                )
             refs[ref] = {
                 "sha": fields[1].decode("ascii", "strict"),
                 "symref": display_bytes(fields[2]) if fields[2] else None,
+                "upstream": display_bytes(fields[3]) if fields[3] else None,
+                "remote": remote,
             }
         return refs
 
@@ -208,37 +232,26 @@ def select_base(
             "freshness": "not_checked",
         }
 
-    remote_heads = sorted(
-        ref
-        for ref, entry in refs.items()
-        if ref.startswith("refs/remotes/")
-        and ref.endswith("/HEAD")
-        and entry["symref"] is not None
-        and ref != "refs/remotes/origin/HEAD"
-    )
-    remote_mains = sorted(
-        ref
-        for ref in refs
-        if ref.startswith("refs/remotes/")
-        and ref.endswith("/main")
-        and ref != "refs/remotes/origin/main"
-    )
-    remote_masters = sorted(
-        ref
-        for ref in refs
-        if ref.startswith("refs/remotes/")
-        and ref.endswith("/master")
-        and ref != "refs/remotes/origin/master"
-    )
+    # Only the direct default branch of each remote qualifies. A topic
+    # called e.g. lane/main is ordinary work.
+    def defaults(branch: str) -> list[str]:
+        candidates = (
+            ref
+            for ref, entry in refs.items()
+            if entry["remote"]
+            and ref == f"refs/remotes/{entry['remote']}/{branch}"
+            and (branch != "HEAD" or entry["symref"])
+        )
+        return sorted(candidates, key=lambda ref: (refs[ref]["remote"] != "origin", ref))
+
     precedence = [
-        "refs/remotes/origin/HEAD",
-        *remote_heads,
+        *defaults("HEAD"),
         "refs/remotes/origin/main",
         "refs/heads/main",
-        *remote_mains,
+        *defaults("main"),
         "refs/remotes/origin/master",
         "refs/heads/master",
-        *remote_masters,
+        *defaults("master"),
     ]
     for ref in precedence:
         if ref in refs:
@@ -254,16 +267,15 @@ def select_base(
     )
 
 
-def primary_local_ref(base: dict[str, Any]) -> str | None:
+def primary_local_ref(
+    base: dict[str, Any], refs: dict[str, dict[str, str | None]]
+) -> str | None:
     ref = base.get("resolved_ref") or base["ref"]
     if ref.startswith("refs/heads/"):
         return ref
-    prefix = "refs/remotes/"
-    if ref.startswith(prefix):
-        remote_and_branch = ref[len(prefix) :]
-        _, separator, branch = remote_and_branch.partition("/")
-        if separator:
-            return "refs/heads/" + branch
+    remote = refs.get(ref, {}).get("remote")
+    if remote:
+        return "refs/heads/" + ref.removeprefix(f"refs/remotes/{remote}/")
     return None
 
 
@@ -284,11 +296,6 @@ def dirty_state(git: Git, worktree: dict[str, Any]) -> dict[str, Any]:
         at=Path(worktree["path"]),
     ).stdout
     return {"status": "observed", "dirty": bool(output)}
-
-
-def is_ancestor(git: Git, older: str, newer: str) -> bool:
-    result = git.run("merge-base", "--is-ancestor", older, newer, allowed=(0, 1))
-    return result.returncode == 0
 
 
 def tree_of(git: Git, sha: str) -> str:
@@ -383,8 +390,27 @@ def lineage_state(
     return "diverged"
 
 
+def remote_subject_scope(
+    refs: dict[str, dict[str, str | None]], base: dict[str, Any]
+) -> tuple[str | None, str]:
+    entry = refs.get(base["resolved_ref"], {})
+    if entry.get("remote"):
+        return entry["remote"], "selected comparison base"
+    upstream = refs.get(entry.get("upstream"), {})
+    if upstream.get("remote"):
+        return upstream["remote"], "selected base's cached upstream"
+    namespaces = {entry["remote"] for entry in refs.values() if entry["remote"]}
+    if len(namespaces) == 1:
+        return next(iter(namespaces)), "sole cached remote namespace"
+    if namespaces:
+        return None, "multiple cached remote namespaces; select one with --base refs/remotes/<remote>/<branch>"
+    return None, "no cached remote refs"
+
+
 def make_subjects(
-    refs: dict[str, dict[str, str | None]], worktrees: list[dict[str, Any]]
+    refs: dict[str, dict[str, str | None]],
+    worktrees: list[dict[str, Any]],
+    remote_namespace: str | None,
 ) -> list[dict[str, Any]]:
     subjects: list[dict[str, Any]] = []
     for ref in sorted(name for name in refs if name.startswith("refs/heads/")):
@@ -402,6 +428,14 @@ def make_subjects(
                 "sha": worktree["head"],
             }
         )
+    if remote_namespace is not None:
+        represented = {subject["sha"] for subject in subjects}
+        for ref, entry in sorted(refs.items()):
+            sha = entry["sha"]
+            if entry["remote"] != remote_namespace or entry["symref"] or sha in represented:
+                continue
+            subjects.append({"kind": "remote_ref", "name": ref, "sha": sha})
+            represented.add(sha)
     return subjects
 
 
@@ -418,7 +452,8 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
         observed["dirty"] = dirty_state(git, worktree)
         custody.append(observed)
 
-    subjects = make_subjects(refs_before, worktrees)
+    namespace, scope_reason = remote_subject_scope(refs_before, base)
+    subjects = make_subjects(refs_before, worktrees, namespace)
     all_shas = {subject["sha"] for subject in subjects}
     all_shas.update(entry["sha"] for entry in refs_before.values())
     all_shas.add(base["sha"])
@@ -439,25 +474,37 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
             worktree["path"]
         )
 
-    ancestry_cache: dict[str, tuple[bool, bool]] = {}
+    common_ancestors: dict[str, str | None] = {}
     patch_cache: dict[str, dict[str, Any]] = {}
     lineage: list[dict[str, Any]] = []
     for subject in subjects:
         sha = subject["sha"]
-        if sha not in ancestry_cache:
-            ancestry_cache[sha] = (
-                is_ancestor(git, sha, base["sha"]),
-                is_ancestor(git, base["sha"], sha),
+        if sha not in common_ancestors:
+            result = git.run("merge-base", sha, base["sha"], allowed=(0, 1))
+            common_ancestors[sha] = (
+                result.stdout.decode("ascii").strip() if result.returncode == 0 else None
             )
+        common = common_ancestors[sha]
+        subject_is_ancestor = sha == common
+        base_is_ancestor = base["sha"] == common
+        state = lineage_state(sha, base["sha"], subject_is_ancestor, base_is_ancestor)
+        if subject["kind"] == "remote_ref":
+            if subject_is_ancestor:
+                continue
+            if common is None:
+                state = "no_observed_merge_base"
+                patch_cache[sha] = {
+                    "status": "not_checked",
+                    "reason": "no common ancestor in the available history",
+                    "definitive_landed_disposition": False,
+                    "caveat": PATCH_CAVEAT,
+                }
         if sha not in patch_cache:
             patch_cache[sha] = patch_evidence(git, base["sha"], sha)
-        subject_is_ancestor, base_is_ancestor = ancestry_cache[sha]
         item = dict(subject)
         item.update(
             {
-                "state": lineage_state(
-                    sha, base["sha"], subject_is_ancestor, base_is_ancestor
-                ),
+                "state": state,
                 "subject_is_ancestor_of_base": subject_is_ancestor,
                 "base_is_ancestor_of_subject": base_is_ancestor,
                 "exact_sha_witnesses": {
@@ -489,7 +536,7 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
         if final_sha != base["sha"] or final_ref != base["resolved_ref"]:
             raise AuditRace("explicit base changed during the audit")
 
-    primary = primary_local_ref(base)
+    primary = primary_local_ref(base, refs_before)
     attention: list[str] = []
     for worktree in custody:
         dirty = worktree["dirty"]
@@ -499,7 +546,13 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
             attention.append(f"dirty custody at {worktree['path']!r}")
         if worktree.get("detached"):
             attention.append(f"detached HEAD at {worktree['path']!r}")
+    if namespace is None and any(ref.startswith("refs/remotes/") for ref in refs_before):
+        attention.append(f"cached remote subject coverage unresolved: {scope_reason}")
     for subject in lineage:
+        if subject["kind"] == "remote_ref":
+            attention.append(
+                f"cached remote ref {subject['name']} is {subject['state']} relative to observed base"
+            )
         if subject["kind"] != "local_head":
             continue
         if subject["name"] == primary and subject["sha"] == base["sha"]:
@@ -516,6 +569,7 @@ def audit_repository(repository: Path, explicit_base: str | None) -> dict[str, A
         "repository": repository_name,
         "state": "ATTENTION" if attention else "QUIET",
         "base": base,
+        "remote_subject_scope": {"namespace": namespace, "reason": scope_reason},
         "remote_freshness": {
             "status": "not_checked",
             "reason": "the audit never fetches or contacts a remote",
@@ -535,7 +589,18 @@ def discover_repositories(root: Path, explicit: Iterable[str]) -> list[Path]:
     if supplied:
         return supplied
     root = root.expanduser()
-    if (root / ".git").exists():
+
+    # Path.exists/is_dir may suppress access errors (Python-version dependent).
+    # Only a missing marker means there is no checkout to inspect.
+    def marker_mode(path: Path) -> int:
+        try:
+            return (path / ".git").stat().st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            return 0
+        except OSError as error:
+            raise AuditFailure(f"cannot inspect repository marker: {error}") from error
+
+    if marker_mode(root):
         return [root]
     try:
         children = sorted(root.iterdir(), key=lambda path: os.fsencode(path.name))
@@ -544,7 +609,7 @@ def discover_repositories(root: Path, explicit: Iterable[str]) -> list[Path]:
     # Default workspace discovery intentionally selects main checkouts. Linked
     # worktrees normally carry a .git *file* and are inventoried by their main
     # repository's `git worktree list`, avoiding duplicate audits.
-    repositories = [child for child in children if (child / ".git").is_dir()]
+    repositories = [child for child in children if stat.S_ISDIR(marker_mode(child))]
     if not repositories:
         raise AuditFailure(f"no Git repositories found directly under {root}")
     return repositories
@@ -589,6 +654,8 @@ def emit_human(records: list[dict[str, Any]]) -> None:
                 else ""
             )
         )
+        scope = record["remote_subject_scope"]
+        print(f"  cached remote subjects: {scope['namespace'] or 'none'} ({scope['reason']})")
         print("  remote freshness: NOT CHECKED (this audit never fetches)")
         print("  live-process custody: NOT CHECKED")
         print("  custody:")
