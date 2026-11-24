@@ -143,9 +143,11 @@ pub fn chunk_about_exec_result<P: TriblePattern>(space: &P, id: Id) -> Option<Id
     find!(v: Id, pattern!(space, [{ id @ ctx::about_exec_result: ?v }])).min()
 }
 
-/// Genuine creation/import observations for a chunk. These sit OUTSIDE
-/// intrinsic state -- they are additive provenance, so several may coexist and
-/// that multiplicity is returned rather than arbitrated.
+/// A chunk's recorded times of writing (see
+/// [`crate::memory::ChunkDraft::observed_at`] for what they do and don't say).
+/// These sit OUTSIDE intrinsic state -- they are additive provenance, so
+/// several may coexist and that multiplicity is returned rather than
+/// arbitrated.
 pub fn chunk_observed_at<P: TriblePattern>(space: &P, id: Id) -> Vec<Inline<NsTAIInterval>> {
     find!(v: Inline<NsTAIInterval>, pattern!(space, [{ id @ metadata::created_at: ?v }]))
         .collect::<BTreeSet<_>>()
@@ -599,11 +601,13 @@ fn recollection_class_cost<B: BlobStoreGet, P: TriblePattern>(
 
 /// The first journal observation of each exact-span structural class.
 ///
-/// A range says what period a memory recalls; `created_at` says when that
-/// recollection became available. Historical replay must use the latter or a
-/// summary written today about an old month appears before it existed. Legacy
-/// memories without an observation fall back to their range end, and the count
-/// is returned so the approximation remains visible.
+/// A range says what period a memory recalls; `created_at` says when it was
+/// written, by the author's clock. Historical replay must use the latter or a
+/// summary written today about an old month appears before it existed. It is
+/// not when the memory reached another host, and older memories written over
+/// an explicit range carry that range's end, so those still appear too early.
+/// Memories without an observation fall back to their range end, and the count
+/// is returned so that approximation remains visible.
 fn recollection_class_observations<P: TriblePattern>(
     space: &P,
     raw_spans: &[(i128, i128, Id)],

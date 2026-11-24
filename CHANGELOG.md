@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `memory create <range>`, `memory image` and `memory consolidate` record when
+  they were written as `created_at`; they stamped the span's end. A respan
+  carries its source's `created_at` values and adds none, where it stamped the
+  time of the respan. Ids don't change, and writing the same memory again adds
+  one observation. Records already written stay as they are. `memory meta`
+  shows the value as `written_at`, `triage chunk` as an observation, and
+  `memory churn` replays by it. It is the author's clock: no causal order, and
+  not when another host received the memory.
+
 - Between memories over exactly the same span, the cover shows the longest
   when no `--about` query asks for another. It showed the least id, so a short
   stub could stand in front of the full telling. The length is the charge the

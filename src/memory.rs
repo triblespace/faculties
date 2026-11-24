@@ -72,6 +72,13 @@ pub struct ChunkDraft {
     pub references: BTreeSet<Id>,
     pub about_exec_result: Option<Id>,
     pub about_archive_message: Option<Id>,
+    /// When this was written, as `metadata::created_at` outside the identity
+    /// core: the author's clock, so neither a causal order between memories
+    /// nor when another host received them. Writing the same chunk again adds
+    /// an observation, and the earliest is when it was first told. Chunks
+    /// written with an explicit range before 2026-11-25 may carry their span's
+    /// end here instead, and respans the time of the respan. Those can't be
+    /// told from real times and stay as they are.
     pub observed_at: BTreeSet<IntervalValue>,
     pub aliases: BTreeSet<Id>,
 }

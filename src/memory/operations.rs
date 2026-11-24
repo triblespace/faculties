@@ -258,17 +258,12 @@ impl Memory {
         if summary.is_empty() {
             bail!("memory summary must not be empty");
         }
-        let range = match range {
-            Some(range) => range,
-            None => {
-                let now = clock::now()?;
-                (now - moment(), now)
-            }
-        };
+        let now = clock::now()?;
+        let range = range.unwrap_or((now - moment(), now));
         require_duration(range)?;
         self.with_operation(|storage| {
             let loaded = storage.load()?;
-            let id = create_chunk(storage, &loaded, summary, range, tags, range.1)?;
+            let id = create_chunk(storage, &loaded, summary, range, tags, now)?;
             Ok(CreatedMemory {
                 id,
                 start: range.0,
@@ -279,7 +274,8 @@ impl Memory {
     /// Store exact resident bytes. Presentation validates/derives a view later;
     /// storage does not decode, convert, or relabel the image.
     pub fn image(&self, bytes: &[u8], range: (Epoch, Epoch)) -> Result<CreatedMemory> {
-        let id = self.with_operation(|storage| create_image_chunk(storage, bytes, range))?;
+        let now = clock::now()?;
+        let id = self.with_operation(|storage| create_image_chunk(storage, bytes, range, now))?;
         Ok(CreatedMemory {
             id,
             start: range.0,
@@ -291,7 +287,7 @@ impl Memory {
         self.with_operation(|storage| {
             let loaded = storage.load()?;
             let previous = resolve_chunk_id(&loaded, previous)?;
-            let (fragment, id) = respan_fragment(&loaded, previous, range, clock::now()?)?;
+            let (fragment, id) = respan_fragment(&loaded, previous, range)?;
             storage.publish_memory(fragment)?;
             Ok(RespanReceipt {
                 memory: CreatedMemory {
@@ -1165,11 +1161,15 @@ fn similar(
 /// Every `metadata::tag` of the old chunk is carried forward as it stands; a
 /// historical `ctx::lens` theme becomes a tag of the same name, since the new
 /// chunk has a new core of its own and the lens attribute is no longer written.
+///
+/// Every `metadata::created_at` is carried as it stands too, and none is added:
+/// the text is as old as its source, and the time of the move would make it
+/// look newly written. A source without one gives its respan none, since
+/// nothing here knows when it was written.
 fn respan_fragment(
     loaded: &LoadedMemory,
     old: Id,
     range: (Epoch, Epoch),
-    now: Epoch,
 ) -> Result<(Fragment, Id)> {
     let space = &loaded.memory.facts;
     let reader = &loaded.memory.reader;
@@ -1202,7 +1202,7 @@ fn respan_fragment(
         references: chunk_references(space, old).into_iter().collect(),
         about_exec_result: chunk_about_exec_result(space, old),
         about_archive_message: chunk_about_archive_message(space, old),
-        observed_at: BTreeSet::from([clock::point(now)?]),
+        observed_at: BTreeSet::new(),
         aliases: BTreeSet::new(),
     })?;
     if moved == old {
@@ -1215,6 +1215,8 @@ fn respan_fragment(
     let carried: BTreeSet<Id> =
         find!(tag: Id, pattern!(space, [{ old @ metadata::tag: ?tag }])).collect();
     fragment += entity! { ExclusiveId::force_ref(&moved) @ metadata::tag*: carried.iter() };
+    let written = chunk_observed_at(space, old);
+    fragment += entity! { ExclusiveId::force_ref(&moved) @ metadata::created_at*: written.iter() };
     fragment += memory_model::respan_edge(moved, old);
     Ok((fragment, moved))
 }
@@ -1316,7 +1318,6 @@ fn respan_instants(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>)
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
     let reader = &loaded.memory.reader;
-    let now = clock::now()?;
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     let mut examples = std::collections::BTreeMap::<&str, Vec<String>>::new();
     let mut batch = Fragment::empty();
@@ -1374,7 +1375,7 @@ fn respan_instants(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>)
             ));
         }
         if !dry_run {
-            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            let (fragment, _) = respan_fragment(&loaded, id, range)?;
             batch += fragment;
         }
         planned += 1;
@@ -1412,7 +1413,6 @@ fn respan_instants(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>)
 fn respan_seams(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>) -> Result<()> {
     let loaded = storage.load()?;
     let space = &loaded.memory.facts;
-    let now = clock::now()?;
     let spans = collect_chunk_spans(space);
     let mut starts: Vec<i128> = spans.iter().map(|s| s.0).collect();
     starts.sort_unstable();
@@ -1440,7 +1440,7 @@ fn respan_seams(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>) ->
             format_time_range(range.0, range.1),
         ));
         if !dry_run {
-            let (fragment, _) = respan_fragment(&loaded, id, range, now)?;
+            let (fragment, _) = respan_fragment(&loaded, id, range)?;
             batch += fragment;
         }
     }
@@ -1474,6 +1474,9 @@ fn respan_seams(storage: MemoryStorage<'_>, dry_run: bool, out: &mut Out<'_>) ->
 /// Neither affects the span: temporal containment is the only hierarchy, and
 /// the given range is stored as typed. Chunks carry no persona or author —
 /// the memory belongs to the one being; only cursors are session-scoped.
+/// `observed_at` is the time of writing ([`memory_model::ChunkDraft`]), never
+/// the range's end: the same text over the same range keeps its id and gains
+/// at most one observation per write.
 fn create_chunk(
     storage: MemoryStorage<'_>,
     loaded: &LoadedMemory,
@@ -1530,10 +1533,11 @@ fn create_image_chunk(
     storage: MemoryStorage<'_>,
     bytes: &[u8],
     range: (Epoch, Epoch),
+    observed_at: Epoch,
 ) -> Result<Id> {
     let start_at = clock::point(range.0)?;
     let end_at = clock::point(range.1)?;
-    let observed_at = clock::point(range.1)?;
+    let observed_at = clock::point(observed_at)?;
     let (fragment, chunk_id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
         content: memory_model::ChunkDraftContent::Image(bytes.to_vec()),
         start_at,
@@ -2797,11 +2801,17 @@ impl Memory {
                     fmt_epoch(edge)
                 );
             }
-            // The boundary timestamp is a deterministic observation for
-            // this automatic write, so retrying a half-completed
-            // Memory-then-Comb publication yields the same Memory data.
-            let chunk_id =
-                create_chunk(storage, &loaded.memory, summary, (edge, until), &[], until)?;
+            // Memory is published before Comb, so a retry after only Memory
+            // landed writes the same chunk id again and adds one observation
+            // of this later attempt; readers take the earliest.
+            let chunk_id = create_chunk(
+                storage,
+                &loaded.memory,
+                summary,
+                (edge, until),
+                &[],
+                clock::now()?,
+            )?;
             comb_advance(
                 storage,
                 &loaded,
@@ -3233,12 +3243,11 @@ mod tests {
         assert!(!listed.contains("afternoon"));
 
         // A respan of the legacy chunk: tags carried, the lens not rewritten.
-        let now = parse_tai_timestamp("2026-07-01T00:00:00").unwrap();
         let range = (
             parse_tai_timestamp("2026-05-02T00:00:00").unwrap(),
             parse_tai_timestamp("2026-06-29T00:00:00").unwrap(),
         );
-        let (fragment, moved) = respan_fragment(&loaded, lens, range, now).unwrap();
+        let (fragment, moved) = respan_fragment(&loaded, lens, range).unwrap();
         storage.publish_memory(fragment).unwrap();
         let loaded = storage.load().unwrap();
         assert_eq!(
@@ -3251,6 +3260,146 @@ mod tests {
             .map(|(_, _, id)| id)
             .collect();
         assert_eq!(spans, BTreeSet::from([tagged, moved]));
+    }
+
+    fn written_at(loaded: &LoadedMemory, chunk: Id) -> Vec<Epoch> {
+        chunk_observed_at(&loaded.memory.facts, chunk)
+            .into_iter()
+            .map(epoch_from_interval)
+            .collect()
+    }
+
+    /// `create` with a range, `image` and `consolidate` record when they were
+    /// written, not where their span ends. The time is outside the identity
+    /// core: the id is the one a chunk stamped at its end has, and an exact
+    /// retry adds one observation to it.
+    #[test]
+    fn writers_record_the_time_of_writing_and_keep_the_id() {
+        let pile = TestPile::new();
+        let memory = Memory::with_storage(pile.storage.clone());
+        let range = parse_time_range("2025-04-01T00:00:00..2025-04-02T00:00:00").unwrap();
+        let id_at = |content: memory_model::ChunkDraftContent, (from, to): (Epoch, Epoch)| {
+            let end = clock::point(to).unwrap();
+            let (_, id) = memory_model::chunk_fragment(memory_model::ChunkDraft {
+                content,
+                start_at: clock::point(from).unwrap(),
+                end_at: end,
+                tags: BTreeSet::new(),
+                references: BTreeSet::new(),
+                about_exec_result: None,
+                about_archive_message: None,
+                observed_at: BTreeSet::from([end]),
+                aliases: BTreeSet::new(),
+            })
+            .unwrap();
+            id
+        };
+        let text = |words: &str| memory_model::ChunkDraftContent::Text(words.to_owned());
+
+        let before = clock::now().unwrap();
+        let told = memory.create("an old night", Some(range), &[]).unwrap().id;
+        let seen = memory.image(b"a picture", range).unwrap().id;
+        memory
+            .consolidate_start(
+                "tester",
+                parse_tai_timestamp("2025-04-01T00:00:00").unwrap(),
+            )
+            .unwrap();
+        let combed = memory
+            .consolidate("tester", range.1, "a day, combed")
+            .unwrap()
+            .id;
+        let after = clock::now().unwrap();
+
+        assert_eq!(told, id_at(text("an old night"), range));
+        assert_eq!(
+            seen,
+            id_at(
+                memory_model::ChunkDraftContent::Image(b"a picture".to_vec()),
+                range
+            )
+        );
+        assert_eq!(combed, id_at(text("a day, combed"), range));
+        let loaded = pile.storage().load().unwrap();
+        for id in [told, seen, combed] {
+            let [at] = written_at(&loaded, id)[..] else {
+                panic!("one write, one observation");
+            };
+            assert!(before <= at && at <= after, "{at} is not the writing");
+        }
+
+        let first = written_at(&loaded, told)[0];
+        let chunks = all_chunk_ids(&loaded.memory.facts);
+        assert_eq!(
+            memory.create("an old night", Some(range), &[]).unwrap().id,
+            told
+        );
+        let loaded = pile.storage().load().unwrap();
+        let times = written_at(&loaded, told);
+        assert_eq!(times.len(), 2, "a retry adds its own observation");
+        assert_eq!(all_chunk_ids(&loaded.memory.facts), chunks, "and no chunk");
+        assert_eq!(times.iter().min(), Some(&first), "the earliest stays");
+
+        // A rangeless memory ends at the moment it was written, as before.
+        let now = memory.create("just now", None, &[]).unwrap();
+        let loaded = pile.storage().load().unwrap();
+        assert_eq!(written_at(&loaded, now.id), vec![now.end]);
+    }
+
+    /// A respan is as old as its source: it carries each observation as it
+    /// stands and adds none, so a repeat is byte-identical; a source without
+    /// one gives none.
+    #[test]
+    fn a_respan_carries_the_time_of_writing_and_adds_none() {
+        let pile = TestPile::new();
+        let storage = pile.storage();
+        let mut draft = text_draft("moved", "2025-05-01T00:00:00", "2025-05-02T00:00:00");
+        draft.observed_at =
+            BTreeSet::from([point("2025-05-03T07:00:00"), point("2025-05-04T08:00:00")]);
+        let old = publish_chunk(storage, draft);
+        let mut silent = text_draft("undated", "2025-06-01T00:00:00", "2025-06-02T00:00:00");
+        silent.observed_at.clear();
+        let silent = publish_chunk(storage, silent);
+        let instant = publish_chunk(
+            storage,
+            text_draft("an instant", "2025-07-01T00:00:00", "2025-07-01T00:00:00"),
+        );
+
+        let memory = Memory::with_storage(pile.storage.clone());
+        let range = parse_time_range("2025-05-01T12:00:00..2025-05-02T12:00:00").unwrap();
+        let moved = memory.respan(&format!("{old:x}"), range).unwrap().memory.id;
+        let undated = memory
+            .respan(&format!("{silent:x}"), range)
+            .unwrap()
+            .memory
+            .id;
+        run_text(|out| respan_instants(storage, false, out));
+
+        let loaded = storage.load().unwrap();
+        let facts = &loaded.memory.facts;
+        let expected = text_draft("moved", "2025-05-01T12:00:00", "2025-05-02T12:00:00");
+        assert_eq!(
+            moved,
+            memory_model::chunk_fragment(expected).unwrap().1,
+            "the id is the one any other time of writing gives"
+        );
+        assert_eq!(written_at(&loaded, moved), written_at(&loaded, old));
+        assert_eq!(written_at(&loaded, moved).len(), 2);
+        assert!(written_at(&loaded, undated).is_empty());
+        let lengthened = find!(
+            id: Id,
+            pattern!(facts, [{ ?id @ metadata::supersedes: instant }])
+        )
+        .next()
+        .expect("the instant was respanned");
+        assert_eq!(
+            written_at(&loaded, lengthened),
+            written_at(&loaded, instant)
+        );
+
+        let repeat = || respan_fragment(&loaded, old, range).unwrap();
+        assert_eq!(repeat(), repeat());
+        assert_eq!(repeat().1, moved);
     }
 
     fn text_draft(summary: &str, start: &str, end: &str) -> memory_model::ChunkDraft {
