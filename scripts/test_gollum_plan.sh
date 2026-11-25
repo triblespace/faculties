@@ -1,28 +1,28 @@
 #!/bin/bash
 # test_gollum_plan.sh [WORKDIR] -- gate gollum-plan against the landed
-# `wiki import --plan` CLI, on a synthetic repository and a scratch pile.
+# `knowledge import --plan` CLI, on a synthetic repository and a scratch pile.
 #
 # Every faculty call runs with the whole colony environment removed
 # (TRIBLESPACE_*, FACULTIES_*, PILE, PERSONA) and an absolute --pile/--key
-# inside WORKDIR. WIKI, FILES, BOOTSTRAP and TRIBLE name the binaries
+# inside WORKDIR. KNOWLEDGE, FILES, BOOTSTRAP and TRIBLE name the binaries
 # exercised (default: the ones on PATH); their sha256 is printed.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 W=${1:-$(mktemp -d /tmp/gollum-plan-gate.XXXXXX)}
 mkdir -p "$W"; [ -z "$(ls -A "$W")" ] || { echo "$W is not empty" >&2; exit 1; }
-WIKI=${WIKI:-$(command -v wiki)}; FILES=${FILES:-$(command -v files)}
+KNOWLEDGE=${KNOWLEDGE:-$(command -v knowledge)}; FILES=${FILES:-$(command -v files)}
 BOOTSTRAP=${BOOTSTRAP:-$(command -v bootstrap)}; TRIBLE=${TRIBLE:-$(command -v trible)}
 clean() { env $(env | grep -o '^\(TRIBLESPACE_[A-Z_]*\|FACULTIES_[A-Z_]*\)' | sed 's/^/-u /' | tr '\n' ' ') -u PERSONA -u PILE "$@"; }
 P=$W/pile/test.pile; K=$W/pile/self.key
-w() { clean "$WIKI" --pile "$P" --key "$K" "$@"; }
+w() { clean "$KNOWLEDGE" --pile "$P" --key "$K" "$@"; }
 f() { clean "$FILES" --pile "$P" --key "$K" "$@"; }
 G=$HERE/gollum-plan
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
 echo "workdir $W"
-for b in "$WIKI" "$FILES" "$BOOTSTRAP" "$TRIBLE"; do echo "binary $(readlink -f "$b") $(sha256sum "$(readlink -f "$b")" | cut -c1-64)"; done
-"$WIKI" import --help | grep -q -- --plan || fail "$WIKI has no import --plan"
+for b in "$KNOWLEDGE" "$FILES" "$BOOTSTRAP" "$TRIBLE"; do echo "binary $(readlink -f "$b") $(sha256sum "$(readlink -f "$b")" | cut -c1-64)"; done
+"$KNOWLEDGE" import --help | grep -q -- --plan || fail "$KNOWLEDGE has no import --plan"
 
 TIP=$("$HERE"/gollum-fixture.sh "$W/repo")
 echo "fixture tip $TIP"

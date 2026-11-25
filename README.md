@@ -383,7 +383,7 @@ authority.
 | Export original | `files get ID path` or `files get ID @-` | `files_get {"id":"ID"}` |
 | Import bytes | `files add path` | `files_add {"name":"notes.txt","mime":"text/plain","data":"base64…"}` |
 | Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID","files:HASH"]}` |
-| Render a notebook | `schemas-capture --headless --out-dir captures` | `viewer_capture {"target":"atlas"}` |
+| Render a notebook | `schemas-capture --headless --out-dir captures` | `viewer_capture {"target":"schemas"}` |
 
 MCP resident reads do not imply a fresh external sync. `teams_read` and
 `discord_read` inspect the archive; their `*_pull` tools explicitly contact
@@ -391,7 +391,7 @@ the service, unlike the CLI read commands' sync-first UX. `linkedin_import`
 takes resident connection rows, while `linkedin_pull` fetches a finite DMA
 export before importing. `mail_fetch` explicitly observes configured IMAP
 accounts read-only (EXAMINE, UID SEARCH, `BODY.PEEK[]`; nothing on the server
-is flagged, moved or deleted); `mail_send` requires its existing Decide
+is flagged, moved or deleted); `mail_send` requires its existing Decisions
 authorization and records uncertain delivery.
 
 Some useful capabilities deliberately remain host interfaces:
