@@ -1014,7 +1014,7 @@ mod tests {
                 10,
                 None,
                 crate::archive::Reading {
-                    reader_provider: None,
+                    provider: None,
                     force: false,
                 },
                 &mut crate::out::Out::new(&mut |part| {

@@ -12,7 +12,7 @@ use crate::archive_source::{
     canonical_dynamic_json, canonical_json_string, json_document, json_elements, json_members,
     json_number, json_str, owned_text, JsonNumber, SourcePart, SourceRecord, ToolLink,
 };
-use crate::schemas::blockdag::content_fact::{direction, modality};
+use crate::schemas::blockdag::content_fact::{direction as directions, modality as modalities};
 
 use super::ProjectionSummary;
 
@@ -270,7 +270,7 @@ impl Scanner {
                 self.record(
                     owned_text("assistant"),
                     &parts,
-                    direction::OUT,
+                    directions::OUT,
                     None,
                     summary,
                 )?;
@@ -299,7 +299,7 @@ impl Scanner {
             self.record(
                 role,
                 &elements(&message.wire, "content")?,
-                direction::IN,
+                directions::IN,
                 tool.as_ref(),
                 summary,
             )?;
@@ -309,8 +309,8 @@ impl Scanner {
             if let Some(catalog) = &input.catalog {
                 let mut record = self.next_record(owned_text("tool_catalog"));
                 record.parts.push(SourcePart::text(
-                    modality::EVENT,
-                    direction::IN,
+                    modalities::EVENT,
+                    directions::IN,
                     catalog.clone(),
                 ));
                 self.records.push(record);
@@ -418,7 +418,7 @@ fn discarded_stream(entry: &Bytes) -> Result<Option<(View<str>, String, Vec<Sour
     let (action, modality, texts) = match &*string(entry, "type")? {
         "message" if id.starts_with("assistant-") => (
             id.trim_start_matches("assistant-"),
-            modality::TEXT,
+            modalities::TEXT,
             elements(entry, "content")?
                 .iter()
                 .filter_map(|part| field(part, "text").as_ref().and_then(json_str))
@@ -426,7 +426,7 @@ fn discarded_stream(entry: &Bytes) -> Result<Option<(View<str>, String, Vec<Sour
         ),
         "reasoning" if id.starts_with("reasoning-") && id.ends_with("-0") => (
             &id["reasoning-".len()..id.len() - 2],
-            modality::THINKING,
+            modalities::THINKING,
             vec![string(entry, "text")?],
         ),
         _ => return Ok(None),
@@ -434,7 +434,7 @@ fn discarded_stream(entry: &Bytes) -> Result<Option<(View<str>, String, Vec<Sour
     let parts: Vec<_> = texts
         .into_iter()
         .filter(|text| !text.is_empty())
-        .map(|text| SourcePart::text(modality, direction::OUT, text))
+        .map(|text| SourcePart::text(modality, directions::OUT, text))
         .collect();
     let action = action.to_owned();
     Ok((!parts.is_empty()).then_some((id, action, parts)))
@@ -497,19 +497,19 @@ fn append_part(
     match &*kind {
         "text" => {
             let modality = if tool.is_some() {
-                modality::TOOL_RESULT
+                modalities::TOOL_RESULT
             } else {
-                modality::TEXT
+                modalities::TEXT
             };
             record
                 .parts
                 .push(SourcePart::text(modality, direction, string(part, "text")?));
         }
-        "tool_call" if direction == direction::OUT => {
+        "tool_call" if direction == directions::OUT => {
             let (id, value) = tool_call(part)?;
             record.links.push((start, ToolLink::Call(id)));
             record.parts.push(SourcePart::text(
-                modality::TOOL_CALL,
+                modalities::TOOL_CALL,
                 direction,
                 owned_text(value),
             ));
@@ -518,7 +518,7 @@ fn append_part(
             for content in elements(part, "content")? {
                 match &*string(&content, "type")? {
                     "text" | "summary" => record.parts.push(SourcePart::text(
-                        modality::THINKING,
+                        modalities::THINKING,
                         direction,
                         string(&content, "text")?,
                     )),
@@ -530,7 +530,7 @@ fn append_part(
                             crate::archive_source::SealedAlphabet::Standard,
                         );
                         record.parts.push(SourcePart::Blob {
-                            modality: modality::THINKING,
+                            modality: modalities::THINKING,
                             direction,
                             bytes: Bytes::from_source(bytes),
                             media_type: owned_text(media_type),
@@ -544,9 +544,9 @@ fn append_part(
             let data = string(part, "data")?;
             let media_type = string(part, "mime_type").or_else(|_| string(part, "mimeType"))?;
             let modality = if &*kind == "image" {
-                modality::IMAGE
+                modalities::IMAGE
             } else {
-                modality::AUDIO
+                modalities::AUDIO
             };
             record.parts.push(SourcePart::Blob {
                 modality,

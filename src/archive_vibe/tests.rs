@@ -214,7 +214,7 @@ fn project(path: &Path) -> (ProjectionSummary, Fragment) {
 }
 
 fn nodes(fragment: &Fragment) -> BTreeSet<Id> {
-    find!(node: Id, pattern!(fragment, [{ ?node @ block::content: _?fact }])).collect()
+    find!(node: Id, pattern!(fragment, [{ ?node @ block::holds: _?fact }])).collect()
 }
 
 #[test]
@@ -259,13 +259,13 @@ fn native_prefix_and_export_converge_across_journal_rotation() {
     assert_eq!(copied.facts(), project(&exported).1.facts());
 
     let replies: Vec<Id> = find!(response: Id, pattern!(&copied, [{
-        ?response @ block::responds_to: ?call, block::content: ?result_fact
+        ?response @ block::responds_to: _?call, block::holds: _?result_fact
     }, {
-        ?call @ block::content: ?call_fact
+        _?call @ block::holds: _?call_fact
     }, {
-        ?call_fact @ content_fact::modality: content_fact::modality::TOOL_CALL
+        _?call_fact @ content_fact::modality: content_fact::modality::TOOL_CALL
     }, {
-        ?result_fact @ content_fact::modality: content_fact::modality::TOOL_RESULT
+        _?result_fact @ content_fact::modality: content_fact::modality::TOOL_RESULT
     }]))
     .collect();
     assert_eq!(replies.len(), 1);
@@ -357,7 +357,7 @@ fn catalog_definitions_are_delivered_once_per_change() {
     assert!(exists!(pattern!(&facts, [{
         _?fact @ content_fact::modality: content_fact::modality::EVENT,
         content_fact::direction: content_fact::direction::IN,
-        content_fact::text: r#"{"tool_catalog":[{"description":"Find synthetic text","name":"lookup","parameters":{"type":"object"}}]}"#,
+        content_fact::payload: r#"{"tool_catalog":[{"description":"Find synthetic text","name":"lookup","parameters":{"type":"object"}}]}"#,
     }])));
 }
 

@@ -1225,6 +1225,7 @@ mod tests {
                 raw_author: Some("human".into()),
                 raw_role: Some("user".into()),
                 raw_model: Some("model-v1".into()),
+                raw_outcome: None,
                 generated_by: vec![id(11)],
                 source_locator: Some("conversation/7".into()),
                 source_detail: Some(r#"{"agentType":"general-purpose"}"#.into()),
