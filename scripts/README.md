@@ -77,6 +77,10 @@ it keeps
   configuration names a generation by path, which nothing else can see; remove
   it when that moves on.
 
+This is what is running and loaded at that moment, no more. A unit file nothing
+has loaded (systemd drops a stopped static unit) and a start after the check do
+not show; `.keep` is for those.
+
 If the holders cannot be read at all, everything is kept. What stays unseen are
 the working directory and environment of processes of other users; on Linux the
 files they run or have open are still asked of the kernel, on macOS they are
