@@ -1805,7 +1805,7 @@ impl Spawn {
                 AgentLine {
                     argv,
                     // agy reads everything from $HOME/.gemini, always: the
-                    // zooid's own home, never Agy's.
+                    // zooid's own home, never the host's.
                     env: vec![
                         ("HOME".to_owned(), text(&files.agy_home)),
                         (

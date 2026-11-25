@@ -6,8 +6,8 @@
 //! into the zooid's working tree. So an agy zooid runs with a home of its
 //! own ([`prepare_home`]): spawn writes its `.gemini/config`, links the
 //! login, and links every other entry of the real home, so `~` still finds
-//! the zooid's tools. Agy's own `~/.gemini` (her rules, her server, her
-//! conversations) is never read or written by a zooid.
+//! the zooid's tools. The host's own `~/.gemini` (the rules, MCP server and
+//! conversations of an interactive agy there) is never read or written by a zooid.
 //!
 //! There is no summarising. agy compacts a conversation at a token
 //! threshold that cannot be switched off; spawn sets it to the whole window
@@ -33,9 +33,9 @@ pub const DEFAULT_WINDOW: u64 = 512_000;
 pub const REPORT_RESERVE: u64 = 32_000;
 
 /// The step growth assumed until a conversation has shown one of its own.
-/// Measured in Agy's first hour on sky (25 Nov 2026): one step of nine
-/// file reads grew her context from 80,759 to 190,561 tokens, 109,802, the
-/// largest growth between her twelve calls.
+/// Measured in the first hour of an interactive agy session (25 Nov 2026):
+/// one step of nine file reads grew its context from 80,759 to 190,561
+/// tokens, 109,802, the largest growth between its twelve calls.
 pub const GROWTH_FLOOR: u64 = 109_802;
 
 /// The home directory's entry an agy zooid gets its own copy of.
@@ -518,7 +518,7 @@ mod tests {
         )
     }
 
-    /// The twelve calls of Agy's first hour (input, cache read, output).
+    /// The twelve calls of that first hour (input, cache read, output).
     const FIRST_HOUR: [(u64, u64, u64, u64); 12] = [
         (1, 11992, 0, 613),
         (5, 3706, 9935, 166),
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(life.limit, 370_198);
         assert_eq!(life.occupancy, 347_270);
         assert!(!life.over);
-        // One more step as large as her largest, and the life is over.
+        // One more step as large as its largest, and the life is over.
         let mut more = calls.clone();
         more.push(Call {
             step: 70,
@@ -756,7 +756,7 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(real.join(".local/bin")).unwrap();
         std::fs::create_dir_all(real.join(".gemini/config")).unwrap();
-        std::fs::write(real.join(".gemini/GEMINI.md"), "Agy's rules").unwrap();
+        std::fs::write(real.join(".gemini/GEMINI.md"), "the host's own rules").unwrap();
         std::fs::write(real.join(".gitconfig"), "[user]").unwrap();
         std::fs::write(state.join("other.prompt"), "x").unwrap();
         let token = real.join("token");
@@ -783,10 +783,10 @@ mod tests {
             std::fs::read_to_string(home.join(".gemini/config/mcp_config.json")).unwrap(),
             "{\"mcp\":1}"
         );
-        // Agy's own files were not touched.
+        // The host's own agy files were not touched.
         assert_eq!(
             std::fs::read_to_string(real.join(".gemini/GEMINI.md")).unwrap(),
-            "Agy's rules"
+            "the host's own rules"
         );
         assert!(!real.join(".gemini/config/mcp_config.json").exists());
         // A missing login refuses.
