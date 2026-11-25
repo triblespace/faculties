@@ -17,10 +17,10 @@ pub(super) fn project_path(
     mut emit: impl FnMut(Fragment, Identity, &Path) -> Result<()>,
 ) -> Result<ImportSummary> {
     match source {
-        ImportSource::Agy => {
-            archive_agy::project_path(path, |p| emit(p.fragment, p.identity, &p.source_path))
-                .map(ImportSummary::Agy)
-        }
+        ImportSource::Agy => archive_agy::project_path_finished(path, finished_before, |p| {
+            emit(p.fragment, p.identity, &p.source_path)
+        })
+        .map(ImportSummary::Agy),
         ImportSource::ChatGpt => {
             archive_chatgpt::project_path(path, |p| emit(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::ChatGpt)

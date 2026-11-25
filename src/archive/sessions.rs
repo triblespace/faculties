@@ -12,6 +12,7 @@
 //! Node identity is structural, so the next import converges with this one and
 //! only appends. Quiet age decides only when a held-back tail is flushed.
 use super::{Archive, ImportReceipt, ImportSource};
+use crate::archive_agy::{BRAIN_PATH, TRANSCRIPT_PATH};
 use crate::archive_collection::ArchiveImportWriter;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -28,12 +29,20 @@ use triblespace::core::collection::{
 pub enum SessionSource {
     ClaudeCode,
     Codex,
+    Agy,
+    AgyZooids,
+}
+impl SessionSource {
+    fn is_agy(self) -> bool {
+        matches!(self, Self::Agy | Self::AgyZooids)
+    }
 }
 impl From<SessionSource> for ImportSource {
     fn from(source: SessionSource) -> Self {
         match source {
             SessionSource::ClaudeCode => Self::ClaudeCode,
             SessionSource::Codex => Self::Codex,
+            SessionSource::Agy | SessionSource::AgyZooids => Self::Agy,
         }
     }
 }
@@ -98,9 +107,9 @@ impl std::fmt::Display for SessionBusy {
 }
 impl std::error::Error for SessionBusy {}
 
-/// Conventional local roots, including archived Codex rollouts. Missing optional
-/// directories are absent from the selection; a newly appearing root therefore
-/// requires an explicit baseline rather than inheriting another selection's progress.
+/// Conventional local roots, including archived Codex rollouts and Agy's
+/// window and zooid transcripts. Missing optional directories are absent
+/// from the selection. Newly appearing Agy roots get their own first pass.
 pub fn default_roots(home: &Path, codex_home: Option<&Path>) -> Result<Vec<SessionRoot>> {
     let mut roots = Vec::new();
     let mut add = |source, path: PathBuf| -> Result<()> {
@@ -112,6 +121,11 @@ pub fn default_roots(home: &Path, codex_home: Option<&Path>) -> Result<Vec<Sessi
         Ok(())
     };
     add(SessionSource::ClaudeCode, home.join(".claude/projects"))?;
+    add(SessionSource::Agy, home.join(BRAIN_PATH))?;
+    add(
+        SessionSource::AgyZooids,
+        crate::spawn::LaunchConfig::under_home(home).state_dir,
+    )?;
     for entry in fs::read_dir(home).with_context(|| format!("enumerate home {:?}", home))? {
         let entry = entry.with_context(|| format!("enumerate home {:?}", home))?;
         if entry.file_name().as_encoded_bytes().starts_with(b".codex") {
@@ -220,6 +234,28 @@ struct Binding {
     collection: String,
     roots: Vec<(SessionSource, BoundPath)>,
 }
+impl Binding {
+    /// A newly bound Agy source starts without applying the old cutoff to it.
+    /// All previously bound roots must still match, including their identity.
+    fn added_agy_sources(&self, next: &Self) -> Option<Vec<SessionSource>> {
+        let mut existing = self.roots.iter().peekable();
+        let mut added = Vec::new();
+        for root in &next.roots {
+            if existing.next_if(|old| *old == root).is_some() {
+                continue;
+            }
+            let source = root.0;
+            if !source.is_agy()
+                || added.contains(&source)
+                || self.roots.iter().any(|old| old.0 == source)
+            {
+                return None;
+            }
+            added.push(source);
+        }
+        existing.peek().is_none().then_some(added)
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
     binding: Binding,
@@ -321,6 +357,15 @@ struct Candidate {
     sidecar: Option<Observation>,
 }
 impl Candidate {
+    fn observe(path: PathBuf, source: SessionSource) -> Result<Self> {
+        Ok(Self {
+            source,
+            observed: observe_file(&path)?,
+            sidecar: sidecar(&path, source)?,
+            path,
+        })
+    }
+
     fn modified(&self) -> SystemTime {
         self.sidecar.as_ref().map_or(self.observed.modified, |s| {
             s.modified.max(self.observed.modified)
@@ -344,11 +389,66 @@ impl Candidate {
         Ok(())
     }
 }
+
+fn discover_agy(root: &Path, source: SessionSource, files: &mut Vec<Candidate>) -> Result<()> {
+    for entry in fs::read_dir(root).with_context(|| format!("read directory {:?}", root))? {
+        let entry = entry.with_context(|| format!("enumerate {:?}", root))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join(TRANSCRIPT_PATH);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                no_symlink_components(&path)?;
+                files.push(Candidate::observe(path, source)?);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).with_context(|| format!("stat {:?}", path)),
+        }
+    }
+    Ok(())
+}
+
+fn discover_agy_zooids(root: &SessionRoot, files: &mut Vec<Candidate>) -> Result<()> {
+    for entry in
+        fs::read_dir(&root.path).with_context(|| format!("read directory {:?}", root.path))?
+    {
+        let entry = entry.with_context(|| format!("enumerate {:?}", root.path))?;
+        if Path::new(&entry.file_name())
+            .extension()
+            .is_none_or(|ext| ext != "agy")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let brain = entry.path().join(BRAIN_PATH);
+        match fs::symlink_metadata(&brain) {
+            Ok(_) => {
+                no_symlink_components(&brain)?;
+                discover_agy(&brain, root.source, files)?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e).with_context(|| format!("stat {:?}", brain)),
+        }
+    }
+    Ok(())
+}
+
 fn discover(roots: &[SessionRoot]) -> Result<(Vec<Candidate>, usize)> {
     // This is a transient file list for one observation, never a retained catalogue.
     let mut files = Vec::new();
     let mut other = 0;
     for root in roots {
+        if root.source.is_agy() {
+            let start = files.len();
+            if root.source == SessionSource::AgyZooids {
+                discover_agy_zooids(root, &mut files)?;
+            } else {
+                discover_agy(&root.path, root.source, &mut files)?;
+            }
+            files[start..].sort_by(|a, b| a.path.cmp(&b.path));
+            continue;
+        }
         let mut pending = vec![root.path.clone()];
         while let Some(path) = pending.pop() {
             let metadata =
@@ -363,14 +463,7 @@ fn discover(roots: &[SessionRoot]) -> Result<(Vec<Candidate>, usize)> {
                 pending.extend(children.into_iter().rev());
             } else if metadata.is_file() {
                 if path.extension().is_some_and(|e| e == "jsonl") {
-                    let observed = observe_file(&path)?;
-                    let annotations = sidecar(&path, root.source)?;
-                    files.push(Candidate {
-                        source: root.source,
-                        path,
-                        observed,
-                        sidecar: annotations,
-                    });
+                    files.push(Candidate::observe(path, root.source)?);
                 } else {
                     other += 1;
                 }
@@ -461,25 +554,29 @@ impl Archive {
             let collection = hex::encode(writer.collection_handle().raw);
             let binding = Binding { pile: pile_binding, collection: collection.clone(), roots: root_binding };
             let mut rebound = false;
-            let since = match options.start {
-                SessionStart::All => None,
-                SessionStart::Since(time) => Some(time),
+            let (since, added_agy) = match options.start {
+                SessionStart::All => (None, Vec::new()),
+                SessionStart::Since(time) => (Some(time), Vec::new()),
                 SessionStart::Incremental => {
                     let previous = previous.as_ref().expect("checked checkpoint");
-                    if previous.binding != binding {
-                        // A compaction swap puts a new file at the same path. The
-                        // progress still holds if that file holds what it published.
-                        let same_place = previous.binding.pile.name == binding.pile.name
-                            && previous.binding.collection == binding.collection
-                            && previous.binding.roots == binding.roots;
+                    if previous.binding.pile.name != binding.pile.name
+                        || previous.binding.collection != binding.collection
+                    {
+                        bail!("session destination or roots changed; choose --all or --since explicitly");
+                    }
+                    let added_agy = previous.binding.added_agy_sources(&binding).ok_or_else(|| {
+                        anyhow!("session destination or roots changed; choose --all or --since explicitly")
+                    })?;
+                    if previous.binding.pile.identity != binding.pile.identity {
+                        // A compacted pile must still hold the last publication.
                         let held = match &previous.last {
-                            Some(last) if same_place => last.held_by(&start, writer.collection_handle())?,
-                            _ => false,
+                            Some(last) => last.held_by(&start, writer.collection_handle())?,
+                            None => false,
                         };
                         if !held { bail!("session destination or roots changed; choose --all or --since explicitly"); }
                         rebound = true;
                     }
-                    Some(previous.through)
+                    (Some(previous.through), added_agy)
                 }
             };
             if since.is_some_and(|time| time > cutoff) { bail!("session lower bound is after eligibility cutoff (clock moved backwards or --since is too recent)"); }
@@ -492,7 +589,12 @@ impl Archive {
             for file in &files {
                 // Inclusive lower edge intentionally rechecks the prior boundary.
                 // A file live in the previous pass is at or after it by definition.
-                if since.is_some_and(|time| file.modified() < time) { report.unchanged += 1; continue; }
+                let lower_bound = if added_agy.contains(&file.source) {
+                    None
+                } else {
+                    since
+                };
+                if lower_bound.is_some_and(|time| file.modified() < time) { report.unchanged += 1; continue; }
                 let live = file.modified() >= cutoff;
                 let result = (|| {
                     if live { event(SessionEvent::Live(&file.path))?; }
@@ -568,6 +670,9 @@ mod tests {
         "{\"timestamp\":\"2026-08-16T08:01:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"synthetic session\"}}\n"
     );
     const CLAUDE: &str = "{\"type\":\"user\",\"sessionId\":\"synthetic\",\"uuid\":\"first\",\"message\":{\"role\":\"user\",\"content\":\"synthetic Claude\"}}\n";
+    const AGY: &str =
+        "{\"source\":\"USER_INPUT\",\"content\":\"synthetic Agy\",\"step_index\":1}\n";
+    const AGY_SESSION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000001";
     fn time(seconds: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(seconds)
     }
@@ -652,6 +757,185 @@ mod tests {
         f.options.now = time(14000);
         let next = f.run().unwrap();
         assert_eq!((next.imported, next.live, next.unchanged), (1, 0, 1));
+    }
+
+    #[test]
+    fn old_checkpoint_imports_older_agy_history_and_keeps_other_roots_progress() {
+        let mut f = Fixture::new();
+        let home = f.directory.path().join("home");
+        fs::create_dir_all(home.join(".codex/sessions")).unwrap();
+        fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        f.options.roots = default_roots(&home, None).unwrap();
+        assert_eq!(f.options.roots.len(), 2);
+        f.file("original.jsonl", CLAUDE, 1000);
+        fs::write(home.join(".codex/sessions/rollout.jsonl"), CODEX).unwrap();
+        File::open(home.join(".codex/sessions/rollout.jsonl"))
+            .unwrap()
+            .set_modified(time(1000))
+            .unwrap();
+        assert_eq!(f.run().unwrap().imported, 2);
+        let before = f.facts();
+
+        let brain = home.join(BRAIN_PATH);
+        let full = brain.join(AGY_SESSION).join(TRANSCRIPT_PATH);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(&full, AGY).unwrap();
+        File::open(&full).unwrap().set_modified(time(1000)).unwrap();
+        for path in [
+            full.with_file_name("transcript.jsonl"),
+            full.with_file_name("other.jsonl"),
+            full.with_file_name("chunks").join("part.jsonl"),
+            brain.join(AGY_SESSION).join("transcript_full.jsonl"),
+            brain.join(AGY_SESSION).join("nested").join(TRANSCRIPT_PATH),
+            brain.join("index.sqlite"),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "not a transcript\n").unwrap();
+        }
+
+        f.options.roots = default_roots(&home, None).unwrap();
+        f.options.now = time(16000);
+        f.options.start = SessionStart::Incremental;
+        let migrated = f.run().unwrap();
+        assert_eq!((migrated.imported, migrated.unchanged), (1, 2));
+        let after = f.facts();
+        assert!(before.difference(&after).is_empty());
+        assert!(after.len() > before.len());
+        let next = f.run().unwrap();
+        assert_eq!((next.imported, next.unchanged), (0, 3));
+    }
+
+    #[test]
+    fn new_agy_zooid_homes_do_not_change_the_checkpoint_binding() {
+        let mut f = Fixture::new();
+        let home = f.directory.path().join("home");
+        let spawn = crate::spawn::LaunchConfig::under_home(&home).state_dir;
+        fs::create_dir_all(&spawn).unwrap();
+        f.options.roots = default_roots(&home, None).unwrap();
+        assert_eq!(f.options.roots[0].source, SessionSource::AgyZooids);
+        assert_eq!(f.run().unwrap().imported, 0);
+        let checkpoint = f.options.state_dir.join("ingest-sessions.json");
+        let before = state_file(&checkpoint).unwrap().unwrap().binding;
+
+        let first = f.file(
+            &format!("first.agy/{BRAIN_PATH}/{AGY_SESSION}/{TRANSCRIPT_PATH}"),
+            AGY,
+            8000,
+        );
+        let second = f.file(
+            &format!("second.agy/{BRAIN_PATH}/two/{TRANSCRIPT_PATH}"),
+            &AGY.replace("synthetic Agy", "another conversation"),
+            8100,
+        );
+        f.file(
+            &format!("another.codex/{BRAIN_PATH}/{AGY_SESSION}/{TRANSCRIPT_PATH}"),
+            "ignore me",
+            8100,
+        );
+
+        f.options.roots = default_roots(&home, None).unwrap();
+        f.options.start = SessionStart::Incremental;
+        f.options.now = time(13000);
+        let mut imported = Vec::new();
+        let report = f
+            .archive
+            .ingest_sessions(&f.options, |event| {
+                if let SessionEvent::Imported { path, .. } = event {
+                    imported.push(path.to_owned());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(report.imported, 2);
+        assert_eq!(imported, [first, second]);
+        assert_eq!(state_file(&checkpoint).unwrap().unwrap().binding, before);
+    }
+
+    #[test]
+    fn agy_live_prefix_replays_and_appends_like_explicit_import() {
+        let mut f = Fixture::new();
+        f.options.roots[0].source = SessionSource::Agy;
+        f.options.roots[0].path = f.directory.path().join(BRAIN_PATH);
+        let tail = r#"{"source":"MODEL","type":"PLANNER_RESPONSE","content":"synthetic"#;
+        let full = f.file(
+            &format!("{AGY_SESSION}/{TRANSCRIPT_PATH}"),
+            &format!("{AGY}{tail}"),
+            8000,
+        );
+        let locator = format!("session/{AGY_SESSION}");
+        let last = || {
+            let mut output = String::new();
+            f.archive
+                .thread(
+                    &locator,
+                    10,
+                    Some(1),
+                    crate::archive::Reading {
+                        force: false,
+                        provider: None,
+                    },
+                    &mut Out::new(&mut |part| {
+                        if let crate::out::Part::Text { text } = part {
+                            output.push_str(&text);
+                        }
+                        Ok(())
+                    }),
+                )
+                .unwrap();
+            assert!(output.starts_with(&format!("conversation: {locator}, newest held leaf ")));
+            output
+        };
+        let first = f
+            .archive
+            .ingest_sessions(&f.options, |event| {
+                if let SessionEvent::Imported { receipt, .. } = event {
+                    let ImportSummary::Agy(summary) = &receipt.summary else {
+                        panic!("expected Agy receipt");
+                    };
+                    assert_eq!(summary.trailing_bytes_held, tail.len());
+                    assert_eq!(summary.stats.records_seen, 1);
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!((first.imported, first.live), (1, 1));
+        assert!(last().contains("synthetic Agy"));
+        let prefix = f.facts();
+
+        f.options.start = SessionStart::Incremental;
+        let size = fs::metadata(f.archive.storage.path()).unwrap().len();
+        assert_eq!(f.run().unwrap().imported, 1);
+        assert_eq!(f.facts(), prefix);
+        assert_eq!(fs::metadata(f.archive.storage.path()).unwrap().len(), size);
+        let checkpoint = f.checkpoint();
+        f.options.now = time(14000);
+        let err = f.run().unwrap_err();
+        assert!(format!("{err:#}").contains(" line 2"), "{err:#}");
+        assert_eq!(f.checkpoint(), checkpoint);
+
+        let mut append = OpenOptions::new().append(true).open(&full).unwrap();
+        writeln!(append, " reply\",\"step_index\":2}}").unwrap();
+        append.set_modified(time(11000)).unwrap();
+        let grown = f.run().unwrap();
+        assert_eq!((grown.imported, grown.live), (1, 1));
+        assert!(last().contains("synthetic reply"));
+        let grown = f.facts();
+        assert!(prefix.difference(&grown).is_empty());
+        assert!(grown.len() > prefix.len());
+
+        let explicit = Fixture::new();
+        super::super::cli::import_paths(
+            explicit.archive.storage.path(),
+            explicit.archive.storage.key_path(),
+            &[full],
+            super::super::cli::CliImportSource::Agy,
+            None,
+            &mut Out::new(&mut |_| Ok(())),
+        )
+        .unwrap();
+        let whole = explicit.facts();
+        assert!(whole.difference(&grown).is_empty());
+        assert_eq!(beyond_annotations(&grown, &whole), (0, 1));
     }
 
     #[test]
