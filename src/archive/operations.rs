@@ -463,10 +463,11 @@ fn print_vibe_import_summary(
         summary.stats.unresolved_tool_results,
     ))?;
     out.line(format!(
-        "segments={} journal_records={} completed_calls={} failed_calls={} pending_calls={} streamed_calls={} trailing_bytes_held={} unsupported_parts={} unmatched_assistant_inputs={}",
+        "segments={} journal_records={} completed_calls={} catalog_replacements={} failed_calls={} pending_calls={} streamed_calls={} trailing_bytes_held={} unsupported_parts={} unmatched_assistant_inputs={}",
         summary.segments,
         summary.journal_records,
         summary.completed_calls,
+        summary.catalog_replacements,
         summary.failed_calls,
         summary.pending_calls,
         summary.streamed_calls,

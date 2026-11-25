@@ -68,16 +68,25 @@ struct Message {
     seen: bool,
 }
 
+#[derive(Clone, Default)]
+struct Input {
+    messages: Vec<Message>,
+    catalog: Option<View<str>>,
+}
+
 #[derive(Default)]
 pub(super) struct Scanner {
     records: Vec<SourceRecord>,
     revision: Option<u64>,
-    messages: Vec<Message>,
+    input: Input,
+    catalog_revision: Option<u64>,
+    delivered_catalog: Option<View<str>>,
     /// One cache observation at the time of each unresolved agent model call.
     /// The provider can fail after the intent, or the run can stop there.
-    pending: BTreeMap<String, Vec<Message>>,
-    failed: BTreeMap<String, Vec<Message>>,
+    pending: BTreeMap<String, Input>,
+    failed: BTreeMap<String, Input>,
     streamed: BTreeSet<String>,
+    streamed_entries: BTreeSet<String>,
     /// A completion is already an act, whether the Core subsequently commits
     /// it back to the model cache or discards it.
     last_reply: Option<[u8; 32]>,
@@ -88,7 +97,6 @@ impl Scanner {
         &mut self,
         first: u64,
         bytes: Bytes,
-        active: bool,
         summary: &mut ProjectionSummary,
     ) -> Result<u64> {
         let mut offset = 0;
@@ -104,9 +112,8 @@ impl Scanner {
             summary.journal_records += 1;
             offset = newline + 1;
         }
-        if !active && offset != bytes.len() {
-            bail!("unterminated record in closed Vibe journal segment");
-        }
+        // Newline is the record boundary even in a retained, formerly active
+        // segment. The next segment's first sequence still has to join it.
         summary.trailing_bytes_held += bytes.len() - offset;
         Ok(sequence)
     }
@@ -162,14 +169,15 @@ impl Scanner {
         if string(&request, "action_id")? != id {
             bail!("Vibe completion request action id mismatch");
         }
-        let input = field(&request, "model_input")
-            .and_then(|input| field(&input, "messages"))
-            .context("missing Vibe model input update")?;
-        self.update_input(&input)?;
+        let input = field(&request, "model_input").context("missing Vibe model input update")?;
+        self.update_messages(&field(&input, "messages").context("missing Vibe message update")?)?;
+        self.update_catalog(
+            &field(&input, "tool_catalog").context("missing Vibe catalog update")?,
+        )?;
         if &*string(&request, "purpose")? == "agent"
             && self
                 .pending
-                .insert(id.to_string(), self.messages.clone())
+                .insert(id.to_string(), self.input.clone())
                 .is_some()
         {
             bail!("duplicate pending Vibe completion");
@@ -177,7 +185,7 @@ impl Scanner {
         Ok(())
     }
 
-    fn update_input(&mut self, input: &Bytes) -> Result<()> {
+    fn update_messages(&mut self, input: &Bytes) -> Result<()> {
         let revision = integer(input, "revision")?;
         let mut new: Vec<_> = elements(input, "messages")?
             .into_iter()
@@ -194,12 +202,12 @@ impl Scanner {
                 // Vibe may replace the cache after a resume or compaction.
                 // Keep already-projected context where the cache copies it
                 // verbatim, including a retained tail after a new summary.
-                let prefix = preserve_seen(self.messages.iter(), new.iter_mut());
+                let prefix = preserve_seen(self.input.messages.iter(), new.iter_mut());
                 preserve_seen(
-                    self.messages[prefix..].iter().rev(),
+                    self.input.messages[prefix..].iter().rev(),
                     new[prefix..].iter_mut().rev(),
                 );
-                self.messages.clear();
+                self.input.messages.clear();
             }
             _ => bail!("unknown Vibe model input update"),
         }
@@ -215,14 +223,34 @@ impl Scanner {
                 }
             }
         }
-        self.messages.extend(new);
+        self.input.messages.extend(new);
         self.revision = Some(revision);
+        Ok(())
+    }
+
+    fn update_catalog(&mut self, input: &Bytes) -> Result<()> {
+        let revision = integer(input, "revision")?;
+        match &*string(input, "type")? {
+            "keep" if self.catalog_revision.unwrap_or(0) == revision => {}
+            "replace" => {
+                let tools = field(input, "tools").context("missing Vibe tool definitions")?;
+                if !tools.starts_with(b"[") {
+                    bail!("Vibe tool catalog is not an array");
+                }
+                let tools =
+                    canonical_dynamic_json(tools).context("invalid Vibe tool definitions")?;
+                self.input.catalog = Some(owned_text(format!(r#"{{"tool_catalog":{tools}}}"#)));
+            }
+            "keep" => bail!("Vibe tool catalog keep did not name the held revision"),
+            _ => bail!("unknown Vibe tool catalog update"),
+        }
+        self.catalog_revision = Some(revision);
         Ok(())
     }
 
     fn result(&mut self, payload: &Bytes, summary: &mut ProjectionSummary) -> Result<()> {
         let id = string(payload, "action_id")?;
-        let Some(messages) = self.pending.remove(&*id) else {
+        let Some(mut input) = self.pending.remove(&*id) else {
             return Ok(());
         };
         let result = field(payload, "result").context("missing Vibe completion result")?;
@@ -231,11 +259,11 @@ impl Scanner {
         }
         match &*string(&result, "type")? {
             "completion_failed" => {
-                self.failed.insert(id.to_string(), messages);
+                self.failed.insert(id.to_string(), input);
                 summary.failed_calls += 1;
             }
             "completion_succeeded" => {
-                self.deliver(messages, summary)?;
+                self.deliver(&mut input, summary)?;
                 let reply = field(&result, "result").context("missing Vibe completion reply")?;
                 let parts = elements(&reply, "parts")?;
                 self.last_reply = Some(assistant_signature(&parts)?);
@@ -253,12 +281,8 @@ impl Scanner {
         Ok(())
     }
 
-    fn deliver(
-        &mut self,
-        mut messages: Vec<Message>,
-        summary: &mut ProjectionSummary,
-    ) -> Result<()> {
-        for message in messages.iter_mut().filter(|message| !message.seen) {
+    fn deliver(&mut self, input: &mut Input, summary: &mut ProjectionSummary) -> Result<()> {
+        for message in input.messages.iter_mut().filter(|message| !message.seen) {
             message.seen = true;
             let role = string(&message.wire, "role")?;
             if &*role == "assistant" {
@@ -280,7 +304,20 @@ impl Scanner {
                 summary,
             )?;
         }
-        preserve_seen(messages.iter(), self.messages.iter_mut());
+        preserve_seen(input.messages.iter(), self.input.messages.iter_mut());
+        if self.delivered_catalog != input.catalog {
+            if let Some(catalog) = &input.catalog {
+                let mut record = self.next_record(owned_text("tool_catalog"));
+                record.parts.push(SourcePart::text(
+                    modality::EVENT,
+                    direction::IN,
+                    catalog.clone(),
+                ));
+                self.records.push(record);
+                summary.catalog_replacements += 1;
+            }
+            self.delivered_catalog = input.catalog.clone();
+        }
         Ok(())
     }
 
@@ -288,7 +325,6 @@ impl Scanner {
     /// nonempty discarded content, it journals that actual provider output.
     /// Use it only for an action without a successful authoritative reply.
     fn projection_delta(&mut self, payload: &Bytes, summary: &mut ProjectionSummary) -> Result<()> {
-        let mut streams: Vec<(String, Vec<SourcePart>)> = Vec::new();
         for op in elements(payload, "delta")? {
             let entries = match &*string(&op, "op")? {
                 "append_entry" | "replace_entry" => {
@@ -298,34 +334,33 @@ impl Scanner {
                 _ => continue,
             };
             for entry in entries {
-                let Some((action, parts)) = discarded_stream(&entry)? else {
+                let Some((id, action, parts)) = discarded_stream(&entry)? else {
                     continue;
                 };
-                if self.streamed.contains(&action) {
+                if self.streamed_entries.contains(&*id) {
                     continue;
                 }
-                if let Some((_, stream)) = streams.iter_mut().find(|(id, _)| *id == action) {
-                    stream.extend(parts);
-                } else {
-                    streams.push((action, parts));
+                if !self.streamed.contains(&action) {
+                    let Some(mut input) = self
+                        .failed
+                        .remove(&action)
+                        .or_else(|| self.pending.get(&action).cloned())
+                    else {
+                        continue;
+                    };
+                    self.deliver(&mut input, summary)?;
+                    if let Some(pending) = self.pending.get_mut(&action) {
+                        *pending = input;
+                    }
+                    self.streamed.insert(action);
+                    summary.streamed_calls += 1;
                 }
+                self.streamed_entries.insert(id.to_string());
+                let mut record = self.next_record(owned_text("assistant"));
+                record.claims.raw_outcome = Some(owned_text("discarded"));
+                record.parts = parts;
+                self.records.push(record);
             }
-        }
-        for (action, parts) in streams {
-            let Some(messages) = self
-                .failed
-                .remove(&action)
-                .or_else(|| self.pending.remove(&action))
-            else {
-                continue;
-            };
-            self.deliver(messages, summary)?;
-            let mut record = self.next_record(owned_text("assistant"));
-            record.claims.raw_outcome = Some(owned_text("discarded"));
-            record.parts = parts;
-            self.records.push(record);
-            self.streamed.insert(action);
-            summary.streamed_calls += 1;
         }
         Ok(())
     }
@@ -355,11 +390,16 @@ impl Scanner {
     }
 
     pub(super) fn finish(self) -> (Vec<SourceRecord>, usize) {
-        (self.records, self.pending.len())
+        let unresolved = self
+            .pending
+            .keys()
+            .filter(|id| !self.streamed.contains(*id))
+            .count();
+        (self.records, unresolved)
     }
 }
 
-fn discarded_stream(entry: &Bytes) -> Result<Option<(String, Vec<SourcePart>)>> {
+fn discarded_stream(entry: &Bytes) -> Result<Option<(View<str>, String, Vec<SourcePart>)>> {
     let [status, outcome, id] = json_members(entry, ["generationStatus", "outcome", "id"]);
     if status.as_ref().and_then(json_str).as_deref() != Some("completed")
         || outcome
@@ -396,7 +436,8 @@ fn discarded_stream(entry: &Bytes) -> Result<Option<(String, Vec<SourcePart>)>> 
         .filter(|text| !text.is_empty())
         .map(|text| SourcePart::text(modality, direction::OUT, text))
         .collect();
-    Ok((!parts.is_empty()).then(|| (action.to_owned(), parts)))
+    let action = action.to_owned();
+    Ok((!parts.is_empty()).then_some((id, action, parts)))
 }
 
 fn preserve_seen<'a>(

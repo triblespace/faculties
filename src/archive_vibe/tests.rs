@@ -236,12 +236,7 @@ fn native_prefix_and_export_converge_across_journal_rotation() {
     assert_eq!(nodes(&prefix).len(), 4);
 
     // The two sides of a completion may reside in different retained files.
-    segment(
-        &native,
-        1,
-        &[initial(), first_completion(), second_intent()],
-        b"",
-    );
+    // The writer can rotate away from an incomplete final line after recovery.
     write_current(&native, SESSION, 3);
     segment(&native, 4, &[answer()], b"");
     let (complete_native, grown) = project(&native);
@@ -251,6 +246,7 @@ fn native_prefix_and_export_converge_across_journal_rotation() {
     assert_eq!(nodes(&grown).len(), 6);
     assert!(nodes(&prefix).is_subset(&nodes(&grown)));
     assert_eq!(complete_native.segments, 2);
+    assert_eq!(complete_native.trailing_bytes_held, 11);
 
     let exported = temp.path().join("one.vibe-out");
     write_export(&exported, SESSION);
@@ -290,17 +286,30 @@ fn failed_call_needs_durable_evidence_of_delivery() {
     assert_eq!(missing.failed_calls, 1);
     assert!(facts.facts().is_empty());
 
+    let first = json!({
+        "type":"message", "id":"assistant-first-action", "role":"assistant",
+        "source":"harness", "generationStatus":"completed",
+        "outcome":{"type":"discarded","cause":"failure"},
+        "content":[{"type":"text","text":"emitted fragment"}],
+    });
     let discarded = (
         "projection_delta",
         json!({
-            "delta": [{
-                "op":"append_entry", "entry": {
-                    "type":"message", "id":"assistant-first-action", "role":"assistant",
-                    "source":"harness", "generationStatus":"completed",
-                    "outcome":{"type":"discarded","cause":"failure"},
-                    "content":[{"type":"text","text":"emitted fragment"}],
-                }
-            }]
+            "delta": [
+                {"op":"append_entry", "entry": first},
+                {"op":"replace_entry", "id":"assistant-first-action", "entry": first},
+            ]
+        }),
+    );
+    let reasoning = (
+        "projection_delta",
+        json!({
+            "delta": [{"op":"append_entry", "entry": {
+                "type":"reasoning", "id":"reasoning-first-action-0",
+                "generationStatus":"completed",
+                "outcome":{"type":"discarded","cause":"failure"},
+                "text":"retained thought"
+            }}]
         }),
     );
     segment(
@@ -311,15 +320,44 @@ fn failed_call_needs_durable_evidence_of_delivery() {
             failure("first-action"),
             discarded.clone(),
             discarded,
+            reasoning,
         ],
         b"",
     );
     let (partial, facts) = project(&native);
     assert_eq!(partial.coverage(), "partial");
     assert_eq!(partial.streamed_calls, 1);
-    assert_eq!(nodes(&facts).len(), 3);
+    assert_eq!(nodes(&facts).len(), 4);
     assert!(exists!(pattern!(&facts, [{
         _?receipt @ source_projection::raw_outcome: "discarded"
+    }])));
+}
+
+#[test]
+fn catalog_definitions_are_delivered_once_per_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let native = temp.path().join(SESSION);
+    write_current(&native, SESSION, 0);
+    let mut initial = initial();
+    initial.1["request"]["model_input"]["tool_catalog"] = json!({
+        "type":"replace", "revision":2,
+        "tools":[{"name":"lookup","description":"Find synthetic text","parameters":{"type":"object"}}]
+    });
+    let mut next = second_intent();
+    next.1["request"]["model_input"]["tool_catalog"] = json!({"type":"keep","revision":2});
+    segment(
+        &native,
+        1,
+        &[initial, first_completion(), next, answer()],
+        b"",
+    );
+    let (summary, facts) = project(&native);
+    assert_eq!(summary.catalog_replacements, 1);
+    assert_eq!(nodes(&facts).len(), 7);
+    assert!(exists!(pattern!(&facts, [{
+        _?fact @ content_fact::modality: content_fact::modality::EVENT,
+        content_fact::direction: content_fact::direction::IN,
+        content_fact::text: r#"{"tool_catalog":[{"description":"Find synthetic text","name":"lookup","parameters":{"type":"object"}}]}"#,
     }])));
 }
 
@@ -371,10 +409,11 @@ fn held_vibe_runs_agree_in_memory() {
     assert!(export_graph.facts() == project(Path::new(&export)).1.facts());
     assert_eq!(exported.stats.unresolved_tool_results, 0);
     println!(
-        "segments={} journal_records={} completed_calls={} nodes={} unresolved_tool_results={}",
+        "segments={} journal_records={} completed_calls={} catalog_replacements={} nodes={} unresolved_tool_results={}",
         exported.segments,
         exported.journal_records,
         exported.completed_calls,
+        exported.catalog_replacements,
         exported.stats.projections_emitted,
         exported.stats.unresolved_tool_results,
     );

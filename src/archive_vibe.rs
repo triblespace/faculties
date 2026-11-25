@@ -36,6 +36,7 @@ pub struct ProjectionSummary {
     pub segments: usize,
     pub journal_records: usize,
     pub completed_calls: usize,
+    pub catalog_replacements: usize,
     pub pending_calls: usize,
     pub failed_calls: usize,
     /// Calls whose only durable reply is a stream fragment the UI settled.
@@ -49,6 +50,9 @@ pub struct ProjectionSummary {
 }
 
 impl ProjectionSummary {
+    /// Coverage of the durable agent call stream from sequence one. An
+    /// export can say the run finished while the source still has gaps.
+    /// Native-only reads make no claim about the end of the headless run.
     pub fn coverage(&self) -> &'static str {
         if self.stats.projections_emitted == 0 {
             "missing"
@@ -447,7 +451,7 @@ fn project(
             break;
         }
         let bytes = read(&segment)?;
-        next = scanner.scan_segment(first, bytes, first == store.active, &mut summary)?;
+        next = scanner.scan_segment(first, bytes, &mut summary)?;
         summary.segments += 1;
     }
     if read(&root.join("CURRENT"))? != store.pointer {

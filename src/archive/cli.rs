@@ -117,6 +117,7 @@ pub(super) enum Command {
         paths_from: Option<PathBuf>,
         /// Source adapter used to interpret PATH.
         /// Vibe requires an exact exported run directory or native session UUID directory.
+        /// Its coverage describes the durable agent call stream from sequence one.
         #[arg(long, value_enum, default_value = "claude-code")]
         source: CliImportSource,
         /// Treat a source file last modified longer ago than this (for
