@@ -47,18 +47,20 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub(super) enum Command {
-    /// Discover and import this host's Codex/Claude Code sessions.
+    /// Discover and import this host's local provider sessions.
     ///
     /// Defaults: ~/.claude/projects, ~/.codex*/{sessions,archived_sessions},
     /// both directories under CODEX_HOME, and Agy's full transcript under each
     /// ~/.gemini/antigravity-cli/brain/<conversation>/, also under Agy zooid
     /// homes (~/.local/state/spawn/<name>.agy/). The Agy transcript is
     /// .system_generated/logs/transcript_full.jsonl within the conversation.
+    /// Vibe zooids are discovered under <name>.vibe/logs/session/unified/<uuid>
+    /// in the same spawn state directory.
     /// Explicit roots replace defaults. Claude and Codex include recursive JSONL
     /// files and subagents. Each file is one import unit, including Claude sidecars.
     ///
     /// The checkpoint is bound to this pile, selected collection and root set;
-    /// uninitialized/changed bindings require --all or --since. Adding an Agy
+    /// uninitialized/changed bindings require --all or --since. Adding an Agy or Vibe
     /// root imports its history while keeping existing roots' progress.
     /// Legacy script stamps are not inherited. Success advances through the fixed quiet
     /// cutoff. A file written within the quiet window is live: it is imported
@@ -114,6 +116,8 @@ pub(super) enum Command {
         #[arg(long, value_name = "FILE")]
         paths_from: Option<PathBuf>,
         /// Source adapter used to interpret PATH.
+        /// Vibe requires an exact exported run directory or native session UUID directory.
+        /// Its coverage describes the durable agent call stream from sequence one.
         #[arg(long, value_enum, default_value = "claude-code")]
         source: CliImportSource,
         /// Treat a source file last modified longer ago than this (for
@@ -212,6 +216,7 @@ pub(super) enum CliImportSource {
     CodexCloud,
     Copilot,
     Gemini,
+    Vibe,
 }
 
 impl From<CliImportSource> for ImportSource {
@@ -226,6 +231,7 @@ impl From<CliImportSource> for ImportSource {
             CliImportSource::CodexCloud => Self::CodexCloud,
             CliImportSource::Copilot => Self::Copilot,
             CliImportSource::Gemini => Self::Gemini,
+            CliImportSource::Vibe => Self::Vibe,
         }
     }
 }

@@ -14,6 +14,7 @@
 use super::{Archive, ImportReceipt, ImportSource};
 use crate::archive_agy::{BRAIN_PATH, TRANSCRIPT_PATH};
 use crate::archive_collection::ArchiveImportWriter;
+use crate::archive_vibe;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -31,6 +32,7 @@ pub enum SessionSource {
     Codex,
     Agy,
     AgyZooids,
+    VibeZooids,
 }
 impl SessionSource {
     fn is_agy(self) -> bool {
@@ -43,6 +45,7 @@ impl From<SessionSource> for ImportSource {
             SessionSource::ClaudeCode => Self::ClaudeCode,
             SessionSource::Codex => Self::Codex,
             SessionSource::Agy | SessionSource::AgyZooids => Self::Agy,
+            SessionSource::VibeZooids => Self::Vibe,
         }
     }
 }
@@ -108,8 +111,8 @@ impl std::fmt::Display for SessionBusy {
 impl std::error::Error for SessionBusy {}
 
 /// Conventional local roots, including archived Codex rollouts and Agy's
-/// window and zooid transcripts. Missing optional directories are absent
-/// from the selection. Newly appearing Agy roots get their own first pass.
+/// window and zooid transcripts and native Vibe zooid journals. Newly bound
+/// provider roots get their own first pass.
 pub fn default_roots(home: &Path, codex_home: Option<&Path>) -> Result<Vec<SessionRoot>> {
     let mut roots = Vec::new();
     let mut add = |source, path: PathBuf| -> Result<()> {
@@ -124,6 +127,10 @@ pub fn default_roots(home: &Path, codex_home: Option<&Path>) -> Result<Vec<Sessi
     add(SessionSource::Agy, home.join(BRAIN_PATH))?;
     add(
         SessionSource::AgyZooids,
+        crate::spawn::LaunchConfig::under_home(home).state_dir,
+    )?;
+    add(
+        SessionSource::VibeZooids,
         crate::spawn::LaunchConfig::under_home(home).state_dir,
     )?;
     for entry in fs::read_dir(home).with_context(|| format!("enumerate home {:?}", home))? {
@@ -178,7 +185,12 @@ fn normalize_roots(roots: Vec<SessionRoot>) -> Result<Vec<SessionRoot>> {
     normalized.sort_by(|a, b| a.path.cmp(&b.path).then(a.source.cmp(&b.source)));
     let mut unique: Vec<SessionRoot> = Vec::new();
     for root in normalized {
-        if let Some(parent) = unique.iter().find(|p| root.path.starts_with(&p.path)) {
+        if let Some(parent) = unique.iter().find(|p| {
+            root.path.starts_with(&p.path)
+                && !(root.path == p.path
+                    && p.source == SessionSource::AgyZooids
+                    && root.source == SessionSource::VibeZooids)
+        }) {
             if parent.source != root.source {
                 bail!(
                     "overlapping roots have different adapters: {:?} and {:?}",
@@ -235,9 +247,9 @@ struct Binding {
     roots: Vec<(SessionSource, BoundPath)>,
 }
 impl Binding {
-    /// A newly bound Agy source starts without applying the old cutoff to it.
+    /// A newly bound provider source starts without applying the old cutoff to it.
     /// All previously bound roots must still match, including their identity.
-    fn added_agy_sources(&self, next: &Self) -> Option<Vec<SessionSource>> {
+    fn added_discovery_sources(&self, next: &Self) -> Option<Vec<SessionSource>> {
         let mut existing = self.roots.iter().peekable();
         let mut added = Vec::new();
         for root in &next.roots {
@@ -245,7 +257,7 @@ impl Binding {
                 continue;
             }
             let source = root.0;
-            if !source.is_agy()
+            if !(source.is_agy() || source == SessionSource::VibeZooids)
                 || added.contains(&source)
                 || self.roots.iter().any(|old| old.0 == source)
             {
@@ -340,16 +352,28 @@ fn observe_file(path: &Path) -> Result<Observation> {
     })
 }
 fn sidecar(path: &Path, source: SessionSource) -> Result<Option<Observation>> {
-    if source != SessionSource::ClaudeCode {
-        return Ok(None);
-    }
-    let path = path.with_extension("meta.json");
+    let path = match source {
+        SessionSource::ClaudeCode => path.with_extension("meta.json"),
+        SessionSource::VibeZooids => {
+            return observe_file(&vibe_session(path)?.join("CURRENT")).map(Some)
+        }
+        _ => return Ok(None),
+    };
     match fs::symlink_metadata(&path) {
         Ok(_) => observe_file(&path).map(Some),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("inspect sidecar {:?}", path)),
     }
 }
+
+fn vibe_session(segment: &Path) -> Result<&Path> {
+    segment
+        .parent()
+        .filter(|path| path.ends_with("journal"))
+        .and_then(Path::parent)
+        .context("Vibe discovery candidate is not a journal segment")
+}
+
 struct Candidate {
     source: SessionSource,
     path: PathBuf,
@@ -371,6 +395,14 @@ impl Candidate {
             s.modified.max(self.observed.modified)
         })
     }
+
+    fn source_path(&self) -> Result<&Path> {
+        if self.source == SessionSource::VibeZooids {
+            vibe_session(&self.path)
+        } else {
+            Ok(&self.path)
+        }
+    }
     /// The file is the one discovered, appended to at most. Appends during
     /// the pass are next-pass work: they post-date the cutoff, and the
     /// importer reads one frozen prefix. Replacement, truncation, a same-size
@@ -383,6 +415,14 @@ impl Candidate {
         if !appended || sidecar(&self.path, self.source)? != self.sidecar {
             bail!(
                 "source or sidecar changed since discovery other than by appending: {:?}; rerun explicitly",
+                self.path
+            );
+        }
+        if self.source == SessionSource::VibeZooids
+            && archive_vibe::active_segment(self.source_path()?)?.as_deref() != Some(&self.path)
+        {
+            bail!(
+                "Vibe active journal changed since discovery: {:?}",
                 self.path
             );
         }
@@ -434,11 +474,55 @@ fn discover_agy_zooids(root: &SessionRoot, files: &mut Vec<Candidate>) -> Result
     Ok(())
 }
 
+fn discover_vibe_zooids(root: &SessionRoot, files: &mut Vec<Candidate>) -> Result<()> {
+    for home in fs::read_dir(&root.path)? {
+        let home = home?;
+        let path = home.path();
+        if path.extension().is_none_or(|ext| ext != "vibe") || !home.file_type()?.is_dir() {
+            continue;
+        }
+        let native = path.join(archive_vibe::NATIVE_SESSIONS);
+        match no_symlink_components(&native) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error),
+        }
+        for session in fs::read_dir(native)? {
+            let session = session?;
+            if !session
+                .file_name()
+                .to_str()
+                .is_some_and(archive_vibe::valid_session_id)
+                || !session.file_type()?.is_dir()
+            {
+                continue;
+            }
+            if let Some(segment) = archive_vibe::active_segment(&session.path())? {
+                no_symlink_components(&segment)?;
+                files.push(Candidate::observe(segment, root.source)?);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn discover(roots: &[SessionRoot]) -> Result<(Vec<Candidate>, usize)> {
     // This is a transient file list for one observation, never a retained catalogue.
     let mut files = Vec::new();
     let mut other = 0;
     for root in roots {
+        if root.source == SessionSource::VibeZooids {
+            let start = files.len();
+            discover_vibe_zooids(root, &mut files)?;
+            files[start..].sort_by(|a, b| a.path.cmp(&b.path));
+            continue;
+        }
         if root.source.is_agy() {
             let start = files.len();
             if root.source == SessionSource::AgyZooids {
@@ -554,7 +638,7 @@ impl Archive {
             let collection = hex::encode(writer.collection_handle().raw);
             let binding = Binding { pile: pile_binding, collection: collection.clone(), roots: root_binding };
             let mut rebound = false;
-            let (since, added_agy) = match options.start {
+            let (since, added_sources) = match options.start {
                 SessionStart::All => (None, Vec::new()),
                 SessionStart::Since(time) => (Some(time), Vec::new()),
                 SessionStart::Incremental => {
@@ -564,7 +648,7 @@ impl Archive {
                     {
                         bail!("session destination or roots changed; choose --all or --since explicitly");
                     }
-                    let added_agy = previous.binding.added_agy_sources(&binding).ok_or_else(|| {
+                    let added_sources = previous.binding.added_discovery_sources(&binding).ok_or_else(|| {
                         anyhow!("session destination or roots changed; choose --all or --since explicitly")
                     })?;
                     if previous.binding.pile.identity != binding.pile.identity {
@@ -576,7 +660,7 @@ impl Archive {
                         if !held { bail!("session destination or roots changed; choose --all or --since explicitly"); }
                         rebound = true;
                     }
-                    (Some(previous.through), added_agy)
+                    (Some(previous.through), added_sources)
                 }
             };
             if since.is_some_and(|time| time > cutoff) { bail!("session lower bound is after eligibility cutoff (clock moved backwards or --since is too recent)"); }
@@ -589,7 +673,7 @@ impl Archive {
             for file in &files {
                 // Inclusive lower edge intentionally rechecks the prior boundary.
                 // A file live in the previous pass is at or after it by definition.
-                let lower_bound = if added_agy.contains(&file.source) {
+                let lower_bound = if added_sources.contains(&file.source) {
                     None
                 } else {
                     since
@@ -597,10 +681,11 @@ impl Archive {
                 if lower_bound.is_some_and(|time| file.modified() < time) { report.unchanged += 1; continue; }
                 let live = file.modified() >= cutoff;
                 let result = (|| {
-                    if live { event(SessionEvent::Live(&file.path))?; }
-                    event(SessionEvent::Importing(&file.path))?;
+                    let source_path = file.source_path()?;
+                    if live { event(SessionEvent::Live(source_path))?; }
+                    event(SessionEvent::Importing(source_path))?;
                     file.check()?;
-                    let summary = super::local::project_path(&file.path, file.source.into(), Some(cutoff), |fragment, identity, _| writer.stage(fragment, identity))?;
+                    let summary = super::local::project_path(source_path, file.source.into(), Some(cutoff), |fragment, identity, _| writer.stage(fragment, identity))?;
                     file.check()?;
                     let publication = writer.commit_unit()?;
                     for commit in publication.commits.iter().rev() {
@@ -613,7 +698,7 @@ impl Archive {
                     report.commits += publication.commits.len();
                     report.imported += 1;
                     report.live += usize::from(live);
-                    event(SessionEvent::Imported { path: &file.path, receipt: &ImportReceipt { summary, publication } })
+                    event(SessionEvent::Imported { path: source_path, receipt: &ImportReceipt { summary, publication } })
                 })();
                 result.with_context(|| format!("import {:?}; checkpoint unchanged", file.path))?;
             }
@@ -849,6 +934,106 @@ mod tests {
         assert_eq!(report.imported, 2);
         assert_eq!(imported, [first, second]);
         assert_eq!(state_file(&checkpoint).unwrap().unwrap().binding, before);
+    }
+
+    #[test]
+    fn adding_vibe_to_the_same_spawn_root_backfills_only_vibe_and_replays_explicit_import() {
+        use crate::archive_vibe::tests::{finished_native, SESSION};
+
+        let mut f = Fixture::new();
+        let home = f.directory.path().join("home");
+        let spawn = crate::spawn::LaunchConfig::under_home(&home).state_dir;
+        let codex = home.join(".codex/sessions");
+        let claude = home.join(".claude/projects");
+        let agy = spawn.join(format!(
+            "one.agy/{BRAIN_PATH}/{AGY_SESSION}/{TRANSCRIPT_PATH}"
+        ));
+        for (path, text) in [
+            (codex.join("old.jsonl"), CODEX),
+            (claude.join("old.jsonl"), CLAUDE),
+            (agy, AGY),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            File::open(&path).unwrap().set_modified(time(1000)).unwrap();
+        }
+
+        // The checkpoint predates Vibe, but already has AgyZooids tied to
+        // the same physical directory. Its three cutoffs must still apply.
+        f.options.roots = default_roots(&home, None).unwrap();
+        f.options
+            .roots
+            .retain(|root| root.source != SessionSource::VibeZooids);
+        assert_eq!(f.run().unwrap().imported, 3);
+
+        let native = spawn
+            .join("one.vibe")
+            .join(archive_vibe::NATIVE_SESSIONS)
+            .join(SESSION);
+        finished_native(&native);
+        for file in [
+            native.join("CURRENT"),
+            native.join("journal/0000000000000005.jsonl"),
+        ] {
+            File::open(file).unwrap().set_modified(time(2000)).unwrap();
+        }
+        let mut output = String::new();
+        super::super::cli::import_paths(
+            f.archive.storage.path(),
+            f.archive.storage.key_path(),
+            std::slice::from_ref(&native),
+            super::super::cli::CliImportSource::Vibe,
+            None,
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Text { text } = part {
+                    output.push_str(&text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(output.contains("coverage=partial"));
+        assert!(output.contains("nodes=6"));
+        let facts = f.facts();
+        let size = fs::metadata(f.archive.storage.path()).unwrap().len();
+
+        f.options.roots = default_roots(&home, None).unwrap();
+        f.options.now = time(16000);
+        f.options.start = SessionStart::Incremental;
+        let migrated = f.run().unwrap();
+        assert_eq!((migrated.imported, migrated.unchanged), (1, 3));
+        assert_eq!(f.facts(), facts);
+        assert_eq!(fs::metadata(f.archive.storage.path()).unwrap().len(), size);
+        let next = f.run().unwrap();
+        assert_eq!((next.imported, next.unchanged), (0, 4));
+
+        let mut thread = String::new();
+        f.archive
+            .thread(
+                &format!("session/{SESSION}"),
+                10,
+                None,
+                crate::archive::Reading {
+                    provider: None,
+                    force: false,
+                },
+                &mut crate::out::Out::new(&mut |part| {
+                    if let crate::out::Part::Text { text } = part {
+                        thread.push_str(&text);
+                    }
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let ordered: Vec<_> = ["synthetic rules", "synthetic question", "synthetic answer"]
+            .iter()
+            .map(|text| {
+                thread
+                    .find(text)
+                    .unwrap_or_else(|| panic!("missing {text} from {thread}"))
+            })
+            .collect();
+        assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
