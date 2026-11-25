@@ -32,33 +32,33 @@ const TOOLS: &[Tool] = &[Tool {
 #[serde(rename_all = "kebab-case")]
 enum CaptureTarget {
     Dashboard,
-    Atlas,
+    Schemas,
     Colony,
     Discord,
     Files,
-    Gauge,
-    Headspace,
+    KnowledgeHealth,
+    Profiles,
     Memory,
     Messages,
-    Planner,
+    Events,
     Teams,
-    Triage,
+    Diagnostics,
 }
 impl From<CaptureTarget> for Target {
     fn from(value: CaptureTarget) -> Self {
         match value {
             CaptureTarget::Dashboard => Self::Dashboard,
-            CaptureTarget::Atlas => Self::Atlas,
+            CaptureTarget::Schemas => Self::Schemas,
             CaptureTarget::Colony => Self::Colony,
             CaptureTarget::Discord => Self::Discord,
             CaptureTarget::Files => Self::Files,
-            CaptureTarget::Gauge => Self::Gauge,
-            CaptureTarget::Headspace => Self::Headspace,
+            CaptureTarget::KnowledgeHealth => Self::KnowledgeHealth,
+            CaptureTarget::Profiles => Self::Profiles,
             CaptureTarget::Memory => Self::Memory,
             CaptureTarget::Messages => Self::Messages,
-            CaptureTarget::Planner => Self::Planner,
+            CaptureTarget::Events => Self::Events,
             CaptureTarget::Teams => Self::Teams,
-            CaptureTarget::Triage => Self::Triage,
+            CaptureTarget::Diagnostics => Self::Diagnostics,
         }
     }
 }

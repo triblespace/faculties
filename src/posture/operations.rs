@@ -4,13 +4,13 @@
 use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
-use crate::decide::{self, Resolution};
+use crate::decisions::{self, Resolution};
 #[cfg(test)]
 use crate::posture_finding::finding_id;
 use crate::posture_finding::{
     commit_message_location, finding_entity, git_probe, Carrier, GitObjects, Inner, Location,
 };
-use crate::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECIDE_SCOPE_ID;
+use crate::schemas::decide::DEFAULT_SCOPE_ID as DEFAULT_DECISIONS_SCOPE_ID;
 #[cfg(any(feature = "local-embed", test))]
 use crate::schemas::embeddings::{self, Embedding768};
 use crate::schemas::posture::{
@@ -518,7 +518,7 @@ pub fn validate_exemplar(text: &str, channel: &str) -> Result<()> {
 // locator)`. It used to be `(modality, path, commit:path:line, value)`, which
 // commit surgery destroyed: a rebase, cherry-pick, amend or history scrub
 // gives the same material a new `commit:path:line`, hence a new id, so every
-// Decide resolution silently stopped applying and the finding re-blocked.
+// Decisions resolution silently stopped applying and the finding re-blocked.
 //
 // The coordinate is MODALITY-DEPENDENT on purpose. Source material has a git
 // blob and blobs survive commit surgery byte-identical; a byte range into an
@@ -2248,7 +2248,7 @@ impl PostureStorage<'_> {
     fn scan_and_decide_views(&self) -> Result<(CollectionView, CollectionView)> {
         let mut views = self.load_scopes(&[
             (DEFAULT_SCAN_SCOPE_ID, "scan"),
-            (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
+            (DEFAULT_DECISIONS_SCOPE_ID, "Decisions"),
         ])?;
         let decisions = views.pop().expect("two requested Posture views");
         let scans = views.pop().expect("two requested Posture views");
@@ -2261,7 +2261,7 @@ impl PostureStorage<'_> {
         let mut views = self.load_scopes(&[
             (DEFAULT_POLICY_SCOPE_ID, "policy"),
             (DEFAULT_SCAN_SCOPE_ID, "scan"),
-            (DEFAULT_DECIDE_SCOPE_ID, "Decide"),
+            (DEFAULT_DECISIONS_SCOPE_ID, "Decisions"),
         ])?;
         let decisions = views.pop().expect("three requested Posture views");
         let scans = views.pop().expect("three requested Posture views");
@@ -2299,8 +2299,8 @@ impl PostureStorage<'_> {
     }
 
     #[cfg(test)]
-    fn decide_view(&self) -> Result<CollectionView> {
-        self.load_scope(DEFAULT_DECIDE_SCOPE_ID, "Decide")
+    fn decisions_view(&self) -> Result<CollectionView> {
+        self.load_scope(DEFAULT_DECISIONS_SCOPE_ID, "Decisions")
     }
 
     fn publish_policy(
@@ -3280,10 +3280,10 @@ fn select_scan<P: TriblePattern>(space: &P, requested: Option<&str>) -> Result<O
 /// The prose a resolution had to spell EXACTLY, before a resolution could
 /// carry a machine-readable result.
 ///
-/// It is still read, and deliberately so. A Decide resolution is an intrinsic,
+/// It is still read, and deliberately so. A Decisions resolution is an intrinsic,
 /// content-addressed, immutable event and an already-resolved decision cannot
 /// be resolved again, so no edit can re-stamp the historical clearances with
-/// `decide::RESULT_BENIGN` — migrating them would mean forging a second
+/// `decisions::RESULT_BENIGN` — migrating them would mean forging a second
 /// resolution head nobody authored. Dropping the legacy read would silently
 /// re-block every finding a human already cleared. New clearances use the
 /// tag; this is a read path only.
@@ -3296,7 +3296,7 @@ struct FindingDecisionState {
     disputed: bool,
 }
 
-/// Which findings a resolved Decide outcome takes off the board.
+/// Which findings a resolved Decisions outcome takes off the board.
 ///
 /// `bridges` carries the pre-2026-08-18 occurrence ids a migration proved to
 /// be the same material, so a judgement made under the old identity keeps
@@ -3393,7 +3393,7 @@ fn legacy_bridges<P: TriblePattern>(facts: &P) -> BTreeMap<Id, BTreeSet<Id>> {
     bridges
 }
 
-/// Occurrences classified benign by the native Decide collection.
+/// Occurrences classified benign by the native Decisions collection.
 ///
 /// The outcome is an exact protocol value, as Mail's Decide authorization uses
 /// exact `send`: merely finishing a deliberation must not turn a negative or
@@ -3407,25 +3407,31 @@ fn settled_findings<P: TriblePattern>(
     bridges: BTreeMap<Id, BTreeSet<Id>>,
 ) -> Result<Settled> {
     let mut states = BTreeMap::<Id, FindingDecisionState>::new();
-    for decision in decide::decision_anchors(facts) {
-        let genesis = decide::genesis_for_decision(facts, decision)?
-            .ok_or_else(|| anyhow!("Decide decision {} has no genesis", fmt_id(decision)))?;
+    for decision in decisions::decision_anchors(facts) {
+        let genesis = decisions::genesis_for_decision(facts, decision)?
+            .ok_or_else(|| anyhow!("Decisions decision {} has no genesis", fmt_id(decision)))?;
         let Some(about) = genesis.about else {
             continue;
         };
         let state = states.entry(about).or_default();
-        let snapshot = match decide::resolution(facts, decision) {
+        let snapshot = match decisions::resolution(facts, decision) {
             Resolution::Missing => continue,
             Resolution::Unique(snapshot) => snapshot,
             Resolution::Agreed(snapshots) => snapshots.into_iter().next().ok_or_else(|| {
-                anyhow!("Decide decision {} has empty agreement", fmt_id(decision))
+                anyhow!(
+                    "Decisions decision {} has empty agreement",
+                    fmt_id(decision)
+                )
             })?,
             Resolution::Forked(_) => {
                 state.disputed = true;
                 continue;
             }
             Resolution::Invalid(error) => {
-                bail!("Decide decision {} is invalid: {error}", fmt_id(decision));
+                bail!(
+                    "Decisions decision {} is invalid: {error}",
+                    fmt_id(decision)
+                );
             }
         };
         // The machine-readable result is authoritative. Only when a
@@ -3434,8 +3440,8 @@ fn settled_findings<P: TriblePattern>(
         // is otherwise free prose: it exists so a human can say WHY, and a
         // gate that reads it byte-for-byte takes that field away from them.
         let benign = match snapshot.result {
-            Some(result) => result == decide::RESULT_BENIGN,
-            None => decide::read_text(reader, snapshot.outcome)? == LEGACY_BENIGN_OUTCOME,
+            Some(result) => result == decisions::RESULT_BENIGN,
+            None => decisions::read_text(reader, snapshot.outcome)? == LEGACY_BENIGN_OUTCOME,
         };
         if benign {
             state.benign = true;
@@ -3443,7 +3449,7 @@ fn settled_findings<P: TriblePattern>(
                 // Decide validates proposal context as canonical required text;
                 // read it anyway so missing/corrupt justification cannot grant
                 // clearance merely because a handle is present.
-                if !decide::read_text(reader, context)?.trim().is_empty() {
+                if !decisions::read_text(reader, context)?.trim().is_empty() {
                     state.justified_benign = true;
                 }
             }
@@ -5260,8 +5266,8 @@ fi
     echo "  It is not pushed yet, so the whole remedy is still cheap:"
     echo "    git commit --amend        (fix the content, keep the commit)"
     echo "  or, if the material is genuinely fine for this channel:"
-    echo "    decide propose \"<what this is>\" --context \"<why it is fine>\" --about <finding id>"
-    echo "    decide resolve <decision> \"<the reasoning>\" --result benign"
+    echo "    decisions propose \"<what this is>\" --context \"<why it is fine>\" --about <finding id>"
+    echo "    decisions resolve <decision> \"<the reasoning>\" --result benign"
     echo ""
     echo "  Nothing is blocked. The pre-push hook is what will refuse."
 }} 2>&1 | tee -a "$LOG" &

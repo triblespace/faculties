@@ -52,7 +52,6 @@ pub mod archive_gemini;
 mod archive_shape;
 pub mod archive_source;
 pub mod archive_v3;
-pub mod atlas;
 pub mod blockdag;
 pub mod body;
 pub mod bootstrap;
@@ -64,18 +63,21 @@ pub mod code;
 pub mod cognition;
 pub mod collection_names;
 pub mod comb;
-pub mod compass;
 pub mod config;
-pub mod decide;
+pub mod decisions;
+pub mod diagnostics;
 pub mod discord;
 pub mod duplex;
+pub mod events;
 pub mod files;
 pub mod gauge;
+pub mod goals;
 pub mod habits;
-pub mod headspace;
 pub mod hear;
 pub mod home;
 pub mod imagine;
+pub mod knowledge;
+pub mod knowledge_additive;
 pub mod linkedin;
 pub mod mail;
 pub mod mail_imap;
@@ -100,14 +102,15 @@ pub mod out;
 pub mod patience;
 #[cfg(any(feature = "wemm", test))]
 pub mod pile_watch;
-pub mod planner;
 pub mod posture;
 pub mod posture_finding;
 pub mod posture_policy;
+pub mod profiles;
 pub mod quota;
 pub mod reason;
 pub mod relations;
 pub mod rules;
+pub mod schema_catalog;
 pub mod schemas;
 pub mod search;
 pub mod spawn;
@@ -115,19 +118,16 @@ pub mod spec;
 pub mod storage;
 pub mod teams;
 pub mod tokens;
-pub mod triage;
 pub mod turntaking;
 pub mod viewer;
 pub mod voice;
 pub mod web;
 #[cfg(feature = "wemm")]
 pub mod wemm;
-pub mod wiki;
-pub mod wiki_additive;
 pub mod workspace;
 pub mod world;
 
-/// What Files, Memory and Wiki semantic commands answer in a build without
+/// What Files, Memory and Knowledge semantic commands answer in a build without
 /// the WeMM model.
 #[cfg(not(feature = "wemm"))]
 pub(crate) fn wemm_unavailable<T>() -> anyhow::Result<T> {
@@ -143,7 +143,7 @@ pub(crate) mod test_support;
 
 /// Resolve a free-text argument that may reference a file or stdin, so every
 /// faculty that takes prose content (`memory create`, `message send`,
-/// `wiki create/edit`, `compass note`, …) shares one convention:
+/// `knowledge create/edit`, `goals note`, …) shares one convention:
 ///
 /// - `@-`         → read all of stdin
 /// - `@<path>`    → read the file at `<path>`

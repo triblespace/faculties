@@ -1,4 +1,4 @@
-//! One initialized MCP session exercises the planning, messaging, and Wiki
+//! One initialized MCP session exercises the planning, messaging, and Knowledge
 //! adapters against the same local pile. No network, ambient persona, protocol
 //! subprocess, or model runtime is needed for this workflow.
 
@@ -10,7 +10,7 @@ use faculties::mcp::Server;
 use faculties::relations::{person_fragment, ProfileInput};
 use faculties::schemas::relations::DEFAULT_SCOPE_ID;
 use faculties::storage::{initialize_signer, publish_fragment};
-use faculties::{compass, message, wiki};
+use faculties::{goals, knowledge, message};
 use serde_json::{json, Value};
 use triblespace::prelude::*;
 
@@ -100,35 +100,39 @@ fn id(result: &Value) -> String {
 #[test]
 fn one_session_writes_and_reads_all_three_faculties() {
     let (_directory, pile, key) = fixture();
-    let compass = compass::mcp::Compass::new(pile.clone(), Some(key.clone()));
+    let goals = goals::mcp::Goals::new(pile.clone(), Some(key.clone()));
     let message = message::mcp::Message::new(pile.clone(), Some(key.clone()));
-    let wiki = wiki::mcp::Wiki::new(pile.clone(), Some(key.clone()));
-    let mut server = Server::new(&[&compass, &message, &wiki]).unwrap();
+    let knowledge = knowledge::mcp::Knowledge::new(pile.clone(), Some(key.clone()));
+    let mut server = Server::new(&[&goals, &message, &knowledge]).unwrap();
     initialize(&mut server);
 
     let original = "One shared office.\nNo trailing newline";
     let revision = id(&call(
         &mut server,
-        "wiki_create",
+        "knowledge_create",
         json!({
             "title": "Release notes", "content": original, "tags": ["delivery"]
         }),
     ));
     let successor = id(&call(
         &mut server,
-        "wiki_edit",
+        "knowledge_edit",
         json!({
             "id": revision, "content": "Updated through the same session."
         }),
     ));
-    let current = text(&call(&mut server, "wiki_show", json!({"id": revision})));
+    let current = text(&call(
+        &mut server,
+        "knowledge_show",
+        json!({"id": revision}),
+    ));
     assert!(
         current.contains("Updated through the same session."),
         "{current}"
     );
     let exported = call(
         &mut server,
-        "wiki_export",
+        "knowledge_export",
         json!({"id": revision, "exact": true}),
     );
     assert_eq!(exported["content"].as_array().unwrap().len(), 1);
@@ -144,7 +148,7 @@ fn one_session_writes_and_reads_all_three_faculties() {
 
     let goal = id(&call(
         &mut server,
-        "compass_add",
+        "goals_add",
         json!({
             "title": "Deliver the report", "tags": ["delivery"],
             "note": format!("Discussed in [the wiki](wiki:{successor})."),
@@ -154,19 +158,19 @@ fn one_session_writes_and_reads_all_three_faculties() {
     let literal = "@/this/path/must/not/be/read";
     call(
         &mut server,
-        "compass_note",
+        "goals_note",
         json!({
             "id": goal, "note": literal, "persona": "alice"
         }),
     );
     call(
         &mut server,
-        "compass_move",
+        "goals_move",
         json!({
             "id": goal, "status": "doing", "persona": "alice"
         }),
     );
-    let shown = text(&call(&mut server, "compass_show", json!({"id": goal})));
+    let shown = text(&call(&mut server, "goals_show", json!({"id": goal})));
     assert!(shown.contains(literal), "{shown}");
     assert!(shown.contains("doing"), "{shown}");
 
@@ -205,20 +209,14 @@ fn one_session_writes_and_reads_all_three_faculties() {
 fn invalid_cross_frontend_arguments_and_notifications_cannot_open_storage() {
     let directory = tempfile::tempdir().unwrap();
     let pile = directory.path().join("must-not-exist.pile");
-    let compass = compass::mcp::Compass::new(pile.clone(), None);
+    let goals = goals::mcp::Goals::new(pile.clone(), None);
     let message = message::mcp::Message::new(pile.clone(), None);
-    let wiki = wiki::mcp::Wiki::new(pile.clone(), None);
-    let mut server = Server::new(&[&compass, &message, &wiki]).unwrap();
+    let knowledge = knowledge::mcp::Knowledge::new(pile.clone(), None);
+    let mut server = Server::new(&[&goals, &message, &knowledge]).unwrap();
     initialize(&mut server);
     for (name, arguments) in [
-        (
-            "compass_add",
-            json!({"title": "task", "pile": "/forbidden"}),
-        ),
-        (
-            "compass_note",
-            json!({"id": "abcd", "note": ["not", "text"]}),
-        ),
+        ("goals_add", json!({"title": "task", "pile": "/forbidden"})),
+        ("goals_note", json!({"id": "abcd", "note": ["not", "text"]})),
         (
             "message_send",
             json!({"to": "bob", "text": "missing explicit sender"}),
@@ -228,11 +226,11 @@ fn invalid_cross_frontend_arguments_and_notifications_cannot_open_storage() {
             json!({"by": "bob", "from": "alice", "key": "/forbidden"}),
         ),
         (
-            "wiki_create",
+            "knowledge_create",
             json!({"title": "page", "content": "text", "path": "/forbidden"}),
         ),
-        ("wiki_export", json!({"id": "abcd", "exact": "true"})),
-        ("wiki_check", json!({"compile": true})),
+        ("knowledge_export", json!({"id": "abcd", "exact": "true"})),
+        ("knowledge_check", json!({"compile": true})),
     ] {
         let response = request(
             &mut server,
@@ -246,13 +244,13 @@ fn invalid_cross_frontend_arguments_and_notifications_cannot_open_storage() {
         assert!(!pile.exists());
     }
     for (name, arguments) in [
-        ("compass_add", json!({"title": "not published"})),
+        ("goals_add", json!({"title": "not published"})),
         (
             "message_send",
             json!({"from": "alice", "to": "bob", "text": "not sent"}),
         ),
         (
-            "wiki_create",
+            "knowledge_create",
             json!({"title": "not published", "content": "text"}),
         ),
     ] {

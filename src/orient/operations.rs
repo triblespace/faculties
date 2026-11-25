@@ -60,16 +60,16 @@ impl Default for WakeOptions {
 }
 /// A topic for the memory cover: among recollections of exactly the same
 /// span, the one closest to it is chosen (`memory context --about`); the
-/// topic also retrieves current Wiki readings, in an allowance of their own.
+/// topic also retrieves current Knowledge readings, in an allowance of their own.
 /// Renderers can reuse this scoring across size estimates for one launch.
 #[derive(Clone, Debug, Default)]
 pub struct WakeTint {
     pub about: String,
     pub scores: Option<HashMap<Id, f32>>,
-    /// Content-handle scores from the admitted journal and Wiki indexes.
+    /// Content-handle scores from the admitted journal and Knowledge indexes.
     #[cfg(feature = "wemm")]
     pub memory_contents: Option<std::sync::Arc<triblespace_search::nvfp4::ReconstructedCosines>>,
-    pub wiki_contents: Option<std::sync::Arc<Vec<(crate::schemas::wiki::TextHandle, f32)>>>,
+    pub knowledge_contents: Option<std::sync::Arc<Vec<(crate::schemas::wiki::TextHandle, f32)>>>,
     pub diagnostics: Vec<String>,
 }
 impl WakeTint {
@@ -91,7 +91,7 @@ pub struct WakePairsOptions {
     pub raw_memory: bool,
     pub doing_limit: usize,
     pub todo_limit: usize,
-    /// A task cue ranks alternative journal tellings and current Wiki pages.
+    /// A task cue ranks alternative journal tellings and current Knowledge pages.
     /// The two domains share one WeMM query when its index is available.
     pub about: Option<String>,
 }
@@ -222,7 +222,7 @@ impl Orient {
     ) -> Result<()> {
         self.wake_reporting(persona, options, true, out)
     }
-    /// The same wake selection and output without recording shown Compass
+    /// The same wake selection and output without recording shown Goals
     /// attention. This does not change memory/goal selection or source upkeep.
     pub fn wake_unpresented(
         &self,
@@ -300,7 +300,7 @@ impl Orient {
             .push("WeMM unavailable: this build has no WeMM support".into());
         tint
     }
-    /// `orient goals`: the Compass and Horizons sections of the wake, alone.
+    /// `orient goals`: the Goals and Horizons sections of the wake, alone.
     pub fn goals(&self, doing_limit: usize, todo_limit: usize, out: &mut Out<'_>) -> Result<()> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_goals(
@@ -434,7 +434,7 @@ use crate::collection_names::{open_configured, open_exact_in, open_workspace_rea
 use crate::memory_cover::{render_cover_report, CoverOpts};
 use crate::out::Out;
 use crate::schemas::archive::archive;
-use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
+use crate::schemas::compass::DEFAULT_SCOPE_ID as GOALS_SCOPE_ID;
 use crate::schemas::compass::{board, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::discord::{discord, DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID};
 use crate::schemas::files::file;
@@ -460,15 +460,15 @@ use crate::schemas::relations::{
     KIND_PERSON_PROFILE,
 };
 use crate::schemas::teams::{teams, DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID};
-use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use crate::schemas::wiki::DEFAULT_SCOPE_ID as KNOWLEDGE_SCOPE_ID;
 use crate::storage::FactView;
 use crate::storage::FacultySnapshot;
 #[cfg(test)]
 use crate::storage::{open_store, open_store_as, runtime};
 use crate::storage::{read, FactArchive, FacultyAccess, FacultyStore, Storage};
 use crate::{
-    clock, compass, discord as discord_model, habits, mail as mail_model, message,
-    orient as orient_model, relations, teams as teams_model, wiki as wiki_model,
+    clock, discord as discord_model, goals, habits, knowledge as knowledge_model,
+    mail as mail_model, message, orient as orient_model, relations, teams as teams_model,
 };
 use anybytes::{Bytes, View};
 use anyhow::{anyhow, bail, Context, Result};
@@ -626,9 +626,9 @@ impl RefreshProbe {
                 &current.facts.discord,
             ),
             (
-                "Compass",
-                previous.map(|p| &p.facts.compass),
-                &current.facts.compass,
+                "Goals",
+                previous.map(|p| &p.facts.goals),
+                &current.facts.goals,
             ),
             (
                 "Relations",
@@ -651,9 +651,9 @@ impl RefreshProbe {
             current.facts.presentations.collection.cover(),
         );
         self.cover(
-            "Compass status",
-            previous.map(|p| p.compass_status_collection.cover()),
-            current.compass_status_collection.cover(),
+            "Goals status",
+            previous.map(|p| p.goals_status_collection.cover()),
+            current.goals_status_collection.cover(),
         );
     }
 
@@ -777,10 +777,10 @@ fn fmt_id(id: Id) -> String {
 
 fn entity_tags(query: &OrientQuery<'_>, entity_id: Id) -> Result<Vec<String>> {
     let mut tags: Vec<String> = find!(
-        tag: compass::TextHandle,
-        pattern!(query.compass, [{ entity_id @ board::tag: ?tag }])
+        tag: goals::TextHandle,
+        pattern!(query.goals, [{ entity_id @ board::tag: ?tag }])
     )
-    .map(|tag| read_utf8(&query.payloads, tag, "Compass tag"))
+    .map(|tag| read_utf8(&query.payloads, tag, "Goals tag"))
     .collect::<Result<_>>()?;
     tags.sort();
     tags.dedup();
@@ -801,7 +801,7 @@ fn visible_notes(
     addressees: &HashSet<Id>,
     assigned_goals: &HashSet<Id>,
 ) -> Result<BTreeMap<Id, (Id, bool)>> {
-    let space = query.compass;
+    let space = query.goals;
     let mut notes = BTreeMap::new();
     for (note_id, goal_id) in find!(
         (note_id: Id, goal_id: Id),
@@ -1136,11 +1136,11 @@ struct OrientSources {
     mail: OrientSource,
     teams: OrientSource,
     discord: OrientSource,
-    compass: OrientSource,
+    goals: OrientSource,
     relations: OrientSource,
     habits: Option<OrientSource>,
     presentations: ReceiptSource,
-    compass_status: Collection<LwwRegisterBlob>,
+    goals_status: Collection<LwwRegisterBlob>,
     #[cfg(test)]
     observations: std::sync::atomic::AtomicUsize,
 }
@@ -1158,8 +1158,7 @@ impl OrientSources {
         let teams = OrientSource::open(routing, pile, signer, TEAMS_SCOPE_ID, "Teams").await?;
         let discord =
             OrientSource::open(routing, pile, signer, DISCORD_SCOPE_ID, "Discord").await?;
-        let compass =
-            OrientSource::open(routing, pile, signer, COMPASS_SCOPE_ID, "Compass").await?;
+        let goals = OrientSource::open(routing, pile, signer, GOALS_SCOPE_ID, "Goals").await?;
         let relations =
             OrientSource::open(routing, pile, signer, RELATIONS_SCOPE_ID, "Relations").await?;
         let habits = if include_habits {
@@ -1170,23 +1169,24 @@ impl OrientSources {
         let presentations = ReceiptSource::open(routing, pile, signer).await?;
         #[cfg(test)]
         pile.before_orient_status_registration()?;
-        let compass_status = compass::status_register_for_source(pile, compass.source).map_err(
-            |cause| OrientRegistrationError {
-                label: "Compass",
-                projection: "status register",
-                cause,
-            },
-        )?;
+        let goals_status =
+            goals::status_register_for_source(pile, goals.source).map_err(|cause| {
+                OrientRegistrationError {
+                    label: "Goals",
+                    projection: "status register",
+                    cause,
+                }
+            })?;
         Ok(Self {
             messages,
             mail,
             teams,
             discord,
-            compass,
+            goals,
             relations,
             habits,
             presentations,
-            compass_status,
+            goals_status,
             #[cfg(test)]
             observations: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -1218,7 +1218,7 @@ struct OrientFacts {
     mail: OrientFact,
     teams: OrientFact,
     discord: OrientFact,
-    compass: OrientFact,
+    goals: OrientFact,
     relations: OrientFact,
     habits: Option<OrientFact>,
     presentations: ReceiptObservation,
@@ -1240,8 +1240,8 @@ struct OrientObservation {
     /// views only ever depend on records in their own lineage.
     payloads: DependencyTracker,
     facts: OrientFacts,
-    compass_status: LwwQuery,
-    compass_status_collection: AttachedSnapshot<FacultySnapshot, LwwRegisterBlob>,
+    goals_status: LwwQuery,
+    goals_status_collection: AttachedSnapshot<FacultySnapshot, LwwRegisterBlob>,
 }
 
 impl OrientObservation {
@@ -1251,7 +1251,7 @@ impl OrientObservation {
             &self.facts.mail,
             &self.facts.teams,
             &self.facts.discord,
-            &self.facts.compass,
+            &self.facts.goals,
             &self.facts.relations,
         ]
         .into_iter()
@@ -1262,7 +1262,7 @@ impl OrientObservation {
                 .as_ref()
                 .is_none_or(|fact| fact.is_current(snapshot))
             && self.facts.presentations.is_current(snapshot)
-            && self.compass_status_collection.is_current(snapshot)
+            && self.goals_status_collection.is_current(snapshot)
             && StoreSnapshot::changes_for(
                 snapshot,
                 &self.snapshot,
@@ -1279,11 +1279,11 @@ impl OrientObservation {
             mail: self.facts.mail.view(),
             teams: self.facts.teams.view(),
             discord: self.facts.discord.view(),
-            compass: self.facts.compass.view(),
+            goals: self.facts.goals.view(),
             relations: self.facts.relations.view(),
             habits: self.facts.habits.as_ref().map(OrientFact::view),
             presentations: self.facts.presentations.view(),
-            compass_status: &self.compass_status,
+            goals_status: &self.goals_status,
             payloads: ObservedStore::with_tracker(
                 snapshot.clone(),
                 std::sync::Arc::clone(&self.payloads),
@@ -1305,7 +1305,7 @@ async fn maintain_inputs(
         Some(&sources.mail),
         Some(&sources.teams),
         Some(&sources.discord),
-        Some(&sources.compass),
+        Some(&sources.goals),
         Some(&sources.relations),
         sources.habits.as_ref(),
     ]
@@ -1315,10 +1315,10 @@ async fn maintain_inputs(
         source.maintain(pile, signer).await?;
     }
     #[cfg(test)]
-    pile.before_orient_maintenance("Compass status", "maintain register")?;
-    crate::storage::tolerate_own_lag(pile.maintain_attached(sources.compass_status, signer).await)
+    pile.before_orient_maintenance("Goals status", "maintain register")?;
+    crate::storage::tolerate_own_lag(pile.maintain_attached(sources.goals_status, signer).await)
         .map_err(|cause| OrientMaintenanceError {
-            label: "Compass",
+            label: "Goals",
             projection: "status register",
             cause,
         })?;
@@ -1347,7 +1347,7 @@ fn observe_sources(
     let mail = sources.mail.observe(&snapshot)?;
     let teams = sources.teams.observe(&snapshot)?;
     let discord = sources.discord.observe(&snapshot)?;
-    let compass = sources.compass.observe(&snapshot)?;
+    let goals = sources.goals.observe(&snapshot)?;
     let relations = sources.relations.observe(&snapshot)?;
     let habits = sources
         .habits
@@ -1358,18 +1358,18 @@ fn observe_sources(
     // Positive known-winner membership is an ordinary relation over the
     // same foundations the facts read: a status no attachment reaches yet is
     // built in memory, so the register never answers for less than the facts.
-    let status_collection = trace_refresh_call("Compass status", "attach", || {
-        snapshot.attached(sources.compass_status)
+    let status_collection = trace_refresh_call("Goals status", "attach", || {
+        snapshot.attached(sources.goals_status)
     })
-    .map_err(|error| anyhow!("observe Compass status register: {error}"))?;
-    let status_index = trace_refresh_call("Compass status", "view", || {
+    .map_err(|error| anyhow!("observe Goals status register: {error}"))?;
+    let status_index = trace_refresh_call("Goals status", "view", || {
         status_collection
             .read::<LwwIndex>()
             .map(|read| read.into_value())
     })
-    .map_err(|error| anyhow!("read Compass status register: {error}"))?;
-    let compass_status = trace_refresh_call("Compass status", "query", || status_index.query())
-        .map_err(|error| anyhow!("prepare Compass status register query: {error}"))?;
+    .map_err(|error| anyhow!("read Goals status register: {error}"))?;
+    let goals_status = trace_refresh_call("Goals status", "query", || status_index.query())
+        .map_err(|error| anyhow!("prepare Goals status register query: {error}"))?;
     Ok(OrientObservation {
         snapshot,
         payloads: DependencyTracker::default(),
@@ -1378,13 +1378,13 @@ fn observe_sources(
             mail,
             teams,
             discord,
-            compass,
+            goals,
             relations,
             habits,
             presentations,
         },
-        compass_status,
-        compass_status_collection: status_collection,
+        goals_status,
+        goals_status_collection: status_collection,
     })
 }
 
@@ -1442,12 +1442,12 @@ fn start_observation(
         sources.mail,
         sources.teams,
         sources.discord,
-        sources.compass,
+        sources.goals,
         sources.relations,
     ];
     let habits = sources.habits;
     let receipts_target = sources.presentations.rank9;
-    let status_target = sources.compass_status;
+    let status_target = sources.goals_status;
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let mut reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
@@ -1471,7 +1471,7 @@ fn start_observation(
                 view,
             })
         };
-        let [messages, mail, teams, discord, compass, relations] = fact_sources;
+        let [messages, mail, teams, discord, goals, relations] = fact_sources;
         let presentations = trace_refresh_call("Orient receipts", "attach", || {
             reader.attached(receipts_target)
         })?
@@ -1490,10 +1490,10 @@ fn start_observation(
                 ),
             ])
         };
-        let status_collection = trace_refresh_call("Compass status", "attach", || {
+        let status_collection = trace_refresh_call("Goals status", "attach", || {
             reader.attached_acquiring(status_target)
         })?;
-        let status_index = trace_refresh_call("Compass status", "view", || {
+        let status_index = trace_refresh_call("Goals status", "view", || {
             crate::storage::require_complete_attached_read(
                 status_collection.read_acquiring::<LwwIndex>()?,
             )
@@ -1506,7 +1506,7 @@ fn start_observation(
                 mail: observe(mail)?,
                 teams: observe(teams)?,
                 discord: observe(discord)?,
-                compass: observe(compass)?,
+                goals: observe(goals)?,
                 relations: observe(relations)?,
                 habits: habits.map(observe).transpose()?,
                 presentations: ReceiptObservation {
@@ -1514,8 +1514,8 @@ fn start_observation(
                     view: presentation_view,
                 },
             },
-            compass_status: trace_refresh_call("Compass status", "query", || status_index.query())?,
-            compass_status_collection: status_collection.into_frozen(),
+            goals_status: trace_refresh_call("Goals status", "query", || status_index.query())?,
+            goals_status_collection: status_collection.into_frozen(),
         })
     })
 }
@@ -1536,49 +1536,49 @@ struct OrientQuery<'a> {
     mail: &'a FactArchive,
     teams: &'a FactArchive,
     discord: &'a FactArchive,
-    compass: &'a FactArchive,
+    goals: &'a FactArchive,
     relations: &'a FactArchive,
     habits: Option<&'a FactArchive>,
     presentations: &'a FactArchive,
-    compass_status: &'a LwwQuery,
+    goals_status: &'a LwwQuery,
     /// The reader every payload is read through: the current snapshot, with
     /// each consultation charged to the observation's read-set.
     payloads: ObservedStore<FacultySnapshot>,
 }
 
-/// Only the admitted Compass sources its overview actually reads.
-struct CompassQuery<'a> {
-    compass: &'a FactArchive,
-    compass_status: &'a LwwQuery,
+/// Only the admitted Goals sources its overview actually reads.
+struct GoalsQuery<'a> {
+    goals: &'a FactArchive,
+    goals_status: &'a LwwQuery,
     payloads: ObservedStore<FacultySnapshot>,
 }
 
 impl OrientQuery<'_> {
-    fn goals(&self) -> CompassQuery<'_> {
-        CompassQuery {
-            compass: self.compass,
-            compass_status: self.compass_status,
+    fn goals(&self) -> GoalsQuery<'_> {
+        GoalsQuery {
+            goals: self.goals,
+            goals_status: self.goals_status,
             payloads: self.payloads.clone(),
         }
     }
 }
 
-struct CompassSources {
+struct GoalsSources {
     facts: OrientSource,
     status: Collection<LwwRegisterBlob>,
 }
 
-impl CompassSources {
+impl GoalsSources {
     async fn prepare(
         routing: &Storage,
         store: &mut FacultyStore,
         signer: &SigningKey,
     ) -> Result<Self> {
-        let facts = OrientSource::open(routing, store, signer, COMPASS_SCOPE_ID, "Compass").await?;
-        let status = compass::status_register_for_source(store, facts.source)?;
+        let facts = OrientSource::open(routing, store, signer, GOALS_SCOPE_ID, "Goals").await?;
+        let status = goals::status_register_for_source(store, facts.source)?;
         facts.maintain(store, signer).await?;
         crate::storage::tolerate_own_lag(store.maintain_attached(status, signer).await)
-            .context("maintain Compass status register")?;
+            .context("maintain Goals status register")?;
         Ok(Self { facts, status })
     }
 
@@ -1602,14 +1602,14 @@ impl CompassSources {
             Ok::<_, anyhow::Error>((facts, index.query()?))
         })
         .await
-        .context("join frozen Compass selection")??;
+        .context("join frozen Goals selection")??;
         crate::storage::read_presentable(store, snapshot, |reader, unreadable| {
-            let query = CompassQuery {
-                compass: &facts,
-                compass_status: &status,
+            let query = GoalsQuery {
+                goals: &facts,
+                goals_status: &status,
                 payloads: ObservedStore::new(reader.clone()),
             };
-            let (mut goals, _) = render_native_compass_goals(&query, doing, todo, unreadable)?;
+            let (mut goals, _) = render_native_goals_goals(&query, doing, todo, unreadable)?;
             goals.push_str(&render_native_horizons(&query, unreadable)?);
             Ok(goals)
         })
@@ -2011,13 +2011,13 @@ fn unread_messages(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<NativeMes
     Ok(rows)
 }
 
-fn native_task_title(query: &CompassQuery<'_>, task: Id) -> Result<String> {
+fn native_task_title(query: &GoalsQuery<'_>, task: Id) -> Result<String> {
     find!(
-        handle: compass::TextHandle,
-        pattern!(query.compass, [{ task @ board::title: ?handle }])
+        handle: goals::TextHandle,
+        pattern!(query.goals, [{ task @ board::title: ?handle }])
     )
     .next()
-    .map(|handle| read_utf8(&query.payloads, handle, "Compass title"))
+    .map(|handle| read_utf8(&query.payloads, handle, "Goals title"))
     .transpose()
     .map(|title| title.unwrap_or_default())
 }
@@ -2979,54 +2979,54 @@ fn render_native_mail(
 }
 
 fn latest_goal_status(
-    query: &CompassQuery<'_>,
+    query: &GoalsQuery<'_>,
     goal: Id,
 ) -> Result<Option<(Id, String, IntervalValue)>> {
     find!(
-        (event: Id, status: compass::TextHandle, at: IntervalValue),
+        (event: Id, status: goals::TextHandle, at: IntervalValue),
         and!(
-            pattern!(query.compass, [{ ?event @
+            pattern!(query.goals, [{ ?event @
                 metadata::tag: &KIND_STATUS_ID,
                 board::status_of: &goal,
                 board::status: ?status,
                 metadata::created_at: ?at,
             }]),
-            query.compass_status.has(event),
+            query.goals_status.has(event),
         )
     )
     .next()
     .map(|(event, status, at)| {
         Ok((
             event,
-            read_utf8(&query.payloads, status, "Compass status")?,
+            read_utf8(&query.payloads, status, "Goals status")?,
             at,
         ))
     })
     .transpose()
 }
 
-/// The Compass section of `orient wake`, `orient goals` and `orient show`.
+/// The Goals section of `orient wake`, `orient goals` and `orient show`.
 ///
 /// A payload read that `unreadable` accepts (one that cannot be had in this
 /// observation) costs only what depends on it, and is said in the section: a
 /// goal whose winning status text is unreadable cannot be placed in Doing or
 /// Todo and is named under "Not placed"; an unreadable title or tag is shown
 /// as unreadable on the goal's row. Any other error still fails the section.
-fn render_native_compass_goals(
-    query: &CompassQuery<'_>,
+fn render_native_goals_goals(
+    query: &GoalsQuery<'_>,
     doing_limit: usize,
     todo_limit: usize,
     unreadable: &crate::storage::Unreadable<'_>,
 ) -> Result<(String, BTreeSet<Id>)> {
     use std::fmt::Write as _;
 
-    let goals = ids_of_kind(query.compass, KIND_GOAL_ID);
-    // The same priority relation the Compass board reads: the current
+    let goals = ids_of_kind(query.goals, KIND_GOAL_ID);
+    // The same priority relation the Goals board reads: the current
     // priority snapshots, plus child before parent. A cycle shares the final tier; the board notes it, wake does
     // not repeat that here.
-    let ranks = compass::priority_ranks(
+    let ranks = goals::priority_ranks(
         goals.iter().copied(),
-        &compass::goal_priority_edges(query.compass),
+        &goals::goal_priority_edges(query.goals),
     );
     let mut doing = Vec::<(usize, i128, Id, Option<Id>)>::new();
     let mut todo = Vec::<(usize, i128, Id, Option<Id>)>::new();
@@ -3050,7 +3050,7 @@ fn render_native_compass_goals(
             .unwrap_or_else(|| (None, "todo".to_owned(), None));
         let created = find!(
             at: IntervalValue,
-            pattern!(query.compass, [{ task @ metadata::created_at: ?at }])
+            pattern!(query.goals, [{ task @ metadata::created_at: ?at }])
         )
         .filter_map(interval_key)
         .min()
@@ -3083,7 +3083,7 @@ fn render_native_compass_goals(
         }
     };
     let row = |task: Id| goal_row(query, task, unreadable, None);
-    writeln!(out, "Compass:").unwrap();
+    writeln!(out, "Goals:").unwrap();
     if doing.is_empty() && todo.is_empty() {
         writeln!(out, "- No goals.").unwrap();
         not_placed(&mut out);
@@ -3129,7 +3129,7 @@ fn render_native_compass_goals(
 /// `unreadable` accepts is said on the row; any other error fails it. `skip`
 /// leaves one tag out, for a section that already names it.
 fn goal_row(
-    query: &CompassQuery<'_>,
+    query: &GoalsQuery<'_>,
     task: Id,
     unreadable: &crate::storage::Unreadable<'_>,
     skip: Option<&str>,
@@ -3146,10 +3146,10 @@ fn goal_row(
     let mut tags = Vec::new();
     let mut unread = Vec::new();
     for handle in find!(
-        tag: compass::TextHandle,
-        pattern!(query.compass, [{ task @ board::tag: ?tag }])
+        tag: goals::TextHandle,
+        pattern!(query.goals, [{ task @ board::tag: ?tag }])
     ) {
-        match read_utf8(&query.payloads, handle, "Compass tag") {
+        match read_utf8(&query.payloads, handle, "Goals tag") {
             Ok(tag) if Some(tag.as_str()) == skip => {}
             Ok(tag) => tags.push(tag),
             Err(error) => match unreadable(&error) {
@@ -3175,10 +3175,10 @@ const HORIZON_TAG: &str = "horizon";
 /// When a goal last moved: its newest status event or note, whatever the
 /// event's status word. A goal with neither falls back to its creation time;
 /// `None` when no time on it decodes.
-fn goal_last_moved(query: &CompassQuery<'_>, goal: Id) -> Option<i128> {
+fn goal_last_moved(query: &GoalsQuery<'_>, goal: Id) -> Option<i128> {
     find!(
         at: IntervalValue,
-        pattern!(query.compass, [{ _?event @
+        pattern!(query.goals, [{ _?event @
             metadata::tag: &KIND_STATUS_ID,
             board::status_of: &goal,
             metadata::created_at: ?at,
@@ -3186,7 +3186,7 @@ fn goal_last_moved(query: &CompassQuery<'_>, goal: Id) -> Option<i128> {
     )
     .chain(find!(
         at: IntervalValue,
-        pattern!(query.compass, [{ _?event @
+        pattern!(query.goals, [{ _?event @
             metadata::tag: &KIND_NOTE_ID,
             board::task: &goal,
             metadata::created_at: ?at,
@@ -3196,7 +3196,7 @@ fn goal_last_moved(query: &CompassQuery<'_>, goal: Id) -> Option<i128> {
     // `board::task`; they are still movements.
     .chain(find!(
         at: IntervalValue,
-        pattern!(query.compass, [{ _?event @
+        pattern!(query.goals, [{ _?event @
             metadata::tag: &KIND_STATUS_ID,
             board::task: &goal,
             metadata::created_at: ?at,
@@ -3207,7 +3207,7 @@ fn goal_last_moved(query: &CompassQuery<'_>, goal: Id) -> Option<i128> {
     .or_else(|| {
         find!(
             at: IntervalValue,
-            pattern!(query.compass, [{ goal @ metadata::created_at: ?at }])
+            pattern!(query.goals, [{ goal @ metadata::created_at: ?at }])
         )
         .filter_map(interval_key)
         .min()
@@ -3238,7 +3238,7 @@ fn moved_ago(now: i128, at: Option<i128>) -> String {
 /// are shown. With none, the section is the empty string, not an empty
 /// header. A status that cannot be read is said rather than guessed at.
 fn render_native_horizons(
-    query: &CompassQuery<'_>,
+    query: &GoalsQuery<'_>,
     unreadable: &crate::storage::Unreadable<'_>,
 ) -> Result<String> {
     use std::fmt::Write as _;
@@ -3247,7 +3247,7 @@ fn render_native_horizons(
     let mut unplaced = Vec::<String>::new();
     for goal in find!(
         goal: Id,
-        pattern!(query.compass, [{ ?goal @
+        pattern!(query.goals, [{ ?goal @
             metadata::tag: &KIND_GOAL_ID,
             board::tag: HORIZON_TAG,
         }])
@@ -3968,7 +3968,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
     let assignment_keys = persona_keys(query, persona_id)?;
 
     let mut assigned_goals = HashSet::new();
-    for id in find!(id: Id, pattern!(query.compass, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
+    for id in find!(id: Id, pattern!(query.goals, [{ ?id @ metadata::tag: &KIND_GOAL_ID }])) {
         let assigned = entity_tags(query, id)?
             .iter()
             .any(|tag| assignment_keys.contains(&tag.to_ascii_lowercase()));
@@ -3980,7 +3980,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
             Some((event, status, _)) => {
                 let authored = exists!((by: Id), and!(
                     own_identities.has(by),
-                    pattern!(query.compass, [{ event @ board::by: ?by }])
+                    pattern!(query.goals, [{ event @ board::by: ?by }])
                 ));
                 if !authored {
                     view.insert(AttentionEvent::Goal {
@@ -3998,14 +3998,14 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
         }
     }
 
-    // A goal has no author of its own: `compass add` attributes the status
+    // A goal has no author of its own: `goals add` attributes the status
     // event it writes at the goal's creation time, so that event's actor is
     // the goal's author.
     for (goal, _) in find!(
         (goal: Id, target: Id),
         and!(
             addressees.has(target),
-            pattern!(query.compass, [{ ?goal @
+            pattern!(query.goals, [{ ?goal @
                 metadata::tag: &KIND_GOAL_ID,
                 board::mention: ?target,
             }])
@@ -4013,7 +4013,7 @@ fn load_attention_view(query: &OrientQuery<'_>, persona_id: Id) -> Result<Attent
     ) {
         let own_goal = exists!((by: Id), and!(
             own_identities.has(by),
-            pattern!(query.compass, [
+            pattern!(query.goals, [
                 { goal @ metadata::created_at: _?at },
                 { _?event @
                     metadata::tag: &KIND_STATUS_ID,
@@ -4207,9 +4207,7 @@ async fn cmd_show(
                 // Show has its own pending path for a missing payload; it
                 // stays strict here.
                 let (goals, goal_events) =
-                    render_native_compass_goals(&query.goals(), doing_limit, todo_limit, &|_| {
-                        None
-                    })?;
+                    render_native_goals_goals(&query.goals(), doing_limit, todo_limit, &|_| None)?;
                 let shown = match persona_id {
                     Some(persona) => {
                         let candidates: BTreeSet<_> =
@@ -4365,7 +4363,7 @@ fn news_report_entry(
 /// Longest preview one `News:` line may carry from a stored body.
 ///
 /// News is an attention channel an agent reads a line at a time, so a bounded
-/// first line is the whole point: the body stays in Compass instead of being
+/// first line is the whole point: the body stays in Goals instead of being
 /// re-delivered on every wake.
 const NEWS_PREVIEW_CHARS: usize = 96;
 
@@ -4374,8 +4372,8 @@ const NEWS_TITLE_CHARS: usize = 72;
 
 /// Short, still-actionable form of an id for a News line.
 ///
-/// Compass resolves hex prefixes (`resolve_id_prefix`), so eight characters
-/// remain a usable argument to `compass show`/`move`/`note` at a quarter of the
+/// Goals resolves hex prefixes (`resolve_id_prefix`), so eight characters
+/// remain a usable argument to `goals show`/`move`/`note` at a quarter of the
 /// tokens a full id costs. The full id is printed wherever no human-readable
 /// name accompanies it, because there an exact id is the only thing the reader
 /// can act on.
@@ -4406,7 +4404,7 @@ fn clip_line(text: &str, limit: usize) -> Option<String> {
 /// error instead would turn a decorative body into a `MissingBlob`, and
 /// `prepare_news_once` treats that as a pending payload — withholding the whole
 /// report over text the reader never had before.
-fn news_text(query: &OrientQuery<'_>, handle: compass::TextHandle, label: &str) -> Option<String> {
+fn news_text(query: &OrientQuery<'_>, handle: goals::TextHandle, label: &str) -> Option<String> {
     read_utf8(&query.payloads, handle, label).ok()
 }
 
@@ -4418,11 +4416,11 @@ fn news_text(query: &OrientQuery<'_>, handle: compass::TextHandle, label: &str) 
 /// would be strictly less useful than the identifier it replaced.
 fn news_goal_name(query: &OrientQuery<'_>, goal: Id) -> String {
     let title = find!(
-        handle: compass::TextHandle,
-        pattern!(query.compass, [{ goal @ board::title: ?handle }])
+        handle: goals::TextHandle,
+        pattern!(query.goals, [{ goal @ board::title: ?handle }])
     )
     .next()
-    .and_then(|handle| news_text(query, handle, "Compass title"))
+    .and_then(|handle| news_text(query, handle, "Goals title"))
     .and_then(|title| clip_line(&title, NEWS_TITLE_CHARS));
     match title {
         Some(title) => format!("[{}] \"{title}\"", fmt_short_id(goal)),
@@ -4435,7 +4433,7 @@ fn news_goal_name(query: &OrientQuery<'_>, goal: Id) -> String {
 /// `board::by` is optional attribution with no workflow semantics, so an absent
 /// author simply drops the clause.
 fn news_actor(query: &OrientQuery<'_>, event: Id) -> String {
-    find!(by: Id, pattern!(query.compass, [{ event @ board::by: ?by }]))
+    find!(by: Id, pattern!(query.goals, [{ event @ board::by: ?by }]))
         .next()
         .and_then(|by| read_native_person_label(query, by).ok())
         .map(|label| format!(" by {label}"))
@@ -4449,9 +4447,9 @@ fn news_actor(query: &OrientQuery<'_>, event: Id) -> String {
 /// named here is the state the winning event replaced. `None` for a goal whose
 /// first status this is.
 fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Option<String> {
-    let mut events: Vec<(i128, Id, compass::TextHandle)> = find!(
-        (event: Id, status: compass::TextHandle, at: IntervalValue),
-        pattern!(query.compass, [{ ?event @
+    let mut events: Vec<(i128, Id, goals::TextHandle)> = find!(
+        (event: Id, status: goals::TextHandle, at: IntervalValue),
+        pattern!(query.goals, [{ ?event @
             metadata::tag: &KIND_STATUS_ID,
             board::status_of: &goal,
             board::status: ?status,
@@ -4464,7 +4462,7 @@ fn previous_goal_status(query: &OrientQuery<'_>, goal: Id, current: Id) -> Optio
     let position = events.iter().position(|(_, event, _)| *event == current)?;
     events[..position]
         .last()
-        .and_then(|(_, _, status)| read_utf8(&query.payloads, *status, "Compass status").ok())
+        .and_then(|(_, _, status)| read_utf8(&query.payloads, *status, "Goals status").ok())
 }
 
 /// The `News:` line for one attention event, carrying the content the reader
@@ -4530,11 +4528,11 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             let mentions = if *mention { " mentions you" } else { "" };
             let note = *note;
             let preview = find!(
-                handle: compass::TextHandle,
-                pattern!(query.compass, [{ note @ board::note: ?handle }])
+                handle: goals::TextHandle,
+                pattern!(query.goals, [{ note @ board::note: ?handle }])
             )
             .next()
-            .and_then(|handle| news_text(query, handle, "Compass note"))
+            .and_then(|handle| news_text(query, handle, "note"))
             .and_then(|body| clip_line(&body, NEWS_PREVIEW_CHARS))
             .map(|body| format!(": {body}"))
             .unwrap_or_default();
@@ -4544,7 +4542,7 @@ fn news_line(query: &OrientQuery<'_>, event: &AttentionEvent) -> String {
             let goal = *goal;
             let actor = find!(
                 by: Id,
-                pattern!(query.compass, [
+                pattern!(query.goals, [
                     { goal @ metadata::created_at: _?at },
                     { _?event @
                         metadata::tag: &KIND_STATUS_ID,
@@ -6310,11 +6308,11 @@ struct WakeSelection {
     /// The memory cover: the charged text, its structured entries, and the
     /// diagnostics kept outside the charged text.
     cover: crate::memory_cover::CoverReport,
-    /// Cover-tagged Wiki beliefs, ordered by title then revision id, and
+    /// Cover-tagged Knowledge beliefs, ordered by title then revision id, and
     /// what could not be read for them.
-    beliefs: Option<wiki_model::CoverBeliefs>,
-    topic: wiki_model::recall::TopicReadings,
-    /// The Compass section exactly as `orient goals` prints it.
+    beliefs: Option<knowledge_model::CoverBeliefs>,
+    topic: knowledge_model::recall::TopicReadings,
+    /// The Goals section exactly as `orient goals` prints it.
     goals: String,
     /// Presentations to record: only for a persona, and only after output.
     presented: Option<(Collection<SimpleArchive>, Vec<Id>)>,
@@ -6334,11 +6332,11 @@ async fn wake_selection(
     // Register and maintain authorized inputs before freezing one query
     // boundary. Plain wake still never consults Embeddings.
     enum GoalSources {
-        Overview(CompassSources),
+        Overview(GoalsSources),
         Attention(OrientSources),
     }
     let goals_source = if cover_opts.about.is_some() && persona.is_none() {
-        GoalSources::Overview(CompassSources::prepare(routing, storage, signer).await?)
+        GoalSources::Overview(GoalsSources::prepare(routing, storage, signer).await?)
     } else {
         let sources = OrientSources::open(routing, storage, signer, false).await?;
         maintain_inputs(storage, signer, &sources).await?;
@@ -6347,27 +6345,28 @@ async fn wake_selection(
     let memory_collection =
         OrientSource::open(routing, storage, signer, MEMORY_SCOPE_ID, "Memory").await?;
     let topic = cover_opts.about.as_deref().map(str::trim).filter(|cue| {
-        !cue.is_empty() && cover_opts.budget_chars > wiki_model::recall::HEADING.len() * 2
+        !cue.is_empty() && cover_opts.budget_chars > knowledge_model::recall::HEADING.len() * 2
     });
     let topic_wanted = topic.is_some();
     memory_collection.maintain(storage, signer).await?;
-    // A worker can recall its journal in a workspace without a Wiki role.
+    // A worker can recall its journal in a workspace without a Knowledge role.
     // When a role is present its exact READ admission still applies.
-    let wiki_omitted = cover_opts.about.is_some()
+    let knowledge_omitted = cover_opts.about.is_some()
         && routing
             .collection_routes()
-            .is_some_and(|routes| !routes.contains_key(&WIKI_SCOPE_ID));
-    let wiki_inputs = if wiki_omitted {
+            .is_some_and(|routes| !routes.contains_key(&KNOWLEDGE_SCOPE_ID));
+    let knowledge_inputs = if knowledge_omitted {
         None
     } else {
-        let wiki = OrientSource::open(routing, storage, signer, WIKI_SCOPE_ID, "Wiki").await?;
-        let latest = wiki_model::latest_for_source(storage, wiki.source)
-            .context("register Wiki supersession index")?;
-        let index = topic.map(|_| wiki_model::recall::topic_index(storage, wiki.source));
-        wiki.maintain(storage, signer).await?;
+        let knowledge =
+            OrientSource::open(routing, storage, signer, KNOWLEDGE_SCOPE_ID, "Knowledge").await?;
+        let latest = knowledge_model::latest_for_source(storage, knowledge.source)
+            .context("register Knowledge supersession index")?;
+        let index = topic.map(|_| knowledge_model::recall::topic_index(storage, knowledge.source));
+        knowledge.maintain(storage, signer).await?;
         crate::storage::tolerate_own_lag(storage.maintain_attached(latest, signer).await)
-            .context("maintain Wiki supersession index")?;
-        Some((wiki.rank9, latest, index))
+            .context("maintain Knowledge supersession index")?;
+        Some((knowledge.rank9, latest, index))
     };
     let snapshot = storage
         .snapshot()
@@ -6377,31 +6376,35 @@ async fn wake_selection(
     // shows afterward must not impose a historical receipt-read barrier.
     let frozen = snapshot.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (memory_facts, wiki_view, topic_read) = tokio::task::spawn_blocking(move || {
+    let (memory_facts, knowledge_view, topic_read) = tokio::task::spawn_blocking(move || {
         let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
         let memory_facts = crate::storage::acquire_facts(&reader, memory_collection.rank9)
             .context("read selected Memory collection")?;
-        let Some((wiki_rank9, wiki_latest, topic_index)) = wiki_inputs else {
+        let Some((knowledge_rank9, knowledge_latest, topic_index)) = knowledge_inputs else {
             return Ok((memory_facts, None, None));
         };
-        let wiki_facts = crate::storage::acquire_facts(&reader, wiki_rank9)
-            .context("read selected Wiki collection")?;
-        let wiki_order = crate::storage::require_complete_attached_read(
+        let knowledge_facts = crate::storage::acquire_facts(&reader, knowledge_rank9)
+            .context("read selected Knowledge collection")?;
+        let knowledge_order = crate::storage::require_complete_attached_read(
             reader
-                .attached_acquiring(wiki_latest)?
+                .attached_acquiring(knowledge_latest)?
                 .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
         )
-        .context("read selected Wiki supersession index")?;
+        .context("read selected Knowledge supersession index")?;
         // As in Archive search, keep a bounded part of a cold index. Later reads
         // reuse those MAPs and ordinary collection maintenance can finish it.
         let topic_read = topic_index.map(|target| -> Result<_> {
             Ok(reader
                 .attached_acquiring(target?)?
-                .read_within::<wiki_model::recall::TopicIndex>(
+                .read_within::<knowledge_model::recall::TopicIndex>(
                     crate::archive_collection::SEARCH_BUILD_BUDGET,
                 )?)
         });
-        Ok::<_, anyhow::Error>((memory_facts, Some((wiki_facts, wiki_order)), topic_read))
+        Ok::<_, anyhow::Error>((
+            memory_facts,
+            Some((knowledge_facts, knowledge_order)),
+            topic_read,
+        ))
     })
     .await
     .context("join frozen wake input selection")??;
@@ -6414,15 +6417,16 @@ async fn wake_selection(
         };
         diagnostics.push(format!("Journal scorer for alternative tellings: {scorer}"));
     }
-    if wiki_omitted {
-        diagnostics.push("Wiki recall unavailable: this workspace has no Wiki role".to_owned());
+    if knowledge_omitted {
+        diagnostics
+            .push("Knowledge recall unavailable: this workspace has no Knowledge role".to_owned());
     }
-    let semantic = tint.and_then(|t| t.wiki_contents.as_deref());
+    let semantic = tint.and_then(|t| t.knowledge_contents.as_deref());
     let lexical = match (topic, topic_read) {
         (Some(topic), Some(Ok(index))) => {
             if !index.unread().is_empty() {
                 diagnostics.push(format!(
-                    "Wiki topic index: {} source commits pending",
+                    "Knowledge topic index: {} source commits pending",
                     index.unread().len()
                 ));
             }
@@ -6431,18 +6435,18 @@ async fn wake_selection(
                     crate::storage::tolerate_own_lag(storage.keep_attached(index.built(), signer))
                 {
                     diagnostics.push(format!(
-                        "Wiki topic index images were not retained: {error}"
+                        "Knowledge topic index images were not retained: {error}"
                     ));
                 }
             }
             let index = index.into_value();
             let needs_postings = match semantic {
-                Some(cosines) => wiki_model::recall::has_unscored_terms(&index, cosines)?,
+                Some(cosines) => knowledge_model::recall::has_unscored_terms(&index, cosines)?,
                 None => true,
             };
             if needs_postings {
-                wiki_model::recall::ranked_bodies(&index, topic).unwrap_or_else(|error| {
-                    diagnostics.push(format!("Wiki topic ranking unavailable: {error:#}"));
+                knowledge_model::recall::ranked_bodies(&index, topic).unwrap_or_else(|error| {
+                    diagnostics.push(format!("Knowledge topic ranking unavailable: {error:#}"));
                     Vec::new()
                 })
             } else {
@@ -6452,7 +6456,7 @@ async fn wake_selection(
             }
         }
         (_, Some(Err(error))) => {
-            diagnostics.push(format!("Wiki topic index unavailable: {error:#}"));
+            diagnostics.push(format!("Knowledge topic index unavailable: {error:#}"));
             Vec::new()
         }
         _ => Vec::new(),
@@ -6461,7 +6465,7 @@ async fn wake_selection(
         (Some(_), Some(cosines)) => {
             let mut supplements: std::collections::BTreeMap<_, _> = lexical
                 .into_iter()
-                .take(wiki_model::recall::MAX_INDEX_HITS)
+                .take(knowledge_model::recall::MAX_INDEX_HITS)
                 .collect();
             for (body, _) in cosines.iter() {
                 supplements.remove(body);
@@ -6469,8 +6473,8 @@ async fn wake_selection(
                     break;
                 }
             }
-            let mut scored = wiki_model::recall::semantic_bodies(cosines);
-            diagnostics.push(format!("Wiki topic scorer: WeMM, {} indexed content handles; {} lexical matches without semantic rows",
+            let mut scored = knowledge_model::recall::semantic_bodies(cosines);
+            diagnostics.push(format!("Knowledge topic scorer: WeMM, {} indexed content handles; {} lexical matches without semantic rows",
                 cosines.len(), supplements.len()));
             if !supplements.is_empty() {
                 scored.extend(supplements);
@@ -6478,22 +6482,22 @@ async fn wake_selection(
             }
             scored
         }
-        (Some(_), None) if !wiki_omitted => {
-            diagnostics.push("Wiki topic scorer: lexical BM25".into());
+        (Some(_), None) if !knowledge_omitted => {
+            diagnostics.push("Knowledge topic scorer: lexical BM25".into());
             lexical
         }
         _ => Vec::new(),
     };
     let (beliefs, mut topic) =
         crate::storage::read_presentable(storage, &snapshot, |reader, unreadable| {
-            let Some((wiki_facts, wiki_order)) = &wiki_view else {
+            let Some((knowledge_facts, knowledge_order)) = &knowledge_view else {
                 return Ok((None, Default::default()));
             };
             if cover_opts.about.is_some() {
-                let pages = wiki_model::recall::TopicReadings::select(
+                let pages = knowledge_model::recall::TopicReadings::select(
                     reader,
-                    wiki_facts,
-                    wiki_order,
+                    knowledge_facts,
+                    knowledge_order,
                     &ranked,
                     &cover_opts,
                     unreadable,
@@ -6501,8 +6505,11 @@ async fn wake_selection(
                 Ok((None, pages))
             } else {
                 Ok((
-                    Some(wiki_model::cover_fragments(
-                        reader, wiki_facts, wiki_order, unreadable,
+                    Some(knowledge_model::cover_fragments(
+                        reader,
+                        knowledge_facts,
+                        knowledge_order,
+                        unreadable,
                     )?),
                     Default::default(),
                 ))
@@ -6511,9 +6518,9 @@ async fn wake_selection(
         .await?;
     if topic_wanted {
         diagnostics.push(format!(
-            "Wiki readings: {} of up to {} characters, beside the memory cover's own budget",
+            "Knowledge readings: {} of up to {} characters, beside the memory cover's own budget",
             topic.charge,
-            wiki_model::recall::readings_allowance(cover_opts.budget_chars)
+            knowledge_model::recall::readings_allowance(cover_opts.budget_chars)
         ));
     }
     let mut cover = read(storage, &snapshot, |reader| {
@@ -6546,12 +6553,8 @@ async fn wake_selection(
 
             crate::storage::read_presentable(storage, &snapshot, |reader, unreadable| {
                 let query = observation.query(reader);
-                let (mut goals, shown) = render_native_compass_goals(
-                    &query.goals(),
-                    doing_limit,
-                    todo_limit,
-                    unreadable,
-                )?;
+                let (mut goals, shown) =
+                    render_native_goals_goals(&query.goals(), doing_limit, todo_limit, unreadable)?;
                 // Horizons follow Doing and Todo. They are an overview, not
                 // attention events, so nothing here is recorded as presented.
                 goals.push_str(&render_native_horizons(&query.goals(), unreadable)?);
@@ -6574,8 +6577,8 @@ async fn wake_selection(
             })
             .await?
         }
-        GoalSources::Overview(compass) => (
-            compass
+        GoalSources::Overview(goals) => (
+            goals
                 .overview(storage, &snapshot, doing_limit, todo_limit)
                 .await?,
             None,
@@ -6592,7 +6595,7 @@ async fn wake_selection(
 
 /// `orient wake` — assemble the full wake bundle a fresh face reads to come
 /// into itself: the memory cover (coarse → fine over ALL memories), then the
-/// cover-tagged wiki beliefs (the ambient always-true set), then the compass
+/// cover-tagged knowledge beliefs (the ambient always-true set), then the goals
 /// goals. A supplied persona records shown attention events after output
 /// acceptance; previous presentation history does not filter this overview.
 async fn cmd_wake(
@@ -6650,7 +6653,7 @@ async fn cmd_wake(
         }
     }
     if !selection.topic.pages.is_empty() {
-        report.push_str(wiki_model::recall::HEADING);
+        report.push_str(knowledge_model::recall::HEADING);
         for (i, (_, show)) in selection.topic.pages.iter().enumerate() {
             if i > 0 {
                 report.push('\n');
@@ -6718,13 +6721,13 @@ impl WakePair {
     }
 }
 
-/// The `orient goals` invocation that prints exactly this Compass section.
+/// The `orient goals` invocation that prints exactly this Goals section.
 fn goals_command(doing_limit: usize, todo_limit: usize) -> String {
     format!("orient goals --doing-limit {doing_limit} --todo-limit {todo_limit}")
 }
 
 /// The wake selection as command/result pairs, in prefix order: memory
-/// recalls, then one `wiki show` per cover belief revision, then one goals
+/// recalls, then one `knowledge show` per cover belief revision, then one goals
 /// pair.
 fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) -> Vec<WakePair> {
     let mut pairs = Vec::new();
@@ -6757,13 +6760,13 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
     }
     let mut shown = BTreeSet::new();
     for belief in selection.beliefs.iter().flat_map(|group| &group.beliefs) {
-        // `wiki show` prints the title, the revision's identity lines and the
+        // `knowledge show` prints the title, the revision's identity lines and the
         // content, as plain wake shows a belief's title above its content. It
         // follows the entry's frontier, which is this revision alone unless
         // the entry is forked; a forked head is named exactly instead. One
         // revision id with several title/content projections is ONE pair:
-        // `wiki show` prints them all, under its fork banner.
-        // A belief whose `wiki show` cannot be rendered here has no pair;
+        // `knowledge show` prints them all, under its fork banner.
+        // A belief whose `knowledge show` cannot be rendered here has no pair;
         // `CoverBeliefs::unreadable` names it among the diagnostics.
         let Some(show) = &belief.show else {
             continue;
@@ -6772,15 +6775,15 @@ fn wake_pairs(selection: &WakeSelection, doing_limit: usize, todo_limit: usize) 
             continue;
         }
         let command = if belief.sole_head {
-            format!("wiki show {:x}", belief.revision)
+            format!("knowledge show {:x}", belief.revision)
         } else {
-            format!("wiki show --exact {:x}", belief.revision)
+            format!("knowledge show --exact {:x}", belief.revision)
         };
         pairs.push(WakePair::new(command, show.clone()));
     }
     for (revision, show) in &selection.topic.pages {
         pairs.push(WakePair::new(
-            format!("wiki show --exact {revision:x}"),
+            format!("knowledge show --exact {revision:x}"),
             show.clone(),
         ));
     }
@@ -6844,7 +6847,7 @@ async fn cmd_wake_pairs(
     Ok(diagnostics)
 }
 
-/// `orient goals`: the Compass and Horizons sections of `orient wake`, alone.
+/// `orient goals`: the Goals and Horizons sections of `orient wake`, alone.
 /// Maintains its inputs like wake does and never records presentation.
 async fn cmd_goals(
     routing: &Storage,
@@ -6854,7 +6857,7 @@ async fn cmd_goals(
     todo_limit: usize,
     output: &mut Out<'_>,
 ) -> Result<()> {
-    let sources = CompassSources::prepare(routing, storage, signer).await?;
+    let sources = GoalsSources::prepare(routing, storage, signer).await?;
     let snapshot = storage
         .snapshot()
         .map_err(|error| anyhow!("freeze goals observation: {error}"))?;
@@ -6928,8 +6931,8 @@ mod tests {
                     entries: vec![entry],
                 },
                 topic: Default::default(),
-                beliefs: Some(wiki_model::CoverBeliefs::default()),
-                goals: "Compass:\n".into(),
+                beliefs: Some(knowledge_model::CoverBeliefs::default()),
+                goals: "Goals:\n".into(),
                 presented: None,
             };
             let pairs = wake_pairs(&selection, 5, 5);
@@ -6970,8 +6973,8 @@ mod tests {
                 ],
             },
             topic: Default::default(),
-            beliefs: Some(wiki_model::CoverBeliefs::default()),
-            goals: "Compass:\n".into(),
+            beliefs: Some(knowledge_model::CoverBeliefs::default()),
+            goals: "Goals:\n".into(),
             presented: None,
         };
         let sealed: Vec<bool> = wake_pairs(&selection, 5, 5)
@@ -7250,7 +7253,7 @@ mod tests {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
-            let wiki_writer = SigningKey::from_bytes(&[37; 32]);
+            let knowledge_writer = SigningKey::from_bytes(&[37; 32]);
             let mut routes = crate::storage::CollectionRoutes::new();
             // The alternate descriptors differ from all signer-private defaults.
             for scope in [
@@ -7258,11 +7261,11 @@ mod tests {
                 MAIL_SCOPE_ID,
                 TEAMS_SCOPE_ID,
                 DISCORD_SCOPE_ID,
-                COMPASS_SCOPE_ID,
+                GOALS_SCOPE_ID,
                 RELATIONS_SCOPE_ID,
                 HABIT_SCOPE_ID,
                 MEMORY_SCOPE_ID,
-                WIKI_SCOPE_ID,
+                KNOWLEDGE_SCOPE_ID,
                 RECEIPTS_SCOPE_ID,
             ] {
                 let collection = pile
@@ -7270,8 +7273,8 @@ mod tests {
                         crate::collection_names::require_name(scope),
                         CollectionPolicy::new(
                             AdmissionPolicy::Open,
-                            AdmissionPolicy::direct(if scope == WIKI_SCOPE_ID {
-                                wiki_writer.verifying_key()
+                            AdmissionPolicy::direct(if scope == KNOWLEDGE_SCOPE_ID {
+                                knowledge_writer.verifying_key()
                             } else {
                                 fixture.signer.verifying_key()
                             }),
@@ -7289,7 +7292,7 @@ mod tests {
                 (MAIL_SCOPE_ID, sources.mail),
                 (TEAMS_SCOPE_ID, sources.teams),
                 (DISCORD_SCOPE_ID, sources.discord),
-                (COMPASS_SCOPE_ID, sources.compass),
+                (GOALS_SCOPE_ID, sources.goals),
                 (RELATIONS_SCOPE_ID, sources.relations),
                 (HABIT_SCOPE_ID, sources.habits.unwrap()),
             ] {
@@ -7300,8 +7303,8 @@ mod tests {
                 routes[&RECEIPTS_SCOPE_ID]
             );
             assert_eq!(
-                sources.compass_status,
-                compass::status_register_for_source(&mut pile, sources.compass.source,).unwrap()
+                sources.goals_status,
+                goals::status_register_for_source(&mut pile, sources.goals.source,).unwrap()
             );
 
             let receipts = sources.presentations.source;
@@ -7331,23 +7334,29 @@ mod tests {
                 .map(Result::unwrap)
                 .all(|record| { record.collection() == receipts.handle() }));
 
-            let wiki =
-                OrientSource::open(&routing, &mut pile, &fixture.signer, WIKI_SCOPE_ID, "Wiki")
-                    .await
-                    .unwrap();
-            let (author, author_id) = wiki_model::author_record(&fixture.signer.verifying_key());
-            let (tag, tag_id, _) = wiki_model::tag_record("cover").unwrap();
-            let draft = wiki_model::RevisionDraft {
+            let knowledge = OrientSource::open(
+                &routing,
+                &mut pile,
+                &fixture.signer,
+                KNOWLEDGE_SCOPE_ID,
+                "Knowledge",
+            )
+            .await
+            .unwrap();
+            let (author, author_id) =
+                knowledge_model::author_record(&fixture.signer.verifying_key());
+            let (tag, tag_id, _) = knowledge_model::tag_record("cover").unwrap();
+            let draft = knowledge_model::RevisionDraft {
                 title: "Selected workspace belief".to_owned(),
-                content: "The selected Wiki also owns its latest index.".to_owned(),
+                content: "The selected Knowledge also owns its latest index.".to_owned(),
                 tags: BTreeSet::from([tag_id]),
                 predecessors: BTreeSet::new(),
                 author: author_id,
                 authored_at: clock::point_now().unwrap(),
             };
-            let (revision, _) = wiki_model::revision_record(draft.clone()).unwrap();
+            let (revision, _) = knowledge_model::revision_record(draft.clone()).unwrap();
             let reading = |title: &str| {
-                wiki_model::revision_record(wiki_model::RevisionDraft {
+                knowledge_model::revision_record(knowledge_model::RevisionDraft {
                     title: title.into(),
                     content: "An astrolabe measures altitude.".into(),
                     tags: BTreeSet::new(),
@@ -7356,17 +7365,21 @@ mod tests {
                 .unwrap()
                 .0
             };
-            let default_wiki =
-                open_configured(&mut pile, WIKI_SCOPE_ID, fixture.signer.verifying_key()).unwrap();
+            let default_knowledge = open_configured(
+                &mut pile,
+                KNOWLEDGE_SCOPE_ID,
+                fixture.signer.verifying_key(),
+            )
+            .unwrap();
             pile.commit(
-                default_wiki,
+                default_knowledge,
                 &fixture.signer,
                 author.clone() + reading("Other workspace"),
             )
             .unwrap();
             pile.commit(
-                wiki.source,
-                &wiki_writer,
+                knowledge.source,
+                &knowledge_writer,
                 author + tag + revision + reading("Selected astrolabe"),
             )
             .unwrap();
@@ -7423,11 +7436,11 @@ mod tests {
             .unwrap();
             pile.commit(memory.source, &fixture.signer, chunk).unwrap();
             let (goal, _) =
-                compass::goal_fragment("An owned goal", Vec::new(), None, mention_moment(1.0))
+                goals::goal_fragment("An owned goal", Vec::new(), None, mention_moment(1.0))
                     .unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, goal)
+            pile.commit(sources.goals.source, &fixture.signer, goal)
                 .unwrap();
-            routes.retain(|scope, _| [MEMORY_SCOPE_ID, COMPASS_SCOPE_ID].contains(scope));
+            routes.retain(|scope, _| [MEMORY_SCOPE_ID, GOALS_SCOPE_ID].contains(scope));
             let missing = test_storage().with_collections(routes.clone());
             let options = WakePairsOptions {
                 chars: 2048,
@@ -7456,7 +7469,9 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(diagnostics.iter().any(|line| line.contains("no Wiki role")));
+            assert!(diagnostics
+                .iter()
+                .any(|line| line.contains("no Knowledge role")));
             let pairs: Vec<serde_json::Value> = emitted
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
@@ -7485,12 +7500,12 @@ mod tests {
                 .collection(
                     "wiki",
                     CollectionPolicy::new(
-                        AdmissionPolicy::direct(wiki_writer.verifying_key()),
-                        AdmissionPolicy::direct(wiki_writer.verifying_key()),
+                        AdmissionPolicy::direct(knowledge_writer.verifying_key()),
+                        AdmissionPolicy::direct(knowledge_writer.verifying_key()),
                     ),
                 )
                 .unwrap();
-            routes.insert(WIKI_SCOPE_ID, denied.handle());
+            routes.insert(KNOWLEDGE_SCOPE_ID, denied.handle());
             let mut options = CoverOpts::plain(2048);
             options.about = Some("astrolabe".into());
             let denial = wake_selection(
@@ -7670,12 +7685,12 @@ mod tests {
                 ("unknown", None, false, true),
             ] {
                 let (goal, goal_id) =
-                    compass::goal_fragment(label, vec!["observer".to_owned()], None, now).unwrap();
+                    goals::goal_fragment(label, vec!["observer".to_owned()], None, now).unwrap();
                 facts += goal;
-                let mut status = compass::status_fragment(goal_id, "doing", actor, now).unwrap();
+                let mut status = goals::status_fragment(goal_id, "doing", actor, now).unwrap();
                 let status_id = status.root().unwrap();
                 let (mut note, note_id) =
-                    compass::note_fragment(goal_id, label, vec![], vec![], vec![], actor, now)
+                    goals::note_fragment(goal_id, label, vec![], vec![], vec![], actor, now)
                         .unwrap();
                 if extra_self {
                     status += entity! { ExclusiveId::force_ref(&status_id) @ board::by: &alias };
@@ -7690,19 +7705,19 @@ mod tests {
             // Writing on a goal subscribes nobody: another person's later
             // update on an untagged goal the persona (here as its alias) once
             // commented on is not news.
-            let (goal, goal_id) = compass::goal_fragment("commented", vec![], None, now).unwrap();
+            let (goal, goal_id) = goals::goal_fragment("commented", vec![], None, now).unwrap();
             facts += goal;
             facts +=
-                compass::note_fragment(goal_id, "mine", vec![], vec![], vec![], Some(alias), now)
+                goals::note_fragment(goal_id, "mine", vec![], vec![], vec![], Some(alias), now)
                     .unwrap()
                     .0;
-            facts += compass::status_fragment(goal_id, "done", Some(other), now).unwrap();
+            facts += goals::status_fragment(goal_id, "done", Some(other), now).unwrap();
             // A goal without a status/actor is likewise unknown, not self.
             let (goal, goal_id) =
-                compass::goal_fragment("bare", vec!["observer".to_owned()], None, now).unwrap();
+                goals::goal_fragment("bare", vec!["observer".to_owned()], None, now).unwrap();
             facts += goal;
             expected.insert(goal_id);
-            pile.commit(sources.compass.source, &fixture.signer, facts)
+            pile.commit(sources.goals.source, &fixture.signer, facts)
                 .unwrap();
             let mut messages = Fragment::empty();
             for (label, sender, recipient, extra_self, visible) in [
@@ -8196,14 +8211,14 @@ mod tests {
             .unwrap();
             pile.commit(sources.relations.source, &fixture.signer, person)
                 .unwrap();
-            let (goal, goal_id) = compass::goal_fragment(
+            let (goal, goal_id) = goals::goal_fragment(
                 "a resident goal for this wake",
                 vec!["wake-reader".to_owned()],
                 None,
                 clock::point_now().unwrap(),
             )
             .unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, goal)
+            pile.commit(sources.goals.source, &fixture.signer, goal)
                 .unwrap();
             pile.commit(
                 sources.presentations.source,
@@ -8711,7 +8726,7 @@ mod tests {
                 &observation.facts.messages,
                 &observation.facts.mail,
                 &observation.facts.teams,
-                &observation.facts.compass,
+                &observation.facts.goals,
                 &observation.facts.relations,
                 observation.facts.habits.as_ref().unwrap(),
             ] {
@@ -10932,7 +10947,7 @@ mod tests {
                 .unwrap();
             let goal = id(46);
             let unseen_goal = id(47);
-            let initial = compass::status_fragment(
+            let initial = goals::status_fragment(
                 goal,
                 "todo",
                 None,
@@ -10940,7 +10955,7 @@ mod tests {
             )
             .unwrap();
             let initial_id = initial.root().unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, initial)
+            pile.commit(sources.goals.source, &fixture.signer, initial)
                 .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await
@@ -10948,7 +10963,7 @@ mod tests {
             let watermark = pile.snapshot().unwrap();
             let observation = observe_snapshot(watermark, &sources).unwrap();
 
-            let next = compass::status_fragment(
+            let next = goals::status_fragment(
                 goal,
                 "done",
                 None,
@@ -10956,7 +10971,7 @@ mod tests {
             )
             .unwrap();
             let next_id = next.root().unwrap();
-            let unseen = compass::status_fragment(
+            let unseen = goals::status_fragment(
                 unseen_goal,
                 "doing",
                 None,
@@ -10964,21 +10979,21 @@ mod tests {
             )
             .unwrap();
             let unseen_id = unseen.root().unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, next + unseen)
+            pile.commit(sources.goals.source, &fixture.signer, next + unseen)
                 .unwrap();
             drop(
-                pile.maintain_attached(sources.compass.succinct, &fixture.signer)
+                pile.maintain_attached(sources.goals.succinct, &fixture.signer)
                     .await
                     .unwrap(),
             );
             let snapshot = pile
-                .maintain_attached(sources.compass.rank9, &fixture.signer)
+                .maintain_attached(sources.goals.rank9, &fixture.signer)
                 .await
                 .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
             // The facts attached the new commit and the status register has
             // not; its read builds that commit in memory and answers for it.
-            let status = lagging.snapshot.attached(sources.compass_status).unwrap();
+            let status = lagging.snapshot.attached(sources.goals_status).unwrap();
             assert_eq!(status.residual().len(), 1);
             drop(status);
             let query = lagging.query(&lagging.snapshot);
@@ -10995,7 +11010,7 @@ mod tests {
             );
 
             let ready = pile
-                .maintain_attached(sources.compass_status, &fixture.signer)
+                .maintain_attached(sources.goals_status, &fixture.signer)
                 .await
                 .unwrap();
             let advanced = observe_sources(ready, &sources).unwrap();
@@ -11038,7 +11053,7 @@ mod tests {
     }
 
     /// A goal whose winning status text never arrived cannot be placed in
-    /// Doing or Todo. It is named in the Compass section instead of failing
+    /// Doing or Todo. It is named in the Goals section instead of failing
     /// the section (and with it the whole wake).
     #[test]
     fn a_goal_whose_status_text_cannot_be_read_is_named_not_fatal() {
@@ -11050,25 +11065,24 @@ mod tests {
                 .unwrap();
             let at = |seconds| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
             let (readable, readable_id) =
-                compass::goal_fragment("readable goal", Vec::new(), None, at(1.0)).unwrap();
+                goals::goal_fragment("readable goal", Vec::new(), None, at(1.0)).unwrap();
             let (unread, unread_id) =
-                compass::goal_fragment("unread goal", Vec::new(), None, at(1.0)).unwrap();
+                goals::goal_fragment("unread goal", Vec::new(), None, at(1.0)).unwrap();
             let readable_status =
-                compass::status_fragment(readable_id, "doing", None, at(2.0)).unwrap();
+                goals::status_fragment(readable_id, "doing", None, at(2.0)).unwrap();
             // Only the status text's bytes are missing; the event is here.
             // (A different status than the readable goal's, whose identical
             // text blob would otherwise supply it.)
-            let (_, facts, metafacts, _) =
-                compass::status_fragment(unread_id, "todo", None, at(2.0))
-                    .unwrap()
-                    .into_parts();
+            let (_, facts, metafacts, _) = goals::status_fragment(unread_id, "todo", None, at(2.0))
+                .unwrap()
+                .into_parts();
             let unread_status = Fragment::from_parts(
                 facts,
                 metafacts,
                 triblespace::core::blob::MemoryBlobStore::new(),
             );
             pile.commit(
-                sources.compass.source,
+                sources.goals.source,
                 &fixture.signer,
                 readable + unread + readable_status + unread_status,
             )
@@ -11079,8 +11093,8 @@ mod tests {
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
             // Strict, the section refuses; presentable, it names the goal.
-            assert!(render_native_compass_goals(&query.goals(), 5, 5, &|_| None).is_err());
-            let (goals, _) = render_native_compass_goals(&query.goals(), 5, 5, &|error| {
+            assert!(render_native_goals_goals(&query.goals(), 5, 5, &|_| None).is_err());
+            let (goals, _) = render_native_goals_goals(&query.goals(), 5, 5, &|error| {
                 Some(format!("{error:#}"))
             })
             .unwrap();
@@ -11107,7 +11121,7 @@ mod tests {
                 .await
                 .unwrap();
             let at = clock::point(Epoch::from_tai_seconds(1.0)).unwrap();
-            let (goal, goal_id) = compass::goal_fragment(
+            let (goal, goal_id) = goals::goal_fragment(
                 "cold tags",
                 vec!["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
                 None,
@@ -11118,7 +11132,7 @@ mod tests {
             let (_, facts, metafacts, blobs) = goal.into_parts();
             let mut kept = triblespace::core::blob::MemoryBlobStore::new();
             let title: Vec<_> = find!(
-                handle: compass::TextHandle,
+                handle: goals::TextHandle,
                 pattern!(&facts, [{ goal_id @ board::title: ?handle }])
             )
             .collect();
@@ -11134,7 +11148,7 @@ mod tests {
                 .unwrap();
             kept.put::<blobencodings::UnknownBlob, _>(bytes).unwrap();
             pile.commit(
-                sources.compass.source,
+                sources.goals.source,
                 &fixture.signer,
                 Fragment::from_parts(facts, metafacts, kept),
             )
@@ -11145,7 +11159,7 @@ mod tests {
             let observation = observe_snapshot(pile.snapshot().unwrap(), &sources).unwrap();
             let query = observation.query(&observation.snapshot);
             let calls = std::cell::Cell::new(0);
-            let (goals, _) = render_native_compass_goals(&query.goals(), 5, 5, &|error| {
+            let (goals, _) = render_native_goals_goals(&query.goals(), 5, 5, &|error| {
                 calls.set(calls.get() + 1);
                 Some(format!("{error:#}"))
             })
@@ -11169,7 +11183,7 @@ mod tests {
                 .unwrap();
             let at = |seconds: f64| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
             let goal = |title: &str, tags: &[&str], seconds: f64| {
-                compass::goal_fragment(
+                goals::goal_fragment(
                     title,
                     tags.iter().map(|tag| (*tag).to_owned()).collect(),
                     None,
@@ -11179,7 +11193,7 @@ mod tests {
             };
             // Nothing tagged yet: no section, not even a header.
             let (plain, plain_id) = goal("ordinary goal", &["topic"], 1.0);
-            pile.commit(sources.compass.source, &fixture.signer, plain)
+            pile.commit(sources.goals.source, &fixture.signer, plain)
                 .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await
@@ -11193,7 +11207,7 @@ mod tests {
 
             // Created first, but a note moved it last.
             let (noted, noted_id) = goal("noted horizon", &["horizon", "owner-a"], 2.0);
-            let (note, _) = compass::note_fragment(
+            let (note, _) = goals::note_fragment(
                 noted_id,
                 "a step".to_owned(),
                 vec![],
@@ -11205,23 +11219,22 @@ mod tests {
             .unwrap();
             // Created later, moved by a status event in between.
             let (moved, moved_id) = goal("moved horizon", &["horizon"], 3.0);
-            let moved_status =
-                compass::status_fragment(moved_id, "doing", None, at(100.0)).unwrap();
+            let moved_status = goals::status_fragment(moved_id, "doing", None, at(100.0)).unwrap();
             // Finished: never shown, however long ago it moved.
             let (done, done_id) = goal("done horizon", &["horizon"], 4.0);
-            let done_status = compass::status_fragment(done_id, "done", None, at(50.0)).unwrap();
+            let done_status = goals::status_fragment(done_id, "done", None, at(50.0)).unwrap();
             pile.commit(
-                sources.compass.source,
+                sources.goals.source,
                 &fixture.signer,
                 noted
                     + note
-                    + compass::status_fragment(noted_id, "todo", None, at(2.0)).unwrap()
+                    + goals::status_fragment(noted_id, "todo", None, at(2.0)).unwrap()
                     + moved
                     + moved_status
                     + done
-                    + compass::status_fragment(done_id, "todo", None, at(4.0)).unwrap()
+                    + goals::status_fragment(done_id, "todo", None, at(4.0)).unwrap()
                     + done_status
-                    + compass::status_fragment(plain_id, "doing", None, at(600.0)).unwrap(),
+                    + goals::status_fragment(plain_id, "doing", None, at(600.0)).unwrap(),
             )
             .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
@@ -11980,26 +11993,26 @@ mod tests {
             }
             let moment =
                 |seconds: f64| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
-            let (goal, goal_id) = compass::goal_fragment(
+            let (goal, goal_id) = goals::goal_fragment(
                 "Give the maintenance daemons their cores",
                 vec!["cc".to_owned()],
                 None,
                 moment(1.0),
             )
             .unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, goal)
+            pile.commit(sources.goals.source, &fixture.signer, goal)
                 .unwrap();
             for (status, when) in [("doing", moment(2.0)), ("done", moment(3.0))] {
                 pile.commit(
-                    sources.compass.source,
+                    sources.goals.source,
                     &fixture.signer,
-                    compass::status_fragment(goal_id, status, Some(author_id), when).unwrap(),
+                    goals::status_fragment(goal_id, status, Some(author_id), when).unwrap(),
                 )
                 .unwrap();
             }
-            let (note, _) = compass::note_fragment(
+            let (note, _) = goals::note_fragment(
                 goal_id,
-                "Slice B frozen, Core lock unchanged\nthe rest of the body stays in Compass",
+                "Slice B frozen, Core lock unchanged\nthe rest of the body stays in Goals",
                 vec![],
                 vec![],
                 vec![],
@@ -12007,7 +12020,7 @@ mod tests {
                 moment(4.0),
             )
             .unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, note)
+            pile.commit(sources.goals.source, &fixture.signer, note)
                 .unwrap();
             let (envelope, _) = message::message_fragment(
                 author_id,
@@ -12049,7 +12062,7 @@ mod tests {
             );
             // Bounded preview: the first line only, and the full id never has
             // to be printed once the title names the goal.
-            assert!(!text.contains("the rest of the body stays in Compass"), "{text}");
+            assert!(!text.contains("the rest of the body stays in Goals"), "{text}");
             assert!(!text.contains(&goal_hex), "{text}");
             pile.close().unwrap();
         });
@@ -12092,12 +12105,12 @@ mod tests {
         }
     }
 
-    /// Commit `relations` and `compass` through the sources a watcher reads,
+    /// Commit `relations` and `goals` through the sources a watcher reads,
     /// then return, for each reader, the attention events it would be shown
     /// and the report it would print.
     fn mention_news(
         relations: Fragment,
-        compass_facts: Fragment,
+        goals_facts: Fragment,
         readers: &[Id],
     ) -> Vec<(BTreeSet<Id>, String)> {
         runtime().unwrap().block_on(async {
@@ -12108,7 +12121,7 @@ mod tests {
                 .unwrap();
             pile.commit(sources.relations.source, &fixture.signer, relations)
                 .unwrap();
-            pile.commit(sources.compass.source, &fixture.signer, compass_facts)
+            pile.commit(sources.goals.source, &fixture.signer, goals_facts)
                 .unwrap();
             maintain_sources(&mut pile, &fixture.signer, &sources)
                 .await
@@ -12140,7 +12153,7 @@ mod tests {
         clock::point(Epoch::from_tai_seconds(seconds)).unwrap()
     }
 
-    /// A goal created at `at` by `by`, the way `compass add` writes one: the
+    /// A goal created at `at` by `by`, the way `goals add` writes one: the
     /// goal and its first status share their creation time.
     fn mention_goal(
         facts: &mut Fragment,
@@ -12150,7 +12163,7 @@ mod tests {
         mentions: &[Id],
         at: f64,
     ) -> (Id, Id) {
-        let (goal, goal_id) = compass::goal_fragment(
+        let (goal, goal_id) = goals::goal_fragment(
             title,
             tags.iter().map(|tag| (*tag).to_owned()).collect(),
             None,
@@ -12158,9 +12171,8 @@ mod tests {
         )
         .unwrap();
         *facts += goal;
-        *facts += compass::mention_fragment(goal_id, mentions);
-        let status =
-            compass::status_fragment(goal_id, "todo", Some(by), mention_moment(at)).unwrap();
+        *facts += goals::mention_fragment(goal_id, mentions);
+        let status = goals::status_fragment(goal_id, "todo", Some(by), mention_moment(at)).unwrap();
         let status_id = status.root().unwrap();
         *facts += status;
         (goal_id, status_id)
@@ -12174,7 +12186,7 @@ mod tests {
         mentions: &[Id],
         at: f64,
     ) -> Id {
-        let (note, note_id) = compass::note_fragment(
+        let (note, note_id) = goals::note_fragment(
             goal,
             body,
             vec![],
@@ -12185,7 +12197,7 @@ mod tests {
         )
         .unwrap();
         *facts += note;
-        *facts += compass::mention_fragment(note_id, mentions);
+        *facts += goals::mention_fragment(note_id, mentions);
         note_id
     }
 
@@ -12281,7 +12293,7 @@ mod tests {
         let mut facts = Fragment::empty();
         let (goal, _) = mention_goal(&mut facts, "A crew topic", &["crew"], cast.bea, &[], 1.0);
         facts +=
-            compass::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
+            goals::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
         mention_note(
             &mut facts,
             goal,
@@ -12303,7 +12315,7 @@ mod tests {
         let mut facts = Fragment::empty();
         let (goal, _) = mention_goal(&mut facts, "Assigned work", &["ada"], cast.bea, &[], 1.0);
         let moved =
-            compass::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
+            goals::status_fragment(goal, "doing", Some(cast.bea), mention_moment(2.0)).unwrap();
         let moved_id = moved.root().unwrap();
         facts += moved;
         let note = mention_note(&mut facts, goal, "context for you", cast.bea, &[], 3.0);
@@ -12322,9 +12334,8 @@ mod tests {
         let (goal, _) = mention_goal(&mut facts, "Somebody's goal", &[], cast.bea, &[], 1.0);
         mention_note(&mut facts, goal, "a passing comment", cast.ada, &[], 2.0);
         facts +=
-            compass::status_fragment(goal, "doing", Some(cast.ada), mention_moment(3.0)).unwrap();
-        facts +=
-            compass::status_fragment(goal, "done", Some(cast.bea), mention_moment(4.0)).unwrap();
+            goals::status_fragment(goal, "doing", Some(cast.ada), mention_moment(3.0)).unwrap();
+        facts += goals::status_fragment(goal, "done", Some(cast.bea), mention_moment(4.0)).unwrap();
         mention_note(&mut facts, goal, "a later reply", cast.bea, &[], 5.0);
         let seen = mention_news(cast.relations, facts, &[cast.ada]);
         assert!(seen[0].0.is_empty(), "{}", seen[0].1);

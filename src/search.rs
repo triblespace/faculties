@@ -1,4 +1,4 @@
-//! One lexical request over the caller's Wiki, Memory and Files bindings.
+//! One lexical request over the caller's Knowledge, Memory and Files bindings.
 //!
 //! Results are request-local projections, not a second catalog. Each source
 //! observes its own frozen view; this is not an atomic cross-source snapshot.
@@ -87,21 +87,21 @@ pub enum Outcome {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", content = "reading", rename_all = "snake_case")]
 pub enum Hit {
-    Wiki(crate::wiki::operations::SearchHit),
+    Knowledge(crate::knowledge::operations::SearchHit),
     Memory(crate::memory::operations::SearchHit),
     Files(crate::files::operations::SearchHit),
 }
 
 /// Native operation arguments, scoped by the enclosing collection/workspace.
-/// A URI alone would lose both that scope and Wiki's exact-revision choice.
+/// A URI alone would lose both that scope and Knowledge's exact-revision choice.
 /// Opening an entity/revision can expose additional current readings of that
 /// identity. The explicit matched content handles pin the bytes searched;
 /// these opening arguments do not promise replay of the search snapshot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "operation", content = "arguments")]
 pub enum OpenTarget {
-    #[serde(rename = "wiki_show")]
-    Wiki { id: String, exact: bool },
+    #[serde(rename = "knowledge_show")]
+    Knowledge { id: String, exact: bool },
     #[serde(rename = "memory_show")]
     Memory { selector: String },
     #[serde(rename = "files_get")]
@@ -117,7 +117,7 @@ impl Search {
         options.validate()?;
         // One scoped owner across the request, with independent source reads.
         self.storage.scope(|storage| {
-            let wiki = crate::wiki::Wiki::with_storage(storage.clone());
+            let knowledge = crate::knowledge::Knowledge::with_storage(storage.clone());
             let memory = crate::memory::Memory::with_storage(storage.clone());
             let files = crate::files::Files::with_storage(storage.clone());
             let sources = vec![
@@ -127,8 +127,8 @@ impl Search {
                     "wiki",
                     "ascii_substring_current_title_and_body",
                     options.limit_per_source,
-                    || wiki.search_hits(options.query, false, false),
-                    Hit::Wiki,
+                    || knowledge.search_hits(options.query, false, false),
+                    Hit::Knowledge,
                 ),
                 source(
                     storage,

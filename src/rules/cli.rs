@@ -19,7 +19,7 @@ use super::{
     ask_quiet_since, eligible_goals, nudges_in, open_asks, program, quota_ok, read_ignited,
     run_requests_in, settle, tick_fragment, Sensed,
 };
-use crate::compass::Compass;
+use crate::goals::Goals;
 use crate::out::Out;
 use crate::quota::operations::Quota;
 use crate::schemas::rules::{DEFAULT_SCOPE_ID as RULES_SCOPE_ID, ENVIRONMENT_ANCHOR};
@@ -32,7 +32,7 @@ use crate::storage::Storage;
     about = "The colony's rule environment: positive sensors, text rules, one driver"
 )]
 pub struct Cli {
-    /// Pile the sensors read Compass and Quota from.
+    /// Pile the sensors read Goals and Quota from.
     #[arg(long, env = "PILE")]
     pile: PathBuf,
     /// Existing durable signing-key file. Reads and writes never create it.
@@ -120,8 +120,8 @@ fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
         log,
     } = cli.command;
 
-    // Sense: one read of Compass and Quota, then the two local state files.
-    let states = Compass::with_storage(Storage::new(cli.pile.clone(), cli.key.clone()))
+    // Sense: one read of Goals and Quota, then the two local state files.
+    let states = Goals::with_storage(Storage::new(cli.pile.clone(), cli.key.clone()))
         .goal_states()
         .context("sense compass")?;
     let view = Quota::with_storage(Storage::new(cli.pile.clone(), cli.key.clone()))

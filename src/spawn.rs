@@ -6,7 +6,7 @@
 //! cover the zooid wakes into, and it is the prompt. An identical brief
 //! relaunches the same zooid under the name it was first given; a changed
 //! brief is a new one.
-//! `zooid goal` renders the brief from a Compass goal's current revision, so
+//! `zooid goal` renders the brief from a goal's current revision, so
 //! a new note on the goal makes a new zooid.
 //!
 //! This module holds the pure parts: naming, the fragments a launch and a
@@ -156,7 +156,7 @@ pub fn spawn_fragment(brief: &str) -> Result<(Fragment, Id, TextHandle, String)>
     Ok((fragment, id, handle, name))
 }
 
-/// The Compass goal revision a brief was rendered from, annotating the spawn.
+/// The goal revision a brief was rendered from, annotating the spawn.
 pub fn goal_fragment(spawn: Id, goal: Id, revision: &[Id]) -> Fragment {
     let revision = revision.to_vec();
     entity! { ExclusiveId::force_ref(&spawn) @
@@ -559,7 +559,7 @@ pub const GOAL_NOTES: usize = 6;
 /// latest note is always included whole.
 pub const GOAL_NOTE_CHARS: usize = 6_000;
 
-/// A brief rendered from one Compass goal revision.
+/// A brief rendered from one goal revision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GoalBrief {
     pub text: String,
@@ -572,7 +572,7 @@ pub struct GoalBrief {
 /// The brief for a goal: its title, the purpose its parent chain gives it,
 /// its latest notes as the current decisions, the zooid's authority over
 /// the goal, and the spawner's own instructions last.
-pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) -> GoalBrief {
+pub fn goal_brief(reading: &crate::goals::GoalReading, extra: Option<&str>) -> GoalBrief {
     let title = if reading.titles.is_empty() {
         "(untitled)".to_owned()
     } else {
@@ -580,10 +580,7 @@ pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) ->
     };
     let mut text = String::new();
     let mut revision = Vec::new();
-    text.push_str(&format!(
-        "# Goal: {title}\n\nCompass goal {:x}",
-        reading.goal
-    ));
+    text.push_str(&format!("# Goal: {title}\n\ngoal {:x}", reading.goal));
     match &reading.status {
         Some((event, status)) => {
             text.push_str(&format!(", status {status} (event {event:x}).\n"));
@@ -610,7 +607,7 @@ pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) ->
     if !chosen.is_empty() {
         text.push_str(&format!(
             "\n## Current decisions\n\nThe latest {} of the goal's {} current notes, oldest \
-             first. `compass show {:x}` has every note.\n",
+             first. `goals show {:x}` has every note.\n",
             chosen.len(),
             reading.notes.len(),
             reading.goal
@@ -624,8 +621,8 @@ pub fn goal_brief(reading: &crate::compass::GoalReading, extra: Option<&str>) ->
     }
     text.push_str(&format!(
         "\n## This goal and your run\n\n\
-         This goal prompted the run. You may add notes to it and move it (`compass note {id:x}`, \
-         `compass move {id:x}`), as you may any goal, under the colony's ordinary rules for \
+         This goal prompted the run. You may add notes to it and move it (`goals note {id:x}`, \
+         `goals move {id:x}`), as you may any goal, under the colony's ordinary rules for \
          attribution and coordination. The brief steers your attention; it does not fence it. \
          If you find more important work along the way, you may follow it: say so in a note on \
          this goal and in your report. Your process ending does not achieve the goal, and \
@@ -1014,15 +1011,15 @@ mod tests {
         assert!(missing_routes(env, &all).is_empty());
     }
 
-    fn reading(notes: usize) -> crate::compass::GoalReading {
+    fn reading(notes: usize) -> crate::goals::GoalReading {
         let id = |byte: u8| Id::new([byte; 16]).unwrap();
-        crate::compass::GoalReading {
+        crate::goals::GoalReading {
             goal: id(1),
             titles: vec!["Ship the thing".to_owned()],
             status: Some((id(2), "doing".to_owned())),
             ancestors: vec![(id(3), "The bigger thing".to_owned())],
             notes: (0..notes)
-                .map(|n| crate::compass::GoalNote {
+                .map(|n| crate::goals::GoalNote {
                     id: id(10 + n as u8),
                     at: format!("2026-11-16T0{n}:00:00"),
                     by: vec![],

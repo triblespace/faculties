@@ -1,7 +1,7 @@
 //! Unified pile inspector: composes all four faculty widgets with a
 //! single shared pile-path selector via `StorageState`.
 //!
-//! Run against a pile that has a `wiki`, `compass`, and `message`
+//! Run against a pile that has a `knowledge`, `goals`, and `message`
 //! branch:
 //!
 //! ```ignore
@@ -13,8 +13,8 @@
 use std::path::PathBuf;
 
 use faculties::widgets::{
-    BranchTimeline, CompassBoard, MessagesPanel, SourceKey, StorageState, TimelineSource,
-    WikiViewer,
+    BranchTimeline, GoalsBoard, KnowledgeViewer, MessagesPanel, SourceKey, StorageState,
+    TimelineSource,
 };
 use GORBIE::notebook;
 use GORBIE::prelude::*;
@@ -43,17 +43,17 @@ fn main(nb: &mut NotebookCtx) {
         "timeline",
         || {
             BranchTimeline::multi(vec![
-                TimelineSource::Compass {
-                    key: SourceKey::Compass,
+                TimelineSource::Goals {
+                    key: SourceKey::Goals,
                     label: "goals".to_owned(),
                 },
                 TimelineSource::LocalMessages {
                     key: SourceKey::Messages,
                     label: "local".to_owned(),
                 },
-                TimelineSource::Wiki {
-                    key: SourceKey::Wiki,
-                    label: "wiki".to_owned(),
+                TimelineSource::Knowledge {
+                    key: SourceKey::Knowledge,
+                    label: "knowledge".to_owned(),
                 },
             ])
         },
@@ -64,21 +64,25 @@ fn main(nb: &mut NotebookCtx) {
         },
     );
 
-    nb.state("wiki", WikiViewer::default, move |ctx, wiki| {
-        let mut st = storage.read_mut(ctx);
-        let sources = st.context();
-        let Some(view) = sources.dataset(SourceKey::Wiki) else {
-            return;
-        };
-        wiki.render(ctx, view, sources.dataset(SourceKey::Files));
-    });
+    nb.state(
+        "knowledge",
+        KnowledgeViewer::default,
+        move |ctx, knowledge| {
+            let mut st = storage.read_mut(ctx);
+            let sources = st.context();
+            let Some(view) = sources.dataset(SourceKey::Knowledge) else {
+                return;
+            };
+            knowledge.render(ctx, view, sources.dataset(SourceKey::Files));
+        },
+    );
 
-    nb.state("compass", CompassBoard::default, move |ctx, compass| {
+    nb.state("goals", GoalsBoard::default, move |ctx, goals| {
         let mut st = storage.read_mut(ctx);
-        let Some(view) = st.context().dataset(SourceKey::Compass) else {
+        let Some(view) = st.context().dataset(SourceKey::Goals) else {
             return;
         };
-        compass.render(ctx, view);
+        goals.render(ctx, view);
     });
 
     nb.state("messages", MessagesPanel::default, move |ctx, panel| {

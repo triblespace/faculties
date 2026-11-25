@@ -1,6 +1,6 @@
 //! The colony's rule environment: positive sensors, text rules, one driver.
 //!
-//! JP's focus lane of 17 Nov 2026 (compass 8e066e0c): a living expert system
+//! JP's focus lane of 17 Nov 2026 (goals 8e066e0c): a living expert system
 //! that keeps inferring and triggers things like spawning zooids on idle goals.
 //! The shape is a nervous system:
 //!
@@ -40,7 +40,7 @@ use triblespace::core::reactive::text;
 use triblespace::core::repo::{BlobStorePut, SnapshotSource, StorageFlush, StoreRead};
 use triblespace::prelude::*;
 
-use crate::compass::GoalState;
+use crate::goals::GoalState;
 use crate::quota::operations::QuotaView;
 use crate::quota::{self, Pace};
 use crate::schemas::quota::PROVIDER_CLAUDE;

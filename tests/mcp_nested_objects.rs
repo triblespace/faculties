@@ -9,10 +9,10 @@ fn adapters(pile: &Path) -> Vec<Box<dyn Faculty>> {
     vec![
         Box::new(faculties::mail::mcp::Mail::new(pile.into(), None)),
         Box::new(faculties::archive::mcp::Archive::new(pile.into(), None)),
-        Box::new(faculties::planner::mcp::Planner::new(pile.into(), None)),
+        Box::new(faculties::events::mcp::Events::new(pile.into(), None)),
         Box::new(faculties::posture::mcp::Posture::new(pile.into(), None)),
         Box::new(faculties::relations::mcp::Relations::new(pile.into(), None)),
-        Box::new(faculties::wiki::mcp::Wiki::new(pile.into(), None)),
+        Box::new(faculties::knowledge::mcp::Knowledge::new(pile.into(), None)),
         Box::new(faculties::linkedin::mcp::LinkedIn::new(pile.into(), None)),
     ]
 }
@@ -58,7 +58,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             adapter: 2,
-            tool: "planner_ingest",
+            tool: "events_ingest",
             prefix: r#"{"documents":["#,
             suffix: "]}",
             record: r#"{"name":"@-","text":"BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR"}"#,
@@ -112,7 +112,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             adapter: 5,
-            tool: "wiki_import",
+            tool: "knowledge_import",
             prefix: r#"{"documents":["#,
             suffix: "]}",
             record: r#"{"title":"@-","content":"= Literal"}"#,

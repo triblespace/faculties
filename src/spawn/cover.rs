@@ -15,7 +15,7 @@ use std::path::Path;
 
 /// The journal's characters in a launch without `--cover`, and in one with
 /// `--cover` that found no window: the former 200k wake plus 40k tail, spent on
-/// one tinted render. Wiki readings have their own allowance beside it.
+/// one tinted render. Knowledge readings have their own allowance beside it.
 pub const PLAIN_MEMORY_CHARS: usize = 240_000;
 
 /// The smallest memory budget the target split gives, however little of
@@ -145,7 +145,7 @@ pub struct CoverRecord {
     pub target_chars: Option<usize>,
     /// Fixed sections and diagnostics measured with no journal budget.
     pub fixed_chars: Option<usize>,
-    /// The journal's character budget in this wake. Wiki readings come beside
+    /// The journal's character budget in this wake. Knowledge readings come beside
     /// it, within `readings_allowance`.
     pub memory_budget: usize,
     /// The delivered wake's characters.
@@ -199,11 +199,11 @@ pub fn reduced_budget(memory_chars: usize, estimate: u64, aim: u64, chars_per_to
     memory_chars.saturating_sub(excess)
 }
 
-/// The journal budget whose cover and Wiki readings together stay within
+/// The journal budget whose cover and Knowledge readings together stay within
 /// `chars`. The readings take up to a fixed allowance, or half the journal's
 /// budget in a small wake, so a hard limit has to leave room for both.
 pub fn journal_budget(chars: usize) -> usize {
-    use crate::wiki::recall::READINGS_CHARS;
+    use crate::knowledge::recall::READINGS_CHARS;
     if chars >= 3 * READINGS_CHARS {
         chars - READINGS_CHARS
     } else {
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn a_hard_limit_leaves_room_for_the_journal_and_its_readings() {
-        use crate::wiki::recall::readings_allowance;
+        use crate::knowledge::recall::readings_allowance;
         for chars in [
             0, 1, 2, 3, 100, 119_999, 120_000, 120_001, 240_000, 2_520_000,
         ] {

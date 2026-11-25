@@ -33,7 +33,7 @@ enum Command {
     /// Observe enabled accounts read-only over IMAP (EXAMINE + BODY.PEEK[]).
     /// Never flags, moves or deletes anything on the server.
     Fetch(FetchArgs),
-    /// Create one immutable draft and its deterministic Decide proposal.
+    /// Create one immutable draft and its deterministic Decisions proposal.
     Draft(DraftArgs),
     /// Create a reply draft from an inbound wire message.
     Reply(ReplyArgs),

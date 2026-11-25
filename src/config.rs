@@ -61,7 +61,7 @@ pub fn handle(authority: VerifyingKey) -> CollectionHandle {
 /// and the history of what this host was pointed at stays readable.
 ///
 /// The pattern proposes and the register filters: `maximal` never proposes
-/// candidates, it only kills dominated ones, so the planner orders around the
+/// candidates, it only kills dominated ones, so the events orders around the
 /// anchor lookup exactly as it would any other relation.
 ///
 /// # What is refused

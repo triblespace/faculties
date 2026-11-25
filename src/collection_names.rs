@@ -1115,14 +1115,14 @@ mod tests {
         let collection = open(&mut store, decide::DEFAULT_SCOPE_ID, owner.verifying_key())
             .expect("register the signer-private descriptor");
 
-        require_command_write_admission(&mut store, collection, &owner, "Decide", "decide show")
+        require_command_write_admission(&mut store, collection, &owner, "Decisions", "decide show")
             .expect("the descriptor's own authority is admitted");
 
         let error = require_command_write_admission(
             &mut store,
             collection,
             &outsider,
-            "Decide",
+            "Decisions",
             "decide show",
         )
         .expect_err("an unadmitted writer must not get a silent success");

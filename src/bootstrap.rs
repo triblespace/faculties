@@ -1,7 +1,7 @@
 //! Portable, locally authorized onboarding seed.
 //!
 //! The seed is declarative program data, not a pile image. Import authors one
-//! Wiki revision DAG and one Compass event set under the recipient's existing
+//! Knowledge revision DAG and one event set under the recipient's existing
 //! durable signer. No builder signature, branch pin, repository commit, or
 //! private key crosses that boundary.
 
@@ -22,135 +22,135 @@ use triblespace::core::trible::{Fragment, TribleSet};
 use triblespace::macros::id_hex;
 use triblespace::prelude::TryToInline;
 
-use crate::wiki::{self, RevisionDraft};
-use crate::{compass, wiki as wiki_model};
+use crate::knowledge::{self, RevisionDraft};
+use crate::{goals, knowledge as knowledge_model};
 
 const GENERATION_DOMAIN: &[u8] = b"faculties.portable-bootstrap.v2";
 const ROOT_TITLE: &str = "Portable bootstrap entry anchor";
 
-struct WikiSeed {
+struct KnowledgeSeed {
     anchor: Id,
     title: &'static str,
     content: &'static str,
     tags: &'static [&'static str],
 }
 
-const WIKI_SEED: &[WikiSeed] = &[
-    WikiSeed {
+const KNOWLEDGE_SEED: &[KnowledgeSeed] = &[
+    KnowledgeSeed {
         anchor: id_hex!("25E8F009E33207755109F19F7A68DFF5"),
         title: "How Faculties Work",
         content: include_str!("../bootstrap/01_how_faculties_work.typ"),
         tags: &["bootstrap", "onboarding", "faculties"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("82129C70B693F7E2D781D78AC5EFBB86"),
         title: "Wiki Fragment Style Guide",
         content: include_str!("../bootstrap/02_wiki_style_guide.typ"),
         tags: &["bootstrap", "onboarding", "wiki"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("7CDD48C272FF344628FE74F4C07783E4"),
         title: "Compass Goals Workflow",
         content: include_str!("../bootstrap/03_compass_workflow.typ"),
         tags: &["bootstrap", "onboarding", "compass"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("996E648886CCCB61D1AFD48296B0A0CB"),
         title: "Work As Its Own Ledger",
         content: include_str!("../bootstrap/05_work_as_its_own_ledger.typ"),
         tags: &["bootstrap", "onboarding", "design", "principle"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("F4AFF48FFF04F313552F5B32244F9873"),
         title: "Tool Selection: Faculties First",
         content: include_str!("../bootstrap/06_tool_selection.typ"),
         tags: &["bootstrap", "onboarding", "tools", "reference"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("44D63D174814371C7468A3E604ED2303"),
         title: "Getting Started: Your First Hour",
         content: include_str!("../bootstrap/07_getting_started.typ"),
         tags: &["bootstrap", "onboarding", "start-here"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("B08448855DE9CCE7610D68DAC2555003"),
         title: "Files Faculty: Archiving and Citing Artefacts",
         content: include_str!("../bootstrap/08_files_faculty.typ"),
         tags: &["bootstrap", "onboarding", "files"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("67477D2173928FD91EF20173EABFEAE4"),
         title: "Teams: Microsoft Graph Archive and Bridge",
         content: include_str!("../bootstrap/09_teams_faculty.typ"),
         tags: &["bootstrap", "onboarding", "teams", "auth"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("65C6965CB3D11052E87804527734A697"),
         title: "Local Messages: Agent-to-Agent Direct Messaging",
         content: include_str!("../bootstrap/10_local_messages_faculty.typ"),
         tags: &["bootstrap", "onboarding", "local-messages", "coordination"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("FF27B500D93E1D545B7465438A0146E1"),
         title: "Orient: The Situation-Snapshot Faculty",
         content: include_str!("../bootstrap/11_orient_faculty.typ"),
         tags: &["bootstrap", "onboarding", "orient", "coordination"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("E7E3F672A66B39E0B5B3C0EAF212B1DA"),
         title: "Relations: People and Handle Mappings",
         content: include_str!("../bootstrap/12_relations_faculty.typ"),
         tags: &["bootstrap", "onboarding", "relations", "people"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("ABE651F605C823085D861F296D9F9907"),
         title: "Web: Search and Fetch Through Provider APIs",
         content: include_str!("../bootstrap/13_web_faculty.typ"),
         tags: &["bootstrap", "onboarding", "web", "research"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("999D2565F2E3AF57FA5CFE2ED507D450"),
         title: "Recipe: Research Workflow",
         content: include_str!("../bootstrap/14_research_workflow.typ"),
         tags: &["bootstrap", "onboarding", "recipe", "research"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("45E1B9BEF3AD9836536AB7BCE367DEB0"),
         title: "Recipe: Multi-Agent Coordination",
         content: include_str!("../bootstrap/15_coordination_workflow.typ"),
         tags: &["bootstrap", "onboarding", "recipe", "coordination"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("5C86DF3DCD5994DE2967483FCA7170AC"),
         title: "Harness Hooks: Mechanical Agent Sync (Watcher, Poll, Enforcement)",
         content: include_str!("../bootstrap/22_harness_hooks.typ"),
         tags: &["bootstrap", "onboarding", "hooks", "coordination"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("D06247B9D9183721E47A2940806E5D7F"),
         title: "Recipe: Share a Collection Between Agents",
         content: include_str!("../bootstrap/16_auth_setup_workflow.typ"),
         tags: &["bootstrap", "onboarding", "recipe", "auth"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("4E19893B36BF37D471BB9EA968EDAC20"),
         title: "Substrate 1/4: What Is a Trible",
         content: include_str!("../bootstrap/17_substrate_tribles.typ"),
         tags: &["bootstrap", "onboarding", "substrate", "concepts"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("5232EA531FEDFCB17BF15E88C3D52A36"),
         title: "Substrate 2/4: The Pile",
         content: include_str!("../bootstrap/18_substrate_pile.typ"),
         tags: &["bootstrap", "onboarding", "substrate", "concepts"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("5CC10E2B0263008B261CF8A1EF30BD8C"),
         title: "Substrate 3/4: Monotonic Merge",
         content: include_str!("../bootstrap/19_substrate_merge.typ"),
         tags: &["bootstrap", "onboarding", "substrate", "concepts"],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("6E5F38BDFD589CD0359BF668D1AF9841"),
         title: "Substrate 4/4: The Architecture — Zero Sync Code",
         content: include_str!("../bootstrap/20_substrate_architecture.typ"),
@@ -162,7 +162,7 @@ const WIKI_SEED: &[WikiSeed] = &[
             "architecture",
         ],
     },
-    WikiSeed {
+    KnowledgeSeed {
         anchor: id_hex!("864C45BED65311B27B1CAFE268B6ED2D"),
         title: "Authoring a Faculty",
         content: include_str!("../bootstrap/21_authoring_a_faculty.typ"),
@@ -170,7 +170,7 @@ const WIKI_SEED: &[WikiSeed] = &[
     },
 ];
 
-struct CompassSeed {
+struct GoalsSeed {
     created_nanosecond: u32,
     title: &'static str,
     tags: &'static [&'static str],
@@ -180,44 +180,44 @@ struct CompassSeed {
 // Fixed occurrence times make the declarative records exactly replayable.
 // Goal and note ids are derived from these immutable fields by their normal
 // constructors; bootstrap has no separate identity manifest to keep in sync.
-const COMPASS_SEED: &[CompassSeed] = &[
-    CompassSeed {
+const GOALS_SEED: &[GoalsSeed] = &[
+    GoalsSeed {
         created_nanosecond: 81_074_000,
         title: "Read the start-here wiki fragment",
         tags: &["bootstrap", "onboarding"],
         note: "Run `wiki list --tag bootstrap` to find the 'Getting Started: Your First Hour' fragment, then `wiki show <id>` to read it. This is your orientation tour.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 93_142_000,
         title: "Mint your first id with `trible genid`",
         tags: &["bootstrap", "faculties"],
         note: "Stable IDs in TribleSpace are minted, never guessed. Run `trible genid` and copy the 32-char hex output. Try minting 3 in a row — they should all be different.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 104_858_000,
         title: "Create your first wiki fragment",
         tags: &["bootstrap", "wiki"],
         note: "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then `wiki create \"My first fragment\" @/tmp/myfrag.typ --tag personal`. Verify with `wiki show <id>`.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 115_536_000,
         title: "Archive a file with `files add`",
         tags: &["bootstrap", "files"],
         note: "Pick any local file (not a binary in a git repo). Run `files add <path>`. The output `files:<hash>` is a content-addressed reference you can cite from wiki fragments. Confirm the hash is stable: re-run on the same file, same hash.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 126_687_000,
         title: "Run `wiki lint` and `wiki check`",
         tags: &["bootstrap", "wiki", "hygiene"],
         note: "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're the wiki's self-diagnostic surface.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 137_024_000,
         title: "Scaffold a trivial faculty",
         tags: &["bootstrap", "faculties", "authoring"],
         note: "Mint an id with `trible genid`, add `faculties/src/bin/echofact.rs`: a clap Cli with `#[arg(long, env = \"PILE\")] pile`, that opens the pile and prints one fact (e.g. the id you minted). Build the native cohort following the workspace build-placement rules and activate it with `faculties/scripts/install-release-cohort`, then run `echofact`. You've added a verb. See the 'Authoring a Faculty' fragment for the full skeleton.",
     },
-    CompassSeed {
+    GoalsSeed {
         created_nanosecond: 148_025_000,
         title: "Mark this goal done and write an outcome note",
         tags: &["bootstrap", "compass"],
@@ -228,17 +228,17 @@ const COMPASS_SEED: &[CompassSeed] = &[
 /// The complete locally authored onboarding seed before collection publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortableSeed {
-    pub wiki: Fragment,
-    pub compass: Fragment,
-    pub wiki_roots: Vec<Id>,
+    pub knowledge: Fragment,
+    pub goals: Fragment,
+    pub knowledge_roots: Vec<Id>,
 }
 
 /// Result of authorizing one logical seed under the recipient's key.
 #[derive(Clone, Debug)]
 pub struct ImportReport {
     pub generation: [u8; 32],
-    pub wiki_commit: CollectionCommit,
-    pub compass_commit: CollectionCommit,
+    pub knowledge_commit: CollectionCommit,
+    pub goals_commit: CollectionCommit,
 }
 
 pub(crate) fn render_import(report: &ImportReport, out: &mut crate::out::Out<'_>) -> Result<()> {
@@ -249,27 +249,27 @@ pub(crate) fn render_import(report: &ImportReport, out: &mut crate::out::Out<'_>
     ))?;
     out.line(format!(
         "wiki COMMIT record fingerprint {}",
-        CollectionRecord::Commit(report.wiki_commit).fingerprint()
+        CollectionRecord::Commit(report.knowledge_commit).fingerprint()
     ))?;
     out.line(format!(
         "compass COMMIT record fingerprint {}",
-        CollectionRecord::Commit(report.compass_commit).fingerprint()
+        CollectionRecord::Commit(report.goals_commit).fingerprint()
     ))
 }
 
-fn seed_time(nanosecond: u32) -> compass::IntervalValue {
+fn seed_time(nanosecond: u32) -> goals::IntervalValue {
     let epoch = Epoch::from_gregorian_tai(2026, 7, 23, 22, 54, 44, nanosecond);
     (epoch, epoch)
         .try_to_inline()
         .expect("fixed bootstrap timestamps are representable")
 }
 
-fn wiki_time(nanosecond: u32) -> wiki_model::IntervalValue {
+fn knowledge_time(nanosecond: u32) -> knowledge_model::IntervalValue {
     seed_time(200_000_000 + nanosecond)
 }
 
 fn root_record(author: Id, anchor: Id) -> Result<(Fragment, Id)> {
-    wiki::revision_record(RevisionDraft {
+    knowledge::revision_record(RevisionDraft {
         title: ROOT_TITLE.to_owned(),
         content: format!(
             "This revision anchors portable bootstrap entry {anchor:x}. Follow the entry to its current frontier."
@@ -277,14 +277,14 @@ fn root_record(author: Id, anchor: Id) -> Result<(Fragment, Id)> {
         tags: BTreeSet::new(),
         predecessors: BTreeSet::new(),
         author,
-        authored_at: wiki_time(0),
+        authored_at: knowledge_time(0),
     })
 }
 
 fn tag_set(out: &mut Fragment, labels: &[&str]) -> Result<BTreeSet<Id>> {
     let mut tags = BTreeSet::new();
     for label in labels {
-        let (record, id, _) = wiki::tag_record(label)?;
+        let (record, id, _) = knowledge::tag_record(label)?;
         *out += record;
         tags.insert(id);
     }
@@ -292,7 +292,7 @@ fn tag_set(out: &mut Fragment, labels: &[&str]) -> Result<BTreeSet<Id>> {
 }
 
 fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
-    let wiki_links = regex::Regex::new(r"\[([^\]]+)\]\(wiki:([0-9A-Fa-f]{32})\)")
+    let knowledge_links = regex::Regex::new(r"\[([^\]]+)\]\(wiki:([0-9A-Fa-f]{32})\)")
         .expect("static Wiki markdown-link expression");
     let web_links =
         regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").expect("static URL expression");
@@ -317,7 +317,7 @@ fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
                 line.to_owned()
             };
             let line = bold.replace_all(&line, "*$1*").to_string();
-            let line = wiki_links
+            let line = knowledge_links
                 .replace_all(&line, |captures: &regex::Captures<'_>| {
                     let alias = Id::from_hex(&captures[2]).expect("expression matched a full id");
                     let root = roots
@@ -344,49 +344,49 @@ fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
     output
 }
 
-/// The seed's Wiki fragment, advancing only its own source strand over
+/// The seed's Knowledge fragment, advancing only its own source strand over
 /// `current`, the collection's facts as they are and a reader for their texts.
 ///
 /// The strand is recognized by query at its point of use: revisions in the
 /// root's entry whose identity author is this key and which carry this key's
 /// fixed source authorship. A revision read several ways is a source revision
 /// when any reading is, and replays exactly when any reading matches the seed.
-fn wiki_fragment<P: TriblePattern, R: BlobStoreGet>(
+fn knowledge_fragment<P: TriblePattern, R: BlobStoreGet>(
     key: &ed25519_dalek::VerifyingKey,
     current: Option<(&P, &R)>,
 ) -> Result<(Fragment, Vec<Id>)> {
-    let (mut out, author) = wiki_model::author_record(key);
+    let (mut out, author) = knowledge_model::author_record(key);
 
     let mut roots = BTreeMap::new();
-    let mut root_ids = Vec::with_capacity(WIKI_SEED.len());
-    for spec in WIKI_SEED {
+    let mut root_ids = Vec::with_capacity(KNOWLEDGE_SEED.len());
+    for spec in KNOWLEDGE_SEED {
         let (record, root) = root_record(author, spec.anchor)?;
         out += record;
         roots.insert(spec.anchor, root);
         root_ids.push(root);
     }
 
-    for (index, spec) in WIKI_SEED.iter().enumerate() {
+    for (index, spec) in KNOWLEDGE_SEED.iter().enumerate() {
         let tags = tag_set(&mut out, spec.tags)?;
         let content = normalize_source(spec.content, &roots);
         // One fixed provenance coordinate marks generated successors. It is
         // deliberately independent of manifest ordering and mutable payload.
-        let source_time = wiki_time(1);
+        let source_time = knowledge_time(1);
         let predecessors = match current.and_then(|(facts, reader)| {
-            wiki_model::entry_members(facts, root_ids[index])
+            knowledge_model::entry_members(facts, root_ids[index])
                 .map(|members| (facts, reader, members))
         }) {
             Some((facts, reader, members)) => {
-                let is_source = |revision: &wiki_model::RevisionRecord| {
+                let is_source = |revision: &knowledge_model::RevisionRecord| {
                     revision.author == Some(author)
                         && revision.authorships.iter().any(|authorship| {
                             authorship.author == Some(author)
                                 && authorship.authored_at == Some(source_time)
                         })
                 };
-                let sources: BTreeMap<Id, Vec<wiki_model::RevisionRecord>> = members
+                let sources: BTreeMap<Id, Vec<knowledge_model::RevisionRecord>> = members
                     .iter()
-                    .map(|id| (*id, wiki_model::revision_records(facts, *id)))
+                    .map(|id| (*id, knowledge_model::revision_records(facts, *id)))
                     .filter(|(_, readings)| readings.iter().any(is_source))
                     .collect();
 
@@ -411,8 +411,8 @@ fn wiki_fragment<P: TriblePattern, R: BlobStoreGet>(
                 if let [head] = source_heads.iter().collect::<Vec<_>>().as_slice() {
                     for reading in &sources[*head] {
                         if reading.tags == tags
-                            && wiki_model::read_text(reader, reading.title)? == spec.title
-                            && wiki_model::read_text(reader, reading.content)? == content
+                            && knowledge_model::read_text(reader, reading.title)? == spec.title
+                            && knowledge_model::read_text(reader, reading.content)? == content
                         {
                             exact_source_head = Some(reading.supersedes.clone());
                             break;
@@ -431,7 +431,7 @@ fn wiki_fragment<P: TriblePattern, R: BlobStoreGet>(
             }
             None => BTreeSet::from([root_ids[index]]),
         };
-        let (record, _) = wiki::revision_record(RevisionDraft {
+        let (record, _) = knowledge::revision_record(RevisionDraft {
             title: spec.title.to_owned(),
             content,
             tags,
@@ -444,19 +444,19 @@ fn wiki_fragment<P: TriblePattern, R: BlobStoreGet>(
     Ok((out, root_ids))
 }
 
-fn compass_fragment() -> Result<Fragment> {
-    let mut out = compass::kind_catalog_fragment();
-    for spec in COMPASS_SEED {
+fn goals_fragment() -> Result<Fragment> {
+    let mut out = goals::kind_catalog_fragment();
+    for spec in GOALS_SEED {
         let at = seed_time(spec.created_nanosecond);
-        let (goal_record, goal) = compass::goal_fragment(
+        let (goal_record, goal) = goals::goal_fragment(
             spec.title,
             spec.tags.iter().map(|tag| (*tag).to_owned()).collect(),
             None,
             at,
         )?;
         out += goal_record;
-        out += compass::status_fragment(goal, "todo", None, at)?;
-        let (note_record, _) = compass::note_fragment(
+        out += goals::status_fragment(goal, "todo", None, at)?;
+        let (note_record, _) = goals::note_fragment(
             goal,
             spec.note,
             Vec::new(),
@@ -472,11 +472,12 @@ fn compass_fragment() -> Result<Fragment> {
 
 /// Build the exact self-contained logical seed for one recipient author.
 pub fn build(key: &ed25519_dalek::VerifyingKey) -> Result<PortableSeed> {
-    let (wiki, wiki_roots) = wiki_fragment(key, None::<(&TribleSet, &PileSnapshot)>)?;
+    let (knowledge, knowledge_roots) =
+        knowledge_fragment(key, None::<(&TribleSet, &PileSnapshot)>)?;
     Ok(PortableSeed {
-        wiki,
-        compass: compass_fragment()?,
-        wiki_roots,
+        knowledge,
+        goals: goals_fragment()?,
+        knowledge_roots,
     })
 }
 
@@ -484,7 +485,7 @@ pub fn build(key: &ed25519_dalek::VerifyingKey) -> Result<PortableSeed> {
 pub fn generation() -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(GENERATION_DOMAIN);
-    for spec in WIKI_SEED {
+    for spec in KNOWLEDGE_SEED {
         hasher.update(spec.anchor.as_ref());
         hasher.update(spec.title.as_bytes());
         hasher.update(spec.content.as_bytes());
@@ -493,7 +494,7 @@ pub fn generation() -> [u8; 32] {
             hasher.update(&[0]);
         }
     }
-    for spec in COMPASS_SEED {
+    for spec in GOALS_SEED {
         hasher.update(&spec.created_nanosecond.to_be_bytes());
         hasher.update(spec.title.as_bytes());
         hasher.update(spec.note.as_bytes());
@@ -505,7 +506,7 @@ pub fn generation() -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// Import one locally authored Wiki root and one locally authored Compass root.
+/// Import one locally authored Knowledge root and one locally authored Goals root.
 ///
 /// The pile and durable key must already exist. Both fragments are constructed
 /// completely before publication. Replaying with the same key yields the same
@@ -530,23 +531,23 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 storage.open_collection_read(pile, scope, signer.verifying_key(), runtime)?;
             }
         }
-        let wiki_source = storage.open_collection_write(
+        let knowledge_source = storage.open_collection_write(
             pile,
             crate::schemas::wiki::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
             runtime,
         )?;
-        let compass_source = storage.open_collection_write(
+        let goals_source = storage.open_collection_write(
             pile,
             crate::schemas::compass::DEFAULT_SCOPE_ID,
             signer.verifying_key(),
             runtime,
         )?;
-        let latest = wiki_model::latest_for_source(pile, wiki_source)?;
+        let latest = knowledge_model::latest_for_source(pile, knowledge_source)?;
         runtime
             .block_on(async {
                 crate::storage::seed_attached(pile, latest, signer).await?;
-                crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
+                crate::storage::ensure_downstream(pile, knowledge_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
             .context("ensure Wiki before bootstrap import")?;
@@ -568,55 +569,55 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 Ok(facts)
             };
         let before = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let wiki_before = read_all(wiki_source, &before)?;
-        let (wiki, wiki_roots) =
-            wiki_fragment(&signer.verifying_key(), Some((&wiki_before, &before)))?;
+        let knowledge_before = read_all(knowledge_source, &before)?;
+        let (knowledge, knowledge_roots) =
+            knowledge_fragment(&signer.verifying_key(), Some((&knowledge_before, &before)))?;
         let seed = PortableSeed {
-            wiki,
-            compass: compass_fragment()?,
-            wiki_roots,
+            knowledge,
+            goals: goals_fragment()?,
+            knowledge_roots,
         };
-        let expected_wiki = seed.wiki.facts().clone();
-        let expected_compass = seed.compass.facts().clone();
-        let wiki_commit = pile.commit(wiki_source, signer, seed.wiki)?;
+        let expected_knowledge = seed.knowledge.facts().clone();
+        let expected_goals = seed.goals.facts().clone();
+        let knowledge_commit = pile.commit(knowledge_source, signer, seed.knowledge)?;
         runtime
             .block_on(async {
                 crate::storage::seed_attached(pile, latest, signer).await?;
-                crate::storage::ensure_downstream(pile, wiki_source, signer).await?;
+                crate::storage::ensure_downstream(pile, knowledge_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
             .context("Bootstrap Wiki was committed, but ensuring its views failed")?;
-        let compass_commit = pile
-            .commit(compass_source, signer, seed.compass)
+        let goals_commit = pile
+            .commit(goals_source, signer, seed.goals)
             .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
         runtime
             .block_on(async {
-                let status = compass::status_register_for_source(pile, compass_source)?;
+                let status = goals::status_register_for_source(pile, goals_source)?;
                 crate::storage::seed_attached(pile, status, signer).await?;
-                crate::storage::ensure_downstream(pile, compass_source, signer).await?;
+                crate::storage::ensure_downstream(pile, goals_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
             .context("Bootstrap Compass was committed, but ensuring its views failed")?;
 
         let after = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
-        let wiki_after = read_all(wiki_source, &after)?;
+        let knowledge_after = read_all(knowledge_source, &after)?;
         // The seed's own texts must be readable; whatever else the collection
         // holds is read open-world by its readers, never checked here.
-        wiki_model::require_text_payloads(&after, &expected_wiki)?;
-        if !expected_wiki.difference(&wiki_after).is_empty() {
+        knowledge_model::require_text_payloads(&after, &expected_knowledge)?;
+        if !expected_knowledge.difference(&knowledge_after).is_empty() {
             bail!("Wiki collection omitted portable bootstrap facts after publication");
         }
-        let compass_after = read_all(compass_source, &after)?;
+        let goals_after = read_all(goals_source, &after)?;
         // The seed's own texts must be readable; whatever else the collection
         // holds is read open-world by its readers, never checked here.
-        compass::require_text_payloads(&after, &expected_compass)?;
-        if !expected_compass.difference(&compass_after).is_empty() {
+        goals::require_text_payloads(&after, &expected_goals)?;
+        if !expected_goals.difference(&goals_after).is_empty() {
             bail!("Compass collection omitted portable bootstrap facts after publication");
         }
         Ok(ImportReport {
             generation: generation(),
-            wiki_commit,
-            compass_commit,
+            knowledge_commit,
+            goals_commit,
         })
     })
 }
@@ -662,20 +663,24 @@ mod tests {
     ) {
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict_as(&imported.pile, signer.verifying_key()).unwrap();
-        let (wiki, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let (compass, _) = compass::materialize_collection(&mut pile, &signer).unwrap();
+        let (knowledge, _) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (goals, _) = goals::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
-        (wiki, compass)
+        (knowledge, goals)
     }
 
     /// The entry containing `root` in `facts`, under their own latest index.
-    fn entry_of(facts: &triblespace::prelude::TribleSet, root: Id) -> wiki_model::EntryRecord {
-        wiki_model::entry(facts, &wiki_model::latest_index_for_tests(facts), root).unwrap()
+    fn entry_of(facts: &triblespace::prelude::TribleSet, root: Id) -> knowledge_model::EntryRecord {
+        knowledge_model::entry(facts, &knowledge_model::latest_index_for_tests(facts), root)
+            .unwrap()
     }
 
     /// The one reading of a revision these fixtures hold.
-    fn record_of(facts: &triblespace::prelude::TribleSet, id: Id) -> wiki_model::RevisionRecord {
-        let mut records = wiki_model::revision_records(facts, id);
+    fn record_of(
+        facts: &triblespace::prelude::TribleSet,
+        id: Id,
+    ) -> knowledge_model::RevisionRecord {
+        let mut records = knowledge_model::revision_records(facts, id);
         assert_eq!(records.len(), 1);
         records.remove(0)
     }
@@ -684,16 +689,19 @@ mod tests {
     fn declared_seed_shape_is_complete_without_alias_entities() {
         let signer = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let seed = build(&signer.verifying_key()).unwrap();
-        let latest = wiki_model::latest_index_for_tests(seed.wiki.facts());
-        assert_eq!(wiki_model::entries(seed.wiki.facts(), &latest).len(), 21);
-        assert_eq!(wiki_model::revision_ids(seed.wiki.facts()).len(), 42);
-        assert_eq!(seed.wiki_roots.len(), 21);
-        assert_eq!(compass::goal_ids(seed.compass.facts()).len(), 7);
-        assert_eq!(compass::note_ids(seed.compass.facts()).len(), 7);
+        let latest = knowledge_model::latest_index_for_tests(seed.knowledge.facts());
         assert_eq!(
-            seed.compass,
-            build(&signer.verifying_key()).unwrap().compass
+            knowledge_model::entries(seed.knowledge.facts(), &latest).len(),
+            21
         );
+        assert_eq!(
+            knowledge_model::revision_ids(seed.knowledge.facts()).len(),
+            42
+        );
+        assert_eq!(seed.knowledge_roots.len(), 21);
+        assert_eq!(goals::goal_ids(seed.goals.facts()).len(), 7);
+        assert_eq!(goals::note_ids(seed.goals.facts()).len(), 7);
+        assert_eq!(seed.goals, build(&signer.verifying_key()).unwrap().goals);
     }
 
     #[test]
@@ -708,10 +716,13 @@ mod tests {
         let seed = build(&signer.verifying_key()).unwrap();
         let mut pile = open_pile_strict_as(&imported.pile, signer.verifying_key()).unwrap();
         for (scope, expected) in [
-            (crate::schemas::wiki::DEFAULT_SCOPE_ID, seed.wiki.facts()),
+            (
+                crate::schemas::wiki::DEFAULT_SCOPE_ID,
+                seed.knowledge.facts(),
+            ),
             (
                 crate::schemas::compass::DEFAULT_SCOPE_ID,
-                seed.compass.facts(),
+                seed.goals.facts(),
             ),
         ] {
             let source =
@@ -733,8 +744,7 @@ mod tests {
             let actual: TribleSet = view.iter().collect();
             assert!(expected.difference(&actual).is_empty());
         }
-        let status =
-            compass::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
+        let status = goals::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
         assert!(!pollster::block_on(pile.maintain_attached(status, &signer))
             .unwrap()
             .attached(status)
@@ -749,22 +759,25 @@ mod tests {
         let left = imported("left");
         let right = imported("right");
         assert_eq!(left.report.generation, right.report.generation);
-        assert_ne!(left.report.wiki_commit, right.report.wiki_commit);
-        assert_ne!(left.report.compass_commit, right.report.compass_commit);
+        assert_ne!(left.report.knowledge_commit, right.report.knowledge_commit);
+        assert_ne!(left.report.goals_commit, right.report.goals_commit);
 
-        let (left_wiki, left_compass) = views(&left);
-        let (right_wiki, right_compass) = views(&right);
-        assert_ne!(left_wiki, right_wiki, "Wiki authorship is part of identity");
-        assert_eq!(left_compass, right_compass);
+        let (left_knowledge, left_goals) = views(&left);
+        let (right_knowledge, right_goals) = views(&right);
+        assert_ne!(
+            left_knowledge, right_knowledge,
+            "Wiki authorship is part of identity"
+        );
+        assert_eq!(left_goals, right_goals);
 
         let titles = |facts: &triblespace::prelude::TribleSet| -> BTreeSet<_> {
-            wiki_model::entries(facts, &wiki_model::latest_index_for_tests(facts))
+            knowledge_model::entries(facts, &knowledge_model::latest_index_for_tests(facts))
                 .into_iter()
                 .flat_map(|entry| entry.frontier)
                 .map(|revision| revision.title)
                 .collect()
         };
-        assert_eq!(titles(&left_wiki), titles(&right_wiki));
+        assert_eq!(titles(&left_knowledge), titles(&right_knowledge));
     }
 
     #[test]
@@ -797,8 +810,8 @@ mod tests {
         let cover_after = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
         assert_eq!(first.generation, second.generation);
-        assert_eq!(first.wiki_commit, second.wiki_commit);
-        assert_eq!(first.compass_commit, second.compass_commit);
+        assert_eq!(first.knowledge_commit, second.knowledge_commit);
+        assert_eq!(first.goals_commit, second.goals_commit);
         assert_eq!(
             bytes_before, bytes_after,
             "exact replay must not grow the pile"
@@ -822,61 +835,61 @@ mod tests {
         let key_path = directory.path().join("upgrade.key");
         File::create(&pile_path).unwrap();
         let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let (mut staged, author) = wiki_model::author_record(&signer.verifying_key());
-        let tags = tag_set(&mut staged, WIKI_SEED[0].tags).unwrap();
+        let (mut staged, author) = knowledge_model::author_record(&signer.verifying_key());
+        let tags = tag_set(&mut staged, KNOWLEDGE_SEED[0].tags).unwrap();
 
-        let (root_fragment, root) = root_record(author, WIKI_SEED[0].anchor).unwrap();
+        let (root_fragment, root) = root_record(author, KNOWLEDGE_SEED[0].anchor).unwrap();
         staged += root_fragment;
-        let (prior_source, prior_source_id) = wiki::revision_record(RevisionDraft {
-            title: WIKI_SEED[0].title.to_owned(),
+        let (prior_source, prior_source_id) = knowledge::revision_record(RevisionDraft {
+            title: KNOWLEDGE_SEED[0].title.to_owned(),
             content: "A simulated earlier bootstrap generation.".to_owned(),
             tags: tags.clone(),
             predecessors: BTreeSet::from([root]),
             author,
             // The fixed odd timestamp identifies this as source-lane output.
-            authored_at: wiki_time(1),
+            authored_at: knowledge_time(1),
         })
         .unwrap();
         staged += prior_source;
-        let (local_edit, local_edit_id) = wiki::revision_record(RevisionDraft {
+        let (local_edit, local_edit_id) = knowledge::revision_record(RevisionDraft {
             title: "Recipient's local onboarding edit".to_owned(),
             content: "This recipient-authored edit must remain visible.".to_owned(),
             tags: tags.clone(),
             predecessors: BTreeSet::from([prior_source_id]),
             author,
-            authored_at: wiki_time(999),
+            authored_at: knowledge_time(999),
         })
         .unwrap();
         staged += local_edit;
 
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        wiki_model::commit_collection(&mut pile, &signer, staged).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, staged).unwrap();
         pile.close().unwrap();
 
         let built = build(&signer.verifying_key()).unwrap();
-        assert_eq!(built.wiki_roots[0], root);
+        assert_eq!(built.knowledge_roots[0], root);
         let roots = BTreeMap::from_iter(
-            WIKI_SEED
+            KNOWLEDGE_SEED
                 .iter()
-                .zip(built.wiki_roots)
+                .zip(built.knowledge_roots)
                 .map(|(seed, root)| (seed.anchor, root)),
         );
-        let desired_content = normalize_source(WIKI_SEED[0].content, &roots);
-        let (_, bundled_source_id) = wiki::revision_record(RevisionDraft {
-            title: WIKI_SEED[0].title.to_owned(),
+        let desired_content = normalize_source(KNOWLEDGE_SEED[0].content, &roots);
+        let (_, bundled_source_id) = knowledge::revision_record(RevisionDraft {
+            title: KNOWLEDGE_SEED[0].title.to_owned(),
             content: desired_content.clone(),
             tags,
             predecessors: BTreeSet::from([prior_source_id]),
             author,
-            authored_at: wiki_time(1),
+            authored_at: knowledge_time(1),
         })
         .unwrap();
 
         let upgraded = import(&pile_path, Some(&key_path)).unwrap();
         let bytes_after_upgrade = std::fs::metadata(&pile_path).unwrap().len();
         let replay = import(&pile_path, Some(&key_path)).unwrap();
-        assert_eq!(upgraded.wiki_commit, replay.wiki_commit);
-        assert_eq!(upgraded.compass_commit, replay.compass_commit);
+        assert_eq!(upgraded.knowledge_commit, replay.knowledge_commit);
+        assert_eq!(upgraded.goals_commit, replay.goals_commit);
         assert_eq!(
             bytes_after_upgrade,
             std::fs::metadata(&pile_path).unwrap().len()
@@ -884,14 +897,14 @@ mod tests {
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (after, reader) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
         let entry = entry_of(&after, root);
         let frontier: BTreeSet<_> = entry.frontier.iter().map(|revision| revision.id).collect();
         assert_eq!(frontier, BTreeSet::from([local_edit_id, bundled_source_id]));
         let bundled = record_of(&after, bundled_source_id);
         assert_eq!(bundled.supersedes, BTreeSet::from([prior_source_id]));
         assert_eq!(
-            wiki_model::read_text(&reader, bundled.content).unwrap(),
+            knowledge_model::read_text(&reader, bundled.content).unwrap(),
             desired_content
         );
         pile.close().unwrap();
@@ -902,35 +915,35 @@ mod tests {
         let imported = imported("source-revert");
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (before, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
+        let (before, _) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
+        let root = build(&signer.verifying_key()).unwrap().knowledge_roots[0];
         let source_a = entry_of(&before, root).frontier[0].clone();
-        let (_, author) = wiki_model::author_record(&signer.verifying_key());
+        let (_, author) = knowledge_model::author_record(&signer.verifying_key());
 
-        let (source_b, source_b_id) = wiki::revision_record(RevisionDraft {
-            title: WIKI_SEED[0].title.to_owned(),
+        let (source_b, source_b_id) = knowledge::revision_record(RevisionDraft {
+            title: KNOWLEDGE_SEED[0].title.to_owned(),
             content: "A simulated intervening bootstrap generation B.".to_owned(),
             tags: source_a.tags.clone(),
             predecessors: BTreeSet::from([source_a.id]),
             author,
-            authored_at: wiki_time(1),
+            authored_at: knowledge_time(1),
         })
         .unwrap();
-        wiki_model::commit_collection(&mut pile, &signer, source_b).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, source_b).unwrap();
         pile.close().unwrap();
 
         import(&imported.pile, Some(&imported.key)).unwrap();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (after, reader) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
         let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         let reverted_a = &entry.frontier[0];
         assert_ne!(reverted_a.id, source_a.id);
         assert_eq!(reverted_a.supersedes, BTreeSet::from([source_b_id]));
         assert_eq!(
-            wiki_model::read_text(&reader, reverted_a.content).unwrap(),
-            wiki_model::read_text(&reader, source_a.content).unwrap()
+            knowledge_model::read_text(&reader, reverted_a.content).unwrap(),
+            knowledge_model::read_text(&reader, source_a.content).unwrap()
         );
         pile.close().unwrap();
     }
@@ -940,39 +953,39 @@ mod tests {
         let imported = imported("source-forks");
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (before, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
+        let (before, _) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
+        let root = build(&signer.verifying_key()).unwrap().knowledge_roots[0];
         let source_a = entry_of(&before, root).frontier[0].clone();
-        let (_, author) = wiki_model::author_record(&signer.verifying_key());
+        let (_, author) = knowledge_model::author_record(&signer.verifying_key());
         let mut forks = Fragment::empty();
         let mut fork_ids = BTreeSet::new();
         for label in ["B", "C"] {
-            let (fork, id) = wiki::revision_record(RevisionDraft {
-                title: WIKI_SEED[0].title.to_owned(),
+            let (fork, id) = knowledge::revision_record(RevisionDraft {
+                title: KNOWLEDGE_SEED[0].title.to_owned(),
                 content: format!("Simulated forked bootstrap generation {label}."),
                 tags: source_a.tags.clone(),
                 predecessors: BTreeSet::from([source_a.id]),
                 author,
-                authored_at: wiki_time(1),
+                authored_at: knowledge_time(1),
             })
             .unwrap();
             forks += fork;
             fork_ids.insert(id);
         }
-        wiki_model::commit_collection(&mut pile, &signer, forks).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, forks).unwrap();
         pile.close().unwrap();
 
         import(&imported.pile, Some(&imported.key)).unwrap();
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (after, reader) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
         let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         let reconciled = &entry.frontier[0];
         assert_eq!(reconciled.supersedes, fork_ids);
         assert_eq!(
-            wiki_model::read_text(&reader, reconciled.content).unwrap(),
-            wiki_model::read_text(&reader, source_a.content).unwrap()
+            knowledge_model::read_text(&reader, reconciled.content).unwrap(),
+            knowledge_model::read_text(&reader, source_a.content).unwrap()
         );
         pile.close().unwrap();
     }
@@ -984,33 +997,36 @@ mod tests {
         let key_path = directory.path().join("shape-change.key");
         File::create(&pile_path).unwrap();
         let signer = initialize_signer(&pile_path, Some(&key_path)).unwrap();
-        let (mut staged, author) = wiki_model::author_record(&signer.verifying_key());
-        let (root_fragment, root) = root_record(author, WIKI_SEED[0].anchor).unwrap();
+        let (mut staged, author) = knowledge_model::author_record(&signer.verifying_key());
+        let (root_fragment, root) = root_record(author, KNOWLEDGE_SEED[0].anchor).unwrap();
         staged += root_fragment;
         let old_tags = tag_set(&mut staged, &["bootstrap", "obsolete-tag"]).unwrap();
-        let (old_source, old_source_id) = wiki::revision_record(RevisionDraft {
+        let (old_source, old_source_id) = knowledge::revision_record(RevisionDraft {
             title: "An earlier bootstrap title".to_owned(),
             content: "An earlier bootstrap body.".to_owned(),
             tags: old_tags,
             predecessors: BTreeSet::from([root]),
             author,
-            authored_at: wiki_time(1),
+            authored_at: knowledge_time(1),
         })
         .unwrap();
         staged += old_source;
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        wiki_model::commit_collection(&mut pile, &signer, staged).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, staged).unwrap();
         pile.close().unwrap();
 
         let built = build(&signer.verifying_key()).unwrap();
-        assert_eq!(built.wiki_roots[0], root);
+        assert_eq!(built.knowledge_roots[0], root);
         import(&pile_path, Some(&key_path)).unwrap();
 
         let signer = load_signer(&pile_path, Some(&key_path)).unwrap();
         let mut pile = open_pile_strict(&pile_path).unwrap();
-        let (after, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let latest = wiki_model::latest_index_for_tests(&after);
-        assert_eq!(wiki_model::entries(&after, &latest).len(), WIKI_SEED.len());
+        let (after, reader) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
+        let latest = knowledge_model::latest_index_for_tests(&after);
+        assert_eq!(
+            knowledge_model::entries(&after, &latest).len(),
+            KNOWLEDGE_SEED.len()
+        );
         let entry = entry_of(&after, root);
         assert_eq!(entry.frontier.len(), 1);
         assert_eq!(
@@ -1018,8 +1034,8 @@ mod tests {
             BTreeSet::from([old_source_id])
         );
         assert_eq!(
-            wiki_model::read_text(&reader, entry.frontier[0].title).unwrap(),
-            WIKI_SEED[0].title
+            knowledge_model::read_text(&reader, entry.frontier[0].title).unwrap(),
+            KNOWLEDGE_SEED[0].title
         );
         assert_ne!(
             entry.frontier[0].tags,
@@ -1033,36 +1049,36 @@ mod tests {
         let imported = imported("equal-successor");
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (before, reader) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
-        let root = build(&signer.verifying_key()).unwrap().wiki_roots[0];
+        let (before, reader) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
+        let root = build(&signer.verifying_key()).unwrap().knowledge_roots[0];
         let head = entry_of(&before, root).frontier[0].clone();
-        let title = wiki_model::read_text(&reader, head.title).unwrap();
-        let content = wiki_model::read_text(&reader, head.content).unwrap();
+        let title = knowledge_model::read_text(&reader, head.title).unwrap();
+        let content = knowledge_model::read_text(&reader, head.content).unwrap();
         drop(reader);
 
-        let (_, author) = wiki_model::author_record(&signer.verifying_key());
-        let (same_payload, successor) = wiki::revision_record(RevisionDraft {
+        let (_, author) = knowledge_model::author_record(&signer.verifying_key());
+        let (same_payload, successor) = knowledge::revision_record(RevisionDraft {
             title,
             content,
             tags: head.tags,
             predecessors: BTreeSet::from([head.id]),
             author,
             // Authorship time is occurrence provenance, not revision identity.
-            authored_at: wiki_time(999),
+            authored_at: knowledge_time(999),
         })
         .unwrap();
-        wiki_model::commit_collection(&mut pile, &signer, same_payload).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, same_payload).unwrap();
         pile.close().unwrap();
 
         let first = import(&imported.pile, Some(&imported.key)).unwrap();
         let bytes = std::fs::metadata(&imported.pile).unwrap().len();
         let second = import(&imported.pile, Some(&imported.key)).unwrap();
-        assert_eq!(first.wiki_commit, second.wiki_commit);
+        assert_eq!(first.knowledge_commit, second.knowledge_commit);
         assert_eq!(bytes, std::fs::metadata(&imported.pile).unwrap().len());
 
         let signer = load_signer(&imported.pile, Some(&imported.key)).unwrap();
         let mut pile = open_pile_strict(&imported.pile).unwrap();
-        let (after, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (after, _) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
         let entry = entry_of(&after, root);
         assert_eq!(
             entry
@@ -1075,11 +1091,11 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// Import adds the seed beside whatever the Compass collection already
+    /// Import adds the seed beside whatever the Goals collection already
     /// holds. A goal there with two titles, or one whose title text is not
     /// resident here, is an ordinary open-world fact, not a reason to refuse.
     #[test]
-    fn import_beside_an_open_world_compass_collection_does_not_refuse() {
+    fn import_beside_an_open_world_goals_collection_does_not_refuse() {
         use crate::schemas::compass::{board, KIND_GOAL_ID};
         use triblespace::core::metadata;
         use triblespace::macros::entity;
@@ -1113,19 +1129,19 @@ mod tests {
         };
         absent.blobs_mut().keep([]);
         fragment += absent;
-        compass::commit_collection(&mut pile, &signer, fragment).unwrap();
+        goals::commit_collection(&mut pile, &signer, fragment).unwrap();
         pile.close().unwrap();
 
         import(&pile_path, Some(&key)).unwrap();
     }
 
-    /// Import adds the seed beside whatever the Wiki collection already
+    /// Import adds the seed beside whatever the Knowledge collection already
     /// holds: a revision with two titles, a supersedes cycle, a revision whose
     /// predecessor is absent, an unnamed tag, a tag name that is not
     /// normalized, and a revision whose texts are not resident here. None of
     /// those is the seed's, and none is a reason to refuse it.
     #[test]
-    fn import_beside_an_open_world_wiki_collection_does_not_refuse() {
+    fn import_beside_an_open_world_knowledge_collection_does_not_refuse() {
         use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
         use triblespace::core::metadata;
         use triblespace::macros::entity;
@@ -1136,7 +1152,7 @@ mod tests {
         let key = directory.path().join("open-wiki.key");
         File::create(&pile_path).unwrap();
         let signer = initialize_signer(&pile_path, Some(&key)).unwrap();
-        let (mut fragment, author) = wiki_model::author_record(&signer.verifying_key());
+        let (mut fragment, author) = knowledge_model::author_record(&signer.verifying_key());
 
         let mut unnamed = RevisionDraft {
             title: "two titles".to_owned(),
@@ -1144,11 +1160,11 @@ mod tests {
             tags: BTreeSet::from([genid().id]),
             predecessors: BTreeSet::from([genid().id]),
             author,
-            authored_at: wiki_time(7),
+            authored_at: knowledge_time(7),
         };
-        let (record, doubled) = wiki::revision_record(unnamed.clone()).unwrap();
+        let (record, doubled) = knowledge::revision_record(unnamed.clone()).unwrap();
         fragment += record;
-        let other: wiki::IntervalValue = wiki_time(8);
+        let other: knowledge::IntervalValue = knowledge_time(8);
         let title = fragment.put::<blobencodings::UTF8String, _>("another title".to_owned());
         fragment += entity! { ExclusiveId::force_ref(&doubled) @ attrs::title: title };
 
@@ -1158,7 +1174,7 @@ mod tests {
         unnamed.title = "mixed tag".to_owned();
         unnamed.authored_at = other;
         fragment += named;
-        fragment += wiki::revision_record(unnamed.clone()).unwrap().0;
+        fragment += knowledge::revision_record(unnamed.clone()).unwrap().0;
 
         let (first, second) = (genid().id, genid().id);
         for (id, predecessor) in [(first, second), (second, first)] {
@@ -1173,24 +1189,24 @@ mod tests {
 
         unnamed.title = "held elsewhere".to_owned();
         unnamed.tags = BTreeSet::new();
-        let (mut absent, _) = wiki::revision_record(unnamed).unwrap();
+        let (mut absent, _) = knowledge::revision_record(unnamed).unwrap();
         absent.blobs_mut().keep([]);
         fragment += absent;
 
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        wiki_model::commit_collection(&mut pile, &signer, fragment).unwrap();
+        knowledge_model::commit_collection(&mut pile, &signer, fragment).unwrap();
         pile.close().unwrap();
 
         import(&pile_path, Some(&key)).unwrap();
         let replay = import(&pile_path, Some(&key)).unwrap();
         let fresh = build(&signer.verifying_key()).unwrap();
         let mut pile = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
-        let (wiki, _) = wiki_model::materialize_collection(&mut pile, &signer).unwrap();
+        let (knowledge, _) = knowledge_model::materialize_collection(&mut pile, &signer).unwrap();
         pile.close().unwrap();
-        assert!(fresh.wiki.facts().difference(&wiki).is_empty());
+        assert!(fresh.knowledge.facts().difference(&knowledge).is_empty());
         assert_eq!(
-            import(&pile_path, Some(&key)).unwrap().wiki_commit,
-            replay.wiki_commit
+            import(&pile_path, Some(&key)).unwrap().knowledge_commit,
+            replay.knowledge_commit
         );
     }
 }

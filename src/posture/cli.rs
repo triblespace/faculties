@@ -39,10 +39,10 @@ enum Command {
         /// Show at most this many examples per group
         #[arg(long, default_value_t = 3)]
         examples: usize,
-        /// Include findings classified benign by a resolved Decide decision.
+        /// Include findings classified benign by a resolved Decisions decision.
         #[arg(long)]
         all: bool,
-        /// Print the content-located finding ids `decide propose --about` names.
+        /// Print the content-located finding ids `decisions propose --about` names.
         #[arg(long)]
         ids: bool,
     },

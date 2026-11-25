@@ -492,7 +492,7 @@ def run(*argv):
     exe = shutil.which(argv[0]) or os.path.expanduser("~/.local/bin/" + argv[0])
     # A moving cutoff is call input, never attention identity.
     label = ("relations show <persona>" if argv[0] == "relations" else
-             "compass has-activity <actor> <since> doing blocked" if argv[:2] == ("compass", "has-activity") else
+             "goals has-activity <actor> <since> doing blocked" if argv[:2] == ("compass", "has-activity") else
              " ".join(argv))
     out = observed_call(label, [exe, *argv[1:]], 120, stdin=subprocess.DEVNULL)
     if out.returncode != 0:
@@ -530,7 +530,7 @@ def decide():
     result = json.loads(run("compass", "has-activity", "--actor", me,
                             "--since", since, "--status", "doing", "--status", "blocked"))
     if type(result) is not bool:
-        raise ValueError("compass has-activity: expected a JSON boolean")
+        raise ValueError("goals has-activity: expected a JSON boolean")
     if result:
         return False, "covered: own activity on a doing/blocked goal within %d min" % (fresh // 60)
     return True, "between things: no own move or note on a doing/blocked goal within %d min, no reservation" % (fresh // 60)

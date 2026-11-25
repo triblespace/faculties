@@ -1,3 +1,3 @@
 fn main() -> anyhow::Result<()> {
-    faculties::gauge::cli::run()
+    faculties::knowledge::health::cli::run()
 }

@@ -41,16 +41,16 @@ required-features = ["widgets"]
 # exists. Kept because iterating on one widget is still faster than
 # rendering the whole notebook.
 [[bin]]
-name = "planner-capture"
-path = "src/bin/planner-capture.rs"
+name = "events-capture"
+path = "src/bin/events-capture.rs"
 required-features = ["widgets"]
 
 # Same idea for the headspace widget — minimal capture target that
 # skips the wiki widget's GPU init so headless captures of the
 # agent-config card don't get truncated.
 [[bin]]
-name = "headspace-capture"
-path = "src/bin/headspace-capture.rs"
+name = "profiles-capture"
+path = "src/bin/profiles-capture.rs"
 required-features = ["widgets"]
 
 # Memory chunks viewer — recent compacted-context summaries.
@@ -61,8 +61,8 @@ required-features = ["widgets"]
 
 # Gauge research-health dashboard.
 [[bin]]
-name = "gauge-capture"
-path = "src/bin/gauge-capture.rs"
+name = "knowledge-health-capture"
+path = "src/bin/knowledge-health-capture.rs"
 required-features = ["widgets"]
 
 # Messages-only viewer.
@@ -79,14 +79,14 @@ required-features = ["widgets"]
 
 # Triage diagnostic viewer.
 [[bin]]
-name = "triage-capture"
-path = "src/bin/triage-capture.rs"
+name = "diagnostics-capture"
+path = "src/bin/diagnostics-capture.rs"
 required-features = ["widgets"]
 
 # Atlas schema-catalog browser.
 [[bin]]
-name = "atlas-capture"
-path = "src/bin/atlas-capture.rs"
+name = "schemas-capture"
+path = "src/bin/schemas-capture.rs"
 required-features = ["widgets"]
 
 # Discord recent-messages viewer.
@@ -119,7 +119,7 @@ web-export = []
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
 # Semantic index and search for Files, Memory and Wiki (`faculties maintain`
 # derives the indexes; `files similar`, `memory similar`, `memory context
-# --about/--filter/--remove`, `wiki similar` read them): one native WeMM model
+# --about/--filter/--remove`, `knowledge similar` read them): one native WeMM model
 # for text, images and documents, on a GB10 only. Without it those commands
 # say so, and context falls back to BM25.
 wemm = ["dep:mary", "mary/wemm-input", "triblespace-search/semantic-wemm-cuda"]
@@ -200,16 +200,16 @@ base64 = "0.22"             # teams
 blake3 = "1"                # mail (deterministic entity id from Message-Id)
 sha2 = "0.10"               # archive v3 reference freezer (sha256 of input bytes and fact sets), home (certificate pins)
 chrono = { version = "0.4.39", features = ["clock"] }  # orient
-comemo = "0.5.1"            # wiki
+comemo = "0.5.1"            # knowledge
 ctrlc = "3.5"               # body (graceful close for kept touch loops)
-dirs = "5"                  # wiki
+dirs = "5"                  # knowledge
 hex = "0.4"                 # gauge
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }  # code (local Git reads, no subprocess or network transports)
 zeroize = "1.9"             # secrets CLI plaintext lifetime
 humantime = "2.3.0"         # orient, patience
 pollster = "0.4"            # explicit blocking boundary for local CLI/UI collection maintenance
-ical = "0.11"               # planner
-itertools = "0.14"          # wiki
+ical = "0.11"               # events
+itertools = "0.14"          # knowledge
 kamadak-exif = "0.6"        # posture (EXIF/TIFF tags on images)
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder"] }  # mail (SMTP send)
 libc = "0.2"                # teams
@@ -225,7 +225,7 @@ rayon = "1.10"              # archive
 syn = { version = "2", features = ["full"] }  # code (Rust declaration extraction; `full` is what makes Item/File exist)
 proc-macro2 = { version = "1", features = ["span-locations"] }         # code (declaration spans; span-locations is load-bearing)
 quote = "1"                 # code (ToTokens for the item token-normalization law)
-regex = "1"                 # wiki
+regex = "1"                 # knowledge
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json", "multipart"] }  # discord, files, teams, web, body, voice
 rodio = { version = "0.22", default-features = false, features = ["playback"], optional = true }  # audio feature (NATIVE cpal device enumeration + playback sink; no afplay/ffplay/SwitchAudioSource subprocesses)
 soma-client = { version = "0.1.0", path = "../soma/soma-client" }  # hear + duplex capture and voice playback (shared Soma wire/HTTP contracts). Unconditional: this is how the body is reached.
@@ -235,7 +235,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 symphonia = { version = "0.5", default-features = false, features = ["pcm"], optional = true }  # discord-voice: songbird decodes its raw f32 input with the PCM codec, registered only when this feature is on
 async-trait = { version = "0.1", optional = true }  # discord-voice: songbird track event handlers
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
-rrule = "0.14"              # planner
+rrule = "0.14"              # events
 chrono-tz = "0.10"          # quota (Europe/Berlin reset times; already in the graph via rrule)
 serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
 serde_json = "1"            # discord, teams, triage, web
@@ -243,8 +243,8 @@ simple-dns = "0.11.3"       # home (mDNS bridge discovery); already locked throu
 toml = "0.8"                # self.toml, the one external plaintext configuration
 tracing = "0.1"             # archive
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }  # archive
-typst = "0.14"              # wiki
-typst-syntax = "0.14"       # wiki
+typst = "0.14"              # knowledge
+typst-syntax = "0.14"       # knowledge
 zip = { version = "2", default-features = false, features = ["deflate"] }  # posture (OOXML is a zip of XML)
 
 # Widgets-only (optional): GORBIE viewer stack.

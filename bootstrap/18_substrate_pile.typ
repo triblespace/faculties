@@ -31,7 +31,7 @@ self.pile
 
 Changing your mind publishes a new immutable state or event rather than editing
 an old one. When a domain needs change, it represents the relationship
-explicitly—for example Wiki revisions form a supersession DAG whose complete
+explicitly—for example Knowledge revisions form a supersession DAG whose complete
 frontier remains visible. There is no substrate-wide last-writer-wins rule. The
 old fact remains in the append-only source pile: history is exhaust from the
 workflow, never separate bookkeeping.

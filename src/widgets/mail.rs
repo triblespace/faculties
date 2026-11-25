@@ -20,8 +20,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
-use triblespace::core::id::Id;
 use super::storage::WidgetReader as PileSnapshot;
+use triblespace::core::id::Id;
 
 use crate::mail::{self, ProjectionDirection};
 use crate::relations::{self, ProfileInput, ProfileView};
@@ -435,7 +435,8 @@ impl MailViewer {
             let need_refresh = match self.live.as_ref() {
                 None => true,
                 Some(l) => {
-                    l.cached_revision != revision || l.relations_cached_revision != relations_revision
+                    l.cached_revision != revision
+                        || l.relations_cached_revision != relations_revision
                 }
             };
             if need_refresh {
@@ -719,7 +720,7 @@ fn render_mail(
                 );
             });
 
-        // Left / right stripes — sender + first recipient, compass idiom.
+        // Left / right stripes — sender + first recipient, goals idiom.
         let outer = frame_resp.response.rect;
         let from_label = mail
             .from

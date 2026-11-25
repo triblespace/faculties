@@ -5,7 +5,7 @@
 //!
 //! Nothing here is authored state. [`colony_view`] is one pure projection
 //! over facts a caller already holds: the routed Spawn, Message, Relations
-//! and Compass collections, the Compass status register, and a blob reader.
+//! and Goals collections, the Goals status register, and a blob reader.
 //! The CLI (`zooid colony`) and the viewer both call it; they differ only in
 //! how they obtained those facts and in whether they can observe units.
 //! Each role can be unavailable on its own, and the view says which.
@@ -30,12 +30,12 @@ use triblespace::prelude::*;
 
 use super::operations::{describe_end, is_running, spawns_in, RunView, Spawn, SpawnView};
 use super::IntervalValue;
-use crate::compass::operations::{goal_reading_in, goal_states_in, GoalState};
+use crate::goals::operations::{goal_reading_in, goal_states_in, GoalState};
 use crate::message::operations::{envelope_id, inbox, outbox, read_by, settled_identity};
 use crate::relations::{self, IdentityComponents, SelectorOutcome};
 use crate::storage::{AcquiringReader, FactArchive};
 
-/// The Compass tag that marks a question waiting on JP.
+/// The Goals tag that marks a question waiting on JP.
 pub const ASK_JP_TAG: &str = "ask-jp";
 /// Which personas to show besides every spawner of a recorded run and every
 /// resident zooid (see [`ParentSource::Roster`]): selectors (label, alias,
@@ -51,10 +51,10 @@ pub enum ColonyRole {
     Spawn,
     Message,
     Relations,
-    Compass,
-    /// Compass's maintained status register, without which no goal has a
+    Goals,
+    /// Goals's maintained status register, without which no goal has a
     /// current status here.
-    CompassStatus,
+    GoalsStatus,
 }
 
 impl ColonyRole {
@@ -63,8 +63,8 @@ impl ColonyRole {
             Self::Spawn => "Spawn",
             Self::Message => "Message",
             Self::Relations => "Relations",
-            Self::Compass => "Compass",
-            Self::CompassStatus => "Compass status register",
+            Self::Goals => "Goals",
+            Self::GoalsStatus => "Goals status register",
         }
     }
 }
@@ -76,9 +76,9 @@ pub struct ColonyRoles<'a> {
     pub spawn: Result<&'a FactArchive, &'a str>,
     pub message: Result<&'a FactArchive, &'a str>,
     pub relations: Result<&'a FactArchive, &'a str>,
-    pub compass: Result<&'a FactArchive, &'a str>,
+    pub goals: Result<&'a FactArchive, &'a str>,
     /// `Err` when the register was not loaded, with the reason.
-    pub compass_status: Result<&'a LwwQuery, &'a str>,
+    pub goals_status: Result<&'a LwwQuery, &'a str>,
 }
 
 /// Why a parent is shown.
@@ -94,13 +94,13 @@ pub enum ParentSource {
     Asked,
 }
 
-/// One Compass goal as the board holds it now.
+/// One goal as the board holds it now.
 #[derive(Clone, Debug)]
 pub struct GoalLine {
     pub goal: Id,
     pub title: String,
     pub status: String,
-    /// The time of the newest current note, as Compass prints it.
+    /// The time of the newest current note, as Goals prints it.
     pub last_note: Option<String>,
 }
 
@@ -224,12 +224,12 @@ fn worker_line(
 
 fn goal_line<R: BlobStoreGet>(
     reader: &R,
-    compass: &FactArchive,
+    goals: &FactArchive,
     register: &LwwQuery,
     state: &GoalState,
 ) -> GoalLine {
     let status = state.status.clone().unwrap_or_else(|| "todo".to_owned());
-    match goal_reading_in(reader, compass, register, state.goal) {
+    match goal_reading_in(reader, goals, register, state.goal) {
         Ok(reading) => GoalLine {
             goal: state.goal,
             title: reading
@@ -274,8 +274,8 @@ pub fn colony_view<R: BlobStoreGet>(
         (ColonyRole::Spawn, roles.spawn.err()),
         (ColonyRole::Message, roles.message.err()),
         (ColonyRole::Relations, roles.relations.err()),
-        (ColonyRole::Compass, roles.compass.err()),
-        (ColonyRole::CompassStatus, roles.compass_status.err()),
+        (ColonyRole::Goals, roles.goals.err()),
+        (ColonyRole::GoalsStatus, roles.goals_status.err()),
     ] {
         if let Some(reason) = missing {
             unavailable.push((role, reason.to_owned()));
@@ -376,11 +376,11 @@ pub fn colony_view<R: BlobStoreGet>(
         }
     }
 
-    let goal_states = match (roles.compass, roles.compass_status) {
-        (Ok(compass), Ok(register)) => match goal_states_in(reader, compass, register) {
+    let goal_states = match (roles.goals, roles.goals_status) {
+        (Ok(goals), Ok(register)) => match goal_states_in(reader, goals, register) {
             Ok(states) => Some(states),
             Err(error) => {
-                unreadable.push(format!("Compass goals: {error:#}"));
+                unreadable.push(format!("goals: {error:#}"));
                 None
             }
         },
@@ -465,8 +465,8 @@ pub fn colony_view<R: BlobStoreGet>(
             .unreviewed
             .sort_by_key(|line| std::cmp::Reverse(start_key(line.finished)));
 
-        if let (Some(states), Ok(compass), Ok(register)) =
-            (&goal_states, roles.compass, roles.compass_status)
+        if let (Some(states), Ok(goals), Ok(register)) =
+            (&goal_states, roles.goals, roles.goals_status)
         {
             for state in states {
                 if !state.tags.iter().any(|tag| *tag == parent.label) {
@@ -477,12 +477,10 @@ pub fn colony_view<R: BlobStoreGet>(
                     if status != "done" {
                         parent
                             .asks_jp
-                            .push(goal_line(reader, compass, register, state));
+                            .push(goal_line(reader, goals, register, state));
                     }
                 } else if status == "doing" {
-                    parent
-                        .doing
-                        .push(goal_line(reader, compass, register, state));
+                    parent.doing.push(goal_line(reader, goals, register, state));
                 }
             }
         }
@@ -582,9 +580,9 @@ impl Spawn {
                 })
                 .collect();
             let register_target = match &registered[3] {
-                Ok((source, _)) => crate::compass::status_register_for_source(pile, *source)
+                Ok((source, _)) => crate::goals::status_register_for_source(pile, *source)
                     .map_err(|e| format!("{e:#}")),
-                Err(_) => Err("Compass is unavailable".to_owned()),
+                Err(_) => Err("Goals is unavailable".to_owned()),
             };
             let reader = AcquiringReader::new(
                 pile.snapshot().context("freeze the colony observation")?,
@@ -615,8 +613,8 @@ impl Spawn {
                 spawn: role(0),
                 message: role(1),
                 relations: role(2),
-                compass: role(3),
-                compass_status: status.as_ref().map_err(String::as_str),
+                goals: role(3),
+                goals_status: status.as_ref().map_err(String::as_str),
             };
             let observe = |unit: &str| {
                 self.unit_state(unit)
@@ -648,8 +646,8 @@ fn evidence_text(evidence: &Evidence) -> String {
         Evidence::ReviewOutstanding(n) => format!(
             "{n} finished zooid report(s) unread (Message; unread means not acknowledged, not that nothing was done with it)"
         ),
-        Evidence::WaitingOnJp(n) => format!("{n} open ask-jp goal(s) (Compass)"),
-        Evidence::Doing(n) => format!("{n} goal(s) in doing with its tag (Compass)"),
+        Evidence::WaitingOnJp(n) => format!("{n} open ask-jp goal(s) (Goals)"),
+        Evidence::Doing(n) => format!("{n} goal(s) in doing with its tag (Goals)"),
     }
 }
 
@@ -689,7 +687,7 @@ pub fn render_colony(view: &ColonyView) -> String {
     let mut out = String::new();
     writeln!(
         out,
-        "colony at {} (Spawn runs, Compass, Message, Relations; {})",
+        "colony at {} (Spawn runs, Goals, Message, Relations; {})",
         crate::care::format_time(view.observed_at),
         if view.units_observed {
             "unit states from this host's systemd"
@@ -831,7 +829,7 @@ mod tests {
         spawn: TribleSet,
         message: TribleSet,
         relations: TribleSet,
-        compass: TribleSet,
+        goals: TribleSet,
         blobs: MemoryBlobStore,
     }
 
@@ -943,19 +941,19 @@ mod tests {
         fn goal(&mut self, title: &str, tags: &[&str], status: &str) -> Id {
             let tags: Vec<String> = tags.iter().map(|tag| (*tag).to_owned()).collect();
             let (mut fragment, goal) =
-                crate::compass::goal_fragment(title, tags.clone(), None, at(1)).unwrap();
+                crate::goals::goal_fragment(title, tags.clone(), None, at(1)).unwrap();
             for tag in &tags {
                 fragment.put::<blobencodings::UTF8String, _>(tag.clone());
             }
             fragment.put::<blobencodings::UTF8String, _>(status.to_owned());
-            fragment += crate::compass::status_fragment(goal, status, None, at(2)).unwrap();
-            Self::add(&mut self.compass, &mut self.blobs, fragment);
+            fragment += crate::goals::status_fragment(goal, status, None, at(2)).unwrap();
+            Self::add(&mut self.goals, &mut self.blobs, fragment);
             goal
         }
 
         fn status(&self) -> LwwQuery {
             let element = derive_element(
-                &self.compass.clone().to_blob(),
+                &self.goals.clone().to_blob(),
                 crate::schemas::compass::board::status_of.id(),
                 triblespace::core::metadata::created_at.id(),
             )
@@ -970,7 +968,7 @@ mod tests {
         spawn: bool,
         message: bool,
         relations: bool,
-        compass: bool,
+        goals: bool,
     }
 
     fn view(
@@ -982,7 +980,7 @@ mod tests {
         let spawn = archive(&fixture.spawn);
         let message = archive(&fixture.message);
         let relations = archive(&fixture.relations);
-        let compass = archive(&fixture.compass);
+        let goals = archive(&fixture.goals);
         let status = fixture.status();
         let reader = fixture.blobs.snapshot().unwrap();
         let pick = |facts, withheld: bool| if withheld { Err("withheld") } else { Ok(facts) };
@@ -990,8 +988,8 @@ mod tests {
             spawn: pick(&spawn, withhold.spawn),
             message: pick(&message, withhold.message),
             relations: pick(&relations, withhold.relations),
-            compass: pick(&compass, withhold.compass),
-            compass_status: if withhold.compass {
+            goals: pick(&goals, withhold.goals),
+            goals_status: if withhold.goals {
                 Err("withheld")
             } else {
                 Ok(&status)
@@ -1091,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_unavailable_keeps_the_roster_and_compass() {
+    fn spawn_unavailable_keeps_the_roster_and_goals() {
         let (mut fixture, _) = colony();
         let withhold = Withhold {
             spawn: true,
@@ -1146,7 +1144,7 @@ mod tests {
             view.unavailable,
             vec![(ColonyRole::Relations, "withheld".to_owned())]
         );
-        // Only the spawner is known, by id, and Compass tags name labels.
+        // Only the spawner is known, by id, and Goals tags name labels.
         assert_eq!(view.parents.len(), 1, "{view:#?}");
         let only = &view.parents[0];
         assert_eq!(only.persona, Some(a));
@@ -1157,10 +1155,10 @@ mod tests {
     }
 
     #[test]
-    fn compass_unavailable_says_nothing_about_goals() {
+    fn goals_unavailable_says_nothing_about_goals() {
         let (mut fixture, _) = colony();
         let withhold = Withhold {
-            compass: true,
+            goals: true,
             ..Withhold::default()
         };
         let active = |_: &str| "active".to_owned();
@@ -1168,8 +1166,8 @@ mod tests {
         assert_eq!(
             view.unavailable,
             vec![
-                (ColonyRole::Compass, "withheld".to_owned()),
-                (ColonyRole::CompassStatus, "withheld".to_owned()),
+                (ColonyRole::Goals, "withheld".to_owned()),
+                (ColonyRole::GoalsStatus, "withheld".to_owned()),
             ]
         );
         let a = parent(&view, "parent-a");
@@ -1204,7 +1202,7 @@ mod tests {
         fixture.zooid("quiet");
         let withhold = Withhold {
             message: true,
-            compass: true,
+            goals: true,
             ..Withhold::default()
         };
         let view = view(&mut fixture, withhold, None, &[]);

@@ -214,7 +214,7 @@ while IFS= read -r -d '' marker; do
     # because a branch can be legitimately unpushable -- 2026-08-26, playground's
     # Teams-daemon tip could not go to `origin` because posture correctly found a
     # protected term in the range, so it was bundled into the pile (which
-    # replicates to three machines) and given a wiki fragment. Without this case
+    # replicates to three machines) and given a knowledge fragment. Without this case
     # the detector would nag forever about a thing that was already handled, and a
     # detector that cries wolf on resolved work teaches you to skim it.
     case "$br" in archive-*|archive/*) continue ;; esac

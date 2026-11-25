@@ -197,7 +197,7 @@ fn an_alarm_raise_missing_optional_fields_still_lists() {
     assert!(rows[0].classes.is_empty() && rows[0].what.is_empty() && rows[0].open);
 }
 
-/// A commit can arrive before its member blob (wiki db1046cc, instance 4):
+/// A commit can arrive before its member blob (knowledge db1046cc, instance 4):
 /// it is left out and counted, never an error, and read once it arrives.
 #[test]
 fn an_alarm_commit_whose_member_blob_has_not_arrived_is_skipped_then_read() {

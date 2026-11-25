@@ -11,7 +11,7 @@ use crate::out::Out;
 
 const TOOLS: &[Tool] = &[Tool {
     name: "bootstrap_import",
-    description: "Idempotently import the portable onboarding Wiki entries and Compass goals under the configured pile's existing signer. Does not initialize keys or accept another pile or local source path.",
+    description: "Idempotently import the portable onboarding Knowledge entries and goals under the configured pile's existing signer. Does not initialize keys or accept another pile or local source path.",
     input_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
 }];
 

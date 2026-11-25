@@ -1031,7 +1031,7 @@ fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<
 // content handle (`crate::wemm`); `memory similar` and `memory context
 // --about/--filter/--remove` score a query against those rows and join them
 // to the journal here, at the point of use. Text and images share the one
-// space, as Files and Wiki contents do.
+// space, as Files and Knowledge contents do.
 
 /// The journal content the WeMM index reads: chunk prose and wordless images.
 #[cfg(feature = "wemm")]
@@ -2421,7 +2421,7 @@ fn print_archive_meta<P: TriblePattern>(
 // ---------------------------------------------------------------------------
 //
 // Two reference forms live in summary prose (settled design, restored after
-// the 2026-06-12 over-steer; see the practice fragment in the wiki):
+// the 2026-06-12 over-steer; see the practice fragment in Knowledge):
 //
 // - SOFT: `(memory:<from>..<to>)` — a temporal address. Human-readable,
 //   machine-recognizable, resolved by range query at read time against

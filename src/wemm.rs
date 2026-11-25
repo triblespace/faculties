@@ -1,6 +1,6 @@
 //! The one model the faculties search with: WeMM-Embedding-9B, native CUDA
 //! on a GB10, which places text, images and documents in one
-//! 4096-dimensional space. Files, Memory and Wiki each derive a collection of
+//! 4096-dimensional space. Files, Memory and Knowledge each derive a collection of
 //! NVFP4 rows from their own source collection through
 //! [`triblespace_search::semantic_wemm`], keyed by content handle, and join it
 //! at the point of use with `find!`.
@@ -505,7 +505,7 @@ pub const COPY_LOCK_WAIT: Duration = Duration::from_secs(300);
 /// `$HOME/.cache/wemm-device-copy.lock`, or `None` without `HOME`.
 ///
 /// `MemAvailable` is read once per bind, so two binds that read it at the
-/// same moment (a `faculties maintain` restart overlapping a Memory, Wiki or
+/// same moment (a `faculties maintain` restart overlapping a Memory, Knowledge or
 /// Files command) would each be admitted against memory only one of them
 /// can have, and together take twice the copy. So a bind takes an exclusive
 /// `flock` on this file before it reads `MemAvailable` and keeps it until
@@ -1032,7 +1032,7 @@ impl Session {
     }
 }
 
-/// Score a task cue against the already-derived Memory and Wiki rows. Resolve
+/// Score a task cue against the already-derived Memory and Knowledge rows. Resolve
 /// both sources under the reader's own authority before binding the model.
 /// No document is embedded on this path.
 pub(crate) fn score_wake(
@@ -1057,7 +1057,7 @@ pub(crate) fn score_wake(
         kernel_profile: request.profile.id(),
     };
     let memory_attrs = crate::memory::operations::content_attributes();
-    let wiki_attrs = [wiki::attrs::content.id()];
+    let knowledge_attrs = [wiki::attrs::content.id()];
     let (loaded, workspace_signer) = routing.with_store(|store, signer, runtime| {
         let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
         if routing.collection_routes().is_some() {
@@ -1077,7 +1077,11 @@ pub(crate) fn score_wake(
         let mut inputs = Vec::new();
         for (role, scope, attrs) in [
             ("Memory", memory::DEFAULT_SCOPE_ID, memory_attrs.as_slice()),
-            ("Wiki", wiki::DEFAULT_SCOPE_ID, wiki_attrs.as_slice()),
+            (
+                "Knowledge",
+                wiki::DEFAULT_SCOPE_ID,
+                knowledge_attrs.as_slice(),
+            ),
         ] {
             if routing
                 .collection_routes()
@@ -1156,7 +1160,7 @@ pub(crate) fn score_wake(
                 let role = if scope == memory::DEFAULT_SCOPE_ID {
                     "Memory"
                 } else {
-                    "Wiki"
+                    "Knowledge"
                 };
                 tint.diagnostics
                     .push(format!("{role} WeMM scoring failed: {error}"));
@@ -1171,7 +1175,7 @@ pub(crate) fn score_wake(
                 scores.similar_to::<Text>(body, f64::NEG_INFINITY))
             .map(|body| (body, scores.cosine(&body).expect("scored body") as f32))
             .collect();
-            tint.wiki_contents = Some(Arc::new(ranked));
+            tint.knowledge_contents = Some(Arc::new(ranked));
         }
     }
     Ok(())
@@ -2150,7 +2154,7 @@ mod tests {
     }
 
     /// The real model on a scratch pile: five memories (one a wordless image
-    /// of a red crab), three wiki fragments and two files, indexed through one
+    /// of a red crab), three knowledge fragments and two files, indexed through one
     /// bound session, then found again by text queries. Needs a GB10 under
     /// the gb10 lock, `WEMM_MODEL_PILE` (a pile whose `models` collection
     /// holds the complete root; its contents are copied into the scratch pile
@@ -2158,7 +2162,7 @@ mod tests {
     /// `WEMM_GATE_PNG` naming a PNG of a red crab.
     #[test]
     #[ignore = "requires a GB10, a pile holding the complete WeMM root and WEMM_GATE_PNG"]
-    fn memory_wiki_and_files_answer_text_queries_on_a_scratch_pile() {
+    fn memory_knowledge_and_files_answer_text_queries_on_a_scratch_pile() {
         use crate::memory::operations::parse_time_range;
         use crate::out::{Out, Part};
 
@@ -2175,7 +2179,7 @@ mod tests {
         crate::storage::initialize_signer(&pile, None).unwrap();
         let storage = crate::storage::Storage::shared(pile.clone(), None);
         let memory = crate::memory::Memory::with_storage(storage.clone());
-        let wiki = crate::wiki::Wiki::with_storage(storage.clone());
+        let knowledge = crate::knowledge::Knowledge::with_storage(storage.clone());
         let files = crate::files::Files::with_storage(storage.clone());
 
         let day = |n: u32| {
@@ -2199,11 +2203,11 @@ mod tests {
             ("Tides", "= Tides\nThe moon's gravity raises two bulges of ocean water, giving most coasts two high tides a day."),
         ]
         .into_iter()
-        .map(|(title, content)| wiki.create(title, content, &[], false).unwrap())
+        .map(|(title, content)| knowledge.create(title, content, &[], false).unwrap())
         .collect();
         // The tides revision is superseded: its rows exist, but it is not current.
         let tides = revisions[2];
-        let volcanoes = wiki
+        let volcanoes = knowledge
             .edit(
                 &format!("{tides:x}"),
                 Some("= Tides\nVolcanoes erupt molten rock and ash when magma pressure breaks the crust."),
@@ -2247,7 +2251,7 @@ mod tests {
         let started = std::time::Instant::now();
         for derived in [
             memory.derive_wemm(&session).unwrap(),
-            wiki.derive_wemm(&session).unwrap(),
+            knowledge.derive_wemm(&session).unwrap(),
             files.derive_wemm(&session).unwrap(),
         ] {
             eprintln!("{derived}");
@@ -2266,12 +2270,12 @@ mod tests {
             first(crustacean).contains(&format!("{crab:x}")),
             "an image chunk answers text"
         );
-        let rust = wiki
+        let rust = knowledge
             .similar_with(&session, "how references and mutation are checked")
             .unwrap();
         eprintln!("{rust}");
         assert!(first(rust).contains(&format!("{:x}", revisions[0])));
-        let ocean = wiki
+        let ocean = knowledge
             .similar_with(&session, "the moon pulls the ocean into high tides")
             .unwrap();
         eprintln!("{ocean}");
@@ -2279,7 +2283,7 @@ mod tests {
             !ocean.contains(&format!("{tides:x}")),
             "a superseded revision is not answered"
         );
-        let lava = wiki
+        let lava = knowledge
             .similar_with(&session, "lava from an erupting volcano")
             .unwrap();
         eprintln!("{lava}");

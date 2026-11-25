@@ -21,7 +21,7 @@ trap cleanup EXIT
 
 echo "==> Pre-building bootstrap cohort"
 cargo build --quiet --manifest-path="$REPO_ROOT/Cargo.toml" --release \
-  --no-default-features --bin bootstrap --bin wiki --bin compass
+  --no-default-features --bin bootstrap --bin knowledge --bin goals
 BOOTSTRAP="$REPO_ROOT/target/release/bootstrap"
 WIKI="$REPO_ROOT/target/release/wiki"
 COMPASS="$REPO_ROOT/target/release/compass"
@@ -60,16 +60,16 @@ if [ "$ACTUAL_GOALS" -ne "$EXPECTED_GOALS" ]; then
   echo "    FAIL: expected $EXPECTED_GOALS bootstrap goals, got $ACTUAL_GOALS" >&2
   exit 1
 fi
-echo "    OK: $ACTUAL_FRAGMENTS Wiki entries, $ACTUAL_GOALS Compass goals"
+echo "    OK: $ACTUAL_FRAGMENTS Knowledge entries, $ACTUAL_GOALS goals"
 
 CHECK_OUT=$("$WIKI" check --compile 2>&1)
 if ! grep -q "0 issues" <<<"$CHECK_OUT"; then
-  echo "    FAIL: wiki check reported issues:" >&2
+  echo "    FAIL: knowledge check reported issues:" >&2
   echo "$CHECK_OUT" >&2
   exit 1
 fi
 "$WIKI" lint --check >/dev/null
-echo "    OK: current Wiki frontier has valid links and Typst"
+echo "    OK: current Knowledge frontier has valid links and Typst"
 
 echo
 echo "==> Portable bootstrap verifier passed"

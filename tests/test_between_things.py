@@ -330,10 +330,10 @@ class PredicateTests(unittest.TestCase):
             self.assertEqual(self.invoke(command=waiting)[0], 2)
         cached = self.verdict()
         why = cached["why"]
-        self.assertIn("phase=wait call=2 [compass has-activity <actor> <since> doing blocked]", why)
+        self.assertIn("phase=wait call=2 [goals has-activity <actor> <since> doing blocked]", why)
         self.assertEqual(cached["diagnostic"], {
             "refresh_start": 1000, "refresh_end": 1000, "refresh_elapsed": 480,
-            "phase": "wait", "call": {"index": 2, "command": "compass has-activity <actor> <since> doing blocked", "elapsed": 477}})
+            "phase": "wait", "call": {"index": 2, "command": "goals has-activity <actor> <since> doing blocked", "elapsed": 477}})
         self.assertEqual((cached["at"], cached["until"], self.io.state["context"]["version"]), (1000, 1600, 3))
         with patch("time.time", return_value=1100):
             code, _, error, spawns = self.invoke(False)
@@ -349,7 +349,7 @@ class PredicateTests(unittest.TestCase):
         with patch("time.monotonic", side_effect=lambda: clock[0]):
             self.assertEqual(self.invoke(command=failed)[0], 2)
         why = self.verdict()["why"]
-        self.assertIn("phase=read-result call=2 [compass has-activity <actor> <since> doing blocked]", why)
+        self.assertIn("phase=read-result call=2 [goals has-activity <actor> <since> doing blocked]", why)
         self.assertEqual(self.verdict()["diagnostic"]["call"]["elapsed"], 7)
         self.assertEqual(self.verdict()["diagnostic"]["refresh_elapsed"], 14)
         self.assertIn("stderr=collection unavailable", why)

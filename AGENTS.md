@@ -44,11 +44,11 @@ selector to bound linking; Cargo can still construct every binary test target.
 
 ```sh
 # from the repo root
-cargo build --bin wiki --release
-./target/release/wiki list --tag bootstrap
+cargo build --bin knowledge --release
+./target/release/knowledge list --tag bootstrap
 
 # or once-off without building first
-cargo run --bin compass --release -- list
+cargo run --bin goals --release -- list
 
 # build and atomically install the complete workspace cohort onto $PATH
 cargo build --release --workspace --bins --locked
@@ -76,17 +76,17 @@ env-var support). Set it once per shell — `export PILE=./self.pile`
 
 ## Portable bootstrap
 
-The `bootstrap` binary imports curated onboarding entries + Compass goals
+The `bootstrap` binary imports curated onboarding entries + goals
 as locally signed collection COMMITs. Sources are `bootstrap/*.typ`; their
 declarative manifest and fixed occurrence times live in `src/bootstrap.rs`;
-Compass goal and note ids are derived by their normal constructors. Import only
+goal and note ids are derived by their normal constructors. Import only
 after explicitly initializing the destination's durable signer
 (`trible pile signing-key init <pile>`). Never
 copy a pre-signed seed pile: a destination's explicit WRITE authority does not
 implicitly authorize its builder key. Run `bootstrap/build.sh` for the
 fresh-recipient, exact-replay, and semantic-closure checks.
 
-For each of the 21 seeded Wiki entries, a later bootstrap generation advances
+For each of the 21 seeded Knowledge entries, a later bootstrap generation advances
 only the recognizable imported source strand. Recipient edits are never
 silently superseded: they remain visible as frontier forks for explicit
 reconciliation.
@@ -177,10 +177,10 @@ triblespace-org repos). PRs are reserved for cross-org coordination
 that doesn't apply within this project. Reviews, when requested, are
 asynchronous diagnostics against an exact artifact: reviewers record what
 they observed, where, and with what evidence. They do not prescribe a fix,
-own Compass status, or block the author from continuing. A finding may become
+own Goals status, or block the author from continuing. A finding may become
 a normal follow-up goal after it is checked against the current artifact;
 later development may already have removed its cause. Any release or
-publication policy belongs at that boundary, not inside Compass. Tag releases
+publication policy belongs at that boundary, not inside Goals. Tag releases
 with `vX.Y.Z`; the GH workflow handles the rest.
 
 ## License

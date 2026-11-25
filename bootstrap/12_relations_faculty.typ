@@ -9,7 +9,7 @@ registry.
 == Why a separate faculty
 
 Each kind of state lives in its own fixed descriptor-policy collection. Relations,
-Message, and Compass therefore retain separate semantics while sharing one
+Message, and Goals therefore retain separate semantics while sharing one
 pile. Faculties that need people-references materialize Relations without
 claiming those facts as their own schema.
 
@@ -69,7 +69,7 @@ relations registry.
 
   - "Local Messages: Agent-to-Agent Direct Messaging" — the
     primary consumer of the relations registry
-  - "Compass Goals Workflow" — `$PERSONA` attributes actions to a Relations
+  - "Goals Goals Workflow" — `$PERSONA` attributes actions to a Relations
     person, while tags can request a person's or group's attention; neither is
     an exclusive assignment lock
 

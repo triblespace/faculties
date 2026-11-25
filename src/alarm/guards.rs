@@ -23,7 +23,7 @@
 //!
 //! What a decision can promise. The guards answer for the facts they are
 //! given and nothing more. A raise whose commit has not yet arrived is not
-//! counted, so `decide` must be fed a complete observation of the alarm
+//! counted, so `decisions` must be fed a complete observation of the alarm
 //! collection (`storage::acquire_facts`, or `require_complete_attached_read`
 //! on an attached read); the tolerant read [`super::observe`] uses, and
 //! `storage::acquire_facts_read`, are for the follower and for display,
@@ -52,7 +52,7 @@ use crate::schemas::message::local as message;
 pub const HOUR: i128 = 60 * MINUTE;
 pub const DAY: i128 = 24 * HOUR;
 
-/// The check every refusal quotes (wiki db1046cc).
+/// The check every refusal quotes (knowledge db1046cc).
 pub const THE_CHECK: &str = "name the physical thing you measured and the semantic thing you \
      care about, and ask whether the system ever promised they would agree";
 

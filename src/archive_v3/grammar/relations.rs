@@ -7,7 +7,7 @@
 //! hand-written importers stay frozen as migration evidence while this
 //! replaces them; the spec is the hand-stated fixtures in the tests, each
 //! one relational decision with its expected items written out (round-7
-//! design, wiki d3f1abd2).
+//! design, knowledge d3f1abd2).
 //!
 //! Built: `Order::Parents` (Claude Code) and `Order::File` (Codex), each
 //! exact with its importer on the live samples where it builds. Still

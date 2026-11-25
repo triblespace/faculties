@@ -1069,7 +1069,7 @@ impl SecretsStorage<'_> {
 
 /// Seal one raw version into the colony vault and deliver it to the vault's
 /// hosts: the shared path for `secrets add` and for credentials other
-/// faculties keep in Secrets (Headspace, Mail).
+/// faculties keep in Secrets (Profiles, Mail).
 pub(crate) fn add_raw_to_colony(
     store: &mut crate::storage::FacultyStore,
     signer: &SigningKey,

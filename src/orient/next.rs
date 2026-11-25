@@ -1276,13 +1276,13 @@ mod tests {
                         signer,
                         true,
                     ))?;
-                    let (fragment, goal) = compass::goal_fragment(
+                    let (fragment, goal) = goals::goal_fragment(
                         "native overview goal",
                         vec!["isolated-zooid".into()],
                         None,
                         clock::point_now()?,
                     )?;
-                    store.commit(sources.compass.source, signer, fragment)?;
+                    store.commit(sources.goals.source, signer, fragment)?;
                     Ok(goal)
                 })
                 .unwrap();
@@ -1586,10 +1586,10 @@ mod tests {
         // build (a debug one was still opening its collections).
         for (label, step) in [
             ("Discord", "register Rank9"),
-            ("Compass status", "register"),
+            ("Goals status", "register"),
             ("Discord", "maintain Succinct"),
             ("Discord", "maintain Rank9"),
-            ("Compass status", "maintain register"),
+            ("Goals status", "maintain register"),
         ] {
             let (hook, ready, release) =
                 crate::storage::registration_test::Rendezvous::at(label, step);

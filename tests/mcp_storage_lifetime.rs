@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 use std::path::PathBuf;
 
-use faculties::compass::{AddOptions, Compass};
+use faculties::goals::{AddOptions, Goals};
 use faculties::mcp::catalog::{Catalog, Config};
 use faculties::mcp::Server;
 use faculties::storage::initialize_signer;
@@ -111,14 +111,14 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         initialize(&mut first);
         goal = id(&call(
             &mut first,
-            "compass_add",
+            "goals_add",
             json!({"title": "shared-pile-record"}),
         ));
 
         // Reopening the configured pathname cannot find the original data.
         // The explicit signer path remains valid, independently of that name.
         fs::rename(&fixture.pile, &renamed).unwrap();
-        let listed = text(&call(&mut first, "compass_list", json!({})));
+        let listed = text(&call(&mut first, "goals_list", json!({})));
         assert!(listed.contains("shared-pile-record"), "{listed}");
         assert!(
             !fixture.pile.exists(),
@@ -148,9 +148,9 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
             "a local-only adapter reopened the pathname"
         );
 
-        // Atlas retains its native reader in the adapter; listing it must
+        // Schemas retains its native reader in the adapter; listing it must
         // neither reopen nor close the application-owned backend.
-        call(&mut second, "atlas_list", json!({}));
+        call(&mut second, "schemas_list", json!({}));
 
         // Continue through Peer consumers after the local guards are released.
         call(
@@ -173,11 +173,15 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
 
         let revision = id(&call(
             &mut second,
-            "wiki_create",
-            json!({"title": "Resident Wiki", "content": "One live store.", "force": true}),
+            "knowledge_create",
+            json!({"title": "Resident Knowledge", "content": "One live store.", "force": true}),
         ));
-        let wiki = text(&call(&mut second, "wiki_show", json!({"id": revision})));
-        assert!(wiki.contains("One live store."), "{wiki}");
+        let knowledge = text(&call(
+            &mut second,
+            "knowledge_show",
+            json!({"id": revision}),
+        ));
+        assert!(knowledge.contains("One live store."), "{knowledge}");
 
         // The local-only readers must take fresh snapshots on their next calls.
         call(
@@ -190,7 +194,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
         assert!(captures.contains("second resident touch"), "{captures}");
         call(
             &mut second,
-            "compass_move",
+            "goals_move",
             json!({"id": goal, "status": "doing", "persona": "alice"}),
         );
         let overview = text(&call(
@@ -208,7 +212,7 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
 
     catalog.close().unwrap();
     assert!(!fixture.pile.exists());
-    let persisted = Compass::new(renamed, Some(fixture.key.clone()))
+    let persisted = Goals::new(renamed, Some(fixture.key.clone()))
         .show(&goal)
         .unwrap();
     assert!(persisted.contains("shared-pile-record"), "{persisted}");
@@ -222,16 +226,16 @@ fn a_live_catalog_observes_later_appends_from_an_independent_writer() {
     let registrations = catalog.registrations();
     let mut server = Server::new(&registrations).unwrap();
     initialize(&mut server);
-    let before = text(&call(&mut server, "compass_list", json!({})));
+    let before = text(&call(&mut server, "goals_list", json!({})));
     assert!(!before.contains("later external append"), "{before}");
 
     // The normal one-shot native operation opens another peer and closes it,
     // while the catalog keeps its own original peer and frozen prior read.
-    Compass::new(fixture.pile.clone(), Some(fixture.key.clone()))
+    Goals::new(fixture.pile.clone(), Some(fixture.key.clone()))
         .add("later external append", AddOptions::default())
         .unwrap();
 
-    let after = text(&call(&mut server, "compass_list", json!({})));
+    let after = text(&call(&mut server, "goals_list", json!({})));
     assert!(after.contains("later external append"), "{after}");
     catalog.finish(Ok(())).unwrap();
 }
@@ -248,16 +252,12 @@ fn independently_configured_catalogs_keep_their_piles_isolated() {
     let mut right = Server::new(&right_registrations).unwrap();
     initialize(&mut left);
     initialize(&mut right);
-    call(&mut left, "compass_add", json!({"title": "left-only-goal"}));
-    call(
-        &mut right,
-        "compass_add",
-        json!({"title": "right-only-goal"}),
-    );
+    call(&mut left, "goals_add", json!({"title": "left-only-goal"}));
+    call(&mut right, "goals_add", json!({"title": "right-only-goal"}));
 
     for _ in 0..2 {
-        let left_goals = text(&call(&mut left, "compass_list", json!({})));
-        let right_goals = text(&call(&mut right, "compass_list", json!({})));
+        let left_goals = text(&call(&mut left, "goals_list", json!({})));
+        let right_goals = text(&call(&mut right, "goals_list", json!({})));
         assert!(left_goals.contains("left-only-goal"), "{left_goals}");
         assert!(!left_goals.contains("right-only-goal"), "{left_goals}");
         assert!(right_goals.contains("right-only-goal"), "{right_goals}");
@@ -286,12 +286,12 @@ fn discovery_and_closing_an_unused_catalog_do_not_open_storage() {
         assert!(response.get("error").is_none(), "{response}");
         let tools = response["result"]["tools"].as_array().unwrap();
         for name in [
-            "compass_list",
+            "goals_list",
             "files_list",
             "message_list",
             "orient_show",
             "relations_list",
-            "wiki_list",
+            "knowledge_list",
         ] {
             assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
         }

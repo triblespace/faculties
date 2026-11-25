@@ -113,7 +113,7 @@ pub fn scan(report: &ScanReport, out: &mut Out<'_>) -> Result<()> {
 
 pub fn list(report: &FindingList, ids: bool, out: &mut Out<'_>) -> Result<()> {
     if report.hidden > 0 && !report.include_resolved {
-        out.line(format!("{} finding(s) hidden by a resolved Decide decision with result \"benign\" — pass --all to include them", report.hidden))?;
+        out.line(format!("{} finding(s) hidden by a resolved Decisions decision with result \"benign\" — pass --all to include them", report.hidden))?;
     }
     if report.groups.is_empty() {
         out.line(format!(
@@ -321,7 +321,7 @@ pub fn git(report: &GitReport, out: &mut Out<'_>) -> Result<()> {
 
     if hidden > 0 {
         out.line(format!(
-            "{hidden} finding(s) hidden by a resolved Decide decision with result \"benign\"."
+            "{hidden} finding(s) hidden by a resolved Decisions decision with result \"benign\"."
         ))?;
     }
     if !hits.is_empty() {
@@ -362,10 +362,10 @@ pub fn git(report: &GitReport, out: &mut Out<'_>) -> Result<()> {
         ))?;
     } else {
         out.line(format!(
-            "\nA finding stops blocking only after a Decide decision about its exact id \
+            "\nA finding stops blocking only after a Decisions decision about its exact id \
              resolves with `--result benign`; the outcome text is free prose and stays yours \
              to write. An added unsafe-attribute pin additionally requires a nonempty \
-             `decide propose --context` justification."
+             `decisions propose --context` justification."
         ))?;
     }
 

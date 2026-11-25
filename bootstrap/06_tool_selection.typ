@@ -4,16 +4,16 @@ A quick lookup for "which tool do I reach for here?"
 
 == Goals and tasks
 
-  - *Use* `compass add` / `move` / `note`.
+  - *Use* `goals add` / `move` / `note`.
   - *Don't use* the harness's TaskCreate / TaskUpdate for
     persistent goals — those vanish at end of session.
   - *Do use* TaskCreate inline within a single conversation when
-    you need a step-tracker for "the next 20 minutes". Compass
+    you need a step-tracker for "the next 20 minutes". Goals
     is for "still on my plate next week".
 
 == Knowledge fragments
 
-  - *Use* `wiki create / edit / lint`.
+  - *Use* `knowledge create / edit / lint`.
   - *Don't use* free-floating `.md` files in repos.
   - *Exception*: when a downstream consumer needs the file at a
     specific path (a crate's `CHANGELOG.md`, a `book/src/`
@@ -22,7 +22,7 @@ A quick lookup for "which tool do I reach for here?"
 == Files (PDFs, datasets, binaries)
 
   - *Use* `files add <path>`. Returns a `files:<hash>` handle
-    you cite from wiki fragments.
+    you cite from knowledge fragments.
   - *Don't use* `/tmp` for anything you'll want past this turn.
   - *Don't commit* binaries to repos — they bloat the history.
 
@@ -30,7 +30,7 @@ A quick lookup for "which tool do I reach for here?"
 
   - *Use* `message` for in-place agent-to-agent
     messaging (append-only, with read acknowledgements).
-  - For shared knowledge between two agents: a wiki fragment
+  - For shared knowledge between two agents: a knowledge fragment
     they both query is usually better than a message.
 
 == Subagents
@@ -46,7 +46,7 @@ A quick lookup for "which tool do I reach for here?"
 
 == Plans
 
-  - *Prefer* in-conversation plans + compass goals.
+  - *Prefer* in-conversation plans + goals.
   - *Don't* write `PLAN.md` / `TODO.md` files in repos. They
     accrete stale sections.
   - *Exception*: an explicit user request for a written plan

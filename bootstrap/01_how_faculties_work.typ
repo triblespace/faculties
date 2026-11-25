@@ -12,18 +12,18 @@ the onboarding tour you are reading under your own pile signer).
 == Mental model
 
   - One faculty = one cognitive verb:
-    [`compass` for goals](wiki:7cdd48c272ff344628fe74f4c07783e4),
-    [`wiki` for knowledge fragments](wiki:82129c70b693f7e2d781d78ac5efbb86),
+    [`goals` for goals](wiki:7cdd48c272ff344628fe74f4c07783e4),
+    [`knowledge` for knowledge fragments](wiki:82129c70b693f7e2d781d78ac5efbb86),
     [`files` for archived artefacts](wiki:b08448855de9cce7610d68dac2555003),
     [`message` for direct messages](wiki:65c6965cb3d11052e87804527734a697),
     and so on.
   - Each durable domain uses one or more fixed, self-describing *collections*
-    in the pile (`compass`, `wiki`, `files`, …). A descriptor fixes the member
+    in the pile (`goals`, `knowledge`, `files`, …). A descriptor fixes the member
     encoding and independent READ and WRITE policies. A faculty may read several and
     need not own one at all. A write publishes a self-contained signed COMMIT;
     the collection view is the union of COMMITs from authors with exact
     positive WRITE authority. Collections [merge independently](wiki:5cc10e2b0263008b261cf8a1ef30bd8c)
-    — touching `compass` never invalidates `wiki`, and there is no mutable head
+    — touching `goals` never invalidates `knowledge`, and there is no mutable head
     or CAS.
   - Every faculty honours `PILE=/path/to/self.pile` as an
     environment variable — set it once per session and skip
@@ -32,7 +32,7 @@ the onboarding tour you are reading under your own pile signer).
 
 == Discovery
 
-`ls $(dirname $(which wiki))` shows every faculty next to the
+`ls $(dirname $(which knowledge))` shows every faculty next to the
 one you found. Each binary explains itself with `--help`;
 subcommands take their own `--help` for argument detail.
 Invoking a faculty with no subcommand prints usage.

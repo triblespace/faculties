@@ -545,7 +545,7 @@ mod tests {
 
         let mut blobs = fragment.blobs().clone();
         let reader = blobs.snapshot().unwrap();
-        let rows = crate::triage::collect_reason_state(&reader, fragment.facts()).unwrap();
+        let rows = crate::diagnostics::collect_reason_state(&reader, fragment.facts()).unwrap();
         let smallest = if first.raw < second.raw {
             "first"
         } else {

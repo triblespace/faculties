@@ -1,0 +1,1665 @@
+//! Canonical read model for Diagnostics diagnostics.
+//!
+//! Diagnostics observes several immutable collection values at once. Cognition is
+//! an event ledger, so queue state is a causal reduction over request,
+//! in-progress, and result entities joined by `about_request`; event time is
+//! taken from the native `created_at`, `started_at`, and `finished_at` fields
+//! according to each event kind. Profiles and Relations retain every current
+//! DAG head. No timestamp winner or mutable branch head participates here.
+//!
+//! This module is the shared semantic boundary for both the `diagnostics` CLI and
+//! the GORBIE widget. Callers own storage and presentation only.
+
+pub mod cli;
+pub mod mcp;
+pub mod operations;
+pub use operations::{InspectOptions, Diagnostics};
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use anybytes::View;
+use anyhow::{anyhow, bail, Context, Result};
+use hifitime::Epoch;
+use triblespace::core::metadata;
+use triblespace::core::query::TriblePattern;
+use triblespace::core::repo::pile::PileSnapshot;
+use triblespace::core::repo::{is_missing_blob, BlobStoreGet};
+use triblespace::macros::{find, pattern};
+use triblespace::prelude::*;
+
+use crate::profiles::{self, ConfigValue, ProfileValue, Resolution};
+use crate::message::operations::{envelope_id, inbox, read_by, settled_identity};
+use crate::relations::{self as relations_model, IdentityComponents, ProfileView};
+use crate::schemas::triage::{
+    exec, model_chat, reason, KIND_EXEC_IN_PROGRESS_ID, KIND_EXEC_REQUEST_ID, KIND_EXEC_RESULT_ID,
+    KIND_MODEL_IN_PROGRESS_ID, KIND_MODEL_REQUEST_ID, KIND_MODEL_RESULT_ID, KIND_REASON_EVENT_ID,
+};
+use crate::secrets::SecretsSnapshot;
+
+pub type TextHandle = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
+pub type Interval = Inline<inlineencodings::NsTAIInterval>;
+
+/// One immutable collection value from a single frozen pile prefix.
+#[derive(Debug)]
+pub struct SourceView<'a, P: TriblePattern = TribleSet, R = PileSnapshot> {
+    pub facts: &'a P,
+    pub reader: &'a R,
+}
+
+impl<P: TriblePattern, R> Copy for SourceView<'_, P, R> {}
+
+impl<P: TriblePattern, R> Clone for SourceView<'_, P, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+pub struct ScanSources<'a, P: TriblePattern = TribleSet, R = PileSnapshot> {
+    pub cognition: SourceView<'a, P, R>,
+    pub profiles: SourceView<'a, P, R>,
+    pub secrets: &'a SecretsSnapshot<R>,
+    pub relations: SourceView<'a, P, R>,
+    pub messages: SourceView<'a, P, R>,
+}
+
+impl<P: TriblePattern, R> Copy for ScanSources<'_, P, R> {}
+
+impl<P: TriblePattern, R> Clone for ScanSources<'_, P, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScanOptions {
+    /// Current TAI coordinate. Without it, in-progress attempts remain
+    /// running and no stale classification is inferred.
+    pub now: Option<i128>,
+    pub stale_after_ns: i128,
+    pub recent_attempts: usize,
+    pub loop_min: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecRequestRow {
+    pub id: Id,
+    pub command: String,
+    pub requested_at: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecInProgressRow {
+    pub id: Id,
+    pub about_request: Id,
+    pub attempt: Option<u64>,
+    pub started_at: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecResultRow {
+    pub id: Id,
+    pub about_request: Id,
+    pub attempt: Option<u64>,
+    pub finished_at: i128,
+    pub exit_code: Option<u64>,
+    pub stdout_text: Option<String>,
+    pub stderr_text: Option<String>,
+    pub error: Option<String>,
+    pub about_thought: Option<Id>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ExecState {
+    pub requests: HashMap<Id, ExecRequestRow>,
+    pub in_progress: Vec<ExecInProgressRow>,
+    pub results: Vec<ExecResultRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelRequestRow {
+    pub id: Id,
+    pub requested_at: i128,
+    pub about_thought: Option<Id>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelInProgressRow {
+    pub id: Id,
+    pub about_request: Id,
+    pub attempt: Option<u64>,
+    pub started_at: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelResultRow {
+    pub id: Id,
+    pub about_request: Id,
+    pub attempt: Option<u64>,
+    pub finished_at: i128,
+    pub error: Option<String>,
+    pub output_text: Option<String>,
+    pub reasoning_text: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ModelChatState {
+    pub requests: HashMap<Id, ModelRequestRow>,
+    pub in_progress: Vec<ModelInProgressRow>,
+    pub results: Vec<ModelResultRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReasonEventRow {
+    pub id: Id,
+    pub created_at: Option<i128>,
+    pub text: Option<String>,
+    pub about_turn: Option<Id>,
+    pub command_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct QueueCounts {
+    pub requests: usize,
+    pub pending: usize,
+    pub running: usize,
+    pub stale: usize,
+    /// In-progress requests whose running/stale state needs a current clock.
+    pub age_unknown: usize,
+    pub done: usize,
+    /// Attempt slots with competing in-progress or result event identities.
+    pub forked: usize,
+    /// Requests whose lifecycle mixes incompatible attempt protocols.
+    pub invalid: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AttemptFork {
+    pub request_id: Id,
+    pub attempt: Option<u64>,
+    pub in_progress_ids: Vec<Id>,
+    pub result_ids: Vec<Id>,
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct QueueProjection {
+    pub counts: QueueCounts,
+    pub forks: Vec<AttemptFork>,
+    pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecAttempt {
+    pub request_id: Id,
+    pub result_id: Id,
+    pub finished_at: i128,
+    pub command: String,
+    pub exit_code: Option<u64>,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatternSummary {
+    pub command: String,
+    pub exit_code: Option<u64>,
+    pub fingerprint: String,
+    pub count: usize,
+    pub latest: i128,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoopReport {
+    pub recent: Vec<ExecAttempt>,
+    pub top_patterns: Vec<PatternSummary>,
+    pub contiguous_head: Option<PatternSummary>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BudgetInfo {
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub safety_margin_tokens: u64,
+    pub chars_per_token: u64,
+    pub system_prompt_chars: usize,
+    pub body_budget_chars: i64,
+}
+
+/// Active Profiles projection without erasing resolution state or concurrent
+/// provenance heads.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DiagnosticsProfiles {
+    pub config: Resolution<ConfigValue>,
+    pub active_profile: Option<Resolution<ProfileValue>>,
+    pub persona_id: Option<Id>,
+    pub budget: Option<BudgetInfo>,
+}
+
+impl DiagnosticsProfiles {
+    pub fn budget(&self) -> Result<&BudgetInfo> {
+        self.budget.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Profiles has no settled active budget: {}",
+                self.unsettled_reason()
+                    .unwrap_or_else(|| "unknown failure".to_owned())
+            )
+        })
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.budget.is_some()
+    }
+
+    pub fn config_heads(&self) -> Vec<Id> {
+        self.config.head_ids()
+    }
+
+    pub fn active_profile_heads(&self) -> Vec<Id> {
+        self.active_profile
+            .as_ref()
+            .map(Resolution::head_ids)
+            .unwrap_or_default()
+    }
+
+    /// Human-readable explanation derived from the typed resolutions. The
+    /// read model retains the variants above; strings exist only at the
+    /// presentation boundary.
+    pub fn unsettled_reason(&self) -> Option<String> {
+        let config = match self.config.settled_value("Profiles config") {
+            Ok(Some(config)) => config,
+            Ok(None) => return Some("Profiles has no active configuration".to_owned()),
+            Err(error) => return Some(format!("{error:#}")),
+        };
+        let Some(profile) = self.active_profile.as_ref() else {
+            return Some(format!(
+                "active profile {:x} is missing",
+                config.active_profile
+            ));
+        };
+        match profile.settled_value(&format!("profile {:x}", config.active_profile)) {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(format!(
+                "active profile {:x} has no snapshot",
+                config.active_profile
+            )),
+            Err(error) => Some(format!("{error:#}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnreadUnavailable {
+    ProfilesUnsettled,
+    PersonaNotConfigured,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum UnreadMessages {
+    Available { reader: Id, count: usize },
+    Unavailable(UnreadUnavailable),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RelationState {
+    pub terms: Vec<String>,
+    /// Every forked person profile and all of its current heads.
+    pub forked_profiles: Vec<(Id, Vec<Id>)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScanReport {
+    pub exec_state: ExecState,
+    pub model_state: ModelChatState,
+    pub reason_events: Vec<ReasonEventRow>,
+    pub exec_queue: QueueCounts,
+    pub model_queue: QueueCounts,
+    pub exec_attempt_forks: Vec<AttemptFork>,
+    pub model_attempt_forks: Vec<AttemptFork>,
+    pub lifecycle_diagnostics: Vec<String>,
+    pub profiles: DiagnosticsProfiles,
+    pub relations: RelationState,
+    pub unread_messages: UnreadMessages,
+    pub loops: LoopReport,
+    pub probable_loop: Option<PatternSummary>,
+    pub suggestions: Vec<String>,
+}
+
+pub fn now_tai_ns() -> Result<i128> {
+    crate::clock::tai_nanoseconds_now()
+}
+
+pub fn interval_key(interval: Interval) -> i128 {
+    let (lower, _): (Epoch, Epoch) = interval
+        .try_from_inline()
+        .expect("NsTAIInterval values decode as epochs");
+    lower.to_tai_duration().total_nanoseconds()
+}
+
+/// A value wider than u64 is not one this reader can model, so the field
+/// reads as absent rather than failing the read or wrapping.
+fn u256be_to_u64(value: Inline<inlineencodings::U256BE>) -> Option<u64> {
+    let bytes = value.raw;
+    if bytes[..24].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let mut lower = [0; 8];
+    lower.copy_from_slice(&bytes[24..]);
+    Some(u64::from_be_bytes(lower))
+}
+
+fn optional_u64(values: impl Iterator<Item = Inline<inlineencodings::U256BE>>) -> Option<u64> {
+    values.min().and_then(u256be_to_u64)
+}
+
+/// A blob that is not resident yet (a commit can sync before its blobs) reads
+/// as absent. A resident blob that fails to decode is damage and fails loudly.
+fn read_text<Store>(reader: &Store, handle: TextHandle) -> Result<Option<String>>
+where
+    Store: BlobStoreGet + ?Sized,
+{
+    match reader.get::<View<str>, _>(handle) {
+        Ok(view) => Ok(Some(view.to_string())),
+        Err(error) if is_missing_blob(&error) => Ok(None),
+        Err(error) => Err(anyhow::Error::new(error)
+            .context(format!("read UTF8String {}", hex::encode(handle.raw)))),
+    }
+}
+
+fn tagged_entities<P: TriblePattern>(space: &P, kind: Id) -> BTreeSet<Id> {
+    find!(id: Id, pattern!(space, [{ ?id @ metadata::tag: kind }])).collect()
+}
+
+fn one_text<Store>(
+    reader: &Store,
+    values: impl Iterator<Item = TextHandle>,
+) -> Result<Option<String>>
+where
+    Store: BlobStoreGet + ?Sized,
+{
+    Ok(match values.min() {
+        Some(handle) => read_text(reader, handle)?,
+        None => None,
+    })
+}
+
+/// Project every native Exec event exactly once by entity id.
+///
+/// The schema is open world: an event lacking a required field does not
+/// match its query and is not modelled, and a field with several values
+/// yields the byte-smallest one (the smallest tuple when required fields are
+/// read together), so the projection is deterministic without imposing
+/// cardinality in Rust.
+pub fn collect_exec_state<Store, P>(reader: &Store, space: &P) -> Result<ExecState>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let mut state = ExecState::default();
+    for id in tagged_entities(space, KIND_EXEC_REQUEST_ID) {
+        let Some((command, requested_at)) = find!(
+            (command: TextHandle, requested_at: Interval),
+            pattern!(space, [{ id @
+                exec::command_text: ?command,
+                metadata::created_at: ?requested_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        // A command whose blob has not arrived is a missing required field.
+        let Some(command) = read_text(reader, command)? else {
+            continue;
+        };
+        state.requests.insert(
+            id,
+            ExecRequestRow {
+                id,
+                command,
+                requested_at: interval_key(requested_at),
+            },
+        );
+    }
+    for id in tagged_entities(space, KIND_EXEC_IN_PROGRESS_ID) {
+        let Some((about_request, started_at)) = find!(
+            (about_request: Id, started_at: Interval),
+            pattern!(space, [{ id @
+                exec::about_request: ?about_request,
+                metadata::started_at: ?started_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        state.in_progress.push(ExecInProgressRow {
+            id,
+            about_request,
+            attempt: optional_u64(
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
+            ),
+            started_at: interval_key(started_at),
+        });
+    }
+    for id in tagged_entities(space, KIND_EXEC_RESULT_ID) {
+        let Some((about_request, finished_at)) = find!(
+            (about_request: Id, finished_at: Interval),
+            pattern!(space, [{ id @
+                exec::about_request: ?about_request,
+                metadata::finished_at: ?finished_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        let exit_code = optional_u64(
+            find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::exit_code: ?value }])),
+        );
+        state.results.push(ExecResultRow {
+            id,
+            about_request,
+            attempt: optional_u64(
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ exec::attempt: ?value }])),
+            ),
+            finished_at: interval_key(finished_at),
+            exit_code,
+            stdout_text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::stdout_text: ?value }])),
+            )?,
+            stderr_text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::stderr_text: ?value }])),
+            )?,
+            error: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ exec::error: ?value }])),
+            )?,
+            about_thought: find!(value: Id, pattern!(space, [{ id @ exec::about_thought: ?value }]))
+                .min(),
+        });
+    }
+    Ok(state)
+}
+
+/// Project every native model-chat event exactly once by entity id, with the
+/// same open-world reading as [`collect_exec_state`].
+pub fn collect_model_chat_state<Store, P>(reader: &Store, space: &P) -> Result<ModelChatState>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let mut state = ModelChatState::default();
+    for id in tagged_entities(space, KIND_MODEL_REQUEST_ID) {
+        let Some(requested_at) = find!(
+            value: Interval,
+            pattern!(space, [{ id @ metadata::created_at: ?value }])
+        )
+        .min() else {
+            continue;
+        };
+        state.requests.insert(
+            id,
+            ModelRequestRow {
+                id,
+                requested_at: interval_key(requested_at),
+                about_thought: find!(
+                    value: Id,
+                    pattern!(space, [{ id @ model_chat::about_thought: ?value }])
+                )
+                .min(),
+            },
+        );
+    }
+    for id in tagged_entities(space, KIND_MODEL_IN_PROGRESS_ID) {
+        let Some((about_request, started_at)) = find!(
+            (about_request: Id, started_at: Interval),
+            pattern!(space, [{ id @
+                model_chat::about_request: ?about_request,
+                metadata::started_at: ?started_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        state.in_progress.push(ModelInProgressRow {
+            id,
+            about_request,
+            attempt: optional_u64(
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
+            ),
+            started_at: interval_key(started_at),
+        });
+    }
+    for id in tagged_entities(space, KIND_MODEL_RESULT_ID) {
+        let Some((about_request, finished_at)) = find!(
+            (about_request: Id, finished_at: Interval),
+            pattern!(space, [{ id @
+                model_chat::about_request: ?about_request,
+                metadata::finished_at: ?finished_at,
+            }])
+        )
+        .min() else {
+            continue;
+        };
+        let token = |attribute: &triblespace::core::attribute::Attribute<
+            inlineencodings::U256BE,
+        >| {
+            optional_u64(
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ attribute: ?value }])),
+            )
+        };
+        state.results.push(ModelResultRow {
+            id,
+            about_request,
+            attempt: optional_u64(
+                find!(value: Inline<inlineencodings::U256BE>, pattern!(space, [{ id @ model_chat::attempt: ?value }])),
+            ),
+            finished_at: interval_key(finished_at),
+            error: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::error: ?value }])),
+            )?,
+            output_text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::output_text: ?value }])),
+            )?,
+            reasoning_text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ model_chat::reasoning_text: ?value }])),
+            )?,
+            input_tokens: token(&model_chat::input_tokens),
+            output_tokens: token(&model_chat::output_tokens),
+            cache_creation_input_tokens: token(&model_chat::cache_creation_input_tokens),
+            cache_read_input_tokens: token(&model_chat::cache_read_input_tokens),
+        });
+    }
+    Ok(state)
+}
+
+pub fn collect_reason_state<Store, P>(reader: &Store, space: &P) -> Result<Vec<ReasonEventRow>>
+where
+    Store: BlobStoreGet + ?Sized,
+    P: TriblePattern,
+{
+    let mut rows = Vec::new();
+    for id in tagged_entities(space, KIND_REASON_EVENT_ID) {
+        rows.push(ReasonEventRow {
+            id,
+            created_at: find!(
+                value: Interval,
+                pattern!(space, [{ id @ metadata::created_at: ?value }])
+            )
+            .min()
+            .map(interval_key),
+            text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ reason::text: ?value }])),
+            )?,
+            about_turn: find!(value: Id, pattern!(space, [{ id @ reason::about_turn: ?value }]))
+                .min(),
+            command_text: one_text(
+                reader,
+                find!(value: TextHandle, pattern!(space, [{ id @ reason::command_text: ?value }])),
+            )?,
+        });
+    }
+    rows.sort_by_key(|row| (row.created_at.unwrap_or(i128::MIN), row.id));
+    rows.reverse();
+    Ok(rows)
+}
+
+pub fn exec_queue_counts(
+    state: &ExecState,
+    now: Option<i128>,
+    stale_after_ns: i128,
+) -> Result<QueueProjection> {
+    queue_counts(
+        state.requests.keys().copied(),
+        state
+            .in_progress
+            .iter()
+            .map(|row| (row.id, row.about_request, row.attempt, row.started_at)),
+        state
+            .results
+            .iter()
+            .map(|row| (row.id, row.about_request, row.attempt)),
+        now,
+        stale_after_ns,
+        "Exec",
+    )
+}
+
+pub fn model_queue_counts(
+    state: &ModelChatState,
+    now: Option<i128>,
+    stale_after_ns: i128,
+) -> Result<QueueProjection> {
+    queue_counts(
+        state.requests.keys().copied(),
+        state
+            .in_progress
+            .iter()
+            .map(|row| (row.id, row.about_request, row.attempt, row.started_at)),
+        state
+            .results
+            .iter()
+            .map(|row| (row.id, row.about_request, row.attempt)),
+        now,
+        stale_after_ns,
+        "Model",
+    )
+}
+
+#[derive(Default)]
+struct AttemptEvidence {
+    in_progress: Vec<(Id, i128)>,
+    results: Vec<Id>,
+}
+
+fn queue_counts(
+    requests: impl IntoIterator<Item = Id>,
+    in_progress: impl IntoIterator<Item = (Id, Id, Option<u64>, i128)>,
+    results: impl IntoIterator<Item = (Id, Id, Option<u64>)>,
+    now: Option<i128>,
+    stale_after_ns: i128,
+    label: &str,
+) -> Result<QueueProjection> {
+    let requests: BTreeSet<_> = requests.into_iter().collect();
+    let in_progress: Vec<_> = in_progress.into_iter().collect();
+    let results: Vec<_> = results.into_iter().collect();
+    let mut numbering = BTreeMap::<Id, (bool, bool)>::new();
+    let mut slots = BTreeMap::<(Id, Option<u64>), AttemptEvidence>::new();
+    let mut diagnostics = Vec::new();
+
+    for (event, request, attempt, started_at) in in_progress {
+        if !requests.contains(&request) {
+            diagnostics.push(format!(
+                "{label} in-progress event {event:x} references missing request {request:x}"
+            ));
+            continue;
+        }
+        let flags = numbering.entry(request).or_default();
+        if attempt.is_some() {
+            flags.1 = true;
+        } else {
+            flags.0 = true;
+        }
+        slots
+            .entry((request, attempt))
+            .or_default()
+            .in_progress
+            .push((event, started_at));
+    }
+    for (event, request, attempt) in results {
+        if !requests.contains(&request) {
+            diagnostics.push(format!(
+                "{label} result {event:x} references missing request {request:x}"
+            ));
+            continue;
+        }
+        let flags = numbering.entry(request).or_default();
+        if attempt.is_some() {
+            flags.1 = true;
+        } else {
+            flags.0 = true;
+        }
+        slots
+            .entry((request, attempt))
+            .or_default()
+            .results
+            .push(event);
+    }
+    let invalid_requests: BTreeSet<_> = numbering
+        .iter()
+        .filter_map(|(request, (unnumbered, numbered))| {
+            (*unnumbered && *numbered).then_some(*request)
+        })
+        .collect();
+    for request in &invalid_requests {
+        diagnostics.push(format!(
+            "{label} request {request:x} mixes numbered and unnumbered lifecycle evidence; attempt identity is ambiguous"
+        ));
+    }
+
+    let mut counts = QueueCounts {
+        requests: requests.len(),
+        ..QueueCounts::default()
+    };
+    let mut forks = Vec::new();
+    for ((request_id, attempt), evidence) in &mut slots {
+        evidence.in_progress.sort_by_key(|(event, _)| *event);
+        evidence.results.sort_unstable();
+        if evidence.in_progress.len() > 1 || evidence.results.len() > 1 {
+            forks.push(AttemptFork {
+                request_id: *request_id,
+                attempt: *attempt,
+                in_progress_ids: evidence
+                    .in_progress
+                    .iter()
+                    .map(|(event, _)| *event)
+                    .collect(),
+                result_ids: evidence.results.clone(),
+            });
+        }
+    }
+
+    for request in &requests {
+        if invalid_requests.contains(request) {
+            counts.invalid += 1;
+            continue;
+        }
+        let current_attempt = slots
+            .keys()
+            .filter_map(|(candidate, attempt)| (*candidate == *request).then_some(*attempt))
+            .max();
+        let Some(current_attempt) = current_attempt else {
+            counts.pending += 1;
+            continue;
+        };
+        let evidence = &slots[&(*request, current_attempt)];
+        if evidence.in_progress.len() > 1 || evidence.results.len() > 1 {
+            counts.forked += 1;
+        } else if evidence.results.len() == 1 {
+            counts.done += 1;
+        } else if let Some((_, started_at)) = evidence.in_progress.first() {
+            match now {
+                Some(now) if now.saturating_sub(*started_at) >= stale_after_ns.max(0) => {
+                    counts.stale += 1;
+                }
+                Some(_) => counts.running += 1,
+                None => counts.age_unknown += 1,
+            }
+        } else {
+            counts.pending += 1;
+        }
+    }
+    debug_assert_eq!(
+        counts.pending
+            + counts.running
+            + counts.stale
+            + counts.age_unknown
+            + counts.done
+            + counts.forked
+            + counts.invalid,
+        counts.requests
+    );
+    Ok(QueueProjection {
+        counts,
+        forks,
+        diagnostics,
+    })
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(text)
+        .trim()
+        .to_owned()
+}
+
+pub fn collect_exec_attempts(state: &ExecState, recent: usize) -> Vec<ExecAttempt> {
+    let mut numbering = BTreeMap::<Id, (bool, bool)>::new();
+    for (request, attempt) in state
+        .in_progress
+        .iter()
+        .map(|row| (row.about_request, row.attempt))
+        .chain(
+            state
+                .results
+                .iter()
+                .map(|row| (row.about_request, row.attempt)),
+        )
+    {
+        if !state.requests.contains_key(&request) {
+            continue;
+        }
+        let flags = numbering.entry(request).or_default();
+        if attempt.is_some() {
+            flags.1 = true;
+        } else {
+            flags.0 = true;
+        }
+    }
+    let invalid_requests: BTreeSet<_> = numbering
+        .into_iter()
+        .filter_map(|(request, (unnumbered, numbered))| (unnumbered && numbered).then_some(request))
+        .collect();
+
+    let mut by_attempt = BTreeMap::<(Id, Option<u64>), Vec<&ExecResultRow>>::new();
+    let mut start_counts = BTreeMap::<(Id, Option<u64>), usize>::new();
+    for start in &state.in_progress {
+        *start_counts
+            .entry((start.about_request, start.attempt))
+            .or_default() += 1;
+    }
+    for result in &state.results {
+        by_attempt
+            .entry((result.about_request, result.attempt))
+            .or_default()
+            .push(result);
+    }
+    let mut rows = Vec::new();
+    for ((request_id, attempt), results) in by_attempt {
+        if invalid_requests.contains(&request_id) {
+            continue;
+        }
+        // Competing results in one semantic attempt slot are a fork. They stay
+        // visible in QueueProjection and the event timeline, but cannot be
+        // chosen as one loop fingerprint without inventing an arbiter.
+        let [result] = results.as_slice() else {
+            continue;
+        };
+        if start_counts
+            .get(&(request_id, attempt))
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
+            continue;
+        }
+        let Some(request) = state.requests.get(&request_id) else {
+            continue;
+        };
+        let fingerprint = result
+            .error
+            .as_deref()
+            .map(first_line)
+            .or_else(|| result.stderr_text.as_deref().map(first_line))
+            .unwrap_or_else(|| {
+                if result.exit_code == Some(0) {
+                    "<ok>".to_owned()
+                } else {
+                    "<no stderr text>".to_owned()
+                }
+            });
+        rows.push(ExecAttempt {
+            request_id: request.id,
+            result_id: result.id,
+            finished_at: result.finished_at,
+            command: request.command.clone(),
+            exit_code: result.exit_code,
+            fingerprint,
+        });
+    }
+    rows.sort_by_key(|row| (row.finished_at, row.result_id));
+    rows.reverse();
+    rows.truncate(recent);
+    rows
+}
+
+pub fn build_loop_report(state: &ExecState, recent: usize, min_repeat: usize) -> LoopReport {
+    let recent_rows = collect_exec_attempts(state, recent);
+    let mut patterns: HashMap<(String, Option<u64>, String), PatternSummary> = HashMap::new();
+    for row in &recent_rows {
+        let entry = patterns
+            .entry((row.command.clone(), row.exit_code, row.fingerprint.clone()))
+            .or_insert_with(|| PatternSummary {
+                command: row.command.clone(),
+                exit_code: row.exit_code,
+                fingerprint: row.fingerprint.clone(),
+                count: 0,
+                latest: row.finished_at,
+            });
+        entry.count += 1;
+        entry.latest = entry.latest.max(row.finished_at);
+    }
+    let mut top_patterns: Vec<_> = patterns.into_values().collect();
+    top_patterns.sort_by_key(|pattern| (pattern.count, pattern.latest));
+    top_patterns.reverse();
+    let contiguous_head = recent_rows.first().and_then(|head| {
+        let count = recent_rows
+            .iter()
+            .take_while(|row| {
+                row.command == head.command
+                    && row.exit_code == head.exit_code
+                    && row.fingerprint == head.fingerprint
+            })
+            .count();
+        (count >= min_repeat).then_some(PatternSummary {
+            command: head.command.clone(),
+            exit_code: head.exit_code,
+            fingerprint: head.fingerprint.clone(),
+            count,
+            latest: head.finished_at,
+        })
+    });
+    LoopReport {
+        recent: recent_rows,
+        top_patterns,
+        contiguous_head,
+    }
+}
+
+fn pattern_is_failure(pattern: &PatternSummary) -> bool {
+    pattern.exit_code.unwrap_or(1) != 0 || !matches!(pattern.fingerprint.trim(), "" | "<ok>")
+}
+
+fn probable_loop(report: &LoopReport, loop_min: usize) -> Option<PatternSummary> {
+    report.contiguous_head.clone().or_else(|| {
+        report
+            .top_patterns
+            .iter()
+            .find(|pattern| pattern.count >= loop_min && pattern_is_failure(pattern))
+            .cloned()
+    })
+}
+
+fn budget_info(
+    context_window_tokens: u64,
+    max_output_tokens: u64,
+    safety_margin_tokens: u64,
+    chars_per_token: u64,
+    system_prompt_chars: usize,
+) -> BudgetInfo {
+    let chars_per_token = chars_per_token.max(1);
+    let body_budget_chars = ((context_window_tokens as i64)
+        - (max_output_tokens as i64)
+        - (safety_margin_tokens as i64))
+        * chars_per_token as i64
+        - system_prompt_chars as i64;
+    BudgetInfo {
+        context_window_tokens,
+        max_output_tokens,
+        safety_margin_tokens,
+        chars_per_token,
+        system_prompt_chars,
+        body_budget_chars,
+    }
+}
+
+pub fn project_profiles<P: TriblePattern, R: BlobStoreGet>(
+    profiles_view: SourceView<'_, P, R>,
+    secrets: &SecretsSnapshot<R>,
+) -> Result<DiagnosticsProfiles> {
+    let config = profiles::current_config(profiles_view.reader, profiles_view.facts)?;
+    let active_profile = config
+        .settled_value("Profiles config")
+        .ok()
+        .flatten()
+        .map(|config| {
+            profiles::current_profile(
+                profiles_view.reader,
+                profiles_view.facts,
+                config.active_profile,
+            )
+        })
+        .transpose()?;
+    profiles::validate_current_secret_references(&config, active_profile.iter(), secrets)
+        .context("validate current exact Profiles Secrets references")?;
+
+    let settled = config
+        .settled_value("Profiles config")
+        .ok()
+        .flatten()
+        .and_then(|config| {
+            active_profile
+                .as_ref()?
+                .settled_value(&format!("profile {:x}", config.active_profile))
+                .ok()
+                .flatten()
+                .map(|profile| (config, profile))
+        });
+    let (persona_id, budget) = settled
+        .map(|(config, profile)| {
+            (
+                config.persona,
+                Some(budget_info(
+                    profile.context_window_tokens,
+                    profile.max_output_tokens,
+                    profile.context_safety_margin_tokens,
+                    profile.chars_per_token,
+                    config.system_prompt.len(),
+                )),
+            )
+        })
+        .unwrap_or((None, None));
+    Ok(DiagnosticsProfiles {
+        config,
+        active_profile,
+        persona_id,
+        budget,
+    })
+}
+
+pub fn relation_state<P: TriblePattern, R: BlobStoreGet>(
+    view: SourceView<'_, P, R>,
+) -> Result<RelationState> {
+    let mut terms = BTreeSet::new();
+    let mut forked_profiles = Vec::new();
+    for (person, profile) in relations_model::person_profile_views(view.reader, view.facts) {
+        match profile {
+            ProfileView::Current { value, .. } => {
+                terms.insert(value.label);
+                terms.extend(value.aliases);
+            }
+            ProfileView::Forked(heads) => {
+                forked_profiles.push((person, heads.clone()));
+                for head in heads {
+                    let profile = relations_model::profile_snapshot(view.facts, head)?;
+                    let value = relations_model::profile_input(view.reader, &profile)
+                        .with_context(|| format!("read forked profile {head:x} for {person:x}"))?;
+                    terms.insert(value.label);
+                    terms.extend(value.aliases);
+                }
+            }
+            ProfileView::Invalid(error) => {
+                bail!("Relations profile {person:x} is invalid after validation: {error}")
+            }
+        }
+    }
+    forked_profiles.sort_by_key(|(person, _)| *person);
+    Ok(RelationState {
+        terms: terms.into_iter().collect(),
+        forked_profiles,
+    })
+}
+
+pub fn count_unread_messages<P: TriblePattern, R>(
+    messages: SourceView<'_, P, R>,
+    relations: SourceView<'_, P, R>,
+    reader: Id,
+) -> Result<usize> {
+    let identities = IdentityComponents::from_facts(relations.facts)?;
+    let mine = settled_identity(&identities, reader);
+    // One envelope per id, however many witnesses selected it.
+    let unread: BTreeSet<Id> = inbox(messages.facts, relations.facts, &mine)
+        .iter()
+        .map(envelope_id)
+        .filter(|message| !read_by(messages.facts, *message, &mine))
+        .collect();
+    Ok(unread.len())
+}
+
+fn extract_unknown_person_label(text: &str) -> Option<String> {
+    let marker = "unknown person label '";
+    let rest = &text[text.find(marker)? + marker.len()..];
+    Some(rest[..rest.find('\'')?].to_owned())
+}
+
+fn scan_suggestions(
+    exec_queue: &QueueCounts,
+    model_queue: &QueueCounts,
+    probable_loop: Option<&PatternSummary>,
+    relations: &RelationState,
+    profiles: &DiagnosticsProfiles,
+    unread_messages: UnreadMessages,
+    lifecycle_diagnostics: &[String],
+) -> Vec<String> {
+    let mut suggestions = Vec::new();
+    if model_queue.pending > 0
+        && model_queue.running == 0
+        && model_queue.stale == 0
+        && model_queue.age_unknown == 0
+        && model_queue.forked == 0
+    {
+        suggestions
+            .push("Model worker may be down: pending requests have no active attempt.".into());
+    }
+    if exec_queue.pending > 0
+        && exec_queue.running == 0
+        && exec_queue.stale == 0
+        && exec_queue.age_unknown == 0
+        && exec_queue.forked == 0
+    {
+        suggestions
+            .push("Exec worker may be down: pending requests have no active attempt.".into());
+    }
+    if exec_queue.stale > 0 || model_queue.stale > 0 {
+        suggestions
+            .push("One or more workers appear stale; inspect service and process health.".into());
+    }
+    if let Some(pattern) = probable_loop {
+        if let Some(label) = extract_unknown_person_label(&pattern.fingerprint) {
+            if let Some(candidate) = relations
+                .terms
+                .iter()
+                .find(|term| term.eq_ignore_ascii_case(&label) && **term != label)
+            {
+                suggestions.push(format!(
+                    "message label mismatch: '{label}' failed; try '{candidate}'."
+                ));
+            } else {
+                suggestions.push(format!(
+                    "unknown message label '{label}': add it to Relations or use an ID."
+                ));
+            }
+        }
+        if pattern.fingerprint.contains("rust-script")
+            && pattern.fingerprint.contains("No such file or directory")
+        {
+            suggestions.push("rust-script is missing in the execution environment.".into());
+        }
+        if pattern.fingerprint.contains("commentary: not found") {
+            suggestions.push(
+                "command extraction appears to retain a markdown wrapper or preamble.".into(),
+            );
+        }
+    }
+    if model_queue.pending == 0
+        && exec_queue.pending == 0
+        && exec_queue.running == 0
+        && model_queue.running == 0
+        && exec_queue.stale == 0
+        && model_queue.stale == 0
+        && exec_queue.age_unknown == 0
+        && model_queue.age_unknown == 0
+        && exec_queue.forked == 0
+        && model_queue.forked == 0
+        && exec_queue.invalid == 0
+        && model_queue.invalid == 0
+        && lifecycle_diagnostics.is_empty()
+        && relations.forked_profiles.is_empty()
+        && profiles.is_settled()
+        && matches!(unread_messages, UnreadMessages::Available { count: 0, .. })
+    {
+        suggestions.push("system looks healthy; no obvious blockers detected.".into());
+    }
+    suggestions
+}
+
+impl ScanReport {
+    /// Re-derive all wall-clock-dependent request states without reprojecting
+    /// immutable collection data. Widgets call this on every render so an
+    /// unchanged start event can cross the Running→Stale boundary.
+    pub fn refresh_time(&mut self, now: Option<i128>, stale_after_ns: i128) -> Result<()> {
+        let exec = exec_queue_counts(&self.exec_state, now, stale_after_ns)?;
+        let model = model_queue_counts(&self.model_state, now, stale_after_ns)?;
+        let mut diagnostics = exec.diagnostics;
+        diagnostics.extend(model.diagnostics);
+        self.exec_queue = exec.counts;
+        self.model_queue = model.counts;
+        self.exec_attempt_forks = exec.forks;
+        self.model_attempt_forks = model.forks;
+        self.lifecycle_diagnostics = diagnostics;
+        self.suggestions = scan_suggestions(
+            &self.exec_queue,
+            &self.model_queue,
+            self.probable_loop.as_ref(),
+            &self.relations,
+            &self.profiles,
+            self.unread_messages,
+            &self.lifecycle_diagnostics,
+        );
+        Ok(())
+    }
+}
+
+/// Project the complete native `diagnostics scan` semantic state.
+pub fn project_scan<P: TriblePattern, R: BlobStoreGet>(
+    sources: ScanSources<'_, P, R>,
+    options: ScanOptions,
+) -> Result<ScanReport> {
+    let exec_state = collect_exec_state(sources.cognition.reader, sources.cognition.facts)?;
+    let model_state = collect_model_chat_state(sources.cognition.reader, sources.cognition.facts)?;
+    let reason_events = collect_reason_state(sources.cognition.reader, sources.cognition.facts)?;
+    let exec_projection = exec_queue_counts(&exec_state, options.now, options.stale_after_ns)?;
+    let model_projection = model_queue_counts(&model_state, options.now, options.stale_after_ns)?;
+    let exec_queue = exec_projection.counts;
+    let model_queue = model_projection.counts;
+    let mut lifecycle_diagnostics = exec_projection.diagnostics;
+    lifecycle_diagnostics.extend(model_projection.diagnostics);
+    let profiles = project_profiles(sources.profiles, sources.secrets)?;
+    let relations = relation_state(sources.relations)?;
+    let unread_messages = if !profiles.is_settled() {
+        UnreadMessages::Unavailable(UnreadUnavailable::ProfilesUnsettled)
+    } else if let Some(persona) = profiles.persona_id {
+        UnreadMessages::Available {
+            reader: persona,
+            count: count_unread_messages(sources.messages, sources.relations, persona)?,
+        }
+    } else {
+        UnreadMessages::Unavailable(UnreadUnavailable::PersonaNotConfigured)
+    };
+    let loops = build_loop_report(&exec_state, options.recent_attempts, options.loop_min);
+    let probable_loop = probable_loop(&loops, options.loop_min);
+
+    let suggestions = scan_suggestions(
+        &exec_queue,
+        &model_queue,
+        probable_loop.as_ref(),
+        &relations,
+        &profiles,
+        unread_messages,
+        &lifecycle_diagnostics,
+    );
+
+    Ok(ScanReport {
+        exec_state,
+        model_state,
+        reason_events,
+        exec_queue,
+        model_queue,
+        exec_attempt_forks: exec_projection.forks,
+        model_attempt_forks: model_projection.forks,
+        lifecycle_diagnostics,
+        profiles,
+        relations,
+        unread_messages,
+        loops,
+        probable_loop,
+        suggestions,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use anybytes::Bytes;
+    use triblespace::macros::entity;
+
+    fn id(byte: u8) -> Id {
+        Id::new([byte; 16]).unwrap()
+    }
+
+    fn request(byte: u8, command: &str) -> ExecRequestRow {
+        ExecRequestRow {
+            id: id(byte),
+            command: command.to_owned(),
+            requested_at: 0,
+        }
+    }
+
+    fn start(byte: u8, request: Id, attempt: Option<u64>, started_at: i128) -> ExecInProgressRow {
+        ExecInProgressRow {
+            id: id(byte),
+            about_request: request,
+            attempt,
+            started_at,
+        }
+    }
+
+    fn result(byte: u8, request: Id, attempt: Option<u64>, finished_at: i128) -> ExecResultRow {
+        ExecResultRow {
+            id: id(byte),
+            about_request: request,
+            attempt,
+            finished_at,
+            exit_code: Some(1),
+            stdout_text: None,
+            stderr_text: Some("same failure".to_owned()),
+            error: None,
+            about_thought: None,
+        }
+    }
+
+    fn assert_partition(counts: &QueueCounts) {
+        assert_eq!(
+            counts.pending
+                + counts.running
+                + counts.stale
+                + counts.age_unknown
+                + counts.done
+                + counts.forked
+                + counts.invalid,
+            counts.requests
+        );
+    }
+
+    #[test]
+    fn queue_states_are_disjoint_and_staleness_rederives_from_now() {
+        let mut state = ExecState::default();
+        for byte in 1..=4 {
+            let row = request(byte, "command");
+            state.requests.insert(row.id, row);
+        }
+        state.in_progress.push(start(11, id(2), None, 950));
+        state.in_progress.push(start(12, id(3), None, 100));
+        state.results.push(result(13, id(4), None, 900));
+
+        let first = exec_queue_counts(&state, Some(1_000), 100).unwrap();
+        assert_eq!(
+            first.counts,
+            QueueCounts {
+                requests: 4,
+                pending: 1,
+                running: 1,
+                stale: 1,
+                age_unknown: 0,
+                done: 1,
+                forked: 0,
+                invalid: 0,
+            }
+        );
+        assert_partition(&first.counts);
+
+        let later = exec_queue_counts(&state, Some(1_050), 100).unwrap();
+        assert_eq!(later.counts.running, 0);
+        assert_eq!(later.counts.stale, 2);
+        assert_partition(&later.counts);
+
+        let without_clock = exec_queue_counts(&state, None, 100).unwrap();
+        assert_eq!(without_clock.counts.running, 0);
+        assert_eq!(without_clock.counts.stale, 0);
+        assert_eq!(without_clock.counts.age_unknown, 2);
+        assert_partition(&without_clock.counts);
+    }
+
+    #[test]
+    fn highest_numbered_attempt_is_current_but_older_terminal_attempts_remain_history() {
+        let request = request(1, "retrying command");
+        let mut state = ExecState::default();
+        state.requests.insert(request.id, request.clone());
+        state.results.push(result(11, request.id, Some(1), 100));
+        state.in_progress.push(start(12, request.id, Some(2), 190));
+
+        let queue = exec_queue_counts(&state, Some(200), 100).unwrap();
+        assert_eq!(queue.counts.running, 1);
+        assert_eq!(queue.counts.done, 0);
+        assert_eq!(collect_exec_attempts(&state, 10).len(), 1);
+    }
+
+    #[test]
+    fn result_without_start_is_done_for_legacy_and_numbered_protocols() {
+        let mut state = ModelChatState::default();
+        for byte in 1..=2 {
+            let request = ModelRequestRow {
+                id: id(byte),
+                requested_at: 0,
+                about_thought: None,
+            };
+            state.requests.insert(request.id, request);
+        }
+        for (byte, request, attempt) in [(11, id(1), None), (12, id(2), Some(4))] {
+            state.results.push(ModelResultRow {
+                id: id(byte),
+                about_request: request,
+                attempt,
+                finished_at: 10,
+                error: None,
+                output_text: None,
+                reasoning_text: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            });
+        }
+
+        let queue = model_queue_counts(&state, Some(20), 100).unwrap();
+        assert_eq!(queue.counts.done, 2);
+        assert_partition(&queue.counts);
+    }
+
+    #[test]
+    fn attempt_forks_are_never_timestamp_arbitrated_and_history_stays_visible() {
+        let current_fork = request(1, "current fork");
+        let historical_fork = request(2, "historical fork");
+        let mut state = ExecState::default();
+        state.requests.insert(current_fork.id, current_fork.clone());
+        state
+            .requests
+            .insert(historical_fork.id, historical_fork.clone());
+        state
+            .in_progress
+            .push(start(11, current_fork.id, Some(1), 10));
+        state
+            .in_progress
+            .push(start(12, current_fork.id, Some(1), 20));
+        state
+            .results
+            .push(result(13, historical_fork.id, Some(1), 30));
+        state
+            .results
+            .push(result(14, historical_fork.id, Some(1), 40));
+        state
+            .results
+            .push(result(15, historical_fork.id, Some(2), 50));
+
+        let queue = exec_queue_counts(&state, Some(100), 1_000).unwrap();
+        assert_eq!(queue.counts.forked, 1);
+        assert_eq!(queue.counts.done, 1);
+        assert_eq!(queue.forks.len(), 2);
+        assert!(queue
+            .forks
+            .iter()
+            .any(|fork| fork.request_id == historical_fork.id && fork.attempt == Some(1)));
+        assert_partition(&queue.counts);
+
+        let attempts = collect_exec_attempts(&state, 10);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result_id, id(15));
+    }
+
+    #[test]
+    fn mixed_attempt_protocol_is_invalid_and_orphans_are_diagnostic_only() {
+        let request = request(1, "ambiguous");
+        let mut state = ExecState::default();
+        state.requests.insert(request.id, request.clone());
+        state.results.push(result(11, request.id, None, 10));
+        state.results.push(result(12, request.id, Some(1), 20));
+        state.results.push(result(13, id(99), Some(1), 30));
+
+        let queue = exec_queue_counts(&state, Some(100), 10).unwrap();
+        assert_eq!(queue.counts.invalid, 1);
+        assert_eq!(queue.counts.requests, 1);
+        assert_eq!(queue.diagnostics.len(), 2);
+        assert!(queue
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("mixes numbered and unnumbered")));
+        assert!(queue
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("references missing request")));
+        assert!(collect_exec_attempts(&state, 10).is_empty());
+        assert_partition(&queue.counts);
+    }
+
+    #[test]
+    fn loop_reduction_uses_only_settled_terminal_attempt_slots() {
+        let settled = request(1, "same command");
+        let forked = request(2, "same command");
+        let mixed = request(3, "same command");
+        let mut state = ExecState::default();
+        for request in [&settled, &forked, &mixed] {
+            state.requests.insert(request.id, request.clone());
+        }
+        state.results.push(result(11, settled.id, Some(1), 10));
+        state.results.push(result(12, settled.id, Some(2), 20));
+        state.results.push(result(13, forked.id, Some(1), 30));
+        state.results.push(result(14, forked.id, Some(1), 40));
+        state.results.push(result(15, mixed.id, None, 50));
+        state.results.push(result(16, mixed.id, Some(1), 60));
+
+        let report = build_loop_report(&state, 20, 2);
+        assert_eq!(report.recent.len(), 2);
+        assert_eq!(report.top_patterns[0].count, 2);
+        assert_eq!(report.contiguous_head.as_ref().unwrap().count, 2);
+    }
+
+    fn point(seconds: f64) -> Interval {
+        let at = Epoch::from_tai_seconds(seconds);
+        (at, at).try_to_inline().unwrap()
+    }
+
+    fn native_exec_fragment(exit_code: Inline<inlineencodings::U256BE>) -> Fragment {
+        let request = id(1);
+        let start = id(2);
+        let result = id(3);
+        let mut fragment = Fragment::empty();
+        let command = fragment.put("native timestamps".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&request) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: command,
+            metadata::created_at: point(10.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&start) @
+            metadata::tag: &KIND_EXEC_IN_PROGRESS_ID,
+            exec::about_request: &request,
+            exec::attempt: 1u64,
+            metadata::started_at: point(20.0),
+        };
+        fragment += entity! { ExclusiveId::force_ref(&result) @
+            metadata::tag: &KIND_EXEC_RESULT_ID,
+            exec::about_request: &request,
+            exec::attempt: 1u64,
+            exec::exit_code: exit_code,
+            metadata::finished_at: point(30.0),
+        };
+        fragment
+    }
+
+    #[test]
+    fn collector_uses_each_native_lifecycle_timestamp() {
+        let exit_code: Inline<inlineencodings::U256BE> = 7u64.to_inline();
+        let mut fragment = native_exec_fragment(exit_code);
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(
+            state.requests[&id(1)].requested_at,
+            interval_key(point(10.0))
+        );
+        assert_eq!(state.in_progress[0].started_at, interval_key(point(20.0)));
+        assert_eq!(state.results[0].finished_at, interval_key(point(30.0)));
+        assert_eq!(state.results[0].exit_code, Some(7));
+    }
+
+    #[test]
+    fn exec_requests_lacking_a_field_are_skipped_and_repeated_fields_do_not_fail() {
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        // Cognition entity 6a1c9171 in the 2026-09-29 union had no command.
+        let missing = id(4);
+        fragment += entity! { ExclusiveId::force_ref(&missing) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            metadata::created_at: point(40.0),
+        };
+        let repeated = id(5);
+        let first = fragment.put("first".to_owned());
+        let second = fragment.put("second".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&repeated) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: first,
+            exec::command_text: second,
+            metadata::created_at: point(50.0),
+            metadata::created_at: point(60.0),
+        };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(state.requests[&id(1)].command, "native timestamps");
+        assert!(!state.requests.contains_key(&missing));
+        // Several values select the byte-smallest (command, created_at) pair.
+        let (command, requested_at) = [first, second]
+            .into_iter()
+            .flat_map(|command| [(command, point(50.0)), (command, point(60.0))])
+            .min()
+            .unwrap();
+        let row = &state.requests[&repeated];
+        assert_eq!(
+            row.command,
+            if command == first { "first" } else { "second" }
+        );
+        assert_eq!(row.requested_at, interval_key(requested_at));
+    }
+
+    #[test]
+    fn oversized_u256_values_read_as_absent_without_wrapping() {
+        let mut raw = [0; 32];
+        raw[0] = 1;
+        // The low 64 bits alone would wrap to 7.
+        raw[31] = 7;
+        let mut fragment = native_exec_fragment(Inline::<inlineencodings::U256BE>::new(raw));
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.results.len(), 1);
+        assert_eq!(state.results[0].exit_code, None);
+        assert_eq!(state.results[0].attempt, Some(1));
+    }
+
+    #[test]
+    fn missing_text_blobs_read_as_absent_and_malformed_ones_fail() {
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        let result = id(3);
+        // A commit can sync before its blobs: this handle's blob is not here.
+        let absent: TextHandle = Fragment::empty().put("not yet synced".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&result) @ exec::stdout_text: absent };
+        let unsynced_request = id(4);
+        fragment += entity! { ExclusiveId::force_ref(&unsynced_request) @
+            metadata::tag: &KIND_EXEC_REQUEST_ID,
+            exec::command_text: absent,
+            metadata::created_at: point(40.0),
+        };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let state = collect_exec_state(&reader, &facts).unwrap();
+        assert_eq!(state.results[0].stdout_text, None);
+        assert_eq!(state.results[0].exit_code, Some(7));
+        assert!(state.requests.contains_key(&id(1)));
+        assert!(!state.requests.contains_key(&unsynced_request));
+
+        let mut fragment = native_exec_fragment(7u64.to_inline());
+        let invalid = Blob::<blobencodings::UTF8String>::new(Bytes::from(vec![0xFF]));
+        let malformed = invalid.get_handle();
+        fragment.blobs_mut().insert(invalid);
+        fragment += entity! { ExclusiveId::force_ref(&result) @ exec::stdout_text: malformed };
+        let facts = fragment.facts().clone();
+        let reader = fragment.blobs_mut().snapshot().unwrap();
+
+        let error = collect_exec_state(&reader, &facts).unwrap_err();
+        assert!(format!("{error:#}").contains("read UTF8String"));
+    }
+
+    #[test]
+    fn unavailable_inbox_never_satisfies_the_healthy_heuristic() {
+        let anchor = id(1);
+        let config = profiles::default_config(anchor);
+        let profile = profiles::default_profile(anchor, "test");
+        let profiles = DiagnosticsProfiles {
+            config: Resolution::Unique(profiles::Snapshot {
+                id: id(2),
+                value: config.clone(),
+                predecessors: Vec::new(),
+            }),
+            active_profile: Some(Resolution::Unique(profiles::Snapshot {
+                id: id(3),
+                value: profile.clone(),
+                predecessors: Vec::new(),
+            })),
+            persona_id: None,
+            budget: Some(budget_info(
+                profile.context_window_tokens,
+                profile.max_output_tokens,
+                profile.context_safety_margin_tokens,
+                profile.chars_per_token,
+                config.system_prompt.len(),
+            )),
+        };
+        let queues = QueueCounts::default();
+        let relations = RelationState::default();
+
+        let unavailable = scan_suggestions(
+            &queues,
+            &queues,
+            None,
+            &relations,
+            &profiles,
+            UnreadMessages::Unavailable(UnreadUnavailable::PersonaNotConfigured),
+            &[],
+        );
+        assert!(!unavailable.iter().any(|line| line.contains("healthy")));
+
+        let available = scan_suggestions(
+            &queues,
+            &queues,
+            None,
+            &relations,
+            &profiles,
+            UnreadMessages::Available {
+                reader: id(4),
+                count: 0,
+            },
+            &[],
+        );
+        assert!(available.iter().any(|line| line.contains("healthy")));
+    }
+}

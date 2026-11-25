@@ -146,9 +146,9 @@ fn selected_cli_help_does_not_resolve_the_destination() {
         "--workspace",
         &revision,
     ];
-    let cli = crate::compass::cli::Cli::try_parse_from(arguments).unwrap();
+    let cli = crate::goals::cli::Cli::try_parse_from(arguments).unwrap();
     let mut text = String::new();
-    crate::compass::cli::execute(
+    crate::goals::cli::execute(
         cli,
         &mut crate::out::Out::new(&mut |part| {
             if let crate::out::Part::Text { text: next } = part {
@@ -159,7 +159,8 @@ fn selected_cli_help_does_not_resolve_the_destination() {
     )
     .unwrap();
     assert!(text.contains("--workspace"));
-    crate::wiki::cli::execute_from(arguments, &mut crate::out::Out::new(&mut |_| Ok(()))).unwrap();
+    crate::knowledge::cli::execute_from(arguments, &mut crate::out::Out::new(&mut |_| Ok(())))
+        .unwrap();
     assert!(!pile.exists());
     assert!(!key.exists());
 }

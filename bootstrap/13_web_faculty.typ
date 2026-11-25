@@ -20,7 +20,7 @@ to query the web, `fetch` to pull and clean a single URL.
 == Usage
 
 ```sh
-# Search using the exact credential version selected through Headspace.
+# Search using the exact credential version selected through Profiles.
 web search "succinct hash array mapped trie"
 
 # Or override one invocation explicitly (use @path or @- to avoid shell history).
@@ -43,7 +43,7 @@ A common pattern:
   + Pick a result.
   + `files fetch <url>` — archive the raw bytes
     (`files:<hash>` returned).
-  + `wiki create "..." --tag paper` — write a fragment
+  + `knowledge create "..." --tag paper` — write a fragment
     citing the `files:<hash>`.
 
 So web is the discovery / clean-extract step; files is
@@ -65,7 +65,7 @@ the durable-archive step. Use the right one for each job.
 Unless `--no-store` is set, each `search` and `fetch` publishes an immutable
 event into one fixed descriptor-policy Web collection. There is no branch selector
 or mutable head. Events accrete; nothing is overwritten. Runtime credentials
-come from exact Secrets versions selected through Headspace, or from explicit
+come from exact Secrets versions selected through Profiles, or from explicit
 per-invocation overrides; they are not stored in the public event facts.
 
 Next stop: [Tool Selection: Faculties First](wiki:f4aff48fff04f313552f5b32244f9873).

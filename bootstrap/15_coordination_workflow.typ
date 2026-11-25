@@ -2,7 +2,7 @@
 
 How several agents sharing one pile divide work, hand it off, and review one
 another without a shadow workflow. This recipe chains `relations`, `message`,
-`orient`, and `compass`. Processes may share one pile, or operators may activate
+`orient`, and `goals`. Processes may share one pile, or operators may activate
 the exact descriptors between independent piles after installing appropriate
 READ and WRITE proofs. Faculty names alone never imply network sharing.
 
@@ -29,21 +29,21 @@ ordinary status and note events; it is not a cryptographic authority claim.
 ```sh
 # Agent A claims and works.
 GOAL=<existing-goal-id>
-compass move "$GOAL" doing
-compass note "$GOAL" "Claimed by agent-a; draft at wiki:<fragment>"
+goals move "$GOAL" doing
+goals note "$GOAL" "Claimed by agent-a; draft at wiki:<fragment>"
 
 # If another agent must continue, send the conversational context directly.
-compass move "$GOAL" blocked
+goals move "$GOAL" blocked
 message send agent-b "Please continue $GOAL from wiki:<fragment>"
 
 # Agent B's watcher surfaces the message; B acknowledges and claims.
 export PERSONA=agent-b
 orient show
 message ack <message-id> "$PERSONA"
-compass move "$GOAL" doing
+goals move "$GOAL" doing
 ```
 
-The Compass status and notes are the durable work ledger. The message carries
+The Goals status and notes are the durable work ledger. The message carries
 the human-readable hand-off and acknowledgement. For a lightweight directed
 assignment, tag a goal with the recipient's own relations label; to draw one
 person or a whole group to a goal or note once, write `@label` in its text.
@@ -67,7 +67,7 @@ A useful report records:
   - enough context for another agent to reproduce the observation
 
 The reviewer describes the problem and does not mandate a particular repair.
-The author keeps developing; review does not own Compass status or imply
+The author keeps developing; review does not own Goals status or imply
 acceptance. When a report arrives, first check whether it still applies to the
 current artifact. If it does, create or annotate an ordinary follow-up goal.
 If subsequent deletion or redesign already resolved it, record that diagnosis
@@ -76,7 +76,7 @@ as stale and move on.
 This makes review asynchronous in the strong sense: a reviewer can work at
 their own pace, and their report remains useful evidence without becoming a
 global lock. Release or publication boundaries may impose their own policy,
-but that policy is separate from Compass and from the diagnostic record.
+but that policy is separate from Goals and from the diagnostic record.
 
 == Persistent notifications for idle agents
 
@@ -117,7 +117,7 @@ the authoring command never inherits `PERSONA` as a target implicitly.
   - "Local Messages: Agent-to-Agent Direct Messaging"
   - "Relations: People and Handle Mappings"
   - "Orient: The Situation-Snapshot Faculty"
-  - "Compass Goals Workflow"
+  - "Goals Goals Workflow"
   - [Recipe: Share a Collection Between Agents](wiki:d06247b9d9183721e47a2940806e5d7f)
   - [Harness Hooks: Mechanical Agent Sync](wiki:5c86df3dcd5994de2967483fca7170ac)
 

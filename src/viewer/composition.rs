@@ -1,13 +1,13 @@
 //! One shared composition for the dashboard, focused CLI wrappers and MCP.
 
 use super::{Target, Viewer};
-use crate::compass::Compass;
+use crate::goals::Goals;
 use crate::storage::Storage;
 use crate::widgets::{
-    AtlasViewer, BranchTimeline, ColonyViewer, CompassBoard, DecidePanel, DiscordViewer,
-    FilesViewer, GameWrite, GaugeViewer, HeadspaceViewer, MailViewer, MemoryViewer, MessagesPanel,
-    PlannerViewer, PriorityGame, RelationsViewer, SourceKey, StorageState, TeamsViewer,
-    TimelineSource, TriageViewer, WidgetContext, WikiViewer,
+    BranchTimeline, ColonyViewer, DecisionsPanel, DiagnosticsViewer, DiscordViewer, EventsViewer,
+    FilesViewer, GameWrite, GoalsBoard, KnowledgeHealthViewer, KnowledgeViewer, MailViewer,
+    MemoryViewer, MessagesPanel, PriorityGame, ProfilesViewer, RelationsViewer, SchemasViewer,
+    SourceKey, StorageState, TeamsViewer, TimelineSource, WidgetContext,
 };
 use std::sync::Arc;
 use triblespace::prelude::Id;
@@ -18,17 +18,17 @@ impl Target {
     pub(crate) fn sources(self) -> &'static [SourceKey] {
         match self {
             Self::Dashboard => &SourceKey::ALL,
-            Self::Atlas => &[SourceKey::Atlas],
+            Self::Schemas => &[SourceKey::Schemas],
             Self::Colony => &crate::widgets::colony::INPUTS,
             Self::Discord => &[SourceKey::Discord],
             Self::Files => &[SourceKey::Files],
-            Self::Gauge => &[SourceKey::Wiki],
-            Self::Headspace => &[SourceKey::Headspace],
+            Self::KnowledgeHealth => &[SourceKey::Knowledge],
+            Self::Profiles => &[SourceKey::Profiles],
             Self::Memory => &[SourceKey::Memory],
             Self::Messages => &[SourceKey::Messages],
-            Self::Planner => &[SourceKey::Planner],
+            Self::Events => &[SourceKey::Events],
             Self::Teams => &[SourceKey::Teams],
-            Self::Triage => &[SourceKey::Triage],
+            Self::Diagnostics => &[SourceKey::Diagnostics],
         }
     }
 }
@@ -59,27 +59,27 @@ pub fn compose(nb: &mut NotebookCtx, viewer: &Viewer, target: Target) {
 }
 
 /// An action a widget asks its host to perform. File actions resolve against
-/// the exact clicked observation; a priority answer is an ordinary Compass
+/// the exact clicked observation; a priority answer is an ordinary Goals
 /// write the host performs with its own storage and identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostAction {
-    WikiLink(String),
+    KnowledgeLink(String),
     Entity(Id),
-    /// Rank `higher` over `lower`, as `Compass::prioritize` does. `Err` is a
+    /// Rank `higher` over `lower`, as `Goals::prioritize` does. `Err` is a
     /// refused write (a cycle, or a child ranked under its parent).
     Prioritize {
         higher: Id,
         lower: Id,
     },
     /// Say the goal is unclear to the host's identity, as
-    /// `Compass::mark_unclear` does: an attributed note tagged `unclear`
+    /// `Goals::mark_unclear` does: an attributed note tagged `unclear`
     /// asking for an explanation. It ranks nothing and moves no status.
     MarkGoalUnclear {
         goal: Id,
     },
 }
 
-/// Perform one Compass write a widget asked for, with the host's own storage
+/// Perform one Goals write a widget asked for, with the host's own storage
 /// and identity. Every host calls this so they all write the same observation;
 /// `None` means the action is not a storage write (opening a file or link),
 /// which the host handles itself.
@@ -88,13 +88,13 @@ pub fn perform_storage_action(
     persona: Option<&str>,
     action: &HostAction,
 ) -> Option<Result<(), String>> {
-    let compass = || Compass::with_storage(storage.clone());
+    let goals = || Goals::with_storage(storage.clone());
     let written = match action {
-        HostAction::WikiLink(_) | HostAction::Entity(_) => return None,
-        HostAction::Prioritize { higher, lower } => compass()
+        HostAction::KnowledgeLink(_) | HostAction::Entity(_) => return None,
+        HostAction::Prioritize { higher, lower } => goals()
             .prioritize(&format!("{higher:x}"), &format!("{lower:x}"), persona)
             .map(drop),
-        HostAction::MarkGoalUnclear { goal } => compass()
+        HostAction::MarkGoalUnclear { goal } => goals()
             .mark_unclear(&format!("{goal:x}"), persona)
             .map(drop),
     };
@@ -143,7 +143,7 @@ impl Host for Standalone {
     }
 }
 
-/// Perform one action for the standalone host, synchronously. A Compass
+/// Perform one action for the standalone host, synchronously. A Goals
 /// write moves the pile stamp, so the next render observes it.
 fn perform(
     storage: &Storage,
@@ -160,12 +160,12 @@ fn perform(
         return written;
     }
     match action {
-        HostAction::WikiLink(selector) => {
-            WikiViewer::open_file_with(files()?, &selector, || Ok(()))
+        HostAction::KnowledgeLink(selector) => {
+            KnowledgeViewer::open_file_with(files()?, &selector, || Ok(()))
         }
         HostAction::Entity(entity) => FilesViewer::open_entity_with(files()?, entity, || Ok(())),
         HostAction::Prioritize { .. } | HostAction::MarkGoalUnclear { .. } => {
-            unreachable!("Compass writes are storage actions")
+            unreachable!("Goals writes are storage actions")
         }
     }
 }
@@ -214,20 +214,20 @@ where
 /// The same ordered cards for standalone notebooks and workspace hosts.
 /// The host renders its own selector before these cards.
 pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
-    if target == Target::Dashboard || target == Target::Headspace {
+    if target == Target::Dashboard || target == Target::Profiles {
         card(
             nb,
             host.clone(),
-            "headspace",
-            HeadspaceViewer::default,
+            "profiles",
+            ProfilesViewer::default,
             move |ctx, panel, sources, _open| {
-                let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
+                let Some(profiles) = sources.dataset(SourceKey::Profiles) else {
                     return;
                 };
                 let Some(secrets) = sources.secrets() else {
                     return;
                 };
-                panel.render(ctx, headspace, secrets);
+                panel.render(ctx, profiles, secrets);
             },
         );
     }
@@ -251,17 +251,17 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             "timeline",
             || {
                 BranchTimeline::multi(vec![
-                    TimelineSource::Compass {
-                        key: SourceKey::Compass,
+                    TimelineSource::Goals {
+                        key: SourceKey::Goals,
                         label: "goals".to_owned(),
                     },
                     TimelineSource::LocalMessages {
                         key: SourceKey::Messages,
                         label: "local".to_owned(),
                     },
-                    TimelineSource::Wiki {
-                        key: SourceKey::Wiki,
-                        label: "wiki".to_owned(),
+                    TimelineSource::Knowledge {
+                        key: SourceKey::Knowledge,
+                        label: "knowledge".to_owned(),
                     },
                     TimelineSource::Reason {
                         key: SourceKey::Reason,
@@ -279,14 +279,14 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         );
     }
 
-    if target == Target::Dashboard || target == Target::Gauge {
+    if target == Target::Dashboard || target == Target::KnowledgeHealth {
         card(
             nb,
             host.clone(),
             "gauge",
-            GaugeViewer::default,
+            KnowledgeHealthViewer::default,
             move |ctx, panel, sources, _open| {
-                let Some(view) = sources.dataset(SourceKey::Wiki) else {
+                let Some(view) = sources.dataset(SourceKey::Knowledge) else {
                     return;
                 };
                 panel.render(ctx, view);
@@ -298,17 +298,17 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         card(
             nb,
             host.clone(),
-            "wiki",
-            WikiViewer::default,
-            move |ctx, wiki, sources, open| {
-                let Some(view) = sources.dataset(SourceKey::Wiki) else {
+            "knowledge",
+            KnowledgeViewer::default,
+            move |ctx, knowledge, sources, open| {
+                let Some(view) = sources.dataset(SourceKey::Knowledge) else {
                     return;
                 };
-                wiki.render_with_file_action(
+                knowledge.render_with_file_action(
                     ctx,
                     view,
                     sources.dataset(SourceKey::Files),
-                    |selector| open(HostAction::WikiLink(selector.to_owned())),
+                    |selector| open(HostAction::KnowledgeLink(selector.to_owned())),
                 );
             },
         );
@@ -318,13 +318,13 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         card(
             nb,
             host.clone(),
-            "compass",
-            CompassBoard::default,
-            move |ctx, compass, sources, _open| {
-                let Some(view) = sources.dataset(SourceKey::Compass) else {
+            "goals",
+            GoalsBoard::default,
+            move |ctx, goals, sources, _open| {
+                let Some(view) = sources.dataset(SourceKey::Goals) else {
                     return;
                 };
-                compass.render(ctx, view);
+                goals.render(ctx, view);
             },
         );
     }
@@ -336,7 +336,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             "priority-game",
             PriorityGame::default,
             move |ctx, game, sources, act| {
-                let Some(view) = sources.dataset(SourceKey::Compass) else {
+                let Some(view) = sources.dataset(SourceKey::Goals) else {
                     return;
                 };
                 game.render(ctx, view, |answer| {
@@ -355,10 +355,10 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         card(
             nb,
             host.clone(),
-            "decide",
-            DecidePanel::default,
+            "decisions",
+            DecisionsPanel::default,
             move |ctx, panel, sources, _open| {
-                let Some(view) = sources.dataset(SourceKey::Decide) else {
+                let Some(view) = sources.dataset(SourceKey::Decisions) else {
                     return;
                 };
                 panel.render(ctx, view);
@@ -381,14 +381,14 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         );
     }
 
-    if target == Target::Dashboard || target == Target::Planner {
+    if target == Target::Dashboard || target == Target::Events {
         card(
             nb,
             host.clone(),
-            "planner",
-            PlannerViewer::default,
+            "events",
+            EventsViewer::default,
             move |ctx, panel, sources, _open| {
-                let Some(view) = sources.dataset(SourceKey::Planner) else {
+                let Some(view) = sources.dataset(SourceKey::Events) else {
                     return;
                 };
                 panel.render(ctx, view, sources.dataset(SourceKey::Relations));
@@ -486,17 +486,17 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         );
     }
 
-    if target == Target::Dashboard || target == Target::Triage {
+    if target == Target::Dashboard || target == Target::Diagnostics {
         card(
             nb,
             host.clone(),
-            "triage",
-            TriageViewer::default,
+            "diagnostics",
+            DiagnosticsViewer::default,
             move |ctx, panel, sources, _open| {
-                let Some(cognition) = sources.dataset(SourceKey::Triage) else {
+                let Some(cognition) = sources.dataset(SourceKey::Diagnostics) else {
                     return;
                 };
-                let Some(headspace) = sources.dataset(SourceKey::Headspace) else {
+                let Some(profiles) = sources.dataset(SourceKey::Profiles) else {
                     return;
                 };
                 let Some(secrets) = sources.secrets() else {
@@ -508,19 +508,19 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
                 let Some(messages) = sources.dataset(SourceKey::Messages) else {
                     return;
                 };
-                panel.render(ctx, cognition, headspace, secrets, relations, messages);
+                panel.render(ctx, cognition, profiles, secrets, relations, messages);
             },
         );
     }
 
-    if target == Target::Dashboard || target == Target::Atlas {
+    if target == Target::Dashboard || target == Target::Schemas {
         card(
             nb,
             host.clone(),
-            "atlas",
-            AtlasViewer::default,
+            "schemas",
+            SchemasViewer::default,
             move |ctx, panel, sources, _open| {
-                let Some(view) = sources.dataset(SourceKey::Atlas) else {
+                let Some(view) = sources.dataset(SourceKey::Schemas) else {
                     return;
                 };
                 panel.render(ctx, view);
@@ -546,7 +546,7 @@ mod tests {
         assert!(selected.for_generation(3, Vec::new).is_empty());
     }
 
-    /// The standalone host performs a priority answer as an ordinary Compass
+    /// The standalone host performs a priority answer as an ordinary Goals
     /// write; the next observation reads the edge, and a refused write comes
     /// back as the error the game shows.
     #[test]
@@ -557,14 +557,14 @@ mod tests {
         std::fs::File::create(&pile).unwrap();
         crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
         let storage = Storage::new(pile, Some(key));
-        let compass = Compass::with_storage(storage.clone());
-        let alpha = compass.add("alpha", Default::default()).unwrap().goal;
-        let beta = compass.add("beta", Default::default()).unwrap().goal;
+        let goals = Goals::with_storage(storage.clone());
+        let alpha = goals.add("alpha", Default::default()).unwrap().goal;
+        let beta = goals.add("beta", Default::default()).unwrap().goal;
         let parent = format!("{alpha:x}");
-        let child = compass
+        let child = goals
             .add(
                 "child",
-                crate::compass::AddOptions {
+                crate::goals::AddOptions {
                     parent: Some(&parent),
                     ..Default::default()
                 },
@@ -572,9 +572,9 @@ mod tests {
             .unwrap()
             .goal;
 
-        let mut state = StorageState::with_storage(storage, [SourceKey::Compass]);
-        let view = state.context().dataset(SourceKey::Compass).unwrap();
-        assert!(crate::compass::active_priority_edges(view.facts).is_empty());
+        let mut state = StorageState::with_storage(storage, [SourceKey::Goals]);
+        let view = state.context().dataset(SourceKey::Goals).unwrap();
+        assert!(crate::goals::active_priority_edges(view.facts).is_empty());
 
         perform(
             state.storage(),
@@ -586,9 +586,9 @@ mod tests {
             },
         )
         .unwrap();
-        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        let view = state.context().dataset(SourceKey::Goals).unwrap();
         assert_eq!(
-            crate::compass::active_priority_edges(view.facts),
+            crate::goals::active_priority_edges(view.facts),
             std::collections::BTreeSet::from([(alpha, beta)])
         );
 
@@ -618,14 +618,14 @@ mod tests {
         std::fs::File::create(&pile).unwrap();
         crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
         let storage = Storage::new(pile, Some(key));
-        let goal = Compass::with_storage(storage.clone())
+        let goal = Goals::with_storage(storage.clone())
             .add("puzzling", Default::default())
             .unwrap()
             .goal;
 
-        let mut state = StorageState::with_storage(storage, [SourceKey::Compass]);
-        let view = state.context().dataset(SourceKey::Compass).unwrap();
-        assert!(crate::compass::unclear_goals(view.facts).is_empty());
+        let mut state = StorageState::with_storage(storage, [SourceKey::Goals]);
+        let view = state.context().dataset(SourceKey::Goals).unwrap();
+        assert!(crate::goals::unclear_goals(view.facts).is_empty());
         perform(
             state.storage(),
             None,
@@ -633,28 +633,28 @@ mod tests {
             HostAction::MarkGoalUnclear { goal },
         )
         .unwrap();
-        let view = state.context().dataset(SourceKey::Compass).unwrap();
+        let view = state.context().dataset(SourceKey::Goals).unwrap();
         assert_eq!(
-            crate::compass::unclear_goals(view.facts),
+            crate::goals::unclear_goals(view.facts),
             std::collections::BTreeSet::from([goal])
         );
-        assert!(crate::compass::active_priority_edges(view.facts).is_empty());
+        assert!(crate::goals::active_priority_edges(view.facts).is_empty());
     }
 
     #[test]
     fn focused_inputs_keep_the_original_roots_and_storage_owns_dependencies() {
         assert_eq!(Target::Dashboard.sources(), &SourceKey::ALL);
         for (target, source) in [
-            (Target::Atlas, SourceKey::Atlas),
+            (Target::Schemas, SourceKey::Schemas),
             (Target::Discord, SourceKey::Discord),
             (Target::Files, SourceKey::Files),
-            (Target::Gauge, SourceKey::Wiki),
-            (Target::Headspace, SourceKey::Headspace),
+            (Target::KnowledgeHealth, SourceKey::Knowledge),
+            (Target::Profiles, SourceKey::Profiles),
             (Target::Memory, SourceKey::Memory),
             (Target::Messages, SourceKey::Messages),
-            (Target::Planner, SourceKey::Planner),
+            (Target::Events, SourceKey::Events),
             (Target::Teams, SourceKey::Teams),
-            (Target::Triage, SourceKey::Triage),
+            (Target::Diagnostics, SourceKey::Diagnostics),
         ] {
             assert_eq!(target.sources(), &[source]);
         }

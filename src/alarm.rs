@@ -1,5 +1,5 @@
 //! An alarm that wakes JP physically, and the ledger of what was done about
-//! it (compass ac4e2b87; the design is in the alarm-faculty-design lane).
+//! it (goals ac4e2b87; the design is in the alarm-faculty-design lane).
 //!
 //! Every record is one self-contained intrinsic entity: a raise, and the
 //! acks, resolves, notes and steps that name it through `alarm::of`. An exact

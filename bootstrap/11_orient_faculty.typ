@@ -3,12 +3,12 @@
 `orient` has six deliberately different modes, plus `goals`. Use `wake` at session start or
 after context compaction to recover the whole self: memory cover, cover-tagged
 beliefs, and goals. Use `show` mid-session for the much smaller answer to "what
-is going on right now?"; it deliberately contains neither memories nor Wiki
+is going on right now?"; it deliberately contains neither memories nor Knowledge
 entries. `wait` blocks and also sweeps timer-driven Habits; `poll` performs the
 same relational attention check once without blocking; `baseline` explicitly
 marks the current attention set as already presented. `daemon` keeps the pile
 open and delivers successive reports to one callback, without per-turn hooks.
-`goals` prints the Compass section of `wake` alone.
+`goals` prints the Goals section of `wake` alone.
 
 == What it shows
 
@@ -17,8 +17,8 @@ open and delivers successive reports to one callback, without per-turn hooks.
   - recent local messages
   - unread Mail
   - due Habits and Habit states needing attention
-  - Compass goals in `doing`
-  - Compass goals in `todo`
+  - goals in `doing`
+  - goals in `todo`
 
 Defaults to ten messages, five doing goals, and five todo goals. The
 `--message-limit`, `--doing-limit`, and `--todo-limit` flags tune those limits.
@@ -48,7 +48,7 @@ for the harness's bookkeeping; a `memory <id>` recall itself prints no time):
   - one recall per selected memory: `memory <from>..<to>` when memory's own
     range lookup selects exactly that memory, otherwise `memory <id>` (always
     for a point, whose instant no range lookup can name uniquely)
-  - one `wiki show <id>` per cover-tagged belief revision (`wiki show --exact
+  - one `knowledge show <id>` per cover-tagged belief revision (`knowledge show --exact
     <id>` for a head of a forked entry), carrying the title as plain `wake` does
   - one `orient goals --doing-limit N --todo-limit M`, naming the limits used
 
@@ -64,7 +64,7 @@ and never records presentation; memory diagnostics go to stderr.
 `orient wait` blocks until the maintained target collections at one
 immutable pile snapshot contain news for this persona, rather than reporting
 every raw pile append. Directed news includes unread
-inbox or group messages, Compass goals and notes whose `@label` mentions name
+inbox or group messages, goals and notes whose `@label` mentions name
 the persona or any Relations group containing it, and unread Mail. A goal tagged
 with the persona's own label is assigned to it:
 other people's status changes and notes on that goal are news too. Group names
@@ -107,12 +107,12 @@ This is attention routing, not authorship or an authorization boundary.
 == When not to use it
 
   - If you already know what you are doing, keep working
-  - For one narrow query, prefer `compass list doing` or
+  - For one narrow query, prefer `goals list doing` or
     `message list "$PERSONA"`
 
 == Cross-references
 
-  - "Compass Goals Workflow"
+  - "Goals Goals Workflow"
   - "Local Messages: Agent-to-Agent Direct Messaging"
 
 Next stop: [Local Messages: Agent-to-Agent Direct Messaging](wiki:65c6965cb3d11052e87804527734a697).

@@ -12,7 +12,7 @@ use GORBIE::prelude::CardCtx;
 
 pub(crate) const INPUTS: [SourceKey; 4] = [
     SourceKey::Spawn,
-    SourceKey::Compass,
+    SourceKey::Goals,
     SourceKey::Messages,
     SourceKey::Relations,
 ];
@@ -62,7 +62,7 @@ impl ColonyViewer {
                 for (key, label) in
                     INPUTS
                         .into_iter()
-                        .zip(["Spawn", "Compass", "Messages", "Relations"])
+                        .zip(["Spawn", "Goals", "Messages", "Relations"])
                 {
                     if sources.missing_route(key) {
                         ui.weak(format!("{label} route missing from this workspace"));
@@ -92,15 +92,15 @@ fn read_colony(views: [Result<DatasetView<'_>, &str>; 4]) -> Result<ColonyView, 
         .iter()
         .find_map(|view| view.as_ref().ok().map(|dataset| dataset.reader))
         .ok_or_else(|| "Current activity unknown. No Colony source is readable.".to_owned())?;
-    let [spawn, compass, message, relations] = views;
+    let [spawn, goals, message, relations] = views;
     let roles = ColonyRoles {
         spawn: spawn.map(|view| view.facts),
         message: message.map(|view| view.facts),
         relations: relations.map(|view| view.facts),
-        compass: compass.map(|view| view.facts),
-        compass_status: compass.as_ref().map_err(|reason| *reason).and_then(|view| {
+        goals: goals.map(|view| view.facts),
+        goals_status: goals.as_ref().map_err(|reason| *reason).and_then(|view| {
             view.lww_register(board::status_of.id(), metadata::created_at.id())
-                .ok_or("current Compass status unavailable")
+                .ok_or("current Goals status unavailable")
         }),
     };
     let at = crate::clock::point_now().map_err(|error| error.to_string())?;
@@ -119,12 +119,12 @@ fn draw(ui: &mut Ui, view: &ColonyView) {
         format_time(view.observed_at)
     ));
     for (role, reason) in &view.unavailable {
-        if (*role == ColonyRole::CompassStatus && view.available(ColonyRole::Compass))
+        if (*role == ColonyRole::GoalsStatus && view.available(ColonyRole::Goals))
             || !matches!(
                 reason.as_str(),
                 "route missing from this workspace"
                     | "routed evidence unavailable"
-                    | "current Compass status unavailable"
+                    | "current Goals status unavailable"
             )
         {
             ui.weak(reason);
@@ -170,7 +170,7 @@ fn draw_parent(ui: &mut Ui, parent: &ParentView) {
         ui.label("Current activity unknown");
     }
     for goal in &parent.doing {
-        draw_goal(ui, goal, "Compass · doing");
+        draw_goal(ui, goal, "Goals · doing");
     }
     for goal in &parent.asks_jp {
         draw_goal(ui, goal, "Requested from JP");
@@ -203,7 +203,7 @@ fn draw_goal(ui: &mut Ui, goal: &GoalLine, label: &str) {
     ui.label(RichText::new(label).strong());
     ui.label(&goal.title);
     if let Some(at) = &goal.last_note {
-        ui.small(format!("Latest Compass note · {at}"));
+        ui.small(format!("Latest note · {at}"));
     }
 }
 

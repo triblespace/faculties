@@ -29,11 +29,11 @@ pub(crate) struct Cli {
     /// Existing durable collection signer. Ordinary commands never create it.
     #[arg(long, env = "TRIBLESPACE_KEY")]
     key: Option<PathBuf>,
-    /// Override the exact Tavily credential referenced by Headspace. Use
+    /// Override the exact Tavily credential referenced by Profiles. Use
     /// @path for file input or @- for stdin.
     #[arg(long)]
     tavily_api_key: Option<String>,
-    /// Override the exact Exa credential referenced by Headspace. Use @path
+    /// Override the exact Exa credential referenced by Profiles. Use @path
     /// for file input or @- for stdin.
     #[arg(long)]
     exa_api_key: Option<String>,

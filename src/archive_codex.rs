@@ -1438,7 +1438,7 @@ fn consistent_session_id(payload: &CodexPayload) -> Result<String> {
     // That is a clean format cutover, not a data defect — and it meant the
     // Codex half of the archive silently stopped ingesting in July while
     // nothing announced it. Exactly the failure the archive epic exists to
-    // prevent (compass 9d9768c9: "the absence of a transcript is
+    // prevent (goals 9d9768c9: "the absence of a transcript is
     // indistinguishable from its never having existed").
     //
     // `id` identifies THIS ROLLOUT and matches the filename; `session_id`

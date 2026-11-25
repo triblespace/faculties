@@ -1,15 +1,15 @@
-//! A pairwise priority game over open Compass goals.
+//! A pairwise priority game over open goals.
 //!
 //! The widget shows two open goals (status `todo`, `doing` or `blocked`) and
 //! asks which matters more. An answer is handed to the host as a
-//! `higher > lower` request; the host performs it as an ordinary Compass
-//! priority write (`Compass::prioritize`), with its own storage and identity.
+//! `higher > lower` request; the host performs it as an ordinary Goals
+//! priority write (`Goals::prioritize`), with its own storage and identity.
 //! "Can't compare" records nothing. "Unclear" says the reader cannot tell
 //! what one goal does, so cannot judge it: the host writes an attributed
-//! Compass note tagged `unclear` (`Compass::mark_unclear`), which ranks
+//! note tagged `unclear` (`Goals::mark_unclear`), which ranks
 //! nothing and moves no status, and the game moves on. A goal stays out of
 //! the game while an unclear note on it is unanswered
-//! ([`crate::compass::unclear_goals`]); a note that supersedes it, the
+//! ([`crate::goals::unclear_goals`]); a note that supersedes it, the
 //! explanation, brings it back. A goal's title opens its details (status, parents, notes) inside
 //! the card, read from the same view. The widget reads only the immutable
 //! [`DatasetView`] it is given and keeps session-local UI state: the pairs
@@ -34,7 +34,7 @@ use triblespace::prelude::blobencodings::UTF8String;
 use triblespace::prelude::View;
 use GORBIE::prelude::CardCtx;
 
-use crate::compass::operations::goal_reading_in;
+use crate::goals::operations::goal_reading_in;
 use crate::schemas::compass::{board, latest_status_event, KIND_GOAL_ID, KIND_NOTE_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
 
@@ -112,7 +112,7 @@ impl PriorityGame {
             let still_open = self.pair.is_some_and(|(a, b)| {
                 open.contains(&a)
                     && open.contains(&b)
-                    && !comparable(&crate::compass::goal_priority_edges(dataset.facts), a, b)
+                    && !comparable(&crate::goals::goal_priority_edges(dataset.facts), a, b)
             });
             if !still_open {
                 self.pair = None;
@@ -194,7 +194,7 @@ impl PriorityGame {
 
 /// Open goals that are not waiting for an explanation.
 fn playable_goals(dataset: DatasetView<'_>) -> BTreeSet<Id> {
-    let unclear = crate::compass::unclear_goals(dataset.facts);
+    let unclear = crate::goals::unclear_goals(dataset.facts);
     let mut open = open_goals(dataset);
     open.retain(|goal| !unclear.contains(goal));
     open
@@ -275,7 +275,7 @@ fn comparable(edges: &BTreeSet<(Id, Id)>, a: Id, b: Id) -> bool {
 /// is already ordered or was offered this session.
 ///
 /// Candidates are pairs with no priority path between them under
-/// [`crate::compass::goal_priority_edges`]. Among them, a pair in one
+/// [`crate::goals::goal_priority_edges`]. Among them, a pair in one
 /// priority layer ranks first, then the number of its goals that take part in
 /// no explicit priority; ties are broken uniformly by `rng`, which also picks
 /// the display order.
@@ -285,12 +285,12 @@ pub fn choose_pair<P: TriblePattern>(
     seen: &HashSet<(Id, Id)>,
     rng: &mut u64,
 ) -> Option<(Id, Id)> {
-    let edges = crate::compass::goal_priority_edges(facts);
-    let ranked: HashSet<Id> = crate::compass::active_priority_edges(facts)
+    let edges = crate::goals::goal_priority_edges(facts);
+    let ranked: HashSet<Id> = crate::goals::active_priority_edges(facts)
         .into_iter()
         .flat_map(|(higher, lower)| [higher, lower])
         .collect();
-    let layers = crate::compass::priority_ranks(open.iter().copied(), &edges);
+    let layers = crate::goals::priority_ranks(open.iter().copied(), &edges);
     let reach = reachable(&edges, open);
 
     let goals: Vec<Id> = open.iter().copied().collect();
@@ -421,7 +421,7 @@ fn goal_card(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id, details: &mu
 }
 
 /// The goal's full id, parent chain and current notes, newest first: the
-/// reading `compass show` prints, from the view the game already holds.
+/// reading `goals show` prints, from the view the game already holds.
 fn goal_details(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
     ui.separator();
     ui.label(egui::RichText::new(format!("{goal:x}")).small().monospace());
@@ -461,7 +461,7 @@ fn goal_details(ui: &mut egui::Ui, dataset: DatasetView<'_>, goal: Id) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compass::{goal_fragment, priority_snapshot_fragment};
+    use crate::goals::{goal_fragment, priority_snapshot_fragment};
     use hifitime::Epoch;
     use triblespace::prelude::*;
 

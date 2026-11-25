@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(version = crate::GIT_VERSION, name = "search",
-    about = "Query Wiki, Memory and Files with explicit per-source lexical results")]
+    about = "Query Knowledge, Memory and Files with explicit per-source lexical results")]
 pub struct Cli {
     #[command(flatten)]
     workspace: crate::cli_workspace::WorkspaceArgs,
@@ -20,7 +20,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Search current Wiki text, selected Memory summaries and Files metadata.
+    /// Search current Knowledge text, selected Memory summaries and Files metadata.
     Query {
         query: String,
         /// Maximum readings returned from each source, after deduplication.

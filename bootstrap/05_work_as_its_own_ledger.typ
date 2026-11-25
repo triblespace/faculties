@@ -16,9 +16,9 @@ step? If separate, redesign until it's not.
 
 == How faculties embody this
 
-  - `wiki create` *is* the writing. The fragment is durable
+  - `knowledge create` *is* the writing. The fragment is durable
     the moment it's saved.
-  - `compass move <id> doing` *is* the claim. No separate
+  - `goals move <id> doing` *is* the claim. No separate
     "log that I started this".
   - `files add <path>` *is* the archive step. The handle is
     the citation.
@@ -31,12 +31,12 @@ step? If separate, redesign until it's not.
 Free-floating `.md` plan files in repos are a red flag. They:
 
   - Don't merge between agents.
-  - Don't show up in `wiki list`.
+  - Don't show up in `knowledge list`.
   - Aren't content-addressed.
   - Drift the moment you stop editing them.
 
 If the content is worth keeping past this turn, it goes in the
-pile (wiki / compass / files). If it's not, the conversation
+pile (knowledge / goals / files). If it's not, the conversation
 itself is enough.
 
 == Further reading

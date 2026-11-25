@@ -104,7 +104,7 @@ pub struct ReplyRequest {
 pub struct DraftReceipt {
     pub draft: Id,
     pub decision: Id,
-    /// The draft's exact recipients, shown before the Decide gate.
+    /// The draft's exact recipients, shown before the Decisions gate.
     pub to: Vec<String>,
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
@@ -294,7 +294,7 @@ impl Mail {
 struct Scopes {
     mail: Id,
     files: Id,
-    decide: Id,
+    decisions: Id,
     relations: Id,
 }
 
@@ -302,7 +302,7 @@ impl Scopes {
     const FIXED: Self = Self {
         mail: mail_schema::DEFAULT_SCOPE_ID,
         files: files_schema::DEFAULT_SCOPE_ID,
-        decide: decide_schema::DEFAULT_SCOPE_ID,
+        decisions: decide_schema::DEFAULT_SCOPE_ID,
         relations: relations_schema::DEFAULT_SCOPE_ID,
     };
 }
@@ -315,7 +315,7 @@ struct CollectionView {
 struct Views {
     mail: CollectionView,
     files: CollectionView,
-    decide: CollectionView,
+    decisions: CollectionView,
     relations: CollectionView,
     secrets: SecretsSnapshot<PileSnapshot>,
 }
@@ -352,71 +352,110 @@ impl Storage {
 
     fn views(&self) -> Result<Views> {
         self.storage.with_store(|store, _, runtime| {
-            for scope in [self.scopes.mail, self.scopes.files, self.scopes.decide, self.scopes.relations] {
+            for scope in [
+                self.scopes.mail,
+                self.scopes.files,
+                self.scopes.decisions,
+                self.scopes.relations,
+            ] {
                 self.storage.open_collection_read(
-                    store, scope, self.signer.verifying_key(), runtime,
+                    store,
+                    scope,
+                    self.signer.verifying_key(),
+                    runtime,
                 )?;
             }
-            let secrets_collection = self.storage.open_secrets_collection(store, self.signer.verifying_key(), runtime, false)?;
+            let secrets_collection = self.storage.open_secrets_collection(
+                store,
+                self.signer.verifying_key(),
+                runtime,
+                false,
+            )?;
             let pile = store;
-            let (mail_facts, files_facts, decide_facts, relations_facts, store_snapshot, secrets) = {
-                let mail_collection =
-                    self.storage.open_collection_local(pile, self.scopes.mail, self.signer.verifying_key())?;
-                let files_collection =
-                    self.storage.open_collection_local(pile, self.scopes.files, self.signer.verifying_key())?;
-                let decide_collection =
-                    self.storage.open_collection_local(pile, self.scopes.decide, self.signer.verifying_key())?;
-                let relations_collection =
-                    self.storage.open_collection_local(pile, self.scopes.relations, self.signer.verifying_key())?;
-                let mail_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(mail_collection, ())?;
-                let mail_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(mail_collection, mail_succinct)?;
-                let files_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(files_collection, ())?;
-                let files_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(files_collection, files_succinct)?;
-                let decide_succinct =
-                    pile.attach::<SuccinctArchiveBlob>(decide_collection, ())?;
-                let decide_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(decide_collection, decide_succinct)?;
+            let (
+                mail_facts,
+                files_facts,
+                decisions_facts,
+                relations_facts,
+                store_snapshot,
+                secrets,
+            ) = {
+                let mail_collection = self.storage.open_collection_local(
+                    pile,
+                    self.scopes.mail,
+                    self.signer.verifying_key(),
+                )?;
+                let files_collection = self.storage.open_collection_local(
+                    pile,
+                    self.scopes.files,
+                    self.signer.verifying_key(),
+                )?;
+                let decisions_collection = self.storage.open_collection_local(
+                    pile,
+                    self.scopes.decisions,
+                    self.signer.verifying_key(),
+                )?;
+                let relations_collection = self.storage.open_collection_local(
+                    pile,
+                    self.scopes.relations,
+                    self.signer.verifying_key(),
+                )?;
+                let mail_succinct = pile.attach::<SuccinctArchiveBlob>(mail_collection, ())?;
+                let mail_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    mail_collection,
+                    mail_succinct,
+                )?;
+                let files_succinct = pile.attach::<SuccinctArchiveBlob>(files_collection, ())?;
+                let files_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    files_collection,
+                    files_succinct,
+                )?;
+                let decisions_succinct =
+                    pile.attach::<SuccinctArchiveBlob>(decisions_collection, ())?;
+                let decisions_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    decisions_collection,
+                    decisions_succinct,
+                )?;
                 let relations_succinct =
                     pile.attach::<SuccinctArchiveBlob>(relations_collection, ())?;
-                let relations_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(relations_collection, relations_succinct)?;
+                let relations_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    relations_collection,
+                    relations_succinct,
+                )?;
                 // Attach the views as they stand through the same final
                 // target snapshot as the configured Secrets view. A read
                 // never maintains and never waits for a source commit nothing
                 // has attached yet, which it reads from its own bytes; a write
                 // attaches the source's frontier after its commit.
                 let secrets = runtime.block_on(async {
-                    let secrets = secret_storage::ensure_and_snapshot(
-                        pile,
-                        secrets_collection,
-                        &self.signer,
-                    )
-                    .await
-                    .context("observe configured Secrets collection")?;
+                    let secrets =
+                        secret_storage::ensure_and_snapshot(pile, secrets_collection, &self.signer)
+                            .await
+                            .context("observe configured Secrets collection")?;
                     Ok::<_, anyhow::Error>(secrets)
                 })?;
                 // Secrets attachment owns the final immutable pile snapshot. Attach
                 // every maintained view through that same world so Mail
                 // facts, file payloads, decisions, relations, and credentials can
                 // never be assembled from different store prefixes.
-                let store_snapshot = AcquiringReader::new(secrets.store_snapshot().clone(), runtime.clone());
-                let secrets = secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
+                let store_snapshot =
+                    AcquiringReader::new(secrets.store_snapshot().clone(), runtime.clone());
+                let secrets =
+                    secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
                 let mail_facts = crate::storage::acquire_facts(&store_snapshot, mail_rank9)
                     .context("read maintained Mail fact collection")?;
                 let files_facts = crate::storage::acquire_facts(&store_snapshot, files_rank9)
                     .context("read maintained Files fact collection")?;
-                let decide_facts = crate::storage::acquire_facts(&store_snapshot, decide_rank9)
-                    .context("read maintained Decide fact collection")?;
-                let relations_facts = crate::storage::acquire_facts(&store_snapshot, relations_rank9)
-                    .context("read maintained Relations fact collection")?;
+                let decisions_facts =
+                    crate::storage::acquire_facts(&store_snapshot, decisions_rank9)
+                        .context("read maintained Decide fact collection")?;
+                let relations_facts =
+                    crate::storage::acquire_facts(&store_snapshot, relations_rank9)
+                        .context("read maintained Relations fact collection")?;
                 (
                     mail_facts,
                     files_facts,
-                    decide_facts,
+                    decisions_facts,
                     relations_facts,
                     store_snapshot,
                     secrets,
@@ -431,8 +470,8 @@ impl Storage {
                     facts: files_facts,
                     reader: store_snapshot.clone(),
                 },
-                decide: CollectionView {
-                    facts: decide_facts,
+                decisions: CollectionView {
+                    facts: decisions_facts,
                     reader: store_snapshot.clone(),
                 },
                 relations: CollectionView {
@@ -813,8 +852,8 @@ fn create_draft(
         )?;
     }
     storage.publish(
-        storage.scopes.decide,
-        draft.decide,
+        storage.scopes.decisions,
+        draft.decisions,
         "mail: draft send decision",
     )?;
     storage.publish(
@@ -1135,13 +1174,13 @@ fn cmd_send_with<S: mail::SmtpSubmit>(
     let (to, cc, bcc) = (draft.to.clone(), draft.cc.clone(), draft.bcc.clone());
     let rendered = mail::render_draft(draft, &account)?;
     let (decision, heads) =
-        mail::authorized_send(&views.decide.reader, &views.decide.facts, draft_id)?;
+        mail::authorized_send(&views.decisions.reader, &views.decisions.facts, draft_id)?;
     let prepared = mail::prepare_send(
         &views.mail.reader,
-        &views.decide.reader,
+        &views.decisions.reader,
         &views.mail.facts,
         &views.files.facts,
-        &views.decide.facts,
+        &views.decisions.facts,
         SendAttemptInput {
             draft: draft_id,
             config: account.config,
@@ -1513,7 +1552,7 @@ mod tests {
         Scopes {
             mail: mail_schema::DEFAULT_SCOPE_ID,
             files: files_schema::DEFAULT_SCOPE_ID,
-            decide: decide_schema::DEFAULT_SCOPE_ID,
+            decisions: decide_schema::DEFAULT_SCOPE_ID,
             relations: relations_schema::DEFAULT_SCOPE_ID,
         }
     }
@@ -1707,7 +1746,7 @@ mod tests {
         for reader in [
             &views.mail.reader,
             &views.files.reader,
-            &views.decide.reader,
+            &views.decisions.reader,
             &views.relations.reader,
         ] {
             assert!(reader.changes_since(secrets_snapshot).is_empty());
@@ -2073,7 +2112,7 @@ mod tests {
 
         // Authorized, the draft is still refused over budget: nothing is
         // published and the transport is never created.
-        let (resolution, _) = crate::decide::resolution_fragment(
+        let (resolution, _) = crate::decisions::resolution_fragment(
             mail::draft_decision_id(draft),
             "send",
             None,
@@ -2084,7 +2123,7 @@ mod tests {
         )
         .unwrap();
         storage
-            .publish(storage.scopes.decide, resolution, "test: authorize send")
+            .publish(storage.scopes.decisions, resolution, "test: authorize send")
             .unwrap();
         storage.views().unwrap();
         let before = pile_len(&fixture);

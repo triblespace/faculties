@@ -27,9 +27,8 @@ use triblespace::core::blob::encodings::succinctarchive::{
 use triblespace::core::collection::latest::{LatestBlob, LatestIndex};
 use triblespace::core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace::core::collection::{
-    AttachedSnapshot, Collection, CollectionEncoding, CollectionHandle, CollectionSnapshotExt,
-    CollectionStoreExt, Cover, Support,
-    observed_store::DependencyTracker,
+    observed_store::DependencyTracker, AttachedSnapshot, Collection, CollectionEncoding,
+    CollectionHandle, CollectionSnapshotExt, CollectionStoreExt, Cover, Support,
 };
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::repo::{BlobStoreGet, CapabilityProofRead, ObservedStore, SnapshotSource};
@@ -37,22 +36,22 @@ use triblespace::prelude::Id;
 use GORBIE::prelude::CardCtx;
 
 use crate::collection_names::open_configured;
-use crate::schemas::atlas::DEFAULT_SCOPE_ID as ATLAS_SCOPE_ID;
+use crate::schemas::atlas::DEFAULT_SCOPE_ID as SCHEMAS_SCOPE_ID;
 use crate::schemas::blockdag::DEFAULT_SCOPE_ID as ARCHIVE_SCOPE_ID;
 use crate::schemas::cognition::DEFAULT_SCOPE_ID as COGNITION_SCOPE_ID;
-use crate::schemas::compass::DEFAULT_SCOPE_ID as COMPASS_SCOPE_ID;
-use crate::schemas::decide::DEFAULT_SCOPE_ID as DECIDE_SCOPE_ID;
+use crate::schemas::compass::DEFAULT_SCOPE_ID as GOALS_SCOPE_ID;
+use crate::schemas::decide::DEFAULT_SCOPE_ID as DECISIONS_SCOPE_ID;
 use crate::schemas::discord::DEFAULT_SCOPE_ID as DISCORD_SCOPE_ID;
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
-use crate::schemas::headspace::DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID;
+use crate::schemas::headspace::DEFAULT_SCOPE_ID as PROFILES_SCOPE_ID;
 use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
-use crate::schemas::planner::DEFAULT_SCOPE_ID as PLANNER_SCOPE_ID;
+use crate::schemas::planner::DEFAULT_SCOPE_ID as EVENTS_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
 use crate::schemas::teams::DEFAULT_SCOPE_ID as TEAMS_SCOPE_ID;
-use crate::schemas::wiki::DEFAULT_SCOPE_ID as WIKI_SCOPE_ID;
+use crate::schemas::wiki::DEFAULT_SCOPE_ID as KNOWLEDGE_SCOPE_ID;
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 use crate::storage::{
     open_secrets_collection_read, AcquiringReader, CollectionRoutes, FactArchive, FacultyStore,
@@ -66,52 +65,52 @@ type PileSnapshot = WidgetReader;
 /// Stable logical input requested by a widget.
 ///
 /// These keys describe consumers, not storage layout. Several consumers may
-/// intentionally share one exact collection (Reason and Triage both observe
+/// intentionally share one exact collection (Reason and Diagnostics both observe
 /// Cognition), while the descriptor identity remains hidden behind this
 /// boundary.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum SourceKey {
     Archive,
-    Atlas,
-    Compass,
-    Decide,
+    Schemas,
+    Goals,
+    Decisions,
     Discord,
     Files,
-    Headspace,
+    Profiles,
     Mail,
     Memory,
     Messages,
-    Planner,
+    Events,
     Reason,
     Relations,
     Secrets,
     Spawn,
     Teams,
-    Triage,
-    Wiki,
+    Diagnostics,
+    Knowledge,
 }
 
 impl SourceKey {
     /// Every logical input understood by the viewer core.
     pub const ALL: [Self; 18] = [
         Self::Archive,
-        Self::Atlas,
-        Self::Compass,
-        Self::Decide,
+        Self::Schemas,
+        Self::Goals,
+        Self::Decisions,
         Self::Discord,
         Self::Files,
-        Self::Headspace,
+        Self::Profiles,
         Self::Mail,
         Self::Memory,
         Self::Messages,
-        Self::Planner,
+        Self::Events,
         Self::Reason,
         Self::Relations,
         Self::Secrets,
         Self::Spawn,
         Self::Teams,
-        Self::Triage,
-        Self::Wiki,
+        Self::Diagnostics,
+        Self::Knowledge,
     ];
 
     /// Logical inputs that must accompany this source for rendering. Storage
@@ -119,10 +118,10 @@ impl SourceKey {
     /// over semantic source keys and scopes are deduplicated only afterwards.
     fn dependencies(self) -> &'static [Self] {
         match self {
-            Self::Headspace => &[Self::Secrets],
-            Self::Mail | Self::Messages | Self::Planner => &[Self::Relations],
-            Self::Triage => &[
-                Self::Headspace,
+            Self::Profiles => &[Self::Secrets],
+            Self::Mail | Self::Messages | Self::Events => &[Self::Relations],
+            Self::Diagnostics => &[
+                Self::Profiles,
                 Self::Secrets,
                 Self::Relations,
                 Self::Messages,
@@ -258,7 +257,10 @@ impl<'a> WidgetContext<'a> {
 
     /// A workspace observation omits absent routes and records routes it failed to read.
     pub(super) fn missing_route(&self, key: SourceKey) -> bool {
-        !self.contains(key) && self.routed_but_unavailable.is_some_and(|keys| !keys.contains(&key))
+        !self.contains(key)
+            && self
+                .routed_but_unavailable
+                .is_some_and(|keys| !keys.contains(&key))
     }
 
     /// The selected observation token is available before decoding a deferred archive.
@@ -340,14 +342,18 @@ impl LoadedDataset {
     ) -> Self {
         // A usable archive has no unread residual. An incomplete read below
         // returns an error and can never expose a partial dataset at this token.
-        let empty = selected.residual().difference(selected.residual())
+        let empty = selected
+            .residual()
+            .difference(selected.residual())
             .expect("one frozen residual has one collection");
         let revision = DatasetRevision::from_attached(&selected, &empty);
         Self {
             facts: DatasetFacts::Deferred(Arc::new(DeferredFacts {
-                selected, facts: OnceLock::new(),
+                selected,
+                facts: OnceLock::new(),
             })),
-            reader, revision,
+            reader,
+            revision,
             lww_registers: Default::default(),
             latest_indexes: Default::default(),
         }
@@ -356,12 +362,18 @@ impl LoadedDataset {
     pub(super) fn view(&self) -> Result<DatasetView<'_>, &str> {
         let facts = match &self.facts {
             DatasetFacts::Ready(facts) => facts,
-            DatasetFacts::Deferred(deferred) => deferred.facts.get_or_init(|| {
-                triblespace::core::collection::succinctarchive_union::read_attached_acquiring(&deferred.selected)
+            DatasetFacts::Deferred(deferred) => deferred
+                .facts
+                .get_or_init(|| {
+                    triblespace::core::collection::succinctarchive_union::read_attached_acquiring(
+                        &deferred.selected,
+                    )
                     .map_err(anyhow::Error::from)
                     .and_then(crate::storage::require_complete_attached_read)
                     .map_err(|error| format!("Spawn evidence unavailable: {error:#}"))
-            }).as_ref().map_err(String::as_str)?,
+                })
+                .as_ref()
+                .map_err(String::as_str)?,
         };
         Ok(DatasetView {
             facts,
@@ -399,20 +411,30 @@ impl WorkspaceObservation {
             hasher.update(&serial.to_le_bytes());
             *revision = DatasetRevision(*hasher.finalize().as_bytes());
         };
-        for dataset in self.0.datasets.values_mut() { advance(&mut dataset.revision); }
-        if let Some(secrets) = &mut self.0.secrets { advance(&mut secrets.revision); }
+        for dataset in self.0.datasets.values_mut() {
+            advance(&mut dataset.revision);
+        }
+        if let Some(secrets) = &mut self.0.secrets {
+            advance(&mut secrets.revision);
+        }
         self
     }
 
     pub fn loaded_context(&self) -> WidgetContext<'_> {
-        WidgetContext { datasets: Some(&self.0.datasets), secrets: self.0.secrets.as_ref(),
-            routed_but_unavailable: Some(&self.0.unavailable) }
+        WidgetContext {
+            datasets: Some(&self.0.datasets),
+            secrets: self.0.secrets.as_ref(),
+            routed_but_unavailable: Some(&self.0.unavailable),
+        }
     }
 
     pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.0.unavailable.iter().map(|key| {
-            COLLECTION_SOURCE_CATALOG.iter().find(|entry| entry.key == *key)
-                .map(|entry| entry.label).unwrap_or("Secrets")
+            COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|entry| entry.key == *key)
+                .map(|entry| entry.label)
+                .unwrap_or("Secrets")
         })
     }
 
@@ -443,8 +465,12 @@ impl WorkspaceObservation {
         let admitted = pile.snapshot().map_err(|error| error.to_string())?;
         for (scope, _) in collection_scopes(&sources) {
             if crate::collection_names::open_workspace_read_in(
-                &admitted, signer.verifying_key(), routes[&scope],
-            ).is_err() {
+                &admitted,
+                signer.verifying_key(),
+                routes[&scope],
+            )
+            .is_err()
+            {
                 unavailable.extend(remove_scope(&mut sources, scope));
             }
         }
@@ -455,19 +481,26 @@ impl WorkspaceObservation {
             let observed = async {
                 // READ controls replication, not possession of delivered wraps.
                 let source = crate::collection_names::open_workspace_in(
-                    &pile.snapshot()?, routes[&crate::secrets::DEFAULT_SCOPE_ID],
+                    &pile.snapshot()?,
+                    routes[&crate::secrets::DEFAULT_SCOPE_ID],
                 )?;
                 let collection = secret_storage::SecretsCollection::from_source(pile, source)?;
-                let snapshot = secret_storage::ensure_and_snapshot(pile, collection, signer).await?;
+                let snapshot =
+                    secret_storage::ensure_and_snapshot(pile, collection, signer).await?;
                 Ok::<_, anyhow::Error>((collection, snapshot))
-            }.await;
+            }
+            .await;
             Some(observed)
-        } else { None };
+        } else {
+            None
+        };
         let mut prepared = prepared;
         let (snapshot, secrets) = match secrets {
             Some(Ok((collection, secrets))) => (secrets.store_snapshot().clone(), Some(collection)),
             other => {
-                if other.is_some() { prepared.unavailable.insert(SourceKey::Secrets); }
+                if other.is_some() {
+                    prepared.unavailable.insert(SourceKey::Secrets);
+                }
                 (pile.snapshot().map_err(|error| error.to_string())?, None)
             }
         };
@@ -506,19 +539,19 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Archive",
     },
     CollectionSource {
-        key: SourceKey::Atlas,
-        scope: ATLAS_SCOPE_ID,
-        label: "Atlas",
+        key: SourceKey::Schemas,
+        scope: SCHEMAS_SCOPE_ID,
+        label: "Schemas",
     },
     CollectionSource {
-        key: SourceKey::Compass,
-        scope: COMPASS_SCOPE_ID,
-        label: "Compass",
+        key: SourceKey::Goals,
+        scope: GOALS_SCOPE_ID,
+        label: "Goals",
     },
     CollectionSource {
-        key: SourceKey::Decide,
-        scope: DECIDE_SCOPE_ID,
-        label: "Decide",
+        key: SourceKey::Decisions,
+        scope: DECISIONS_SCOPE_ID,
+        label: "Decisions",
     },
     CollectionSource {
         key: SourceKey::Discord,
@@ -531,9 +564,9 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Files",
     },
     CollectionSource {
-        key: SourceKey::Headspace,
-        scope: HEADSPACE_SCOPE_ID,
-        label: "Headspace",
+        key: SourceKey::Profiles,
+        scope: PROFILES_SCOPE_ID,
+        label: "Profiles",
     },
     CollectionSource {
         key: SourceKey::Mail,
@@ -551,9 +584,9 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Messages",
     },
     CollectionSource {
-        key: SourceKey::Planner,
-        scope: PLANNER_SCOPE_ID,
-        label: "Planner",
+        key: SourceKey::Events,
+        scope: EVENTS_SCOPE_ID,
+        label: "Events",
     },
     CollectionSource {
         key: SourceKey::Reason,
@@ -576,14 +609,14 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         label: "Teams",
     },
     CollectionSource {
-        key: SourceKey::Triage,
+        key: SourceKey::Diagnostics,
         scope: COGNITION_SCOPE_ID,
         label: "Cognition",
     },
     CollectionSource {
-        key: SourceKey::Wiki,
-        scope: WIKI_SCOPE_ID,
-        label: "Wiki",
+        key: SourceKey::Knowledge,
+        scope: KNOWLEDGE_SCOPE_ID,
+        label: "Knowledge",
     },
 ];
 
@@ -723,7 +756,8 @@ impl StorageState {
     pub fn loaded_context(&self) -> WidgetContext<'_> {
         WidgetContext {
             datasets: self.datasets.as_ref(),
-            routed_but_unavailable: (self.workspace_only && self.datasets.is_some()).then_some(&self.unavailable),
+            routed_but_unavailable: (self.workspace_only && self.datasets.is_some())
+                .then_some(&self.unavailable),
             secrets: self.secrets.as_ref(),
         }
     }
@@ -920,8 +954,11 @@ fn retain_routed_sources(sources: &mut BTreeSet<SourceKey>, routes: &CollectionR
         let scope = if *key == SourceKey::Secrets {
             crate::secrets::DEFAULT_SCOPE_ID
         } else {
-            COLLECTION_SOURCE_CATALOG.iter().find(|entry| entry.key == *key)
-                .expect("every source has a role").scope
+            COLLECTION_SOURCE_CATALOG
+                .iter()
+                .find(|entry| entry.key == *key)
+                .expect("every source has a role")
+                .scope
         };
         routes.contains_key(&scope)
     });
@@ -1071,7 +1108,12 @@ fn load_inputs_from_store_mode(
             .map_err(|error| format!("freeze viewer observation: {error}"))?,
     };
     let snapshot = WidgetReader::Acquiring(AcquiringReader::new(snapshot, runtime.clone()));
-    read_inputs(snapshot, secrets.map(|(collection, _)| collection), prepared, partial)
+    read_inputs(
+        snapshot,
+        secrets.map(|(collection, _)| collection),
+        prepared,
+        partial,
+    )
 }
 
 // Operation-local descriptor setup only; consumed before returning an observation.
@@ -1079,9 +1121,13 @@ fn load_inputs_from_store_mode(
 struct PreparedInputs {
     sources: BTreeSet<SourceKey>,
     unavailable: BTreeSet<SourceKey>,
-    collections: Vec<(Id, &'static str, Collection<Rank9AcceleratedSuccinctArchiveBlob>)>,
-    compass_register: Option<Collection<LwwRegisterBlob>>,
-    wiki_latest: Option<Collection<LatestBlob>>,
+    collections: Vec<(
+        Id,
+        &'static str,
+        Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    )>,
+    goals_register: Option<Collection<LwwRegisterBlob>>,
+    knowledge_latest: Option<Collection<LatestBlob>>,
 }
 
 fn prepare_inputs<S>(
@@ -1089,7 +1135,12 @@ fn prepare_inputs<S>(
     requested: &BTreeSet<SourceKey>,
     partial: bool,
     mut unavailable: BTreeSet<SourceKey>,
-    mut open_source: impl FnMut(&mut S, Id) -> anyhow::Result<Collection<triblespace::prelude::blobencodings::SimpleArchive>>,
+    mut open_source: impl FnMut(
+        &mut S,
+        Id,
+    ) -> anyhow::Result<
+        Collection<triblespace::prelude::blobencodings::SimpleArchive>,
+    >,
 ) -> Result<PreparedInputs, String>
 where
     S: CollectionStoreExt + SnapshotSource,
@@ -1097,28 +1148,28 @@ where
 {
     let mut sources = requested.clone();
     let mut collections = Vec::new();
-    let mut compass_register = None;
-    let mut wiki_latest = None;
+    let mut goals_register = None;
+    let mut knowledge_latest = None;
     for (scope, label) in collection_scopes(&sources) {
         let registration = (|| {
-            let source = open_source(pile, scope)
-                .map_err(|error| format!("open {label}: {error:#}"))?;
+            let source =
+                open_source(pile, scope).map_err(|error| format!("open {label}: {error:#}"))?;
             let succinct = pile
                 .attach::<SuccinctArchiveBlob>(source, ())
                 .map_err(|error| format!("attach {label}: {error:#}"))?;
             let rank9 = pile
                 .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                 .map_err(|error| format!("attach {label}: {error:#}"))?;
-            if scope == COMPASS_SCOPE_ID {
-                compass_register = Some(
-                    crate::compass::status_register_for_source(pile, source)
-                        .map_err(|error| format!("attach Compass status: {error:#}"))?,
+            if scope == GOALS_SCOPE_ID {
+                goals_register = Some(
+                    crate::goals::status_register_for_source(pile, source)
+                        .map_err(|error| format!("attach Goals status: {error:#}"))?,
                 );
             }
-            if scope == WIKI_SCOPE_ID {
-                wiki_latest = Some(
-                    crate::wiki::latest_for_source(pile, source)
-                        .map_err(|error| format!("attach Wiki supersession: {error:#}"))?,
+            if scope == KNOWLEDGE_SCOPE_ID {
+                knowledge_latest = Some(
+                    crate::knowledge::latest_for_source(pile, source)
+                        .map_err(|error| format!("attach Knowledge supersession: {error:#}"))?,
                 );
             }
             Ok::<_, String>(rank9)
@@ -1130,7 +1181,13 @@ where
         }
     }
 
-    Ok(PreparedInputs { sources, unavailable, collections, compass_register, wiki_latest })
+    Ok(PreparedInputs {
+        sources,
+        unavailable,
+        collections,
+        goals_register,
+        knowledge_latest,
+    })
 }
 
 fn read_inputs(
@@ -1139,7 +1196,13 @@ fn read_inputs(
     prepared: PreparedInputs,
     partial: bool,
 ) -> Result<LoadedInputs, String> {
-    let PreparedInputs { mut sources, mut unavailable, collections, compass_register, wiki_latest } = prepared;
+    let PreparedInputs {
+        mut sources,
+        mut unavailable,
+        collections,
+        goals_register,
+        knowledge_latest,
+    } = prepared;
     let secrets = match secrets {
         Some(collection) => {
             match secret_storage::snapshot_acquiring(snapshot.clone(), collection) {
@@ -1159,10 +1222,15 @@ fn read_inputs(
         if scope == SPAWN_SCOPE_ID {
             match snapshot.attached_acquiring(rank9) {
                 Ok(selected) => {
-                    datasets.insert(SourceKey::Spawn, LoadedDataset::deferred_spawn(snapshot.clone(), selected));
+                    datasets.insert(
+                        SourceKey::Spawn,
+                        LoadedDataset::deferred_spawn(snapshot.clone(), selected),
+                    );
                 }
                 Err(error) if !partial => return Err(format!("select {label}: {error:#}")),
-                Err(_) => { unavailable.insert(SourceKey::Spawn); }
+                Err(_) => {
+                    unavailable.insert(SourceKey::Spawn);
+                }
             }
             continue;
         }
@@ -1171,8 +1239,8 @@ fn read_inputs(
                 .map_err(|error| format!("read {label}: {error:#}"))?;
             let mut lww = BTreeMap::new();
             let mut latest = BTreeMap::new();
-            if scope == COMPASS_SCOPE_ID {
-                if let Some(target) = compass_register {
+            if scope == GOALS_SCOPE_ID {
+                if let Some(target) = goals_register {
                     let collection = snapshot
                         .attached_acquiring(target)
                         .map_err(|e| e.to_string())?;
@@ -1181,7 +1249,7 @@ fn read_inputs(
                         .map_err(|e| e.to_string())?
                         .into_parts();
                     if !unread.is_empty() {
-                        return Err("Compass status is unavailable.".into());
+                        return Err("Goals status is unavailable.".into());
                     }
                     revision.include_attached(&collection, &unread);
                     lww.insert(
@@ -1193,8 +1261,8 @@ fn read_inputs(
                     );
                 }
             }
-            if scope == WIKI_SCOPE_ID {
-                if let Some(target) = wiki_latest {
+            if scope == KNOWLEDGE_SCOPE_ID {
+                if let Some(target) = knowledge_latest {
                     let collection = snapshot
                         .attached_acquiring(target)
                         .map_err(|e| e.to_string())?;
@@ -1203,7 +1271,7 @@ fn read_inputs(
                         .map_err(|e| e.to_string())?
                         .into_parts();
                     if !unread.is_empty() {
-                        return Err("Wiki supersession is unavailable.".into());
+                        return Err("Knowledge supersession is unavailable.".into());
                     }
                     revision.include_attached(&collection, &unread);
                     latest.insert(triblespace::core::metadata::supersedes.id(), index);
@@ -1292,37 +1360,66 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let signer = SigningKey::from_bytes(&[17; 32]);
         let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
-        let teams = pile.collection("live widget fixture", CollectionPolicy::new(
-            AdmissionPolicy::Open, AdmissionPolicy::Open,
-        )).unwrap();
+        let teams = pile
+            .collection(
+                "live widget fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
         let routes = CollectionRoutes::from([(TEAMS_SCOPE_ID, teams.handle())]);
         let tracker = DependencyTracker::default();
         // Settle derived covers first; subsequent payload writes have no facts.
-        drop(pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap());
+        drop(
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap(),
+        );
         let baseline = pile.snapshot().unwrap();
         let first = pollster::block_on(WorkspaceObservation::observe_tracked(
-            &mut pile, &signer, &routes, tracker.clone(),
-        )).unwrap().with_presentation_revision(1);
+            &mut pile,
+            &signer,
+            &routes,
+            tracker.clone(),
+        ))
+        .unwrap()
+        .with_presentation_revision(1);
         let context = first.loaded_context();
         let dataset = context.dataset(SourceKey::Teams).unwrap();
         let clone = dataset.reader.clone();
         let body: Blob<blobencodings::UTF8String> = "late name or body".to_blob();
         let handle = body.get_handle();
-        pile.put::<blobencodings::UTF8String, _>("unrelated payload").unwrap();
+        pile.put::<blobencodings::UTF8String, _>("unrelated payload")
+            .unwrap();
         let unrelated = pile.snapshot().unwrap();
-        assert_eq!(unrelated.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        assert_eq!(
+            unrelated.changes_for(&baseline, &tracker.lock().unwrap()),
+            StoreChanges::NONE
+        );
         pile.put::<blobencodings::UTF8String, _>(body).unwrap();
         let arrived = pile.snapshot().unwrap();
-        assert_eq!(arrived.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        assert_eq!(
+            arrived.changes_for(&baseline, &tracker.lock().unwrap()),
+            StoreChanges::NONE
+        );
         // UI reads occur after observe returned, through cloned resident readers.
-        assert!(clone.get::<Blob<blobencodings::UTF8String>, _>(handle).is_err());
-        assert_ne!(arrived.changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+        assert!(clone
+            .get::<Blob<blobencodings::UTF8String>, _>(handle)
+            .is_err());
+        assert_ne!(
+            arrived.changes_for(&baseline, &tracker.lock().unwrap()),
+            StoreChanges::NONE
+        );
         let second = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes))
-            .unwrap().with_presentation_revision(2);
+            .unwrap()
+            .with_presentation_revision(2);
         let context = second.loaded_context();
         let fresh = context.dataset(SourceKey::Teams).unwrap();
-        assert!(fresh.reader.get::<Blob<blobencodings::UTF8String>, _>(handle).is_ok());
-        assert_ne!(dataset.revision, fresh.revision, "payload-only arrivals invalidate presentation caches");
+        assert!(fresh
+            .reader
+            .get::<Blob<blobencodings::UTF8String>, _>(handle)
+            .is_ok());
+        assert_ne!(
+            dataset.revision, fresh.revision,
+            "payload-only arrivals invalidate presentation caches"
+        );
         assert_eq!(
             find!(name: Inline<_>, pattern!(dataset.facts, [{ metadata::name: ?name }])).count(),
             find!(name: Inline<_>, pattern!(fresh.facts, [{ metadata::name: ?name }])).count(),
@@ -1331,10 +1428,24 @@ mod tests {
         let tracker = DependencyTracker::default();
         let baseline = pile.snapshot().unwrap();
         let _stable = pollster::block_on(WorkspaceObservation::observe_tracked(
-            &mut pile, &signer, &routes, tracker.clone(),
-        )).unwrap();
-        pile.commit(teams, &signer, entity! { metadata::name: "external relation change" }).unwrap();
-        assert_ne!(pile.snapshot().unwrap().changes_for(&baseline, &tracker.lock().unwrap()), StoreChanges::NONE);
+            &mut pile,
+            &signer,
+            &routes,
+            tracker.clone(),
+        ))
+        .unwrap();
+        pile.commit(
+            teams,
+            &signer,
+            entity! { metadata::name: "external relation change" },
+        )
+        .unwrap();
+        assert_ne!(
+            pile.snapshot()
+                .unwrap()
+                .changes_for(&baseline, &tracker.lock().unwrap()),
+            StoreChanges::NONE
+        );
         pile.close().unwrap();
     }
 
@@ -1347,31 +1458,55 @@ mod tests {
         let open = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let teams = pile.collection("team fixture", open.clone()).unwrap();
         let messages = pile.collection("message fixture", open).unwrap();
-        let denied = pile.collection("files fixture", CollectionPolicy::new(
-            AdmissionPolicy::direct(SigningKey::from_bytes(&[18; 32]).verifying_key()),
-            AdmissionPolicy::Open,
-        )).unwrap();
+        let denied = pile
+            .collection(
+                "files fixture",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(SigningKey::from_bytes(&[18; 32]).verifying_key()),
+                    AdmissionPolicy::Open,
+                ),
+            )
+            .unwrap();
         let routes = CollectionRoutes::from([
-            (TEAMS_SCOPE_ID, teams.handle()), (MESSAGES_SCOPE_ID, messages.handle()),
+            (TEAMS_SCOPE_ID, teams.handle()),
+            (MESSAGES_SCOPE_ID, messages.handle()),
             (FILES_SCOPE_ID, denied.handle()),
         ]);
-        pile.commit(teams, &signer, entity! { metadata::name: "before" }).unwrap();
-        let first = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        pile.commit(teams, &signer, entity! { metadata::name: "before" })
+            .unwrap();
+        let first =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
         let first_context = first.loaded_context();
         let before = first_context.dataset(SourceKey::Teams).unwrap();
         let peer = first_context.dataset(SourceKey::Messages).unwrap();
         assert!(matches!(before.reader, WidgetReader::Resident(_)));
         assert!(before.reader.changes_since(peer.reader).is_empty());
-        assert_eq!(first.unavailable_labels().collect::<Vec<_>>(), vec!["Files"]);
-        assert!(!first_context.contains(SourceKey::Wiki));
-        pile.commit(teams, &signer, entity! { metadata::name: "after" }).unwrap();
-        let second = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
-        assert_ne!(before.revision, second.loaded_context().dataset(SourceKey::Teams).unwrap().revision);
-        assert_eq!(find!(name: Inline<_>, pattern!(before.facts, [{ metadata::name: ?name }])).count(), 1);
+        assert_eq!(
+            first.unavailable_labels().collect::<Vec<_>>(),
+            vec!["Files"]
+        );
+        assert!(!first_context.contains(SourceKey::Knowledge));
+        pile.commit(teams, &signer, entity! { metadata::name: "after" })
+            .unwrap();
+        let second =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        assert_ne!(
+            before.revision,
+            second
+                .loaded_context()
+                .dataset(SourceKey::Teams)
+                .unwrap()
+                .revision
+        );
+        assert_eq!(
+            find!(name: Inline<_>, pattern!(before.facts, [{ metadata::name: ?name }])).count(),
+            1
+        );
         drop(first);
         drop(second);
         // Closing every viewer observation leaves the same mutable owner usable.
-        pile.commit(teams, &signer, entity! { metadata::name: "after close" }).unwrap();
+        pile.commit(teams, &signer, entity! { metadata::name: "after close" })
+            .unwrap();
         pile.close().unwrap();
     }
 
@@ -1381,21 +1516,44 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let signer = SigningKey::from_bytes(&[19; 32]);
         let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
-        let source = pile.collection("secret fixture", CollectionPolicy::new(
-            AdmissionPolicy::direct(SigningKey::from_bytes(&[20; 32]).verifying_key()),
-            AdmissionPolicy::direct(signer.verifying_key()),
-        )).unwrap();
+        let source = pile
+            .collection(
+                "secret fixture",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(SigningKey::from_bytes(&[20; 32]).verifying_key()),
+                    AdmissionPolicy::direct(signer.verifying_key()),
+                ),
+            )
+            .unwrap();
         let at = Epoch::from_unix_seconds(100.0);
-        let sealed = crate::secrets::seal_version("fixture", b"fixture only",
-            [signer.verifying_key()], (at, at).try_to_inline().unwrap()).unwrap();
+        let sealed = crate::secrets::seal_version(
+            "fixture",
+            b"fixture only",
+            [signer.verifying_key()],
+            (at, at).try_to_inline().unwrap(),
+        )
+        .unwrap();
         let secret = sealed.secret;
         pile.commit(source, &signer, sealed.fragment).unwrap();
         assert!(crate::collection_names::open_workspace_read_in(
-            &pile.snapshot().unwrap(), signer.verifying_key(), source.handle(),
-        ).is_err());
+            &pile.snapshot().unwrap(),
+            signer.verifying_key(),
+            source.handle(),
+        )
+        .is_err());
         let routes = CollectionRoutes::from([(crate::secrets::DEFAULT_SCOPE_ID, source.handle())]);
-        let observed = pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
-        assert_eq!(observed.loaded_context().secrets().unwrap().snapshot.open(secret, &signer).unwrap(), b"fixture only");
+        let observed =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        assert_eq!(
+            observed
+                .loaded_context()
+                .secrets()
+                .unwrap()
+                .snapshot
+                .open(secret, &signer)
+                .unwrap(),
+            b"fixture only"
+        );
         drop(observed);
         pile.close().unwrap();
     }
@@ -1520,7 +1678,7 @@ mod tests {
             views.unavailable_labels().collect::<Vec<_>>(),
             vec!["Files"]
         );
-        assert!(!views.loaded_context().contains(SourceKey::Wiki));
+        assert!(!views.loaded_context().contains(SourceKey::Knowledge));
         storage.close().unwrap();
     }
 
@@ -1700,12 +1858,12 @@ mod tests {
         let context = storage.context();
 
         let reason = context.dataset(SourceKey::Reason).unwrap();
-        let triage = context.dataset(SourceKey::Triage).unwrap();
-        assert_eq!(reason.revision, triage.revision);
-        assert!(reason.facts.iter().eq(triage.facts.iter()));
+        let diagnostics = context.dataset(SourceKey::Diagnostics).unwrap();
+        assert_eq!(reason.revision, diagnostics.revision);
+        assert!(reason.facts.iter().eq(diagnostics.facts.iter()));
         let secrets = context.secrets().unwrap();
         let secrets_reader = secrets.snapshot.store_snapshot();
-        for reader in [reason.reader, triage.reader] {
+        for reader in [reason.reader, diagnostics.reader] {
             assert!(reader.changes_since(secrets_reader).is_empty());
             assert!(secrets_reader.changes_since(reader).is_empty());
         }
@@ -1716,16 +1874,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("triage.pile");
         create_pile(&path);
-        let mut storage = StorageState::for_sources(&path, [SourceKey::Triage]);
+        let mut storage = StorageState::for_sources(&path, [SourceKey::Diagnostics]);
 
         assert_eq!(
             visible_keys(storage.context()),
             BTreeSet::from([
-                SourceKey::Headspace,
+                SourceKey::Profiles,
                 SourceKey::Messages,
                 SourceKey::Relations,
                 SourceKey::Secrets,
-                SourceKey::Triage,
+                SourceKey::Diagnostics,
             ])
         );
         assert!(storage.error().is_none());
@@ -1738,14 +1896,14 @@ mod tests {
             BTreeSet::from([SourceKey::Mail, SourceKey::Relations])
         );
         assert_eq!(
-            source_closure([SourceKey::Headspace]),
-            BTreeSet::from([SourceKey::Headspace, SourceKey::Secrets])
+            source_closure([SourceKey::Profiles]),
+            BTreeSet::from([SourceKey::Profiles, SourceKey::Secrets])
         );
         assert_eq!(
             source_closure([SourceKey::Teams]),
             BTreeSet::from([SourceKey::Teams])
         );
-        for source in [SourceKey::Messages, SourceKey::Planner] {
+        for source in [SourceKey::Messages, SourceKey::Events] {
             assert_eq!(
                 source_closure([source]),
                 BTreeSet::from([source, SourceKey::Relations])
@@ -1900,24 +2058,25 @@ mod tests {
     }
 
     #[test]
-    fn wiki_dataset_attaches_positive_latest_index_without_advancing_source() {
+    fn knowledge_dataset_attaches_positive_latest_index_without_advancing_source() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("wiki-latest.pile");
         create_pile(&path);
         let signer = load_signer(&path, None).unwrap();
-        let (author_fragment, author) = crate::wiki::author_record(&signer.verifying_key());
+        let (author_fragment, author) = crate::knowledge::author_record(&signer.verifying_key());
         let instant = Epoch::from_tai_seconds(1.0);
-        let (root_fragment, root) = crate::wiki::revision_record(crate::wiki::RevisionDraft {
-            title: "root".to_owned(),
-            content: "root".to_owned(),
-            tags: BTreeSet::new(),
-            predecessors: BTreeSet::new(),
-            author,
-            authored_at: (instant, instant).try_to_inline().unwrap(),
-        })
-        .unwrap();
+        let (root_fragment, root) =
+            crate::knowledge::revision_record(crate::knowledge::RevisionDraft {
+                title: "root".to_owned(),
+                content: "root".to_owned(),
+                tags: BTreeSet::new(),
+                predecessors: BTreeSet::new(),
+                author,
+                authored_at: (instant, instant).try_to_inline().unwrap(),
+            })
+            .unwrap();
         let (successor_fragment, successor) =
-            crate::wiki::revision_record(crate::wiki::RevisionDraft {
+            crate::knowledge::revision_record(crate::knowledge::RevisionDraft {
                 title: "successor".to_owned(),
                 content: "successor".to_owned(),
                 tags: BTreeSet::new(),
@@ -1927,33 +2086,33 @@ mod tests {
             })
             .unwrap();
         let mut pile = open_pile_strict_as(&path, signer.verifying_key()).unwrap();
-        crate::wiki::commit_collection(
+        crate::knowledge::commit_collection(
             &mut pile,
             &signer,
             author_fragment + root_fragment + successor_fragment,
         )
         .unwrap();
-        crate::wiki::carry_for_tests(&mut pile, &signer);
+        crate::knowledge::carry_for_tests(&mut pile, &signer);
         let collection =
-            crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
+            crate::collection_names::open(&mut pile, KNOWLEDGE_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_before = collection.admitted(&store_snapshot).unwrap();
         pile.close().unwrap();
 
-        let mut storage = StorageState::for_sources(&path, [SourceKey::Wiki]);
-        let dataset = storage.context().dataset(SourceKey::Wiki).unwrap();
+        let mut storage = StorageState::for_sources(&path, [SourceKey::Knowledge]);
+        let dataset = storage.context().dataset(SourceKey::Knowledge).unwrap();
         let latest = dataset
             .latest_index(metadata::supersedes.id())
-            .expect("Wiki dataset carries its positive latest relation");
-        let entries = crate::wiki::entries(dataset.facts, latest);
+            .expect("Knowledge dataset carries its positive latest relation");
+        let entries = crate::knowledge::entries(dataset.facts, latest);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].frontier.len(), 1);
         assert_eq!(entries[0].frontier[0].id, successor);
 
         let mut pile = open_pile_strict(&path).unwrap();
         let collection =
-            crate::collection_names::open(&mut pile, WIKI_SCOPE_ID, signer.verifying_key())
+            crate::collection_names::open(&mut pile, KNOWLEDGE_SCOPE_ID, signer.verifying_key())
                 .unwrap();
         let store_snapshot = pile.snapshot().unwrap();
         let cover_after = collection.admitted(&store_snapshot).unwrap();
@@ -1968,7 +2127,7 @@ mod tests {
         create_pile(&path);
         publish_reason(&path, "shared", 1.0);
 
-        let sources = source_closure([SourceKey::Reason, SourceKey::Triage]);
+        let sources = source_closure([SourceKey::Reason, SourceKey::Diagnostics]);
         assert_eq!(
             collection_scopes(&sources)
                 .into_iter()
@@ -1977,12 +2136,13 @@ mod tests {
             1
         );
 
-        let mut storage = StorageState::for_sources(&path, [SourceKey::Reason, SourceKey::Triage]);
+        let mut storage =
+            StorageState::for_sources(&path, [SourceKey::Reason, SourceKey::Diagnostics]);
         let context = storage.context();
         let reason = context.dataset(SourceKey::Reason).unwrap();
-        let triage = context.dataset(SourceKey::Triage).unwrap();
-        assert_eq!(reason.revision, triage.revision);
-        assert!(reason.facts.iter().eq(triage.facts.iter()));
+        let diagnostics = context.dataset(SourceKey::Diagnostics).unwrap();
+        assert_eq!(reason.revision, diagnostics.revision);
+        assert!(reason.facts.iter().eq(diagnostics.facts.iter()));
     }
 
     #[test]
@@ -1996,7 +2156,7 @@ mod tests {
         let mut narrow = StorageState::for_sources(&path, [SourceKey::Reason]);
         let context = narrow.context();
         assert!(context.dataset(SourceKey::Reason).is_some());
-        assert!(context.dataset(SourceKey::Triage).is_none());
+        assert!(context.dataset(SourceKey::Diagnostics).is_none());
         assert!(narrow.error().is_none());
 
         let mut full = StorageState::new(&path);
@@ -2058,7 +2218,7 @@ mod tests {
         let length = std::fs::metadata(&path).unwrap().len();
         let mut storage = StorageState::new(&path);
 
-        assert!(storage.context().dataset(SourceKey::Wiki).is_none());
+        assert!(storage.context().dataset(SourceKey::Knowledge).is_none());
         let error = storage.error().expect("missing signer is surfaced");
         assert!(error.contains("load durable signing key"), "{error}");
         assert!(!crate::storage::signer_path(&path, None).exists());

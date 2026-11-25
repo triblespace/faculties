@@ -33,7 +33,7 @@ use triblespace::prelude::*;
 
 use super::cover::{self, CoverRecord, MISTRAL_CONTEXT_TOKENS, PLAIN_MEMORY_CHARS};
 use super::{Exit, HostKey, IntervalValue, Reported, RunFacts, ScriptFacts, TextHandle};
-use crate::compass::{Compass, NoteOptions};
+use crate::goals::{Goals, NoteOptions};
 use crate::orient::WakeTint;
 use crate::out::{Out, Part};
 use crate::relations::{ProfileInput, Relations};
@@ -172,7 +172,7 @@ pub trait Renderer: Send + Sync {
     /// Scores the memory cover's recollections against a topic. Its own
     /// step, so a launch can tell a tint that failed from a wake that did.
     fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint>;
-    /// Render one wake. `memory_chars` is the journal's budget; a task's Wiki
+    /// Render one wake. `memory_chars` is the journal's budget; a task's Knowledge
     /// readings come beside it, in an allowance of their own. Zero measures the
     /// fixed sections for cover sizing.
     /// A personal wake without a tint carries the complete standing beliefs.
@@ -830,7 +830,7 @@ pub struct CoverWish {
     pub window: Option<u64>,
 }
 
-/// Launch a zooid whose brief is rendered from a Compass goal.
+/// Launch a zooid whose brief is rendered from a goal.
 #[derive(Clone, Debug)]
 pub struct GoalRequest {
     /// The goal: an id or a unique id prefix.
@@ -957,7 +957,7 @@ pub struct SpawnView {
     pub origin_colony: Vec<Id>,
     pub brief: TextHandle,
     pub brief_text: Option<String>,
-    /// The Compass goal the brief was rendered from, and that revision.
+    /// The goal the brief was rendered from, and that revision.
     pub goal: Vec<Id>,
     pub goal_revision: Vec<Id>,
     /// What it declares about where and how it lives.
@@ -1328,12 +1328,12 @@ impl Spawn {
         )
     }
 
-    /// Launch the zooid for a Compass goal's current revision. The brief is
+    /// Launch the zooid for a goal's current revision. The brief is
     /// rendered from the goal ([`super::goal_brief`]); the spawn records the
     /// goal and the revision, and the zooid notes its launch on the goal. The
     /// goal's status is the zooid's to move: nothing here touches it.
     pub fn goal(&self, request: &GoalRequest) -> Result<Launched> {
-        let reading = Compass::with_storage(self.storage.clone())
+        let reading = Goals::with_storage(self.storage.clone())
             .reading(&request.goal)
             .with_context(|| format!("read goal {}", request.goal))?;
         let rendered = super::goal_brief(&reading, request.extra.as_deref());
@@ -1402,7 +1402,7 @@ impl Spawn {
     /// and nothing is looked up. With one, the target is `percent` of `W`;
     /// fixed text is measured by a wake with no journal budget. The journal
     /// gets the remaining target, initially at least
-    /// [`cover::MIN_MEMORY_CHARS`], and a task's Wiki readings their own
+    /// [`cover::MIN_MEMORY_CHARS`], and a task's Knowledge readings their own
     /// allowance beside it. If the whole prompt is then
     /// estimated above `W` less the headroom, the memory part is rendered
     /// once more aimed at that line, possibly with no memory at all, and the
@@ -1502,8 +1502,8 @@ impl Spawn {
         let cover_chars = delivered.chars().count();
         let readings = match tint {
             Some(_) => format!(
-                " and up to {} for Wiki readings",
-                crate::wiki::recall::readings_allowance(budget)
+                " and up to {} for Knowledge readings",
+                crate::knowledge::recall::readings_allowance(budget)
             ),
             None => String::new(),
         };
@@ -2034,7 +2034,7 @@ impl Spawn {
         let mut started = false;
         let launched = (|| -> Result<Launched> {
             let about = brief.about.as_str();
-            // With no semantic score available, both Memory and Wiki can still
+            // With no semantic score available, both Memory and Knowledge can still
             // use the brief lexically. A failed device allocation can panic.
             let lexical = || WakeTint {
                 about: about.to_owned(),
@@ -2049,7 +2049,7 @@ impl Spawn {
                 })) {
                     Ok(Ok(tint)) => {
                         let reason = (!tint.has_memory_scores()
-                            && tint.wiki_contents.is_none()
+                            && tint.knowledge_contents.is_none()
                             && !tint.diagnostics.is_empty())
                         .then(|| tint.diagnostics.join(", "));
                         (tint, reason)
@@ -2245,7 +2245,7 @@ impl Spawn {
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
-                match Compass::with_storage(self.storage.clone()).note(
+                match Goals::with_storage(self.storage.clone()).note(
                     &format!("{goal:x}"),
                     &note,
                     NoteOptions {
@@ -4949,7 +4949,7 @@ mod tests {
         assert!(
             cover
                 .summary
-                .contains("journal budget 214600 and up to 40000 for Wiki readings"),
+                .contains("journal budget 214600 and up to 40000 for Knowledge readings"),
             "{}",
             cover.summary
         );
@@ -5459,7 +5459,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tint_recalls_current_wiki_readings_beside_the_journal() {
+    fn a_tint_recalls_current_knowledge_readings_beside_the_journal() {
         let f = fixture();
         let memory = crate::memory::Memory::with_storage(f.storage.clone());
         for day in 1..=16 {
@@ -5475,7 +5475,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let wiki = crate::wiki::Wiki::with_storage(f.storage.clone());
+        let knowledge = crate::knowledge::Knowledge::with_storage(f.storage.clone());
         let curated = "Watch the warp and the orchard.";
         let wake = |cue: &str, chars| {
             LibraryRenderer
@@ -5492,13 +5492,14 @@ mod tests {
         };
         let budget = 1100;
         let before = wake("warp", budget);
-        assert!(!before.contains(crate::wiki::recall::HEADING));
-        wiki.create("Standing note", curated, &["cover".into()], false)
+        assert!(!before.contains(crate::knowledge::recall::HEADING));
+        knowledge
+            .create("Standing note", curated, &["cover".into()], false)
             .unwrap();
-        let old = wiki
+        let old = knowledge
             .create("Tile sizes", "The stale warp schedule.", &[], false)
             .unwrap();
-        let fresh = wiki
+        let fresh = knowledge
             .edit(
                 &format!("{old:x}"),
                 Some("The warp schedule uses one tile per block."),
@@ -5507,11 +5508,11 @@ mod tests {
                 false,
             )
             .unwrap();
-        let discarded = wiki
+        let discarded = knowledge
             .create("Discarded tile", "A retired warp experiment.", &[], false)
             .unwrap();
-        wiki.archive(&format!("{discarded:x}")).unwrap();
-        let orchard = wiki
+        knowledge.archive(&format!("{discarded:x}")).unwrap();
+        let orchard = knowledge
             .create(
                 "Pruning",
                 "Prune an orchard after the leaves fall.",
@@ -5524,7 +5525,7 @@ mod tests {
             ("orchard", orchard, "one tile per block"),
         ] {
             let text = wake(cue, budget);
-            let exact = wiki.show(&format!("{id:x}"), true).unwrap();
+            let exact = knowledge.show(&format!("{id:x}"), true).unwrap();
             assert!(text.contains(&exact), "{text}");
             assert!(
                 !text.contains(absent)
@@ -5534,12 +5535,14 @@ mod tests {
             assert_eq!(text.matches(curated).count(), 1);
             // Whatever a brief reads, its journal is the same, byte for byte,
             // and within the whole budget; the readings have their own.
-            let flexible = text.split_once("\nCompass:").unwrap().0;
-            let (journal, readings) = flexible.split_once(crate::wiki::recall::HEADING).unwrap();
-            assert_eq!(journal, before.split_once("\nCompass:").unwrap().0);
+            let flexible = text.split_once("\nGoals:").unwrap().0;
+            let (journal, readings) = flexible
+                .split_once(crate::knowledge::recall::HEADING)
+                .unwrap();
+            assert_eq!(journal, before.split_once("\nGoals:").unwrap().0);
             assert!(journal.contains("Journal day"));
             assert!(journal.chars().count() <= budget);
-            let allowance = crate::wiki::recall::readings_allowance(budget);
+            let allowance = crate::knowledge::recall::readings_allowance(budget);
             assert!(readings.chars().count() <= allowance);
             assert!(text.contains(&format!("of up to {allowance} characters, beside")));
             assert_eq!(text, wake(cue, budget));
@@ -5562,7 +5565,7 @@ mod tests {
                 .lines()
                 .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
                 .any(
-                    |pair| pair["command"] == format!("wiki show --exact {id:x}")
+                    |pair| pair["command"] == format!("knowledge show --exact {id:x}")
                         && pair["output"] == exact
                 ));
         }
@@ -5570,7 +5573,7 @@ mod tests {
         // higher scoring stale and archived bodies must never become readings.
         let tint = WakeTint {
             about: "Fruit tree care".into(),
-            wiki_contents: Some(Arc::new(
+            knowledge_contents: Some(Arc::new(
                 [
                     ("The stale warp schedule.", 0.99),
                     ("A retired warp experiment.", 0.98),
@@ -5585,13 +5588,13 @@ mod tests {
         let semantic = LibraryRenderer
             .wake(&f.storage, Some(&tint), budget)
             .unwrap();
-        assert!(semantic.contains(&wiki.show(&format!("{orchard:x}"), true).unwrap()));
-        assert!(semantic.contains("Wiki topic scorer: WeMM"));
+        assert!(semantic.contains(&knowledge.show(&format!("{orchard:x}"), true).unwrap()));
+        assert!(semantic.contains("Knowledge topic scorer: WeMM"));
         assert!(!semantic.contains("stale warp schedule"));
         assert!(!semantic.contains("retired warp experiment"));
         let coverage_gap = WakeTint {
             about: "warp".into(),
-            wiki_contents: Some(Arc::new(vec![(
+            knowledge_contents: Some(Arc::new(vec![(
                 super::super::text_handle("Prune an orchard after the leaves fall."),
                 0.1,
             )])),
@@ -5600,9 +5603,9 @@ mod tests {
         let supplemented = LibraryRenderer
             .wake(&f.storage, Some(&coverage_gap), budget)
             .unwrap();
-        assert!(supplemented.contains(&wiki.show(&format!("{fresh:x}"), true).unwrap()));
+        assert!(supplemented.contains(&knowledge.show(&format!("{fresh:x}"), true).unwrap()));
         assert!(supplemented.contains("lexical matches without semantic rows"));
-        assert!(!wake("warp", 80).contains(crate::wiki::recall::HEADING));
+        assert!(!wake("warp", 80).contains(crate::knowledge::recall::HEADING));
         for cue in ["", "unmatchedkeyword"] {
             let broad = wake(cue, budget);
             assert!(broad.contains(curated) && !broad.contains("one tile per block"));
@@ -5610,10 +5613,10 @@ mod tests {
         let personal = LibraryRenderer.wake(&f.storage, None, 0).unwrap();
         assert!(personal.contains(curated) && personal.contains("Beliefs (cover):"));
         let zero = wake("warp", 0);
-        assert!(!zero.contains(curated) && zero.contains("Compass:"));
-        assert!(!zero.contains(crate::wiki::recall::HEADING) && !zero.contains("Journal day"));
+        assert!(!zero.contains(curated) && zero.contains("Goals:"));
+        assert!(!zero.contains(crate::knowledge::recall::HEADING) && !zero.contains("Journal day"));
         // A reading too long for the allowance is named, never clipped.
-        let long = wiki
+        let long = knowledge
             .create("Warp manual", &"warp ".repeat(400), &[], false)
             .unwrap();
         let text = wake("warp", budget);
@@ -6585,15 +6588,15 @@ mod tests {
     #[test]
     fn spawn_goal_renders_the_brief_records_the_revision_and_notes_the_launch() {
         let f = fixture();
-        let compass = Compass::with_storage(f.storage.clone());
-        let parent = compass
-            .add("The larger aim", crate::compass::AddOptions::default())
+        let goals = Goals::with_storage(f.storage.clone());
+        let parent = goals
+            .add("The larger aim", crate::goals::AddOptions::default())
             .unwrap();
         let parent_hex = format!("{:x}", parent.goal);
-        let goal = compass
+        let goal = goals
             .add(
                 "Build the widget",
-                crate::compass::AddOptions {
+                crate::goals::AddOptions {
                     status: "doing",
                     parent: Some(&parent_hex),
                     note: Some("Decided: use the small design."),
@@ -6638,7 +6641,7 @@ mod tests {
         let note = launched.goal_note.expect("a launch note");
         assert!(launched.warnings.is_empty(), "{:?}", launched.warnings);
         assert_eq!(view.runs[0].goal_note, [note]);
-        let reading = compass.reading(&goal_hex).unwrap();
+        let reading = goals.reading(&goal_hex).unwrap();
         let launch_note = reading.notes.iter().find(|n| n.id == note).unwrap();
         assert!(launch_note.text.starts_with(&format!(
             "spawned {} run {:x} from goal revision",
@@ -6648,7 +6651,7 @@ mod tests {
 
         // Settling does not move the goal.
         f.settle(&launched.name, &launched).unwrap();
-        let after = compass.reading(&goal_hex).unwrap();
+        let after = goals.reading(&goal_hex).unwrap();
         assert_eq!(after.status, Some((goal.status_event, "doing".to_owned())));
 
         // The launch note is a new revision: the same goal renders a new zooid.

@@ -156,11 +156,11 @@ impl Fixture {
                 }
             }
             let status =
-                faculties::compass::status_register_collection(&mut pile, signer.verifying_key())
+                faculties::goals::status_register_collection(&mut pile, signer.verifying_key())
                     .unwrap();
             drop(pile.maintain_attached(status, &signer).await.unwrap());
             let latest =
-                faculties::wiki::latest_collection(&mut pile, signer.verifying_key()).unwrap();
+                faculties::knowledge::latest_collection(&mut pile, signer.verifying_key()).unwrap();
             drop(pile.maintain_attached(latest, &signer).await.unwrap());
         });
         pile.close().unwrap();
@@ -718,7 +718,7 @@ fn authorized_reporting_frontends_maintain_lagging_targets_without_a_daemon() {
         let body = "visible through eager reader upkeep";
         let title = "a goal carried by the reporting frontend";
         let event = f.message(body, f.persona);
-        let (goal, _) = faculties::compass::goal_fragment(
+        let (goal, _) = faculties::goals::goal_fragment(
             title,
             Vec::new(),
             None,
@@ -1596,7 +1596,7 @@ fn wake_at(seconds: i64) -> faculties::memory::IntervalValue {
 }
 
 impl Fixture {
-    /// One deterministic self: memories (wide, point, closing arc), Wiki
+    /// One deterministic self: memories (wide, point, closing arc), Knowledge
     /// beliefs (a sole head, a forked pair, an untagged entry) and goals.
     /// Every identity is intrinsic over fixed content and fixed times, so the
     /// rendered wake is the same bytes on every run.
@@ -1633,10 +1633,11 @@ impl Fixture {
         self.publish(faculties::schemas::memory::DEFAULT_SCOPE_ID, memories);
 
         let signer = faculties::storage::load_signer(&self.pile, Some(&self.key)).unwrap();
-        let (author_fragment, author) = faculties::wiki::author_record(&signer.verifying_key());
-        let (cover_fragment, cover, _) = faculties::wiki::tag_record("cover").unwrap();
+        let (author_fragment, author) =
+            faculties::knowledge::author_record(&signer.verifying_key());
+        let (cover_fragment, cover, _) = faculties::knowledge::tag_record("cover").unwrap();
         let revision = |title: &str, content: &str, tagged: bool, after: &[Id], at: i64| {
-            faculties::wiki::revision_record(faculties::wiki::RevisionDraft {
+            faculties::knowledge::revision_record(faculties::knowledge::RevisionDraft {
                 title: title.to_owned(),
                 content: content.to_owned(),
                 tags: if tagged {
@@ -1650,7 +1651,7 @@ impl Fixture {
             })
             .unwrap()
         };
-        let mut wiki = author_fragment + cover_fragment;
+        let mut knowledge = author_fragment + cover_fragment;
         let (alpha, _) = revision(
             "Alpha belief",
             "= Alpha belief\n\nThe first standing belief, with a `literal` and $x$.\n",
@@ -1658,9 +1659,9 @@ impl Fixture {
             &[],
             100,
         );
-        wiki += alpha;
+        knowledge += alpha;
         let (root, root_id) = revision("Fork root", "= Fork root\n", false, &[], 200);
-        wiki += root;
+        knowledge += root;
         let (left, _) = revision(
             "Fork left",
             "= Fork\n\nThe left head.",
@@ -1668,7 +1669,7 @@ impl Fixture {
             &[root_id],
             300,
         );
-        wiki += left;
+        knowledge += left;
         let (right, _) = revision(
             "Fork right",
             "= Fork\n\nThe right head.",
@@ -1676,31 +1677,31 @@ impl Fixture {
             &[root_id],
             301,
         );
-        wiki += right;
+        knowledge += right;
         let (other, _) = revision("Not a belief", "= Not a belief\n", false, &[], 400);
-        wiki += other;
-        self.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, wiki);
+        knowledge += other;
+        self.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, knowledge);
 
-        let mut compass = Fragment::empty();
+        let mut goals = Fragment::empty();
         let mut goal = |title: &str, tags: &[&str], at: i64, status: Option<&str>| {
-            let (fragment, id) = faculties::compass::goal_fragment(
+            let (fragment, id) = faculties::goals::goal_fragment(
                 title,
                 tags.iter().map(|tag| (*tag).to_owned()).collect(),
                 None,
                 wake_at(at),
             )
             .unwrap();
-            compass += fragment;
+            goals += fragment;
             if let Some(status) = status {
-                compass +=
-                    faculties::compass::status_fragment(id, status, None, wake_at(at + 1)).unwrap();
+                goals +=
+                    faculties::goals::status_fragment(id, status, None, wake_at(at + 1)).unwrap();
             }
         };
         goal("Doing the wake pairs", &["wake"], 1_000, Some("doing"));
         goal("Todo first", &[], 1_100, None);
         goal("Todo second", &["later"], 1_200, Some("todo"));
         goal("Already done", &[], 1_300, Some("done"));
-        self.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, compass);
+        self.publish(faculties::schemas::compass::DEFAULT_SCOPE_ID, goals);
         self.maintain();
     }
 
@@ -1760,7 +1761,7 @@ const PLAIN_WAKE_GOLDEN: &str = concat!(
     "    \n",
     "    The right head.\n",
     "\n",
-    "Compass:\n",
+    "Goals:\n",
     "Doing (1 of 1):\n",
     "- [9abaeb01ceb998880a70f2c6c9488c4f] Doing the wake pairs #wake\n",
     "Todo (2 of 2):\n",
@@ -1870,7 +1871,7 @@ fn replay(f: &Fixture, command: &str) -> String {
     let mut words = command.split(' ');
     let program = match words.next().unwrap() {
         "memory" => env!("CARGO_BIN_EXE_memory"),
-        "wiki" => env!("CARGO_BIN_EXE_wiki"),
+        "wiki" => env!("CARGO_BIN_EXE_knowledge"),
         "orient" => env!("CARGO_BIN_EXE_orient"),
         other => panic!("unexpected program {other}"),
     };
@@ -1953,9 +1954,9 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
         let rest = &pairs[memory.len()..];
         let (goals, beliefs) = rest.split_last().unwrap();
         assert_eq!(goals.0, "orient goals --doing-limit 5 --todo-limit 5");
-        assert!(goals.1.starts_with("Compass:\n"), "{}", goals.1);
+        assert!(goals.1.starts_with("Goals:\n"), "{}", goals.1);
         assert!(PLAIN_WAKE_GOLDEN.contains(&goals.1));
-        // `wiki show`: the title, the revision's identity lines, the content.
+        // `knowledge show`: the title, the revision's identity lines, the content.
         let expected = [
             (
                 false,
@@ -1968,9 +1969,9 @@ fn wake_pairs_select_what_memory_context_selects_and_every_command_replays() {
         assert_eq!(beliefs.len(), expected.len());
         for ((command, output), (forked, title, content)) in beliefs.iter().zip(expected) {
             let id = if forked {
-                command.strip_prefix("wiki show --exact ").unwrap()
+                command.strip_prefix("knowledge show --exact ").unwrap()
             } else {
-                command.strip_prefix("wiki show ").unwrap()
+                command.strip_prefix("knowledge show ").unwrap()
             };
             assert_eq!(id.len(), 32, "{command}");
             assert!(
@@ -2054,10 +2055,10 @@ fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
 
     // One revision id carrying two title/content projections.
     let signer = faculties::storage::load_signer(&f.pile, Some(&f.key)).unwrap();
-    let (author_fragment, author) = faculties::wiki::author_record(&signer.verifying_key());
-    let (cover_fragment, cover, _) = faculties::wiki::tag_record("cover").unwrap();
+    let (author_fragment, author) = faculties::knowledge::author_record(&signer.verifying_key());
+    let (cover_fragment, cover, _) = faculties::knowledge::tag_record("cover").unwrap();
     let (revision, revision_id) =
-        faculties::wiki::revision_record(faculties::wiki::RevisionDraft {
+        faculties::knowledge::revision_record(faculties::knowledge::RevisionDraft {
             title: "Twice projected".to_owned(),
             content: "= Twice projected\n\nFirst text.".to_owned(),
             tags: BTreeSet::from([cover]),
@@ -2066,15 +2067,16 @@ fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
             authored_at: wake_at(100),
         })
         .unwrap();
-    let mut wiki = author_fragment + cover_fragment + revision;
-    let title: faculties::schemas::wiki::TextHandle = wiki.put("Twice projected, again".to_owned());
+    let mut knowledge = author_fragment + cover_fragment + revision;
+    let title: faculties::schemas::wiki::TextHandle =
+        knowledge.put("Twice projected, again".to_owned());
     let content: faculties::schemas::wiki::TextHandle =
-        wiki.put("= Twice projected\n\nSecond text.".to_owned());
-    wiki += entity! { ExclusiveId::force_ref(&revision_id) @
+        knowledge.put("= Twice projected\n\nSecond text.".to_owned());
+    knowledge += entity! { ExclusiveId::force_ref(&revision_id) @
         faculties::schemas::wiki::attrs::title: title,
         faculties::schemas::wiki::attrs::content: content,
     };
-    f.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, wiki);
+    f.publish(faculties::schemas::wiki::DEFAULT_SCOPE_ID, knowledge);
     f.maintain();
 
     // The old spellings name the WRONG memory: what the previous pairs
@@ -2139,7 +2141,7 @@ fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
         .filter(|(command, _)| command.starts_with("wiki "))
         .collect();
     assert_eq!(beliefs.len(), 1, "{beliefs:?}");
-    assert_eq!(beliefs[0].0, format!("wiki show {revision_id:x}"));
+    assert_eq!(beliefs[0].0, format!("knowledge show {revision_id:x}"));
     assert!(beliefs[0].1.contains("First text.") && beliefs[0].1.contains("Second text."));
     // The plain report still lists each projection under its own title.
     let plain = text(&f.cli(&["wake"]));

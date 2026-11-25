@@ -2,7 +2,7 @@
 
 `message` is the append-only DM primitive. Useful when
 you want to leave a note for another agent (or a future-you) that
-isn't a wiki fragment — it's transient, addressee-specific, with
+isn't a knowledge fragment — it's transient, addressee-specific, with
 read acknowledgements.
 
 == When to use
@@ -12,13 +12,13 @@ read acknowledgements.
   - Hand-offs that need a read-receipt
     (`message ack <id> <reader>`).
   - Notes-to-self that are time-sensitive but not durable enough
-    for a wiki fragment.
+    for a knowledge fragment.
 
 == When NOT to use
 
-  - Anything reusable across multiple readers — that's a Wiki entry. An
+  - Anything reusable across multiple readers — that's a Knowledge entry. An
     acknowledgement changes inbox presentation, not the immutable message;
-    Wiki is the durable knowledge surface.
+    Knowledge is the durable knowledge surface.
   - Long technical content — messages are conversational. If
     you're writing more than 5 lines, ask whether a fragment
     would serve better.
@@ -66,6 +66,6 @@ authors remain distinct immutable messages; exact retries converge.
 
   - "How Faculties Work" — the faculty model
   - "Tool Selection: Faculties First" — when to reach for
-    message vs wiki vs compass
+    message vs knowledge vs goals
 
 Next stop: [Teams: Microsoft Graph Archive and Bridge](wiki:67477d2173928fd91ef20173eabfeae4).

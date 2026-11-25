@@ -611,7 +611,7 @@ fn render_import_card(
                         // OPEN — extracts the import's root file or
                         // directory tree to $TMPDIR/faculties-files/ and
                         // fires the platform opener, mirroring the
-                        // wiki widget's files:-link behaviour.
+                        // knowledge widget's files:-link behaviour.
                         // `Align::Min` cross-axis: Center would feed
                         // the frame-delayed cell-sizing loop.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {

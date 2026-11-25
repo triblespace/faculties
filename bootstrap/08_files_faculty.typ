@@ -1,7 +1,7 @@
 = Files Faculty: Archiving and Citing Artefacts
 
 `files` is the content-addressed file store. Use it for any
-binary or large-text artefact you'll want to cite from a wiki
+binary or large-text artefact you'll want to cite from a knowledge
 fragment later: PDFs, datasets, screenshots, codex output dumps,
 downloaded papers.
 
@@ -14,7 +14,7 @@ downloaded papers.
     still requires the referenced blob and an admitted Files fact in the
     current WRITE-authorized collection; the token does not grant or transport
     either one by itself.
-  - Wiki fragments cite files by handle, not by path; an
+  - Knowledge fragments cite files by handle, not by path; an
     archived file is durable across machines, sessions, and
     pile renames.
 
@@ -23,7 +23,7 @@ downloaded papers.
 ```sh
 # Archive a single file
 files add ~/Downloads/some_paper.pdf
-# → files:<hash>   (use this handle in wiki fragments)
+# → files:<hash>   (use this handle in knowledge fragments)
 
 # Fetch from a URL straight into the pile (avoids the tmp step)
 files fetch https://arxiv.org/pdf/2305.12345.pdf
@@ -56,13 +56,13 @@ files get <hash> @- > /tmp/check.pdf
 
   - Source code under git — that's already content-addressed
     by the commit hash.
-  - Tiny text snippets — those go in wiki fragments directly.
-  - Anything you'd want to read with `wiki show` later —
+  - Tiny text snippets — those go in knowledge fragments directly.
+  - Anything you'd want to read with `knowledge show` later —
     fragments render in GORBIE; files don't.
 
 == Citation pattern
 
-In a wiki fragment:
+In a knowledge fragment:
 
 ```typ
 The convergence rate proof appears in
@@ -73,7 +73,7 @@ GORBIE renders this as a clickable link (labelled
 "Mezard 2009, section 4") that opens the archived PDF in a
 viewer. Always cite with the `[label](files:<hash>)` form: a
 *bare* `files:<hash>` in prose does NOT become a link (the
-wiki warns you if you write one), and the label reads far
+knowledge warns you if you write one), and the label reads far
 better than a raw hash.
 
 Next stop: [Orient: The Situation-Snapshot Faculty](wiki:ff27b500d93e1d545b7465438a0146e1).

@@ -1,5 +1,5 @@
 //! The durable Nomic embedder seam. Only the posture policy's semantic tier
-//! still reads nomic-embed-text; Files, Memory and Wiki search with WeMM
+//! still reads nomic-embed-text; Files, Memory and Knowledge search with WeMM
 //! (`crate::wemm`).
 //!
 //! The nomic models live in the working pile itself, as roots of its

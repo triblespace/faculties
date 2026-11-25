@@ -1482,7 +1482,7 @@ where
     Ok(selector_outcome(settled, forked, BTreeSet::new()))
 }
 
-/// The person and group anchors a Compass `@label` addresses: every
+/// The person and group anchors a Goals `@label` addresses: every
 /// addressable person whose current profile label or alias, and every group
 /// whose current name, equals `label` under [`lookup_key`].
 ///

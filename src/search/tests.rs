@@ -11,7 +11,7 @@ use triblespace::core::metadata;
 use triblespace::core::repo::SnapshotSource;
 use triblespace::prelude::*;
 
-const WIKI: Id = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+const KNOWLEDGE: Id = crate::schemas::wiki::DEFAULT_SCOPE_ID;
 const MEMORY: Id = crate::schemas::memory::DEFAULT_SCOPE_ID;
 const FILES: Id = crate::schemas::files::DEFAULT_SCOPE_ID;
 
@@ -32,7 +32,7 @@ impl Fixture {
         let owner = Storage::shared_local(pile, Some(key));
         let routes = owner
             .with_store(|store, signer, _| {
-                [WIKI, MEMORY, FILES]
+                [KNOWLEDGE, MEMORY, FILES]
                     .into_iter()
                     .map(|scope| {
                         let collection = store.collection(
@@ -68,10 +68,10 @@ impl Fixture {
             .unwrap();
     }
 
-    fn wiki(&self, title: &str, body: &str, predecessors: &[Id]) -> Id {
+    fn knowledge(&self, title: &str, body: &str, predecessors: &[Id]) -> Id {
         let fragment = wiki::revision_fragment(genid().id, title, body, &[], predecessors);
         let revision = fragment.root().unwrap();
-        self.publish(WIKI, fragment);
+        self.publish(KNOWLEDGE, fragment);
         revision
     }
 
@@ -164,7 +164,7 @@ fn capture(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> String {
 #[test]
 fn exact_workspace_routes_and_method_labels_need_no_models() {
     let fixture = Fixture::new();
-    fixture.wiki("needle wiki", "body", &[]);
+    fixture.knowledge("needle wiki", "body", &[]);
     fixture.memory("needle memory");
     fixture.file(b"body", "needle.txt");
     fixture
@@ -195,7 +195,7 @@ fn exact_workspace_routes_and_method_labels_need_no_models() {
         })
         .unwrap();
     assert_eq!(report.workspace_revision, Some(format!("{workspace:x}")));
-    for (source, scope) in report.sources.iter().zip([WIKI, MEMORY, FILES]) {
+    for (source, scope) in report.sources.iter().zip([KNOWLEDGE, MEMORY, FILES]) {
         assert_eq!(
             source.collection,
             Some(hex::encode(fixture.routes[&scope].raw))
@@ -243,7 +243,7 @@ fn missing_role_is_unavailable_while_other_sources_answer() {
 }
 
 #[test]
-fn unavailable_wiki_payload_does_not_become_an_empty_answer() {
+fn unavailable_knowledge_payload_does_not_become_an_empty_answer() {
     let fixture = Fixture::new();
     fixture.memory("needle memory");
     fixture.file(b"body", "needle.txt");
@@ -251,14 +251,14 @@ fn unavailable_wiki_payload_does_not_become_an_empty_answer() {
     let mut fragment = Fragment::empty();
     let title = fragment.put::<blobencodings::UTF8String, _>("needle title".to_owned());
     fragment += wiki::revision_fragment_from_handles(genid().id, title, missing, &[], &[]);
-    fixture.publish(WIKI, fragment);
+    fixture.publish(KNOWLEDGE, fragment);
     let report = fixture.query("needle", 10);
     assert!(
         matches!(&report.sources[0].outcome, Outcome::Unavailable { message } if !message.is_empty())
     );
     assert_eq!(
         report.sources[0].collection,
-        Some(hex::encode(fixture.routes[&WIKI].raw))
+        Some(hex::encode(fixture.routes[&KNOWLEDGE].raw))
     );
     assert_eq!(answered(&report.sources[1]).1, 1);
     assert_eq!(answered(&report.sources[2]).1, 1);
@@ -267,7 +267,7 @@ fn unavailable_wiki_payload_does_not_become_an_empty_answer() {
 #[test]
 fn unavailable_file_tag_fails_only_files_and_ordinary_search_reports_it() {
     let fixture = Fixture::new();
-    fixture.wiki("needle wiki", "body", &[]);
+    fixture.knowledge("needle wiki", "body", &[]);
     fixture.memory("needle memory");
     let holder = fixture.file(b"body", "unrelated.txt");
     let missing: Inline<inlineencodings::Handle<blobencodings::UTF8String>> =
@@ -371,16 +371,16 @@ fn file_readings_keep_duplicate_content_holders_and_multiple_metadata() {
 }
 
 #[test]
-fn wiki_current_readings_deduplicate_witnesses_and_open_history_exactly() {
+fn knowledge_current_readings_deduplicate_witnesses_and_open_history_exactly() {
     let fixture = Fixture::new();
-    let old = fixture.wiki("needle old", "old body", &[]);
+    let old = fixture.knowledge("needle old", "old body", &[]);
     let old_report = fixture.query("needle", 10);
-    let Hit::Wiki(old_hit) = &answered(&old_report.sources[0]).0[0] else {
-        panic!("Wiki")
+    let Hit::Knowledge(old_hit) = &answered(&old_report.sources[0]).0[0] else {
+        panic!("Knowledge")
     };
-    let new = fixture.wiki("needle current", "new body", &[old]);
+    let new = fixture.knowledge("needle current", "new body", &[old]);
     fixture.publish(
-        WIKI,
+        KNOWLEDGE,
         entity! { ExclusiveId::force_ref(&new) @
             wiki::attrs::author: genid().id,
             wiki::attrs::title: "needle alternative".to_owned(),
@@ -391,33 +391,42 @@ fn wiki_current_readings_deduplicate_witnesses_and_open_history_exactly() {
     assert_eq!((hits.len(), count, truncated), (1, 2, true));
     let full = fixture.query("needle", 10);
     for hit in answered(&full.sources[0]).0 {
-        let Hit::Wiki(hit) = hit else { panic!("Wiki") };
+        let Hit::Knowledge(hit) = hit else {
+            panic!("Knowledge")
+        };
         assert_eq!(hit.revision, format!("{new:x}"));
     }
-    let OpenTarget::Wiki { id, exact } = &old_hit.open else {
-        panic!("exact Wiki target")
+    let OpenTarget::Knowledge { id, exact } = &old_hit.open else {
+        panic!("exact Knowledge target")
     };
     assert!(*exact);
-    let wiki = crate::wiki::Wiki::with_storage(fixture.selected.clone());
-    assert_eq!(wiki.export(id, *exact).unwrap().bytes.as_ref(), b"old body");
-    assert!(wiki.show(id, false).unwrap().contains("new body"));
+    let knowledge = crate::knowledge::Knowledge::with_storage(fixture.selected.clone());
     assert_eq!(
-        wiki.search("needle", false, false).unwrap().lines().count(),
+        knowledge.export(id, *exact).unwrap().bytes.as_ref(),
+        b"old body"
+    );
+    assert!(knowledge.show(id, false).unwrap().contains("new body"));
+    assert_eq!(
+        knowledge
+            .search("needle", false, false)
+            .unwrap()
+            .lines()
+            .count(),
         2
     );
 }
 
 #[test]
-fn wiki_context_is_collected_only_when_requested() {
+fn knowledge_context_is_collected_only_when_requested() {
     let fixture = Fixture::new();
-    fixture.wiki(
+    fixture.knowledge(
         "needle title",
         "needle first\nother line\n  needle second",
         &[],
     );
-    let wiki = crate::wiki::Wiki::with_storage(fixture.selected.clone());
-    let without = wiki.search_hits("needle", false, false).unwrap();
-    let with = wiki.search_hits("needle", true, false).unwrap();
+    let knowledge = crate::knowledge::Knowledge::with_storage(fixture.selected.clone());
+    let without = knowledge.search_hits("needle", false, false).unwrap();
+    let with = knowledge.search_hits("needle", true, false).unwrap();
     assert_eq!(without.hits.len(), with.hits.len());
     assert!(without.hits[0].matching_lines.is_none());
     assert_eq!(
@@ -425,17 +434,21 @@ fn wiki_context_is_collected_only_when_requested() {
         Some(["needle first".to_owned(), "needle second".to_owned()].as_slice())
     );
     assert_eq!(
-        wiki.search("needle", false, false).unwrap().lines().count(),
+        knowledge
+            .search("needle", false, false)
+            .unwrap()
+            .lines()
+            .count(),
         1
     );
-    let rendered = wiki.search("needle", true, false).unwrap();
+    let rendered = knowledge.search("needle", true, false).unwrap();
     assert!(rendered.contains("    needle first\n"));
     assert!(rendered.contains("    needle second\n"));
     assert!(!rendered.contains("other line"));
     let report = fixture.query("needle", 10);
     assert_eq!(answered(&report.sources[0]).1, 1);
-    let Hit::Wiki(hit) = &answered(&report.sources[0]).0[0] else {
-        panic!("Wiki")
+    let Hit::Knowledge(hit) = &answered(&report.sources[0]).0[0] else {
+        panic!("Knowledge")
     };
     assert!(hit.matching_lines.is_none());
     assert!(
@@ -507,7 +520,7 @@ fn source_limits_follow_deduplication_and_memory_ties_are_stable() {
 #[test]
 fn native_mcp_and_cli_share_the_report_and_catalog_registers_search() {
     let fixture = Fixture::new();
-    fixture.wiki("needle", "body", &[]);
+    fixture.knowledge("needle", "body", &[]);
     fixture.memory("needle memory");
     fixture.file(b"body", "needle.txt");
     let storage = fixture.pin();

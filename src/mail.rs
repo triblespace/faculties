@@ -32,7 +32,7 @@ use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::core::repo::{BlobStoreGet, BlobStoreMeta};
 use triblespace::prelude::*;
 
-use crate::decide::{self, Resolution};
+use crate::decisions::{self, Resolution};
 use crate::files;
 use crate::relations::IdentityComponents;
 use crate::schemas::files::{file as file_schema, KIND_FILE, KIND_MEDIA_TYPE};
@@ -264,7 +264,7 @@ pub struct DraftInput {
 #[derive(Debug)]
 pub struct DraftPublication {
     pub mail: Fragment,
-    pub decide: Fragment,
+    pub decisions: Fragment,
     pub draft: Id,
     pub decision: Id,
 }
@@ -1500,7 +1500,7 @@ pub fn draft_publication(input: DraftInput) -> Result<DraftPublication> {
         "Send mail: {}",
         read_local_text(&mail_fragment, record.subject)?
     );
-    let (decide_fragment, _) = decide::decision_fragment(
+    let (decisions_fragment, _) = decisions::decision_fragment(
         decision,
         title,
         Some("Authorize exactly this immutable DraftIntent".to_owned()),
@@ -1509,7 +1509,7 @@ pub fn draft_publication(input: DraftInput) -> Result<DraftPublication> {
     )?;
     Ok(DraftPublication {
         mail: mail_fragment,
-        decide: decide_fragment,
+        decisions: decisions_fragment,
         draft: draft_id,
         decision,
     })
@@ -1939,17 +1939,17 @@ where
         .collect()
 }
 
-/// Resolve the exact Decide frontier which authorizes a send.
+/// Resolve the exact Decisions frontier which authorizes a send.
 pub fn authorized_send<P>(
     reader: &impl BlobStoreGet,
-    decide_facts: &P,
+    decisions_facts: &P,
     draft_id: Id,
 ) -> Result<(Id, Vec<Id>)>
 where
     P: TriblePattern,
 {
     let decision = draft_decision_id(draft_id);
-    let snapshots = match decide::resolution(decide_facts, decision) {
+    let snapshots = match decisions::resolution(decisions_facts, decision) {
         Resolution::Unique(snapshot) => vec![snapshot],
         Resolution::Agreed(snapshots) => snapshots,
         Resolution::Missing => bail!("send decision {decision:x} has no resolution"),
@@ -1965,7 +1965,7 @@ where
         bail!("send decision {decision:x} resolved to an empty frontier");
     }
     for snapshot in &snapshots {
-        let outcome = decide::read_text(reader, snapshot.outcome)?;
+        let outcome = decisions::read_text(reader, snapshot.outcome)?;
         if outcome != "send" {
             bail!("send decision {decision:x} resolves to {outcome:?}, not exact outcome \"send\"");
         }
@@ -2754,7 +2754,7 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 
 /// Freeze and validate one exact SMTP effect plan against one local snapshot.
 ///
-/// The stored Decide heads are the complete frontier observed by this
+/// The stored Decisions heads are the complete frontier observed by this
 /// executor at preparation time. A later resolution does not retroactively
 /// invalidate that historical authorization. Conversely, the eventual union
 /// cannot prove that this local snapshot was globally fresh or complete: SMTP
@@ -2762,10 +2762,10 @@ fn smtp_envelope_for_attempt(input: &SendAttemptInput) -> Result<SmtpEnvelope> {
 /// serialize per account rather than running concurrently on replicas.
 pub fn prepare_send<R, M, F, D>(
     mail_reader: &R,
-    decide_reader: &impl BlobStoreGet,
+    decisions_reader: &impl BlobStoreGet,
     mail_facts: &M,
     files_facts: &F,
-    decide_facts: &D,
+    decisions_facts: &D,
     input: SendAttemptInput,
     attachment_limit: u64,
 ) -> Result<PreparedSend>
@@ -2790,11 +2790,11 @@ where
         ),
     }
     let (current_decision, current_heads) =
-        authorized_send(decide_reader, decide_facts, input.draft)?;
+        authorized_send(decisions_reader, decisions_facts, input.draft)?;
     if input.decision != current_decision
         || sorted_ids(input.decision_heads.iter().copied()) != current_heads
     {
-        bail!("send attempt does not cite the exact locally observed Decide frontier");
+        bail!("send attempt does not cite the exact locally observed Decisions frontier");
     }
 
     let envelope = smtp_envelope_for_attempt(&input)?;
@@ -2930,7 +2930,7 @@ mod tests {
     struct Views {
         mail: CollectionView,
         files: CollectionView,
-        decide: CollectionView,
+        decisions: CollectionView,
         relations: CollectionView,
         secrets: SecretsSnapshot<PileSnapshot>,
     }
@@ -3000,7 +3000,7 @@ mod tests {
             let views = Views {
                 mail: materialize(mail),
                 files: materialize(files),
-                decide: materialize(decide),
+                decisions: materialize(decide),
                 relations: materialize(relations),
                 secrets,
             };
@@ -3610,7 +3610,7 @@ mod tests {
                 .all(|row| !row.unread)
         );
 
-        // Draft and its deterministic Decide genesis are independent signed
+        // Draft and its deterministic Decisions genesis are independent signed
         // roots; Decide lands first.
         let draft = draft_publication(DraftInput {
             nonce: id(4),
@@ -3627,11 +3627,11 @@ mod tests {
             created_at: at(2),
         })
         .unwrap();
-        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decisions);
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
 
         let (resolution, resolution_id) =
-            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3))
+            decisions::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(3))
                 .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, resolution);
 
@@ -3655,7 +3655,7 @@ mod tests {
         .unwrap();
         let rendered = render_draft(materialized.clone(), &account).unwrap();
         let (decision, heads) =
-            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap();
+            authorized_send(&views.decisions.reader, &views.decisions.facts, draft.draft).unwrap();
         assert_eq!(heads, vec![resolution_id]);
         let base_attempt = SendAttemptInput {
             draft: draft.draft,
@@ -3682,10 +3682,10 @@ mod tests {
         );
         let error = prepare_send(
             &views.mail.reader,
-            &views.decide.reader,
+            &views.decisions.reader,
             &views.mail.facts,
             &views.files.facts,
-            &views.decide.facts,
+            &views.decisions.facts,
             SendAttemptInput {
                 raw: corrupt,
                 ..base_attempt.clone()
@@ -3697,10 +3697,10 @@ mod tests {
 
         let prepared = prepare_send(
             &views.mail.reader,
-            &views.decide.reader,
+            &views.decisions.reader,
             &views.mail.facts,
             &views.files.facts,
-            &views.decide.facts,
+            &views.decisions.facts,
             base_attempt,
             MAX_DRAFT_ATTACHMENT_BYTES,
         )
@@ -3761,11 +3761,11 @@ mod tests {
             created_at: at(1),
         })
         .unwrap();
-        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decide);
+        fixture.publish(decide_schema::DEFAULT_SCOPE_ID, draft.decisions);
         fixture.publish(mail_schema::DEFAULT_SCOPE_ID, draft.mail);
 
         let (send, send_id) =
-            decide::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(2))
+            decisions::resolution_fragment(draft.decision, "send", None, true, &[], &[], at(2))
                 .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, send);
         let views = fixture.views();
@@ -3787,14 +3787,14 @@ mod tests {
         .unwrap();
         let rendered = render_draft(materialized.clone(), &account).unwrap();
         let (decision, heads) =
-            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap();
+            authorized_send(&views.decisions.reader, &views.decisions.facts, draft.draft).unwrap();
         assert_eq!(heads, vec![send_id]);
         let prepared = prepare_send(
             &views.mail.reader,
-            &views.decide.reader,
+            &views.decisions.reader,
             &views.mail.facts,
             &views.files.facts,
-            &views.decide.facts,
+            &views.decisions.facts,
             SendAttemptInput {
                 draft: draft.draft,
                 config: account.config,
@@ -3818,13 +3818,14 @@ mod tests {
         // fork. It prevents a new effect, but it cannot rewrite the evidence
         // of which genuine send head the executor previously observed.
         let (reject, reject_id) =
-            decide::resolution_fragment(draft.decision, "reject", None, true, &[], &[], at(3))
+            decisions::resolution_fragment(draft.decision, "reject", None, true, &[], &[], at(3))
                 .unwrap();
         fixture.publish(decide_schema::DEFAULT_SCOPE_ID, reject);
         let views = fixture.views();
         assert!(format!(
             "{:#}",
-            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
+            authorized_send(&views.decisions.reader, &views.decisions.facts, draft.draft)
+                .unwrap_err()
         )
         .contains("divergent heads"));
 
@@ -3832,7 +3833,7 @@ mod tests {
         // effects. The final union cannot reconstruct whether the executor's
         // earlier local frontier was globally complete; that is its affine
         // authority attestation, not a fact derivable after the event.
-        let (reject_join, _) = decide::resolution_fragment(
+        let (reject_join, _) = decisions::resolution_fragment(
             draft.decision,
             "reject",
             None,
@@ -3846,7 +3847,8 @@ mod tests {
         let views = fixture.views();
         assert!(format!(
             "{:#}",
-            authorized_send(&views.decide.reader, &views.decide.facts, draft.draft).unwrap_err()
+            authorized_send(&views.decisions.reader, &views.decisions.facts, draft.draft)
+                .unwrap_err()
         )
         .contains("not exact outcome \"send\""));
     }

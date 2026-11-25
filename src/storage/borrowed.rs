@@ -4,8 +4,8 @@
 
 use super::*;
 use anybytes::Bytes;
-use std::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use triblespace::core::blob::{BlobEncoding, IntoBlob};
 use triblespace::core::capability::CapabilityProof;
 use triblespace::core::collection::CollectionStore;
@@ -21,16 +21,28 @@ pub(crate) trait FacultyAccess:
 {
     fn with_local<T>(&mut self, operation: impl FnOnce(&mut Pile) -> Result<T>) -> Result<T>;
 
-    fn read_control(&self) -> Option<AcquiringReadControl> { None }
+    fn read_control(&self) -> Option<AcquiringReadControl> {
+        None
+    }
 
     #[cfg(test)]
-    fn before_orient_rank9_registration(&self, _label: &'static str) -> Result<()> { Ok(()) }
+    fn before_orient_rank9_registration(&self, _label: &'static str) -> Result<()> {
+        Ok(())
+    }
 
     #[cfg(test)]
-    fn before_orient_status_registration(&self) -> Result<()> { Ok(()) }
+    fn before_orient_status_registration(&self) -> Result<()> {
+        Ok(())
+    }
 
     #[cfg(test)]
-    fn before_orient_maintenance(&self, _label: &'static str, _projection: &'static str) -> Result<()> { Ok(()) }
+    fn before_orient_maintenance(
+        &self,
+        _label: &'static str,
+        _projection: &'static str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl FacultyAccess for FacultyStore {
@@ -61,45 +73,69 @@ pub(crate) struct BorrowError(anyhow::Error);
 #[cfg(test)]
 impl BorrowError {
     /// Classifier fixture only; does not simulate a failed store operation.
-    pub(crate) fn for_classification_test(cause: anyhow::Error) -> Self { Self(cause) }
+    pub(crate) fn for_classification_test(cause: anyhow::Error) -> Self {
+        Self(cause)
+    }
 }
 
 impl std::fmt::Display for BorrowError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 impl std::error::Error for BorrowError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.0.as_ref()) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
 }
 
 impl BorrowedStore {
-    pub(crate) fn open(storage: Storage, control: AcquiringReadControl, prepared: Arc<AtomicBool>)
-        -> Result<(Self, SigningKey, Arc<tokio::runtime::Runtime>)>
-    {
+    pub(crate) fn open(
+        storage: Storage,
+        control: AcquiringReadControl,
+        prepared: Arc<AtomicBool>,
+    ) -> Result<(Self, SigningKey, Arc<tokio::runtime::Runtime>)> {
         let (signer, runtime, remote) = borrow(&storage, &control, |store, signer, runtime| {
             Ok((signer.clone(), runtime.clone(), store.acquires_remotely()))
         })?;
-        Ok((Self { storage, control, prepared, runtime: runtime.clone(), remote,
-            #[cfg(test)]
-            registration: None,
-            #[cfg(test)]
-            cancel_in: None,
-        }, signer, runtime))
+        Ok((
+            Self {
+                storage,
+                control,
+                prepared,
+                runtime: runtime.clone(),
+                remote,
+                #[cfg(test)]
+                registration: None,
+                #[cfg(test)]
+                cancel_in: None,
+            },
+            signer,
+            runtime,
+        ))
     }
 
     fn control(&self) -> AcquiringReadControl {
         // Selection has one absolute deadline. Once its complete report is
         // owned by the caller, token admission/publication and Presented keep
         // the same cancellation but do not restart or expire that selection.
-        if self.prepared.load(Ordering::Acquire) { self.control.without_deadline() }
-        else { self.control.clone() }
+        if self.prepared.load(Ordering::Acquire) {
+            self.control.without_deadline()
+        } else {
+            self.control.clone()
+        }
     }
 
     fn local<T>(&self, operation: impl FnOnce(&mut FacultyStore) -> Result<T>) -> Result<T> {
         #[cfg(test)]
         if let Some(left) = &self.cancel_in {
-            if left.fetch_sub(1, Ordering::Relaxed) == 1 { self.control.cancel(); }
+            if left.fetch_sub(1, Ordering::Relaxed) == 1 {
+                self.control.cancel();
+            }
         }
-        borrow(&self.storage, &self.control(), |store, _, _| operation(store))
+        borrow(&self.storage, &self.control(), |store, _, _| {
+            operation(store)
+        })
     }
 }
 
@@ -128,41 +164,49 @@ impl SnapshotSource for BorrowedStore {
     type Snapshot = FacultySnapshot;
     type SnapshotError = BorrowError;
     fn snapshot(&mut self) -> std::result::Result<FacultySnapshot, BorrowError> {
-        self.local(|store| Ok(store.snapshot()?)).map_err(BorrowError)
+        self.local(|store| Ok(store.snapshot()?))
+            .map_err(BorrowError)
     }
 }
 
 impl BlobStorePut for BorrowedStore {
     type PutError = BorrowError;
     fn put<S, T>(&mut self, item: T) -> std::result::Result<Inline<Handle<S>>, BorrowError>
-    where S: BlobEncoding + 'static, T: IntoBlob<S>, Handle<S>: InlineEncoding,
+    where
+        S: BlobEncoding + 'static,
+        T: IntoBlob<S>,
+        Handle<S>: InlineEncoding,
     {
-        self.local(|store| Ok(store.put(item)?)).map_err(BorrowError)
+        self.local(|store| Ok(store.put(item)?))
+            .map_err(BorrowError)
     }
 }
 
 impl CollectionStore for BorrowedStore {
     type InsertError = BorrowError;
     fn insert(&mut self, record: CollectionRecord) -> std::result::Result<(), BorrowError> {
-        self.local(|store| Ok(CollectionStore::insert(store, record)?)).map_err(BorrowError)
+        self.local(|store| Ok(CollectionStore::insert(store, record)?))
+            .map_err(BorrowError)
     }
 }
 
 impl CapabilityProofStore for BorrowedStore {
     type InsertError = BorrowError;
     fn insert_proof(&mut self, proof: CapabilityProof) -> std::result::Result<(), BorrowError> {
-        self.local(|store| Ok(store.insert_proof(proof)?)).map_err(BorrowError)
+        self.local(|store| Ok(store.insert_proof(proof)?))
+            .map_err(BorrowError)
     }
 }
 
 impl AsyncBlobStoreAcquire for BorrowedStore {
     type AcquireError = BorrowError;
-    async fn acquire(&mut self, handle: Inline<Handle<UnknownBlob>>)
-        -> std::result::Result<Option<Bytes>, BorrowError>
-    {
+    async fn acquire(
+        &mut self,
+        handle: Inline<Handle<UnknownBlob>>,
+    ) -> std::result::Result<Option<Bytes>, BorrowError> {
         let snapshot = self.snapshot()?;
-        let reader = AcquiringReader::new(snapshot, self.runtime.clone())
-            .with_control(self.control());
+        let reader =
+            AcquiringReader::new(snapshot, self.runtime.clone()).with_control(self.control());
         match AsyncBlobStoreGet::get::<Bytes, UnknownBlob>(&reader, handle).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if triblespace::core::repo::is_missing_blob(&error) => Ok(None),
@@ -170,7 +214,9 @@ impl AsyncBlobStoreAcquire for BorrowedStore {
         }
     }
 
-    fn acquires_remotely(&self) -> bool { self.remote }
+    fn acquires_remotely(&self) -> bool {
+        self.remote
+    }
 }
 
 impl FacultyAccess for BorrowedStore {
@@ -178,23 +224,35 @@ impl FacultyAccess for BorrowedStore {
         self.local(|store| operation(&mut store.store()))
     }
 
-    fn read_control(&self) -> Option<AcquiringReadControl> { Some(self.control()) }
+    fn read_control(&self) -> Option<AcquiringReadControl> {
+        Some(self.control())
+    }
 
     #[cfg(test)]
     fn before_orient_rank9_registration(&self, label: &'static str) -> Result<()> {
-        if let Some(hook) = &self.registration { hook.pause(label, "register Rank9")?; }
+        if let Some(hook) = &self.registration {
+            hook.pause(label, "register Rank9")?;
+        }
         Ok(())
     }
 
     #[cfg(test)]
     fn before_orient_status_registration(&self) -> Result<()> {
-        if let Some(hook) = &self.registration { hook.pause("Compass status", "register")?; }
+        if let Some(hook) = &self.registration {
+            hook.pause("Goals status", "register")?;
+        }
         Ok(())
     }
 
     #[cfg(test)]
-    fn before_orient_maintenance(&self, label: &'static str, projection: &'static str) -> Result<()> {
-        if let Some(hook) = &self.registration { hook.pause(label, projection)?; }
+    fn before_orient_maintenance(
+        &self,
+        label: &'static str,
+        projection: &'static str,
+    ) -> Result<()> {
+        if let Some(hook) = &self.registration {
+            hook.pause(label, projection)?;
+        }
         Ok(())
     }
 }
@@ -216,7 +274,9 @@ pub(crate) mod registration_test {
     pub(crate) struct Release(pub(crate) Option<Sender<()>>);
     impl Drop for Release {
         fn drop(&mut self) {
-            if let Some(send) = self.0.take() { let _ = send.send(()); }
+            if let Some(send) = self.0.take() {
+                let _ = send.send(());
+            }
         }
     }
 
@@ -225,18 +285,36 @@ pub(crate) mod registration_test {
             Self::at("Relations", "register Rank9")
         }
 
-        pub(crate) fn at(label: &'static str, step: &'static str) -> (Self, Receiver<&'static str>, Sender<()>) {
+        pub(crate) fn at(
+            label: &'static str,
+            step: &'static str,
+        ) -> (Self, Receiver<&'static str>, Sender<()>) {
             let (entered, ready) = mpsc::channel();
             let (release, go) = mpsc::channel();
-            (Self { label, step, entered, release: std::sync::Mutex::new(Some(go)) }, ready, release)
+            (
+                Self {
+                    label,
+                    step,
+                    entered,
+                    release: std::sync::Mutex::new(Some(go)),
+                },
+                ready,
+                release,
+            )
         }
 
         pub(super) fn pause(&self, label: &'static str, step: &'static str) -> Result<()> {
-            if (label, step) != (self.label, self.step) { return Ok(()); }
+            if (label, step) != (self.label, self.step) {
+                return Ok(());
+            }
             // Neither this mutex nor the Storage owner spans the wait.
             let go = self.release.lock().unwrap().take();
-            let Some(go) = go else { return Ok(()); };
-            self.entered.send(label).context("observe Orient step rendezvous")?;
+            let Some(go) = go else {
+                return Ok(());
+            };
+            self.entered
+                .send(label)
+                .context("observe Orient step rendezvous")?;
             go.recv_timeout(Duration::from_secs(10))
                 .context("Orient step rendezvous release")?;
             // Do not check cancellation here: the real store operation must observe it.

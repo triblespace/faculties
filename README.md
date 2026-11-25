@@ -3,12 +3,12 @@
 An office suite for AI agents.
 
 Faculties are shared Rust capabilities with CLI and MCP frontends that give
-an agent a stable workspace: a kanban board, a personal wiki, a file organizer,
+an agent a stable workspace: a kanban board, a personal knowledge base, a file organizer,
 situation awareness, direct messaging, and more. They persist their state in a [TribleSpace](https://github.com/triblespace/triblespace-rs)
 pile — typically `./self.pile` — so the agent owns its own history
 across sessions.
 
-![viewer composing activity, wiki, compass, and messages widgets](preview.png)
+![viewer composing activity, knowledge, goals, and messages widgets](preview.png)
 
 ## Getting started
 
@@ -84,14 +84,14 @@ trible pile create ./self.pile
 trible pile signing-key init ./self.pile
 export PILE=./self.pile
 
-compass add "ship the demo" --status doing
-wiki create "Hello" "First *typst* fragment."
+goals add "ship the demo" --status doing
+knowledge create "Hello" "First *typst* fragment."
 viewer               # picks up PILE from the environment
 ```
 
 ### Import a Gollum wiki
 
-Give Wiki a local Git working tree, bare repository, or self-contained Git bundle.
+Give Knowledge a local Git working tree, bare repository, or self-contained Git bundle.
 Use the workspace revision from `faculties workspace list` to select the destination.
 
 ```sh
@@ -99,17 +99,17 @@ wiki --workspace "$workspace_revision" import gollum "/path/to/studio wiki.bundl
 ```
 
 The command requires Git and Python 3. It imports committed articles and their
-history into Wiki. Each converted revision links to its exact original file.
+history into Knowledge. Each converted revision links to its exact original file.
 Files holds those originals, attachments and redirect metadata. The input Git
-bundle stays local. Each Wiki revision retains the source commit, path, author
+bundle stays local. Each Knowledge revision retains the source commit, path, author
 and date. Repeated imports reuse the existing history. For articles imported
-by an earlier version, Wiki adds the source citation to their provenance and
+by an earlier version, Knowledge adds the source citation to their provenance and
 displays it alongside the original revision text. Existing revision IDs and
 exact text exports stay stable. New commits extend those histories. A source occurrence
 that matches multiple histories is reported before anything is published.
 
-The adapter ships inside the Wiki binary. `wiki import <file.typ>` and
-`wiki import --plan plan.json` remain available for other sources.
+The adapter ships inside the Knowledge binary. `knowledge import <file.typ>` and
+`knowledge import --plan plan.json` remain available for other sources.
 
 ### Use an existing Erlkonig workspace from the CLI
 
@@ -121,11 +121,11 @@ key are bootstrap inputs, separate from choosing a workspace:
 export PILE=/path/to/existing/self.pile
 export TRIBLESPACE_KEY=/path/to/existing/self.key
 faculties workspace list
-wiki --workspace '<exact-revision-from-the-list>' list
+knowledge --workspace '<exact-revision-from-the-list>' list
 
 # Optional shell convenience; an explicit --workspace takes precedence.
 export FACULTIES_WORKSPACE='<exact-revision-from-the-list>'
-compass list
+goals list
 ```
 
 Discovery prints current exact revision IDs, labels, role routes, and reasons
@@ -177,14 +177,14 @@ all adapters together, including `viewer_capture` and `search`. See the
 
 Shared operations own domain logic, resident inputs, observations and write
 receipts; a Rust caller does not construct argv, an MCP request, or parse stdout
-to use them. Each frontend owns its UX. Atlas and Files use the optional CLI
+to use them. Each frontend owns its UX. Schemas and Files use the optional CLI
 declaration helper; the other ordinary CLIs retain tailored parsers and use
 `cli::with_output` where appropriate. MCP schemas are independent of those
 parsers. Cargo shares compilation within a build configuration, while binaries
 still link separately.
 
 ```sh
-atlas --pile ./self.pile list
+schemas --pile ./self.pile list
 files --pile ./self.pile view <file-id> --accept image/png --max-dimension 1024
 search --pile ./self.pile --workspace <exact-revision> query "notification owner"
 faculties mcp --pile ./self.pile
@@ -208,7 +208,7 @@ tools cannot substitute those paths. Additional launcher configuration is:
 | --- | --- |
 | Discord bot access | Pile-backed `discord auth set <exact-secrets-version>`; no launcher token |
 | LinkedIn DMA pulls | Optional `--linkedin-token` / `LINKEDIN_TOKEN` |
-| Files, Memory and Wiki semantic index and search | With the `wemm` feature on a GB10: `WEMM_ROOT`, the complete WeMM model root (weights, tokenizer, configuration and chat template) in the working pile's `models` collection, which `TRIBLESPACE_COLLECTION_MODELS` names. Other machines carry the replicated index rows but cannot query them |
+| Files, Memory and Knowledge semantic index and search | With the `wemm` feature on a GB10: `WEMM_ROOT`, the complete WeMM model root (weights, tokenizer, configuration and chat template) in the working pile's `models` collection, which `TRIBLESPACE_COLLECTION_MODELS` names. Other machines carry the replicated index rows but cannot query them |
 | Existing Duplex session | Optional `--duplex-session` / `DUPLEX_SESSION` directory |
 | Finite Hear inference | `--hear-model-pile`, `--hear-config-json`, and `--hear-tokenizer-json` together; corresponding `HEAR_MODEL_PILE`, `HEAR_CONFIG_JSON`, `HEAR_TOKENIZER_JSON` variables, plus optional `--hear-model` / `HEAR_MODEL` |
 
@@ -234,7 +234,7 @@ provisioning Secrets and binding its version before upgrading the launcher.
 
 Semantic search runs on **one** native WeMM model (the `wemm` feature, NVIDIA
 GB10 compute 12.1 only) for text, images and documents in one 4096-D space:
-`files similar`, `memory similar` and `wiki similar`, plus `memory context
+`files similar`, `memory similar` and `knowledge similar`, plus `memory context
 --about/--filter/--remove`, which fall back to exact BM25 when no model is
 configured. Each faculty declares one derived collection of NVFP4 rows keyed by
 content handle over its source collection: an image whole, and text (HTML
@@ -371,7 +371,7 @@ options use JSON numbers. Typed decoders reject duplicate/unknown fields;
 nested record fields require JSON objects, not positional arrays.
 
 Attribution is explicit in MCP: for example, Message requires `from`, Mail
-read tracking requires `persona`, and Compass writes accept optional
+read tracking requires `persona`, and Goals writes accept optional
 `persona`. No adapter silently takes `PERSONA`, `TURN_ID`, or `WORKER_ID`
 from the host to attribute an action. These fields are cooperative attribution,
 not authentication: publication still uses the configured signer and collection
@@ -383,7 +383,7 @@ authority.
 | Export original | `files get ID path` or `files get ID @-` | `files_get {"id":"ID"}` |
 | Import bytes | `files add path` | `files_add {"name":"notes.txt","mime":"text/plain","data":"base64…"}` |
 | Resolve a batch | `files resolve @path` or `files resolve @-` | `files_resolve {"selectors":["ID","files:HASH"]}` |
-| Render a notebook | `atlas-capture --headless --out-dir captures` | `viewer_capture {"target":"atlas"}` |
+| Render a notebook | `schemas-capture --headless --out-dir captures` | `viewer_capture {"target":"atlas"}` |
 
 MCP resident reads do not imply a fresh external sync. `teams_read` and
 `discord_read` inspect the archive; their `*_pull` tools explicitly contact
@@ -400,7 +400,7 @@ Some useful capabilities deliberately remain host interfaces:
 | --- | --- |
 | Orient waits and Memory's local cover-chunk cache | Finite Orient observations and resident Memory context/replay tools |
 | Teams interactive OAuth; Mail password input | Safe auth metadata and exact Secrets-version configuration |
-| Files directory extraction; Wiki batch directories; local import paths | Resident records/bytes, document imports, and explicit resource exports |
+| Files directory extraction; Knowledge batch directories; local import paths | Resident records/bytes, document imports, and explicit resource exports |
 | Posture Git/hook/sweep commands | Resident document scanning and recorded findings/policy tools |
 | Reason/Patience command execution wrappers | Explicit reasoning/action records and timeout-extension requests |
 | Body robot/daemon/camera actions | Already acquired captures, intent state, raw exports and bounded views |
@@ -409,7 +409,7 @@ Some useful capabilities deliberately remain host interfaces:
 | Discord's live gateway session (`discord live`: message intake, and with `discord-voice` a voice connection that plays the say requests `discord say` publishes into the discord collection) | The resident chat archive intake writes, and explicit pulls/sends |
 | GUI startup and filesystem/web notebook exports | Finite resident PNG capture from the shared composition |
 
-Planner's local `today`/`week` convenience commands become explicit time
+Events's local `today`/`week` convenience commands become explicit time
 windows in MCP. Host-only does not mean the functionality is trapped in a binary:
 configured device/runtime libraries remain separate from the finite MCP UX.
 
@@ -524,12 +524,12 @@ render PDFs or transcode audio. Unsupported formats, malformed inputs and
 results that cannot fit fail explicitly. The CLI Drive sink's narrow WAV
 adaptation is described below.
 
-Wiki `show` presents text and follows the current frontier unless `exact`
+Knowledge `show` presents text and follows the current frontier unless `exact`
 is requested. `export` returns the selected revision's exact UTF-8 bytes:
 a binary MCP resource, or raw CLI stdout even with Drive configured. Unresolved
-forks stay visible rather than being arbitrarily selected. Wiki create/edit
+forks stay visible rather than being arbitrarily selected. Knowledge create/edit
 retain Typst validation; its world denies external file/import access, but is
-not CPU/memory isolation. MCP `wiki_check` omits the CLI's compile option.
+not CPU/memory isolation. MCP `knowledge_check` omits the CLI's compile option.
 
 URL fetch imports acquired bytes directly and enforces its download budget;
 requests originate on the server host. CLI extraction acquires its complete
@@ -544,7 +544,7 @@ image/audio parts. With `DRIVE_ENDPOINT`, perception goes to Drive's existing
 fallback on delivery failure:
 
 ```sh
-DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' atlas --pile ./self.pile list
+DRIVE_ENDPOINT='<endpoint-id>@127.0.0.1:port' schemas --pile ./self.pile list
 ```
 
 For Drive, `files view` defaults to text, PNG/JPEG, and WAV MIME aliases
@@ -581,7 +581,7 @@ a migration.
 
 ### Reading cold blobs from peers
 
-`relations`, `message`, `orient`, `wiki`, `compass`, and ordinary `files` commands
+`relations`, `message`, `orient`, `knowledge`, `goals`, and ordinary `files` commands
 use a live store for foreground acquisition. If an explicitly requested
 descriptor, fact fragment, or selected payload is absent locally, they discover a provider
 through the blob DHT and cache its bytes. Files similarity and embedding
@@ -634,24 +634,24 @@ acquired a live boundary.
 
 If you're an AI agent landing in this repo for the first time —
 or setting one up — the `bootstrap` binary carries a curated onboarding
-seed: 21 Wiki entries, fully cross-linked into a guided
+seed: 21 Knowledge entries, fully cross-linked into a guided
 tour (a start-here hub plus a "Next stop" spine), in four layers:
 
-  1. **Foundations** (7) — faculty model and authoring, wiki
-     authoring, compass workflow, the work-as-its-own-ledger
+  1. **Foundations** (7) — faculty model and authoring, knowledge
+     authoring, goals workflow, the work-as-its-own-ledger
      principle, tool selection lookup, and the getting-started hub.
   2. **Specific faculties** (6) — files, teams, message,
      orient, relations, web — one fragment each, used when you
      reach for that faculty in practice.
   3. **Recipes and coordination** (4) — chained-faculty workflows:
-     research (compass → web → files → wiki), multi-agent
-     coordination (relations + message + orient + compass), harness
+     research (goals → web → files → knowledge), multi-agent
+     coordination (relations + message + orient + goals), harness
      hooks, and collection-policy grants plus `pile net` synchronization.
   4. **Substrate concepts** (4) — what a trible is, the pile,
      monotonic merge, and the architecture (why no faculty
      contains sync code) — Substrate 1/4 through 4/4.
 
-Plus 7 `#bootstrap`-tagged compass goals walking through hands-on
+Plus 7 `#bootstrap`-tagged goals walking through hands-on
 faculty use (mint an id, create a fragment, archive a file, run
 lint/check, mark a goal done with an outcome note).
 
@@ -664,29 +664,29 @@ export PILE=./self.pile
 bootstrap import
 
 # Verify:
-wiki list --tag bootstrap          # 21 fragments
-compass list                       # 7 hands-on goals in TODO
+knowledge list --tag bootstrap          # 21 fragments
+goals list                       # 7 hands-on goals in TODO
 ```
 
 The logical seed is built deterministically from the checked-in
-`bootstrap/*.typ` sources. Bootstrap signs the Wiki and Compass content COMMITs
+`bootstrap/*.typ` sources. Bootstrap signs the Knowledge and Goals content COMMITs
 directly with the recipient's durable key into deterministic collections whose
 READ and WRITE policies are rooted at that key. No release-builder signature,
 authority census, branch identity, or seed private key is transplanted.
 Re-running `bootstrap import` with the same key is exactly idempotent.
 
-For each of the 21 Wiki entries, a later bootstrap generation advances only
+For each of the 21 Knowledge entries, a later bootstrap generation advances only
 the recognizable imported source strand. Recipient edits are never silently
 superseded: they remain visible as frontier forks for explicit reconciliation.
 
-Then start with `wiki show <id>` on the "Getting Started: Your
+Then start with `knowledge show <id>` on the "Getting Started: Your
 First Hour" fragment (tagged `start-here`) — that's the orientation
 tour that points at every other piece.
 
 The bootstrap is ordinary source: edit `bootstrap/*.typ` and the
 declarative manifest in `src/bootstrap.rs`, then run
 `bootstrap/build.sh`. The verifier imports into a throwaway recipient,
-checks exact replay, and validates the Wiki and Compass projections.
+checks exact replay, and validates the Knowledge and Goals projections.
 The prose is embedded at compile time: editing the sources does not update an
 already installed `bootstrap` binary. Include a rebuilt importer in the next
 tested native cohort before importing that generation. There is no pre-signed
@@ -720,19 +720,19 @@ schemas describe exact arguments and effects.
 | Faculty | Purpose |
 | --- | --- |
 | `archive` | Resident conversation imports, provenance, search and replay |
-| `atlas` | Cross-collection catalog inspection |
+| `schemas` | Cross-collection catalog inspection |
 | `body` | Deliberate sensory captures and intent; separate host robot/device API |
 | `bootstrap` | Idempotent recipient-authored onboarding import |
 | `code` | Source catalogue: definitions, unresolved usage, duplication and capability search |
 | `cognition` | Validate shared execution/context evidence |
-| `compass` | Goals, status, priority edges and referenceable ledger notes |
-| `decide` | Proposals, factors and fork-visible decision resolutions |
+| `goals` | Goals, status, priority edges and referenceable ledger notes |
+| `decisions` | Proposals, factors and fork-visible decision resolutions |
 | `discord` | Resident chat archive, explicit bot pulls/sends, channel discovery, and a live gateway session (`discord live`: message intake, and voice with `discord-voice`) |
 | `duplex` | Finite session interaction; separate continuous host speech runtime |
 | `files` | Blob import, tags, discovery, perception and exact export |
-| `gauge` | Research-health, link and quality diagnostics |
+| `knowledge` | Research-health, link and quality diagnostics |
 | `habit` | Standing intentions, activation and explicitly evaluated predicates |
-| `headspace` | Fork-visible model/profile configuration and credential references |
+| `profiles` | Fork-visible model/profile configuration and credential references |
 | `hear` | Resident-clip hearing/embeddings; separate continuous listener |
 | `home` | Hue lights, live from the bridge: rooms, lights, scenes, on/off/dim, with each change recorded |
 | `imagine` | Local image generation and optional memory publication |
@@ -742,18 +742,18 @@ schemas describe exact arguments and effects.
 | `message` | Direct messages and explicit per-reader acknowledgements |
 | `orient` | Situation awareness and directed news; CLI background waits |
 | `patience` | Explicit execution timeout-extension requests |
-| `planner` | Calendar events, recurrence windows, notes and resident iCalendar import |
+| `events` | Calendar events, recurrence windows, notes and resident iCalendar import |
 | `posture` | Disclosure candidates, coverage and policy over resident documents |
 | `quota` | Provider-reported subscription quota per window: record readings, show latest, pace and staleness |
 | `reason` | Reasoning notes and intended-action evidence |
 | `relations` | People, full profiles, groups and non-destructive identity verdicts |
-| `search` | One grouped lexical query: current Wiki text, selected Memory summaries and Files metadata; exact source identities and unavailable-source diagnostics |
+| `search` | One grouped lexical query: current Knowledge text, selected Memory summaries and Files metadata; exact source identities and unavailable-source diagnostics |
 | `secrets` | Encrypted versions, resource-specific grants and explicit retrieval/maintenance |
 | `teams` | Resident Graph archive, explicit sync/actions and professional context |
-| `triage` | Execution-loop, timeline and context diagnostics |
+| `diagnostics` | Execution-loop, timeline and context diagnostics |
 | `voice` | Resident speech synthesis and routing policy; host playback separately |
 | `web` | Explicit web search/fetch and optional evidence recording |
-| `wiki` | Typst knowledge, revisions/frontiers, links, tags, search and audits |
+| `knowledge` | Typst knowledge, revisions/frontiers, links, tags, search and audits |
 | `viewer` and `*-capture` | Shared notebooks; one finite `viewer_capture` MCP tool |
 | `zooid` | Task zooids named by their brief, each a headless Claude session in its own systemd user unit; runs, exits and reports |
 
@@ -1079,7 +1079,7 @@ foreign MERGE and MAP records remain inert. Attached indexes have no independent
 policy. Audit unfamiliar piles explicitly before accepting them as trusted
 local storage, whose record signatures are not reverified during replay.
 
-Relations, Message, Compass, and Wiki do not require a reader to be a producer.
+Relations, Message, Goals, and Knowledge do not require a reader to be a producer.
 Acquiring a selected read is distinct from maintenance or derivation, and WRITE
 is not a prerequisite for reading shared data. Transport READ must cover each
 collection through which records or exact blobs are requested; a derived
@@ -1173,20 +1173,20 @@ keeps using it until the route itself is changed.
 
 The `viewer` binary composes the full [GORBIE] faculty dashboard against one pile. The
 **Colony** section shows the selected workspace’s parent personas, their spawned
-runs, recorded Compass work, JP requests and report acknowledgments. It reads
-the routed Spawn, Compass, Message and Relations evidence when expanded.
+runs, recorded Goals work, JP requests and report acknowledgments. It reads
+the routed Spawn, Goals, Message and Relations evidence when expanded.
 Active people with the `zooid` affinity appear in the roster even if they
 have never spawned a worker. Task zooids appear under the parent recorded
 on their run. A run without a recorded
 end has unknown current activity on a desktop without unit observations.
-The 10 small capture binaries select shared compositions for Atlas, Discord,
-Files, Gauge, Headspace, Memory, Messages, Planner, Teams and Triage.
+The 10 small capture binaries select shared compositions for Schemas, Discord,
+Files, Knowledge health, Profiles, Memory, Messages, Events, Teams and Diagnostics.
 They retain GORBIE's explicit window, headless-file and web-export CLI UX;
 help/version do not start a GPU or open a pile.
 
 ```sh
 cargo run --release --bin viewer -- ./self.pile
-atlas-capture --pile ./self.pile --headless --out-dir captures
+schemas-capture --pile ./self.pile --headless --out-dir captures
 ```
 
 Rust callers can use `viewer::Viewer::capture_with` for typed resident PNG
@@ -1204,7 +1204,7 @@ budget applies separately. Dashboard composition may initialize its widgets'
 own GPU computations. An error stops delivery without retrying accepted pages.
 
 Standalone embedding examples remain under `examples/`:
-`compass_board.rs`, `wiki_viewer.rs`, `messages_panel.rs`,
+`goals_board.rs`, `knowledge_viewer.rs`, `messages_panel.rs`,
 `branch_timeline.rs`, and `pile_inspector.rs`.
 
 [GORBIE]: https://github.com/triblespace/GORBIE

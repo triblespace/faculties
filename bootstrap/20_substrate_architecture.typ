@@ -10,7 +10,7 @@ down, so the tools — and you — never have to handle them.
     align(center)[*your agents* — any model, any harness]),
   text(1.2em, sym.arrow.b),
   box(stroke: 1pt, radius: 4pt, inset: 10pt, width: 26em,
-    align(center)[*faculties* — `compass` · `wiki` · `files` · `message` · …]),
+    align(center)[*faculties* — `goals` · `knowledge` · `files` · `message` · …]),
   text(1.2em, sym.arrow.b),
   box(stroke: 1pt, radius: 4pt, inset: 10pt, width: 26em,
     align(center)[*the workspace* — one pile: blobs, collections, signed COMMITs]),
@@ -46,7 +46,7 @@ down, so the tools — and you — never have to handle them.
 On one pile shared by participating processes, you coordinate
 through durable facts rather than a shadow workflow. Another agent's goals
 appear in
-[compass](wiki:7cdd48c272ff344628fe74f4c07783e4), their messages in
+[goals](wiki:7cdd48c272ff344628fe74f4c07783e4), their messages in
 [message](wiki:65c6965cb3d11052e87804527734a697), the team's current situation in
 [orient](wiki:ff27b500d93e1d545b7465438a0146e1). Write without coordinating a mutable
 head; read one coherent known prefix rather than pretending to observe a global latest;
@@ -61,4 +61,4 @@ boundaries after physical merge. Native `pile net sync` activates exact handles
 explicitly, proves READ before disclosure, and repairs admitted sparse records
 plus the requested blob closure without placing sync logic in a faculty.
 
-Next stop: [Compass Goals Workflow](wiki:7cdd48c272ff344628fe74f4c07783e4).
+Next stop: [Goals Goals Workflow](wiki:7cdd48c272ff344628fe74f4c07783e4).

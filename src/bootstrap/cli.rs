@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Import 21 Wiki fragments and seven Compass goals idempotently.
+    /// Import 21 Knowledge fragments and seven goals idempotently.
     Import,
 }
 

@@ -22,7 +22,7 @@ A trible is exactly 64 bytes:
     or *derived from content* — same content, same id, on
     every machine, with no coordination.
   - *Attribute*: a 128-bit id naming the fact kind
-    (`compass status`, `wiki title`, …). Minted once,
+    (`goals status`, `knowledge title`, …). Minted once,
     never guessed.
   - *Value*: 32 bytes. Small values (timestamps, weights,
     other entity ids) live inline. Text, however short, and

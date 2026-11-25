@@ -65,7 +65,7 @@ enum Command {
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
         /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// uses 240,000 journal characters, and up to 40,000 of Wiki readings
+        /// uses 240,000 journal characters, and up to 40,000 of Knowledge readings
         /// beside them.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,
@@ -75,7 +75,7 @@ enum Command {
         #[arg(long, value_name = "TOKENS", requires = "cover")]
         window: Option<u64>,
     },
-    /// Launch a zooid for a Compass goal: the brief is rendered from the
+    /// Launch a zooid for a goal: the brief is rendered from the
     /// goal's title, its parent chain and its latest notes, plus the zooid's
     /// authority to note, move and check off the goal itself.
     ///
@@ -110,7 +110,7 @@ enum Command {
         /// percent, for memories, beliefs and goals together (e.g. 20). Best
         /// effort: goals render whole, so the cover may come out
         /// larger; the sizing is printed and recorded. Without it the cover
-        /// uses 240,000 journal characters, and up to 40,000 of Wiki readings
+        /// uses 240,000 journal characters, and up to 40,000 of Knowledge readings
         /// beside them.
         #[arg(long, value_name = "PERCENT")]
         cover: Option<f64>,

@@ -74,7 +74,7 @@ enum Command {
         #[arg(long, value_name = "URL", requires = "http_listen")]
         http_origin: Vec<String>,
     },
-    /// Keep the WeMM indexes of Memory, Wiki and Files derived: bind the model
+    /// Keep the WeMM indexes of Memory, Knowledge and Files derived: bind the model
     /// once, derive every commit that has no rows, and again whenever the pile
     /// grows. Prints a line for an index only when a pass derived something
     /// or left something missing. Exits 0 when a compaction replaces the
@@ -253,11 +253,11 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
         std::env::var_os("FACULTIES_WORKSPACE").is_none(),
         "faculties maintain does not support workspace selection; unset FACULTIES_WORKSPACE to use its explicit model bootstrap"
     );
-    use faculties::{files::Files, memory::Memory, wiki::Wiki};
+    use faculties::{files::Files, knowledge::Knowledge, memory::Memory};
 
     let storage = faculties::storage::Storage::shared(pile.clone(), key);
     let memory = Memory::with_storage(storage.clone());
-    let wiki = Wiki::with_storage(storage.clone());
+    let knowledge = Knowledge::with_storage(storage.clone());
     let files = Files::with_storage(storage.clone());
     let session = faculties::wemm::Session::from_env(&pile)?;
     // Off unless WEMM_PROBE_DIR names a directory (faculties::wemm::probe).
@@ -275,7 +275,7 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
                 }
             };
             report("memory", memory.derive_wemm(&session).context("memory")?);
-            report("wiki", wiki.derive_wemm(&session).context("wiki")?);
+            report("wiki", knowledge.derive_wemm(&session).context("wiki")?);
             report("files", files.derive_wemm(&session).context("files")?);
             Ok(())
         },

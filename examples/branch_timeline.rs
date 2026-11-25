@@ -1,6 +1,6 @@
 //! Minimal GORBIE notebook that embeds `faculties::widgets::BranchTimeline`.
 //!
-//! Run against a pile whose viewer catalog provides the wiki dataset:
+//! Run against a pile whose viewer catalog provides the knowledge dataset:
 //!
 //! ```ignore
 //! cargo run --example branch_timeline --features widgets -- ./self.pile
@@ -41,9 +41,9 @@ fn main(nb: &mut NotebookCtx) {
     nb.state(
         "timeline",
         || {
-            BranchTimeline::multi(vec![TimelineSource::Wiki {
-                key: SourceKey::Wiki,
-                label: "wiki".into(),
+            BranchTimeline::multi(vec![TimelineSource::Knowledge {
+                key: SourceKey::Knowledge,
+                label: "knowledge".into(),
             }])
         },
         move |ctx, tl| {

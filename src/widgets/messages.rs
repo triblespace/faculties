@@ -91,9 +91,9 @@ fn format_timestamp_key(key: i128) -> String {
     format!("{y:04}-{m:02}-{d:02} {h:02}:{min:02}:{s:02} UTC")
 }
 
-// ── Color palette (reuses compass.rs conventions) ────────────────────
+// ── Color palette (reuses goals.rs conventions) ────────────────────
 
-// Theme-adaptive neutrals (mirror of compass.rs). The accent /
+// Theme-adaptive neutrals (mirror of goals.rs). The accent /
 // read / person colors are legible on both themes, but the
 // frame / bubble / muted greys need to flip so theme-aware text
 // doesn't land dark-on-dark in light mode.
@@ -513,7 +513,8 @@ impl MessagesPanel {
             let need_refresh = match self.live.as_ref() {
                 None => true,
                 Some(l) => {
-                    l.cached_revision != revision || l.relations_cached_revision != relations_revision
+                    l.cached_revision != revision
+                        || l.relations_cached_revision != relations_revision
                 }
             };
             if need_refresh {
@@ -786,7 +787,7 @@ fn render_message(
             .fill(bubble_fill)
             .stroke(egui::Stroke::new(STROKE_INSET, color_frame(ui)))
             // Hard offset shadow + sharp corners: same paper-card idiom
-            // compass goals use, giving the bubble physical "lift" instead
+            // goals use, giving the bubble physical "lift" instead
             // of a backlit LCD look.
             .shadow(egui::epaint::Shadow {
                 offset: [2, 2],

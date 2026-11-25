@@ -9,7 +9,7 @@
 //! A finding's id is `(modality, carrier, inner locator)`. It used to be
 //! `(modality, path, commit:path:line, value)`, and commit surgery destroyed
 //! that: a rebase, cherry-pick, amend or history scrub gives the same material
-//! a new `commit:path:line`, hence a new id, so every Decide resolution
+//! a new `commit:path:line`, hence a new id, so every Decisions resolution
 //! silently stopped applying and the finding re-blocked.
 //!
 //! The coordinate is MODALITY-DEPENDENT on purpose. Source material has a git

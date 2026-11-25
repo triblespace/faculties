@@ -1,0 +1,564 @@
+//! Configured operations over one frozen authorized Decide observation.
+#[cfg(test)]
+use crate::storage::FactView;
+use std::path::PathBuf;
+
+use crate::clock;
+#[cfg(test)]
+use crate::collection_names::open_configured;
+use crate::decisions::{
+    self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
+};
+use crate::schemas::decide::DEFAULT_SCOPE_ID;
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
+use anyhow::{anyhow, bail, Context, Result};
+use hifitime::Epoch;
+use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace::core::blob::encodings::succinctarchive::{
+    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+};
+use triblespace::core::collection::{Collection, CollectionStoreExt};
+use triblespace::core::metadata;
+use triblespace::core::repo::SnapshotSource;
+use triblespace::prelude::*;
+
+#[derive(Clone, Debug)]
+pub struct Decisions {
+    storage: crate::storage::Storage,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ProposedDecision {
+    pub decision: Id,
+    pub genesis: Id,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct AddedFactor {
+    pub decision: Id,
+    pub factor: Id,
+    pub side: FactorSide,
+}
+#[derive(Clone, Debug)]
+pub struct ResolutionReceipt {
+    pub decision: Id,
+    pub head: Id,
+    pub result: Option<Id>,
+    pub forced: bool,
+    pub evidence: Vec<Id>,
+    pub predecessors: Vec<Id>,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ListOptions {
+    pub all: bool,
+    pub forced: bool,
+}
+#[derive(Clone, Debug)]
+pub struct DecisionSummary {
+    pub id: Id,
+    pub genesis: DecisionGenesis,
+    pub title: String,
+    pub pros: usize,
+    pub cons: usize,
+    pub resolution: Resolution,
+    /// Present only for a semantically resolved state. No outcome is selected
+    /// from divergent or invalid heads.
+    pub outcome: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct FactorDetail {
+    pub record: FactorRecord,
+    pub text: String,
+}
+#[derive(Clone, Debug)]
+pub struct ResolutionText {
+    pub head: Id,
+    pub outcome: String,
+}
+#[derive(Clone, Debug)]
+pub struct DecisionDetail {
+    pub id: Id,
+    pub genesis: DecisionGenesis,
+    pub title: String,
+    pub context: Option<String>,
+    pub factors: Vec<FactorDetail>,
+    pub resolution: Resolution,
+    pub outcomes: Vec<ResolutionText>,
+}
+
+/// Pure domain validation; no @file/stdin expansion.
+pub fn validate_prose(text: &str, field: &str) -> Result<()> {
+    super::canonical_required(text, field).map(|_| ())
+}
+pub fn result_id(raw: &str) -> Result<Id> {
+    let raw = raw.trim();
+    decisions::result_tag(raw)
+        .or_else(|| Id::from_hex(raw))
+        .ok_or_else(|| {
+            anyhow!(
+                "unknown result '{raw}'; expected a 32-character id or one of: {}",
+                decisions::RESULT_TAGS
+                    .iter()
+                    .map(|(label, _)| *label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+impl Decisions {
+    pub fn new(pile: PathBuf, key: Option<PathBuf>) -> Self {
+        Self::with_storage(crate::storage::Storage::new(pile, key))
+    }
+    pub fn with_storage(storage: crate::storage::Storage) -> Self {
+        Self { storage }
+    }
+    fn storage(&self) -> DecisionsStorage<'_> {
+        DecisionsStorage {
+            storage: &self.storage,
+        }
+    }
+    pub fn propose(
+        &self,
+        title: &str,
+        context: Option<&str>,
+        about: Option<Id>,
+    ) -> Result<ProposedDecision> {
+        validate_prose(title, "decision title")?;
+        if let Some(context) = context {
+            validate_prose(context, "decision context")?;
+        }
+        let decision = genid().id;
+        self.storage().update("propose Decisions decision", |_| {
+            let (fragment, genesis) = decisions::decision_fragment(
+                decision,
+                title,
+                context.map(str::to_owned),
+                about,
+                epoch_interval(now_epoch()?),
+            )?;
+            Ok((fragment, ProposedDecision { decision, genesis }))
+        })
+    }
+    pub fn factor(&self, input: &str, text: &str, side: FactorSide) -> Result<AddedFactor> {
+        validate_prose(text, "factor text")?;
+        let description = match side {
+            FactorSide::Pro => "add Decide pro factor",
+            FactorSide::Con => "add Decide con factor",
+        };
+        self.storage().update(description, |view| {
+            let decision = resolve_decision(input, &view.facts)?;
+            ensure_missing(
+                &decisions::resolution(&view.facts, decision),
+                "add a factor",
+                decision,
+            )?;
+            let (fragment, factor) = decisions::factor_fragment(
+                genid().id,
+                decision,
+                side,
+                text,
+                epoch_interval(now_epoch()?),
+            )?;
+            Ok((
+                fragment,
+                AddedFactor {
+                    decision,
+                    factor,
+                    side,
+                },
+            ))
+        })
+    }
+    pub fn resolve(
+        &self,
+        decision: &str,
+        outcome: &str,
+        result: Option<Id>,
+        forced: bool,
+    ) -> Result<ResolutionReceipt> {
+        self.finish_resolution(decision, outcome, result, forced, false)
+    }
+    pub fn reconcile(
+        &self,
+        decision: &str,
+        outcome: &str,
+        result: Option<Id>,
+        forced: bool,
+    ) -> Result<ResolutionReceipt> {
+        self.finish_resolution(decision, outcome, result, forced, true)
+    }
+    fn finish_resolution(
+        &self,
+        input: &str,
+        outcome: &str,
+        result: Option<Id>,
+        forced: bool,
+        reconcile: bool,
+    ) -> Result<ResolutionReceipt> {
+        validate_prose(outcome, "resolution outcome")?;
+        let description = if reconcile {
+            "reconcile Decisions resolution fork"
+        } else {
+            "resolve Decisions decision"
+        };
+        self.storage().update(description, |view| {
+            let decision = resolve_decision(input, &view.facts)?;
+            let state = decisions::resolution(&view.facts, decision);
+            let predecessors = if reconcile {
+                reconciliation_heads(state, decision)?
+            } else {
+                ensure_missing(&state, "resolve it again", decision)?;
+                Vec::new()
+            };
+            let mut evidence = evidence(&view.facts, decision, forced)?;
+            evidence.sort_unstable();
+            let (fragment, head) = decisions::resolution_fragment(
+                decision,
+                outcome,
+                result,
+                forced,
+                &evidence,
+                &predecessors,
+                epoch_interval(now_epoch()?),
+            )?;
+            Ok((
+                fragment,
+                ResolutionReceipt {
+                    decision,
+                    head,
+                    result,
+                    forced,
+                    evidence,
+                    predecessors,
+                },
+            ))
+        })
+    }
+    pub fn list(&self, options: ListOptions) -> Result<Vec<DecisionSummary>> {
+        self.storage().with_view(|view| {
+            collect_decisions(view)?
+                .into_iter()
+                .filter(|row| {
+                    if options.forced {
+                        common_snapshot(&row.resolution).is_some_and(|snapshot| snapshot.forced)
+                    } else if options.all {
+                        true
+                    } else {
+                        matches!(
+                            row.resolution,
+                            Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_)
+                        )
+                    }
+                })
+                .map(|row| {
+                    let title = decisions::read_text(&view.reader, row.genesis.title)?;
+                    let outcome = common_snapshot(&row.resolution)
+                        .map(|snapshot| decisions::read_text(&view.reader, snapshot.outcome))
+                        .transpose()?;
+                    Ok(DecisionSummary {
+                        id: row.id,
+                        genesis: row.genesis,
+                        title,
+                        pros: row.pros,
+                        cons: row.cons,
+                        resolution: row.resolution,
+                        outcome,
+                    })
+                })
+                .collect()
+        })
+    }
+    pub fn show(&self, input: &str) -> Result<DecisionDetail> {
+        self.storage().with_view(|view| {
+            let id = resolve_decision(input, &view.facts)?;
+            let genesis = decisions::genesis_for_decision(&view.facts, id)?
+                .ok_or_else(|| anyhow!("decision {id:x} has no genesis"))?;
+            let title = decisions::read_text(&view.reader, genesis.title)?;
+            let context = genesis
+                .context
+                .map(|handle| decisions::read_text(&view.reader, handle))
+                .transpose()?;
+            let factors = decisions::factors_for_decision(&view.facts, id)?
+                .into_iter()
+                .map(|record| {
+                    Ok(FactorDetail {
+                        text: decisions::read_text(&view.reader, record.text)?,
+                        record,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let resolution = decisions::resolution(&view.facts, id);
+            let snapshots: &[ResolutionSnapshot] = match &resolution {
+                Resolution::Unique(snapshot) => std::slice::from_ref(snapshot),
+                Resolution::Agreed(snapshots) | Resolution::Forked(snapshots) => snapshots,
+                Resolution::Missing | Resolution::Invalid(_) => &[],
+            };
+            let outcomes = snapshots
+                .iter()
+                .map(|snapshot| {
+                    Ok(ResolutionText {
+                        head: snapshot.id,
+                        outcome: decisions::read_text(&view.reader, snapshot.outcome)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(DecisionDetail {
+                id,
+                genesis,
+                title,
+                context,
+                factors,
+                resolution,
+                outcomes,
+            })
+        })
+    }
+    pub fn resolve_id(&self, prefix: &str) -> Result<Id> {
+        self.storage()
+            .with_view(|view| resolve_decision(prefix, &view.facts))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DecisionsStorage<'a> {
+    storage: &'a crate::storage::Storage,
+}
+
+struct CollectionView {
+    facts: FactArchive,
+    reader: AcquiringReader<FacultySnapshot>,
+}
+
+impl DecisionsStorage<'_> {
+    fn with_store<T>(
+        &self,
+        operation: impl FnOnce(
+            &mut FacultyStore,
+            Collection<SimpleArchive>,
+            &ed25519_dalek::SigningKey,
+            &CollectionView,
+            &std::sync::Arc<tokio::runtime::Runtime>,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        self.storage.with_store(|pile, signer, runtime| {
+            let result = (|| {
+                let collection = self.storage.open_collection_read(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                    runtime,
+                )?;
+                let maintained_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
+                let maintained_rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(
+                    collection,
+                    maintained_succinct,
+                )?;
+                let store_snapshot = AcquiringReader::new(
+                    pile.snapshot().context("freeze Decide fact collection")?,
+                    runtime.clone(),
+                );
+                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
+                    .context("read maintained Decide fact collection")?;
+                operation(
+                    pile,
+                    collection,
+                    signer,
+                    &CollectionView {
+                        facts,
+                        reader: store_snapshot,
+                    },
+                    runtime,
+                )
+            })();
+            result
+        })
+    }
+
+    fn with_view<T>(&self, operation: impl FnOnce(&CollectionView) -> Result<T>) -> Result<T> {
+        self.with_store(|_, _, _, view, _| operation(view))
+    }
+
+    fn update<T>(
+        &self,
+        description: &'static str,
+        operation: impl FnOnce(&CollectionView) -> Result<(Fragment, T)>,
+    ) -> Result<T> {
+        self.with_store(|pile, collection, signer, view, runtime| {
+            let (mut fragment, value) = operation(view)?;
+            fragment.describe_with(entity! { metadata::description: description });
+            crate::collection_names::require_command_write_admission_acquiring(
+                pile,
+                collection,
+                signer,
+                "Decisions",
+                "decisions show",
+                runtime,
+            )?;
+            pile.commit(collection, signer, fragment)
+                .context("commit authored Decide fragment")?;
+            drop(
+                runtime
+                    .block_on(crate::storage::ensure_downstream(pile, collection, signer))
+                    .context(
+                        "Decisions facts were committed, but ensuring their derived views failed",
+                    )?,
+            );
+            Ok(value)
+        })
+    }
+}
+
+fn now_epoch() -> Result<Epoch> {
+    clock::now()
+}
+
+fn epoch_interval(epoch: Epoch) -> IntervalValue {
+    (epoch, epoch)
+        .try_to_inline()
+        .expect("valid point interval")
+}
+
+fn interval_key(interval: IntervalValue) -> i128 {
+    let (lower, _): (i128, i128) = interval
+        .try_from_inline()
+        .expect("validated point interval");
+    lower
+}
+
+fn resolve_decision(input: &str, facts: &FactArchive) -> Result<Id> {
+    crate::resolve_id_prefix(input, decisions::decision_anchors(facts))
+}
+
+fn ensure_missing(state: &Resolution, action: &str, decision: Id) -> Result<()> {
+    match state {
+        Resolution::Missing => Ok(()),
+        Resolution::Unique(snapshot) => {
+            bail!(
+                "decision {decision:x} is already resolved at head {:x}; cannot {action}",
+                snapshot.id
+            )
+        }
+        Resolution::Agreed(snapshots) => bail!(
+            "decision {decision:x} is already resolved by {} agreeing heads; cannot {action}",
+            snapshots.len()
+        ),
+        Resolution::Forked(snapshots) => bail!(
+            "decision {decision:x} has {} divergent resolution heads; use `decisions reconcile`",
+            snapshots.len()
+        ),
+        Resolution::Invalid(reason) => {
+            bail!("decision {decision:x} resolution is invalid: {reason}")
+        }
+    }
+}
+
+fn reconciliation_heads(state: Resolution, decision: Id) -> Result<Vec<Id>> {
+    match state {
+        Resolution::Forked(snapshots) => {
+            Ok(snapshots.into_iter().map(|snapshot| snapshot.id).collect())
+        }
+        Resolution::Missing => bail!("decision {decision:x} is unresolved; use `decisions resolve`"),
+        Resolution::Unique(snapshot) => bail!(
+            "decision {decision:x} has one closed resolution head {:x}; there is no fork to reconcile",
+            snapshot.id
+        ),
+        Resolution::Agreed(snapshots) => bail!(
+            "decision {decision:x} is already semantically resolved by {} agreeing heads",
+            snapshots.len()
+        ),
+        Resolution::Invalid(reason) => bail!("decision {decision:x} resolution is invalid: {reason}"),
+    }
+}
+
+fn evidence(facts: &FactArchive, decision: Id, forced: bool) -> Result<Vec<Id>> {
+    let factors = decisions::factors_for_decision(facts, decision)?;
+    let pros = factors
+        .iter()
+        .filter(|factor| factor.side == FactorSide::Pro)
+        .count();
+    let cons = factors
+        .iter()
+        .filter(|factor| factor.side == FactorSide::Con)
+        .count();
+    if !forced && (pros == 0 || cons == 0) {
+        bail!(
+            "cannot resolve without force: exact evidence needs at least one pro and one con (have {pros} pro, {cons} con)"
+        );
+    }
+    Ok(factors.into_iter().map(|factor| factor.id).collect())
+}
+
+#[derive(Clone, Debug)]
+struct DecisionRow {
+    id: Id,
+    genesis: DecisionGenesis,
+    pros: usize,
+    cons: usize,
+    resolution: Resolution,
+}
+
+fn collect_decisions(view: &CollectionView) -> Result<Vec<DecisionRow>> {
+    let mut rows = Vec::new();
+    for id in decisions::decision_anchors(&view.facts) {
+        let genesis = decisions::genesis_for_decision(&view.facts, id)?
+            .ok_or_else(|| anyhow!("decision {id:x} has no genesis"))?;
+        let factors = decisions::factors_for_decision(&view.facts, id)?;
+        rows.push(DecisionRow {
+            id,
+            genesis,
+            pros: factors
+                .iter()
+                .filter(|factor| factor.side == FactorSide::Pro)
+                .count(),
+            cons: factors
+                .iter()
+                .filter(|factor| factor.side == FactorSide::Con)
+                .count(),
+            resolution: decisions::resolution(&view.facts, id),
+        });
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse((interval_key(row.genesis.created_at), row.id)));
+    Ok(rows)
+}
+
+pub(super) fn common_snapshot(resolution: &Resolution) -> Option<&ResolutionSnapshot> {
+    match resolution {
+        Resolution::Unique(snapshot) => Some(snapshot),
+        Resolution::Agreed(snapshots) => snapshots.first(),
+        Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_) => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn proposed_decision_is_one_commit_a_preparing_reader_observes() {
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("decide.pile");
+    let key = directory.path().join("decide.key");
+    std::fs::File::create(&pile).unwrap();
+    crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    let capability = Decisions::new(pile, Some(key));
+    let proposed = capability.propose("Already visible", None, None).unwrap();
+    capability
+        .storage
+        .with_pile(|pile, signer| {
+            let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            // Maintenance is the reader's job now: prepare the projection here,
+            // then observe exactly what the action published.
+            let snapshot = pollster::block_on(async {
+                drop(pile.maintain_attached(succinct, signer).await?);
+                pile.maintain_attached(rank9, signer).await
+            })?;
+            let selected = snapshot.attached(rank9)?;
+            let facts = selected.facts()?;
+            assert!(decisions::decision_anchors(&facts).contains(&proposed.decision));
+            assert_eq!(source.admitted(&snapshot)?.len(), 1);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;

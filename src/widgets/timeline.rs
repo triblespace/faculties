@@ -9,22 +9,22 @@
 //! [`WidgetContext`](crate::widgets::storage::WidgetContext).
 //!
 //! Per-kind decoration:
-//! * Compass — goal status changes (pill + goal title)
+//! * Goals — goal status changes (pill + goal title)
 //! * Local messages — body preview with sender/recipient pills
-//! * Wiki — fragment versions with title
+//! * Knowledge — fragment versions with title
 //!
 //! ```ignore
 //! let mut timeline = BranchTimeline::multi(vec![
-//!     TimelineSource::Compass {
-//!         key: SourceKey::Compass,
+//!     TimelineSource::Goals {
+//!         key: SourceKey::Goals,
 //!         label: "goals".into(),
 //!     },
 //!     TimelineSource::LocalMessages {
 //!         key: SourceKey::Messages,
 //!         label: "local".into(),
 //!     },
-//!     TimelineSource::Wiki {
-//!         key: SourceKey::Wiki,
+//!     TimelineSource::Knowledge {
+//!         key: SourceKey::Knowledge,
 //!         label: "wiki".into(),
 //!     },
 //! ]);
@@ -59,10 +59,10 @@ use GORBIE::card_ctx::GRID_ROW_MODULE;
 use GORBIE::prelude::CardCtx;
 
 use crate::schemas::blockdag as archive;
-use crate::schemas::compass::{board as compass_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
+use crate::schemas::compass::{board as goals_attrs, KIND_GOAL_ID, KIND_NOTE_ID, KIND_STATUS_ID};
 use crate::schemas::message::{local as message_attrs, KIND_MESSAGE_ID};
 use crate::schemas::reason::{reason_schema as reason_attrs, KIND_REASON_ID};
-use crate::schemas::wiki::{attrs as wiki_attrs, KIND_AUTHORSHIP};
+use crate::schemas::wiki::{attrs as knowledge_attrs, KIND_AUTHORSHIP};
 use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 
@@ -176,13 +176,13 @@ fn text_on(fill: egui::Color32) -> egui::Color32 {
 /// stable key used to find its immutable dataset at render time.
 #[derive(Clone, Debug)]
 pub enum TimelineSource {
-    /// Compass — render goal status changes with the goal title and
+    /// Goals — render goal status changes with the goal title and
     /// status-color pill.
-    Compass { key: SourceKey, label: String },
+    Goals { key: SourceKey, label: String },
     /// Local-messages — render each message with sender/body preview.
     LocalMessages { key: SourceKey, label: String },
-    /// Wiki — render fragment versions with title.
-    Wiki { key: SourceKey, label: String },
+    /// Knowledge — render fragment versions with title.
+    Knowledge { key: SourceKey, label: String },
     /// Reason events — explicit reasoning notes the agent records
     /// alongside the command it ran. Useful as
     /// "thought before action" markers along the activity axis.
@@ -196,9 +196,9 @@ pub enum TimelineSource {
 /// Coarse kind used on the widget's `selected_event` and as a color key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
-    Compass,
+    Goals,
     LocalMessages,
-    Wiki,
+    Knowledge,
     Reason,
     Archive,
 }
@@ -206,9 +206,9 @@ pub enum SourceKind {
 impl TimelineSource {
     fn key(&self) -> SourceKey {
         match self {
-            TimelineSource::Compass { key, .. }
+            TimelineSource::Goals { key, .. }
             | TimelineSource::LocalMessages { key, .. }
-            | TimelineSource::Wiki { key, .. }
+            | TimelineSource::Knowledge { key, .. }
             | TimelineSource::Reason { key, .. }
             | TimelineSource::Archive { key, .. } => *key,
         }
@@ -217,9 +217,9 @@ impl TimelineSource {
     /// A short (≤6 char) source label used in the pill.
     fn label(&self) -> String {
         match self {
-            TimelineSource::Compass { label, .. }
+            TimelineSource::Goals { label, .. }
             | TimelineSource::LocalMessages { label, .. }
-            | TimelineSource::Wiki { label, .. }
+            | TimelineSource::Knowledge { label, .. }
             | TimelineSource::Reason { label, .. }
             | TimelineSource::Archive { label, .. } => label.clone(),
         }
@@ -228,11 +228,11 @@ impl TimelineSource {
     fn color(&self) -> egui::Color32 {
         match self {
             // RAL 1012 lemon yellow — matches playground color_goals.
-            TimelineSource::Compass { .. } => egui::Color32::from_rgb(0xd9, 0xc2, 0x2e),
+            TimelineSource::Goals { .. } => egui::Color32::from_rgb(0xd9, 0xc2, 0x2e),
             // RAL 6032 signal green — matches playground color_local_msg.
             TimelineSource::LocalMessages { .. } => egui::Color32::from_rgb(0x23, 0x7f, 0x52),
             // RAL 3012 beige red — matches playground color_wiki.
-            TimelineSource::Wiki { .. } => egui::Color32::from_rgb(0xc1, 0x87, 0x6b),
+            TimelineSource::Knowledge { .. } => egui::Color32::from_rgb(0xc1, 0x87, 0x6b),
             // RAL 1003 signal yellow — reason events read as "agent thought".
             TimelineSource::Reason { .. } => egui::Color32::from_rgb(0xf7, 0xba, 0x0b),
             // RAL 5012 light blue — archived conversation messages.
@@ -241,7 +241,7 @@ impl TimelineSource {
     }
 }
 
-/// Kanban status color — reused for the inline pill on Compass events.
+/// Kanban status color — reused for the inline pill on events.
 fn status_color(status: &str) -> egui::Color32 {
     match status {
         // RAL 6018 yellow green
@@ -272,8 +272,8 @@ enum Label {
     Note { goal: Id, note: TextHandle },
     /// A local message: its body; sender and recipient are ids.
     Message { from: Id, to: Id, body: TextHandle },
-    /// A wiki revision: its title.
-    Wiki { title: TextHandle },
+    /// A knowledge revision: its title.
+    Knowledge { title: TextHandle },
     /// A reasoning note: its text.
     Reason { text: TextHandle },
     /// A source projection: the texts of the node it projects to.
@@ -293,9 +293,9 @@ struct Mark {
 /// The text a drawn label shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Shown {
-    /// Primary one-line preview (goal title, message body, or wiki title).
+    /// Primary one-line preview (goal title, message body, or knowledge title).
     summary: String,
-    /// Optional kanban-status pill label (Compass).
+    /// Optional kanban-status pill label (Goals).
     status: Option<String>,
     /// Optional sender line (LocalMessages — "<from> → <to>"), tooltip only.
     from_to: Option<String>,
@@ -393,23 +393,17 @@ fn marks_in(
     out: &mut Vec<Mark>,
 ) -> usize {
     match source {
-        TimelineSource::Compass { .. } => compass_marks(idx, facts, lo, hi, out),
+        TimelineSource::Goals { .. } => goals_marks(idx, facts, lo, hi, out),
         TimelineSource::LocalMessages { .. } => local_marks(idx, facts, lo, hi, out),
-        TimelineSource::Wiki { .. } => wiki_marks(idx, facts, lo, hi, out),
+        TimelineSource::Knowledge { .. } => knowledge_marks(idx, facts, lo, hi, out),
         TimelineSource::Reason { .. } => reason_marks(idx, facts, lo, hi, out),
         TimelineSource::Archive { .. } => archive_marks(idx, facts, lo, hi, out),
     }
 }
 
-/// A Compass mark per goal creation, status change and note at its
+/// A Goals mark per goal creation, status change and note at its
 /// `created_at`, so quiet boards still show up.
-fn compass_marks(
-    idx: usize,
-    facts: &FactArchive,
-    lo: i128,
-    hi: i128,
-    out: &mut Vec<Mark>,
-) -> usize {
+fn goals_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
     let times = starts_in(facts, metadata::created_at.id(), lo, hi);
     for &(at, entity) in &times {
         let Some(ts_ns) = interval_start(at) else {
@@ -417,7 +411,7 @@ fn compass_marks(
         };
         let mark = |label| Mark {
             source_idx: idx,
-            kind: SourceKind::Compass,
+            kind: SourceKind::Goals,
             entity_id: entity,
             ts_ns,
             label,
@@ -427,7 +421,7 @@ fn compass_marks(
             pattern!(facts, [{
                 entity @
                 metadata::tag: &KIND_GOAL_ID,
-                compass_attrs::title: ?title,
+                goals_attrs::title: ?title,
             }])
         ) {
             out.push(mark(Label::Goal { title }));
@@ -437,8 +431,8 @@ fn compass_marks(
             pattern!(facts, [{
                 entity @
                 metadata::tag: &KIND_STATUS_ID,
-                compass_attrs::status_of: ?goal,
-                compass_attrs::status: ?status,
+                goals_attrs::status_of: ?goal,
+                goals_attrs::status: ?status,
             }])
         ) {
             out.push(mark(Label::Status { goal, status }));
@@ -448,8 +442,8 @@ fn compass_marks(
             pattern!(facts, [{
                 entity @
                 metadata::tag: &KIND_NOTE_ID,
-                compass_attrs::task: ?goal,
-                compass_attrs::note: ?note,
+                goals_attrs::task: ?goal,
+                goals_attrs::note: ?note,
             }])
         ) {
             out.push(mark(Label::Note { goal, note }));
@@ -460,7 +454,7 @@ fn compass_marks(
 
 /// One LocalMessages mark per envelope. The view answers with a bag, so a
 /// repeated field is another witness of the same message; the mark sits at
-/// the newest `created_at`, as the message listing and the triage count do,
+/// the newest `created_at`, as the message listing and the diagnostics count do,
 /// and only a window holding that newest time shows it.
 fn local_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
     let times = starts_in(facts, metadata::created_at.id(), lo, hi);
@@ -507,12 +501,18 @@ fn local_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Ve
     times.len()
 }
 
-/// A Wiki mark per revision projection at its authored time: a native
+/// A Knowledge mark per revision projection at its authored time: a native
 /// revision's earliest authorship, a legacy version's greatest observation.
 /// A `created_at` in the window names either the legacy version itself or
 /// an authorship of a native revision; each candidate is then projected
 /// exactly as the full listing projects it and kept if its time is here.
-fn wiki_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec<Mark>) -> usize {
+fn knowledge_marks(
+    idx: usize,
+    facts: &FactArchive,
+    lo: i128,
+    hi: i128,
+    out: &mut Vec<Mark>,
+) -> usize {
     let times = starts_in(facts, metadata::created_at.id(), lo, hi);
     let mut candidates = BTreeSet::new();
     for &(_, entity) in &times {
@@ -521,7 +521,7 @@ fn wiki_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec
             pattern!(facts, [{
                 entity @
                 metadata::tag: &KIND_AUTHORSHIP,
-                wiki_attrs::revision: ?revision,
+                knowledge_attrs::revision: ?revision,
             }])
         )
         .peekable();
@@ -532,7 +532,7 @@ fn wiki_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec
         }
     }
     for revision_id in candidates {
-        for revision in crate::wiki::revision_records(facts, revision_id) {
+        for revision in crate::knowledge::revision_records(facts, revision_id) {
             let Some(ts_ns) = revision.authored_at().and_then(interval_start) else {
                 continue;
             };
@@ -541,10 +541,10 @@ fn wiki_marks(idx: usize, facts: &FactArchive, lo: i128, hi: i128, out: &mut Vec
             }
             out.push(Mark {
                 source_idx: idx,
-                kind: SourceKind::Wiki,
+                kind: SourceKind::Knowledge,
                 entity_id: revision.id,
                 ts_ns,
-                label: Label::Wiki {
+                label: Label::Knowledge {
                     title: revision.title,
                 },
             });
@@ -727,7 +727,7 @@ fn hydrate(
             status: None,
             from_to: Some(format!("{} → {}", id_hex(from), id_hex(to))),
         },
-        Label::Wiki { title } | Label::Reason { text: title } => Shown {
+        Label::Knowledge { title } | Label::Reason { text: title } => Shown {
             summary: preview(&read(title), 80),
             status: None,
             from_to: None,
@@ -747,7 +747,7 @@ fn goal_title(facts: &FactArchive, goal: Id, read: &mut dyn FnMut(TextHandle) ->
         pattern!(facts, [{
             goal @
             metadata::tag: &KIND_GOAL_ID,
-            compass_attrs::title: ?title,
+            goals_attrs::title: ?title,
             metadata::created_at: _?created_at,
         }])
     )
@@ -1097,7 +1097,7 @@ impl BranchTimeline {
             }
             // Paint the viewport directly on the section ctx (no
             // grid wrapper) so it runs edge-to-edge inside the
-            // section, matching the wiki graph's treatment. Legend
+            // section, matching the knowledge graph's treatment. Legend
             // + SPAN + zoom-hint all live as overlays inside the
             // viewport itself.
             self.paint_viewport(ctx, now, datasets);
@@ -1420,8 +1420,12 @@ impl BranchTimeline {
                 painter.rect_filled(rect, 0.0, sources[strip.mark.source_idx].color());
                 if let Some(pos) = pointer_pos.filter(|p| viewport_rect.contains(*p)) {
                     let distance = (pos.y - y).abs();
-                    if pos.x >= rect.left() && pos.x < rect.right() && distance <= 3.0
-                        && pointed_strip.as_ref().is_none_or(|(best, ..)| distance < *best)
+                    if pos.x >= rect.left()
+                        && pos.x < rect.right()
+                        && distance <= 3.0
+                        && pointed_strip
+                            .as_ref()
+                            .is_none_or(|(best, ..)| distance < *best)
                     {
                         pointed_strip = Some((distance, strip, rect, row));
                     }
@@ -1461,7 +1465,7 @@ impl BranchTimeline {
             let mut text_x = event_left + src_pill_w + 6.0;
             if let Some(status) = &shown.status {
                 let pill_color = match ev.kind {
-                    SourceKind::Compass => status_color(status),
+                    SourceKind::Goals => status_color(status),
                     _ => src_color,
                 };
                 let pill_w = 40.0 + (status.len() as f32 * 4.0).min(40.0);
@@ -1687,9 +1691,9 @@ mod tests {
 
     fn kind(source: &TimelineSource) -> SourceKind {
         match source {
-            TimelineSource::Compass { .. } => SourceKind::Compass,
+            TimelineSource::Goals { .. } => SourceKind::Goals,
             TimelineSource::LocalMessages { .. } => SourceKind::LocalMessages,
-            TimelineSource::Wiki { .. } => SourceKind::Wiki,
+            TimelineSource::Knowledge { .. } => SourceKind::Knowledge,
             TimelineSource::Reason { .. } => SourceKind::Reason,
             TimelineSource::Archive { .. } => SourceKind::Archive,
         }
@@ -1697,13 +1701,13 @@ mod tests {
 
     fn configured_sources() -> Vec<TimelineSource> {
         vec![
-            TimelineSource::Compass {
-                key: SourceKey::Compass,
+            TimelineSource::Goals {
+                key: SourceKey::Goals,
                 label: "goals".into(),
             },
-            TimelineSource::Wiki {
-                key: SourceKey::Wiki,
-                label: "wiki".into(),
+            TimelineSource::Knowledge {
+                key: SourceKey::Knowledge,
+                label: "knowledge".into(),
             },
             TimelineSource::Archive {
                 key: SourceKey::Archive,
@@ -1716,7 +1720,7 @@ mod tests {
     fn missing_middle_source_does_not_shift_kinds() {
         let sources = configured_sources();
         let resolved = resolve_sources(&sources, |key| match key {
-            SourceKey::Compass => Some("compass dataset"),
+            SourceKey::Goals => Some("compass dataset"),
             SourceKey::Archive => Some("archive dataset"),
             _ => None,
         });
@@ -1728,12 +1732,7 @@ mod tests {
         assert_eq!(
             routes,
             vec![
-                (
-                    0,
-                    SourceKey::Compass,
-                    SourceKind::Compass,
-                    "compass dataset"
-                ),
+                (0, SourceKey::Goals, SourceKind::Goals, "compass dataset"),
                 (
                     2,
                     SourceKey::Archive,
@@ -1748,14 +1747,14 @@ mod tests {
     fn input_map_order_does_not_change_source_resolution() {
         let sources = configured_sources();
         let forward = [
-            (SourceKey::Compass, "compass dataset"),
-            (SourceKey::Wiki, "wiki dataset"),
+            (SourceKey::Goals, "compass dataset"),
+            (SourceKey::Knowledge, "wiki dataset"),
             (SourceKey::Archive, "archive dataset"),
         ];
         let reverse = [
             (SourceKey::Archive, "archive dataset"),
-            (SourceKey::Wiki, "wiki dataset"),
-            (SourceKey::Compass, "compass dataset"),
+            (SourceKey::Knowledge, "wiki dataset"),
+            (SourceKey::Goals, "compass dataset"),
         ];
         let route = |available: &[(SourceKey, &'static str)]| {
             resolve_sources(&sources, |key| {
@@ -1860,8 +1859,11 @@ mod tests {
     fn offscreen_history_is_neither_selected_nor_read() {
         let view_start = T0 + 2_400 * MINUTE;
         let view_end = view_start - 400 * MINUTE;
-        let facts = reasons((0..2_000).map(|n| T0 + n * MINUTE)
-            .chain([view_end - 1, view_start + 1]));
+        let facts = reasons(
+            (0..2_000)
+                .map(|n| T0 + n * MINUTE)
+                .chain([view_end - 1, view_start + 1]),
+        );
         let mut activity = Activity::new(BTreeMap::new());
 
         let frame = draw(
@@ -1951,11 +1953,7 @@ mod tests {
         );
 
         assert_eq!(activity.selections, 2);
-        assert!(
-            activity.scanned == 0,
-            "scanned {}",
-            activity.scanned
-        );
+        assert!(activity.scanned == 0, "scanned {}", activity.scanned);
         assert!(frame.strips.is_empty());
         assert!(
             (40..=41).contains(&frame.labels.len()),

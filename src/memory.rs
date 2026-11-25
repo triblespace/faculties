@@ -149,7 +149,7 @@ fn annotate_chunk(
 }
 
 /// Tag a chunk: the canonical `metadata::tag` edge to a tag entity named by
-/// `metadata::name`, the same tag record the Wiki writes, so one name is one
+/// `metadata::name`, the same tag record the Knowledge writes, so one name is one
 /// tag across faculties. The edge annotates the chunk; it is not part of the
 /// identity core, so tagging an existing memory keeps its id, and a tag is
 /// only a tag: it neither moves the memory in time nor files it elsewhere.
@@ -157,7 +157,7 @@ pub fn tag_fragment(chunk: Id, name: &str) -> Result<Fragment> {
     if name.trim().is_empty() {
         bail!("memory tag must not be empty");
     }
-    let (mut fragment, tag, _) = crate::wiki::tag_record(name)?;
+    let (mut fragment, tag, _) = crate::knowledge::tag_record(name)?;
     fragment += entity! { ExclusiveId::force_ref(&chunk) @ metadata::tag: &tag };
     Ok(fragment)
 }
@@ -312,12 +312,12 @@ mod tests {
         assert_eq!(
             names,
             BTreeSet::from(["us".to_owned(), "becoming-self".to_owned()]),
-            "the same normalized tag record the Wiki writes"
+            "the same normalized tag record the Knowledge writes"
         );
-        let (_, wiki_us, _) = crate::wiki::tag_record("us").unwrap();
+        let (_, knowledge_us, _) = crate::knowledge::tag_record("us").unwrap();
         assert!(exists!(
             (),
-            pattern!(tagged.facts(), [{ id @ metadata::tag: &wiki_us }])
+            pattern!(tagged.facts(), [{ id @ metadata::tag: &knowledge_us }])
         ));
         assert!(exists!(
             (),

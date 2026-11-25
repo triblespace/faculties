@@ -78,7 +78,7 @@ supervisor.
 
 == Attribution and Habit routing
 
-Directed-message and Compass news filter out the observer's own actions.
+Directed-message and Goals news filter out the observer's own actions.
 Set `PERSONA` explicitly for faculty writes so sender attribution is retained.
 `message send <TO> <TEXT>` uses that persona by default; `--from` overrides it.
 Forwarded news retains its original sender and authority rather than becoming

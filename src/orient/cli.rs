@@ -28,7 +28,7 @@ pub struct Cli {
     /// not to this selector.
     ///
     /// Directed news for a persona: messages and mail to it or its groups;
-    /// Compass goals and notes that `@`-mention it or a group it belongs to;
+    /// Goals and notes that `@`-mention it or a group it belongs to;
     /// other people's status changes and notes on goals tagged with its own
     /// label (assignment); Teams, Discord and
     /// health news. Group-name tags are topics, and writing on a goal does
@@ -71,10 +71,10 @@ pub struct Cli {
 ///   wholeness, not efficiency, so it is read whole. `wake --pairs` prints the
 ///   same selection as command/result pairs for a harness that wakes a model
 ///   from commands it could have issued (`memory <range>` or `memory <id>`,
-///   `wiki show <id>`, `orient goals ...`), never a pasted document.
-/// - `goals` — the Compass and Horizons sections of `wake`, alone.
+///   `knowledge show <id>`, `orient goals ...`), never a pasted document.
+/// - `goals` — the Goals and Horizons sections of `wake`, alone.
 /// - `show`  — a general overview mid-session, for "what's up right now".
-///   **Neither memories nor wiki entries belong here** — it is a situation
+///   **Neither memories nor knowledge entries belong here** — it is a situation
 ///   snapshot, not a self. Keeping it cheap is what makes it runnable often.
 /// - `wait`  — blocking. Things you might want to deal with, so it wakes you
 ///   out of idling. Terse by design: the reasons plus what changed.
@@ -96,7 +96,7 @@ pub struct Cli {
 /// receipt COMMITs; `--peek` performs upkeep but never records presentation.
 #[derive(Subcommand)]
 enum Command {
-    /// Mid-session overview, with resident local swarm health first (no memories, no wiki)
+    /// Mid-session overview, with resident local swarm health first (no memories, no knowledge)
     Show {
         /// Max local messages to show
         #[arg(long, default_value_t = 10)]
@@ -108,7 +108,7 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         todo_limit: usize,
     },
-    /// Recall the journal, read Wiki knowledge and show current goals.
+    /// Recall the journal, read knowledge and show current goals.
     ///
     /// With `--pairs`, the same selection as JSON lines, one
     /// `{"command": ..., "output": ...}` object per line (a memory recall also
@@ -119,10 +119,10 @@ enum Command {
     /// wakes a model from commands rather than a pasted document: first one
     /// recall per cover entry, `memory <from>..<to>` when memory's range lookup
     /// selects exactly that memory and `memory <id>` otherwise (always for a
-    /// point). In a personal wake the Wiki pairs read the cover-tagged
-    /// beliefs with `wiki show <id>` (or `--exact` for a fork). With
-    /// `--about` the Wiki pairs read the selected topic revisions with
-    /// `wiki show --exact <id>`. Both forms end with one `orient goals
+    /// point). In a personal wake the Knowledge pairs read the cover-tagged
+    /// beliefs with `knowledge show <id>` (or `--exact` for a fork). With
+    /// `--about` the Knowledge pairs read the selected topic revisions with
+    /// `knowledge show --exact <id>`. Both forms end with one `orient goals
     /// --doing-limit N --todo-limit M`. Each `output` is exactly what its
     /// command prints to stdout when run against the same pile; for an image
     /// memory it is the placeholder line of the cover text, without the image.
@@ -130,7 +130,7 @@ enum Command {
     /// --chunk-overhead K`. `--pairs` never uses a persona and never records
     /// presentation; memory diagnostics go to stderr.
     Wake {
-        /// Character budget for the journal and, with --about, selected Wiki
+        /// Character budget for the journal and, with --about, selected Knowledge
         /// readings. Untinted standing beliefs, goals and diagnostics render
         /// separately. A smaller budget gives a coarser recollection.
         #[arg(long, default_value_t = 800_000)]
@@ -153,7 +153,7 @@ enum Command {
         /// --chunk-overhead` charges it. Only with `--pairs`.
         #[arg(long, default_value_t = 0, requires = "pairs")]
         chunk_overhead: usize,
-        /// Select Wiki readings for a task, beside the memory budget and at most
+        /// Select Knowledge readings for a task, beside the memory budget and at most
         /// 40,000 characters or half of it. The cover
         /// tag is a ranking prior. An empty topic selects general readings.
         /// Without this argument all cover-tagged personal beliefs render.
@@ -162,7 +162,7 @@ enum Command {
         #[arg(long)]
         about: Option<String>,
     },
-    /// The Compass section of `orient wake`: priority-ranked doing and todo
+    /// The Goals section of `orient wake`: priority-ranked doing and todo
     /// goals, then every not-done `horizon` goal, longest unmoved first.
     /// Never records presentation.
     Goals {
@@ -175,7 +175,7 @@ enum Command {
     },
     /// Wait for directed news, an actionable local health alert, or a stale report
     ///
-    /// Compass news is addressed, not subscribed: an `@label` mention of the
+    /// Goals news is addressed, not subscribed: an `@label` mention of the
     /// persona or of a group it belongs to, or a change by someone else on a
     /// goal tagged with the persona's own label. See `--persona`.
     Wait {

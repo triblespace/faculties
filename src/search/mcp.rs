@@ -19,7 +19,7 @@ impl Search {
 
 static TOOLS: &[Tool] = &[Tool {
     name: "search",
-    description: "One lexical query across the selected workspace's Wiki, Memory and Files. Returns JSON grouped by source, exact collection, native selector, method and availability. Wiki searches current titles/bodies; Memory uses BM25 on each chunk's least summary handle; Files searches names/media types/tags only, not file bodies. Limit applies per source after identical-reading deduplication. No shared relevance rank, model or semantic index. Each source has its own frozen observation, not an atomic cross-source snapshot.",
+    description: "One lexical query across the selected workspace's Knowledge, Memory and Files. Returns JSON grouped by source, exact collection, native selector, method and availability. Knowledge searches current titles/bodies; Memory uses BM25 on each chunk's least summary handle; Files searches names/media types/tags only, not file bodies. Limit applies per source after identical-reading deduplication. No shared relevance rank, model or semantic index. Each source has its own frozen observation, not an atomic cross-source snapshot.",
     input_schema: r#"{"type":"object","properties":{"query":{"type":"string","minLength":1},"limit_per_source":{"type":"integer","minimum":1,"default":10}},"required":["query"],"additionalProperties":false}"#,
 }];
 

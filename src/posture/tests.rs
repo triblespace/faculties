@@ -963,7 +963,7 @@ fn semantic_occurrences_are_settled_directly_by_exact_decide_outcomes() {
         .unwrap();
 
     let decision = genid().id;
-    let proposed = decide::decision_fragment(
+    let proposed = decisions::decision_fragment(
         decision,
         "Classify this Posture occurrence",
         None,
@@ -973,19 +973,19 @@ fn semantic_occurrences_are_settled_directly_by_exact_decide_outcomes() {
     .unwrap()
     .0;
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
+        DEFAULT_DECISIONS_SCOPE_ID,
         proposed,
         "unresolved fixture decision",
     );
-    let view = storage.decide_view().unwrap();
+    let view = storage.decisions_view().unwrap();
     assert!(!benign_occurrences(&view.reader, &view.facts)
         .unwrap()
         .contains(&occurrence));
 
-    let benign = decide::resolution_fragment(
+    let benign = decisions::resolution_fragment(
         decision,
         "benign, and here is a whole sentence of reasoning about why",
-        Some(decide::RESULT_BENIGN),
+        Some(decisions::RESULT_BENIGN),
         true,
         &[],
         &[],
@@ -993,14 +993,18 @@ fn semantic_occurrences_are_settled_directly_by_exact_decide_outcomes() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, benign, "benign fixture decision");
-    let view = storage.decide_view().unwrap();
+    store.publish_raw(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        benign,
+        "benign fixture decision",
+    );
+    let view = storage.decisions_view().unwrap();
     assert!(benign_occurrences(&view.reader, &view.facts)
         .unwrap()
         .contains(&occurrence));
 
     let disagreement = genid().id;
-    let proposed = decide::decision_fragment(
+    let proposed = decisions::decision_fragment(
         disagreement,
         "Reconsider this Posture occurrence",
         None,
@@ -1009,8 +1013,12 @@ fn semantic_occurrences_are_settled_directly_by_exact_decide_outcomes() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposed, "second fixture decision");
-    let other = decide::resolution_fragment(
+    store.publish_raw(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        proposed,
+        "second fixture decision",
+    );
+    let other = decisions::resolution_fragment(
         disagreement,
         "sensitive",
         None,
@@ -1022,11 +1030,11 @@ fn semantic_occurrences_are_settled_directly_by_exact_decide_outcomes() {
     .unwrap()
     .0;
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
+        DEFAULT_DECISIONS_SCOPE_ID,
         other,
         "disagreeing fixture decision",
     );
-    let view = storage.decide_view().unwrap();
+    let view = storage.decisions_view().unwrap();
     assert!(!benign_occurrences(&view.reader, &view.facts)
         .unwrap()
         .contains(&occurrence));
@@ -1038,8 +1046,8 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
     let decision = genid().id;
     let occurrence = genid().id;
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
-        decide::decision_fragment(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        decisions::decision_fragment(
             decision,
             "Classify occurrence",
             None,
@@ -1051,11 +1059,11 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
         "fixture decision",
     );
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
-        decide::resolution_fragment(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        decisions::resolution_fragment(
             decision,
             "benign, and here is a whole sentence of reasoning about why",
-            Some(decide::RESULT_BENIGN),
+            Some(decisions::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -1066,11 +1074,11 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
         "first benign head",
     );
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
-        decide::resolution_fragment(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        decisions::resolution_fragment(
             decision,
             "benign, and here is a whole sentence of reasoning about why",
-            Some(decide::RESULT_BENIGN),
+            Some(decisions::RESULT_BENIGN),
             true,
             &[],
             &[],
@@ -1080,9 +1088,9 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
         .0,
         "second benign head",
     );
-    let view = store.storage().decide_view().unwrap();
+    let view = store.storage().decisions_view().unwrap();
     assert!(matches!(
-        decide::resolution(&view.facts, decision),
+        decisions::resolution(&view.facts, decision),
         Resolution::Agreed(_)
     ));
     assert!(benign_occurrences(&view.reader, &view.facts)
@@ -1090,8 +1098,8 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
         .contains(&occurrence));
 
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
-        decide::resolution_fragment(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        decisions::resolution_fragment(
             decision,
             "reject",
             None,
@@ -1104,9 +1112,9 @@ fn agreed_benign_heads_settle_but_a_fork_does_not() {
         .0,
         "rejecting head",
     );
-    let view = store.storage().decide_view().unwrap();
+    let view = store.storage().decisions_view().unwrap();
     assert!(matches!(
-        decide::resolution(&view.facts, decision),
+        decisions::resolution(&view.facts, decision),
         Resolution::Forked(_)
     ));
     assert!(!benign_occurrences(&view.reader, &view.facts)
@@ -1733,7 +1741,7 @@ fn unsafe_attribute_findings_have_exact_decide_occurrences() {
 
     let store = TestStore::new();
     let decision = genid().id;
-    let proposed = decide::decision_fragment(
+    let proposed = decisions::decision_fragment(
         decision,
         "Justify this literal-pinned attribute identity",
         Some("It preserves rows written under this already-published byte id".to_owned()),
@@ -1742,11 +1750,15 @@ fn unsafe_attribute_findings_have_exact_decide_occurrences() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposed, "attribute justification");
-    let resolved = decide::resolution_fragment(
+    store.publish_raw(
+        DEFAULT_DECISIONS_SCOPE_ID,
+        proposed,
+        "attribute justification",
+    );
+    let resolved = decisions::resolution_fragment(
         decision,
         "benign, and here is a whole sentence of reasoning about why",
-        Some(decide::RESULT_BENIGN),
+        Some(decisions::RESULT_BENIGN),
         true,
         &[],
         &[],
@@ -1755,11 +1767,11 @@ fn unsafe_attribute_findings_have_exact_decide_occurrences() {
     .unwrap()
     .0;
     store.publish_raw(
-        DEFAULT_DECIDE_SCOPE_ID,
+        DEFAULT_DECISIONS_SCOPE_ID,
         resolved,
         "attribute classification",
     );
-    let view = store.storage().decide_view().unwrap();
+    let view = store.storage().decisions_view().unwrap();
     let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
     assert!(benign.justified.contains(&occurrence));
     assert!(!benign.justified.contains(&changed_occurrence));
@@ -1798,7 +1810,7 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     let occurrence = genid().id;
 
     let decision = genid().id;
-    let proposal = decide::decision_fragment(
+    let proposal = decisions::decision_fragment(
         decision,
         "Classify literal-pinned attribute",
         None,
@@ -1807,11 +1819,11 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "unexplained proposal");
-    let resolution = decide::resolution_fragment(
+    store.publish_raw(DEFAULT_DECISIONS_SCOPE_ID, proposal, "unexplained proposal");
+    let resolution = decisions::resolution_fragment(
         decision,
         "benign, and here is a whole sentence of reasoning about why",
-        Some(decide::RESULT_BENIGN),
+        Some(decisions::RESULT_BENIGN),
         true,
         &[],
         &[],
@@ -1819,9 +1831,9 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "unexplained benign");
+    store.publish_raw(DEFAULT_DECISIONS_SCOPE_ID, resolution, "unexplained benign");
 
-    let view = store.storage().decide_view().unwrap();
+    let view = store.storage().decisions_view().unwrap();
     let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
     assert!(benign.ordinary.contains(&occurrence));
     assert!(!benign.justified.contains(&occurrence));
@@ -1830,7 +1842,7 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     drop(view);
 
     let explained = genid().id;
-    let proposal = decide::decision_fragment(
+    let proposal = decisions::decision_fragment(
         explained,
         "Classify literal-pinned attribute",
         Some("This exact byte id and encoding preserve already-published rows".to_owned()),
@@ -1839,11 +1851,11 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, proposal, "explained proposal");
-    let resolution = decide::resolution_fragment(
+    store.publish_raw(DEFAULT_DECISIONS_SCOPE_ID, proposal, "explained proposal");
+    let resolution = decisions::resolution_fragment(
         explained,
         "benign, and here is a whole sentence of reasoning about why",
-        Some(decide::RESULT_BENIGN),
+        Some(decisions::RESULT_BENIGN),
         true,
         &[],
         &[],
@@ -1851,8 +1863,8 @@ fn unsafe_attribute_clearance_requires_decide_proposal_context() {
     )
     .unwrap()
     .0;
-    store.publish_raw(DEFAULT_DECIDE_SCOPE_ID, resolution, "explained benign");
-    let view = store.storage().decide_view().unwrap();
+    store.publish_raw(DEFAULT_DECISIONS_SCOPE_ID, resolution, "explained benign");
+    let view = store.storage().decisions_view().unwrap();
     let benign = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
     assert!(benign.hides(modality::UNSAFE_ATTRIBUTE_ID, occurrence));
 }
@@ -1868,8 +1880,8 @@ fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
         let finding = genid().id;
         let decision = genid().id;
         store.publish_raw(
-            DEFAULT_DECIDE_SCOPE_ID,
-            decide::decision_fragment(
+            DEFAULT_DECISIONS_SCOPE_ID,
+            decisions::decision_fragment(
                 decision,
                 title,
                 Some("justified".to_owned()),
@@ -1881,8 +1893,8 @@ fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
             "clearance proposal",
         );
         store.publish_raw(
-            DEFAULT_DECIDE_SCOPE_ID,
-            decide::resolution_fragment(
+            DEFAULT_DECISIONS_SCOPE_ID,
+            decisions::resolution_fragment(
                 decision,
                 outcome,
                 result,
@@ -1895,7 +1907,7 @@ fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
             .0,
             "clearance resolution",
         );
-        let view = store.storage().decide_view().unwrap();
+        let view = store.storage().decisions_view().unwrap();
         let settled = settled_findings(&view.reader, &view.facts, BTreeMap::new()).unwrap();
         settled.hides(modality::PROTECTED_TERM, finding)
     };
@@ -1904,7 +1916,7 @@ fn only_a_result_tag_clears_a_finding_and_legacy_prose_still_does() {
     assert!(cleared(
         "tagged",
         "benign - it is a BPE vocabulary, so it spells most of the lexicon",
-        Some(decide::RESULT_BENIGN),
+        Some(decisions::RESULT_BENIGN),
         7_000.0
     ));
     // Pre-tag clearances carried the exact word and nothing else.
@@ -2022,7 +2034,7 @@ fn finding_ids(audit: &GitAudit, term: &str, kind: &str) -> BTreeSet<Id> {
 
 /// THE property the redesign exists for. Commit surgery rewrites commits
 /// and leaves blobs byte-identical, so the material keeps its id and every
-/// Decide resolution about it keeps applying.
+/// Decisions resolution about it keeps applying.
 #[test]
 fn commit_surgery_that_preserves_the_blob_preserves_the_finding_id() {
     let directory = git_carry_forward_fixture();

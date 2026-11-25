@@ -12,7 +12,7 @@ use faculties::storage::CollectionRoutes;
 use faculties::viewer::{compose_hosted, Host, HostAction, Target};
 use faculties::widgets::storage::WorkspaceObservation;
 use faculties::widgets::WidgetContext;
-use faculties::{clock, compass, message, relations, schemas, spawn};
+use faculties::{clock, goals, message, relations, schemas, spawn};
 use hifitime::Epoch;
 use triblespace::core::collection::observed_store::DependencyTracker;
 use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
@@ -63,23 +63,23 @@ impl Fixture {
         let time = |minute| {
             clock::point(Epoch::from_gregorian_utc(2026, 11, 18, 8, minute, 0, 0)).unwrap()
         };
-        let (mut observations, task) = compass::goal_fragment(
+        let (mut observations, task) = goals::goal_fragment(
             "Inspect the rehearsal audio",
             vec!["Rowan".into()],
             None,
             time(0),
         )
         .unwrap();
-        observations += compass::status_fragment(task, "doing", Some(rowan), time(1)).unwrap();
-        let (mut request, ask) = compass::goal_fragment(
+        observations += goals::status_fragment(task, "doing", Some(rowan), time(1)).unwrap();
+        let (mut request, ask) = goals::goal_fragment(
             "Confirm the studio date",
             vec!["Iris".into(), "ask-jp".into()],
             None,
             time(2),
         )
         .unwrap();
-        request += compass::status_fragment(ask, "blocked", Some(iris), time(3)).unwrap();
-        observations += compass::note_fragment(
+        request += goals::status_fragment(ask, "blocked", Some(iris), time(3)).unwrap();
+        observations += goals::note_fragment(
             task,
             "Listening to track two",
             vec![],
@@ -90,7 +90,7 @@ impl Fixture {
         )
         .unwrap()
         .0;
-        request += compass::note_fragment(
+        request += goals::note_fragment(
             ask,
             "The room booking needs a date",
             vec![],
@@ -333,7 +333,7 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
         &fixture.ended_child,
         "unknown",
         "2025-01-10",
-        "Latest Compass note",
+        "Latest note",
         "unread",
         "Started · current run state unknown",
         "Run ended · exit 0",
@@ -474,7 +474,7 @@ fn resident_observation_defers_an_unreadable_spawn_payload_until_requested() {
         context.dataset(SourceKey::Spawn).is_none(),
         "opening must surface a missing archive instead of partial evidence"
     );
-    assert!(context.dataset(SourceKey::Compass).is_some());
+    assert!(context.dataset(SourceKey::Goals).is_some());
     fixture.pile.close().unwrap();
 }
 

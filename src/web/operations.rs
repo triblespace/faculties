@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::clock;
 use crate::schemas::headspace::{
-    playground_config, DEFAULT_SCOPE_ID as HEADSPACE_SCOPE_ID, KIND_CONFIG_ID, KIND_LIVE_RECORD,
+    playground_config, DEFAULT_SCOPE_ID as PROFILES_SCOPE_ID, KIND_CONFIG_ID, KIND_LIVE_RECORD,
 };
 use crate::schemas::web::{web_schema, DEFAULT_SCOPE_ID};
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
@@ -34,7 +34,7 @@ pub struct ApiKeys {
 }
 
 /// The exact immutable credential versions named by one Web-visible
-/// Headspace frontier.
+/// Profiles frontier.
 ///
 /// Sets are intentional: TribleSpace does not impose attribute cardinality.
 /// Repeated values remain useful alternatives rather than invalidating the
@@ -131,12 +131,12 @@ impl Web {
     }
     fn resolve_keys(&self, provider: Provider) -> Result<ApiKeys> {
         let mut keys = self.keys.clone();
-        let needs_headspace = match provider {
+        let needs_profiles = match provider {
             Provider::Auto => keys.tavily.is_none() || keys.exa.is_none(),
             Provider::Tavily => keys.tavily.is_none(),
             Provider::Exa => keys.exa.is_none(),
         };
-        if needs_headspace {
+        if needs_profiles {
             let configured = self.storage().open_web_secrets()?;
             keys.tavily = keys.tavily.or(configured.tavily);
             keys.exa = keys.exa.or(configured.exa);
@@ -244,7 +244,7 @@ fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
         Provider::Tavily => {
             if keys.tavily.is_none() {
                 bail!(
-                    "no Tavily credential available (attach an exact Headspace secret or pass --tavily-api-key)"
+                    "no Tavily credential available (attach an exact Profiles secret or pass --tavily-api-key)"
                 );
             }
             Ok(Provider::Tavily)
@@ -252,7 +252,7 @@ fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
         Provider::Exa => {
             if keys.exa.is_none() {
                 bail!(
-                    "no Exa credential available (attach an exact Headspace secret or pass --exa-api-key)"
+                    "no Exa credential available (attach an exact Profiles secret or pass --exa-api-key)"
                 );
             }
             Ok(Provider::Exa)
@@ -264,7 +264,7 @@ fn choose_provider(provider: Provider, keys: &ApiKeys) -> Result<Provider> {
                 Ok(Provider::Exa)
             } else {
                 bail!(
-                    "no Web provider credential is referenced by Headspace or explicitly supplied"
+                    "no Web provider credential is referenced by Profiles or explicitly supplied"
                 );
             }
         }
@@ -280,7 +280,7 @@ fn choose_provider_fetch(provider: Provider, keys: &ApiKeys) -> Result<Provider>
                 Ok(Provider::Tavily)
             } else {
                 bail!(
-                    "no Web provider credential is referenced by Headspace or explicitly supplied"
+                    "no Web provider credential is referenced by Profiles or explicitly supplied"
                 );
             }
         }
@@ -294,13 +294,13 @@ struct WebStorage<'a> {
 }
 
 impl WebStorage<'_> {
-    /// Resolve Headspace once and decrypt exactly the credential versions it
+    /// Resolve Profiles once and decrypt exactly the credential versions it
     /// names. Labels and timestamps never participate in runtime selection.
     fn open_web_secrets(&self) -> Result<ApiKeys> {
         self.storage.with_store(|store, signer, runtime| {
             let source = self.storage.open_collection_read(
                 store,
-                HEADSPACE_SCOPE_ID,
+                PROFILES_SCOPE_ID,
                 signer.verifying_key(),
                 runtime,
             )?;
@@ -311,27 +311,27 @@ impl WebStorage<'_> {
                 false,
             )?;
             let pile = store;
-            let (headspace_rank9, secrets) = runtime.block_on(async {
-                let headspace_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-                let headspace_rank9 =
-                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, headspace_succinct)?;
+            let (profiles_rank9, secrets) = runtime.block_on(async {
+                let profiles_succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+                let profiles_rank9 =
+                    pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, profiles_succinct)?;
 
                 // Derive this key's own commits into each view; the root is
                 // not acquired, and what the views lack is lag.
                 crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(headspace_succinct, signer).await,
+                    pile.maintain_attached(profiles_succinct, signer).await,
                 )
-                .context("maintain Headspace fact collection")?;
+                .context("maintain Profiles fact collection")?;
                 crate::storage::tolerate_own_lag(
-                    pile.maintain_attached(headspace_rank9, signer).await,
+                    pile.maintain_attached(profiles_rank9, signer).await,
                 )
-                .context("maintain Headspace fact collection")?;
+                .context("maintain Profiles fact collection")?;
 
                 let secrets = secret_storage::ensure_and_snapshot(pile, secrets_collection, signer)
                     .await
                     .context("observe configured Secrets collection")?;
 
-                Ok::<_, anyhow::Error>((headspace_rank9, secrets))
+                Ok::<_, anyhow::Error>((profiles_rank9, secrets))
             })?;
             // Every query shares one frozen prefix. Only exact payload reads
             // acquire bytes; no key or message selection is retried.
@@ -339,8 +339,8 @@ impl WebStorage<'_> {
                 secrets.store_snapshot().clone(),
                 runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&reader, headspace_rank9)
-                .context("read maintained Headspace collection")?;
+            let facts = crate::storage::acquire_facts(&reader, profiles_rank9)
+                .context("read maintained Profiles collection")?;
             let secrets = secret_storage::snapshot_acquiring(reader, secrets_collection)?;
             let versions = web_secret_versions(&facts)?;
             Ok(ApiKeys {
@@ -372,13 +372,13 @@ impl WebStorage<'_> {
     }
 }
 
-/// Query the current Headspace Web-credential projection without loading a
+/// Query the current Profiles Web-credential projection without loading a
 /// second catalog beside TribleSpace.
 ///
 /// A snapshot participates when its two type tags are present and decodable.
 /// Additional facts are open-world annotations. Entity ids are opaque: the
 /// projection never reconstructs or validates an intrinsic root. The only
-/// cross-row semantic retained here is Headspace's explicit supersession DAG;
+/// cross-row semantic retained here is Profiles's explicit supersession DAG;
 /// concurrent heads may agree on this Web-specific projection, while a real
 /// credential fork is surfaced rather than arbitrated by arrival order.
 fn web_secret_versions<P>(facts: &P) -> Result<WebSecretVersions>
@@ -408,12 +408,12 @@ where
 
     let mut frontier = configs.difference(&superseded).copied();
     let Some(first) = frontier.next() else {
-        bail!("Headspace Web credential track has no current state");
+        bail!("Profiles Web credential track has no current state");
     };
     let selected = web_secret_versions_at(facts, first);
     for head in frontier {
         if web_secret_versions_at(facts, head) != selected {
-            bail!("Headspace Web credential configuration is forked");
+            bail!("Profiles Web credential configuration is forked");
         }
     }
     Ok(selected)
@@ -441,7 +441,7 @@ where
 ///
 /// Repeated attribute values are alternatives, not a cardinality error. A
 /// reference that is absent from this local Secrets view therefore does not
-/// mask another usable reference asserted on the same Headspace state.
+/// mask another usable reference asserted on the same Profiles state.
 fn open_web_secret<R: triblespace::core::repo::BlobStoreGet>(
     secrets: &SecretsSnapshot<R>,
     signer: &SigningKey,
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_provider_override_does_not_require_headspace_or_a_pile() {
+    fn explicit_provider_override_does_not_require_profiles_or_a_pile() {
         let missing = PathBuf::from("/definitely/not/a/web-test.pile");
         let keys = Web::new(missing, None)
             .with_api_keys(ApiKeys {
