@@ -1027,7 +1027,11 @@ mod tests {
             .unwrap();
         let ordered: Vec<_> = ["synthetic rules", "synthetic question", "synthetic answer"]
             .iter()
-            .map(|text| thread.find(text).unwrap())
+            .map(|text| {
+                thread
+                    .find(text)
+                    .unwrap_or_else(|| panic!("missing {text} from {thread}"))
+            })
             .collect();
         assert!(ordered.windows(2).all(|pair| pair[0] < pair[1]));
     }

@@ -6,8 +6,8 @@ use triblespace::prelude::*;
 use super::*;
 use crate::schemas::blockdag::{block, content_fact, source_projection};
 
-pub(crate) const SESSION: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000001";
-const PREDECESSOR: &str = "aaaaaaaa-aaaa-4aaa-8aaa-000000000002";
+pub(crate) const SESSION: &str = "bbbbbbbb-bbbb-4bbb-8bbb-000000000001";
+const PREDECESSOR: &str = "bbbbbbbb-bbbb-4bbb-8bbb-000000000002";
 
 fn write_json(path: &Path, json: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(json).unwrap();
