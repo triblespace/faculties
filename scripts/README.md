@@ -58,10 +58,39 @@ scripts/install-release-cohort --activate-staged <generation>
 Omit `--stage-only` for a single stage-and-activate operation. Pass the same
 `--features a,b` and `--no-default-features` choices used for `cargo build`;
 they are recorded as provenance rather than guessed from opaque executables.
-Existing commands not managed by this installer are never overwritten. Old
-generations remain versioned under `~/.local/lib/faculties/releases/`, and the
-installer never rewrites their paths; rollback is the same verified atomic
-activation command with an older generation.
+Existing commands not managed by this installer are never overwritten.
+
+An activation that reads back removes the generations nothing needs any more,
+and prints for each one what happened. Under `~/.local/lib/faculties/releases/`
+it keeps
+
+- the current generation and the one current before it (the `previous` symlink
+  beside `current`; rollback is the same activation command with that name, and
+  activating the same generation twice changes nothing),
+- generations staged after the current one,
+- generations a process executes, maps, has open, works in, or names in its
+  environment or command line, and those a loaded systemd unit or launch agent
+  names. A running process keeps its old generation until it is restarted and
+  the next prune comes by,
+- generations with a file named `.keep`, whose text (who needs it, and why) is
+  printed every time. Put one where a stopped launcher or a private
+  configuration names a generation by path, which nothing else can see; remove
+  it when that moves on.
+
+If the holders cannot be read at all, everything is kept. What stays unseen are
+the working directory and environment of processes of other users; on Linux the
+files they run or have open are still asked of the kernel, on macOS they are
+not. Nothing but a plain directory with a readable `manifest.json` directly
+under `releases/` is ever removed, and no symlink is followed. Each removed
+generation leaves its manifest and `Cargo.lock` in
+`~/.local/lib/faculties/retired/`. A removal that fails is reported, never fails
+the activation, and is finished by the next prune.
+
+```sh
+scripts/install-release-cohort --prune-dry-run     # what would go, and who holds the rest
+scripts/install-release-cohort --prune-only
+scripts/install-release-cohort --activate-staged <generation> --no-prune
+```
 
 Activation changes the `current` symlink for **new** processes. A process that
 was already running keeps its old executable mapped, even when its command path

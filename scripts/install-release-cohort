@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -13,11 +14,12 @@ from pathlib import PurePosixPath
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 
 GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -26,6 +28,18 @@ REQUIRED_COHORT_BINARIES = frozenset({"migrations"})
 BUILD_ENVIRONMENT = ("RUSTFLAGS", "CARGO_INCREMENTAL")
 HEX_40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+READ_LIMIT = 16 << 20
+PROCESS_FILES = {
+    "executable": "exe",
+    "mapped file": "maps",
+    "open file": "fd",
+    "working directory": "cwd",
+    "environment": "environ",
+    "command line": "cmdline",
+}
+UNIT_PROPERTIES = (
+    "--property=Id,ExecStart,ExecStartPre,ExecStartPost,ExecStop,ExecReload,Environment"
+)
 
 
 class ReleaseError(RuntimeError):
@@ -625,8 +639,9 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
     manifest, links = validate_staged_release(release_dir, generation)
     preflight_links(prefix, links)
     preflight_path(prefix, links, os.environ.get("PATH", ""))
-    if os.path.lexists(current) and not current.is_symlink():
-        raise ReleaseError(f"current is not a symlink: {current}")
+    for link in (current, release_root / "previous"):
+        if os.path.lexists(link) and not link.is_symlink():
+            raise ReleaseError(f"{link.name} is not a symlink: {link}")
     if dry_run:
         print(json.dumps(manifest, indent=2, sort_keys=True))
         return manifest
@@ -641,6 +656,9 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
             if not os.path.lexists(path):
                 os.symlink(expected_link(prefix, binary_name), path)
                 created_links.append(path)
+        before = linked_generation(current)
+        if before not in (None, generation):
+            atomic_symlink(f"releases/{before}", release_root / "previous")
         atomic_symlink(f"releases/{generation}", current)
         fsync_directory(release_root)
         fsync_directory(command_dir)
@@ -656,6 +674,10 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
         if path.is_symlink() and os.readlink(path) == expected_link(prefix, old_binary):
             path.unlink()
     fsync_directory(command_dir)
+    for link_name, binary_name in links.items():
+        command, binary = command_dir / link_name, release_dir / "bin" / binary_name
+        if not command.exists() or not command.samefile(binary):
+            raise ReleaseError(f"activated, but {command} does not reach {binary}")
     print(f"activated Faculties release {generation} ({len(links)} binaries)")
     print(
         "warning: already-running Faculties processes still execute their previous "
@@ -666,19 +688,257 @@ def activate_staged(prefix: Path, generation: str, *, dry_run: bool) -> dict[str
     return manifest
 
 
+def linked_generation(link: Path) -> str | None:
+    parent, _, name = (os.readlink(link) if link.is_symlink() else "").rpartition("/")
+    return name if parent == "releases" and GENERATION_RE.fullmatch(name) else None
+
+
+def capped(source: Any) -> bytes:
+    data = source.read(READ_LIMIT + 1)
+    if len(data) > READ_LIMIT:
+        raise OSError(f"more than {READ_LIMIT} bytes")
+    return data
+
+
+def plain_file(path: Path) -> bytes:
+    """What a regular file holds; opening neither follows a symlink nor waits."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with open(descriptor, "rb") as file:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError("not a plain file")
+        return capped(file)
+
+
+def output(*args: str) -> bytes:
+    environment = {"XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}", **os.environ}
+    with subprocess.Popen(args, stdout=subprocess.PIPE, env=environment) as command:
+        try:
+            text = capped(command.stdout)
+        except OSError:
+            command.kill()
+            raise
+    if command.returncode and args[0] != "lsof":  # which exits 1 over any one file
+        raise OSError(f"{' '.join(args)} exited {command.returncode}")
+    return text
+
+
+def process_text(base: str, file: str) -> bytes:
+    if file in ("exe", "cwd"):
+        return os.fsencode(os.readlink(f"{base}/{file}"))
+    if file != "fd":
+        with open(f"{base}/{file}", "rb") as opened:
+            return capped(opened)
+    targets = []
+    for entry in os.listdir(f"{base}/fd"):
+        try:
+            targets.append(os.fsencode(os.readlink(f"{base}/fd/{entry}")))
+        except FileNotFoundError:
+            pass  # closed meanwhile, the others still count
+    return b"\n".join(targets)
+
+
+def linux_holders(unread: set[str]) -> Iterator[tuple[str, str, bytes]]:
+    """What every process and loaded unit names: (who, how, text)."""
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        if int(pid) == os.getpid():
+            continue
+        for how, file in PROCESS_FILES.items():
+            try:
+                who = f"pid {pid} {Path('/proc', pid, 'comm').read_text(errors='replace').strip()}"
+                yield who, how, process_text(f"/proc/{pid}", file)
+            except PermissionError:
+                if how == "mapped file":  # a kernel thread's is empty, not refused
+                    unread.add(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                pass  # it ended
+    if Path("/run/systemd/system").is_dir():
+        # --all: the default shows active units only, and a stopped one can start.
+        for manager in ("--user", "--system"):
+            shown = output("systemctl", manager, "show", "*", "--all", UNIT_PROPERTIES)
+            for unit in shown.split(b"\n\n"):
+                name = re.search(rb"^Id=(.*)$", unit, re.MULTILINE)
+                yield f"unit {name[1].decode() if name else '?'}", "loaded", unit
+
+
+def macos_holders(_unread: set[str]) -> Iterator[tuple[str, str, bytes]]:
+    kinds = {b"txt": "executable or mapped file", b"cwd": "working directory"}
+    who = how = ""
+    listed = output("lsof", "-nPw", "-Fpcfn")
+    if f"p{os.getpid()}\n".encode() not in listed:
+        raise OSError("lsof did not list this process")
+    for line in listed.splitlines():
+        if line[:1] == b"p":
+            who = f"pid {line[1:].decode()}"
+        elif line[:1] == b"c":
+            who += " " + line[1:].decode(errors="replace")
+        elif line[:1] == b"f":
+            how = kinds.get(line[1:], "open file")
+        elif line[:1] == b"n" and who.split()[1] != str(os.getpid()):
+            yield who, how, line
+    for line in output("ps", "-axEww", "-o", "pid=,command=").splitlines():
+        pid = line.split()[0].decode()
+        if int(pid) != os.getpid():
+            yield f"pid {pid}", "command line or environment", line
+    for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):
+        text = output("launchctl", "print", domain)
+        services = re.search(rb"^\tservices = \{\n(.*?)^\t\}", text, re.MULTILINE | re.DOTALL)
+        if services is None:
+            raise OSError(f"launchctl print {domain} lists no services")
+        for row in services[1].splitlines():
+            label = row.split()[-1].decode()
+            if not label.startswith("com.apple."):
+                yield f"agent {label}", "loaded", output("launchctl", "print", f"{domain}/{label}")
+
+
+def in_use(release_dir: Path) -> str | None:
+    """Linux refuses a write lease while any process, also one we cannot read,
+    executes, maps or has the file open."""
+    signal.signal(signal.SIGIO, signal.SIG_IGN)
+    for path in release_dir.rglob("*") if sys.platform == "linux" else ():
+        if path.is_symlink() or not path.is_file():
+            continue
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.fcntl(descriptor, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+        except OSError as error:
+            return f"{path.name} is in use, or cannot be asked ({error.strerror})"
+        finally:
+            os.close(descriptor)  # which also gives the lease back
+    return None
+
+
+def retire(release_root: Path, release_dir: Path) -> None:
+    """Keep the manifest (with its source identities) and lock, then remove; the
+    manifest goes last, so a half-removed generation is found again."""
+    kept = release_root / "retired" / f"{release_dir.name}-{sha256(release_dir / 'manifest.json')[:12]}"
+    kept.mkdir(parents=True, exist_ok=True)
+    for name in ("manifest.json", "Cargo.lock"):
+        if (release_dir / name).is_file():
+            shutil.copy2(release_dir / name, kept / f".{name}.new")
+            fsync_file(kept / f".{name}.new")
+            os.replace(kept / f".{name}.new", kept / name)
+    fsync_directory(kept)
+    for entry in sorted(release_dir.iterdir(), key=lambda path: (path.name == "manifest.json", path)):
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    release_dir.rmdir()
+
+
+def prune(release_root: Path, *, dry_run: bool) -> int:
+    """Remove every generation but the current, the previous, newer ones, those
+    with a .keep file and those something holds. Returns how many removals failed."""
+    releases = release_root / "releases"
+    current = linked_generation(release_root / "current")
+    if releases.is_symlink() or current is None:
+        raise ReleaseError("pruned nothing: current or releases/ is not as installed")
+    free = shutil.disk_usage(releases).free
+    stamps: dict[str, float | None] = {}  # None: undated
+    for path in sorted(releases.iterdir()):
+        plain = path.is_dir() and not path.is_symlink() and not os.path.ismount(path)
+        if not plain or not GENERATION_RE.fullmatch(path.name):
+            print(f"left {path.name}: not a generation directory")
+            continue
+        try:
+            manifest = json.loads(plain_file(path / "manifest.json"))
+            if manifest["generation"] != path.name:
+                raise ValueError
+            stamps[path.name] = dt.datetime.fromisoformat(manifest["created_utc"]).timestamp()
+        except OSError as error:
+            print(f"left {path.name}: no readable manifest.json ({error.strerror or error})")
+        except (ValueError, KeyError, TypeError):
+            stamps[path.name] = None
+    now = stamps.get(current)
+    if now is None:
+        raise ReleaseError(f"pruned nothing: the manifest of {current} gives no creation time")
+    previous, recorded = linked_generation(release_root / "previous"), "previous"
+    if previous in (None, current):
+        older = {name: stamp for name, stamp in stamps.items() if stamp and stamp < now}
+        previous = max(older, key=older.__getitem__, default=None)
+        recorded = "taken as previous, none is recorded: the newest staged before the current"
+
+    held: dict[str, dict[str, list[str]]] = {name: {} for name in stamps}
+    unread: set[str] = set()
+    unknown = None
+    try:
+        for who, how, text in (linux_holders if sys.platform == "linux" else macos_holders)(unread):
+            for name in stamps if b"releases/" in text else ():
+                if f"releases/{name}".encode() in text:
+                    held[name].setdefault(who, []).append(how)
+    except OSError as error:
+        unknown = f"what holds it cannot be read: {error}"
+    blind = f"{len(unread)} processes" if sys.platform == "linux" else "processes of other users"
+    print(f"not readable: environment and working directory of {blind}")
+
+    failures = 0
+    for name, stamp in stamps.items():
+        reasons = [recorded] if name == previous else []
+        if stamp is None:
+            reasons.append("its manifest gives no creation time for this generation")
+        elif stamp > now:
+            reasons.append("staged after the current")
+        try:
+            note = plain_file(releases / name / ".keep")[:500].decode(errors="replace")
+            reasons.append(f".keep: {' '.join(note.split())}")
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            reasons.append(f".keep: cannot be read ({error.strerror or error})")
+        reasons += [f"held by {who} ({', '.join(dict.fromkeys(how))})" for who, how in held[name].items()]
+        reasons += [unknown] if unknown else []
+        if name == current:
+            reasons = ["current"]
+        try:
+            use = None if reasons else in_use(releases / name)
+            if reasons or use:
+                print(f"kept {name}: {use or '; '.join(reasons)}")
+                continue
+            if not dry_run:
+                retire(release_root, releases / name)
+            print(f"{'would remove' if dry_run else 'removed'} {name}")
+        except OSError as error:
+            failures += 1
+            print(f"could not remove {name}: {error}", file=sys.stderr)
+    print(f"free space by df: {(shutil.disk_usage(releases).free - free) / 1e9:+.2f} GB")
+    return failures
+
+
+def lock(releases: Path) -> None:
+    """Keep this installer's activation and another's prune apart, until it exits."""
+    if releases.is_dir():
+        fcntl.flock(os.open(releases, os.O_RDONLY), fcntl.LOCK_EX)
+
+
 def install(args: argparse.Namespace) -> dict[str, Any]:
     prefix = args.prefix.expanduser().resolve()
+    release_root = prefix / "lib" / "faculties"
+    if args.prune_only or args.prune_dry_run:
+        if args.build_dir or args.activate_staged or args.generation or args.stage_only or args.dry_run:
+            raise ReleaseError("--prune-only and --prune-dry-run stand alone")
+        lock(release_root / "releases")
+        if prune(release_root, dry_run=args.prune_dry_run):
+            raise ReleaseError("a generation could not be removed")
+        return {}
     if args.activate_staged is not None:
         if args.build_dir is not None or args.generation is not None or args.stage_only:
             raise ReleaseError(
                 "--activate-staged cannot be combined with build_dir, --generation, or --stage-only"
             )
-        return activate_staged(prefix, args.activate_staged, dry_run=args.dry_run)
+        generation = args.activate_staged
+    else:
+        generation, manifest = stage_release(args)
+        if args.dry_run or args.stage_only:
+            return manifest
 
-    generation, manifest = stage_release(args)
-    if args.dry_run or args.stage_only:
-        return manifest
-    return activate_staged(prefix, generation, dry_run=False)
+    lock(release_root / "releases")
+    manifest = activate_staged(prefix, generation, dry_run=args.dry_run)
+    if not args.dry_run and not args.no_prune:
+        try:
+            prune(release_root, dry_run=False)
+        except Exception as error:  # the activation stands whatever happens here
+            print(f"warning: not pruned: {error}", file=sys.stderr)
+    return manifest
 
 
 def parser() -> argparse.ArgumentParser:
@@ -723,6 +983,21 @@ def parser() -> argparse.ArgumentParser:
         "--features",
         default="",
         help="comma-separated Cargo features used for the build",
+    )
+    pruning = result.add_mutually_exclusive_group()
+    pruning.add_argument(
+        "--no-prune", action="store_true", help="keep old generations this time"
+    )
+    pruning.add_argument(
+        "--prune-only",
+        action="store_true",
+        help="activate nothing; remove generations that are neither current, "
+        "previous, newer, kept nor held",
+    )
+    pruning.add_argument(
+        "--prune-dry-run",
+        action="store_true",
+        help="print what --prune-only would do; remove nothing",
     )
     result.add_argument(
         "--dry-run", action="store_true", help="validate and print manifest only"

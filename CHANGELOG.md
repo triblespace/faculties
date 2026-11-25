@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `install-release-cohort` keeps the current and the previous generation and
+  removes the others after an activation: not those staged later, held by a
+  running process or a loaded unit, or marked with a `.keep` file, and each
+  removed one leaves its manifest and lock in `retired/`. `--prune-dry-run`
+  shows what would go, `--prune-only` does it without activating, `--no-prune`
+  skips it once. Before the first activation with it, run `--prune-dry-run` and
+  put a `.keep` into any generation a stopped launcher still names by path. A
+  `previous` symlink now records the one before; where it is missing, the newest
+  staged before the current is kept. Activation also checks that every command
+  reaches the new generation.
+
 - Faculties are named for what they hold: `wiki` is now `knowledge`, `compass`
   `goals`, `atlas` `schemas`, `planner` `events`, `decide` `decisions`,
   `headspace` `profiles` and `triage` `diagnostics`. Binaries, MCP tools
