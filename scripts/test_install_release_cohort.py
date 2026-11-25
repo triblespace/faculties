@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import fcntl
+import functools
 import hashlib
 from importlib.machinery import SourceFileLoader
 import importlib.util
@@ -402,6 +404,20 @@ def load_script():
     return module
 
 
+@functools.cache
+def sleeper() -> str:
+    """A program that sleeps and may be run from a copy. macOS kills a copied
+    /bin/sleep at once, so there one is compiled."""
+    if sys.platform != "darwin":
+        return shutil.which("sleep")
+    directory = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    source, program = Path(directory, "sleep.c"), Path(directory, "sleep")
+    source.write_text("#include <unistd.h>\nint main(void) { sleep(60); }\n")
+    subprocess.run(["cc", "-o", str(program), str(source)], check=True)
+    return str(program)
+
+
 class PruneTest(unittest.TestCase):
     """Generations are written directly: a prune reads manifests, not binaries."""
 
@@ -427,7 +443,7 @@ class PruneTest(unittest.TestCase):
         directory = self.releases / name
         (directory / "bin").mkdir(parents=True)
         tool = directory / "bin" / "tool"
-        shutil.copy(shutil.which("sleep"), tool)
+        shutil.copy(sleeper(), tool)
         (directory / "Cargo.lock").write_text(f"lock of {name}\n")
         manifest = {
             "format": 1,
@@ -564,7 +580,8 @@ class PruneTest(unittest.TestCase):
             options.setdefault("env", {"PATH": os.environ["PATH"]})
             with self.subTest(kind=kind), self.process(*args, **options) as holder:
                 line = self.line(self.pruned(), self.a)
-                self.assertRegex(line, rf"kept .*held by pid {holder.pid} \w+")
+                self.assertIsNone(holder.poll(), "the holder is alive")
+                self.assertRegex(line, rf"kept .*held by pid {holder.pid}\b")
                 self.assertIn(f"({kind})" if linux else mac, line)
         self.assertEqual(self.line(self.pruned(), self.a), f"removed {self.a}")
 
