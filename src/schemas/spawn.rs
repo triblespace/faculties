@@ -267,8 +267,9 @@ pub mod spawn {
         /// Minted with `trible genid` on 2026-11-24, like every attribute
         /// below.
         "F24D2F33F865F26FBD8675682EB382C0" as place: inlineencodings::GenId;
-        /// The immutable model specification a declaration binds, such as a
-        /// model root in the Models collection. Opaque here. Absent leaves
+        /// The model a declaration binds: the immutable entity a native
+        /// runtime names its model by in the archive, for these exact
+        /// weights, configuration and tokenizer. Opaque here. Absent leaves
         /// the choice to the node.
         "CE06D0F62697451006B4FD7B5CAF6319" as model_spec: inlineencodings::GenId;
         /// A declaration that this one follows.

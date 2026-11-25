@@ -12,7 +12,9 @@
 //! (or none), leads anywhere from here. Every other declared zooid is
 //! returned with the reason nothing follows here: a rest, an open place,
 //! another host, several heads, or a history that cannot say where it ends.
-//! Nothing is started, answered or written. The tip it returns is what this
+//! Nothing is started, answered or written, and whether the zooid already
+//! runs is not asked: not starting it twice at once is for its owner on that
+//! host. The tip it returns is what this
 //! scope's archive held when it was read; the node checks it again under its
 //! own WRITE before opening.
 //!
@@ -124,7 +126,9 @@ pub fn declaration_fragment(declaration: &DeclarationFacts) -> (Fragment, Id) {
     (fragment, id)
 }
 
-/// The declaration a run made true, annotating the run.
+/// The declaration a run made true, annotating the run. A run's end, clean or
+/// not, completes no declaration: it stands until another follows it, and a
+/// later run goes on from the tail the history has then.
 pub fn realises_fragment(run: Id, declaration: Id) -> Fragment {
     entity! { ExclusiveId::force_ref(&run) @ attrs::realises: declaration }
 }

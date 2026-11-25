@@ -145,8 +145,9 @@ enum Command {
         /// Nowhere: the zooid exists and rests.
         #[arg(long, conflicts_with_all = ["model_spec", "model_label"])]
         rest: bool,
-        /// Bind this immutable model specification (hex id), such as a model
-        /// root in the Models collection. Without it the node chooses.
+        /// Bind this model (hex id): the immutable entity a native runtime
+        /// names it by in the archive, for these exact weights, configuration
+        /// and tokenizer. Without it the node chooses.
         #[arg(long, value_name = "ID")]
         model_spec: Option<String>,
         /// A model label to show. It binds nothing.
