@@ -404,6 +404,7 @@ pub mod witness {
         (SOURCE_GEMINI, "gemini"),
         (SOURCE_COPILOT, "copilot"),
         (SOURCE_AGY, "antigravity"),
+        (SOURCE_VIBE, "vibe"),
         (SOURCE_DRIVE, "drive"),
     ];
     /// OCCURRENCE CORE. Relations entities that produced and observed it.
@@ -412,7 +413,7 @@ pub mod witness {
     pub use crate::schemas::blockdag::source_projection::{raw_author, raw_model, raw_role};
     use crate::schemas::blockdag::source_projection::{
         SOURCE_AGY, SOURCE_CHATGPT, SOURCE_CLAUDE_CODE, SOURCE_CLAUDE_WEB, SOURCE_CODEX,
-        SOURCE_COPILOT, SOURCE_DRIVE, SOURCE_GEMINI,
+        SOURCE_COPILOT, SOURCE_DRIVE, SOURCE_GEMINI, SOURCE_VIBE,
     };
 
     attributes! {

@@ -16,6 +16,7 @@ pub enum ImportSource {
     CodexCloud,
     Copilot,
     Gemini,
+    Vibe,
 }
 #[derive(Clone, Debug)]
 pub enum ImportSummary {
@@ -28,6 +29,7 @@ pub enum ImportSummary {
     CodexCloud(CodexCloudProjectionSummary),
     Copilot(CopilotProjectionSummary),
     Gemini(GeminiProjectionSummary),
+    Vibe(crate::archive_vibe::ProjectionSummary),
 }
 pub struct ImportReceipt {
     pub summary: ImportSummary,
@@ -62,6 +64,7 @@ impl ImportSummary {
             Self::CodexCloud(s) => print_codex_cloud_import_summary(s, publication, out),
             Self::Copilot(s) => print_copilot_import_summary(s, publication, out),
             Self::Gemini(s) => print_gemini_import_summary(s, publication, out),
+            Self::Vibe(s) => print_vibe_import_summary(s, publication, out),
         }
     }
 }
@@ -94,6 +97,9 @@ impl Archive {
         bytes: Bytes,
         attachments: &BTreeMap<String, Bytes>,
     ) -> Result<ImportReceipt> {
+        if source == ImportSource::Vibe {
+            bail!("Vibe import requires an exact local session directory");
+        }
         if source_name.trim().is_empty() || source_name.contains('\0') {
             bail!("resident Archive source name must be nonempty and contain no NUL");
         }
@@ -110,6 +116,7 @@ impl Archive {
                 &self.storage,
             )?;
             let projection = match source {
+                ImportSource::Vibe => unreachable!("Vibe requires an exact local session directory"),
                 ImportSource::Agy => archive_agy::project_bytes(source_name, bytes, |p| {
                     writer.stage(p.fragment, p.identity)
                 })
@@ -442,6 +449,39 @@ fn print_agy_import_summary(
     Ok(())
 }
 
+fn print_vibe_import_summary(
+    summary: &crate::archive_vibe::ProjectionSummary,
+    publication: &Publication,
+    out: &mut Out<'_>,
+) -> Result<()> {
+    out.line(format!(
+        "Vibe session={} coverage={} export_outcome={} nodes={} unresolved_tool_results={}",
+        summary.session_id,
+        summary.coverage(),
+        summary.export_outcome.as_deref().unwrap_or("absent"),
+        summary.stats.projections_emitted,
+        summary.stats.unresolved_tool_results,
+    ))?;
+    out.line(format!(
+        "segments={} journal_records={} completed_calls={} failed_calls={} pending_calls={} streamed_calls={} trailing_bytes_held={} unsupported_parts={} unmatched_assistant_inputs={}",
+        summary.segments,
+        summary.journal_records,
+        summary.completed_calls,
+        summary.failed_calls,
+        summary.pending_calls,
+        summary.streamed_calls,
+        summary.trailing_bytes_held,
+        summary.unsupported_parts,
+        summary.unmatched_assistant_inputs,
+    ))?;
+    if let Some(sequence) = summary.missing_sequence {
+        out.line(format!(
+            "Vibe journal prefix ends before sequence {sequence}"
+        ))?;
+    }
+    print_collection_publication(publication, out)
+}
+
 fn print_chatgpt_import_summary(
     summary: &ChatGptProjectionSummary,
     publication: &Publication,
@@ -743,6 +783,14 @@ fn projection_actor(facts: &FactArchive, reader: &PileSnapshot, projection: Id) 
         projection @ metadata::tag: archive_schema::source_projection::COMPACTION_SUMMARY
     }])) {
         actor.push_str(" [source compaction summary]");
+    }
+    let outcomes: BTreeSet<TextHandle> = find!(
+        outcome: TextHandle,
+        pattern!(facts, [{ projection @ archive_schema::source_projection::raw_outcome: ?outcome }])
+    )
+    .collect();
+    for outcome in outcomes {
+        write!(actor, " [source outcome {}]", read_text(reader, outcome)?)?;
     }
     Ok(actor)
 }
@@ -1221,6 +1269,10 @@ fn render_projection(
         ),
         ("raw_role", &*archive_schema::source_projection::raw_role),
         ("raw_model", &*archive_schema::source_projection::raw_model),
+        (
+            "raw_outcome",
+            &*archive_schema::source_projection::raw_outcome,
+        ),
     ] {
         for value in find!(
             value: TextHandle,

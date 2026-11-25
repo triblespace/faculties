@@ -52,6 +52,7 @@ pub mod archive_gemini;
 mod archive_shape;
 pub mod archive_source;
 pub mod archive_v3;
+pub mod archive_vibe;
 pub mod blockdag;
 pub mod body;
 pub mod bootstrap;

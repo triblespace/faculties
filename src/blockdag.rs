@@ -59,6 +59,8 @@ pub struct ProjectionAnnotations {
     pub raw_role: Option<String>,
     /// Exact source spelling of the model field.
     pub raw_model: Option<String>,
+    /// Exact source spelling of an outcome on this occurrence.
+    pub raw_outcome: Option<String>,
     /// Models that wrote this occurrence ([`vendor_model`] roots for
     /// imported records, the producer's binding for native ones). Leave it
     /// empty for anything the model perceived rather than produced.
@@ -867,6 +869,9 @@ pub fn annotate_source_projection(
     let raw_model = annotations
         .raw_model
         .map(|value| projection.put::<UTF8String, _>(value));
+    let raw_outcome = annotations
+        .raw_outcome
+        .map(|value| projection.put::<UTF8String, _>(value));
     let source_locator = annotations
         .source_locator
         .map(|value| projection.put::<UTF8String, _>(value));
@@ -895,6 +900,7 @@ pub fn annotate_source_projection(
         schema::source_projection::raw_author?: raw_author.as_ref(),
         schema::source_projection::raw_role?: raw_role.as_ref(),
         schema::source_projection::raw_model?: raw_model.as_ref(),
+        schema::source_projection::raw_outcome?: raw_outcome.as_ref(),
         schema::source_projection::generated_by*: annotations.generated_by.iter(),
         schema::source_projection::source_locator?: source_locator.as_ref(),
         schema::source_projection::source_detail?: source_detail.as_ref(),

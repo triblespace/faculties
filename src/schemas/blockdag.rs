@@ -216,6 +216,8 @@ pub mod source_projection {
         "2874AFE6553B4E044D4EBFB8FA89A641" unsafe as pub raw_role: Handle<UTF8String>;
         /// NONIDENTITY. Exact vendor model label retained for provenance.
         "CEB26C9520076D245DF83F77D994A800" unsafe as pub raw_model: Handle<UTF8String>;
+        /// NONIDENTITY. The source's own outcome label for this occurrence.
+        "510883B13D2AD23338B7F6EB2AFB318C" as pub raw_outcome: Handle<UTF8String>;
         /// NONIDENTITY. Canonical JSON of provider metadata about the
         /// conversation a leaf ends, such as a Claude Code subagent's
         /// `.meta.json`. Minted with `trible genid` on 2026-10-11.
@@ -292,6 +294,8 @@ pub mod source_projection {
     /// Gemini Antigravity transcript source namespace. Minted with `trible
     /// genid` on 2026-08-17.
     pub const SOURCE_AGY: Id = id_hex!("29D3BFFAF4AC6C2AD2EFD1C7D22B60FB");
+    /// Mistral Vibe's unified session recovery journal.
+    pub const SOURCE_VIBE: Id = id_hex!("8D71A17A4D0AC39D278A643CDA687CD7");
 
     /// ChatGPT data-export Codex cloud task source namespace. Minted with
     /// `trible genid` on 2026-11-24.

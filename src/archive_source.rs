@@ -163,6 +163,7 @@ pub struct SourceClaims {
     pub raw_author: Option<View<str>>,
     pub raw_role: Option<View<str>>,
     pub raw_model: Option<View<str>>,
+    pub raw_outcome: Option<View<str>>,
 }
 
 /// One source occurrence plus its semantic interpretation.
@@ -1156,6 +1157,10 @@ where
                     .map(|value| value.as_ref().to_owned()),
                 raw_model: claims
                     .raw_model
+                    .as_ref()
+                    .map(|value| value.as_ref().to_owned()),
+                raw_outcome: claims
+                    .raw_outcome
                     .as_ref()
                     .map(|value| value.as_ref().to_owned()),
                 ..ProjectionAnnotations::default()

@@ -3,7 +3,7 @@ use super::{ImportSource, ImportSummary};
 use crate::blockdag::Identity;
 use crate::{
     archive_agy, archive_chatgpt, archive_chatgpt_library, archive_claude_code, archive_claude_web,
-    archive_codex, archive_codex_cloud, archive_copilot, archive_gemini,
+    archive_codex, archive_codex_cloud, archive_copilot, archive_gemini, archive_vibe,
 };
 use anyhow::Result;
 use std::path::Path;
@@ -54,6 +54,10 @@ pub(super) fn project_path(
         ImportSource::Gemini => {
             archive_gemini::project_path(path, |p| emit(p.fragment, p.identity, &p.source_path))
                 .map(ImportSummary::Gemini)
+        }
+        ImportSource::Vibe => {
+            archive_vibe::project_path(path, |p| emit(p.fragment, p.identity, &p.source_path))
+                .map(ImportSummary::Vibe)
         }
     }
 }
