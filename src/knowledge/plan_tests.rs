@@ -247,7 +247,10 @@ fn a_source_annotation_resumes_after_files_and_replays_without_publication() {
     let pile = Pile::new();
     let mut plan = fixture_plan(None);
     plan.commits[0].revisions[0].source = Some("missing.md".into());
-    assert!(pile.knowledge().import_plan_batched(plan.clone(), &[]).is_err());
+    assert!(pile
+        .knowledge()
+        .import_plan_batched(plan.clone(), &[])
+        .is_err());
     assert_eq!(pile.counts().files, 0);
     assert_eq!(pile.counts().revisions, 0);
 
@@ -255,9 +258,14 @@ fn a_source_annotation_resumes_after_files_and_replays_without_publication() {
     for commit in &mut files_only.commits {
         commit.revisions.clear();
     }
-    pile.knowledge().import_plan_batched(files_only, &[]).unwrap();
+    pile.knowledge()
+        .import_plan_batched(files_only, &[])
+        .unwrap();
     plan.commits[0].revisions[0].source = Some("uploads/floor.png".into());
-    let report = pile.knowledge().import_plan_batched(plan.clone(), &[]).unwrap();
+    let report = pile
+        .knowledge()
+        .import_plan_batched(plan.clone(), &[])
+        .unwrap();
     assert_eq!(
         (
             report.new_files,
@@ -274,7 +282,10 @@ fn a_source_annotation_resumes_after_files_and_replays_without_publication() {
 #[test]
 fn an_interrupted_run_then_a_rerun_converges_on_the_full_run() {
     let full = Pile::new();
-    let expected = full.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let expected = full
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
 
     let resumed = full.sibling();
     // Interrupted between the attachment commit and the first page commit.
@@ -287,7 +298,10 @@ fn an_interrupted_run_then_a_rerun_converges_on_the_full_run() {
     plan.commits.truncate(2);
     let partial = resumed.knowledge().import_plan(plan, &[]).unwrap();
     assert_eq!(partial.new_files, 0, "the attachment is not imported twice");
-    let rerun = resumed.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let rerun = resumed
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
 
     assert_eq!(ids(&rerun), ids(&expected));
     assert_eq!(
@@ -300,7 +314,10 @@ fn an_interrupted_run_then_a_rerun_converges_on_the_full_run() {
 #[test]
 fn a_native_edit_after_the_import_survives_a_replay() {
     let pile = Pile::new();
-    let report = pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let report = pile
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     let home = ids(&report)["c3:home"];
     let native = pile
         .knowledge()
@@ -313,7 +330,10 @@ fn a_native_edit_after_the_import_survives_a_replay() {
         )
         .unwrap();
     let before = pile.counts();
-    let replay = pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let replay = pile
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     assert_eq!(replay.publications, 0);
     assert_eq!(pile.counts(), before);
     let entry = pile.entry_of(home);
@@ -330,7 +350,10 @@ fn a_native_edit_after_the_import_survives_a_replay() {
 #[test]
 fn a_rename_is_one_entry_with_its_whole_history() {
     let pile = Pile::new();
-    let report = pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let report = pile
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     let ids = ids(&report);
     let entry = pile.entry_of(ids["c1:guide"]);
     assert_eq!(entry.roots, vec![ids["c1:guide"]]);
@@ -364,8 +387,13 @@ fn a_rename_is_one_entry_with_its_whole_history() {
 #[test]
 fn links_name_the_pages_and_files_as_they_stood_and_resolve_after_replay() {
     let pile = Pile::new();
-    let report = pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
-    pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    let report = pile
+        .knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
+    pile.knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     let ids = ids(&report);
     let (home, office, breakage) = pile
         .storage()
@@ -383,11 +411,11 @@ fn links_name_the_pages_and_files_as_they_stood_and_resolve_after_replay() {
         })
         .unwrap();
     assert!(
-        home.contains(&format!("wiki:{:x}", ids["c3:guide"])),
+        home.contains(&format!("knowledge:{:x}", ids["c3:guide"])),
         "{home}"
     );
     assert!(
-        home.contains(&format!("wiki:{:x}", ids["c1:office"])),
+        home.contains(&format!("knowledge:{:x}", ids["c1:office"])),
         "{home}"
     );
     let hash = blake3::hash(FLOOR_PNG).to_hex().to_string();
@@ -399,7 +427,9 @@ fn links_name_the_pages_and_files_as_they_stood_and_resolve_after_replay() {
 #[test]
 fn attachment_bytes_read_back_and_a_replay_is_no_new_import() {
     let pile = Pile::new();
-    pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    pile.knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     let hash = blake3::hash(FLOOR_PNG).to_hex().to_string();
     assert_eq!(pile.files().get(&hash).unwrap().bytes.as_ref(), FLOOR_PNG);
     let before = pile.counts();
@@ -418,7 +448,9 @@ fn attachment_bytes_read_back_and_a_replay_is_no_new_import() {
         (again.files, again.file_imports),
         (before.files, before.file_imports + 1)
     );
-    pile.knowledge().import_plan(fixture_plan(None), &[]).unwrap();
+    pile.knowledge()
+        .import_plan(fixture_plan(None), &[])
+        .unwrap();
     assert_eq!(
         pile.counts(),
         again,

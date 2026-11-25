@@ -943,6 +943,10 @@ fn regexes() -> &'static LintPatterns {
             r"(wiki|\bknowledge):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b",
         )
         .unwrap(),
+        old_scheme_links: regex::Regex::new(
+            r#"#link\("wiki:((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)""#,
+        )
+        .unwrap(),
     })
 }
 
@@ -951,6 +955,38 @@ struct LintPatterns {
     markdown_links: regex::Regex,
     web_links: regex::Regex,
     knowledge_references: regex::Regex,
+    old_scheme_links: regex::Regex,
+}
+
+/// `content` with each `#link("wiki:X")` written `#link("knowledge:X")`, the
+/// spelling new text uses. A label, a bare mention and raw text keep theirs:
+/// both spellings name the same page, for every reader and for ever.
+///
+/// Authoring passes through here and `lint` does not, so a page takes the new
+/// spelling when somebody edits it and never because a pass went over it.
+fn link_by_knowledge(content: &str) -> String {
+    let mut output = String::with_capacity(content.len());
+    let mut fenced = false;
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        }
+        for (index, part) in line.split('`').enumerate() {
+            if index > 0 {
+                output.push('`');
+            }
+            if fenced || index % 2 == 1 {
+                output.push_str(part);
+            } else {
+                output.push_str(
+                    &regexes()
+                        .old_scheme_links
+                        .replace_all(part, "#link(\"knowledge:$1\""),
+                );
+            }
+        }
+    }
+    output
 }
 
 fn lint_line<P: TriblePattern>(line: &str, resolver: ReferenceResolver<'_, P>) -> String {
@@ -1018,7 +1054,7 @@ fn prepare_content(
     files: Option<&FactArchive>,
     allow_dangling: bool,
 ) -> Result<String> {
-    let content = lint_fix(raw, ReferenceResolver { knowledge, files });
+    let content = link_by_knowledge(&lint_fix(raw, ReferenceResolver { knowledge, files }));
     validate_typst(&content)?;
     validate_links(&content, knowledge, allow_dangling)?;
     validate_file_links(&content, files, allow_dangling)?;
@@ -2026,11 +2062,11 @@ fn resolve_plan_links(
     let resolved = re.replace_all(content, |captures: &regex::Captures| {
         let key = &captures[1];
         if let Some(id) = pages.get(key) {
-            format!("#link(\"wiki:{id:x}\")")
+            format!("#link(\"knowledge:{id:x}\")")
         } else if let Some(handle) = attachments.get(key) {
             format!("#link(\"files:{}\")", content_hash_hex(*handle))
         } else if let Some(id) = revisions.get(key) {
-            format!("#link(\"wiki:{id:x}\")")
+            format!("#link(\"knowledge:{id:x}\")")
         } else {
             missing.get_or_insert_with(|| key.to_owned());
             captures[0].to_owned()
@@ -2586,19 +2622,21 @@ fn cmd_lint(
     check: bool,
     out: &mut Out<'_>,
 ) -> Result<()> {
-    let (report, changed, revisions, unfixed) =
+    let (report, changed, revisions, unfixed, old_scheme) =
         storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let resolver = ReferenceResolver {
                 knowledge: &view.facts,
                 files: Some(files),
             };
             let mut report = String::new();
+            let mut old_scheme = 0usize;
             let mut revisions = Vec::new();
             let mut unfixed = Vec::new();
             let mut changed = 0usize;
             for entry in knowledge_model::entries(&view.facts, &view.latest) {
                 for head in &entry.frontier {
                     let content = revision_content(&view.reader, head)?;
+                    old_scheme += usize::from(link_by_knowledge(&content) != content);
                     let revised = lint_fix(&content, resolver);
                     if revised == content {
                         continue;
@@ -2628,7 +2666,7 @@ fn cmd_lint(
                     }
                 }
             }
-            Ok((report, changed, revisions, unfixed))
+            Ok((report, changed, revisions, unfixed, old_scheme))
         })?;
     let mut fragment = Fragment::empty();
     for (entry, title, content, tags) in revisions {
@@ -2639,6 +2677,11 @@ fn cmd_lint(
     }
     out.text(format!("{report}"))?;
     out.line(format!("{changed} revision(s) need lint fixes"))?;
+    if old_scheme > 0 {
+        out.line(format!(
+            "{old_scheme} revision(s) link with wiki:, written knowledge: when next edited"
+        ))?;
+    }
     for label in unfixed {
         out.note(format!(
             "not fixed: entry {label} has several current revisions or readings; \
@@ -4028,6 +4071,36 @@ mod tests {
         let once = lint_fix(&format!("wiki:{}", &format!("{v2:x}")[..12]), resolver);
         assert_eq!(once, format!("wiki:{v2:x}"));
         assert_eq!(lint_fix(&once, resolver), once);
+    }
+
+    /// Authoring writes knowledge: links and nothing else: the target, a label,
+    /// a bare mention and raw text keep their bytes, and `lint` leaves the old
+    /// spelling alone.
+    #[test]
+    fn authoring_writes_knowledge_links_and_lint_does_not() {
+        let (fragment, _anchor, v1, _v2) = legacy_anchor_pair();
+        let resolver = ReferenceResolver {
+            knowledge: fragment.facts(),
+            files: None,
+        };
+        let content = format!(
+            "#link(\"wiki:{v1:x}\")[wiki:{v1:x}] and #link(\"wiki:reviews:{v1:x}\")[b], wiki:{v1:x}\n\
+             `#link(\"wiki:{v1:x}\")[raw]` then #link(\"wiki:{v1:x}\")[c]\n\
+             ```\n#link(\"wiki:{v1:x}\")[fenced]\n```\n\
+             #link(\"knowledge:{v1:x}\")[d] #link(\"https://example.org/wiki:{v1:x}\")[e]"
+        );
+        assert_eq!(lint_fix(&content, resolver), content);
+        let written = link_by_knowledge(&content);
+        assert_eq!(
+            written,
+            format!(
+                "#link(\"knowledge:{v1:x}\")[wiki:{v1:x}] and #link(\"knowledge:reviews:{v1:x}\")[b], wiki:{v1:x}\n\
+                 `#link(\"wiki:{v1:x}\")[raw]` then #link(\"knowledge:{v1:x}\")[c]\n\
+                 ```\n#link(\"wiki:{v1:x}\")[fenced]\n```\n\
+                 #link(\"knowledge:{v1:x}\")[d] #link(\"https://example.org/wiki:{v1:x}\")[e]"
+            )
+        );
+        assert_eq!(link_by_knowledge(&written), written);
     }
 
     /// End to end: `knowledge lint --fix` mints a SUCCESSOR carrying the corrected

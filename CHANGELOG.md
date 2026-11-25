@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- `knowledge create`, `edit`, `import` and plans write `#link("wiki:…")` as
+  `#link("knowledge:…")`. Labels, bare mentions and raw text keep their bytes,
+  stored pages are not touched, and `wiki:` links keep working. `knowledge lint`
+  counts the pages that still link the old way; it neither fixes them nor fails.
+
 - `install-release-cohort` keeps the current and the previous generation and
   removes the others after an activation: not those staged later, held by a
   running process or a loaded unit, or marked with a `.keep` file, and each
