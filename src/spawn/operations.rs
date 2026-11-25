@@ -2698,12 +2698,18 @@ impl Spawn {
                 )
             }
         };
+        // An agy run's conversation goes into the archive as it ends, whatever
+        // the end: a failure is its own line, never the run's result.
+        let archived = match (agent.as_deref(), &recorded) {
+            (Some(agent), Ok(Some(view))) => self.archive_run(&request.name, agent, view),
+            _ => String::new(),
+        };
         let mut message = earlier_message;
         if message.is_none() {
             let sent = match spawner {
                 Some(spawner) => {
                     let text = format!(
-                        "{} finished, {end}, {}. `zooid show {}` reads it.{}",
+                        "{} finished, {end}, {}. `zooid show {}` reads it.{}{archived}",
                         request.name,
                         lifecycle_text(local, report, clean),
                         request.name,
@@ -2745,7 +2751,19 @@ impl Spawn {
                 }
             }
         }
-        if message.is_some() {
+        // A replayed settlement (to retry its archive import, say) must not
+        // retire a persona that a newer run of the same zooid revived.
+        let superseded = self.newer_run(run).unwrap_or_else(|error| {
+            failures.push(error.context("look for a newer run of the zooid"));
+            None
+        });
+        if let Some(newer) = superseded {
+            let why = format!(
+                "not retiring {}: run {newer:x} of the same zooid started after this one",
+                request.name
+            );
+            let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
+        } else if message.is_some() {
             if let Err(error) = Relations::with_storage(self.storage.clone()).retire(&request.name)
             {
                 let why = format!("retire {}: {error:#}", request.name);
@@ -2834,6 +2852,18 @@ impl Spawn {
     /// The first model call's input tokens in claude's transcript of a
     /// session: `<projects>/<any project>/<session>.jsonl`.
     fn claude_first_call(&self, session: &str) -> Option<u64> {
+        self.claude_session_file(session)
+            .and_then(|path| std::fs::File::open(path).ok())
+            .and_then(|file| {
+                use std::io::BufRead as _;
+                cover::claude_first_call(
+                    std::io::BufReader::new(file).lines().map_while(Result::ok),
+                )
+            })
+    }
+
+    /// A claude session's transcript: `<projects>/<any project>/<session>.jsonl`.
+    fn claude_session_file(&self, session: &str) -> Option<PathBuf> {
         if session.is_empty() || session.contains(['/', '.']) {
             return None;
         }
@@ -2843,13 +2873,6 @@ impl Spawn {
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().join(format!("{session}.jsonl")))
             .find(|path| path.is_file())
-            .and_then(|path| std::fs::File::open(path).ok())
-            .and_then(|file| {
-                use std::io::BufRead as _;
-                cover::claude_first_call(
-                    std::io::BufReader::new(file).lines().map_while(Result::ok),
-                )
-            })
     }
 
     /// Every spawn, by name.
@@ -2904,6 +2927,176 @@ impl Spawn {
             std::thread::sleep(poll);
         }
         self.show(name)
+    }
+
+    /// Import an ended run's conversation into the archive, from where its
+    /// provider keeps it, whatever the end: the seam every provider shares,
+    /// each saying where its transcript is and which importer reads it
+    /// ([`Self::run_transcript`]). Importing the same bytes again adds
+    /// nothing. Returns the sentence for the spawner, which says archived
+    /// only when the import succeeded. A failure is recorded on the run as
+    /// a settlement failure and leaves its exit and result alone;
+    /// ingest-sessions finds the transcript again later.
+    fn archive_run(&self, name: &str, agent: &str, view: &RunView) -> String {
+        let (conversation, path, source) = match self.run_transcript(name, agent, view) {
+            Ok(Some(found)) => found,
+            Ok(None) => return String::new(),
+            Err(why) => return format!(" {why}"),
+        };
+        let imported = (|| -> Result<usize> {
+            let source_name = path
+                .to_str()
+                .ok_or_else(|| anyhow!("{} is not UTF-8", path.display()))?
+                .to_owned();
+            let bytes = crate::archive_source::read_file(&path)?;
+            let receipt = crate::archive::Archive::with_storage(self.storage.clone()).import(
+                source,
+                &source_name,
+                bytes,
+                &std::collections::BTreeMap::new(),
+            )?;
+            Ok(receipt.publication.pieces)
+        })();
+        match imported {
+            Ok(0) => format!(" Its conversation {conversation} was already archived."),
+            Ok(pieces) => {
+                format!(" Its conversation {conversation} was archived ({pieces} pieces).")
+            }
+            Err(error) => {
+                let why = format!("archive the conversation {conversation}: {error:#}");
+                let _ = self.publish(super::run_annotation(view.id, None, Some(&why), None));
+                format!(
+                    " Archiving its conversation {conversation} failed ({error:#}); \
+                     ingest-sessions will find it again."
+                )
+            }
+        }
+    }
+
+    /// A run of the same zooid that started after `run`, if any.
+    fn newer_run(&self, run: Id) -> Result<Option<Id>> {
+        self.observe(|facts, _| {
+            let Some((spawn, started)) = find!(
+                (spawn: Id, started: IntervalValue),
+                pattern!(facts, [{ run @ attrs::of: ?spawn, metadata::started_at: ?started }])
+            )
+            .next() else {
+                return Ok(None);
+            };
+            let start = |at: IntervalValue| {
+                at.try_from_inline::<(Epoch, Epoch)>()
+                    .ok()
+                    .map(|(from, _)| from)
+            };
+            let Some(this) = start(started) else {
+                return Ok(None);
+            };
+            Ok(find!(
+                (other: Id, at: IntervalValue),
+                pattern!(facts, [{ ?other @
+                    metadata::tag: KIND_RUN,
+                    attrs::of: spawn,
+                    metadata::started_at: ?at,
+                }])
+            )
+            .filter(|(other, at)| *other != run && start(*at).is_some_and(|from| from > this))
+            .map(|(other, _)| other)
+            .next())
+        })
+    }
+
+    /// Where a provider keeps an ended run's transcript, and the importer
+    /// that reads it: the conversation, the file, the source. `Ok(None)`
+    /// when there is nothing to import here; `Err` says, for the spawner,
+    /// why a run that should have one has none.
+    ///
+    /// - agy: `transcript_full.jsonl` of the run's conversation in the
+    ///   zooid's own home. A run that recorded none (killed before its
+    ///   result) is matched to the conversation there last written at or
+    ///   after the run started.
+    /// - claude: the session file of the run's `session/<id>` under
+    ///   claude's projects. A run that recorded no session has none here.
+    /// - codex, mistral: not located yet (spawn records no rollout or vibe
+    ///   session); ingest-sessions reads what it discovers.
+    /// - local: Drive archives as it lives.
+    fn run_transcript(
+        &self,
+        name: &str,
+        agent: &str,
+        view: &RunView,
+    ) -> std::result::Result<Option<(String, PathBuf, crate::archive::ImportSource)>, String> {
+        let sessions: Vec<&str> = view
+            .source_locator
+            .iter()
+            .filter_map(|locator| locator.strip_prefix("session/"))
+            .collect();
+        if sessions.len() > 1 {
+            return Err(format!(
+                "It recorded {} conversations, so none was archived at settlement.",
+                sessions.len()
+            ));
+        }
+        let session = sessions.first().map(|id| id.to_string());
+        if agent == Provider::Claude.name() {
+            let Some(session) = session else {
+                return Ok(None);
+            };
+            return match self.claude_session_file(&session) {
+                Some(path) => Ok(Some((
+                    session,
+                    path,
+                    crate::archive::ImportSource::ClaudeCode,
+                ))),
+                None => Err(format!(
+                    "Its session {session} was not found under claude's projects to archive."
+                )),
+            };
+        }
+        if agent != Provider::Agy.name() {
+            return Ok(None);
+        }
+        let home = self.launch.agy_home(name);
+        let conversation = match session {
+            Some(id) => Some(id),
+            None => {
+                let started = view
+                    .started
+                    .and_then(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
+                    .map(|(from, _)| from);
+                super::agy::latest_conversation(&home)
+                    .ok()
+                    .flatten()
+                    .filter(|id| {
+                        let modified = super::agy::transcript(&home, id)
+                            .ok()
+                            .and_then(|path| std::fs::metadata(path).ok())
+                            .and_then(|meta| meta.modified().ok())
+                            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
+                        match (modified, started) {
+                            (Some(modified), Some(started)) => {
+                                Epoch::from_unix_seconds(modified.as_secs_f64()) >= started
+                            }
+                            _ => false,
+                        }
+                    })
+            }
+        };
+        let Some(conversation) = conversation else {
+            return Err("It left no conversation to archive.".to_owned());
+        };
+        let path =
+            super::agy::transcript(&home, &conversation).map_err(|error| format!("{error:#}"))?;
+        if !path.is_file() {
+            return Err(format!(
+                "Its conversation {conversation} has no transcript in {} to archive.",
+                home.display()
+            ));
+        }
+        Ok(Some((
+            conversation,
+            path,
+            crate::archive::ImportSource::Agy,
+        )))
     }
 
     /// What the zooid never read: unread messages addressed to it, named in
@@ -5442,11 +5635,14 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join(format!("{session}.jsonl")),
-            concat!(
-                r#"{"type":"user","message":{"content":"x"}}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"usage":{"input_tokens":2,"cache_creation_input_tokens":192066,"cache_read_input_tokens":11266}}}"#,
-                "\n"
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"user","sessionId":"{session}","uuid":"u1","parentUuid":null,"timestamp":"2026-11-26T00:00:00.000Z","message":{{"role":"user","content":"x"}}}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"assistant","sessionId":"{session}","uuid":"a1","parentUuid":"u1","timestamp":"2026-11-26T00:00:01.000Z","message":{{"role":"assistant","model":"claude-opus-5-5","content":[{{"type":"text","text":"claude reply"}}],"usage":{{"input_tokens":2,"cache_creation_input_tokens":192066,"cache_read_input_tokens":11266}}}}}}"#
+                ),
             ),
         )
         .unwrap();
@@ -5456,6 +5652,15 @@ mod tests {
         assert_eq!(run.context_window, [1_000_000]);
         assert_eq!(run.first_call_input_tokens, [203_334]);
         assert_eq!(run.source_locator, [format!("session/{session}")]);
+        // Its session went into the archive as it settled.
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+        let told = f.told(&launched.name);
+        assert!(
+            told.contains(&format!("Its conversation {session} was archived (")),
+            "{told}"
+        );
+        let thread = archive_thread(&f, &format!("session/{session}"));
+        assert!(thread.contains("claude reply"), "{thread}");
         let later = f
             .spawn
             .run(&covered(&f, "Second claude run.", 20.0, None))
@@ -6751,17 +6956,18 @@ mod tests {
     fn agy_ran(home: &Path, report: &Path, conversation: &str, occupancies: &[u64]) {
         let path = super::super::agy::transcript(home, conversation).unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let lines: Vec<String> = occupancies
-            .iter()
-            .enumerate()
-            .map(|(step, occupancy)| {
-                format!(
-                    r#"{{"step_index":{step},"source":"MODEL","type":"PLANNER_RESPONSE","input_tokens":1000,"cache_read_tokens":{},"output_tokens":10}}"#,
-                    occupancy - 1000
-                )
-            })
-            .collect();
-        std::fs::write(&path, lines.join("\n")).unwrap();
+        let mut lines = vec![format!(
+            r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-26T00:00:00Z","content":"brief of {conversation}"}}"#
+        )];
+        lines.extend(occupancies.iter().enumerate().map(|(step, occupancy)| {
+            format!(
+                r#"{{"step_index":{},"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T00:00:0{}Z","content":"reply at {occupancy}","input_tokens":1000,"cache_read_tokens":{},"output_tokens":10}}"#,
+                step + 1,
+                step + 1,
+                occupancy - 1000
+            )
+        }));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
         std::fs::write(
             report,
             format!(
@@ -6769,6 +6975,26 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn archive_thread(f: &Fixture, locator: &str) -> String {
+        let mut text = String::new();
+        let mut collect = |part: Part| {
+            if let Part::Text { text: part } = part {
+                text.push_str(&part);
+            }
+            Ok(())
+        };
+        crate::archive::Archive::with_storage(f.spawn.storage.clone())
+            .thread(
+                locator,
+                100,
+                None,
+                crate::archive::Reading::default(),
+                &mut Out::new(&mut collect),
+            )
+            .unwrap();
+        text
     }
 
     #[test]
@@ -6843,6 +7069,14 @@ mod tests {
         assert_eq!(run.output_tokens, [30]);
         assert_eq!(run.first_call_input_tokens, [50_000]);
         assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+        // Archived as it ended, and found by the run's own locator.
+        let told = f.told(&name);
+        assert!(
+            told.contains("Its conversation c-1 was archived ("),
+            "{told}"
+        );
+        let thread = archive_thread(&f, "session/c-1");
+        assert!(thread.contains("reply at 120000"), "{thread}");
 
         // The same zooid again: its life has room, so it continues.
         let again = f.spawn.run(&request).unwrap();
@@ -6859,6 +7093,36 @@ mod tests {
         let run = &f.spawn.show(&name).unwrap().runs[1];
         assert!(run.provider_reason[0].contains("continues conversation c-1"));
 
+        // Settling the first run again (an archive retry) while the second
+        // lives leaves the second's persona live, and re-imports nothing new.
+        f.spawn
+            .settle(&SettleRequest {
+                name: name.clone(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let state = Relations::with_storage(f.spawn.storage.clone())
+            .person_state(&name)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !state.retired,
+            "a replayed settlement retired the live successor"
+        );
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(
+            first
+                .settle_failure
+                .iter()
+                .any(|why| why.contains("not retiring")),
+            "{:?}",
+            first.settle_failure
+        );
+        assert!(archive_thread(&f, "session/c-1").contains("reply at 120000"));
+
         // That life ends at its limit: the next run wakes fresh.
         agy_ran(&home, &again.report, "c-1", &[50_000, 120_000, 400_000]);
         f.spawn
@@ -6870,6 +7134,8 @@ mod tests {
                 usage: None,
             })
             .unwrap();
+        let thread = archive_thread(&f, "session/c-1");
+        assert!(thread.contains("reply at 400000"), "{thread}");
         let third = f.spawn.run(&request).unwrap();
         assert_eq!(third.agy_resume.conversation, None);
         assert!(
@@ -6883,6 +7149,48 @@ mod tests {
         assert!(!f.script(2).contains("--conversation"));
         let prompt = std::fs::read_to_string(third.report.with_extension("prompt")).unwrap();
         assert!(prompt.contains("# Wake"), "{prompt}");
+    }
+
+    #[test]
+    fn an_agy_run_whose_transcript_will_not_import_still_ends_as_it_ended() {
+        let f = fixture();
+        let mut request = f.request("Agy task with a broken transcript.");
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let home = f
+            .directory
+            .path()
+            .join("state")
+            .join(format!("{}.agy", launched.name));
+        agy_ran(&home, &launched.report, "c-9", &[50_000]);
+        let path = super::super::agy::transcript(&home, "c-9").unwrap();
+        std::fs::write(&path, "{not json\n").unwrap();
+        f.spawn
+            .settle(&SettleRequest {
+                name: launched.name.clone(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.exit_code, [0]);
+        assert_eq!(run.result, ["success"]);
+        assert_eq!(run.report_text.as_deref(), Some("the report"));
+        assert!(
+            run.settle_failure
+                .iter()
+                .any(|why| why.contains("archive the conversation c-9")),
+            "{:?}",
+            run.settle_failure
+        );
+        let told = f.told(&launched.name);
+        assert!(
+            told.contains("Archiving its conversation c-9 failed"),
+            "{told}"
+        );
+        assert!(!told.contains("was archived"), "{told}");
     }
 
     #[test]
