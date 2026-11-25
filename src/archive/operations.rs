@@ -432,6 +432,12 @@ fn print_agy_import_summary(
         summary.stats.missing_predecessors,
         summary.stats.unresolved_tool_results,
     ))?;
+    if summary.trailing_bytes_held != 0 {
+        out.line(format!(
+            "held back {} trailing Antigravity bytes in an unterminated line",
+            summary.trailing_bytes_held,
+        ))?;
+    }
     print_collection_publication(publication, out)?;
     Ok(())
 }

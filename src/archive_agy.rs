@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use anybytes::{Bytes, View};
 use anyhow::{bail, Context, Result};
@@ -11,8 +12,12 @@ use triblespace::core::inline::TryToInline;
 
 use crate::archive_source::{
     self, ProjectedSource, ProjectionStats, SourceClaims, SourcePart, SourceRecord, ToolLink,
+    UnitAnnotations,
 };
 use crate::schemas::blockdag as schema;
+
+pub(crate) const BRAIN_PATH: &str = ".gemini/antigravity-cli/brain";
+pub(crate) const TRANSCRIPT_PATH: &str = ".system_generated/logs/transcript_full.jsonl";
 
 /// Result returned after every selected transcript reaches the sink.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -20,6 +25,7 @@ pub struct ProjectionSummary {
     pub files_scanned: usize,
     pub fragments_emitted: usize,
     pub stats: ProjectionStats,
+    pub trailing_bytes_held: usize,
 }
 
 #[derive(Default)]
@@ -34,7 +40,19 @@ struct RawFields {
 }
 
 /// Project one `transcript_full.jsonl`, or all matching files below a directory.
-pub fn project_path<F>(path: &Path, mut emit: F) -> Result<ProjectionSummary>
+pub fn project_path<F>(path: &Path, emit: F) -> Result<ProjectionSummary>
+where
+    F: FnMut(ProjectedSource) -> Result<()>,
+{
+    project_path_finished(path, None, emit)
+}
+
+/// With a quiet cutoff, defer an unterminated line in a still-live transcript.
+pub(crate) fn project_path_finished<F>(
+    path: &Path,
+    finished_before: Option<SystemTime>,
+    mut emit: F,
+) -> Result<ProjectionSummary>
 where
     F: FnMut(ProjectedSource) -> Result<()>,
 {
@@ -54,18 +72,19 @@ where
 
     let mut summary = ProjectionSummary::default();
     for source_path in paths {
-        let records = parse_file(&source_path)?;
+        let (records, trailing_bytes) = parse_file(&source_path, finished_before)?;
         let stats = archive_source::project_records(
             schema::source_projection::SOURCE_AGY,
             &source_path,
             records,
-            archive_source::UnitAnnotations::default(),
+            unit_annotations(&source_path),
             |projected| {
                 summary.fragments_emitted += 1;
                 emit(projected)
             },
         )?;
         summary.files_scanned += 1;
+        summary.trailing_bytes_held += trailing_bytes;
         absorb(&mut summary.stats, stats);
     }
     Ok(summary)
@@ -87,13 +106,32 @@ where
         schema::source_projection::SOURCE_AGY,
         path,
         records,
-        archive_source::UnitAnnotations::default(),
+        unit_annotations(path),
         |projected| {
             summary.fragments_emitted += 1;
             emit(projected)
         },
     )?;
     Ok(summary)
+}
+
+/// The provider's directory name is a locator on the leaf receipt. Copies
+/// outside this layout still project the same nodes and receipts.
+fn unit_annotations(path: &Path) -> UnitAnnotations {
+    let locator = || {
+        let conversation = path.ancestors().nth(3)?;
+        if !conversation.parent()?.ends_with(BRAIN_PATH)
+            || path.strip_prefix(conversation).ok()? != Path::new(TRANSCRIPT_PATH)
+        {
+            return None;
+        }
+        let id = conversation.file_name()?.to_str()?;
+        Some(format!("session/{id}"))
+    };
+    UnitAnnotations {
+        source_locator: locator(),
+        ..UnitAnnotations::default()
+    }
 }
 
 fn collect_transcripts(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -113,8 +151,32 @@ fn collect_transcripts(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn parse_file(path: &Path) -> Result<Vec<SourceRecord>> {
-    parse_bytes(path, archive_source::read_file(path)?)
+fn parse_file(
+    path: &Path,
+    finished_before: Option<SystemTime>,
+) -> Result<(Vec<SourceRecord>, usize)> {
+    let mut bytes = archive_source::read_file(path)?;
+    // Read the time after the bytes: an append can only make this prefix
+    // look live, never cause us to parse a partial line as finished.
+    let live = match finished_before {
+        Some(cutoff) => {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .with_context(|| format!("read the modification time of {}", path.display()))?
+                >= cutoff
+        }
+        None => false,
+    };
+    let mut trailing_bytes = 0;
+    if live && !bytes.ends_with(b"\n") {
+        let complete = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |i| i + 1);
+        trailing_bytes = bytes.len() - complete;
+        bytes = bytes.slice(..complete);
+    }
+    Ok((parse_bytes(path, bytes)?, trailing_bytes))
 }
 
 /// The transcript's records in the order the model experienced them.
@@ -541,8 +603,8 @@ mod tests {
         )
         .unwrap();
 
-        let before = parse_file(&first_path).unwrap();
-        let after = parse_file(&second_path).unwrap();
+        let (before, _) = parse_file(&first_path, None).unwrap();
+        let (after, _) = parse_file(&second_path, None).unwrap();
         assert_eq!(before.len(), 2);
         assert_eq!(after.len(), 3);
         assert_eq!(before[0].locator, after[0].locator);

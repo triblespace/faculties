@@ -50,14 +50,17 @@ pub(super) enum Command {
     /// Discover and import this host's Codex/Claude Code sessions.
     ///
     /// Defaults: ~/.claude/projects, ~/.codex*/{sessions,archived_sessions},
-    /// and both directories under CODEX_HOME. Explicit roots replace defaults.
-    /// Recursive regular JSONL files include subagents. Symlinks/special entries
-    /// and hard-linked sources are refused; same-adapter overlapping roots collapse.
-    /// Each file remains its own native import unit, including Claude sidecars.
+    /// both directories under CODEX_HOME, and Agy's full transcript under each
+    /// ~/.gemini/antigravity-cli/brain/<conversation>/, also under Agy zooid
+    /// homes (~/.local/state/spawn/<name>.agy/). The Agy transcript is
+    /// .system_generated/logs/transcript_full.jsonl within the conversation.
+    /// Explicit roots replace defaults. Claude and Codex include recursive JSONL
+    /// files and subagents. Each file is one import unit, including Claude sidecars.
     ///
     /// The checkpoint is bound to this pile, selected collection and root set;
-    /// uninitialized/changed bindings require --all or --since. Legacy script
-    /// stamps are not inherited. Success advances only through the fixed quiet
+    /// uninitialized/changed bindings require --all or --since. Adding an Agy
+    /// root imports its history while keeping existing roots' progress.
+    /// Legacy script stamps are not inherited. Success advances through the fixed quiet
     /// cutoff. A file written within the quiet window is live: it is imported
     /// up to its last finished record (a trailing partial line and an
     /// unfinished message's tail are held back) and selected again next pass,
@@ -115,11 +118,10 @@ pub(super) enum Command {
         source: CliImportSource,
         /// Treat a source file last modified longer ago than this (for
         /// example `1h`) as finished, and emit what it holds back at its tail:
-        /// Claude Code results logged inside its last message, a trailing
-        /// Codex prompt event. A transcript cannot say it is finished, so
-        /// without this option such a tail waits for a later record. The
-        /// modification time decides only when the tail is emitted, never any
-        /// identity.
+        /// Claude Code results logged inside its last message or a trailing
+        /// Codex prompt event. With this option, an Agy file still within the
+        /// quiet window defers its final line until it is newline-terminated
+        /// or ages past the cutoff. Modification time never enters identity.
         #[arg(long, value_name = "DURATION", value_parser = parse_finished_after)]
         finished_after: Option<std::time::Duration>,
     },
