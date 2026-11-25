@@ -257,6 +257,23 @@ pub struct LaunchConfig {
     /// by vibe's own estimate from the configured prices).
     /// `SPAWN_MISTRAL_MAX_PRICE` overrides it.
     pub mistral_max_price: f64,
+    /// The `agy` command (the Antigravity CLI), for `--provider agy`.
+    /// `SPAWN_AGY` overrides it.
+    pub agy: PathBuf,
+    /// The model agy zooids are told to use (`agy --model`). `None` names
+    /// none: agy runs its own default, and the run says so.
+    /// `SPAWN_AGY_MODEL` sets it.
+    pub agy_model: Option<String>,
+    /// agy's login file, outside any run. Each agy zooid's own home links
+    /// it, so a token one agy refreshes is the one every agy here reads.
+    /// `None` links nothing. `SPAWN_AGY_TOKEN` overrides it.
+    pub agy_token: Option<PathBuf>,
+    /// The context window an agy zooid's life is measured against, in
+    /// tokens ([`super::agy::DEFAULT_WINDOW`]). `SPAWN_AGY_WINDOW` overrides it.
+    pub agy_window: u64,
+    /// The home directory whose entries an agy zooid's own home links, so
+    /// `~` still finds its tools.
+    pub real_home: PathBuf,
     /// The command the unit reads secrets with, found on `path` inside it.
     pub secrets: String,
     /// The colony's routes file. The unit sources it for what the launch
@@ -389,6 +406,11 @@ impl LaunchConfig {
             mistral_model: "mistral-large-4".to_owned(),
             mistral_key_secret: "c2c7b31676a61315928103941b04d487".to_owned(),
             mistral_max_price: 2.0,
+            agy: PathBuf::from("agy"),
+            agy_model: None,
+            agy_token: Some(home.join(super::agy::TOKEN_FILE)),
+            agy_window: super::agy::DEFAULT_WINDOW,
+            real_home: home.to_path_buf(),
             secrets: "secrets".to_owned(),
             colony_env: Some(home.join(".config/triblespace/faculty-collections.env")),
             path,
@@ -469,6 +491,21 @@ impl LaunchConfig {
                 _ => bail!("SPAWN_MISTRAL_MAX_PRICE {price:?} is not a positive number of dollars"),
             };
         }
+        if let Some(agy) = set("SPAWN_AGY") {
+            self.agy = PathBuf::from(agy);
+        }
+        if let Some(model) = set("SPAWN_AGY_MODEL") {
+            self.agy_model = Some(model);
+        }
+        if let Some(token) = set("SPAWN_AGY_TOKEN") {
+            self.agy_token = Some(PathBuf::from(token));
+        }
+        if let Some(window) = set("SPAWN_AGY_WINDOW") {
+            self.agy_window = match window.parse::<u64>() {
+                Ok(window) if window > 0 => window,
+                _ => bail!("SPAWN_AGY_WINDOW {window:?} is not a positive whole number of tokens"),
+            };
+        }
         if let Some(template) = set("SPAWN_LOCAL_EXECUTOR") {
             self.local = Some(parse_local_executor(&template)?);
         }
@@ -498,6 +535,17 @@ impl LaunchConfig {
                 ),
             },
             Provider::Mistral => (Some(self.mistral_model.clone()), None),
+            Provider::Agy => match &self.agy_model {
+                Some(model) => (Some(model.clone()), None),
+                None => (
+                    None,
+                    Some(
+                        "no agy model is configured (SPAWN_AGY_MODEL), so agy chose its own \
+                         default"
+                            .to_owned(),
+                    ),
+                ),
+            },
             Provider::Local => (
                 None,
                 Some("the local executor (SPAWN_LOCAL_EXECUTOR) chooses its own model".to_owned()),
@@ -538,6 +586,11 @@ impl LaunchConfig {
                     self.path
                 )
             })
+    }
+
+    /// An agy zooid's own home ([`super::agy::prepare_home`]).
+    pub fn agy_home(&self, name: &str) -> PathBuf {
+        self.file(name, "agy")
     }
 
     fn file(&self, name: &str, suffix: &str) -> PathBuf {
@@ -711,8 +764,13 @@ pub enum Provider {
     /// not in the quota table and `auto` never chooses it. A run is capped
     /// by [`LaunchConfig::mistral_max_price`].
     Mistral,
+    /// The Antigravity CLI (`agy`), headless, on the host's Google login.
+    /// Opt-in only: `auto` never chooses it. Its zooids run with a home of
+    /// their own ([`super::agy`]) and their lives end before agy would
+    /// compact the conversation.
+    Agy,
     /// Whichever of claude and codex the latest fresh quota readings show
-    /// with the most headroom. Never mistral.
+    /// with the most headroom. Never mistral or agy.
     Auto,
     /// A local model, through the host's configured executor
     /// ([`LaunchConfig::local`]). Refused on a host without one; never falls
@@ -721,13 +779,14 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub const NAMES: [&'static str; 5] = ["claude", "codex", "mistral", "auto", "local"];
+    pub const NAMES: [&'static str; 6] = ["claude", "codex", "mistral", "agy", "auto", "local"];
 
     pub fn parse(text: &str) -> Result<Self> {
         match text.trim().to_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "mistral" => Ok(Self::Mistral),
+            "agy" => Ok(Self::Agy),
             "auto" => Ok(Self::Auto),
             "local" => Ok(Self::Local),
             other => bail!(
@@ -742,6 +801,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Mistral => "mistral",
+            Self::Agy => "agy",
             Self::Auto => "auto",
             Self::Local => "local",
         }
@@ -874,6 +934,8 @@ pub struct Launched {
     pub lexical_fallback: Option<String>,
     /// The archived node a local run continues its zooid's history from.
     pub resumes: Option<Id>,
+    /// Whether an agy run continues its zooid's conversation, and why.
+    pub agy_resume: AgyResume,
     /// How the cover was sized, when the launch asked for a share
     /// (`--cover`).
     pub cover: Option<CoverRecord>,
@@ -883,6 +945,14 @@ pub struct Launched {
     pub goal_note: Option<Id>,
     /// What went wrong after the unit had started. The zooid runs anyway.
     pub warnings: Vec<String>,
+}
+
+/// Whether an agy launch continues its zooid's conversation, and why.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgyResume {
+    /// The conversation `--conversation` continues; `None` starts fresh.
+    pub conversation: Option<String>,
+    pub reason: String,
 }
 
 /// The files of one run that an agent's command line names.
@@ -899,6 +969,9 @@ struct RunFiles {
     codex_home: PathBuf,
     vibe_home: PathBuf,
     vibe_out: PathBuf,
+    /// An agy run's own home, and the conversation it continues, if any.
+    agy_home: PathBuf,
+    agy_conversation: Option<String>,
     /// The archived node a local run continues from, for `{resume}`.
     resume: Option<Id>,
     /// A local run's first input without the wake, for `{brief}`.
@@ -1376,7 +1449,7 @@ impl Spawn {
     /// The concrete provider and why, before anything is touched.
     fn resolve_provider(&self, provider: Provider) -> Result<(Provider, String)> {
         match provider {
-            Provider::Claude | Provider::Codex | Provider::Mistral => {
+            Provider::Claude | Provider::Codex | Provider::Mistral | Provider::Agy => {
                 Ok((provider, format!("{} was asked for", provider.name())))
             }
             Provider::Local => match &self.launch.local {
@@ -1567,6 +1640,14 @@ impl Spawn {
             Provider::Local => {
                 return Err("a local run takes its window from --window only".to_owned());
             }
+            Provider::Agy => {
+                return Ok(cover::Window {
+                    tokens: self.launch.agy_window,
+                    source: "the window an agy zooid's life is measured against \
+                             (SPAWN_AGY_WINDOW, default Gemini 4 Neon's 512K)"
+                        .to_owned(),
+                });
+            }
             Provider::Mistral => {
                 return Ok(cover::Window {
                     tokens: MISTRAL_CONTEXT_TOKENS,
@@ -1699,6 +1780,48 @@ impl Spawn {
                 )],
                 stdout_is_report: true,
             },
+            Provider::Agy => {
+                // The prompt is stdin (`-p -`): a cover is longer than one
+                // argument may be. The result object is stdout; settlement
+                // reads the reply, usage and conversation id from it.
+                let mut argv = vec![
+                    text(&self.launch.agy),
+                    "--output-format".to_owned(),
+                    "json".to_owned(),
+                    "--dangerously-skip-permissions".to_owned(),
+                    "--disable-slash-commands".to_owned(),
+                    "--effort".to_owned(),
+                    effort.to_owned(),
+                    "--settings".to_owned(),
+                    text(&files.settings),
+                ];
+                if let Some(model) = &self.launch.agy_model {
+                    argv.extend(["--model".to_owned(), model.clone()]);
+                }
+                if let Some(conversation) = &files.agy_conversation {
+                    argv.extend(["--conversation".to_owned(), conversation.clone()]);
+                }
+                argv.extend(["-p".to_owned(), "-".to_owned()]);
+                AgentLine {
+                    argv,
+                    // agy reads everything from $HOME/.gemini, always: the
+                    // zooid's own home, never Agy's.
+                    env: vec![
+                        ("HOME".to_owned(), text(&files.agy_home)),
+                        (
+                            "AGY_CLI_AUTO_COMPACT_OVERRIDE".to_owned(),
+                            super::agy::COMPACT_AT.to_owned(),
+                        ),
+                        (
+                            "AGY_CLI_FORCE_FILE_TOKEN_STORAGE".to_owned(),
+                            "1".to_owned(),
+                        ),
+                        ("AGY_CLI_DISABLE_AUTO_UPDATE".to_owned(), "1".to_owned()),
+                    ],
+                    secrets: Vec::new(),
+                    stdout_is_report: true,
+                }
+            }
             Provider::Claude => AgentLine {
                 argv: vec![
                     text(&self.launch.claude),
@@ -1774,6 +1897,96 @@ impl Spawn {
                 provider.name()
             ),
         })
+    }
+
+    /// Whether an agy launch of `spawn` continues the conversation of its
+    /// latest agy run. Only when that run recorded its conversation
+    /// (`session/<id>`), ran in the same workdir (agy scopes conversations
+    /// to it), and its transcript in the zooid's home shows room for more
+    /// life; otherwise the launch starts fresh into the cover, and the
+    /// reason says which.
+    fn agy_resume(&self, spawn: Id, workdir: &str, home: &Path) -> AgyResume {
+        let fresh = |reason: String| AgyResume {
+            conversation: None,
+            reason,
+        };
+        let latest = self.observe(|facts, reader| {
+            let mut runs = find!(
+                (run: Id, started: IntervalValue),
+                pattern!(facts, [{ ?run @
+                    metadata::tag: KIND_RUN,
+                    attrs::of: spawn,
+                    attrs::provider: Provider::Agy.name(),
+                    metadata::started_at: ?started,
+                }])
+            )
+            .filter_map(|(run, started)| {
+                let (from, _) = started.try_from_inline::<(Epoch, Epoch)>().ok()?;
+                Some((from, run, started))
+            })
+            .collect::<Vec<_>>();
+            runs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            Ok(runs
+                .pop()
+                .map(|(_, run, started)| run_view(facts, reader, run, started)))
+        });
+        let run = match latest {
+            Ok(Some(run)) => run,
+            Ok(None) => return fresh("fresh: no earlier agy run of this zooid".to_owned()),
+            Err(error) => {
+                return fresh(format!("fresh: reading earlier runs failed: {error:#}"));
+            }
+        };
+        let conversations: Vec<&str> = run
+            .source_locator
+            .iter()
+            .filter_map(|locator| locator.strip_prefix("session/"))
+            .filter(|id| super::agy::plain_id(id))
+            .collect();
+        let conversation = match conversations.as_slice() {
+            [one] => one.to_string(),
+            [] => {
+                return fresh(format!(
+                    "fresh: the latest agy run {:x} recorded no conversation",
+                    run.id
+                ))
+            }
+            several => {
+                return fresh(format!(
+                    "fresh: the latest agy run {:x} recorded {} conversations, and nothing \
+                     picks one",
+                    run.id,
+                    several.len()
+                ))
+            }
+        };
+        if run.workdir.iter().all(|dir| dir != workdir) {
+            return fresh(format!(
+                "fresh: conversation {conversation} ran in {}, and agy scopes conversations to \
+                 their workdir",
+                run.workdir.join(", ")
+            ));
+        }
+        match super::agy::read_life(home, Some(&conversation), self.launch.agy_window) {
+            Ok(Some(life)) if life.over => fresh(format!(
+                "fresh: conversation {conversation} ended its life at {} of {} tokens",
+                life.occupancy, life.window
+            )),
+            Ok(Some(life)) => AgyResume {
+                reason: format!(
+                    "continues conversation {conversation} at {} of {} tokens (life limit {})",
+                    life.occupancy, life.window, life.limit
+                ),
+                conversation: Some(conversation),
+            },
+            Ok(None) => fresh(format!(
+                "fresh: conversation {conversation} has no recorded model call in {}",
+                home.display()
+            )),
+            Err(error) => fresh(format!(
+                "fresh: conversation {conversation}'s transcript is unreadable: {error:#}"
+            )),
+        }
     }
 
     /// The name for the zooid `spawn`. A zooid that has a stored name keeps
@@ -1952,6 +2165,20 @@ impl Spawn {
         super::require_unit_safe("vibe home", &vibe_home.display().to_string())?;
         super::require_unit_safe("vibe output", &vibe_out.display().to_string())?;
         let usage_path = (provider == Provider::Mistral).then(|| vibe_out.join("export.json"));
+        let agy_home = launch.file(&name, "agy");
+        super::require_unit_safe("agy home", &agy_home.display().to_string())?;
+        if provider == Provider::Agy {
+            if let Some(token) = &launch.agy_token {
+                if !token.is_file() {
+                    bail!(
+                        "agy is not logged in here: {} does not exist, so an agy zooid would be \
+                         refused. Nothing was started; log in with the official CLI, or pass \
+                         another --provider",
+                        token.display()
+                    );
+                }
+            }
+        }
         let faculties = launch.faculties_binary()?;
         super::require_unit_safe("faculties binary", &faculties.display().to_string())?;
         let (model, model_unset) = launch.model_for(provider);
@@ -2082,6 +2309,21 @@ impl Spawn {
                 }
                 _ => None,
             };
+            // An agy zooid continues its own conversation while that life
+            // has room; a life that ended at its limit, or none, starts
+            // fresh into the cover.
+            let agy_resume = match provider {
+                Provider::Agy => self.agy_resume(spawn, &workdir_text, &agy_home),
+                _ => AgyResume::default(),
+            };
+            let prompt = match &agy_resume.conversation {
+                Some(conversation) => super::agy_resume_prompt(&name, spawner_label, conversation),
+                None => prompt,
+            };
+            let provider_reason = match provider {
+                Provider::Agy => format!("{provider_reason}; {}", agy_resume.reason),
+                _ => provider_reason.clone(),
+            };
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -2114,6 +2356,8 @@ impl Spawn {
                     codex_home: codex_home.clone(),
                     vibe_home: vibe_home.clone(),
                     vibe_out: vibe_out.clone(),
+                    agy_home: agy_home.clone(),
+                    agy_conversation: agy_resume.conversation.clone(),
                     resume: resumes,
                     brief: brief_path.clone(),
                     spawner: spawner_label.to_owned(),
@@ -2163,6 +2407,9 @@ impl Spawn {
                 log: &text(&log_path),
                 spawn: &launch.spawn,
                 faculties: &text(&faculties),
+                home: (provider == Provider::Agy)
+                    .then(|| text(&launch.real_home))
+                    .as_deref(),
             });
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
@@ -2192,6 +2439,17 @@ impl Spawn {
                     std::fs::write(&mcp_config, claude_mcp_config(&script_path))
                         .with_context(|| format!("write {}", mcp_config.display()))?;
                     std::fs::write(&settings, claude_hook_settings(&script_path))
+                        .with_context(|| format!("write {}", settings.display()))?;
+                }
+                Provider::Agy => {
+                    super::agy::prepare_home(
+                        &agy_home,
+                        &launch.real_home,
+                        launch.agy_token.as_deref(),
+                        &super::agy::mcp_config(&script_path),
+                        &super::agy::hooks_config(&script_path),
+                    )?;
+                    std::fs::write(&settings, super::agy::settings(&workdir))
                         .with_context(|| format!("write {}", settings.display()))?;
                 }
                 // The executor's own configuration is the host's.
@@ -2288,6 +2546,7 @@ impl Spawn {
                 untinted: None,
                 lexical_fallback,
                 resumes,
+                agy_resume: agy_resume.clone(),
                 cover,
                 unprefixed: naming.unprefixed.clone(),
                 goal_note,
@@ -2374,6 +2633,25 @@ impl Spawn {
                 },
                 None => None,
             };
+            let usage = usage.or_else(|| reported.usage.clone());
+            if agent.as_deref() == Some(Provider::Agy.name()) {
+                // The first call's input, as agy itself counted it in the
+                // conversation's transcript: what the cover cost.
+                let conversation = reported
+                    .source_locator
+                    .as_deref()
+                    .and_then(|locator| locator.strip_prefix("session/"));
+                if let Some(conversation) = conversation {
+                    let home = self.launch.file(&request.name, "agy");
+                    if let Ok(path) = super::agy::transcript(&home, conversation) {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            reported.first_call_input_tokens = super::agy::calls(text.lines())
+                                .first()
+                                .map(|call| call.occupancy);
+                        }
+                    }
+                }
+            }
             let (fragment, handle) = super::settlement_fragment(
                 run,
                 crate::clock::point_now()?,
@@ -2507,6 +2785,28 @@ impl Spawn {
         reported: &mut Reported,
     ) -> Option<String> {
         let raw = || String::from_utf8_lossy(bytes).into_owned();
+        if agent == Some(Provider::Agy.name()) {
+            let Some(result) = super::agy::agy_result(bytes) else {
+                return Some(raw());
+            };
+            // The archive names an agy conversation `session/<id>`, the id
+            // its brain directory has.
+            reported.source_locator = result
+                .conversation_id
+                .as_ref()
+                .map(|conversation| format!("session/{conversation}"));
+            if result.usage != super::Usage::default() {
+                reported.usage = Some(result.usage.clone());
+            }
+            return match (result.response, result.error) {
+                (Some(text), _) if !text.is_empty() => Some(text),
+                (_, Some(error)) => Some(format!(
+                    "agy ended with status {} and no reply: {error}",
+                    result.status.as_deref().unwrap_or("unknown")
+                )),
+                _ => None,
+            };
+        }
         if agent != Some(Provider::Claude.name()) {
             return Some(raw());
         }
@@ -3645,6 +3945,12 @@ mod tests {
         std::fs::create_dir(directory.path().join("lane")).unwrap();
         let codex_auth = directory.path().join("codex-auth.json");
         std::fs::write(&codex_auth, "fake login\n").unwrap();
+        // A home to link: two entries, one of them the state directory's
+        // ancestor, as ~/.local is on a host.
+        let real_home = directory.path().to_path_buf();
+        std::fs::write(directory.path().join(".gitconfig"), "[user]\n").unwrap();
+        let agy_token = directory.path().join("agy-token");
+        std::fs::write(&agy_token, "fake agy login\n").unwrap();
         let faculties = directory.path().join("bin").join("faculties");
         std::fs::create_dir(directory.path().join("bin")).unwrap();
         std::fs::write(&faculties, "#!/bin/sh\n").unwrap();
@@ -3663,6 +3969,11 @@ mod tests {
             mistral_model: "mistral-large-4".to_owned(),
             mistral_key_secret: "c2c7b31676a61315928103941b04d487".to_owned(),
             mistral_max_price: 2.0,
+            agy: PathBuf::from("/fake/agy"),
+            agy_model: None,
+            agy_token: Some(agy_token),
+            agy_window: super::super::agy::DEFAULT_WINDOW,
+            real_home: real_home.clone(),
             secrets: "secrets".to_owned(),
             colony_env: Some(env),
             path: format!("/usr/bin:/bin:{}", directory.path().join("bin").display()),
@@ -6304,6 +6615,8 @@ mod tests {
             codex_home: PathBuf::from("/s/n.codex"),
             vibe_home: PathBuf::from("/s/n.vibe"),
             vibe_out: PathBuf::from("/s/n.vibe-out"),
+            agy_home: PathBuf::from("/s/n.agy"),
+            agy_conversation: None,
             resume: None,
             brief: PathBuf::from("/s/n.brief"),
             spawner: "s".to_owned(),
@@ -6431,6 +6744,158 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("cost: $0.0904"), "{shown}");
+    }
+
+    /// A stand-in for what agy leaves after one run: its result object as
+    /// the report, and the conversation's transcript in the zooid's home.
+    fn agy_ran(home: &Path, report: &Path, conversation: &str, occupancies: &[u64]) {
+        let path = super::super::agy::transcript(home, conversation).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let lines: Vec<String> = occupancies
+            .iter()
+            .enumerate()
+            .map(|(step, occupancy)| {
+                format!(
+                    r#"{{"step_index":{step},"source":"MODEL","type":"PLANNER_RESPONSE","input_tokens":1000,"cache_read_tokens":{},"output_tokens":10}}"#,
+                    occupancy - 1000
+                )
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        std::fs::write(
+            report,
+            format!(
+                r#"{{"conversation_id":"{conversation}","status":"SUCCESS","response":"the report","num_turns":1,"usage":{{"input_tokens":3000,"output_tokens":30,"thinking_tokens":0,"cache_read_tokens":40000,"total_tokens":43030}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_agy_zooid_runs_in_its_own_home_and_resumes_its_conversation_while_it_has_room() {
+        let f = fixture();
+        let mut request = f.request("Agy task.");
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        assert_eq!(launched.provider, Provider::Agy);
+        assert_eq!(launched.agy_resume.conversation, None);
+        assert!(launched.agy_resume.reason.contains("no earlier agy run"));
+        let state = f.directory.path().join("state");
+        let name = launched.name.clone();
+        let home = state.join(format!("{name}.agy"));
+        let script = f.script(0);
+        let workdir = std::fs::canonicalize(f.directory.path().join("lane")).unwrap();
+        let settings = state.join(format!("{name}.settings.json"));
+        assert!(
+            script.contains(&format!(
+                "exec /fake/agy --output-format json --dangerously-skip-permissions \
+                 --disable-slash-commands --effort high --settings {} -p - < {} > {}\n",
+                settings.display(),
+                launched.report.with_extension("prompt").display(),
+                launched.report.display()
+            )),
+            "{script}"
+        );
+        // The real home first, for settlement, the inbox and the MCP
+        // server; the zooid's own only for agy.
+        let real = f.directory.path().display().to_string();
+        let restore = script.find(&format!("export HOME={real}\n")).unwrap();
+        let settle = script.find("= settle ]").unwrap();
+        let own = script
+            .find(&format!("export HOME={}\n", home.display()))
+            .unwrap();
+        assert!(restore < settle && settle < own, "{script}");
+        assert!(
+            script.contains("export AGY_CLI_AUTO_COMPACT_OVERRIDE='100%'\n"),
+            "{script}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            super::super::agy::settings(&workdir)
+        );
+        let unit = f.launcher.started.lock().unwrap()[0].clone();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gemini/config/hooks.json")).unwrap(),
+            super::super::agy::hooks_config(&unit.script)
+        );
+        assert_eq!(
+            std::fs::read_link(home.join(".gitconfig")).unwrap(),
+            f.directory.path().join(".gitconfig")
+        );
+        assert!(!home.join(format!("state/{name}.agy")).exists());
+
+        // Settlement: the reply, agy's usage and its conversation.
+        agy_ran(&home, &launched.report, "c-1", &[50_000, 120_000]);
+        f.spawn
+            .settle(&SettleRequest {
+                name: name.clone(),
+                run: launched.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(launched.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let run = &f.spawn.show(&name).unwrap().runs[0];
+        assert_eq!(run.report_text.as_deref(), Some("the report"));
+        assert_eq!(run.source_locator, ["session/c-1"]);
+        assert_eq!(run.input_tokens, [43000]);
+        assert_eq!(run.cached_input_tokens, [40000]);
+        assert_eq!(run.output_tokens, [30]);
+        assert_eq!(run.first_call_input_tokens, [50_000]);
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+
+        // The same zooid again: its life has room, so it continues.
+        let again = f.spawn.run(&request).unwrap();
+        assert_eq!(again.name, name);
+        assert_eq!(again.agy_resume.conversation.as_deref(), Some("c-1"));
+        let script = f.script(1);
+        assert!(script.contains("--conversation c-1 -p -"), "{script}");
+        let prompt = std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap();
+        assert!(
+            prompt.contains("your own conversation c-1, continued"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("# Wake"), "{prompt}");
+        let run = &f.spawn.show(&name).unwrap().runs[1];
+        assert!(run.provider_reason[0].contains("continues conversation c-1"));
+
+        // That life ends at its limit: the next run wakes fresh.
+        agy_ran(&home, &again.report, "c-1", &[50_000, 120_000, 400_000]);
+        f.spawn
+            .settle(&SettleRequest {
+                name: name.clone(),
+                run: again.run,
+                exit: Exit::from_systemd("exited", "0", "success"),
+                report: Some(again.report.clone()),
+                usage: None,
+            })
+            .unwrap();
+        let third = f.spawn.run(&request).unwrap();
+        assert_eq!(third.agy_resume.conversation, None);
+        assert!(
+            third
+                .agy_resume
+                .reason
+                .contains("ended its life at 400000 of 512000"),
+            "{}",
+            third.agy_resume.reason
+        );
+        assert!(!f.script(2).contains("--conversation"));
+        let prompt = std::fs::read_to_string(third.report.with_extension("prompt")).unwrap();
+        assert!(prompt.contains("# Wake"), "{prompt}");
+    }
+
+    #[test]
+    fn agy_needs_a_login_and_auto_never_chooses_it() {
+        assert_eq!(Provider::parse(" Agy ").unwrap(), Provider::Agy);
+        assert_eq!(Provider::Agy.name(), "agy");
+        let f = fixture();
+        std::fs::remove_file(f.directory.path().join("agy-token")).unwrap();
+        let mut request = f.request("Agy task without a login.");
+        request.provider = Provider::Agy;
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(format!("{error:#}").contains("not logged in"), "{error:#}");
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 
     #[test]

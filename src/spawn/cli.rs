@@ -53,7 +53,9 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
-        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
+        /// SPAWN_MISTRAL_MAX_PRICE), agy (opt-in; the Antigravity CLI on this
+        /// host's Google login, its own HOME per zooid, no compaction),
+        /// auto (most quota headroom; never mistral or agy) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
@@ -98,7 +100,9 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         spawner: Option<String>,
         /// The agent: claude, codex, mistral (opt-in; bills money, capped by
-        /// SPAWN_MISTRAL_MAX_PRICE), auto (most quota headroom; never mistral) or local
+        /// SPAWN_MISTRAL_MAX_PRICE), agy (opt-in; the Antigravity CLI on this
+        /// host's Google login, its own HOME per zooid, no compaction),
+        /// auto (most quota headroom; never mistral or agy) or local
         /// (this host's SPAWN_LOCAL_EXECUTOR argv template, with {prompt}, {message},
         /// {name}, {effort}, {script}, {runtime}, {brief}, {spawner} and {resume} (where its archived history ends)
         /// replaced; refused without it, never a hosted
@@ -277,6 +281,9 @@ fn run_inbox(
     run: String,
     hook: String,
 ) -> Result<()> {
+    if let Some(agy) = super::agy::AgyHook::parse(&hook) {
+        return run_agy_hook(workspace, pile, key, name, run, agy);
+    }
     let hook = InboxHook::parse(&hook)?;
     let mut input = String::new();
     let stop_hook_active = match std::io::stdin().read_to_string(&mut input) {
@@ -321,6 +328,79 @@ fn run_inbox(
         eprintln!("{warning}");
     }
     if let Some(output) = &answer.output {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// One of an agy zooid's hooks: the life limit from its transcript, and its
+/// inbox through the same answers a claude zooid's hooks give. Input that
+/// cannot be read allows everything and says why in the log: a hook that
+/// refused on its own failure would stop a healthy zooid.
+fn run_agy_hook(
+    workspace: &crate::cli_workspace::WorkspaceArgs,
+    pile: PathBuf,
+    key: Option<PathBuf>,
+    name: String,
+    run: String,
+    hook: super::agy::AgyHook,
+) -> Result<()> {
+    use super::agy::AgyHook;
+    let mut text = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut text) {
+        eprintln!("zooid inbox: reading the agy hook input failed ({error}); allowing");
+        return Ok(());
+    }
+    let input = match super::agy::hook_input(&text) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("zooid inbox: the agy hook input is not JSON ({error}); allowing");
+            return Ok(());
+        }
+    };
+    let config = LaunchConfig::from_home_env()?;
+    let life = match super::agy::read_life(
+        &config.agy_home(&name),
+        input.conversation.as_deref(),
+        config.agy_window,
+    ) {
+        Ok(life) => life,
+        Err(error) => {
+            eprintln!("zooid inbox: the life limit is not enforced for this call: {error:#}");
+            None
+        }
+    };
+    let inbox = || {
+        let inbox_hook = match hook {
+            AgyHook::Stop if input.continuation_active => return None,
+            AgyHook::Stop => InboxHook::Stop,
+            _ => InboxHook::Post,
+        };
+        let answer = (|| -> Result<_> {
+            let run = Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("the clock is before 1970")?
+                .as_secs();
+            let request = InboxRequest {
+                name: name.clone(),
+                run,
+                hook: inbox_hook,
+                stop_hook_active: false,
+                now,
+            };
+            let storage = workspace.storage(pile.clone(), key.clone())?;
+            storage.scope_to_exit(|storage| {
+                Ok(Spawn::new(storage.clone(), config.clone()).inbox(&request))
+            })
+        })()
+        .unwrap_or_else(|error| inbox_failure(inbox_hook, &error));
+        if let Some(warning) = &answer.warning {
+            eprintln!("{warning}");
+        }
+        answer.output
+    };
+    if let Some(output) = super::agy::hook_answer(hook, life.as_ref(), inbox) {
         println!("{output}");
     }
     Ok(())

@@ -13,6 +13,7 @@
 //! settlement publish, the opening context, and the unit script. Everything
 //! that touches the pile, Relations, Message or systemd is in [`operations`].
 
+pub mod agy;
 pub mod cli;
 pub mod colony;
 pub mod continuation;
@@ -386,11 +387,14 @@ pub fn vibe_usage(export: &str) -> Result<Usage> {
 /// settlement: the window for its model, the input tokens of its first
 /// model call (overhead, prompt and cover in one total), and the
 /// conversation it recorded, as the archive's `session/<id>` locator.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Reported {
     pub context_window: Option<u64>,
     pub first_call_input_tokens: Option<u64>,
     pub source_locator: Option<String>,
+    /// Usage the agent's own result reported (agy's), when no usage file
+    /// is read. Recorded with the usage, not with these annotations.
+    pub usage: Option<Usage>,
 }
 
 /// The end of a run, annotating the run itself. `report` is a hosted run's
@@ -430,7 +434,11 @@ pub fn settlement_fragment(
             attrs::cost_usd?: usage.cost_usd,
         };
     }
-    if reported != &Reported::default() {
+    let annotated = Reported {
+        usage: None,
+        ..reported.clone()
+    };
+    if annotated != Reported::default() {
         // The archive's own attribute, so a run and the receipts of the
         // conversation it recorded share one locator.
         let locator = reported
@@ -513,6 +521,20 @@ pub fn assemble_brief(preamble: &str, brief: &str) -> String {
         text.push_str("\n\n");
     }
     text
+}
+
+/// An agy zooid's first input when it continues its own conversation: the
+/// conversation already holds its wake, who it is and the brief, so only
+/// what is new is said. Nothing it did before is repeated for it.
+pub fn agy_resume_prompt(name: &str, spawner: &str, conversation: &str) -> String {
+    format!(
+        "You are {name} again, started once more by {spawner} with the same brief. This is \
+         your own conversation {conversation}, continued: your wake, the brief and everything \
+         you did are above. Your previous run ended; anything you had begun may be unfinished, \
+         and a tool call you made then may or may not have taken effect, so check before you \
+         repeat it. Read your inbox first (`orient_poll`, persona {name}, peek true), then \
+         carry on with the brief. Your final reply is your report.\n"
+    )
 }
 
 /// The longest prefix of a topic that fits [`ABOUT_BYTES`], ending on a
@@ -722,6 +744,11 @@ pub struct ScriptFacts<'a> {
     /// zooid's own stdio MCP server, started by the agent from its MCP
     /// config, in the same environment as the CLI calls and settlement.
     pub faculties: &'a str,
+    /// The real home, exported first, when the agent runs with a home of
+    /// its own (agy): its hooks and MCP server run this script with the
+    /// agent's HOME, and settlement, the inbox and the server read the
+    /// host's spawn state and configuration under the real one.
+    pub home: Option<&'a str>,
 }
 
 /// The unit's script. Run without arguments it is the zooid: the agent on
@@ -753,6 +780,9 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
     script.push_str(&format!(
         "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT{secret_vars} ${{!TRIBLESPACE_@}}\n"
     ));
+    if let Some(home) = facts.home {
+        script.push_str(&format!("export HOME={}\n", q(home)));
+    }
     if let Some(env) = facts.colony_env {
         script.push_str(&format!("set -a; . {} || exit 78; set +a\n", q(env)));
     }
@@ -1139,6 +1169,7 @@ mod tests {
             log: "/s/n.log",
             spawn: "zooid",
             faculties: "/b/faculties",
+            home: None,
         });
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
         assert!(script.contains("PERSONA=lusab-babad"));
@@ -1212,6 +1243,7 @@ mod tests {
             log: &log,
             spawn: &spawn,
             faculties: "/b/faculties",
+            home: None,
         });
         let script = dir.path().join("n.sh");
         std::fs::write(&script, script_text).unwrap();
@@ -1263,6 +1295,7 @@ mod tests {
             log: "/s/n.log",
             spawn: "zooid",
             faculties: "/b/faculties",
+            home: None,
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
         assert!(!script.contains(". /"));
