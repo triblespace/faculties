@@ -1,4 +1,7 @@
 //! Planner schema: calendar events (RFC 5545 VEVENT-shaped) plus
+//!
+//! The module keeps the name `planner`: every attribute publishes its module path,
+//! so the `events` faculty reads the same schema under its first name.
 //! the notes a user attaches to them.
 //!
 //! Used by `planner.rs` (the faculty CLI). Decomposes RFC 5545

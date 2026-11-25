@@ -20,14 +20,15 @@
 
 pub mod cli;
 mod gollum;
+pub mod health;
 pub mod mcp;
 pub mod operations;
 pub(crate) mod recall;
 
 pub use operations::{
-    Carried, Export, ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit,
-    PlanReport, PlanRevision, Presence, Reason, Reference, ReferenceKind, TransferOptions,
-    TransferReport, Knowledge,
+    Carried, Export, ImportDocument, ImportPlan, Knowledge, ListOptions, PlanAttachment,
+    PlanCommit, PlanReport, PlanRevision, Presence, Reason, Reference, ReferenceKind,
+    TransferOptions, TransferReport,
 };
 
 use crate::storage::FactRead;
@@ -620,7 +621,10 @@ pub fn require_text_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> R
         if texts.contains(fact.a()) {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
-                format!("read Knowledge text payload {}", hex::encode_upper(handle.raw))
+                format!(
+                    "read Knowledge text payload {}",
+                    hex::encode_upper(handle.raw)
+                )
             })?;
         }
     }
@@ -793,7 +797,7 @@ pub fn cover_fragments<P: TriblePattern>(
 // per-state and the entry keeps all of them.
 //
 // Lifted out of the `knowledge` binary on 2026-08-27 so the link audit in the
-// `knowledge` CLI and gauge's metrics share one model instead of growing a second
+// `knowledge` CLI and the health metrics share one model instead of growing a second
 // extractor that drifts from the first.
 
 /// Display every name asserted for a tag directly from a query substrate:
@@ -983,7 +987,7 @@ impl FrontierModel {
 
 // ── what a dangling link actually means ────────────────────────────────────
 //
-// A knowledge whose convention is to LINK LIBERALLY cannot treat every unresolved
+// A knowledge base whose convention is to LINK LIBERALLY cannot treat every unresolved
 // target as a defect: a link to a page nobody has written yet marks work, not
 // breakage. Three outcomes are genuinely different and a report that merges
 // them is worse than no report at all.
@@ -1203,12 +1207,17 @@ pub fn materialize_collection(
 /// admits states unseen by a lagging index. Normal reads therefore never
 /// flatten the collection or validate a closed-world catalog before asking
 /// their actual query.
-pub async fn query_snapshot(pile: &mut Pile, signer: &SigningKey) -> Result<KnowledgeQuerySnapshot> {
+pub async fn query_snapshot(
+    pile: &mut Pile,
+    signer: &SigningKey,
+) -> Result<KnowledgeQuerySnapshot> {
     let collection = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
     let succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
     let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, succinct)?;
     let target = latest_collection(pile, signer.verifying_key())?;
-    let store_snapshot = pile.snapshot().context("freeze resident Knowledge targets")?;
+    let store_snapshot = pile
+        .snapshot()
+        .context("freeze resident Knowledge targets")?;
     let facts = store_snapshot
         .read_facts(rank9)
         .context("read Knowledge fact collection")?;
@@ -2171,7 +2180,7 @@ mod tests {
     /// Every fact the strict catalog used to refuse is an ordinary fact of an
     /// open-world union. Each case here is one refusal the catalog made,
     /// committed to a real pile; the facts are read as they are, and the
-    /// reading the Knowledge gives each is pinned beside it.
+    /// reading Knowledge gives each is pinned beside it.
     #[test]
     fn open_world_knowledge_facts_are_read_not_refused() {
         let signer = SigningKey::from_bytes(&[41; 32]);
@@ -2306,7 +2315,7 @@ mod tests {
 
         let (mut fragment, revision) = base("annotated");
         fragment += entity! { ExclusiveId::force_ref(&revision) @
-            metadata::description: "an annotation the Knowledge does not model",
+            metadata::description: "an annotation Knowledge does not model",
         };
         case(
             &mut refused,

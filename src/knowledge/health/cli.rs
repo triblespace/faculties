@@ -1,32 +1,11 @@
-//! Explicit Knowledge health CLI grammar and output routing.
+//! Knowledge health subcommands, flattened into the `knowledge` CLI.
 use super::{presentation, KnowledgeHealth};
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
-use std::path::PathBuf;
-#[derive(Parser)]
-#[command(
-    version = crate::GIT_VERSION,
-    name = "gauge",
-    about = "Research-quality metrics over Knowledge entries and complete DAG frontiers"
-)]
-struct Cli {
-    #[command(flatten)]
-    workspace: crate::cli_workspace::WorkspaceArgs,
-    #[arg(long, env = "PILE")]
-    pile: PathBuf,
-    /// Existing durable signing-key file. Reads never create one.
-    #[arg(long, env = "TRIBLESPACE_KEY")]
-    key: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
+use clap::Subcommand;
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Show entry, frontier, tag, link, and orphan metrics.
     Health,
-    /// Count tags both by current state occurrence and by logical entry.
-    Tags,
     /// Show current published/refuted states without settling forks.
     Quality,
     /// Show entries with the most unambiguously resolved incoming links.
@@ -46,20 +25,25 @@ enum Command {
     },
 }
 
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let Some(command) = cli.command else {
-        Cli::command().print_help()?;
-        println!();
-        return Ok(());
-    };
-    let gauge = KnowledgeHealth::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
-    crate::cli::with_output("gauge", |out| match command {
-        Command::Health => presentation::health(&gauge.health()?, out),
-        Command::Tags => presentation::tags(&gauge.tags()?, out),
-        Command::Quality => presentation::quality(&gauge.quality()?, out),
-        Command::Hubs { top } => presentation::hubs(&gauge.hubs(top)?, out),
-        Command::Risk => presentation::risk(&gauge.risk()?, out),
-        Command::Orphans { top, ids } => presentation::orphans(&gauge.orphans(top)?, ids, out),
-    })
+pub(crate) fn execute(
+    command: Command,
+    storage: crate::storage::Storage,
+    out: &mut crate::out::Out<'_>,
+) -> Result<()> {
+    let health = KnowledgeHealth::with_storage(storage);
+    match command {
+        Command::Health => presentation::health(&health.health()?, out),
+        Command::Quality => presentation::quality(&health.quality()?, out),
+        Command::Hubs { top } => presentation::hubs(&health.hubs(top)?, out),
+        Command::Risk => presentation::risk(&health.risk()?, out),
+        Command::Orphans { top, ids } => presentation::orphans(&health.orphans(top)?, ids, out),
+    }
+}
+
+/// Count current tag evidence both by state occurrence and by logical entry.
+pub(crate) fn tag_counts(
+    storage: crate::storage::Storage,
+    out: &mut crate::out::Out<'_>,
+) -> Result<()> {
+    presentation::tags(&KnowledgeHealth::with_storage(storage).tags()?, out)
 }

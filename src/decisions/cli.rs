@@ -1,4 +1,4 @@
-//! Decide CLI prose input conventions; MCP and operations receive literal text.
+//! Decisions CLI prose input conventions; MCP and operations receive literal text.
 use super::{presentation, Decisions, FactorSide, ListOptions};
 use crate::out::Out;
 use anyhow::Result;

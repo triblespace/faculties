@@ -27,8 +27,8 @@ fn native_and_mcp_import_share_exact_idempotent_publication() {
     )
     .unwrap();
     assert!(text.contains(&hex::encode(first.generation)));
-    assert!(text.contains("wiki COMMIT record fingerprint"));
-    assert!(text.contains("compass COMMIT record fingerprint"));
+    assert!(text.contains("knowledge COMMIT record fingerprint"));
+    assert!(text.contains("goals COMMIT record fingerprint"));
     assert_eq!(std::fs::metadata(&pile).unwrap().len(), before);
 }
 

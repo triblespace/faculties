@@ -1,5 +1,8 @@
 //! Compass schema: goals, statuses, notes, and priority relations.
 //!
+//! The module keeps the name `compass`: every attribute publishes its module path,
+//! so the `goals` faculty reads the same schema under its first name.
+//!
 //! Used by the Compass faculty and by viewers that read Compass boards from a
 //! pile. Status names are intentionally open-ended; the defaults only define
 //! the lanes presented first by clients.

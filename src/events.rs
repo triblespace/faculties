@@ -74,7 +74,7 @@ pub struct EventDraft {
     pub last_modified: Option<IntervalValue>,
 }
 
-/// One exact event projected from a Events collection. Text fields are the
+/// One exact event projected from an Events collection. Text fields are the
 /// handles of their UTF-8 blobs; equal handles are equal text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EventRow {

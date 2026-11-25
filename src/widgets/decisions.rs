@@ -250,7 +250,7 @@ fn load_resolution(dataset: DatasetView<'_>, decision: Id) -> anyhow::Result<Res
 fn interval_ns(value: decisions::IntervalValue) -> anyhow::Result<i128> {
     let (lower, _upper): (i128, i128) = value
         .try_from_inline()
-        .map_err(|error| anyhow::anyhow!("decode Decide timestamp: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("decode Decisions timestamp: {error:?}"))?;
     Ok(lower)
 }
 
@@ -539,7 +539,7 @@ fn render_decision(ui: &mut egui::Ui, dec: &DecisionRow, search_needle: &str, fo
                 render_resolution(ui, &dec.resolution, search_needle, focused);
             });
 
-        // Left status stripe, compass-card idiom.
+        // Left status stripe, goals-card idiom.
         let outer = frame_resp.response.rect;
         paint_status_stripe(ui.painter(), outer, stripe_color, stripe_label);
     });

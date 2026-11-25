@@ -1,5 +1,8 @@
 //! Headspace schema: fork-visible configuration and model-profile snapshots.
 //!
+//! The module keeps the name `headspace`: every attribute publishes its module path,
+//! so the `profiles` faculty reads the same schema under its first name.
+//!
 //! The exact-additive cutover leaves historical `config` branch facts in the
 //! collection as immutable evidence. Native semantics apply only to entities
 //! carrying [`KIND_LIVE_RECORD`]. Complete intrinsic snapshots form one global

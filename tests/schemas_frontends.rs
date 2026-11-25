@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use anybytes::Bytes;
 use anyhow::Result;
-use faculties::schema_catalog::{cli, mcp::Schemas, SchemasEntry, Store};
 use faculties::mcp::{Faculty, InvalidArguments};
 use faculties::out::{Out, Part};
+use faculties::schema_catalog::{cli, mcp::Schemas, SchemasEntry, Store};
 use faculties::schemas::atlas::DEFAULT_SCOPE_ID;
 use faculties::spec::CliRequest;
 use faculties::storage::{initialize_signer, publish_fragment};
@@ -138,7 +138,7 @@ fn explicit_cli_and_mcp_render_the_same_lossless_metadata() {
         };
         let arguments = Bytes::from(serde_json::to_vec(&arguments).unwrap());
         let mcp_text =
-            collect_text(|out| schemas.call(&format!("atlas_{verb}"), arguments, out)).unwrap();
+            collect_text(|out| schemas.call(&format!("schemas_{verb}"), arguments, out)).unwrap();
         assert_eq!(cli_text, expected);
         assert_eq!(mcp_text, expected);
     }

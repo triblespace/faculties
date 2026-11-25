@@ -13,7 +13,7 @@ impl TestDirectory {
     fn new() -> Self {
         let serial = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "faculties-planner-live-{}-{serial}",
+            "faculties-events-live-{}-{serial}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&path);
@@ -76,10 +76,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
     storage
         .with_view(|loaded| {
             assert!(events_model::event(&loaded.facts, event).is_some());
-            assert_eq!(
-                events_model::notes_for_event(&loaded.facts, event).len(),
-                1
-            );
+            assert_eq!(events_model::notes_for_event(&loaded.facts, event).len(), 1);
             let occurrences = collect_occurrences(
                 &loaded.reader,
                 &loaded.facts,
@@ -652,9 +649,7 @@ fn exdate_and_recurrence_id_override_replace_master_instances() {
         name: "series.ics",
         text: &text,
     }];
-    let receipt = events
-        .ingest(&documents, IngestOptions::default())
-        .unwrap();
+    let receipt = events.ingest(&documents, IngestOptions::default()).unwrap();
     assert_eq!((receipt.imported.len(), receipt.total), (2, 2));
     assert_eq!(
         starts_in(&events, "2026-10-01T00:00:00Z", "2026-12-01T00:00:00Z"),
@@ -665,9 +660,7 @@ fn exdate_and_recurrence_id_override_replace_master_instances() {
         ]
     );
     // Re-ingesting the same document is a pair of exact duplicates.
-    let again = events
-        .ingest(&documents, IngestOptions::default())
-        .unwrap();
+    let again = events.ingest(&documents, IngestOptions::default()).unwrap();
     assert_eq!((again.imported.len(), again.duplicates), (0, 2));
     // The next occurrence after the first skips both the EXDATE and the
     // replaced instance.
@@ -1007,9 +1000,7 @@ fn reingest_over_an_escaped_reading_makes_the_unescaped_version_current() {
         name: "tie.ics",
         text: &text,
     }];
-    let receipt = events
-        .ingest(&documents, IngestOptions::default())
-        .unwrap();
+    let receipt = events.ingest(&documents, IngestOptions::default()).unwrap();
     assert_eq!(receipt.revisions, 1);
     let decoded_id = receipt.imported[0];
     assert_ne!(decoded_id, escaped_id);
@@ -1030,9 +1021,7 @@ fn reingest_over_an_escaped_reading_makes_the_unescaped_version_current() {
     assert_eq!(next[0].location.as_deref(), Some("Saal, OG"));
 
     // The same export again is a duplicate and writes nothing more.
-    let again = events
-        .ingest(&documents, IngestOptions::default())
-        .unwrap();
+    let again = events.ingest(&documents, IngestOptions::default()).unwrap();
     assert_eq!(again.duplicates, 1);
     assert!(again.imported.is_empty());
 }

@@ -283,7 +283,7 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
         card(
             nb,
             host.clone(),
-            "gauge",
+            "knowledge-health",
             KnowledgeHealthViewer::default,
             move |ctx, panel, sources, _open| {
                 let Some(view) = sources.dataset(SourceKey::Knowledge) else {

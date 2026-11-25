@@ -1,4 +1,4 @@
-//! Minimal capture target for iterating on the gauge widget.
+//! Minimal capture target for iterating on the knowledge health widget.
 
 fn main() -> anyhow::Result<()> {
     faculties::viewer::cli::run(env!("CARGO_BIN_NAME"), notebook)

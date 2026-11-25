@@ -1,7 +1,7 @@
 //! Read-only GORBIE-embeddable viewer for the `mail` faculty.
 //!
 //! Renders RFC-5322-shaped messages as paper cards: sender + first
-//! recipient on left/right stripes (compass-card idiom), subject as
+//! recipient on left/right stripes (goals-card idiom), subject as
 //! the card heading, body text below, sent-at age and attachment
 //! count in the footer. Spam-tagged messages are filtered by default.
 //! Drafts show a DRAFT badge in the header.

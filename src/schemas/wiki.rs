@@ -1,5 +1,8 @@
 //! Wiki schema: fragments, content, links, file references, and tag vocabulary.
 //!
+//! The module keeps the name `wiki`: every attribute publishes its module path,
+//! so the `knowledge` faculty reads the same schema under its first name.
+//!
 //! Used by `wiki.rs` (the faculty CLI) and by viewers that render wiki
 //! fragments from a pile (the GORBIE wiki viewer widget, playground
 //! dashboard, etc.).
@@ -365,7 +368,10 @@ mod revision_tests {
 
 // ── links are derived, never asserted ──────────────────────────────────────
 
-/// Wiki link targets appearing in `content`, as raw 32-hex strings, lowercased.
+/// Page link targets appearing in `content`, as raw 32-hex strings, lowercased.
+///
+/// `wiki:` is what was written before the faculty was named for what it holds,
+/// and it resolves for ever. New text writes `knowledge:`.
 ///
 /// Content-only and ambient-independent ON PURPOSE. The older extractor
 /// consulted the surrounding space and dropped any target that did not already
@@ -378,8 +384,10 @@ mod revision_tests {
 /// content by a recipe, and belong in a recipe-versioned derived collection
 /// rather than being asserted as facts alongside the revision.
 pub fn extract_link_targets(content: &str) -> Vec<String> {
-    let re = regex::Regex::new(r#"#link\("wiki:(?:[a-zA-Z_][a-zA-Z0-9_]*:)?([0-9a-fA-F]{32})"\)"#)
-        .expect("static regex");
+    let re = regex::Regex::new(
+        r#"#link\("(?:wiki|knowledge):(?:[a-zA-Z_][a-zA-Z0-9_]*:)?([0-9a-fA-F]{32})"\)"#,
+    )
+    .expect("static regex");
     let mut out: Vec<String> = re
         .captures_iter(content)
         .map(|c| c[1].to_lowercase())

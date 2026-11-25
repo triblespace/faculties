@@ -275,7 +275,10 @@ fn maintain(pile: PathBuf, key: Option<PathBuf>, poll: u64) -> Result<()> {
                 }
             };
             report("memory", memory.derive_wemm(&session).context("memory")?);
-            report("wiki", knowledge.derive_wemm(&session).context("wiki")?);
+            report(
+                "knowledge",
+                knowledge.derive_wemm(&session).context("knowledge")?,
+            );
             report("files", files.derive_wemm(&session).context("files")?);
             Ok(())
         },

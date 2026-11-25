@@ -1,4 +1,7 @@
 //! Triage's historical view of Cognition event attributes and the compatibility
+//!
+//! The module keeps the name `triage`: every attribute publishes its module path,
+//! so the `diagnostics` faculty reads the same schema under its first name.
 //! views still consumed by the separately migrated widget surface.
 //!
 //! The CLI reads the fixed native Cognition collection and uses the current

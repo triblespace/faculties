@@ -309,8 +309,7 @@ fn require_profile(profile: &Resolution<ProfileValue>, anchor: Id) -> Result<&Pr
 
 fn resolve_profile_selector(views: &Views, raw: &str) -> Result<Id> {
     if let Some(id) = Id::from_hex(raw.trim()) {
-        let profile =
-            profiles::current_profile(&views.profiles.reader, &views.profiles.facts, id)?;
+        let profile = profiles::current_profile(&views.profiles.reader, &views.profiles.facts, id)?;
         require_profile(&profile, id)?;
         return Ok(id);
     }
@@ -353,8 +352,7 @@ fn publish_profiles(storage: &Storage, fragment: Fragment, description: &str) ->
 fn use_profile(storage: &Storage, selector: &str, out: &mut Out<'_>) -> Result<()> {
     let views = storage.views()?;
     let anchor = resolve_profile_selector(&views, selector)?;
-    let profile =
-        profiles::current_profile(&views.profiles.reader, &views.profiles.facts, anchor)?;
+    let profile = profiles::current_profile(&views.profiles.reader, &views.profiles.facts, anchor)?;
     require_profile(&profile, anchor)?;
     let config_resolution =
         profiles::current_config(&views.profiles.reader, &views.profiles.facts)?;
@@ -367,7 +365,7 @@ fn use_profile(storage: &Storage, selector: &str, out: &mut Out<'_>) -> Result<(
         .unwrap_or_else(|| profiles::default_config(anchor));
     config.active_profile = anchor;
     let fragment = profiles::config_snapshot_fragment(&config, &config_resolution.head_ids())?.0;
-    publish_profiles(storage, fragment, "headspace: switch active profile")?;
+    publish_profiles(storage, fragment, "profiles: switch active profile")?;
     print_reloaded(storage, out)
 }
 
@@ -422,7 +420,7 @@ fn add_profile(storage: &Storage, args: &AddProfileOptions, out: &mut Out<'_>) -
         .unwrap_or_else(|| profiles::default_config(anchor));
     next_config.active_profile = anchor;
     let fragment = profiles::add_profile_fragment(&profile, &next_config, &config.head_ids())?.0;
-    publish_profiles(storage, fragment, "headspace: add and activate profile")?;
+    publish_profiles(storage, fragment, "profiles: add and activate profile")?;
     print_reloaded(storage, out)?;
     Ok(anchor)
 }
@@ -458,7 +456,7 @@ fn set_profile_field(storage: &Storage, field: &ProfileEdit, out: &mut Out<'_>) 
         return print_profiles(&views, None, out);
     }
     let fragment = profiles::profile_snapshot_fragment(&changed, &profile.head_ids())?.0;
-    publish_profiles(storage, fragment, "headspace: update profile")?;
+    publish_profiles(storage, fragment, "profiles: update profile")?;
     print_reloaded(storage, out)
 }
 
@@ -486,7 +484,7 @@ fn unset_profile_field(
         return print_profiles(&views, None, out);
     }
     let fragment = profiles::profile_snapshot_fragment(&changed, &profile.head_ids())?.0;
-    publish_profiles(storage, fragment, "headspace: unset profile field")?;
+    publish_profiles(storage, fragment, "profiles: unset profile field")?;
     print_reloaded(storage, out)
 }
 
@@ -570,7 +568,7 @@ fn unset_secret(storage: &Storage, role: SecretRole, out: &mut Out<'_>) -> Resul
     publish_profiles(
         storage,
         successor.fragment,
-        "headspace: unset exact credential reference",
+        "profiles: unset exact credential reference",
     )?;
     out.line(format!("{role:?} credential unset"))?;
     Ok(())
@@ -592,7 +590,7 @@ fn reconcile(storage: &Storage, raw: &str, out: &mut Out<'_>) -> Result<()> {
     else {
         return print_profiles(&views, None, out);
     };
-    publish_profiles(storage, fragment, "headspace: reconcile snapshot track")?;
+    publish_profiles(storage, fragment, "profiles: reconcile snapshot track")?;
     print_reloaded(storage, out)
 }
 
@@ -871,7 +869,7 @@ fn set_secret(
             publish_profiles(
                 storage,
                 successor.fragment,
-                "headspace: exact credential reference",
+                "profiles: exact credential reference",
             )?;
             out.line(format!("{role:?} credential version {secret:x}"))?;
             Ok(secret)
@@ -881,8 +879,7 @@ fn set_secret(
             if plaintext.is_empty() || plaintext.bytes().any(|byte| byte == 0) {
                 bail!("credential is empty or contains NUL");
             }
-            let config =
-                profiles::current_config(&views.profiles.reader, &views.profiles.facts)?;
+            let config = profiles::current_config(&views.profiles.reader, &views.profiles.facts)?;
             let profile = settled_config(&config)?
                 .ok_or_else(|| {
                     anyhow!("Profiles has no active configuration; add a profile first")
@@ -903,7 +900,7 @@ fn set_secret(
                 publish_profiles(
                     storage,
                     successor.fragment,
-                    "headspace: exact credential reference",
+                    "profiles: exact credential reference",
                 )?;
                 reference_published = true;
                 out.line(format!("{role:?} credential version {secret:x}"))?;
@@ -1121,8 +1118,7 @@ mod tests {
         assert_eq!(repaired.secrets.collection(), collection.handle());
         assert!(repaired.secrets.contains(version));
         let config_resolution =
-            profiles::current_config(&repaired.profiles.reader, &repaired.profiles.facts)
-                .unwrap();
+            profiles::current_config(&repaired.profiles.reader, &repaired.profiles.facts).unwrap();
         let config = settled_config(&config_resolution).unwrap().unwrap();
         let profile_resolution = profiles::current_profile(
             &repaired.profiles.reader,

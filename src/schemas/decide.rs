@@ -1,5 +1,8 @@
 //! Collection-native Decide ontology.
 //!
+//! The module keeps the name `decide`: every attribute publishes its module path,
+//! so the `decisions` faculty reads the same schema under its first name.
+//!
 //! A decision id is a stable extrinsic anchor. Its proposal is one immutable
 //! intrinsic genesis; factors are independent intrinsic occurrences; and a
 //! resolution is an intrinsic predecessor DAG. Union therefore preserves

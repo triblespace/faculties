@@ -1,7 +1,7 @@
 //! Knowledge command-line UX: Clap, host paths, and @file/@- expansion live here.
 
 use super::operations::{
-    ImportDocument, ImportPlan, ListOptions, PlanAttachment, PlanCommit, PlanRevision, Knowledge,
+    ImportDocument, ImportPlan, Knowledge, ListOptions, PlanAttachment, PlanCommit, PlanRevision,
 };
 use crate::out::Out;
 use anyhow::{anyhow, Context, Result};
@@ -14,7 +14,7 @@ use triblespace::prelude::Id;
 #[command(
     version = crate::GIT_VERSION,
     name = "knowledge",
-    about = "A fork-visible knowledge wiki over a signed revision-DAG collection"
+    about = "A fork-visible knowledge base over a signed revision-DAG collection"
 )]
 struct Cli {
     #[command(flatten)]
@@ -31,6 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Health(super::health::cli::Command),
     /// Create an unanchored native entry.
     Create {
         title: String,
@@ -228,10 +230,21 @@ enum Command {
 
 #[derive(Subcommand)]
 enum TagCommand {
-    Add { id: String, name: String },
-    Remove { id: String, name: String },
+    Add {
+        id: String,
+        name: String,
+    },
+    Remove {
+        id: String,
+        name: String,
+    },
+    /// List known tags and revision counts.
     List,
-    Mint { name: String },
+    Mint {
+        name: String,
+    },
+    /// Count current tag evidence by state occurrence and by logical entry.
+    Counts,
 }
 
 #[derive(Subcommand)]
@@ -325,7 +338,7 @@ fn transfer_report(report: &super::TransferReport, out: &mut Out<'_>) -> Result<
         out.line("read back from the destination: every carried fact and text")?;
     }
     out.line(format!(
-        "the source is unchanged; archiving it is separate: `wiki --workspace {:X} archive {:x}` archives that entry's whole source frontier, not only this revision",
+        "the source is unchanged; archiving it is separate: `knowledge --workspace {:X} archive {:x}` archives that entry's whole source frontier, not only this revision",
         report.from, report.revision
     ))
 }
@@ -405,8 +418,10 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     let Some(command) = cli.command else {
         return Ok(());
     };
-    let knowledge = Knowledge::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
+    let storage = cli.workspace.storage(cli.pile, cli.key)?;
+    let knowledge = Knowledge::with_storage(storage.clone());
     match command {
+        Command::Health(command) => super::health::cli::execute(command, storage, out),
         Command::Create {
             title,
             content,
@@ -470,6 +485,7 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 tag_change(out, knowledge.tag(&id, &name, false)?, &name, false)
             }
             TagCommand::List => knowledge.tags(out),
+            TagCommand::Counts => super::health::cli::tag_counts(storage, out),
             TagCommand::Mint { name } => out.line(format!(
                 "{:x}  {}",
                 knowledge.mint_tag(&name)?,

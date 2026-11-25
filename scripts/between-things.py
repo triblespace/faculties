@@ -492,7 +492,7 @@ def run(*argv):
     exe = shutil.which(argv[0]) or os.path.expanduser("~/.local/bin/" + argv[0])
     # A moving cutoff is call input, never attention identity.
     label = ("relations show <persona>" if argv[0] == "relations" else
-             "goals has-activity <actor> <since> doing blocked" if argv[:2] == ("compass", "has-activity") else
+             "goals has-activity <actor> <since> doing blocked" if argv[:2] == ("goals", "has-activity") else
              " ".join(argv))
     out = observed_call(label, [exe, *argv[1:]], 120, stdin=subprocess.DEVNULL)
     if out.returncode != 0:
@@ -527,7 +527,7 @@ def decide():
     # seconds as Unix/UTC seconds, discarding fractional seconds. A whole-second
     # TAI cutoff at ceil(now-fresh) is equivalent; this is not a leap-second fix.
     since = time.strftime("%Y-%m-%dT%H:%M:%S TAI", time.gmtime(math.ceil(now - fresh)))
-    result = json.loads(run("compass", "has-activity", "--actor", me,
+    result = json.loads(run("goals", "has-activity", "--actor", me,
                             "--since", since, "--status", "doing", "--status", "blocked"))
     if type(result) is not bool:
         raise ValueError("goals has-activity: expected a JSON boolean")

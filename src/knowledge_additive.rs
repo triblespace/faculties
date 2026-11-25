@@ -75,7 +75,7 @@ pub struct Malformed {
     pub unfragmented: Vec<Id>,
     /// Versions carrying SEVERAL `fragment` values, which say two different
     /// things about which page the version belongs to. Chaining one of them
-    /// would pick a page by accident, so this refuses instead. The wiki's read
+    /// would pick a page by accident, so this refuses instead. Knowledge's read
     /// model stopped looking at anchors entirely on 2026-08-18; this migration
     /// is the last reader of that vocabulary, so the arity check lives here.
     pub ambiguous: Vec<Id>,

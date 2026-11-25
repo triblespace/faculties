@@ -1,4 +1,4 @@
-//! Typed Decide operations and native frontend behavior over temporary local collections.
+//! Typed Decisions operations and native frontend behavior over temporary local collections.
 use anybytes::Bytes;
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -66,7 +66,7 @@ fn collect(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<String>
     let mut text = String::new();
     operation(&mut Out::new(&mut |part| {
         let Part::Text { text: part } = part else {
-            panic!("Decide emits text");
+            panic!("Decisions emits text");
         };
         text.push_str(&part);
         Ok(())

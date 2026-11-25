@@ -1871,7 +1871,7 @@ fn replay(f: &Fixture, command: &str) -> String {
     let mut words = command.split(' ');
     let program = match words.next().unwrap() {
         "memory" => env!("CARGO_BIN_EXE_memory"),
-        "wiki" => env!("CARGO_BIN_EXE_knowledge"),
+        "knowledge" => env!("CARGO_BIN_EXE_knowledge"),
         "orient" => env!("CARGO_BIN_EXE_orient"),
         other => panic!("unexpected program {other}"),
     };
@@ -2138,7 +2138,7 @@ fn every_recall_and_belief_pair_resolves_to_exactly_what_it_shows() {
     // The doubly projected revision is ONE pair, showing both projections.
     let beliefs: Vec<_> = pairs
         .iter()
-        .filter(|(command, _)| command.starts_with("wiki "))
+        .filter(|(command, _)| command.starts_with("knowledge "))
         .collect();
     assert_eq!(beliefs.len(), 1, "{beliefs:?}");
     assert_eq!(beliefs[0].0, format!("knowledge show {revision_id:x}"));

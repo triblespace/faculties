@@ -33,7 +33,7 @@ fn main(nb: &mut NotebookCtx) {
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
-                ctx.markdown("# Goals Board\nKanban view of goals on a pile's compass branch.");
+                ctx.markdown("# Goals Board\nKanban view of goals on a pile's goals collection.");
             });
         });
     });

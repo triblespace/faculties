@@ -70,7 +70,6 @@ pub mod discord;
 pub mod duplex;
 pub mod events;
 pub mod files;
-pub mod gauge;
 pub mod goals;
 pub mod habits;
 pub mod hear;

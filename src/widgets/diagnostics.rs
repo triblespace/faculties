@@ -25,11 +25,11 @@
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::{blend, colorhash};
 
-use crate::storage::FactArchive;
 use crate::diagnostics::{
     self as diagnostics_model, PatternSummary, QueueCounts, ScanOptions, ScanReport, ScanSources,
     SourceView, UnreadMessages, UnreadUnavailable,
 };
+use crate::storage::FactArchive;
 use crate::widgets::storage::{DatasetRevision, DatasetView, SecretsView, WidgetReader};
 use triblespace::core::id::Id;
 
@@ -552,7 +552,7 @@ fn render_diagnostic_card(ui: &mut egui::Ui, error: &str) {
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.label(
-                egui::RichText::new("INVALID TRIAGE SNAPSHOT")
+                egui::RichText::new("INVALID DIAGNOSTICS SNAPSHOT")
                     .monospace()
                     .small()
                     .strong()
@@ -628,7 +628,7 @@ fn render_queues_card(ui: &mut egui::Ui, live: &DiagnosticsLive) {
             if let Some(error) = live.profiles_error.as_deref() {
                 render_status_line(
                     ui,
-                    "HEADSPACE UNRESOLVED",
+                    "PROFILES UNRESOLVED",
                     &first_line(error, 140),
                     color_error(),
                 );
@@ -644,7 +644,7 @@ fn render_queues_card(ui: &mut egui::Ui, live: &DiagnosticsLive) {
                     .unwrap_or_else(|| "no persona".to_owned());
                 render_status_line(
                     ui,
-                    &format!("HEADSPACE {agreement}"),
+                    &format!("PROFILES {agreement}"),
                     &format!(
                         "config heads {} · profile heads {} · {persona}",
                         live.config_heads, live.active_profile_heads

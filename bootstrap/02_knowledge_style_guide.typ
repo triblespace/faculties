@@ -51,7 +51,7 @@ create/edit and rejects malformed input. GORBIE renders them with
 math mode, code blocks, links. Avoid raw HTML; typst markup beats
 it everywhere.
 
-== When NOT to use the knowledge
+== When NOT to use Knowledge
 
   - Per-task working notes that the conversation already covers
     — the moment-history captures those.

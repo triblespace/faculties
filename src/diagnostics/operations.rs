@@ -28,7 +28,10 @@ impl Diagnostics {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
-    fn with_snapshot(&self, operation: impl FnOnce(&DiagnosticsSnapshot) -> Result<()>) -> Result<()> {
+    fn with_snapshot(
+        &self,
+        operation: impl FnOnce(&DiagnosticsSnapshot) -> Result<()>,
+    ) -> Result<()> {
         self.storage.with_store(|store, signer, runtime| {
             let snapshot = DiagnosticsSnapshot::load(&self.storage, store, signer, runtime)?;
             operation(&snapshot)
@@ -71,6 +74,12 @@ impl Diagnostics {
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::diagnostics::{
+    self as diagnostics_model, build_loop_report, collect_exec_state, collect_model_chat_state,
+    collect_reason_state, DiagnosticsProfiles, ExecRequestRow, ExecState, ModelChatState,
+    ModelResultRow, ReasonEventRow, ScanOptions, ScanSources, SourceView, UnreadMessages,
+    UnreadUnavailable,
+};
 use crate::memory::{self as memory_model};
 use crate::memory_cover::{
     all_chunk_ids, chunk_about_archive_message, chunk_about_exec_result, chunk_aliases,
@@ -87,12 +96,6 @@ use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
-use crate::diagnostics::{
-    self as diagnostics_model, build_loop_report, collect_exec_state, collect_model_chat_state,
-    collect_reason_state, ExecRequestRow, ExecState, ModelChatState, ModelResultRow,
-    ReasonEventRow, ScanOptions, ScanSources, SourceView, DiagnosticsProfiles, UnreadMessages,
-    UnreadUnavailable,
-};
 use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
@@ -1161,8 +1164,8 @@ mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
-    use crate::profiles::{self, Resolution};
     use crate::memory::{ChunkDraft, ChunkDraftContent};
+    use crate::profiles::{self, Resolution};
     use crate::schemas::headspace::{
         playground_config, KIND_CONFIG_ID, KIND_LIVE_RECORD, KIND_MODEL_PROFILE_ID,
     };
@@ -1426,12 +1429,17 @@ mod tests {
 
     #[test]
     fn retired_branch_commands_and_selector_are_not_cli_surface() {
-        assert!(
-            Cli::try_parse_from(["triage", "--pile", "x", "--branch", "cognition", "scan"])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from(["triage", "--pile", "x", "chain"]).is_err());
-        assert!(Cli::try_parse_from(["triage", "--pile", "x", "repair"]).is_err());
-        assert!(Cli::try_parse_from(["triage", "--pile", "x", "migrate-legacy"]).is_err());
+        assert!(Cli::try_parse_from([
+            "diagnostics",
+            "--pile",
+            "x",
+            "--branch",
+            "cognition",
+            "scan"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "chain"]).is_err());
+        assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "repair"]).is_err());
+        assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "migrate-legacy"]).is_err());
     }
 }

@@ -120,7 +120,7 @@ class PredicateTests(unittest.TestCase):
         if Path(argv[0]).name == "relations":
             self.assertEqual(argv[1:], ["show", "tester"])
             return subprocess.CompletedProcess(argv, 0, self.person, "")
-        self.assertEqual(Path(argv[0]).name, "compass")
+        self.assertEqual(Path(argv[0]).name, "goals")
         self.assertEqual(argv[1:4], ["has-activity", "--actor", PERSON])
         self.assertEqual(argv[4], "--since")
         self.assertEqual(argv[6:], ["--status", "doing", "--status", "blocked"])
@@ -249,7 +249,7 @@ class PredicateTests(unittest.TestCase):
 
     def test_exact_persona_never_calls_status_or_relations(self):
         def command(argv, **kwargs):
-            self.assertEqual(Path(argv[0]).name, "compass")
+            self.assertEqual(Path(argv[0]).name, "goals")
             return self.command(argv, **kwargs)
         self.assertEqual(self.invoke(command=command, persona=PERSON)[0], 0)
 
@@ -511,7 +511,7 @@ class PredicateTests(unittest.TestCase):
 
     def test_compass_failure_is_error(self):
         def failed(argv, **kwargs):
-            if "compass" in Path(argv[0]).name:
+            if "goals" in Path(argv[0]).name:
                 return subprocess.CompletedProcess(argv, 2, "", "collection unavailable")
             return self.command(argv, **kwargs)
         self.assertEqual(self.invoke(command=failed)[0], 2)

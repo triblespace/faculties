@@ -458,7 +458,7 @@ impl EventsStorage<'_> {
         })
     }
 
-    /// How many distinct payloads the planner's collection stands on. A
+    /// How many distinct payloads the events collection stands on. A
     /// write that changes nothing adds none.
     #[cfg(test)]
     fn payload_count(&self) -> Result<usize> {

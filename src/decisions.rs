@@ -1,4 +1,4 @@
-//! Collection-native Decide values, validation, and fork-visible resolution.
+//! Collection-native Decisions values, validation, and fork-visible resolution.
 //!
 //! Decision ids are stable random anchors. One intrinsic immutable genesis
 //! describes each anchor, factors are independent intrinsic occurrences, and
@@ -291,7 +291,7 @@ where
         }])
     )
     .min()
-    .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable genesis projection"))?;
+    .ok_or_else(|| anyhow!("Decisions entity {id:x} has no decodable genesis projection"))?;
     Ok(DecisionGenesis {
         id,
         decision,
@@ -365,7 +365,7 @@ where
                 .then_with(|| left.3.cmp(&right.3))
                 .then_with(|| left.4.cmp(&right.4))
         })
-        .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable factor projection"))?;
+        .ok_or_else(|| anyhow!("Decisions entity {id:x} has no decodable factor projection"))?;
     Ok(FactorRecord {
         id,
         occurrence,
@@ -424,7 +424,7 @@ where
         }])
     )
     .min()
-    .ok_or_else(|| anyhow!("Decide entity {id:x} has no decodable resolution projection"))?;
+    .ok_or_else(|| anyhow!("Decisions entity {id:x} has no decodable resolution projection"))?;
     Ok(ResolutionSnapshot {
         id,
         decision,
@@ -615,7 +615,7 @@ where
 pub fn read_text(reader: &impl BlobStoreGet, handle: TextHandle) -> Result<String> {
     let view: View<str> = reader
         .get(handle)
-        .with_context(|| format!("read Decide text payload {}", hex::encode(handle.raw)))?;
+        .with_context(|| format!("read Decisions text payload {}", hex::encode(handle.raw)))?;
     Ok(view.to_string())
 }
 

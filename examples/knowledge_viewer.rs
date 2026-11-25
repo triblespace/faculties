@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use faculties::widgets::{SourceKey, StorageState, KnowledgeViewer};
+use faculties::widgets::{KnowledgeViewer, SourceKey, StorageState};
 use GORBIE::notebook;
 use GORBIE::prelude::*;
 
@@ -40,7 +40,9 @@ fn main(nb: &mut NotebookCtx) {
     nb.view(|ctx| {
         ctx.grid(|g| {
             g.full(|ctx| {
-                ctx.markdown("# Knowledge Viewer\nBrowse wiki fragments stored in a TribleSpace pile.");
+                ctx.markdown(
+                    "# Knowledge Viewer\nBrowse knowledge fragments stored in a TribleSpace pile.",
+                );
             });
         });
     });
@@ -71,8 +73,8 @@ mod semantic {
     use std::path::PathBuf;
     use std::sync::mpsc::{channel, Receiver, Sender};
 
-    use faculties::widgets::KnowledgeViewer;
     use faculties::knowledge::Knowledge;
+    use faculties::widgets::KnowledgeViewer;
 
     type Answer = (
         String,

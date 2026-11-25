@@ -1,4 +1,7 @@
 //! Atlas schema: the fixed collection containing inspectable schema metadata.
+//!
+//! The module keeps the name `atlas`: every attribute publishes its module path,
+//! so the `schemas` faculty reads the same schema under its first name.
 
 use triblespace::macros::id_hex;
 use triblespace::prelude::*;

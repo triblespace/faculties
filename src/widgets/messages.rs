@@ -769,7 +769,7 @@ fn render_message(
     let bubble_fill = ui.visuals().window_fill;
     let from_color = person_color(msg.from);
     let to_color = person_color(msg.to);
-    // Sender/recipient stripes flank the bubble (compass-card idiom).
+    // Sender/recipient stripes flank the bubble (goals-card idiom).
     // Width 18 fits a 9-pt monospace name rotated 90°. Inner content
     // is inset on both sides to leave room.
     const STRIPE_WIDTH: f32 = 18.0;
@@ -939,7 +939,7 @@ fn render_message(
                 });
             });
 
-        // ── Sender / recipient stripes (compass-card idiom) ─────────────
+        // ── Sender / recipient stripes (goals-card idiom) ─────────────
         //
         // After the Frame has measured + painted, lay two colored stripes
         // along the bubble's left and right edges (inset by the stroke so
@@ -980,7 +980,7 @@ enum StripeSide {
     Right,
 }
 
-/// Paint a compass-style colored stripe along one vertical edge of
+/// Paint a goals-style colored stripe along one vertical edge of
 /// `outer`, with `label` rendered as monospace rotated 90°. The text
 /// is skipped when the stripe is too short to hold the glyphs (avoids
 /// overflowing into the bubble body on one-line messages).

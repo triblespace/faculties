@@ -19,14 +19,14 @@ use crate::clock;
 #[cfg(test)]
 use crate::collection_names::open_configured;
 use crate::files::{content_hash_hex, ContentHandle};
-use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
-use crate::schemas::files::{file, KIND_FILE};
-use crate::schemas::wiki::{self as schema, extract_link_targets};
-use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use crate::knowledge::{
     self as knowledge_model, EntryRecord, FrontierModel, LinkClass, LinkReference, RevisionDraft,
     RevisionRecord,
 };
+use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
+use crate::schemas::files::{file, KIND_FILE};
+use crate::schemas::wiki::{self as schema, extract_link_targets};
+use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
 use hifitime::Epoch;
@@ -59,7 +59,7 @@ pub struct Export {
 }
 impl Export {
     pub fn uri(&self) -> String {
-        format!("wiki:{:x}", self.revision)
+        format!("knowledge:{:x}", self.revision)
     }
 }
 
@@ -373,7 +373,9 @@ impl KnowledgeStorage<'_> {
         label: &str,
         mut prepare: impl FnMut(&KnowledgeView, &FactArchive) -> Result<T>,
     ) -> Result<T> {
-        self.views(&[(scope, label)], |knowledge, facts| prepare(knowledge, &facts[0]))
+        self.views(&[(scope, label)], |knowledge, facts| {
+            prepare(knowledge, &facts[0])
+        })
     }
 
     fn publish(&self, fragment: Fragment) -> Result<CollectionCommit> {
@@ -402,7 +404,9 @@ impl KnowledgeStorage<'_> {
                     crate::storage::ensure_downstream(pile, collection, signer).await?;
                     Ok::<_, anyhow::Error>(())
                 })
-                .context("Knowledge fragment was committed, but ensuring its derived views failed")?;
+                .context(
+                    "Knowledge fragment was committed, but ensuring its derived views failed",
+                )?;
             Ok(commit)
         })
     }
@@ -726,22 +730,37 @@ fn link_targets<'a>(content: &'a str, scheme: &str) -> Vec<&'a str> {
         .collect()
 }
 
+/// Every page link as written: its scheme, and the token past an optional kind.
+fn page_links(content: &str) -> Vec<(&str, &str)> {
+    static LINK: OnceLock<regex::Regex> = OnceLock::new();
+    LINK.get_or_init(|| {
+        regex::Regex::new(r#"#link\("(wiki|knowledge):(?:[A-Za-z_][A-Za-z0-9_]*:)?([0-9A-Fa-f]+)""#)
+            .unwrap()
+    })
+    .captures_iter(content)
+    .map(|m| (m.get(1).unwrap().as_str(), m.get(2).unwrap().as_str()))
+    .collect()
+}
+
 fn validate_links<P: TriblePattern>(content: &str, facts: &P, allow_dangling: bool) -> Result<()> {
     let known = known_link_ids(facts);
     let mut failures = Vec::new();
-    for token in link_targets(content, "wiki") {
+    for (scheme, token) in page_links(content) {
         if token.len() != 32 {
-            failures.push(format!("truncated link wiki:{token}"));
+            failures.push(format!("truncated link {scheme}:{token}"));
         } else if let Some(id) = Id::from_hex(token) {
             if !known.contains(&id) && !allow_dangling {
-                failures.push(format!("broken link wiki:{token}"));
+                failures.push(format!("broken link {scheme}:{token}"));
             }
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        bail!("Knowledge link validation failed:\n  {}", failures.join("\n  "))
+        bail!(
+            "Knowledge link validation failed:\n  {}",
+            failures.join("\n  ")
+        )
     }
 }
 
@@ -856,7 +875,7 @@ impl<P: TriblePattern> ReferenceResolver<'_, P> {
             // anchor's then-current head first — and now an anchor id simply
             // does not resolve, so a reference that survives is left as it is
             // and `knowledge check` reports it broken rather than following it.
-            "wiki" => {
+            "wiki" | "knowledge" => {
                 let (kind, hex) = split_typed(rest);
                 Ok(format!("{kind}{:x}", resolve_prefix(self.knowledge, hex)?))
             }
@@ -916,12 +935,14 @@ fn regexes() -> &'static LintPatterns {
     PATTERNS.get_or_init(|| LintPatterns {
         bold: regex::Regex::new(r"\*\*([^*]+)\*\*").unwrap(),
         markdown_links: regex::Regex::new(
-            r"\[([^\]]+)\]\((wiki|files):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\)",
+            r"\[([^\]]+)\]\((wiki|knowledge|files):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\)",
         )
         .unwrap(),
         web_links: regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").unwrap(),
-        knowledge_references: regex::Regex::new(r"wiki:((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b")
-            .unwrap(),
+        knowledge_references: regex::Regex::new(
+            r"(wiki|\bknowledge):((?:[A-Za-z_][A-Za-z0-9_]*:)?[0-9A-Fa-f]+)\b",
+        )
+        .unwrap(),
     })
 }
 
@@ -964,13 +985,15 @@ fn lint_line<P: TriblePattern>(line: &str, resolver: ReferenceResolver<'_, P>) -
     // way. This is what retires the legacy anchors: an anchor becomes the
     // citation it always stood for (its current head revision), a truncated
     // prefix becomes the full id, and anything that already names a revision
-    // keeps its exact bytes, so a knowledge of citations is a fixpoint of the pass.
+    // keeps its exact bytes, so a page of citations is a fixpoint of the pass.
     let line = patterns
         .knowledge_references
         .replace_all(&line, |captures: &regex::Captures| {
-            let rest = &captures[1];
-            match resolver.expand("wiki", rest) {
-                Ok(resolved) if !resolved.eq_ignore_ascii_case(rest) => format!("wiki:{resolved}"),
+            let (scheme, rest) = (&captures[1], &captures[2]);
+            match resolver.expand(scheme, rest) {
+                Ok(resolved) if !resolved.eq_ignore_ascii_case(rest) => {
+                    format!("{scheme}:{resolved}")
+                }
                 _ => captures[0].to_owned(),
             }
         })
@@ -1247,7 +1270,12 @@ fn cmd_diff(
     Ok(report)
 }
 
-fn mutate_tags(storage: KnowledgeStorage<'_>, id: String, name: &str, add: bool) -> Result<Option<Id>> {
+fn mutate_tags(
+    storage: KnowledgeStorage<'_>,
+    id: String,
+    name: &str,
+    add: bool,
+) -> Result<Option<Id>> {
     let normalized = name.trim().to_ascii_lowercase();
     if normalized.is_empty() {
         bail!("tag name cannot be empty");
@@ -1356,7 +1384,7 @@ fn backlink_summaries(
     facts: &FactArchive,
 ) -> Result<BTreeMap<Id, BacklinkSummary>> {
     let expression = regex::Regex::new(
-        r#"#link\("wiki:(?:(?P<kind>[A-Za-z_][A-Za-z0-9_]*):)?(?P<id>[0-9A-Fa-f]{32})"\)"#,
+        r#"#link\("(?:wiki|knowledge):(?:(?P<kind>[A-Za-z_][A-Za-z0-9_]*):)?(?P<id>[0-9A-Fa-f]{32})"\)"#,
     )
     .expect("static Knowledge link expression");
     let mut summaries = BTreeMap::<Id, BacklinkSummary>::new();
@@ -1415,14 +1443,22 @@ fn cmd_links(
 /// pre-cutover citation -- fails for three different reasons, and "no Knowledge id
 /// matches" is the same sentence for all of them. Only reached on the failure
 /// path, so the ordinary lookup pays nothing for it.
-fn explain_selector(view: &KnowledgeView, raw: &str, error: anyhow::Error) -> Result<anyhow::Error> {
+fn explain_selector(
+    view: &KnowledgeView,
+    raw: &str,
+    error: anyhow::Error,
+) -> Result<anyhow::Error> {
     let Some(target) = Id::from_hex(raw.trim()) else {
         return Ok(error);
     };
     let model = FrontierModel::load(&view.reader, &view.facts, &view.latest)?;
     let entry = |index: usize| {
         let entry = &model.entries[index];
-        format!("{} [wiki:{:x}]", short(&entry.title(), 55), entry.label)
+        format!(
+            "{} [knowledge:{:x}]",
+            short(&entry.title(), 55),
+            entry.label
+        )
     };
     let diagnosis = match model.classify(target) {
         LinkClass::Legacy { entries, retired } => format!(
@@ -1464,7 +1500,11 @@ fn explain_selector(view: &KnowledgeView, raw: &str, error: anyhow::Error) -> Re
 fn describe_target(model: &FrontierModel, reference: &LinkReference) -> String {
     let entry = |index: usize| {
         let entry = &model.entries[index];
-        format!("{} [wiki:{:x}]", short(&entry.title(), 55), entry.label)
+        format!(
+            "{} [knowledge:{:x}]",
+            short(&entry.title(), 55),
+            entry.label
+        )
     };
     match &reference.class {
         LinkClass::Live(index) | LinkClass::Retired(index) => entry(*index),
@@ -1500,12 +1540,12 @@ fn print_class(
     out.line(format!("\n--- {heading} ({}) ---", rows.len()))?;
     for reference in rows.iter().take(top) {
         out.line(format!(
-            "{} [wiki:{:x}]",
+            "{} [knowledge:{:x}]",
             short(&reference.source_title, 60),
             reference.source
         ))?;
         out.line(format!(
-            "  -> wiki:{:x}  {}",
+            "  -> knowledge:{:x}  {}",
             reference.target,
             describe_target(model, reference)
         ))?;
@@ -1520,7 +1560,7 @@ fn print_class(
 ///
 /// Diagnostic by design: this reports, it does not gate. The one class that
 /// means something broke is a citation into an entry whose every current state
-/// is archived; an unwritten target is the wiki's link-liberally convention
+/// is archived; an unwritten target is Knowledge's link-liberally convention
 /// working as intended, and a legacy anchor is a migration signal.
 fn cmd_link_audit(
     model: &FrontierModel,
@@ -1531,7 +1571,7 @@ fn cmd_link_audit(
     let audit = model.audit();
     let unreferenced = model.unreferenced(&audit);
 
-    out.line(format!("=== WIKI: Frontier Link Audit ===\n"))?;
+    out.line(format!("=== KNOWLEDGE: Frontier Link Audit ===\n"))?;
     out.line(format!(
         "Live entries:          {} ({} current states)",
         model.active_count(),
@@ -1574,7 +1614,7 @@ fn cmd_link_audit(
     for index in unreferenced.iter().take(top) {
         let entry = &model.entries[*index];
         out.line(format!(
-            "{} [wiki:{:x}]",
+            "{} [knowledge:{:x}]",
             short(&entry.title(), 60),
             entry.label
         ))?;
@@ -2194,8 +2234,13 @@ fn cmd_import_plan(
         let mut fragment = pending_tags.take().unwrap_or_else(Fragment::empty);
         for revision in &commit.revisions {
             knowledge_model::check_revision_inputs(&revision.title, &tags)?;
-            let content = prepare_content(&revision.content, &knowledge_facts, Some(&files_facts), true)
-                .with_context(|| format!("plan revision '{}'", revision.key))?;
+            let content = prepare_content(
+                &revision.content,
+                &knowledge_facts,
+                Some(&files_facts),
+                true,
+            )
+            .with_context(|| format!("plan revision '{}'", revision.key))?;
             let content =
                 resolve_plan_links(&content, &pages, &revisions, &attachments, &revision.key)?;
             let predecessors: Vec<Id> = revision
@@ -2362,7 +2407,12 @@ fn search_hits(
     })
 }
 
-fn cmd_search(storage: KnowledgeStorage<'_>, query: String, context: bool, all: bool) -> Result<String> {
+fn cmd_search(
+    storage: KnowledgeStorage<'_>,
+    query: String,
+    context: bool,
+    all: bool,
+) -> Result<String> {
     let mut report = String::new();
     for hit in search_hits(storage, &query, context, all)?.hits {
         writeln!(
@@ -2431,14 +2481,14 @@ fn cmd_check(storage: KnowledgeStorage<'_>, compile: bool, out: &mut Out<'_>) ->
                         LinkClass::Retired(target) => {
                             writeln!(
                                 diagnostics,
-                                "BROKEN_LINK  {:x}  wiki:{raw}  -> archived entry wiki:{:x}",
+                                "BROKEN_LINK  {:x}  knowledge:{raw}  -> archived entry knowledge:{:x}",
                                 head.id, model.entries[target].label
                             )
                             .unwrap();
                             issues += 1;
                         }
                         LinkClass::Legacy { .. } => {
-                            writeln!(diagnostics, "LEGACY_LINK  {:x}  wiki:{raw}", head.id)
+                            writeln!(diagnostics, "LEGACY_LINK  {:x}  knowledge:{raw}", head.id)
                                 .unwrap();
                             legacy += 1;
                         }
@@ -2508,7 +2558,11 @@ fn resolve_reference_line(
     }
 }
 
-fn cmd_fix_truncated(storage: KnowledgeStorage<'_>, input: String, out: &mut Out<'_>) -> Result<()> {
+fn cmd_fix_truncated(
+    storage: KnowledgeStorage<'_>,
+    input: String,
+    out: &mut Out<'_>,
+) -> Result<()> {
     let (view, files) = storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
         Ok((view.clone(), files.clone()))
     })?;
@@ -2526,7 +2580,12 @@ fn cmd_fix_truncated(storage: KnowledgeStorage<'_>, input: String, out: &mut Out
     Ok(())
 }
 
-fn cmd_lint(storage: KnowledgeStorage<'_>, fix: bool, check: bool, out: &mut Out<'_>) -> Result<()> {
+fn cmd_lint(
+    storage: KnowledgeStorage<'_>,
+    fix: bool,
+    check: bool,
+    out: &mut Out<'_>,
+) -> Result<()> {
     let (report, changed, revisions, unfixed) =
         storage.view_with_scope(FILES_SCOPE_ID, "Files", |view, files| {
             let resolver = ReferenceResolver {
@@ -2557,7 +2616,7 @@ fn cmd_lint(storage: KnowledgeStorage<'_>, fix: bool, check: bool, out: &mut Out
                     if fix {
                         // A fork, or one revision read several ways, has no
                         // single text to fix; it is named, and the rest of
-                        // the Knowledge is still fixed.
+                        // Knowledge is still fixed.
                         if entry.frontier.len() != 1 {
                             unfixed.push(entry_label(&entry));
                             break;
@@ -3944,7 +4003,7 @@ mod tests {
 
         for content in [
             format!("see #link(\"wiki:{anchor:x}\")[the page]\n"),
-            format!("#link(\"wiki:{anchor:x}\")[wiki:{anchor:x}]\n"),
+            format!("#link(\"wiki:{anchor:x}\")[knowledge:{anchor:x}]\n"),
             format!("context: wiki:{anchor:x} says so\n"),
         ] {
             assert_eq!(lint_fix(&content, resolver), content);

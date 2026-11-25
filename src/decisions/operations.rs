@@ -1,4 +1,4 @@
-//! Configured operations over one frozen authorized Decide observation.
+//! Configured operations over one frozen authorized Decisions observation.
 #[cfg(test)]
 use crate::storage::FactView;
 use std::path::PathBuf;
@@ -141,8 +141,8 @@ impl Decisions {
     pub fn factor(&self, input: &str, text: &str, side: FactorSide) -> Result<AddedFactor> {
         validate_prose(text, "factor text")?;
         let description = match side {
-            FactorSide::Pro => "add Decide pro factor",
-            FactorSide::Con => "add Decide con factor",
+            FactorSide::Pro => "add Decisions pro factor",
+            FactorSide::Con => "add Decisions con factor",
         };
         self.storage().update(description, |view| {
             let decision = resolve_decision(input, &view.facts)?;
@@ -353,11 +353,12 @@ impl DecisionsStorage<'_> {
                     maintained_succinct,
                 )?;
                 let store_snapshot = AcquiringReader::new(
-                    pile.snapshot().context("freeze Decide fact collection")?,
+                    pile.snapshot()
+                        .context("freeze Decisions fact collection")?,
                     runtime.clone(),
                 );
                 let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
-                    .context("read maintained Decide fact collection")?;
+                    .context("read maintained Decisions fact collection")?;
                 operation(
                     pile,
                     collection,
@@ -394,7 +395,7 @@ impl DecisionsStorage<'_> {
                 runtime,
             )?;
             pile.commit(collection, signer, fragment)
-                .context("commit authored Decide fragment")?;
+                .context("commit authored Decisions fragment")?;
             drop(
                 runtime
                     .block_on(crate::storage::ensure_downstream(pile, collection, signer))

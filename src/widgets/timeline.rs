@@ -25,7 +25,7 @@
 //!     },
 //!     TimelineSource::Knowledge {
 //!         key: SourceKey::Knowledge,
-//!         label: "wiki".into(),
+//!         label: "knowledge".into(),
 //!     },
 //! ]);
 //! // Inside a GORBIE card:
@@ -1720,7 +1720,7 @@ mod tests {
     fn missing_middle_source_does_not_shift_kinds() {
         let sources = configured_sources();
         let resolved = resolve_sources(&sources, |key| match key {
-            SourceKey::Goals => Some("compass dataset"),
+            SourceKey::Goals => Some("goals dataset"),
             SourceKey::Archive => Some("archive dataset"),
             _ => None,
         });
@@ -1732,7 +1732,7 @@ mod tests {
         assert_eq!(
             routes,
             vec![
-                (0, SourceKey::Goals, SourceKind::Goals, "compass dataset"),
+                (0, SourceKey::Goals, SourceKind::Goals, "goals dataset"),
                 (
                     2,
                     SourceKey::Archive,
@@ -1747,14 +1747,14 @@ mod tests {
     fn input_map_order_does_not_change_source_resolution() {
         let sources = configured_sources();
         let forward = [
-            (SourceKey::Goals, "compass dataset"),
-            (SourceKey::Knowledge, "wiki dataset"),
+            (SourceKey::Goals, "goals dataset"),
+            (SourceKey::Knowledge, "knowledge dataset"),
             (SourceKey::Archive, "archive dataset"),
         ];
         let reverse = [
             (SourceKey::Archive, "archive dataset"),
-            (SourceKey::Knowledge, "wiki dataset"),
-            (SourceKey::Goals, "compass dataset"),
+            (SourceKey::Knowledge, "knowledge dataset"),
+            (SourceKey::Goals, "goals dataset"),
         ];
         let route = |available: &[(SourceKey, &'static str)]| {
             resolve_sources(&sources, |key| {

@@ -3,10 +3,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anybytes::Bytes;
+use faculties::knowledge::{cli, mcp, Knowledge, ListOptions};
 use faculties::mcp::{Faculty, InvalidArguments, Server};
 use faculties::out::{Out, Part};
 use faculties::storage::initialize_signer;
-use faculties::knowledge::{cli, mcp, ListOptions, Knowledge};
 use serde_json::{json, Value};
 use triblespace::core::repo::SnapshotSource;
 
@@ -113,7 +113,9 @@ fn revision(parts: &[Part]) -> String {
 fn library_cli_and_mcp_agree_on_frontier_exact_and_raw_exports() {
     let fixture = Fixture::new();
     let knowledge = fixture.knowledge();
-    let first = knowledge.create("page", "first draft\n", &[], true).unwrap();
+    let first = knowledge
+        .create("page", "first draft\n", &[], true)
+        .unwrap();
     let first = format!("{first:x}");
     let head = knowledge
         .edit(
@@ -153,7 +155,10 @@ fn library_cli_and_mcp_agree_on_frontier_exact_and_raw_exports() {
         };
         assert_eq!(bytes.as_ref(), expected.as_bytes());
         assert_eq!(mime_type, "text/plain; charset=utf-8");
-        assert_eq!(uri, &format!("wiki:{}", if exact { &first } else { &head }));
+        assert_eq!(
+            uri,
+            &format!("knowledge:{}", if exact { &first } else { &head })
+        );
     }
     assert_eq!(
         fixture.cli(&["history", &first]),
@@ -177,8 +182,15 @@ fn write_receipts_are_returned_after_publication_and_tag_noops_are_visible() {
         .show(&first, true)
         .unwrap()
         .contains("ordinary text"));
-    let next = revision(&fixture.call("knowledge_edit", json!({"id":first,"content":"updated text"})));
-    assert!(fixture.knowledge().show(&first, false).unwrap().contains(&next));
+    let next = revision(&fixture.call(
+        "knowledge_edit",
+        json!({"id":first,"content":"updated text"}),
+    ));
+    assert!(fixture
+        .knowledge()
+        .show(&first, false)
+        .unwrap()
+        .contains(&next));
     let no_op = fixture.call("knowledge_tag_add", json!({"id":first,"name":"blue"}));
     assert_eq!(text(&no_op), "already tagged #blue\n");
     let archived = revision(&fixture.call("knowledge_archive", json!({"id":first})));
@@ -195,7 +207,12 @@ fn write_receipts_are_returned_after_publication_and_tag_noops_are_visible() {
         .contains("resident"));
     fixture.call("knowledge_revert", json!({"id":first,"to":1}));
     assert_eq!(
-        fixture.knowledge().export(&first, false).unwrap().bytes.as_ref(),
+        fixture
+            .knowledge()
+            .export(&first, false)
+            .unwrap()
+            .bytes
+            .as_ref(),
         b"ordinary text"
     );
 }
@@ -225,7 +242,12 @@ fn mcp_strings_are_literal_while_cli_owns_file_expansion() {
         .unwrap()
         .starts_with(&format!("# {title_argument}\n")));
     assert_eq!(
-        fixture.knowledge().export(&mcp_id, true).unwrap().bytes.as_ref(),
+        fixture
+            .knowledge()
+            .export(&mcp_id, true)
+            .unwrap()
+            .bytes
+            .as_ref(),
         b"resident content"
     );
 
@@ -620,5 +642,50 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         let listing = fixture.knowledge().list(&ListOptions::default()).unwrap();
         assert!(listing.contains("source writer"), "{listing}");
         assert!(listing.contains("imported by source writer"), "{listing}");
+    }
+}
+
+/// `wiki:` was written before the faculty was named for what it holds, and it
+/// resolves for ever beside `knowledge:`.
+#[test]
+fn both_link_schemes_resolve_to_one_revision_and_count_alike() {
+    let fixture = Fixture::new();
+    let knowledge = fixture.knowledge();
+    let target = knowledge.create("target", "body", &[], true).unwrap();
+    let old = knowledge
+        .create(
+            "old",
+            &format!("#link(\"wiki:{target:x}\")[was]"),
+            &[],
+            false,
+        )
+        .unwrap();
+    let new = knowledge
+        .create(
+            "new",
+            &format!("#link(\"knowledge:{target:x}\")[is]"),
+            &[],
+            false,
+        )
+        .unwrap();
+    // Each is stored as written, and both cite the one target.
+    for (id, scheme) in [(old, "wiki"), (new, "knowledge")] {
+        let shown = text(&fixture.cli(&["show", &format!("{id:x}")]));
+        assert!(shown.contains(&format!("{scheme}:{target:x}")), "{shown}");
+    }
+    let shown = text(&fixture.call("knowledge_links", json!({"id": format!("{target:x}")})));
+    for id in [old, new] {
+        assert!(shown.contains(&format!("{id:x}")), "{shown}");
+    }
+    // A link to nothing is refused under either scheme.
+    for scheme in ["wiki", "knowledge"] {
+        assert!(knowledge
+            .create(
+                "broken",
+                &format!("#link(\"{scheme}:{}\")[x]", "ab".repeat(16)),
+                &[],
+                false
+            )
+            .is_err());
     }
 }

@@ -39,7 +39,7 @@ If there isn't one, skip this step.
 
 == Step 3: do the bootstrap goals (30 min)
 
-The goals has a handful of `#bootstrap`-tagged goals walking
+Goals holds a handful of `#bootstrap`-tagged goals walking
 you through hands-on faculty use:
 
   - read this start-here fragment

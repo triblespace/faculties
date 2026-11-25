@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Faculties are named for what they hold: `wiki` is now `knowledge`, `compass`
+  `goals`, `atlas` `schemas`, `planner` `events`, `decide` `decisions`,
+  `headspace` `profiles` and `triage` `diagnostics`. Binaries, MCP tools
+  (`wiki_show` is `knowledge_show`, and so on), capture targets, viewer cards
+  and targets, library modules and types follow; there is no alias.
+  `gauge` is now under `knowledge`: `knowledge health`, `quality`, `hubs`,
+  `risk`, `orphans` and `knowledge tag counts` (it was `gauge tags`), with the
+  tools `knowledge_health`, `knowledge_tag_counts` and so on. A `search` hit's
+  source and the viewer's target `gauge` are `knowledge` and
+  `knowledge-health`.
+
+  Stored names are unchanged: collections, environment variables
+  (`TRIBLESPACE_COLLECTION_WIKI`), kinds, attributes and the module paths
+  under `schemas/`. A page written with `wiki:` links resolves as before, and
+  new text writes `knowledge:`; lint keeps the scheme it finds. Bootstrap page
+  text advances one revision on its own strand and goal titles and tags are
+  kept, so a re-import adds a note to each goal it changed.
+
+  Switch order: a reader of `orient wake --pairs` that runs or parses `wiki
+  show` accepts `knowledge show` first, then every writer switches. Restart
+  long-lived processes and their MCP sessions, and build the cohort in a fresh
+  target directory, since the installer ships every executable it finds.
+
 - `memory create <range>`, `memory image` and `memory consolidate` record when
   they were written as `created_at`; they stamped the span's end. A respan
   carries its source's `created_at` values and adds none, where it stamped the

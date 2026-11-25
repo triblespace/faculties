@@ -72,34 +72,35 @@ impl Fixture {
         let both = AdmissionPolicy::quorum([n, original.verifying_key()], 1, None).unwrap();
         let with_third = AdmissionPolicy::quorum([n, third.verifying_key()], 1, None).unwrap();
 
-        let (source_knowledge, destination_knowledge, knowledge_only_root, source_files, destination_files) =
-            storage
-                .with_store(|store, _, _| {
-                    let mut root =
-                        |name: &str, policy: CollectionPolicy| -> Result<CollectionHandle> {
-                            Ok(store.collection(name, policy)?.handle())
-                        };
-                    Ok((
-                        root(
-                            "wiki",
-                            CollectionPolicy::new(AdmissionPolicy::direct(n), both.clone()),
-                        )?,
-                        root("wiki", crate::collection_names::private_policy(n))?,
-                        root(
-                            "wiki",
-                            CollectionPolicy::new(
-                                AdmissionPolicy::Open,
-                                AdmissionPolicy::direct(n),
-                            ),
-                        )?,
-                        root("files", crate::collection_names::private_policy(n))?,
-                        root(
-                            "files",
-                            CollectionPolicy::new(AdmissionPolicy::direct(n), with_third.clone()),
-                        )?,
-                    ))
-                })
-                .unwrap();
+        let (
+            source_knowledge,
+            destination_knowledge,
+            knowledge_only_root,
+            source_files,
+            destination_files,
+        ) = storage
+            .with_store(|store, _, _| {
+                let mut root = |name: &str, policy: CollectionPolicy| -> Result<CollectionHandle> {
+                    Ok(store.collection(name, policy)?.handle())
+                };
+                Ok((
+                    root(
+                        "wiki",
+                        CollectionPolicy::new(AdmissionPolicy::direct(n), both.clone()),
+                    )?,
+                    root("wiki", crate::collection_names::private_policy(n))?,
+                    root(
+                        "wiki",
+                        CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::direct(n)),
+                    )?,
+                    root("files", crate::collection_names::private_policy(n))?,
+                    root(
+                        "files",
+                        CollectionPolicy::new(AdmissionPolicy::direct(n), with_third.clone()),
+                    )?,
+                ))
+            })
+            .unwrap();
 
         // Source content, authored and signed by the original key.
         let (author_facts, author) = knowledge_model::author_record(&original.verifying_key());
@@ -344,7 +345,10 @@ fn a_transferred_revision_keeps_its_identity_author_and_time_without_its_private
         )
         .unwrap();
     assert!(report.verified);
-    assert_eq!(report.publications, 1, "Knowledge only: no file was opted in");
+    assert_eq!(
+        report.publications, 1,
+        "Knowledge only: no file was opted in"
+    );
     assert_eq!(report.new_file_facts, 0);
 
     let source = fixture.knowledge_facts(fixture.source);
@@ -380,7 +384,10 @@ fn a_transferred_revision_keeps_its_identity_author_and_time_without_its_private
     // The identical citation resolves to identical bytes in both workspaces.
     let id = format!("{:x}", fixture.guide);
     let from = fixture.knowledge(fixture.source).export(&id, true).unwrap();
-    let to = fixture.knowledge(fixture.destination).export(&id, true).unwrap();
+    let to = fixture
+        .knowledge(fixture.destination)
+        .export(&id, true)
+        .unwrap();
     assert_eq!(from.uri(), to.uri());
     assert_eq!(from.bytes.as_ref(), to.bytes.as_ref());
 
@@ -589,7 +596,10 @@ fn missing_workspaces_revisions_and_roles_refuse_before_publication() {
         format!("{error:#}").contains("has no Files role"),
         "{error:#}"
     );
-    assert_eq!(census(&fixture.knowledge_facts(fixture.knowledge_only)), before);
+    assert_eq!(
+        census(&fixture.knowledge_facts(fixture.knowledge_only)),
+        before
+    );
 
     // Without files the Knowledge-only workspace accepts the revision, and says
     // it could not look for the attachment.
@@ -653,7 +663,7 @@ fn the_cli_binds_from_and_to_and_refuses_an_ambient_workspace() {
     let run = |extra: &[String]| {
         let mut text = String::new();
         let mut arguments = vec![
-            "wiki".to_owned(),
+            "knowledge".to_owned(),
             "--pile".to_owned(),
             fixture.pile.display().to_string(),
             "--key".to_owned(),
@@ -743,7 +753,10 @@ fn a_random_id_and_a_later_annotation_cross_as_received() {
     for revision in [id, fixture.guide] {
         let records = knowledge_model::revision_records(&at_destination, revision);
         assert!(!records.is_empty());
-        assert_eq!(knowledge_model::revision_records(&at_source, revision), records);
+        assert_eq!(
+            knowledge_model::revision_records(&at_source, revision),
+            records
+        );
     }
     assert!(
         knowledge_model::revision_records(&at_destination, fixture.guide)[0]

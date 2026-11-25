@@ -31,7 +31,7 @@ impl TestPile {
             .as_nanos();
         let sequence = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "faculties-compass-note-{}-{nonce}-{sequence}",
+            "faculties-goals-note-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();

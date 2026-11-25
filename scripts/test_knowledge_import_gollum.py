@@ -18,7 +18,7 @@ def mappings(receipt):
 def main():
     env = {k: v for k, v in os.environ.items()
            if k not in {"PILE", "PERSONA"} and not k.startswith(("TRIBLESPACE_", "FACULTIES_", "DRIVE_"))}
-    wiki = env.get("WIKI", "wiki")
+    wiki = env.get("KNOWLEDGE", "knowledge")
     files = env.get("FILES", "files")
     with tempfile.TemporaryDirectory(prefix="knowledge import gollum ") as tmp:
         root = Path(tmp)

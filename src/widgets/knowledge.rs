@@ -38,9 +38,9 @@ use GORBIE::graph::{self, GraphViewport, KeyedLayout, LayoutParams};
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::colorhash;
 
+use crate::knowledge::{EntryRecord, RevisionRecord};
 use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-use crate::knowledge::{EntryRecord, RevisionRecord};
 
 /// How close, in screen points, the pointer must come to a graph node to
 /// hover or click it. Independent of the drawn dot, which stays a pixel or
@@ -98,7 +98,8 @@ impl KnowledgeLive {
     /// Confirm that the maintained supersession order needed for frontiers is
     /// attached to this exact immutable dataset view.
     fn refresh(knowledge: DatasetView<'_>, files: Option<DatasetView<'_>>) -> Result<Self, String> {
-        knowledge.latest_index(metadata::supersedes.id())
+        knowledge
+            .latest_index(metadata::supersedes.id())
             .ok_or_else(|| "maintained Knowledge supersession index missing".to_owned())?;
         Ok(KnowledgeLive {
             cached_revision: knowledge.revision,
@@ -134,7 +135,11 @@ impl KnowledgeLive {
             .unwrap_or_default()
     }
 
-    fn content<P: TriblePattern>(facts: &P, knowledge_reader: &PileSnapshot, revision: Id) -> String {
+    fn content<P: TriblePattern>(
+        facts: &P,
+        knowledge_reader: &PileSnapshot,
+        revision: Id,
+    ) -> String {
         Self::revision(facts, revision)
             .map(|row| Self::text(knowledge_reader, row.content))
             .unwrap_or_default()
@@ -182,7 +187,10 @@ impl KnowledgeLive {
         heads.sort_by(|left, right| {
             Self::title(knowledge.facts, knowledge.reader, left.revision_id)
                 .to_lowercase()
-                .cmp(&Self::title(knowledge.facts, knowledge.reader, right.revision_id).to_lowercase())
+                .cmp(
+                    &Self::title(knowledge.facts, knowledge.reader, right.revision_id)
+                        .to_lowercase(),
+                )
                 .then_with(|| left.entry_key.cmp(&right.entry_key))
                 .then_with(|| left.revision_id.cmp(&right.revision_id))
         });
@@ -220,7 +228,8 @@ impl KnowledgeLive {
     }
 
     fn resolve_entry_selector(knowledge: DatasetView<'_>, selector: Id) -> Vec<Id> {
-        knowledge.latest_index(metadata::supersedes.id())
+        knowledge
+            .latest_index(metadata::supersedes.id())
             .map(|order| Self::resolve_entry_selector_with_order(knowledge.facts, order, selector))
             .unwrap_or_default()
     }
@@ -247,7 +256,11 @@ impl KnowledgeLive {
     }
 
     /// Resolve links parsed from immutable revision content.
-    fn links<P: TriblePattern>(facts: &P, knowledge_reader: &PileSnapshot, revision: Id) -> Vec<Id> {
+    fn links<P: TriblePattern>(
+        facts: &P,
+        knowledge_reader: &PileSnapshot,
+        revision: Id,
+    ) -> Vec<Id> {
         let mut links = BTreeSet::new();
         for raw in extract_link_targets(&Self::content(facts, knowledge_reader, revision)) {
             if let Some(selector) = Id::from_hex(&raw) {
@@ -559,7 +572,9 @@ impl KnowledgeGraph {
             }
         }
         if unresolved > 0 {
-            eprintln!("[wiki] graph: {unresolved} link targets are outside the visible frontier");
+            eprintln!(
+                "[knowledge] graph: {unresolved} link targets are outside the visible frontier"
+            );
         }
 
         (nodes, edges)
@@ -886,7 +901,11 @@ pub(crate) fn render_knowledge_content(ctx: &mut CardCtx<'_>, content: &str) -> 
         for cmd in new_commands {
             match &cmd {
                 egui::OutputCommand::OpenUrl(open_url) => {
-                    if let Some(target) = open_url.url.strip_prefix("wiki:") {
+                    if let Some(target) = open_url
+                        .url
+                        .strip_prefix("knowledge:")
+                        .or_else(|| open_url.url.strip_prefix("wiki:"))
+                    {
                         if let Some((id, follow_entry)) = parse_knowledge_link_target(target) {
                             clicked = Some(if follow_entry {
                                 LinkClick::KnowledgeEntry(id)
@@ -898,7 +917,7 @@ pub(crate) fn render_knowledge_content(ctx: &mut CardCtx<'_>, content: &str) -> 
                             });
                         } else {
                             eprintln!(
-                                "[wiki] link click: wiki:{target} ({} target chars) → failed to parse as Id (expected 32 hex chars)",
+                                "[knowledge] link click: {target} ({} target chars) → failed to parse as Id (expected 32 hex chars)",
                                 target.len()
                             );
                         }
@@ -929,7 +948,7 @@ fn render_diagnostic(ui: &mut egui::Ui, message: &str) {
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
             ui.label(
-                egui::RichText::new(format!("INVALID WIKI SNAPSHOT · {message}"))
+                egui::RichText::new(format!("INVALID KNOWLEDGE SNAPSHOT · {message}"))
                     .monospace()
                     .small()
                     .strong()
@@ -1431,7 +1450,7 @@ impl KnowledgeViewer {
                             });
                             g.full(|ctx| {
                                 ctx.label(
-                                    egui::RichText::new(format!("wiki:{revision_id:x}"))
+                                    egui::RichText::new(format!("knowledge:{revision_id:x}"))
                                         .monospace()
                                         .small()
                                         .color(color),
@@ -1473,7 +1492,7 @@ impl KnowledgeViewer {
                         // timestamp winner through navigation chrome.
                         g.place(8, |ctx| {
                             ctx.label(
-                                egui::RichText::new(format!("wiki:{revision_id:x}"))
+                                egui::RichText::new(format!("knowledge:{revision_id:x}"))
                                     .monospace()
                                     .small()
                                     .color(color),
@@ -1553,9 +1572,9 @@ impl KnowledgeViewer {
 mod tests {
     use super::*;
 
+    use crate::knowledge::{self, RevisionDraft};
     use crate::schemas::files::file as file_attrs;
     use crate::schemas::wiki::{attrs, KIND_VERSION_ID};
-    use crate::knowledge::{self, RevisionDraft};
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
     use triblespace::core::metadata;

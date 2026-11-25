@@ -44,14 +44,14 @@ const KNOWLEDGE_SEED: &[KnowledgeSeed] = &[
     },
     KnowledgeSeed {
         anchor: id_hex!("82129C70B693F7E2D781D78AC5EFBB86"),
-        title: "Wiki Fragment Style Guide",
-        content: include_str!("../bootstrap/02_wiki_style_guide.typ"),
+        title: "Knowledge Fragment Style Guide",
+        content: include_str!("../bootstrap/02_knowledge_style_guide.typ"),
         tags: &["bootstrap", "onboarding", "wiki"],
     },
     KnowledgeSeed {
         anchor: id_hex!("7CDD48C272FF344628FE74F4C07783E4"),
-        title: "Compass Goals Workflow",
-        content: include_str!("../bootstrap/03_compass_workflow.typ"),
+        title: "Goals Workflow",
+        content: include_str!("../bootstrap/03_goals_workflow.typ"),
         tags: &["bootstrap", "onboarding", "compass"],
     },
     KnowledgeSeed {
@@ -185,7 +185,7 @@ const GOALS_SEED: &[GoalsSeed] = &[
         created_nanosecond: 81_074_000,
         title: "Read the start-here wiki fragment",
         tags: &["bootstrap", "onboarding"],
-        note: "Run `wiki list --tag bootstrap` to find the 'Getting Started: Your First Hour' fragment, then `wiki show <id>` to read it. This is your orientation tour.",
+        note: "Run `knowledge list --tag bootstrap` to find the 'Getting Started: Your First Hour' fragment, then `knowledge show <id>` to read it. This is your orientation tour.",
     },
     GoalsSeed {
         created_nanosecond: 93_142_000,
@@ -197,19 +197,19 @@ const GOALS_SEED: &[GoalsSeed] = &[
         created_nanosecond: 104_858_000,
         title: "Create your first wiki fragment",
         tags: &["bootstrap", "wiki"],
-        note: "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then `wiki create \"My first fragment\" @/tmp/myfrag.typ --tag personal`. Verify with `wiki show <id>`.",
+        note: "Pick something you've learned today. Write a 5-10 line typst body to /tmp/myfrag.typ, then `knowledge create \"My first fragment\" @/tmp/myfrag.typ --tag personal`. Verify with `knowledge show <id>`.",
     },
     GoalsSeed {
         created_nanosecond: 115_536_000,
         title: "Archive a file with `files add`",
         tags: &["bootstrap", "files"],
-        note: "Pick any local file (not a binary in a git repo). Run `files add <path>`. The output `files:<hash>` is a content-addressed reference you can cite from wiki fragments. Confirm the hash is stable: re-run on the same file, same hash.",
+        note: "Pick any local file (not a binary in a git repo). Run `files add <path>`. The output `files:<hash>` is a content-addressed reference you can cite from knowledge fragments. Confirm the hash is stable: re-run on the same file, same hash.",
     },
     GoalsSeed {
         created_nanosecond: 126_687_000,
         title: "Run `wiki lint` and `wiki check`",
         tags: &["bootstrap", "wiki", "hygiene"],
-        note: "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're the wiki's self-diagnostic surface.",
+        note: "lint applies markdown→typst transforms and rebuilds the links_to index. check reports orphan fragments, broken links, truncated ids. Run both. Note any warnings — they're knowledge's self-diagnostic surface.",
     },
     GoalsSeed {
         created_nanosecond: 137_024_000,
@@ -221,7 +221,7 @@ const GOALS_SEED: &[GoalsSeed] = &[
         created_nanosecond: 148_025_000,
         title: "Mark this goal done and write an outcome note",
         tags: &["bootstrap", "compass"],
-        note: "When you finish working through the bootstrap goals, move this one to done with `compass move <id> done` and add a final note recording what stuck and what you'd improve. The outcome note IS the audit trail.",
+        note: "When you finish working through the bootstrap goals, move this one to done with `goals move <id> done` and add a final note recording what stuck and what you'd improve. The outcome note IS the audit trail.",
     },
 ];
 
@@ -248,11 +248,11 @@ pub(crate) fn render_import(report: &ImportReport, out: &mut crate::out::Out<'_>
         hex::encode(report.generation)
     ))?;
     out.line(format!(
-        "wiki COMMIT record fingerprint {}",
+        "knowledge COMMIT record fingerprint {}",
         CollectionRecord::Commit(report.knowledge_commit).fingerprint()
     ))?;
     out.line(format!(
-        "compass COMMIT record fingerprint {}",
+        "goals COMMIT record fingerprint {}",
         CollectionRecord::Commit(report.goals_commit).fingerprint()
     ))
 }
@@ -292,8 +292,9 @@ fn tag_set(out: &mut Fragment, labels: &[&str]) -> Result<BTreeSet<Id>> {
 }
 
 fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
-    let knowledge_links = regex::Regex::new(r"\[([^\]]+)\]\(wiki:([0-9A-Fa-f]{32})\)")
-        .expect("static Wiki markdown-link expression");
+    let knowledge_links =
+        regex::Regex::new(r"\[([^\]]+)\]\((?:wiki|knowledge):([0-9A-Fa-f]{32})\)")
+            .expect("static Knowledge markdown-link expression");
     let web_links =
         regex::Regex::new(r"\[([^\]]+)\]\((https?://[^)]+)\)").expect("static URL expression");
     let bold = regex::Regex::new(r"\*\*([^*]+)\*\*").expect("static bold expression");
@@ -322,8 +323,8 @@ fn normalize_source(content: &str, roots: &BTreeMap<Id, Id>) -> String {
                     let alias = Id::from_hex(&captures[2]).expect("expression matched a full id");
                     let root = roots
                         .get(&alias)
-                        .expect("every source-level Wiki alias is declared");
-                    format!("#link(\"wiki:entry:{root:x}\")[{}]", &captures[1])
+                        .expect("every source-level Knowledge alias is declared");
+                    format!("#link(\"knowledge:entry:{root:x}\")[{}]", &captures[1])
                 })
                 .to_string();
             let line = web_links
@@ -550,7 +551,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 crate::storage::ensure_downstream(pile, knowledge_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
-            .context("ensure Wiki before bootstrap import")?;
+            .context("ensure Knowledge before bootstrap import")?;
 
         // Read every admitted foundation through one fixed snapshot, even if
         // its payload has not arrived locally. The facts are read as they
@@ -586,10 +587,10 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 crate::storage::ensure_downstream(pile, knowledge_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
-            .context("Bootstrap Wiki was committed, but ensuring its views failed")?;
+            .context("Bootstrap Knowledge was committed, but ensuring its views failed")?;
         let goals_commit = pile
             .commit(goals_source, signer, seed.goals)
-            .context("Wiki bootstrap facts were committed, but Compass publication failed")?;
+            .context("Knowledge bootstrap facts were committed, but Goals publication failed")?;
         runtime
             .block_on(async {
                 let status = goals::status_register_for_source(pile, goals_source)?;
@@ -597,7 +598,7 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
                 crate::storage::ensure_downstream(pile, goals_source, signer).await?;
                 Ok::<_, anyhow::Error>(())
             })
-            .context("Bootstrap Compass was committed, but ensuring its views failed")?;
+            .context("Bootstrap Goals were committed, but ensuring its views failed")?;
 
         let after = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
         let knowledge_after = read_all(knowledge_source, &after)?;
@@ -605,14 +606,14 @@ pub fn import_with_storage(storage: &crate::storage::Storage) -> Result<ImportRe
         // holds is read open-world by its readers, never checked here.
         knowledge_model::require_text_payloads(&after, &expected_knowledge)?;
         if !expected_knowledge.difference(&knowledge_after).is_empty() {
-            bail!("Wiki collection omitted portable bootstrap facts after publication");
+            bail!("Knowledge collection omitted portable bootstrap facts after publication");
         }
         let goals_after = read_all(goals_source, &after)?;
         // The seed's own texts must be readable; whatever else the collection
         // holds is read open-world by its readers, never checked here.
         goals::require_text_payloads(&after, &expected_goals)?;
         if !expected_goals.difference(&goals_after).is_empty() {
-            bail!("Compass collection omitted portable bootstrap facts after publication");
+            bail!("Goals collection omitted portable bootstrap facts after publication");
         }
         Ok(ImportReport {
             generation: generation(),
@@ -766,7 +767,7 @@ mod tests {
         let (right_knowledge, right_goals) = views(&right);
         assert_ne!(
             left_knowledge, right_knowledge,
-            "Wiki authorship is part of identity"
+            "Knowledge authorship is part of identity"
         );
         assert_eq!(left_goals, right_goals);
 
@@ -818,7 +819,7 @@ mod tests {
         );
         assert_eq!(
             cover_before, cover_after,
-            "maintaining the Wiki index must not advance source authority"
+            "maintaining the Knowledge index must not advance source authority"
         );
 
         let mut pile = open_pile_strict(&imported.pile).unwrap();

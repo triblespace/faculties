@@ -1,4 +1,4 @@
-//! Explicit finite Decide tools; all prose is literal and attribution comes
+//! Explicit finite Decisions tools; all prose is literal and attribution comes
 //! from the configured collection signer, never an ambient persona argument.
 use super::{presentation, Decisions as Operations, FactorSide, ListOptions};
 use crate::mcp::{decode_arguments, invalid_arguments, Faculty, Tool};
@@ -197,7 +197,7 @@ impl Faculty for Decisions {
                 selector(&args.prefix)?;
                 out.line(format!("{:x}", self.operations.resolve_id(&args.prefix)?))
             }
-            _ => bail!("unknown Decide tool '{name}'"),
+            _ => bail!("unknown Decisions tool '{name}'"),
         }
     }
 }

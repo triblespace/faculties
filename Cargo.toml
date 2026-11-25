@@ -9,12 +9,12 @@ name = "faculties"
 version = "0.21.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "An office suite for AI agents: kanban, wiki, files, messaging, and a Lissajous-backed viewer — all persisted in a TribleSpace pile."
+description = "An office suite for AI agents: kanban, knowledge, files, messaging, and a Lissajous-backed viewer — all persisted in a TribleSpace pile."
 authors = ["Jan-Paul Bultmann <jp@bultmann.eu>"]
 homepage = "https://github.com/triblespace/faculties"
 repository = "https://github.com/triblespace/faculties"
 readme = "README.md"
-keywords = ["triblespace", "ai-agent", "kanban", "wiki", "notebook"]
+keywords = ["triblespace", "ai-agent", "kanban", "knowledge", "notebook"]
 categories = ["command-line-utilities", "data-structures"]
 
 # docs.rs should render all public API, including the optional
@@ -33,8 +33,8 @@ name = "viewer"
 path = "src/bin/viewer.rs"
 required-features = ["widgets"]
 
-# Minimal headless capture target for iterating on planner-widget
-# visuals in isolation. It was needed because the wiki widget opened its
+# Minimal headless capture target for iterating on events-widget
+# visuals in isolation. It was needed because the knowledge widget opened its
 # own cubecl `WgpuDevice`, which collided with the headless wgpu renderer
 # on some platforms; that device is gone — the graph layout runs on the
 # CPU in `GORBIE::graph` — so the collision it works around no longer
@@ -45,8 +45,8 @@ name = "events-capture"
 path = "src/bin/events-capture.rs"
 required-features = ["widgets"]
 
-# Same idea for the headspace widget — minimal capture target that
-# skips the wiki widget's GPU init so headless captures of the
+# Same idea for the profiles widget — minimal capture target that
+# skips the knowledge widget's GPU init so headless captures of the
 # agent-config card don't get truncated.
 [[bin]]
 name = "profiles-capture"
@@ -59,7 +59,7 @@ name = "memory-capture"
 path = "src/bin/memory-capture.rs"
 required-features = ["widgets"]
 
-# Gauge research-health dashboard.
+# Knowledge research-health dashboard.
 [[bin]]
 name = "knowledge-health-capture"
 path = "src/bin/knowledge-health-capture.rs"
@@ -77,7 +77,7 @@ name = "files-capture"
 path = "src/bin/files-capture.rs"
 required-features = ["widgets"]
 
-# Triage diagnostic viewer.
+# Diagnostics viewer.
 [[bin]]
 name = "diagnostics-capture"
 path = "src/bin/diagnostics-capture.rs"
@@ -117,7 +117,7 @@ web-export = []
 # nomic-embed-text for posture's semantic tier (`posture semantic`), the one
 # reader of the nomic models left. Default (see above).
 local-embed = ["dep:mary", "mary/embed", "mary/gemma"]
-# Semantic index and search for Files, Memory and Wiki (`faculties maintain`
+# Semantic index and search for Files, Memory and Knowledge (`faculties maintain`
 # derives the indexes; `files similar`, `memory similar`, `memory context
 # --about/--filter/--remove`, `knowledge similar` read them): one native WeMM model
 # for text, images and documents, on a GB10 only. Without it those commands
@@ -203,7 +203,7 @@ chrono = { version = "0.4.39", features = ["clock"] }  # orient
 comemo = "0.5.1"            # knowledge
 ctrlc = "3.5"               # body (graceful close for kept touch loops)
 dirs = "5"                  # knowledge
-hex = "0.4"                 # gauge
+hex = "0.4"                 # knowledge
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }  # code (local Git reads, no subprocess or network transports)
 zeroize = "1.9"             # secrets CLI plaintext lifetime
 humantime = "2.3.0"         # orient, patience
@@ -237,8 +237,8 @@ async-trait = { version = "0.1", optional = true }  # discord-voice: songbird tr
 tokenizers = { version = "0.21", optional = true }  # hear (Gemma-4 BPE, needed to build the Hearing handle)
 rrule = "0.14"              # events
 chrono-tz = "0.10"          # quota (Europe/Berlin reset times; already in the graph via rrule)
-serde = { version = "1", features = ["derive"] }  # discord, teams, triage, web
-serde_json = "1"            # discord, teams, triage, web
+serde = { version = "1", features = ["derive"] }  # discord, teams, diagnostics, web
+serde_json = "1"            # discord, teams, diagnostics, web
 simple-dns = "0.11.3"       # home (mDNS bridge discovery); already locked through iroh-dns
 toml = "0.8"                # self.toml, the one external plaintext configuration
 tracing = "0.1"             # archive

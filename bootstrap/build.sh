@@ -23,8 +23,8 @@ echo "==> Pre-building bootstrap cohort"
 cargo build --quiet --manifest-path="$REPO_ROOT/Cargo.toml" --release \
   --no-default-features --bin bootstrap --bin knowledge --bin goals
 BOOTSTRAP="$REPO_ROOT/target/release/bootstrap"
-WIKI="$REPO_ROOT/target/release/wiki"
-COMPASS="$REPO_ROOT/target/release/compass"
+KNOWLEDGE="$REPO_ROOT/target/release/knowledge"
+GOALS="$REPO_ROOT/target/release/goals"
 
 command -v trible >/dev/null || {
   echo "trible CLI is required to initialize the test signing identity" >&2
@@ -48,9 +48,9 @@ echo "    OK: exact replay is idempotent"
 
 EXPECTED_FRAGMENTS=21
 EXPECTED_GOALS=7
-ACTUAL_FRAGMENTS=$("$WIKI" list --tag bootstrap 2>/dev/null \
+ACTUAL_FRAGMENTS=$("$KNOWLEDGE" list --tag bootstrap 2>/dev/null \
   | { grep -cE "^[0-9a-f]" || true; })
-ACTUAL_GOALS=$("$COMPASS" list 2>/dev/null \
+ACTUAL_GOALS=$("$GOALS" list 2>/dev/null \
   | { grep -cE "^- \[" || true; })
 if [ "$ACTUAL_FRAGMENTS" -ne "$EXPECTED_FRAGMENTS" ]; then
   echo "    FAIL: expected $EXPECTED_FRAGMENTS bootstrap entries, got $ACTUAL_FRAGMENTS" >&2
@@ -62,13 +62,13 @@ if [ "$ACTUAL_GOALS" -ne "$EXPECTED_GOALS" ]; then
 fi
 echo "    OK: $ACTUAL_FRAGMENTS Knowledge entries, $ACTUAL_GOALS goals"
 
-CHECK_OUT=$("$WIKI" check --compile 2>&1)
+CHECK_OUT=$("$KNOWLEDGE" check --compile 2>&1)
 if ! grep -q "0 issues" <<<"$CHECK_OUT"; then
   echo "    FAIL: knowledge check reported issues:" >&2
   echo "$CHECK_OUT" >&2
   exit 1
 fi
-"$WIKI" lint --check >/dev/null
+"$KNOWLEDGE" lint --check >/dev/null
 echo "    OK: current Knowledge frontier has valid links and Typst"
 
 echo

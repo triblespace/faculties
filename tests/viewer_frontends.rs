@@ -43,7 +43,7 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
             "profiles",
             "colony",
             "timeline",
-            "gauge",
+            "knowledge-health",
             "knowledge",
             "goals",
             "decisions",

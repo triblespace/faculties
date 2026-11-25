@@ -1,4 +1,4 @@
-//! Native, fallible presentation of completed Decide observations.
+//! Native, fallible presentation of completed Decisions observations.
 use super::operations::common_snapshot;
 use super::{
     AddedFactor, DecisionDetail, DecisionSummary, FactorDetail, FactorSide, IntervalValue,

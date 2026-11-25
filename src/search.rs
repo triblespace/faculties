@@ -124,7 +124,7 @@ impl Search {
                 source(
                     storage,
                     crate::schemas::wiki::DEFAULT_SCOPE_ID,
-                    "wiki",
+                    "knowledge",
                     "ascii_substring_current_title_and_body",
                     options.limit_per_source,
                     || knowledge.search_hits(options.query, false, false),

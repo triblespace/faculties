@@ -18,9 +18,9 @@ use triblespace::core::metadata;
 use GORBIE::prelude::CardCtx;
 use GORBIE::themes::{blend, colorhash};
 
+use crate::knowledge;
 use crate::schemas::wiki::{extract_link_targets, TAG_ARCHIVED_ID};
 use crate::widgets::storage::{DatasetRevision, DatasetView};
-use crate::knowledge;
 
 // ── Palette ──────────────────────────────────────────────────────────
 
@@ -186,7 +186,7 @@ impl KnowledgeHealthViewer {
                     g.full(|ctx| {
                         let color = egui::Color32::from_rgb(0xcc, 0x0a, 0x17);
                         ctx.label(
-                            egui::RichText::new(format!("INVALID WIKI SNAPSHOT · {error}"))
+                            egui::RichText::new(format!("INVALID KNOWLEDGE SNAPSHOT · {error}"))
                                 .monospace()
                                 .small()
                                 .strong()
@@ -424,11 +424,11 @@ mod tests {
 
     use std::fs::File;
 
+    use crate::knowledge::{self, RevisionDraft};
     use crate::schemas::wiki::TAG_SPECS;
     use crate::storage::open_pile_strict_as;
     use crate::test_support::initialize_open_collection_fixture;
     use crate::widgets::storage::{SourceKey, StorageState};
-    use crate::knowledge::{self, RevisionDraft};
     use hifitime::Epoch;
     use triblespace::prelude::*;
 
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn gauge_counts_every_frontier_head_without_a_timestamp_winner() {
         let directory = tempfile::tempdir().unwrap();
-        let pile_path = directory.path().join("gauge.pile");
+        let pile_path = directory.path().join("research.pile");
         File::create(&pile_path).unwrap();
         let signer = initialize_open_collection_fixture(&pile_path, None);
         let (mut fragment, author) = knowledge::author_record(&signer.verifying_key());
@@ -507,61 +507,105 @@ mod tests {
 
     #[test]
     fn closed_gauge_defers_reads_and_opens_the_current_revision() {
-        use std::{cell::{Cell, RefCell}, rc::Rc};
-        use ed25519_dalek::SigningKey;
         use crate::storage::CollectionRoutes;
         use crate::widgets::storage::WorkspaceObservation;
+        use ed25519_dalek::SigningKey;
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
         use triblespace::core::collection::{
-            AdmissionPolicy, CollectionPolicy, observed_store::DependencyTracker,
+            observed_store::DependencyTracker, AdmissionPolicy, CollectionPolicy,
         };
         let file = tempfile::NamedTempFile::new().unwrap();
         let signer = SigningKey::from_bytes(&[17; 32]);
         let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
-        let collection = pile.collection("closed gauge fixture", CollectionPolicy::new(
-            AdmissionPolicy::Open, AdmissionPolicy::Open,
-        )).unwrap();
-        let routes = CollectionRoutes::from([(crate::schemas::wiki::DEFAULT_SCOPE_ID, collection.handle())]);
+        let collection = pile
+            .collection(
+                "closed gauge fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let routes =
+            CollectionRoutes::from([(crate::schemas::wiki::DEFAULT_SCOPE_ID, collection.handle())]);
         let (mut fragment, author) = knowledge::author_record(&signer.verifying_key());
         revision(&mut fragment, author, "first", "first body", &[], &[], 1.0);
         pile.commit(collection, &signer, fragment).unwrap();
         let tracker = DependencyTracker::default();
-        let observed = Rc::new(RefCell::new(pollster::block_on(
-            WorkspaceObservation::observe_tracked(&mut pile, &signer, &routes, tracker.clone()),
-        ).unwrap()));
+        let observed = Rc::new(RefCell::new(
+            pollster::block_on(WorkspaceObservation::observe_tracked(
+                &mut pile,
+                &signer,
+                &routes,
+                tracker.clone(),
+            ))
+            .unwrap(),
+        ));
         let panel = Rc::new(RefCell::new(KnowledgeHealthViewer::default()));
         let open = Rc::new(Cell::new(false));
         let context = egui::Context::default();
-        let (views, gauge, expanded) = (observed.clone(), panel.clone(), open.clone());
+        let (views, research, expanded) = (observed.clone(), panel.clone(), open.clone());
         let mut notebook = GORBIE::NotebookConfig::new("closed gauge regression")
-            .without_editor().embedded(&context, move |nb| {
-                let (views, gauge, expanded) = (views.clone(), gauge.clone(), expanded.clone());
+            .without_editor()
+            .embedded(&context, move |nb| {
+                let (views, research, expanded) =
+                    (views.clone(), research.clone(), expanded.clone());
                 nb.view(move |ctx| {
                     // Exercise the real section body gate, with no headless
                     // override (capture mode intentionally opens all sections).
                     ctx.set_default_section_open(false);
                     let id = ctx.ui_mut().make_persistent_id("Knowledge health");
-                    ctx.ui_mut().ctx().data_mut(|data| data.insert_persisted(id, expanded.get()));
+                    ctx.ui_mut()
+                        .ctx()
+                        .data_mut(|data| data.insert_persisted(id, expanded.get()));
                     let view = views.borrow();
-                    gauge.borrow_mut().render(ctx, view.loaded_context().dataset(SourceKey::Knowledge).unwrap());
+                    research.borrow_mut().render(
+                        ctx,
+                        view.loaded_context().dataset(SourceKey::Knowledge).unwrap(),
+                    );
                 });
             });
         let frame = |notebook: &mut GORBIE::Notebook| {
-            let _ = context.run_ui(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0))),
-                ..Default::default()
-            }, |ui| notebook.show(ui, None));
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| notebook.show(ui, None),
+            );
         };
         *tracker.lock().unwrap() = Default::default();
         frame(&mut notebook);
-        assert!(panel.borrow().live.is_none(), "closed section must not query its projection");
-        assert!(tracker.lock().unwrap().is_empty(), "closed section must not read bodies or observations");
+        assert!(
+            panel.borrow().live.is_none(),
+            "closed section must not query its projection"
+        );
+        assert!(
+            tracker.lock().unwrap().is_empty(),
+            "closed section must not read bodies or observations"
+        );
 
         let mut fragment = Fragment::empty();
-        revision(&mut fragment, author, "second", "second body", &[], &[], 2.0);
+        revision(
+            &mut fragment,
+            author,
+            "second",
+            "second body",
+            &[],
+            &[],
+            2.0,
+        );
         pile.commit(collection, &signer, fragment).unwrap();
         *observed.borrow_mut() = pollster::block_on(WorkspaceObservation::observe_tracked(
-            &mut pile, &signer, &routes, tracker.clone(),
-        )).unwrap();
+            &mut pile,
+            &signer,
+            &routes,
+            tracker.clone(),
+        ))
+        .unwrap();
         *tracker.lock().unwrap() = Default::default();
         frame(&mut notebook);
         assert!(panel.borrow().live.is_none());
@@ -569,11 +613,24 @@ mod tests {
         open.set(true);
         frame(&mut notebook);
         let panel = panel.borrow();
-        let live = panel.live.as_ref().expect("opening renders the current dataset");
+        let live = panel
+            .live
+            .as_ref()
+            .expect("opening renders the current dataset");
         assert_eq!(live.total_entries, 2);
-        assert_eq!(live.cached_revision, observed.borrow().loaded_context().dataset(SourceKey::Knowledge).unwrap().revision);
-        assert!(!tracker.lock().unwrap().blobs.is_empty(), "positive control actually reads Knowledge bodies");
+        assert_eq!(
+            live.cached_revision,
+            observed
+                .borrow()
+                .loaded_context()
+                .dataset(SourceKey::Knowledge)
+                .unwrap()
+                .revision
+        );
+        assert!(
+            !tracker.lock().unwrap().blobs.is_empty(),
+            "positive control actually reads Knowledge bodies"
+        );
         pile.close().unwrap();
     }
-
 }
