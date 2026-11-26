@@ -108,7 +108,8 @@ impl Overlap {
     /// content constraint, and no binding carries a condition. The producer
     /// must still fire.
     pub fn unconditional(&self, consumer: &RuleLine) -> bool {
-        self.remaining.is_empty()
+        consumer.partial.is_empty()
+            && self.remaining.is_empty()
             && consumer.constraints.is_empty()
             && self.bindings.iter().all(|b| b.conditions.is_empty())
     }

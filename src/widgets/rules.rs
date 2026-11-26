@@ -931,13 +931,21 @@ fn draw_edge(ui: &mut Ui, view: &RulesView, edge: &Edge) {
         "Structurally, {} can conclude facts of these shapes. Whether it fires, and with which values, depends on its own inputs.",
         producer.title()
     ));
+    if !consumer.partial.is_empty() {
+        ui.weak("Only the decoded part of the receiving rule is shown. Additional conditions may still apply.");
+    }
     let total = consumer.clauses(ClauseKind::Matches).count();
     for (n, overlap) in edge.overlaps.iter().enumerate() {
         ui.small(format!(
-            "  overlap {}: {} of {} matches clause{} met",
+            "  overlap {}: {} of {}{} matches clause{} met",
             n + 1,
             overlap.pairs.len(),
             total,
+            if consumer.partial.is_empty() {
+                ""
+            } else {
+                " decoded"
+            },
             if total == 1 { "" } else { "s" }
         ));
         for (matched, output) in &overlap.pairs {

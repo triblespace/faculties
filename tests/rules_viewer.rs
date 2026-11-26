@@ -899,6 +899,61 @@ fn the_web_finds_maximal_overlaps_and_remaining_conditions() {
 }
 
 #[test]
+fn an_omitted_match_prevents_an_unconditional_overlap() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let signer = SigningKey::from_bytes(&[43; 32]);
+    let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+    let root = pile
+        .collection(
+            "Partly decoded rule",
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+        )
+        .unwrap();
+    let rule_id = genid().id;
+    let input = genid().id;
+    let (s, o) = (genid().id, genid().id);
+    let mut predicates: Vec<_> = (0..=projection::MAX_COMBINATIONS)
+        .map(|_| genid().id)
+        .collect();
+    predicates.sort();
+    let mut program = entity! { ExclusiveId::force_ref(&rule_id) @
+        rule::operation: rule::POSITIVE,
+        rule::matches: input,
+    };
+    program += entity! { ExclusiveId::force_ref(&input) @
+        rule::subject: s, rule::object: o, rule::predicate*: predicates.iter().copied(),
+    };
+    // One firing emits every displayed predicate, but never the omitted last one.
+    for &predicate in &predicates[..projection::MAX_COMBINATIONS] {
+        let output = genid().id;
+        program += entity! { ExclusiveId::force_ref(&rule_id) @ rule::emits: output };
+        program += entity! { ExclusiveId::force_ref(&output) @
+            rule::subject: s, rule::predicate: predicate, rule::object: o,
+        };
+    }
+    pile.commit(root, &signer, program).unwrap();
+    let routes = CollectionRoutes::from([(schemas::rules::DEFAULT_SCOPE_ID, root.handle())]);
+    let observation =
+        pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+    let context = observation.loaded_context();
+    let view = projection::project(context.dataset(SourceKey::Rules).unwrap(), None);
+    let index = rule_index(&view, rule_id);
+    let consumer = &view.rules[index];
+    assert!(!consumer.partial.is_empty());
+    let graph = web::web(&view);
+    let edge = graph.edge(index, index).expect("witnessed self-edge");
+    let overlap = edge
+        .overlaps
+        .iter()
+        .find(|o| o.remaining.is_empty())
+        .unwrap();
+    assert_eq!(overlap.pairs.len(), projection::MAX_COMBINATIONS);
+    assert!(overlap.bindings.iter().all(|b| b.conditions.is_empty()));
+    assert!(!overlap.unconditional(consumer));
+    pile.close().unwrap();
+}
+
+#[test]
 fn a_selected_revision_beyond_the_listing_bound_is_still_analysed() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let signer = SigningKey::from_bytes(&[37; 32]);
