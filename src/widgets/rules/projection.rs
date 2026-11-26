@@ -197,8 +197,16 @@ pub struct RuleLine {
     pub selected_in: Vec<Id>,
     /// Readings (current or not) that name this revision.
     pub named_by_readings: usize,
-    /// Undecodable or ambiguous parts, said plainly.
-    pub problems: Vec<String>,
+    /// Why the engine would refuse this revision if it were selected (or error
+    /// at its first firing), mirroring `reactive::Batch::new` and `fire`. A
+    /// refused revision concludes nothing, so its edges are structural only.
+    pub refused: Vec<String>,
+    /// Parts this viewer did not decode (bounds). The engine may read them;
+    /// what is shown of this revision is then incomplete, not wrong.
+    pub partial: Vec<String>,
+    /// Valid shapes worth saying, e.g. a multi-valued clause read as every
+    /// combination, exactly as the engine reads it.
+    pub notes: Vec<String>,
     /// `triblespace::core::reactive::text::write` of this revision's own facts.
     pub text: String,
     pub outputs: Vec<OutputShape>,
@@ -245,14 +253,40 @@ impl RuleLine {
             .map(|(_, clause)| clause.subject)
             .collect()
     }
+
+    /// Terms with a value before any construction: matched, or literal.
+    pub fn bound_terms(&self) -> BTreeSet<usize> {
+        let mut bound = self.matched_terms();
+        bound.extend(
+            self.terms
+                .iter()
+                .enumerate()
+                .filter(|(_, term)| !term.literals.is_empty())
+                .map(|(index, _)| index),
+        );
+        bound
+    }
+
+    /// The engine would run this revision when selected, as far as its stored
+    /// facts show; content and firing-time data are not judged here.
+    pub fn executable(&self) -> bool {
+        self.refused.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RulesView {
     pub environments: Vec<EnvironmentLine>,
+    /// Revisions a current reading selects come first, so a selection is
+    /// never lost to the listing bound before the unselected ones are.
     pub rules: Vec<RuleLine>,
     /// All revisions found, including those beyond [`MAX_RULES`].
     pub revisions_total: usize,
+    /// Revisions a current reading selects that have no rule facts in this
+    /// collection: their bodies are not here, so they cannot be analysed.
+    pub selected_missing: Vec<Id>,
+    /// Selected revisions present but beyond [`MAX_RULES`].
+    pub selected_unlisted: usize,
     /// Entities that are neither program nor reading: observations and
     /// conclusions alike, which the pile does not tell apart.
     pub other_entities: usize,
@@ -464,14 +498,52 @@ fn term_label(index: usize) -> String {
     }
 }
 
+/// Every distinct id among `attribute`'s values, sorted.
+fn sorted_ids(facts: &FactArchive, entity: Id, attribute: Id) -> Vec<Id> {
+    let mut found = ids(facts, entity, attribute);
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Names of the empty fields, for a refusal cause.
+fn missing_fields(fields: [(&[Id], &str); 3]) -> String {
+    fields
+        .iter()
+        .filter(|(values, _)| values.is_empty())
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Combinations decoded from one multi-valued clause or constraint.
+pub const MAX_COMBINATIONS: usize = 16;
+
 fn decode(facts: &FactArchive, revision: Id, names: &Names<'_>) -> RuleLine {
-    let mut problems = Vec::new();
-    let operations = ids(facts, revision, rule::operation.id());
+    let mut refused = Vec::new();
+    let mut partial = Vec::new();
+    let mut notes = Vec::new();
+    let operations = sorted_ids(facts, revision, rule::operation.id());
     let operation = match operations.as_slice() {
         [] => Operation::Missing,
         [one] if *one == rule::POSITIVE => Operation::Positive,
         other => Operation::Unknown(other.to_vec()),
     };
+    // As `Batch::new`: no operation, or any operation other than POSITIVE
+    // (even beside POSITIVE), is a selected-program error.
+    match &operation {
+        Operation::Positive => {}
+        Operation::Missing => {
+            refused.push("no operation is stated: the engine refuses it when selected".to_owned())
+        }
+        Operation::Unknown(ids) => refused.push(format!(
+            "operation {} is not POSITIVE alone: the engine refuses it when selected",
+            ids.iter()
+                .map(|id| short(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
     let mut decoder = Decoder {
         facts,
         terms: Vec::new(),
@@ -485,74 +557,114 @@ fn decode(facts: &FactArchive, revision: Id, names: &Names<'_>) -> RuleLine {
         (ClauseKind::Core, rule::core.id()),
         (ClauseKind::Emits, rule::emits.id()),
     ] {
-        let mut linked = ids(facts, revision, attribute);
-        linked.sort();
-        if linked.len() > MAX_CLAUSES {
-            problems.push(format!(
-                "{} {} clauses; the first {MAX_CLAUSES} are shown",
-                linked.len(),
-                kind.keyword()
-            ));
-            linked.truncate(MAX_CLAUSES);
-        }
+        let linked = sorted_ids(facts, revision, attribute);
+        let mut decoded = 0;
         for clause in linked {
             subgraph(facts, clause, &mut program);
-            let fields = [rule::subject.id(), rule::predicate.id(), rule::object.id()]
-                .map(|field| single(facts, clause, field));
-            let [Ok(s), Ok(predicate), Ok(o)] = fields else {
-                let why = fields
-                    .iter()
-                    .zip(["subject", "predicate", "object"])
-                    .filter_map(|(field, name)| field.err().map(|e| format!("{name} {e}")))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                problems.push(format!(
-                    "{} clause {} is incomplete ({why})",
+            let [subjects, predicates, objects] =
+                [rule::subject.id(), rule::predicate.id(), rule::object.id()]
+                    .map(|field| sorted_ids(facts, clause, field));
+            if subjects.is_empty() || predicates.is_empty() || objects.is_empty() {
+                // `Batch::new`: a linked clause with no complete tuple.
+                refused.push(format!(
+                    "{} clause {} has no {}: the engine refuses it when selected",
+                    kind.keyword(),
+                    short(clause),
+                    missing_fields([
+                        (subjects.as_slice(), "subject"),
+                        (predicates.as_slice(), "predicate"),
+                        (objects.as_slice(), "object"),
+                    ])
+                ));
+                continue;
+            }
+            // The engine reads every (subject, predicate, object) combination
+            // of a multi-valued clause as its own clause; so does this viewer.
+            let combinations = subjects.len() * predicates.len() * objects.len();
+            if combinations > 1 {
+                notes.push(format!(
+                    "{} clause {} has {combinations} value combinations, each read as a clause as the engine does",
                     kind.keyword(),
                     short(clause)
                 ));
-                continue;
-            };
-            let subject = decoder.term(s);
-            let object = decoder.term(o);
-            clauses.push(Clause {
-                id: clause,
-                kind,
-                subject,
-                predicate,
-                predicate_label: names.label(predicate),
-                object,
-            });
+            }
+            let mut taken = 0;
+            'combinations: for &s in &subjects {
+                for &predicate in &predicates {
+                    for &o in &objects {
+                        if taken == MAX_COMBINATIONS || decoded == MAX_CLAUSES {
+                            partial.push(format!(
+                                "{} clauses beyond the first {MAX_CLAUSES} (or a clause's combinations beyond {MAX_COMBINATIONS}) are not decoded here",
+                                kind.keyword()
+                            ));
+                            break 'combinations;
+                        }
+                        taken += 1;
+                        decoded += 1;
+                        let subject = decoder.term(s);
+                        let object = decoder.term(o);
+                        clauses.push(Clause {
+                            id: clause,
+                            kind,
+                            subject,
+                            predicate,
+                            predicate_label: names.label(predicate),
+                            object,
+                        });
+                    }
+                }
+            }
         }
     }
     let mut constraints = Vec::new();
-    let mut linked = ids(facts, revision, rule::constraints.id());
-    linked.sort();
-    linked.truncate(MAX_CLAUSES);
+    let linked = sorted_ids(facts, revision, rule::constraints.id());
     for constraint in linked {
         subgraph(facts, constraint, &mut program);
-        let fields = [
+        let [operations, containers, needles] = [
             rule::operation.id(),
             rule::container.id(),
             rule::needle.id(),
         ]
-        .map(|field| single(facts, constraint, field));
-        match fields {
-            [Ok(op), Ok(container), Ok(needle)] if op == rule::STRING_CONTAINS => {
+        .map(|field| sorted_ids(facts, constraint, field));
+        if operations.is_empty() || containers.is_empty() || needles.is_empty() {
+            refused.push(format!(
+                "constraint {} has no {}: the engine refuses it when selected",
+                short(constraint),
+                missing_fields([
+                    (operations.as_slice(), "operation"),
+                    (containers.as_slice(), "container"),
+                    (needles.as_slice(), "needle"),
+                ])
+            ));
+            continue;
+        }
+        if let Some(op) = operations.iter().find(|op| **op != rule::STRING_CONTAINS) {
+            refused.push(format!(
+                "constraint {} names operation {}, which the engine does not support: it refuses it when selected",
+                short(constraint),
+                short(*op)
+            ));
+            continue;
+        }
+        let mut taken = 0;
+        'pairs: for &container in &containers {
+            for &needle in &needles {
+                if taken == MAX_COMBINATIONS || constraints.len() == MAX_CLAUSES {
+                    partial.push(format!(
+                        "constraints beyond the first {MAX_CLAUSES} (or a constraint's combinations beyond {MAX_COMBINATIONS}) are not decoded here"
+                    ));
+                    break 'pairs;
+                }
+                taken += 1;
                 constraints.push(ContentConstraint {
                     id: constraint,
                     container: decoder.term(container),
                     needle: decoder.term(needle),
-                })
+                });
             }
-            [Ok(op), _, _] if op != rule::STRING_CONTAINS => problems.push(format!(
-                "constraint {} names an unknown operation {}",
-                short(constraint),
-                short(op)
-            )),
-            _ => problems.push(format!("constraint {} is incomplete", short(constraint))),
         }
     }
+    partial.dedup();
     // Literals take the encoding of an attribute they meet; reformat those
     // that meet `created_at`, the one attribute formatted specially.
     for clause in &clauses {
@@ -585,10 +697,7 @@ fn decode(facts: &FactArchive, revision: Id, names: &Names<'_>) -> RuleLine {
         pattern!(facts, [{ ?reading @ environment::selects: revision }])
     )
     .count();
-    if matches!(operation, Operation::Missing) {
-        problems.push("no operation is stated".to_owned());
-    }
-    RuleLine {
+    let mut line = RuleLine {
         revision,
         names: names.names(revision),
         operation,
@@ -599,11 +708,90 @@ fn decode(facts: &FactArchive, revision: Id, names: &Names<'_>) -> RuleLine {
         superseded_by,
         selected_in: Vec::new(),
         named_by_readings,
-        problems,
+        refused,
+        partial,
+        notes,
         text,
         outputs: Vec::new(),
         annotations: Vec::new(),
+    };
+    // The remaining engine checks need the whole program; on a partly decoded
+    // revision they could misjudge, so they are not made.
+    if line.partial.is_empty() {
+        let causes = engine_refusals(&line);
+        line.refused.extend(causes);
     }
+    line
+}
+
+/// The engine's remaining program errors, decided from the decoded program
+/// exactly as `reactive::Batch::new` (selection) and `Batch::fire` (first
+/// firing) decide them. Scratch sets live for this call only.
+fn engine_refusals(line: &RuleLine) -> Vec<String> {
+    let mut causes = Vec::new();
+    let bound = line.bound_terms();
+    let label = |term: usize| line.terms[term].label.clone();
+    // One slot per term, plus an equality helper per same-term matches clause.
+    let helpers = line
+        .clauses(ClauseKind::Matches)
+        .filter(|(_, clause)| clause.subject == clause.object)
+        .count();
+    if line.terms.len() + helpers > 128 {
+        causes.push(
+            "it needs more than 128 query variable slots: the engine refuses it when selected"
+                .to_owned(),
+        );
+    }
+    for constraint in &line.constraints {
+        for term in [constraint.container, constraint.needle] {
+            if !bound.contains(&term) {
+                causes.push(format!(
+                    "constraint {} reads {}, which no match or literal binds: the engine refuses it when selected",
+                    short(constraint.id),
+                    label(term)
+                ));
+            }
+        }
+    }
+    let constructed = line.constructed_terms();
+    for &term in &constructed {
+        if bound.contains(&term) {
+            causes.push(format!(
+                "core subject {} is already bound by a match or literal: the engine errors at its first firing",
+                label(term)
+            ));
+        }
+    }
+    // Resolve constructions in dependency order, as `fire` does.
+    let mut values = bound.clone();
+    loop {
+        let ready: Vec<usize> = constructed
+            .iter()
+            .copied()
+            .filter(|term| !values.contains(term))
+            .filter(|&term| {
+                line.clauses(ClauseKind::Core)
+                    .filter(|(_, clause)| clause.subject == term)
+                    .all(|(_, clause)| values.contains(&clause.object))
+            })
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        values.extend(ready);
+    }
+    let unresolved: Vec<String> = (0..line.terms.len())
+        .filter(|term| !values.contains(term))
+        .map(label)
+        .collect();
+    if !unresolved.is_empty() {
+        causes.push(format!(
+            "{} {} no value (no match, literal or constructible core): the engine errors at its first firing",
+            unresolved.join(", "),
+            if unresolved.len() == 1 { "has" } else { "have" }
+        ));
+    }
+    causes
 }
 
 fn subgraph_literals(facts: &FactArchive, term: Id, into: &mut TribleSet) {
@@ -766,11 +954,33 @@ pub fn project(rules: DatasetView<'_>, schemas: Option<DatasetView<'_>>) -> Rule
     let environments = environments(facts);
     let found = revisions(facts);
     let revisions_total = found.len();
+    // What current readings select, chosen from the readings themselves
+    // before the listing bound, so no selection hides behind unselected ids.
+    let selected: BTreeSet<Id> = environments
+        .iter()
+        .filter_map(|environment| match &environment.state {
+            ReadingState::Sole { selects, .. } => Some(selects.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let selected_missing: Vec<Id> = selected
+        .iter()
+        .filter(|id| !found.contains(*id))
+        .copied()
+        .collect();
     let mut lines: Vec<RuleLine> = found
         .iter()
+        .filter(|id| selected.contains(*id))
+        .chain(found.iter().filter(|id| !selected.contains(*id)))
         .take(MAX_RULES)
         .map(|revision| decode(facts, *revision, &names))
         .collect();
+    let selected_listed = lines
+        .iter()
+        .filter(|line| selected.contains(&line.revision))
+        .count();
+    let selected_unlisted = selected.len() - selected_missing.len() - selected_listed;
     for line in &mut lines {
         line.selected_in = environments
             .iter()
@@ -815,6 +1025,8 @@ pub fn project(rules: DatasetView<'_>, schemas: Option<DatasetView<'_>>) -> Rule
         environments,
         rules: lines,
         revisions_total,
+        selected_missing,
+        selected_unlisted,
         other_entities: entities.len(),
         schemas_unavailable: schemas.is_none(),
     }

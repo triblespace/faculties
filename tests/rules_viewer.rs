@@ -17,9 +17,10 @@ use faculties::schemas::rules::{
 };
 use faculties::storage::CollectionRoutes;
 use faculties::viewer::{compose_hosted, Host, HostAction, Target};
+use faculties::widgets::rules::projection::{self, ClauseKind, RulesView};
 use faculties::widgets::rules::web;
 use faculties::widgets::storage::WorkspaceObservation;
-use faculties::widgets::WidgetContext;
+use faculties::widgets::{SourceKey, WidgetContext};
 use faculties::{quota, rules, schemas};
 use triblespace::core::collection::{
     empty_metadata_handle, AdmissionPolicy, CollectionCommit, CollectionPolicy, CollectionRecord,
@@ -27,6 +28,7 @@ use triblespace::core::collection::{
 };
 use triblespace::core::metadata;
 use triblespace::core::reactive::collection::schema as environment;
+use triblespace::core::reactive::schema as rule;
 use triblespace::core::reactive::{text, Environment, Progress};
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::inlineencodings::Handle;
@@ -466,12 +468,24 @@ fn data_view_shows_the_selected_workspace_rules_and_writes_nothing() {
     for leaked in ["ignite", &request[..8], "Stored conclusion-shaped facts"] {
         assert!(!quiet.contains(leaked), "workspace A leaked: {leaked:?}");
     }
+    assert!(
+        !quiet.contains("termination is not stated"),
+        "a complete scope states the sound termination fact: {quiet:?}"
+    );
     let nest = format!("rule {}", &format!("{:x}", fixture.nest)[..8]);
     screen.click(&nest);
     let opened = screen.wait("Stored conclusion-shaped facts");
     assert!(opened.contains("None stored yet."), "{opened:?}");
-    assert!(opened.contains("can feed itself"), "{opened:?}");
-    assert!(opened.contains("still needs") || opened.contains("no remaining conditions"));
+    let itself = format!("{nest} can feed itself: 1 maximal overlap");
+    assert!(opened.contains(&itself), "{opened:?}");
+    // The edge's clauses show only when it is inspected.
+    assert!(!opened.contains("overlap 1:"), "{opened:?}");
+    screen.click(&itself);
+    let inspected = screen.wait("overlap 1: 1 of 1 matches clause met");
+    assert!(
+        inspected.contains("no remaining conditions"),
+        "{inspected:?}"
+    );
     screen.click("← All rules");
 
     // Empty workspace: a tick, no program.
@@ -503,35 +517,571 @@ fn data_view_shows_the_selected_workspace_rules_and_writes_nothing() {
     fixture.pile.close().unwrap();
 }
 
+/// Six rules over shared attributes, as text, so every overlap is known:
+/// - `pair` constructs a pair from an edge and tags it with a literal kind;
+/// - `labelled` meets three of pair's conclusions (one reused variable across
+///   them, an equal literal), needs one more fact and a STRING_CONTAINS;
+/// - `other_kind` wants a disjoint literal kind: no edge from `pair`;
+/// - `fixed` wants a literal subject where `pair` constructs one at runtime;
+/// - `refused` reads an unbound content term: the engine refuses it, so its
+///   edges are structural only and the cycle through it is not feedback;
+/// - `multi` has one clause with two predicates (both hold, as the engine
+///   reads it) and feeds itself with a remaining condition.
+struct WebProgram {
+    program: Fragment,
+    names: Fragment,
+    rules: [Id; 6],
+}
+
+const WEB_RULES: [&str; 6] = [
+    "pair",
+    "labelled",
+    "other_kind",
+    "fixed",
+    "refused",
+    "multi",
+];
+
+const WEB_SOURCE: &str = r#"
+rule @pair {
+  operation POSITIVE;
+  matches @p_m (?p_x @edge ?p_y);
+  core @p_c1 (?p_n @pair_from ?p_x);
+  core @p_c2 (?p_n @pair_to ?p_y);
+  emits @p_e (?p_n @kind ?p_k);
+  literal ?p_k genid(@pairkind);
+}
+rule @labelled {
+  operation POSITIVE;
+  matches @l_m1 (?l_a @pair_from ?l_s);
+  matches @l_m2 (?l_a @pair_to ?l_t);
+  matches @l_m3 (?l_a @kind ?l_k);
+  matches @l_m4 (?l_t @label ?l_l);
+  literal ?l_k genid(@pairkind);
+  literal ?l_needle utf8("ok");
+  constraint @l_c STRING_CONTAINS(?l_l, ?l_needle);
+  emits @l_e (?l_t @flag ?l_a);
+}
+rule @other_kind {
+  operation POSITIVE;
+  matches @o_m (?o_b @kind ?o_k);
+  literal ?o_k genid(@otherkind);
+  emits @o_e (?o_b @flag ?o_b);
+}
+rule @fixed {
+  operation POSITIVE;
+  matches @f_m (?f_w @pair_from ?f_q);
+  literal ?f_w genid(@someid);
+  emits @f_e (?f_q @flag ?f_w);
+}
+rule @refused {
+  operation POSITIVE;
+  matches @r_m (?r_u @flag ?r_v);
+  emits @r_e (?r_u @edge ?r_v);
+  constraint @r_c STRING_CONTAINS(?r_v, ?r_nobody);
+}
+rule @multi {
+  operation POSITIVE;
+  matches @g_m (?g_g @label ?g_h);
+  matches @g_m (?g_g @edge ?g_h);
+  emits @g_e (?g_h @edge ?g_g);
+}
+"#;
+
+fn web_program() -> WebProgram {
+    // Every `@name` / `?name` in the source is an alias for a fresh id.
+    let mut ids: Vec<(String, Id)> = Vec::new();
+    for word in
+        WEB_SOURCE.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '@' || c == '?'))
+    {
+        if let Some(alias) = word.strip_prefix('@').or_else(|| word.strip_prefix('?')) {
+            if !ids.iter().any(|(a, _)| a == alias) {
+                ids.push((alias.to_owned(), genid().id));
+            }
+        }
+    }
+    let id = |alias: &str| ids.iter().find(|(a, _)| a == alias).unwrap().1;
+    let header: String = ids
+        .iter()
+        .map(|(alias, id)| format!("alias {alias} = id\"{id:X}\";\n"))
+        .collect();
+    let source = format!("{header}{WEB_SOURCE}");
+    let program = text::parse(source.into_bytes().into()).unwrap();
+    let mut names = Fragment::empty();
+    for alias in WEB_RULES
+        .iter()
+        .chain(&["edge", "pair_from", "pair_to", "kind", "label", "flag"])
+    {
+        name(&mut names, id(*alias), alias);
+    }
+    WebProgram {
+        program,
+        names,
+        rules: WEB_RULES.map(|alias| id(alias)),
+    }
+}
+
+/// One workspace holding the web program, read by two current readings: one
+/// selecting all six rules, one selecting `pair`, `other_kind` and a
+/// revision whose body is not in this collection.
+struct WebFixture {
+    file: tempfile::NamedTempFile,
+    pile: Pile,
+    signer: SigningKey,
+    routes: CollectionRoutes,
+    rules: [Id; 6],
+    second: Id,
+    /// The program and readings exactly as committed, for engine controls.
+    facts: TribleSet,
+}
+
+impl WebFixture {
+    fn new() -> Self {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[31; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let rules_root = pile.collection("Rules web fixture", policy).unwrap();
+        let schemas_root = pile
+            .collection(
+                "Schemas web fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let WebProgram {
+            mut program,
+            names,
+            rules,
+        } = web_program();
+        let (second, ghost) = (genid().id, genid().id);
+        program += entity! { _ @
+            environment::reading_of: ENVIRONMENT_ANCHOR,
+            environment::selects*: rules,
+        };
+        program += entity! { _ @
+            environment::reading_of: second,
+            environment::selects*: [rules[0], rules[2], ghost],
+        };
+        let facts = program.facts().clone();
+        pile.commit(rules_root, &signer, program).unwrap();
+        pile.commit(schemas_root, &signer, names).unwrap();
+        let routes = CollectionRoutes::from([
+            (schemas::rules::DEFAULT_SCOPE_ID, rules_root.handle()),
+            (schemas::atlas::DEFAULT_SCOPE_ID, schemas_root.handle()),
+        ]);
+        Self {
+            file,
+            pile,
+            signer,
+            routes,
+            rules,
+            second,
+            facts,
+        }
+    }
+
+    fn observe(&mut self) -> WorkspaceObservation {
+        pollster::block_on(WorkspaceObservation::observe(
+            &mut self.pile,
+            &self.signer,
+            &self.routes,
+        ))
+        .unwrap()
+        .with_presentation_revision(1)
+    }
+}
+
+fn rule_index(view: &RulesView, revision: Id) -> usize {
+    view.rules
+        .iter()
+        .position(|rule| rule.revision == revision)
+        .expect("listed")
+}
+
+fn reading_scope<'w>(graph: &'w web::Web, anchor: Id) -> &'w web::Scope {
+    graph
+        .scopes
+        .iter()
+        .find(|scope| scope.kind == web::ScopeKind::Reading(vec![anchor]))
+        .expect("a scope per distinct reading")
+}
+
 #[test]
 fn the_web_finds_maximal_overlaps_and_remaining_conditions() {
-    // The seed program's two rules: ignite concludes run_for/requested_in,
-    // ask_jp concludes nudges; neither matches the other's conclusions.
-    let program = rules::program().unwrap();
+    // Negative control: the seed program's two rules (ignite concludes
+    // run_for/requested_in, ask_jp concludes nudges) never match each other's
+    // conclusions, and with nothing lost that absence may be said.
+    {
+        let program = rules::program().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[29; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let root = pile
+            .collection(
+                "Rules seed fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        pile.commit(root, &signer, program).unwrap();
+        let routes = CollectionRoutes::from([(schemas::rules::DEFAULT_SCOPE_ID, root.handle())]);
+        let observation =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        let context = observation.loaded_context();
+        let view = projection::project(context.dataset(SourceKey::Rules).unwrap(), None);
+        assert_eq!(view.rules.len(), 2);
+        let graph = web::web(&view);
+        assert_eq!(graph.scopes.len(), 1);
+        assert!(matches!(graph.scopes[0].kind, web::ScopeKind::Reading(_)));
+        assert!(graph.scopes[0].complete());
+        assert!(graph.edges.is_empty(), "{:?}", graph.edges);
+        assert!(graph.scopes[0].cycles.is_empty());
+        pile.close().unwrap();
+    }
+
+    let mut fixture = WebFixture::new();
+    let observation = fixture.observe();
+    let context = observation.loaded_context();
+    let view = projection::project(
+        context.dataset(SourceKey::Rules).unwrap(),
+        context.dataset(SourceKey::Schemas),
+    );
+    let [pair, labelled, other_kind, fixed, refused, multi] =
+        fixture.rules.map(|revision| rule_index(&view, revision));
+
+    // Statuses, decided as the engine decides them, and checked against it.
+    for (index, revision) in fixture.rules.iter().enumerate() {
+        let mut engine = Environment::new();
+        engine.extend(&fixture.facts);
+        engine.select([*revision]);
+        let outcome = engine.advance(8);
+        assert_eq!(
+            outcome.is_ok(),
+            view.rules[rule_index(&view, *revision)].executable(),
+            "{} disagrees with the engine: {outcome:?}",
+            WEB_RULES[index]
+        );
+    }
+    assert!(
+        view.rules[refused]
+            .refused
+            .iter()
+            .any(|cause| cause.contains("which no match or literal binds")),
+        "{:?}",
+        view.rules[refused].refused
+    );
+    // A valid multi-valued clause is read as both clauses, not refused.
+    assert_eq!(view.rules[multi].clauses(ClauseKind::Matches).count(), 2);
+    assert!(view.rules[multi].refused.is_empty());
+    assert!(view.rules[multi].partial.is_empty());
+    assert!(!view.rules[multi].notes.is_empty());
+    assert_eq!(view.selected_missing.len(), 1);
+
+    let graph = web::web(&view);
+    assert_eq!(graph.scopes.len(), 2, "one scope per distinct reading");
+    let all = reading_scope(&graph, ENVIRONMENT_ANCHOR);
+    let second = reading_scope(&graph, fixture.second);
+    assert_eq!(all.members.len(), 6);
+    assert!(all.complete());
+    assert_eq!(all.refused, vec![refused]);
+
+    // A multi-clause overlap: three clauses meet three conclusions through one
+    // reused variable and an equal literal; one clause and the content
+    // constraint remain.
+    let feeds = graph.edge(pair, labelled).expect("pair can feed labelled");
+    assert!(!feeds.hypothetical && !feeds.bounded);
+    assert_eq!(feeds.overlaps.len(), 1);
+    let overlap = &feeds.overlaps[0];
+    assert_eq!(overlap.pairs.len(), 3);
+    assert_eq!(overlap.remaining.len(), 1);
+    assert!(!overlap.unconditional(&view.rules[labelled]));
+    let shared = overlap
+        .bindings
+        .iter()
+        .find(|binding| binding.consumer.len() == 1 && !binding.literals.is_empty())
+        .expect("the literal kind is a binding");
+    assert!(shared.conditions.is_empty(), "{:?}", shared.conditions);
+    // One consumer term (the pair) is reused by all three met clauses.
+    let consumer = &view.rules[labelled];
+    assert!(overlap.bindings.iter().any(|binding| {
+        binding.consumer.iter().any(|&term| {
+            overlap
+                .pairs
+                .iter()
+                .filter(|(m, _)| consumer.clauses[*m].subject == term)
+                .count()
+                == 3
+        })
+    }));
+
+    // Disjoint literals: no edge, and not undecided either.
+    assert!(graph.edge(pair, other_kind).is_none());
+    assert!(!graph
+        .undecided
+        .iter()
+        .any(|u| u.from == pair && u.to == other_kind));
+
+    // A literal meeting a constructed identity is only structurally compatible.
+    let derived = graph.edge(pair, fixed).expect("pair can feed fixed");
+    assert!(derived.overlaps[0]
+        .bindings
+        .iter()
+        .any(|binding| binding.conditions.contains(&web::Condition::DerivedLiteral)));
+
+    // Edges through the refused rule are structural only and form no cycle.
+    for (from, to) in [(labelled, refused), (refused, pair), (refused, multi)] {
+        let edge = graph.edge(from, to).expect("structural edge");
+        assert!(edge.hypothetical, "{from} → {to}");
+    }
+    assert!(!graph.edge(pair, labelled).unwrap().hypothetical);
+    assert_eq!(all.cycles.len(), 1, "{:?}", all.cycles);
+    let cycle = &all.cycles[0];
+    assert_eq!(cycle.members, vec![multi]);
+    assert_eq!(cycle.walk, vec![multi]);
+    assert!(!cycle.constructs && cycle.settles);
+    assert_eq!(
+        graph.edge(multi, multi).unwrap().overlaps[0]
+            .remaining
+            .len(),
+        1
+    );
+
+    // The other reading is its own scope: it lost a body, so it is not complete,
+    // and nothing from the first reading's selection is combined into it.
+    assert_eq!(second.members, {
+        let mut members = vec![pair, other_kind];
+        members.sort();
+        members
+    });
+    assert_eq!(second.missing, 1);
+    assert!(!second.complete());
+    assert_eq!(graph.edges_in(second).count(), 0);
+
+    // Bounded evidence: a search stopped before any witness is undecided, never
+    // an edge, never part of a cycle, and makes the scope incomplete.
+    let bounded = web::web_with(
+        &view,
+        web::Limits {
+            nodes: 1,
+            ..Default::default()
+        },
+    );
+    assert!(bounded.edges.is_empty(), "{:?}", bounded.edges);
+    assert!(bounded
+        .undecided
+        .iter()
+        .any(|u| u.from == pair && u.to == labelled && u.why == web::Unsearched::Bound));
+    let all_bounded = reading_scope(&bounded, ENVIRONMENT_ANCHOR);
+    assert!(!all_bounded.complete());
+    assert!(all_bounded.cycles.is_empty());
+    let spent = web::web_with(
+        &view,
+        web::Limits {
+            total_nodes: 0,
+            ..Default::default()
+        },
+    );
+    assert!(spent.edges.is_empty());
+    assert!(spent
+        .undecided
+        .iter()
+        .all(|u| u.why == web::Unsearched::Budget));
+    assert!(!spent.undecided.is_empty());
+    let narrow = web::web_with(
+        &view,
+        web::Limits {
+            rules: 3,
+            ..Default::default()
+        },
+    );
+    assert_eq!(narrow.analysed.len(), 3);
+    assert!(narrow.scopes.iter().any(|scope| scope.beyond > 0));
+    fixture.pile.close().unwrap();
+}
+
+#[test]
+fn a_selected_revision_beyond_the_listing_bound_is_still_analysed() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let signer = SigningKey::from_bytes(&[29; 32]);
+    let signer = SigningKey::from_bytes(&[37; 32]);
     let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
     let root = pile
         .collection(
-            "Rules web fixture",
+            "Rules listing fixture",
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
         )
         .unwrap();
+    // More revisions than are listed; the selected one has the highest id, so
+    // listing by id alone would drop it.
+    let positive: Inline<GenId> = rule::POSITIVE.to_inline();
+    let mut facts = TribleSet::new();
+    for _ in 0..projection::MAX_RULES + 20 {
+        facts.insert(&Trible::force(
+            &genid().id,
+            &rule::operation.id(),
+            &positive,
+        ));
+    }
+    let high = Id::new([0xff; 16]).unwrap();
+    facts.insert(&Trible::force(&high, &rule::operation.id(), &positive));
+    let mut program = Fragment::from(facts);
+    program += entity! { _ @
+        environment::reading_of: ENVIRONMENT_ANCHOR,
+        environment::selects*: [high],
+    };
     pile.commit(root, &signer, program).unwrap();
     let routes = CollectionRoutes::from([(schemas::rules::DEFAULT_SCOPE_ID, root.handle())]);
     let observation =
         pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
     let context = observation.loaded_context();
-    let view = faculties::widgets::rules::projection::project(
-        context
-            .dataset(faculties::widgets::SourceKey::Rules)
-            .unwrap(),
-        None,
-    );
-    assert_eq!(view.rules.len(), 2);
-    let graph = web::web(&view.rules);
-    assert!(graph.selected_only);
-    assert!(graph.edges.is_empty(), "{:?}", graph.edges);
-    assert!(graph.cycles.is_empty());
+    let view = projection::project(context.dataset(SourceKey::Rules).unwrap(), None);
+    assert_eq!(view.revisions_total, projection::MAX_RULES + 21);
+    assert_eq!(view.rules.len(), projection::MAX_RULES);
+    assert_eq!(view.rules[0].revision, high);
+    assert_eq!(view.selected_unlisted, 0);
+    let graph = web::web(&view);
+    assert_eq!(graph.scopes.len(), 1);
+    assert_eq!(graph.scopes[0].members, vec![0]);
+    assert!(graph.scopes[0].complete());
     pile.close().unwrap();
+}
+
+#[test]
+fn a_diagram_arrow_is_picked_by_its_own_side() {
+    use egui::pos2;
+    use faculties::widgets::rules::diagram::{self, Mark};
+    let (a, b) = (pos2(0.0, 0.0), pos2(100.0, 0.0));
+    let marks = [
+        diagram::link(a, b),
+        diagram::link(b, a),
+        diagram::self_loop(pos2(50.0, 60.0), pos2(50.0, 0.0)),
+    ];
+    assert!(matches!(marks[2], Mark::Loop { .. }));
+    // A → B and B → A are drawn apart, each on its own side.
+    assert_eq!(
+        diagram::pick(&marks, pos2(50.0, diagram::SIDE), 2.0),
+        Some(0)
+    );
+    assert_eq!(
+        diagram::pick(&marks, pos2(50.0, -diagram::SIDE), 2.0),
+        Some(1)
+    );
+    let Mark::Loop { centre } = marks[2] else {
+        unreachable!()
+    };
+    assert_eq!(
+        diagram::pick(&marks, centre + egui::vec2(diagram::LOOP, 0.0), 2.0),
+        Some(2)
+    );
+    assert_eq!(diagram::pick(&marks, pos2(50.0, 30.0), 2.0), None);
+    assert_eq!(diagram::ring(1, pos2(5.0, 5.0), 40.0), vec![pos2(5.0, 5.0)]);
+    assert_eq!(diagram::ring(4, pos2(0.0, 0.0), 10.0).len(), 4);
+}
+
+#[test]
+fn the_rule_web_is_explorable_and_says_what_its_evidence_cannot() {
+    let mut fixture = WebFixture::new();
+    let observation = fixture.observe();
+    let before = std::fs::read(fixture.file.path()).unwrap();
+    let host = FixtureHost {
+        observation: Rc::new(RefCell::new(observation)),
+        generation: Rc::new(Cell::new(1)),
+    };
+    let ctx = egui::Context::default();
+    let nb_host = host.clone();
+    let notebook = GORBIE::NotebookConfig::new("Data")
+        .without_editor()
+        .embedded(&ctx, move |nb| {
+            compose_hosted(nb, Target::Dashboard, nb_host.clone())
+        });
+    let mut screen = Screen {
+        ctx,
+        notebook,
+        click: None,
+        last: vec![],
+    };
+    let short = |id: Id| format!("{id:x}")[..8].to_owned();
+    screen.wait("rule revisions");
+    screen.click(&format!("Reading of {}", short(ENVIRONMENT_ANCHOR)));
+    let all = screen.wait("R5 = pair");
+    for expected in [
+        "Current readings select different revisions",
+        "refused by the engine:",
+        "R1 = fixed · R2 = labelled · R3 = multi · R4 = other_kind · R5 = pair · R6 = refused",
+        "pair can feed labelled: 1 maximal overlap",
+        "pair can feed fixed: 1 maximal overlap",
+        "refused can feed pair: 1 maximal overlap (structural only: a refused revision)",
+        "Static feedback cycle: multi can feed itself",
+        "it settles whenever its inputs are finite",
+    ] {
+        assert!(all.contains(expected), "missing {expected:?} in {all:?}");
+    }
+    // Disjoint literals draw no edge; the cycle through the refused rule is
+    // not reported as feedback.
+    assert!(!all.contains("pair can feed other_kind"), "{all:?}");
+    assert!(!all.contains("Static feedback cycle among"), "{all:?}");
+    for label in ["R1", "R2", "R3", "R4", "R5", "R6"] {
+        assert!(screen.last.iter().any(|(text, _)| text == label), "{label}");
+    }
+
+    // Inspecting an edge shows its clauses, bindings and what remains.
+    screen.click("pair can feed labelled: 1 maximal overlap");
+    let edge = screen.wait("overlap 1: 3 of 4 matches clauses met");
+    for expected in [
+        "binds ",
+        "still needs (",
+        "@label",
+        "sharing ",
+        "still needs STRING_CONTAINS(",
+    ] {
+        assert!(edge.contains(expected), "missing {expected:?} in {edge:?}");
+    }
+    assert!(!edge.contains("no remaining conditions"), "{edge:?}");
+    screen.click("pair can feed fixed: 1 maximal overlap");
+    let derived = screen.wait("would still have to equal the identity pair constructs at runtime");
+    assert!(
+        !derived.contains("overlap 1: 3 of 4"),
+        "one edge is inspected at a time"
+    );
+    screen.click("refused can feed pair: 1 maximal overlap (structural only: a refused revision)");
+    screen
+        .wait("Structural only: the engine refuses refused, so this edge cannot occur as stored.");
+
+    // A mark in the diagram opens its rule.
+    screen.click("R5");
+    let opened = screen.wait("Stored conclusion-shaped facts");
+    assert!(
+        opened.contains(&format!("revision {:x}", fixture.rules[0])),
+        "{opened:?}"
+    );
+    assert!(opened.contains("pair can feed labelled: 1 maximal overlap"));
+    screen.click("← All rules");
+
+    // The other reading: its own scope, with a lost body, so no absence is
+    // claimed, and nothing from the first reading is combined into it.
+    screen.wait("rule revisions");
+    screen.click(&format!("Reading of {}", short(fixture.second)));
+    let second = screen.wait("R2 = pair");
+    for expected in [
+        "1 selected revision(s) have no rule facts in this collection and are not analysed.",
+        "No edge was witnessed. The evidence above is incomplete",
+        "termination is not stated",
+        "Selected but with no rule facts in this collection:",
+    ] {
+        assert!(
+            second.contains(expected),
+            "missing {expected:?} in {second:?}"
+        );
+    }
+    for leaked in [
+        "No analysed rule can feed another",
+        "pair can feed labelled",
+        "Static feedback cycle",
+    ] {
+        assert!(!second.contains(leaked), "{leaked:?} in {second:?}");
+    }
+
+    assert!(
+        std::fs::read(fixture.file.path()).unwrap() == before,
+        "exploring the web changed the pile"
+    );
+    fixture.pile.close().unwrap();
 }
