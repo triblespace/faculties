@@ -2681,11 +2681,19 @@ impl Spawn {
                 .find(|declared| declared.zooid == spawn)
                 .map(|declared| declared.standing))
         };
-        let realises = match zooid.realises {
+        // A declaration that binds a model is realised only by a launch that
+        // binds it, and this launch carries no model binding: it names none.
+        let mut realises = match zooid.realises {
             Some(declaration) => match standing(spawn)? {
                 Some(super::declaration::Standing::Here(placement))
                     if placement.declaration == declaration =>
                 {
+                    if let Some(spec) = placement.model_spec {
+                        bail!(
+                            "{name}'s declaration {declaration:x} binds model {spec:x}, which \
+                             this launch does not bind; nothing was started"
+                        );
+                    }
                     Some(declaration)
                 }
                 Some(super::declaration::Standing::Here(placement)) => bail!(
@@ -2698,7 +2706,9 @@ impl Spawn {
                 None => bail!("{name} declares nothing here; nothing was started"),
             },
             None if zooid.resident => match standing(spawn) {
-                Ok(Some(super::declaration::Standing::Here(placement))) => {
+                Ok(Some(super::declaration::Standing::Here(placement)))
+                    if placement.model_spec.is_none() =>
+                {
                     Some(placement.declaration)
                 }
                 _ => None,
@@ -3006,6 +3016,27 @@ impl Spawn {
                     return Err(error).context("remove the previous report");
                 }
                 _ => {}
+            }
+            // Read once more right before the unit starts: preparing the wake
+            // takes long, and a rest or move recorded meanwhile wins. An
+            // explicit continuation then starts nothing; a direct launch
+            // starts as asked and names no declaration. A rest recorded after
+            // this read stands for the next life, not this one.
+            if let Some(declaration) = realises {
+                let still = matches!(
+                    standing(spawn),
+                    Ok(Some(super::declaration::Standing::Here(placement)))
+                        if placement.declaration == declaration
+                );
+                if !still && zooid.realises.is_some() {
+                    bail!(
+                        "{name}'s declaration {declaration:x} stopped standing here while its \
+                         life was prepared; nothing was started"
+                    );
+                }
+                if !still {
+                    realises = None;
+                }
             }
             self.launcher.start(&UnitSpec {
                 unit: unit.clone(),
@@ -9842,7 +9873,7 @@ mod tests {
         assert!(next.evidence.contains("past its life limit"), "{}", next.evidence);
         // Asking starts nothing.
         assert_eq!(f.launcher.started.lock().unwrap().len(), started);
-        let second = match f.spawn.continue_life("life-test").unwrap() {
+        let second = match f.spawn.continue_life("life-test", None).unwrap() {
             Continued::Started { launched, .. } => *launched,
             Continued::Nothing { reason } => panic!("nothing started: {reason}"),
         };
@@ -9856,7 +9887,7 @@ mod tests {
         assert!(view.runs[1].resident);
         // Asked again while it lives: nothing.
         assert!(matches!(
-            f.spawn.continue_life("life-test").unwrap(),
+            f.spawn.continue_life("life-test", None).unwrap(),
             Continued::Nothing { .. }
         ));
         // A caller that read the first life's end before the second began
@@ -9883,7 +9914,7 @@ mod tests {
             nothing_follows(&f, "life-test")
         );
         assert!(matches!(
-            f.spawn.continue_life("life-test").unwrap(),
+            f.spawn.continue_life("life-test", None).unwrap(),
             Continued::Nothing { .. }
         ));
         // A continuation decided before the rest is refused at admission.
@@ -9969,9 +10000,70 @@ mod tests {
         let reason = nothing_follows(&f, "lost-test");
         assert!(reason.contains("not in the archive"), "{reason}");
         assert!(matches!(
-            f.spawn.continue_life("lost-test").unwrap(),
+            f.spawn.continue_life("lost-test", None).unwrap(),
             super::super::life::Continued::Nothing { .. }
         ));
+    }
+
+    /// Records a rest for `name` while a wake is rendered: a declaration
+    /// that lands during a launch's preparation, after its first check.
+    struct RestDuringWake {
+        inner: StubRenderer,
+        spawn: Spawn,
+        name: String,
+    }
+
+    impl Renderer for RestDuringWake {
+        fn tint(&self, storage: &Storage, about: &str) -> Result<WakeTint> {
+            self.inner.tint(storage, about)
+        }
+        fn wake(
+            &self,
+            storage: &Storage,
+            tint: Option<&WakeTint>,
+            memory_chars: usize,
+        ) -> Result<String> {
+            self.spawn.declare(&super::super::declaration::DeclareRequest {
+                name: self.name.clone(),
+                place: super::super::declaration::PlaceWish::At(
+                    super::super::declaration::Place::Rest,
+                ),
+                model_spec: None,
+                model_label: None,
+                reason: Some("rest while the next life is prepared".to_owned()),
+                persona: "agent-cc".to_owned(),
+            })?;
+            self.inner.wake(storage, tint, memory_chars)
+        }
+    }
+
+    #[test]
+    fn a_rest_recorded_while_the_next_life_is_prepared_starts_nothing() {
+        use super::super::declaration::PlaceWish;
+        let f = fixture();
+        let mut request = named(&f, "Resident racing.", "race-test", true);
+        request.provider = Provider::Agy;
+        let first = f.spawn.run(&request).unwrap();
+        declare_as(&f, "race-test", PlaceWish::Here);
+        set_unit(&f, "inactive");
+        agy_ran(&agy_home_of(&f, "race-test"), &first.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &first, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let racing = f.spawn.clone().with_renderer(Arc::new(RestDuringWake {
+            inner: StubRenderer::default(),
+            spawn: f.spawn.clone(),
+            name: "race-test".to_owned(),
+        }));
+        let started = f.launcher.started.lock().unwrap().len();
+        let error = racing.continue_life("race-test", None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stopped standing here while its life was prepared"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+        assert_eq!(f.spawn.show("race-test").unwrap().runs.len(), 1);
+        assert!(!f.persona("race-test").unwrap().retired);
+        let reason = nothing_follows(&f, "race-test");
+        assert!(reason.contains("at rest"), "{reason}");
     }
 
     #[test]

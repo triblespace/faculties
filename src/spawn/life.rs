@@ -22,8 +22,13 @@
 //!   started under an earlier declaration does not carry over a rest, or a
 //!   new placement after one: that is a new start, never a continuation;
 //! - its conversation is in the archive (the launch checks this again);
-//! - its unit does not run, and its bound model, if any, is one this host
-//!   can honour.
+//! - its unit does not run, and its declaration binds no model: a Spawn
+//!   launch carries no model binding, so it cannot realise one that does.
+//!
+//! The next life lives with its predecessor's provider unless the caller
+//! names another (`auto` lets Spawn choose by quota, as for any launch).
+//! A provider is part of how a life lives: an agy resident's lives are not
+//! compacted, a claude one's may be.
 //!
 //! How the life ended is reported, never judged: the exit, and when
 //! settlement measured it, the context's size at the end beside its life
@@ -175,12 +180,9 @@ impl Spawn {
             }
         };
         if let Some(spec) = placement.model_spec {
-            if provider != Provider::Local {
-                return nothing(format!(
-                    "{name} binds model {spec:x}, which a {} life cannot honour",
-                    provider.name()
-                ));
-            }
+            return nothing(format!(
+                "{name}'s declaration binds model {spec:x}, and a Spawn launch binds none"
+            ));
         }
         if matches!(provider, Provider::Agy | Provider::Claude) && last.archive_imported.is_empty()
         {
@@ -256,10 +258,15 @@ impl Spawn {
     /// ([`Spawn::next_life`]); the launch admits it again under the zooid's
     /// lock. Asking again, or twice at once, starts at most one life after
     /// each life: the second finds it followed, or its unit running.
-    pub fn continue_life(&self, name: &str) -> Result<Continued> {
+    ///
+    /// `provider` replaces the predecessor's, when given.
+    pub fn continue_life(&self, name: &str, provider: Option<Provider>) -> Result<Continued> {
         match self.next_life(name)? {
             NextLife::Nothing { reason } => Ok(Continued::Nothing { reason }),
-            NextLife::Follows(continuation) => {
+            NextLife::Follows(mut continuation) => {
+                if let Some(provider) = provider {
+                    continuation.request.provider = provider;
+                }
                 let launched = self.run(&continuation.request)?;
                 Ok(Continued::Started {
                     continuation,

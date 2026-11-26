@@ -206,6 +206,10 @@ enum Command {
         /// Only say whether a next life follows; start nothing.
         #[arg(long)]
         check: bool,
+        /// The next life's provider instead of its predecessor's: claude,
+        /// codex, mistral, agy, auto or local, as for `zooid spawn`.
+        #[arg(long, conflicts_with = "check")]
+        provider: Option<String>,
     },
     /// Every zooid, one line each.
     List,
@@ -694,7 +698,12 @@ pub fn run() -> Result<()> {
                 })?;
                 crate::cli::with_output("zooid", |out| out.line(declaring.line(&name)))
             }
-            Command::Continue { name, check } => {
+            Command::Continue {
+                name,
+                check,
+                provider,
+            } => {
+                let provider = provider.as_deref().map(Provider::parse).transpose()?;
                 use super::life::{Continued, NextLife};
                 let text = if check {
                     match spawn.next_life(&name)? {
@@ -705,7 +714,7 @@ pub fn run() -> Result<()> {
                         NextLife::Nothing { reason } => format!("nothing follows: {reason}\n"),
                     }
                 } else {
-                    match spawn.continue_life(&name)? {
+                    match spawn.continue_life(&name, provider)? {
                         Continued::Started {
                             continuation,
                             launched,
