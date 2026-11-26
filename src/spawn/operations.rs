@@ -2207,8 +2207,9 @@ impl Spawn {
     /// latest agy run. Only when that run recorded its conversation
     /// (`session/<id>`), ran in the same workdir (agy scopes conversations
     /// to it), and its transcript in the zooid's home shows room for more
-    /// life; otherwise the launch starts fresh into the cover, and the
-    /// reason says which.
+    /// life, and no agy run of the zooid that named the conversation was
+    /// recorded at settlement as past its life limit; otherwise the launch
+    /// starts fresh into the cover, and the reason says which.
     fn agy_resume(&self, spawn: Id, workdir: &str, home: &Path, wake: &Path) -> AgyResume {
         let fresh = |reason: String| AgyResume {
             conversation: None,
@@ -2265,6 +2266,62 @@ impl Spawn {
                 ))
             }
         };
+        // A life that ended stays ended. Any agy run of this zooid that named
+        // the conversation and whose settlement recorded it past the limit
+        // then decides, not today's pricing of the transcript: a lowered
+        // growth floor raised the limit on 26 Nov 2026 and continued a
+        // conversation that had ended (run 80ad63de). Only that positive
+        // record counts; without one (no run's settlement saw the life over,
+        // or the run was settled before the record existed) the transcript
+        // is priced as below, and nothing is inferred from how runs exited.
+        let locator: TextHandle = format!("session/{conversation}").to_blob().get_handle();
+        let ended = self.observe(|facts, _| {
+            let mut ended = find!(
+                (
+                    run: Id,
+                    started: IntervalValue,
+                    occupancy: Inline<inlineencodings::U256BE>,
+                    limit: Inline<inlineencodings::U256BE>
+                ),
+                pattern!(facts, [{ ?run @
+                    metadata::tag: KIND_RUN,
+                    attrs::of: spawn,
+                    attrs::provider: Provider::Agy.name(),
+                    metadata::started_at: ?started,
+                    crate::schemas::blockdag::source_projection::source_locator: locator,
+                    attrs::life_occupancy: ?occupancy,
+                    attrs::life_limit: ?limit,
+                }])
+            )
+            .filter_map(|(run, started, occupancy, limit)| {
+                let (from, _) = started.try_from_inline::<(Epoch, Epoch)>().ok()?;
+                Some((
+                    from,
+                    run,
+                    occupancy.try_from_inline::<u64>().ok()?,
+                    limit.try_from_inline::<u64>().ok()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+            ended.sort();
+            Ok(ended.into_iter().next())
+        });
+        match ended {
+            Ok(Some((_, ended, occupancy, limit))) => {
+                return fresh(format!(
+                    "fresh: conversation {conversation} ended its life: run {ended:x}'s \
+                     settlement recorded its context at {occupancy} tokens, past its life limit \
+                     then of {limit}, and a life that ended stays ended whatever the limit is now"
+                ))
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return fresh(format!(
+                    "fresh: reading whether conversation {conversation} ended its life failed: \
+                     {error:#}"
+                ))
+            }
+        }
         if run.workdir.iter().all(|dir| dir != workdir) {
             return fresh(format!(
                 "fresh: conversation {conversation} ran in {}, and agy scopes conversations to \
@@ -8553,10 +8610,11 @@ mod tests {
         let third = f.spawn.run(&request).unwrap();
         assert_eq!(third.agy_resume.conversation, None);
         assert!(
-            third
-                .agy_resume
-                .reason
-                .contains("ended its life at 400000 of 512000"),
+            third.agy_resume.reason.contains(&format!(
+                "ended its life: run {:x}'s settlement recorded its context at 400000 \
+                     tokens, past its life limit then of 200000",
+                again.run
+            )),
             "{}",
             third.agy_resume.reason
         );
