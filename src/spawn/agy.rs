@@ -425,9 +425,9 @@ pub const HOOK_TIMEOUT_SECS: u64 = 120;
 /// The zooid's hooks, as agy's `hooks.json` (hook names mapping to their
 /// events): its unit script run as `inbox agy-tool` before every tool call,
 /// `inbox agy-invocation` before every model call and `inbox agy-stop` when
-/// it would end. PreToolUse takes a matcher and nests its handlers; the
-/// other events list their handlers directly.
-pub fn hooks_config(script: &Path) -> String {
+/// it would end, unless it is `fed`. PreToolUse takes a matcher and nests
+/// its handlers; the other events list their handlers directly.
+pub fn hooks_config(script: &Path, fed: bool) -> String {
     let command = |hook: &str| {
         format!(
             "/bin/bash {} inbox {hook}",
@@ -441,7 +441,7 @@ pub fn hooks_config(script: &Path) -> String {
             "timeout": HOOK_TIMEOUT_SECS,
         })
     };
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "zooid-life": {
             "PreToolUse": [{ "matcher": "*", "hooks": [handler("agy-tool")] }],
         },
@@ -450,6 +450,16 @@ pub fn hooks_config(script: &Path) -> String {
             "Stop": [handler("agy-stop")],
         },
     });
+    if fed {
+        // A fed resident's turn ending is not its life ending: the feeder
+        // brings news between turns, so a Stop that continued while any
+        // message is unread would only spend the life's context on every
+        // turn's end.
+        config["zooid-inbox"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("Stop");
+    }
     format!("{config:#}\n")
 }
 
@@ -493,7 +503,12 @@ pub fn hook_input(text: &str) -> Result<HookInput> {
             .as_str()
             .filter(|id| plain_id(id))
             .map(str::to_owned),
-        continuation_active: value["continuation_active"].as_bool().unwrap_or(false),
+        // agy's hook payloads are protojson, camelCase (its docs/hooks.md);
+        // the snake_case spelling is read as well.
+        continuation_active: value["continuationActive"]
+            .as_bool()
+            .or_else(|| value["continuation_active"].as_bool())
+            .unwrap_or(false),
     })
 }
 
@@ -823,7 +838,7 @@ mod tests {
     #[test]
     fn hooks_config_names_each_event_in_agys_shape() {
         let config: serde_json::Value =
-            serde_json::from_str(&hooks_config(Path::new("/s/n.sh"))).unwrap();
+            serde_json::from_str(&hooks_config(Path::new("/s/n.sh"), false)).unwrap();
         let tool = &config["zooid-life"]["PreToolUse"][0];
         assert_eq!(tool["matcher"], "*");
         assert_eq!(

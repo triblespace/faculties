@@ -487,8 +487,9 @@ pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
 pub fn resident_preamble(name: &str, spawner: &str, fed: bool) -> String {
     let news = if fed {
         "Colony news addressed to you (messages, and Discord lines in the channels that are \
-         yours) arrives as a user turn between your turns, each item once; you need not poll \
-         for it. A message stays unread until you `message_ack` it."
+         yours) arrives as a user turn between your turns, and what was shown once is not \
+         shown again; you need not poll for it. A message stays unread until you \
+         `message_ack` it."
     } else {
         "Check your inbox between steps with `orient_poll` (persona {name}, peek true) and \
          `message_ack` what you have handled."

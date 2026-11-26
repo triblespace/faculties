@@ -1020,6 +1020,27 @@ struct RunFiles {
     spawner: String,
     /// A fed resident: its input is `zooid feed`'s stream of user events.
     fed: bool,
+    /// A claude run's session, chosen at launch ([`claude_session_for`]).
+    claude_session: Option<String>,
+}
+
+/// The claude session of `run`: its id as a version 4 UUID, which claude's
+/// `--session-id` takes. Chosen at launch and recorded on the run, so the
+/// transcript of a run killed before its result is still found.
+fn claude_session_for(run: Id) -> String {
+    let mut hex: Vec<char> = format!("{run:x}").chars().collect();
+    hex[12] = '4';
+    let variant = hex[16].to_digit(16).expect("hex digit");
+    hex[16] = std::char::from_digit(0x8 | (variant & 0x3), 16).expect("a hex digit");
+    let hex: String = hex.into_iter().collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// An agent command line and what the unit gives it.
@@ -1496,11 +1517,20 @@ pub enum FeedEnd {
 enum Sent {
     /// Written and flushed.
     Whole,
-    /// Cut inside the event, or written and not flushed: it may have been
-    /// read.
+    /// Written whole, and the flush after it failed: the whole event was
+    /// handed over and may have been read.
+    Unflushed,
+    /// Cut inside the event: the agent reads no event from half a line.
     Cut,
     /// Not a byte of it was written.
     Unsent,
+}
+
+impl Sent {
+    /// Whether the agent may have read the whole event.
+    fn handed_over(self) -> bool {
+        matches!(self, Sent::Whole | Sent::Unflushed)
+    }
 }
 
 /// Write `text` as one user event, counting what was taken.
@@ -1520,7 +1550,7 @@ fn send(out: &mut dyn std::io::Write, text: &str) -> Sent {
         0 => Sent::Unsent,
         n if n < bytes.len() => Sent::Cut,
         _ if out.flush().is_ok() => Sent::Whole,
-        _ => Sent::Cut,
+        _ => Sent::Unflushed,
     }
 }
 
@@ -1532,11 +1562,11 @@ fn ids_text(items: &[NewsItem]) -> String {
         .join(", ")
 }
 
-/// One feeder event: the news items, each once.
+/// One feeder event: the news items not delivered before.
 fn feed_text(name: &str, items: &[NewsItem]) -> String {
     let mut text = format!(
-        "News for {name}, between your turns. Each item is shown once; a message stays unread \
-         until you `message_ack` it (from {name}).\n\n"
+        "News for {name}, between your turns. An item already shown is not shown again; a \
+         message stays unread until you `message_ack` it (from {name}).\n\n"
     );
     for item in items {
         text.push_str(item.text.trim_end());
@@ -1989,7 +2019,9 @@ impl Spawn {
                 // argument may be. The result object is stdout; settlement
                 // reads the reply, usage and conversation id from it.
                 // A fed resident reads user events from the feeder and
-                // writes events: its run spans many turns.
+                // writes events: its run spans many turns. Its prompt is the
+                // feeder's first event, so it has no `-p`: agy refuses one
+                // beside `--input-format stream-json` (exit 2).
                 let mut argv = vec![text(&self.launch.agy)];
                 if files.fed {
                     argv.extend(["--input-format".to_owned(), "stream-json".to_owned()]);
@@ -2010,7 +2042,9 @@ impl Spawn {
                 if let Some(conversation) = &files.agy_conversation {
                     argv.extend(["--conversation".to_owned(), conversation.clone()]);
                 }
-                argv.extend(["-p".to_owned(), "-".to_owned()]);
+                if !files.fed {
+                    argv.extend(["-p".to_owned(), "-".to_owned()]);
+                }
                 AgentLine {
                     argv,
                     // agy reads everything from $HOME/.gemini, always: the
@@ -2031,14 +2065,21 @@ impl Spawn {
                     stdout_is_report: true,
                 }
             }
-            Provider::Claude => AgentLine {
-                argv: vec![
+            Provider::Claude => {
+                let mut argv = vec![
                     text(&self.launch.claude),
                     "-p".to_owned(),
                     "--model".to_owned(),
                     self.launch.model.clone(),
                     "--effort".to_owned(),
                     effort.to_owned(),
+                ];
+                // The session is the run's, chosen at launch: its transcript
+                // is found by it even when no result names it.
+                if let Some(session) = &files.claude_session {
+                    argv.extend(["--session-id".to_owned(), session.clone()]);
+                }
+                argv.extend([
                     "--dangerously-skip-permissions".to_owned(),
                     "--strict-mcp-config".to_owned(),
                     "--mcp-config".to_owned(),
@@ -2050,11 +2091,14 @@ impl Spawn {
                     // stdout was, and the window the CLI reports.
                     "--output-format".to_owned(),
                     "json".to_owned(),
-                ],
-                env: Vec::new(),
-                secrets: Vec::new(),
-                stdout_is_report: true,
-            },
+                ]);
+                AgentLine {
+                    argv,
+                    env: Vec::new(),
+                    secrets: Vec::new(),
+                    stdout_is_report: true,
+                }
+            }
             Provider::Local => {
                 let Some(template) = &self.launch.local else {
                     bail!("{LOCAL_UNCONFIGURED}");
@@ -2575,6 +2619,16 @@ impl Spawn {
         // retired the persona), so a replayed settlement of an earlier run
         // either sees this run or waits for it.
         let _zooid_lock = self.zooid_lock(&name)?;
+        // The name, decided again now that it is held: a launch of another
+        // brief may have taken it, under this lock, while this one waited.
+        let held = self.naming(spawn, brief_handle, spawner, zooid.name.as_deref())?;
+        if held.name != name {
+            bail!(
+                "{name} was this zooid's name when the launch began, and is {} now that its \
+                 lock is held; nothing was started. Launch it again",
+                held.name
+            );
+        }
         // Whether this launch made the persona live: only then does a launch
         // that never started retire it again. A resident adopts a live one.
         let mut revived = true;
@@ -2747,6 +2801,7 @@ impl Spawn {
                 cover: cover.clone(),
                 resident: zooid.resident,
             });
+            let claude_session = (provider == Provider::Claude).then(|| claude_session_for(run));
             let text = |path: &Path| path.display().to_string();
             let mut agent = self.agent(
                 provider,
@@ -2768,6 +2823,7 @@ impl Spawn {
                     brief: brief_path.clone(),
                     spawner: spawner_label.to_owned(),
                     fed,
+                    claude_session: claude_session.clone(),
                 },
             )?;
             if let Some(input) = &first_input {
@@ -2855,7 +2911,7 @@ impl Spawn {
                         &launch.real_home,
                         launch.agy_token.as_deref(),
                         &super::agy::mcp_config(&script_path),
-                        &super::agy::hooks_config(&script_path),
+                        &super::agy::hooks_config(&script_path, fed),
                     )?;
                     std::fs::write(&settings, super::agy::settings(&workdir))
                         .with_context(|| format!("write {}", settings.display()))?;
@@ -2898,6 +2954,15 @@ impl Spawn {
                 record += entity! { ExclusiveId::force_ref(&run) @
                     crate::schemas::blockdag::source_projection::source_locator: locator,
                     attrs::archive_start: start,
+                };
+            }
+            if let Some(session) = &claude_session {
+                // Claude's session is the run's from launch, as a continued
+                // agy conversation is: settlement finds its transcript by it.
+                let locator =
+                    record.put::<blobencodings::UTF8String, _>(format!("session/{session}"));
+                record += entity! { ExclusiveId::force_ref(&run) @
+                    crate::schemas::blockdag::source_projection::source_locator: locator,
                 };
             }
             if let Some(why) = &lexical_fallback {
@@ -3415,6 +3480,40 @@ impl Spawn {
             })
     }
 
+    /// A claude session's transcript, searched in every project under
+    /// claude's projects: `Ok(None)` only when each was read and none holds
+    /// it; a directory that could not be read is an error.
+    fn claude_session_search(&self, session: &str) -> Result<Option<PathBuf>> {
+        if session.is_empty() || session.contains(['/', '.']) {
+            bail!("{session:?} is not a session id");
+        }
+        let projects = self
+            .launch
+            .claude_projects
+            .as_ref()
+            .ok_or_else(|| anyhow!("no claude projects directory is configured"))?;
+        let entries = match std::fs::read_dir(projects) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", projects.display()))
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read {}", projects.display()))?;
+            let path = entry.path().join(format!("{session}.jsonl"));
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("read {}", path.display()))
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// A claude session's transcript: `<projects>/<any project>/<session>.jsonl`.
     fn claude_session_file(&self, session: &str) -> Option<PathBuf> {
         if session.is_empty() || session.contains(['/', '.']) {
@@ -3757,19 +3856,36 @@ impl Spawn {
         }
         let session = sessions.first().map(|id| id.to_string());
         if agent == Provider::Claude.name() {
+            // No session is not no conversation: a run launched before spawn
+            // chose claude's session, and killed before its result, may have
+            // lived turns no search here can find.
             let Some(session) = session else {
-                return Located::Nothing(
-                    "It recorded no session, so nothing was archived at settlement.".to_owned(),
+                return Located::Refused(
+                    "It recorded no session, so whether it wrote a conversation cannot be told \
+                     and nothing was archived at settlement; ingest-sessions reads claude's \
+                     projects."
+                        .to_owned(),
                 );
             };
-            return match self.claude_session_file(&session) {
-                Some(path) => Located::Found(RunTranscript {
+            return match self.claude_session_search(&session) {
+                Ok(Some(path)) => Located::Found(RunTranscript {
                     conversation: session,
                     path,
                     source: crate::archive::ImportSource::ClaudeCode,
                 }),
-                None => Located::Refused(format!(
+                // A run with no report never answered: with its session
+                // chosen at launch and no transcript anywhere under claude's
+                // projects, claude wrote none.
+                Ok(None) if view.report.is_empty() => Located::Nothing(format!(
+                    "Its session {session} has no transcript under claude's projects: it ended \
+                     before claude wrote one."
+                )),
+                Ok(None) => Located::Refused(format!(
                     "Its session {session} was not found under claude's projects to archive."
+                )),
+                Err(error) => Located::Refused(format!(
+                    "Looking for its session {session} under claude's projects failed \
+                     ({error:#}); settling again retries it."
                 )),
             };
         }
@@ -3985,8 +4101,9 @@ impl Spawn {
     /// keep what they showed in, under the same lock: an item the
     /// PreInvocation hook showed is not fed again, nor one fed here shown
     /// there. An item is recorded as delivered once its event was written
-    /// whole, or cut inside it (the agent may have read it); one not a byte
-    /// of which was written stays undelivered. The lock is not held while
+    /// whole, flushed or not (the agent may have read it); one whose event
+    /// was cut inside it, or not a byte of which was written, stays
+    /// undelivered, as half a line is no event. The lock is not held while
     /// writing, as the agent's own hook may wait for it: a hook and the
     /// feeder that read the same new item at once can both show it.
     ///
@@ -4000,7 +4117,23 @@ impl Spawn {
     /// its limit the feeder tells the life so and ends, closing the agent's
     /// input. A failed write means the agent is gone. A failed read is
     /// logged and tried again at the next one.
+    ///
+    /// The feeder holds one store for its life, as a long-lived MCP server
+    /// does: an open of a live pile costs seconds and takes its lock, and a
+    /// held store still sees what other processes write. The run's start
+    /// and the conversation it continues are read once, when its record is
+    /// here.
     pub fn feed(&self, request: &FeedRequest, out: &mut dyn std::io::Write) -> Result<FeedEnd> {
+        self.storage.scope(|storage| {
+            let held = Spawn {
+                storage: storage.clone(),
+                ..self.clone()
+            };
+            held.feed_held(request, out)
+        })
+    }
+
+    fn feed_held(&self, request: &FeedRequest, out: &mut dyn std::io::Write) -> Result<FeedEnd> {
         let prompt_path = self.launch.file(&request.name, "prompt");
         let prompt = std::fs::read_to_string(&prompt_path)
             .with_context(|| format!("read {}", prompt_path.display()))?;
@@ -4020,8 +4153,9 @@ impl Spawn {
                     ),
                 }
             }
-            if let Some(started) = started {
-                if self.life_over(&home, request.run, started) {
+            if let Some((started, continued)) = &started {
+                let started = *started;
+                if self.life_over(&home, continued.as_deref(), started) {
                     // The hooks tell a turn that is under way; a life that
                     // crossed its limit as a turn ended hears it here, once,
                     // before its input closes.
@@ -4033,20 +4167,31 @@ impl Spawn {
                         let new = self.undelivered(&request.name, request.run, started, items)?;
                         if !new.is_empty() {
                             let sent = send(out, &feed_text(&request.name, &new));
-                            if sent != Sent::Unsent {
+                            if sent.handed_over() {
                                 let ids: Vec<Id> = new.iter().map(|item| item.id).collect();
                                 self.delivered(&request.name, request.run, &ids)?;
                             }
-                            if sent != Sent::Whole {
-                                if sent == Sent::Cut {
+                            match sent {
+                                Sent::Whole => {}
+                                Sent::Unflushed => {
                                     eprintln!(
-                                        "zooid feed {}: an event was cut while written; its {} \
-                                         item(s) count as delivered",
+                                        "zooid feed {}: an event was written whole and its flush \
+                                         failed; its {} item(s) count as delivered",
                                         request.name,
                                         ids_text(&new)
                                     );
+                                    return Ok(FeedEnd::AgentGone);
                                 }
-                                return Ok(FeedEnd::AgentGone);
+                                Sent::Cut => {
+                                    eprintln!(
+                                        "zooid feed {}: an event was cut while written; its {} \
+                                         item(s) stay undelivered",
+                                        request.name,
+                                        ids_text(&new)
+                                    );
+                                    return Ok(FeedEnd::AgentGone);
+                                }
+                                Sent::Unsent => return Ok(FeedEnd::AgentGone),
                             }
                         }
                     }
@@ -4064,39 +4209,40 @@ impl Spawn {
         }
     }
 
-    /// When `run` started, once its record is here; `None` before.
-    fn run_started(&self, run: Id) -> Result<Option<Epoch>> {
-        self.observe(|facts, _| {
-            Ok(find!(
+    /// When `run` started, and the conversation it continues, once its
+    /// record is here; `None` before. Both are in the launch's record: a
+    /// continued conversation is recorded on the run as it launches.
+    fn run_started(&self, run: Id) -> Result<Option<(Epoch, Option<String>)>> {
+        self.observe(|facts, reader| {
+            let started = find!(
                 at: IntervalValue,
                 pattern!(facts, [{ run @ metadata::started_at: ?at }])
             )
             .filter_map(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
             .map(|(from, _)| from)
-            .next())
+            .next();
+            let Some(started) = started else {
+                return Ok(None);
+            };
+            let continued = find!(
+                handle: TextHandle,
+                pattern!(facts, [{
+                    run @ crate::schemas::blockdag::source_projection::source_locator: ?handle
+                }])
+            )
+            .filter_map(|handle| read_text(reader, handle))
+            .filter_map(|locator| locator.strip_prefix("session/").map(str::to_owned))
+            .next();
+            Ok(Some((started, continued)))
         })
     }
 
-    /// Whether the conversation of `run` is past its life limit: the one
-    /// the run continues, or the one conversation in the zooid's home that
+    /// Whether the conversation of a run is past its life limit: the one
+    /// the run `continued`, or the one conversation in the zooid's home that
     /// changed since the run started. None found, or several, is not over.
-    fn life_over(&self, home: &Path, run: Id, started: Epoch) -> bool {
-        let continued = self
-            .observe(|facts, reader| {
-                Ok(find!(
-                    handle: TextHandle,
-                    pattern!(facts, [{
-                        run @ crate::schemas::blockdag::source_projection::source_locator: ?handle
-                    }])
-                )
-                .filter_map(|handle| read_text(reader, handle))
-                .filter_map(|locator| locator.strip_prefix("session/").map(str::to_owned))
-                .next())
-            })
-            .ok()
-            .flatten();
+    fn life_over(&self, home: &Path, continued: Option<&str>, started: Epoch) -> bool {
         let conversation = match continued {
-            Some(conversation) => conversation,
+            Some(conversation) => conversation.to_owned(),
             None => {
                 let since = std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_secs_f64(started.to_unix_seconds().max(0.0));
@@ -7975,6 +8121,7 @@ mod tests {
             brief: PathBuf::from("/s/n.brief"),
             spawner: "s".to_owned(),
             fed: false,
+            claude_session: None,
         };
         for provider in [Provider::Auto, Provider::Local] {
             assert!(f.spawn.agent(provider, "high", &files).is_err());
@@ -8192,7 +8339,7 @@ mod tests {
         let unit = f.launcher.started.lock().unwrap()[0].clone();
         assert_eq!(
             std::fs::read_to_string(home.join(".gemini/config/hooks.json")).unwrap(),
-            super::super::agy::hooks_config(&unit.script)
+            super::super::agy::hooks_config(&unit.script, false)
         );
         assert_eq!(
             std::fs::read_link(home.join(".gitconfig")).unwrap(),
