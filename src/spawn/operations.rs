@@ -6725,7 +6725,10 @@ mod tests {
     fn a_claude_result_records_its_window_and_first_call_and_a_later_cover_uses_it() {
         let f = fixture();
         let launched = f.spawn.run(&f.request("First claude run.")).unwrap();
-        let session = "e0bf4238-7a93-4604-be3f-a4ddb456d86b";
+        // The session the launch chose, which claude's result names.
+        let session = claude_session_in_script(&f, &launched)
+            .unwrap_or_else(|| "e0bf4238-7a93-4604-be3f-a4ddb456d86b".to_owned());
+        let session = session.as_str();
         std::fs::write(
             &launched.report,
             format!(
@@ -9616,9 +9619,12 @@ mod tests {
             ),
             "{line}"
         );
+        // Its prompts come as stream-json on stdin: agy refuses `-p`
+        // beside `--input-format stream-json` (exit 2).
+        assert!(!line.split_whitespace().any(|word| word == "-p"), "{line}");
         assert!(
             line.contains(&format!(
-                " -p - < <(HOME={real} zooid feed fed-test --run {:x} 2>> ",
+                " < <(HOME={real} zooid feed fed-test --run {:x} 2>> ",
                 launched.run
             )),
             "{line}"
@@ -9627,10 +9633,31 @@ mod tests {
             line.ends_with(&format!(") > {}", launched.report.display())),
             "{line}"
         );
+        // News reaches a fed resident between its turns, so a turn's end
+        // forces no continuation: it has no Stop hook. Its life hooks stay.
+        let hooks: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(agy_home_of(&f, "fed-test").join(".gemini/config/hooks.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(hooks["zooid-inbox"].get("Stop").is_none(), "{hooks:#}");
+        assert!(
+            hooks["zooid-inbox"].get("PreInvocation").is_some(),
+            "{hooks:#}"
+        );
+        assert!(hooks["zooid-life"].get("PreToolUse").is_some(), "{hooks:#}");
         // An unfed one is as it was.
         let mut request = f.request("Plain agy.");
         request.provider = Provider::Agy;
-        f.spawn.run(&request).unwrap();
+        let plain_run = f.spawn.run(&request).unwrap();
+        let hooks: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                agy_home_of(&f, &plain_run.name).join(".gemini/config/hooks.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(hooks["zooid-inbox"].get("Stop").is_some(), "{hooks:#}");
         let plain = f.script(1);
         assert!(!plain.contains(" feed "), "{plain}");
         assert!(
@@ -9767,6 +9794,39 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| m.id == shown));
+    }
+
+    /// A news source that records whether each read was given a store
+    /// held open across reads.
+    #[derive(Default)]
+    struct OwnerNews {
+        held: Mutex<Vec<bool>>,
+    }
+
+    impl NewsSource for OwnerNews {
+        fn news(&self, storage: &Storage, _persona: &str) -> Result<Vec<NewsItem>> {
+            self.held
+                .lock()
+                .unwrap()
+                .push(format!("{storage:?}").contains("shared: true"));
+            Ok(Vec::new())
+        }
+    }
+
+    /// A feeder lasts a life and reads every few seconds: on a live pile an
+    /// open costs seconds and takes the pile's lock, so it keeps one store
+    /// open for its life, as a long-lived MCP server does.
+    #[test]
+    fn the_feeder_keeps_one_store_for_its_life() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, held.", "held-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let news = Arc::new(OwnerNews::default());
+        let spawn = f.spawn.clone().with_news(news.clone());
+        let (end, _) = feed_once(&spawn, "held-test", launched.run, 3);
+        assert_eq!(end, FeedEnd::Rounds);
+        assert_eq!(*news.held.lock().unwrap(), [true, true, true]);
     }
 
     #[test]
@@ -9906,17 +9966,19 @@ mod tests {
     }
 
     /// A writer that takes `whole` writes, then `partial` bytes of the
-    /// next, then refuses everything.
+    /// next, then refuses everything. With `flushes` set, it takes every
+    /// write and fails each flush after the first `flushes`.
     struct Breaking {
         bytes: Vec<u8>,
         whole: usize,
         partial: usize,
+        flushes: Option<usize>,
     }
 
     impl std::io::Write for Breaking {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if self.whole > 0 {
-                self.whole -= 1;
+            if self.whole > 0 || self.flushes.is_some() {
+                self.whole = self.whole.saturating_sub(1);
                 self.bytes.extend_from_slice(buf);
                 return Ok(buf.len());
             }
@@ -9929,7 +9991,14 @@ mod tests {
             Err(std::io::ErrorKind::BrokenPipe.into())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+            match &mut self.flushes {
+                Some(0) => Err(std::io::ErrorKind::BrokenPipe.into()),
+                Some(left) => {
+                    *left -= 1;
+                    Ok(())
+                }
+                None => Ok(()),
+            }
         }
     }
 
@@ -9961,6 +10030,7 @@ mod tests {
             bytes: Vec::new(),
             whole: 1,
             partial: 0,
+            flushes: None,
         };
         assert_eq!(
             feed_into(&spawn, "pipe-test", launched.run, &mut out),
@@ -9972,8 +10042,9 @@ mod tests {
         assert_eq!(texts.len(), 2, "{texts:?}");
         assert!(texts[1].contains("a message"));
 
-        // A delivery cut inside the event may have reached the agent: it
-        // counts as delivered and is not sent twice.
+        // A delivery cut inside the event is no event: half a line never
+        // reaches the agent as news, so its items stay undelivered, for the
+        // hook and for a feeder fed again.
         let news = ScriptedNews::default();
         *news.reads.lock().unwrap() = vec![vec![item(byte_id(6), "News: cut short", true)]];
         let spawn = f.spawn.clone().with_news(Arc::new(news));
@@ -9981,11 +10052,35 @@ mod tests {
             bytes: Vec::new(),
             whole: 1,
             partial: 10,
+            flushes: None,
         };
         assert_eq!(
             feed_into(&spawn, "pipe-test", launched.run, &mut out),
             FeedEnd::AgentGone
         );
+        let (_, texts) = feed_once(&spawn, "pipe-test", launched.run, 1);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("cut short"), "{}", texts[1]);
+
+        // Written whole, with a flush that failed after it: the whole event
+        // was handed over and may have been read, so it counts as shown and
+        // is not sent twice.
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![item(byte_id(7), "News: unflushed", true)]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let mut out = Breaking {
+            bytes: Vec::new(),
+            whole: 0,
+            partial: 0,
+            flushes: Some(1),
+        };
+        assert_eq!(
+            feed_into(&spawn, "pipe-test", launched.run, &mut out),
+            FeedEnd::AgentGone
+        );
+        let texts = fed_texts(&out.bytes);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("unflushed"), "{}", texts[1]);
         let (_, texts) = feed_once(&spawn, "pipe-test", launched.run, 1);
         assert_eq!(texts.len(), 1, "{texts:?}");
     }
@@ -10086,9 +10181,11 @@ mod tests {
         let f = fixture();
         let bin = f.directory.path().join("bin");
         let agent = bin.join("quick-agy");
+        // As the real agy 1.5.17: a prompt on the command line beside
+        // stream-json input is refused with exit 2.
         std::fs::write(
             &agent,
-            "#!/bin/bash\nread -r first\necho '{\"conversation_id\":\"c-e2e\",\"status\":\"SUCCESS\",\"response\":\"answered\",\"usage\":{}}'\n",
+            "#!/bin/bash\nprev=; fed=; p=\nfor a in \"$@\"; do\n  [ \"$prev\" = --input-format ] && [ \"$a\" = stream-json ] && fed=1\n  [ \"$a\" = -p ] && p=1\n  prev=$a\ndone\nif [ -n \"$fed\" ] && [ -n \"$p\" ]; then\n  echo '--input-format stream-json reads prompts from stdin, so a prompt given on the command line would be ignored' >&2\n  exit 2\nfi\nread -r first\necho '{\"conversation_id\":\"c-e2e\",\"status\":\"SUCCESS\",\"response\":\"answered\",\"usage\":{}}'\n",
         )
         .unwrap();
         let feeder = bin.join("quiet-zooid");
@@ -10131,5 +10228,115 @@ mod tests {
         assert!(status.success(), "{status}");
         let report = std::fs::read_to_string(&launched.report).unwrap();
         assert!(report.contains("answered"), "{report}");
+    }
+
+    /// The claude session a launch chose for its run, read from the unit
+    /// script's `--session-id` (shell words are quoted only when they need it).
+    fn claude_session_in_script(f: &Fixture, launched: &Launched) -> Option<String> {
+        let script = std::fs::read_to_string(f.spawn.launch.file(&launched.name, "sh")).unwrap();
+        let mut words = script.split_whitespace();
+        words.find(|word| *word == "--session-id")?;
+        words.next().map(|word| word.trim_matches('\'').to_owned())
+    }
+
+    /// A claude transcript of one user line and one reply in `session`.
+    fn claude_transcript(f: &Fixture, session: &str, reply: &str) {
+        let project = f.directory.path().join("claude-projects/-lane");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{session}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"user","sessionId":"{session}","uuid":"u1","parentUuid":null,"timestamp":"2026-11-26T00:00:00.000Z","message":{{"role":"user","content":"x"}}}}"#
+                ),
+                format_args!(
+                    r#"{{"type":"assistant","sessionId":"{session}","uuid":"a1","parentUuid":"u1","timestamp":"2026-11-26T00:00:01.000Z","message":{{"role":"assistant","model":"claude-opus-5-5","content":[{{"type":"text","text":"{reply}"}}],"usage":{{"input_tokens":2}}}}}}"#
+                ),
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A claude run killed before its result wrote no session id anywhere
+    /// but its transcript. Spawn chose the session at launch, so the turns
+    /// it lived are archived, and the gate to the next life opens only on
+    /// what was imported; a killed run with no transcript under a chosen
+    /// session is affirmatively empty.
+    #[test]
+    fn a_claude_run_killed_before_its_result_archives_the_turns_it_wrote() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Claude killed mid-life.")).unwrap();
+        let session =
+            claude_session_in_script(&f, &launched).expect("the launch names claude's session");
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert_eq!(run.source_locator, [format!("session/{session}")]);
+        claude_transcript(&f, &session, "a turn before the kill");
+        set_unit(&f, "inactive");
+        let _ = settle_as(&f, &launched, killed());
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(
+            run.archive_imported.first().is_some_and(|bytes| *bytes > 0),
+            "{:?} {:?}",
+            run.archive_imported,
+            run.archive_outcome
+        );
+        let thread = archive_thread(&f, &format!("session/{session}"));
+        assert!(thread.contains("a turn before the kill"), "{thread}");
+
+        // Killed before claude wrote anything: nothing to wait for.
+        let empty = f.spawn.run(&f.request("Claude killed at once.")).unwrap();
+        let session = claude_session_in_script(&f, &empty).unwrap();
+        set_unit(&f, "inactive");
+        let _ = settle_as(&f, &empty, killed());
+        let run = &f.spawn.show(&empty.name).unwrap().runs[0];
+        assert_eq!(run.archive_imported, [0], "{:?}", run.archive_outcome);
+        assert!(
+            run.archive_outcome
+                .iter()
+                .any(|outcome| outcome.contains(&session)),
+            "{:?}",
+            run.archive_outcome
+        );
+    }
+
+    /// A run that recorded no session (one launched before spawn chose
+    /// claude's) may still have lived turns: no search of claude's
+    /// projects says otherwise, so it is not recorded as empty.
+    #[test]
+    fn a_claude_run_without_a_session_is_not_recorded_as_empty() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Claude, no session.")).unwrap();
+        let mut view = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        view.source_locator.clear();
+        assert!(matches!(
+            f.spawn
+                .run_transcript(&launched.name, "claude", &view, Some(&[])),
+            Located::Refused(_)
+        ));
+    }
+
+    /// A given name is decided under the zooid's lock: a launch that passed
+    /// the name check, then waited for the lock while another brief took the
+    /// name, refuses instead of publishing a second zooid on it.
+    #[test]
+    fn a_given_name_taken_while_a_launch_waits_for_the_lock_refuses() {
+        let f = fixture();
+        let held = f.spawn.zooid_lock("race-test").unwrap();
+        let spawn = f.spawn.clone();
+        let request = named(&f, "Race, the first brief.", "race-test", false);
+        let waiting = std::thread::spawn(move || spawn.run(&request));
+        // Past its name check, it waits for the lock.
+        std::thread::sleep(Duration::from_millis(500));
+        let (mut fragment, other, _) = super::super::spawn_core("Race, the other brief.").unwrap();
+        fragment += super::super::name_fragment(other, "race-test", None);
+        f.spawn.publish(fragment).unwrap();
+        drop(held);
+        let error = waiting.join().unwrap().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already the name of zooid"),
+            "{error:#}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
     }
 }

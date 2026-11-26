@@ -848,6 +848,19 @@ mod tests {
                 continuation_active: true
             }
         );
+        // agy's hook payloads are protojson, camelCase (docs/hooks.md).
+        assert_eq!(
+            hook_input(r#"{"conversationId":"c-1","continuationActive":true}"#).unwrap(),
+            HookInput {
+                conversation: Some("c-1".to_owned()),
+                continuation_active: true
+            }
+        );
+        assert!(
+            !hook_input(r#"{"conversationId":"c-1","continuationActive":false}"#)
+                .unwrap()
+                .continuation_active
+        );
     }
 
     #[test]
