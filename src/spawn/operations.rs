@@ -2656,9 +2656,23 @@ impl Spawn {
         // settlements of one run never act on each other's stale reads, and
         // a launch in progress holds it until its run record is published,
         // so a newer run is either seen here or waits. When it cannot be
-        // taken the end is still recorded, but nothing is retired and no
-        // archive boundary is bound.
-        let lock = self.zooid_lock(&request.name);
+        // taken nothing is read, sent, archived or retired: without it two
+        // replays could both message. Only why is recorded, so settling
+        // again settles it whole.
+        let lock = match self.zooid_lock(&request.name) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let why = format!("not settled: {}'s lock could not be taken", request.name);
+                let error = error.context(why.clone());
+                return Err(
+                    match self.publish(super::run_annotation(run, None, Some(&why), None)) {
+                        Ok(()) => error,
+                        Err(record) => error
+                            .context(format!("also: record the settlement failure: {record:#}")),
+                    },
+                );
+            }
+        };
         let (already_ended, earlier_message, local, agent, resumed_at) =
             self.observe(|facts, reader| {
                 Ok((
@@ -2690,16 +2704,10 @@ impl Spawn {
         // Runs of the same zooid that started after this one; `None` when
         // that is unknown. Then the persona is not retired, and an archive
         // boundary not recorded yet is not recorded now.
-        let newer = match &lock {
-            Ok(_) => match self.newer_runs(run) {
-                Ok(newer) => Some(newer),
-                Err(error) => {
-                    failures.push(error.context("look for a newer run of the zooid"));
-                    None
-                }
-            },
+        let newer = match self.newer_runs(run) {
+            Ok(newer) => Some(newer),
             Err(error) => {
-                failures.push(anyhow!("take {}'s lock: {error:#}", request.name));
+                failures.push(error.context("look for a newer run of the zooid"));
                 None
             }
         };
