@@ -6379,6 +6379,50 @@ mod tests {
         assert!(f.persona(&launched.name).unwrap().retired);
     }
 
+    /// The distinguishing control: an ended run whose spawner was never messaged
+    /// is replayed while the zooid's lock cannot be taken. Without the lock
+    /// two such replays could both message, so the replay ends before any
+    /// send, retire or archive outcome, and a later one completes it.
+    #[test]
+    fn a_replay_that_cannot_take_the_lock_sends_and_records_nothing() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Lock fails on replay.")).unwrap();
+        std::fs::write(&launched.report, "Report.\n").unwrap();
+        // The end is recorded while messaging is unavailable.
+        f.settle("nobody-here", &launched).unwrap_err();
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(run.ended() && run.message.is_empty());
+        let outcomes = run.archive_outcome.len();
+        let failures = run.settle_failure.len();
+        // Messaging is back; the lock file cannot be opened.
+        let lock = f.spawn.launch.file(&launched.name, "lock");
+        let _ = std::fs::remove_file(&lock);
+        std::fs::create_dir(&lock).unwrap();
+        let error = f.settle(&launched.name, &launched).unwrap_err();
+        assert!(format!("{error:#}").contains("lock"), "{error:#}");
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        assert!(f.inbox().is_empty(), "no message without the lock");
+        assert!(run.message.is_empty());
+        assert_eq!(
+            run.archive_outcome.len(),
+            outcomes,
+            "no outcome without the lock"
+        );
+        assert_eq!(
+            run.settle_failure.len(),
+            failures + 1,
+            "{:?}",
+            run.settle_failure
+        );
+        assert!(!f.persona(&launched.name).unwrap().retired);
+
+        std::fs::remove_dir(&lock).unwrap();
+        let repaired = f.settle(&launched.name, &launched).unwrap();
+        assert!(repaired.already_ended && !repaired.already_messaged);
+        assert_eq!(f.inbox().len(), 1);
+        assert!(f.persona(&launched.name).unwrap().retired);
+    }
+
     #[test]
     fn a_wake_that_fails_fails_the_launch_even_with_a_tint() {
         let f = fixture_full(
