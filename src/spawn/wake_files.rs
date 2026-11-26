@@ -28,7 +28,8 @@ pub const PART_BYTES: usize = 40_000;
 pub const PART_LINES: usize = 700;
 
 /// The directory a zooid's parts are written to holds only them: each
-/// launch that writes parts removes the ones it finds there first.
+/// launch that writes parts empties it first ([`write`]), and only a file
+/// named as a part ([`is_part_name`]) is one.
 const PART_PREFIX: &str = "part-";
 const PART_SUFFIX: &str = ".md";
 
@@ -68,9 +69,27 @@ fn part_end(rest: &str) -> usize {
     end
 }
 
-/// Whether `name` is a part's file name.
+/// Whether `name` is a part's file name, as [`files`] names them:
+/// `part-<n>-of-<count>.md`, both decimal, `n` from 1 to `count`.
 pub fn is_part_name(name: &str) -> bool {
-    name.starts_with(PART_PREFIX) && name.ends_with(PART_SUFFIX)
+    let Some(rest) = name
+        .strip_prefix(PART_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PART_SUFFIX))
+    else {
+        return false;
+    };
+    let Some((index, count)) = rest.split_once("-of-") else {
+        return false;
+    };
+    let number = |text: &str| {
+        (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse::<u64>().ok())
+            .flatten()
+    };
+    match (number(index), number(count)) {
+        (Some(index), Some(count)) => (1..=count).contains(&index),
+        _ => false,
+    }
 }
 
 /// One part as a file: where it is written, and its text.
@@ -99,28 +118,52 @@ pub fn files<'a>(dir: &Path, wake: &'a str) -> Vec<Part<'a>> {
         .collect()
 }
 
-/// Write `parts` (all in one directory), after removing every part file
-/// an earlier launch left there, so a shorter wake never leaves a stale
-/// tail. Entries that are not part files are left as they are.
+/// Write `parts` (all in one directory) as the directory's only entries:
+/// everything an earlier launch, or anyone, left there is removed first, so
+/// a shorter wake leaves no stale tail and no other file there passes for a
+/// part. Nothing is written through a link: a link found inside is removed
+/// as an entry, each part is a new regular file, and a directory that is
+/// itself a link is refused.
 pub fn write(dir: &Path, parts: &[Part<'_>]) -> Result<()> {
     if let Some(part) = parts.iter().find(|part| part.path.parent() != Some(dir)) {
         bail!("{} is not in {}", part.path.display(), dir.display());
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    match std::fs::symlink_metadata(dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?
+        }
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dir.display())),
+        Ok(_) => {}
+    }
+    let meta =
+        std::fs::symlink_metadata(dir).with_context(|| format!("inspect {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        bail!(
+            "{} is a link or a file, not the wake's own directory: nothing was written",
+            dir.display()
+        );
+    }
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("read an entry of {}", dir.display()))?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.starts_with(PART_PREFIX)
-            && name.ends_with(PART_SUFFIX)
-            && entry.file_type().is_ok_and(|kind| kind.is_file())
-        {
-            std::fs::remove_file(entry.path())
-                .with_context(|| format!("remove {}", entry.path().display()))?;
+        let path = entry.path();
+        // The entry's own type: a link is a link here, never its target.
+        let kind = entry
+            .file_type()
+            .with_context(|| format!("inspect {}", path.display()))?;
+        if kind.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
         }
+        .with_context(|| format!("remove {}", path.display()))?;
     }
     for part in parts {
-        std::fs::write(&part.path, part.text)
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part.path)
+            .with_context(|| format!("create {}", part.path.display()))?;
+        std::io::Write::write_all(&mut file, part.text.as_bytes())
             .with_context(|| format!("write {}", part.path.display()))?;
     }
     Ok(())

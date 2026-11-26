@@ -121,8 +121,15 @@ pub mod spawn {
         "94D1C5DA8C9B004162DBB2D8B0FDDF76" as workdir: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The Claude effort level the run was started with.
         "D819F708F4213FA6188A80F778C33C78" as effort: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The whole opening context fed to the zooid: wake, tail, preamble, brief.
+        /// The first input fed to the zooid, byte for byte. Mostly the whole
+        /// opening context: wake, tail, preamble, brief. A life that reads its
+        /// wake by tools is fed who it is, the brief and the list of the wake's
+        /// parts; the wake itself is [`wake`].
         "9E76A94B167864C6C61D1FA7B5369FF2" as prompt: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// The wake a life was given to read by tools, as its parts hold it,
+        /// joined byte for byte. Whether it was read is the conversation's to
+        /// say. Minted with `trible genid` on 2026-11-26.
+        "46B7582C68FD1FC81AADD283AC6695EA" as wake: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The main process's exit code, when it exited rather than being killed.
         "CEBA41649EE59E5026D9C77A9D043846" as exit_code: inlineencodings::U256BE;
         /// systemd's verdict on the unit (`success`, `exit-code`, `signal`,

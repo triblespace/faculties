@@ -154,9 +154,11 @@ pub fn calls<L: AsRef<str>>(lines: impl IntoIterator<Item = L>) -> Vec<Call> {
     calls_reading(lines, None)
 }
 
-/// [`calls`], with each call that only reads files in `wake` (the life's
-/// wake parts, [`super::wake_files`]) marked as such: a call with tool calls,
-/// every one agy's `read_file` of a path inside `wake` with no `..` in it.
+/// [`calls`], with each call that only reads the life's wake parts in
+/// `wake` ([`super::wake_files`]) marked as such: a call with tool calls,
+/// every one agy's `read_file` of a file directly in `wake` named as a part
+/// ([`super::wake_files::is_part_name`]). The launch leaves nothing else
+/// there; any other read counts.
 pub fn calls_reading<L: AsRef<str>>(
     lines: impl IntoIterator<Item = L>,
     wake: Option<&Path>,
@@ -171,10 +173,11 @@ pub fn calls_reading<L: AsRef<str>>(
                 tool["name"] == "read_file"
                     && tool["args"]["Path"].as_str().is_some_and(|path| {
                         let path = Path::new(path);
-                        path.starts_with(dir)
+                        path.parent() == Some(dir)
                             && path
-                                .components()
-                                .all(|part| part != std::path::Component::ParentDir)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .is_some_and(super::wake_files::is_part_name)
                     })
             })
     };

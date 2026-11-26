@@ -224,11 +224,12 @@ enum Command {
     },
     /// A fed resident's input, run by its unit script into the agent's
     /// stdin: the prompt as the first stream-json user event, then the
-    /// persona's news between turns, each item at least once (a failed
-    /// flush, or a hook showing the same item at the same moment, can show
-    /// it twice), until the life is past
-    /// its limit (then the input closes) or the agent is gone. It
-    /// acknowledges nothing and writes no Orient receipt.
+    /// persona's news between turns, until the life is past its limit
+    /// (then the input closes) or the agent is gone. An unread message comes
+    /// at least once (a failed flush, or a hook showing the same item at the
+    /// same moment, can show it twice); other news is Orient's state as each
+    /// read finds it, so one replaced before it is shown comes as its
+    /// replacement. It acknowledges nothing and writes no Orient receipt.
     Feed {
         name: String,
         /// The run being fed (hex id), as `zooid spawn` wrote it into the script.

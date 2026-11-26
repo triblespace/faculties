@@ -895,6 +895,7 @@ mod tests {
                 workdir: "/tmp".to_owned(),
                 effort: "high".to_owned(),
                 prompt: brief.to_owned(),
+                wake: None,
                 provider: "claude".to_owned(),
                 provider_reason: "asked".to_owned(),
                 model: None,

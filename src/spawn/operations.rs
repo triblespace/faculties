@@ -1144,6 +1144,8 @@ pub struct RunView {
     pub persona: Vec<Id>,
     pub spawner: Vec<Id>,
     pub prompt: Vec<TextHandle>,
+    /// The wake given to read by tools, when the prompt lists its parts.
+    pub wake: Vec<TextHandle>,
     pub report: Vec<TextHandle>,
     /// The first report's text, when it is here.
     pub report_text: Option<String>,
@@ -1556,13 +1558,20 @@ const FEED_TAIL_BYTES: usize = 1_024;
 
 /// One feeder event: the news items not delivered before, as many as fit
 /// in one user event ([`super::wake_files::EVENT_BYTES`]), and how many of
-/// `items` it holds. The rest wait for the next read, and the event says how
-/// many. An item larger than an event alone is shown cut, and the cut is said.
+/// `items` it holds. Nothing that waits is kept by the feeder: each read
+/// derives the news again. An unread message is still unread then, so it
+/// comes in a later turn; anything else is the source's current state, so
+/// one replaced before the next read comes as its replacement and the one
+/// it replaced is not shown. The event says which waits, and how. An item
+/// larger than an event alone is shown cut, marked delivered, and the cut
+/// names where the whole of it is.
 fn feed_text(name: &str, items: &[NewsItem]) -> (String, usize) {
     let cap = super::wake_files::EVENT_BYTES - FEED_TAIL_BYTES;
     let mut text = format!(
-        "News for {name}, between your turns. Each item comes at least once, and now and \
-         then twice; a message stays unread until you `message_ack` it (from {name}).\n\n"
+        "News for {name}, between your turns. A message comes at least once, now and then \
+         twice, and stays unread until you `message_ack` it (from {name}). Anything else is \
+         what Orient sees as it is read (a goal's status, a Discord line): one that changes \
+         before it is shown is shown as it is then.\n\n"
     );
     let mut held = 0;
     for item in items {
@@ -1579,20 +1588,39 @@ fn feed_text(name: &str, items: &[NewsItem]) -> (String, usize) {
                 end -= 1;
             }
             text.push_str(&body[..end]);
+            let whole = if item.unread_message {
+                format!("Its whole text is in `message_list` (reader {name}).")
+            } else {
+                format!(
+                    "It is not a message, so `message_list` does not hold it; `orient_poll` \
+                     (persona {name}, peek true) shows it again while it is still news, and \
+                     the faculty it is from (Goals, Discord, Mail, Teams) holds it whole. \
+                     This feeder keeps no copy."
+                )
+            };
             text.push_str(&format!(
                 "\n[This item was cut here: it is {} bytes, more than one news turn holds, and \
-                 only its first {end} are shown. A message's whole text is in `message_list` \
-                 (reader {name}).]\n",
+                 only its first {end} are shown. {whole}]\n",
                 body.len()
             ));
             held = 1;
         }
         break;
     }
-    let waiting = items.len() - held;
-    if waiting > 0 {
+    let waiting = &items[held..];
+    let messages = waiting.iter().filter(|item| item.unread_message).count();
+    let others = waiting.len() - messages;
+    if messages > 0 {
         text.push_str(&format!(
-            "\n{waiting} more item(s) did not fit in this turn: they come in the next news turn.\n"
+            "\n{messages} more message(s) did not fit in this turn: they stay unread, and a \
+             later news turn brings them.\n"
+        ));
+    }
+    if others > 0 {
+        text.push_str(&format!(
+            "\n{others} more item(s) that are not messages did not fit in this turn. They are \
+             current state, read again at the next poll: one replaced before then comes as its \
+             replacement, and the one it replaced is not shown.\n"
         ));
     }
     (text, held)
@@ -2823,8 +2851,9 @@ impl Spawn {
                 None => (prompt, cover),
             };
             // A fresh life that reads its wake by tools is first given who it
-            // is, its brief and the wake's parts; the run records the whole
-            // opening context, the wake included, as any other run does.
+            // is, its brief and the wake's parts. The run records that first
+            // input as its prompt, exactly as it was fed, and the wake the
+            // parts hold beside it.
             let wake_dir = launch.wake_dir(&name);
             let (agent_input, wake_parts) = match &resident_wake {
                 Some(wake) if wake_by_files && agy_resume.conversation.is_none() => {
@@ -2864,7 +2893,10 @@ impl Spawn {
                 unit: unit.clone(),
                 workdir: workdir_text.clone(),
                 effort: effort.to_owned(),
-                prompt: prompt.clone(),
+                prompt: agent_input.clone(),
+                wake: (!wake_parts.is_empty())
+                    .then(|| resident_wake.clone())
+                    .flatten(),
                 provider: provider.name().to_owned(),
                 provider_reason: provider_reason.clone(),
                 model: model.clone(),
@@ -3098,7 +3130,7 @@ impl Spawn {
                 unit: unit.clone(),
                 report: report_path.clone(),
                 log: log_path.clone(),
-                prompt_chars: prompt.chars().count(),
+                prompt_chars: agent_input.chars().count(),
                 provider,
                 provider_reason: provider_reason.clone(),
                 model: model.clone(),
@@ -4183,15 +4215,17 @@ impl Spawn {
     /// prompt as the first user event, then each read of its news that
     /// holds something not yet delivered, as one user event between turns.
     /// An event holds as many items as fit in one ([`feed_text`]); the rest
-    /// stay undelivered and come with the next read.
+    /// stay undelivered, and the next read derives them again: an unread
+    /// message is still there, other news as it is by then.
     ///
     /// Delivered is kept in the run's inbox state, the file the inbox hooks
     /// keep what they showed in, under the same lock: an item the
     /// PreInvocation hook showed is not fed again, nor one fed here shown
     /// there. An item is recorded as delivered only once its event was
     /// written whole and flushed; an event cut, unwritten or not flushed
-    /// leaves its items undelivered, to be shown again (at least once: a
-    /// second showing is cheap, a lost one is not). The lock is not held while
+    /// leaves its items undelivered, to be shown again if they are still
+    /// news (a message at least once: a second showing is cheap, a lost one
+    /// is not). The lock is not held while
     /// writing, as the agent's own hook may wait for it: a hook and the
     /// feeder that read the same new item at once can both show it.
     ///
@@ -4739,6 +4773,8 @@ fn run_view<R: BlobStoreGet + ?Sized>(
         persona: find!(id: Id, pattern!(facts, [{ run @ attrs::persona: ?id }])).collect(),
         spawner: find!(id: Id, pattern!(facts, [{ run @ archive_attrs::author: ?id }])).collect(),
         prompt: find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::prompt: ?handle }]))
+            .collect(),
+        wake: find!(handle: TextHandle, pattern!(facts, [{ run @ attrs::wake: ?handle }]))
             .collect(),
         report_text: report.first().and_then(|handle| read_text(reader, *handle)),
         report,
@@ -5330,6 +5366,9 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
             )
         };
         writeln!(out, "  prompt: {}", handles(&run.prompt)).unwrap();
+        if !run.wake.is_empty() {
+            writeln!(out, "  wake read by tools: {}", handles(&run.wake)).unwrap();
+        }
         writeln!(out, "  report: {}", handles(&run.report)).unwrap();
         if let Some(report) = &run.report_text {
             writeln!(out, "  --- report").unwrap();
@@ -10361,6 +10400,7 @@ mod tests {
             workdir: "/tmp".to_owned(),
             effort: "high".to_owned(),
             prompt: "p".to_owned(),
+            wake: None,
             provider: "agy".to_owned(),
             provider_reason: "test".to_owned(),
             model: None,
@@ -10754,6 +10794,10 @@ mod tests {
         // The run records the exact first input it was given.
         let run = &f.spawn.show("parts-test").unwrap().runs[0];
         assert_eq!(run.prompt, [super::super::text_handle(&first)]);
+        // And the wake its parts hold, beside it.
+        assert_eq!(run.wake, [super::super::text_handle(&wake)]);
+        assert!(render_show(&f.spawn.show("parts-test").unwrap(), false)
+            .contains("wake read by tools: blake3:"));
         // The feeder's first event is that small input.
         let (_, texts) = feed_once(&f.spawn, "parts-test", launched.run, 1);
         assert_eq!(texts[0], first);

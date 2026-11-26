@@ -11,8 +11,10 @@ All notable changes to this project will be documented in this file.
   at most 40,000 bytes and 700 lines, so that one file read takes each. A step
   that only reads those parts is left out of the life limit's step margin, and
   the margin's floor is now 80,686 tokens (it was 109,802). A news turn holds
-  at most 128,000 bytes, and the turn says how many items wait for the next
-  one. A first input over that size refuses the launch.
+  at most 128,000 bytes, and the turn says what waits: unread messages stay
+  unread for a later turn, other news is read again as it is then. A first
+  input over that size refuses the launch. The run records that first input
+  as its prompt, and the wake the parts hold as its own record.
 
 - `install-release-cohort` keeps the current and the previous generation and
   removes the others after an activation: not those staged later, held by a
