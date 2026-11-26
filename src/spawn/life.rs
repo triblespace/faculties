@@ -8,25 +8,29 @@
 //! colony runs, is not Spawn's: a rule (Avalanche) or a person asks, and
 //! asking again is harmless.
 //!
-//! A next life follows only from a life that filled its context. Each of
-//! these must hold, and the first that does not is the reason nothing
-//! follows:
+//! When to ask is not Spawn's either. Spawn reads only whether a next life
+//! may follow here, and these must hold, the first that does not being the
+//! reason nothing follows:
 //!
 //! - one declaration stands for the zooid and places it on this host
-//!   ([`super::declaration::placed`]): a rest, an open or other host, two
-//!   heads, or no declaration at all starts nothing;
+//!   ([`super::declaration::placed`]): a rest (the zooid's own, or anyone's
+//!   with the authority to record it), an open or other host, two heads, or
+//!   no declaration at all starts nothing;
 //! - its newest run is resident, has ended, and realises that standing
 //!   declaration, or realises none while the standing declaration follows
 //!   none (a first life, lived before anything was declared). A life
 //!   started under an earlier declaration does not carry over a rest, or a
-//!   new placement after one: that is a new start;
-//! - that run ended cleanly with its context past its life limit, as
-//!   settlement observed it from the provider's own transcript. A clean
-//!   exit is required beside the observation: a life stopped, killed or
-//!   failed past its limit did not end because it filled;
+//!   new placement after one: that is a new start, never a continuation;
 //! - its conversation is in the archive (the launch checks this again);
 //! - its unit does not run, and its bound model, if any, is one this host
 //!   can honour.
+//!
+//! How the life ended is reported, never judged: the exit, and when
+//! settlement measured it, the context's size at the end beside its life
+//! limit. That size says how full the life was, not why it ended, so it is
+//! never read as a cause here; a rule that wants a positive exhaustion
+//! cause must read one where it is recorded. A process exit or quiet time
+//! is no rest, and no reason to start either.
 //!
 //! The launch admits it again under the zooid's lock: the newest run must
 //! still be the one this life follows, and the declaration must still
@@ -42,7 +46,7 @@ use triblespace::prelude::Id;
 
 use super::declaration::Standing;
 use super::operations::{
-    ended_clean, is_running, CoverWish, Launched, Provider, RunRequest, RunView, Spawn, ZooidWish,
+    is_running, CoverWish, Launched, Provider, RunRequest, RunView, Spawn, ZooidWish,
 };
 
 /// A next life that follows here: the launch that starts it.
@@ -53,7 +57,8 @@ pub struct Continuation {
     pub previous: Id,
     /// The declaration it makes true.
     pub declaration: Id,
-    /// What the previous life's end showed, in words.
+    /// How the previous life ended, in words: an observation for the
+    /// caller, which decided to ask; never a reason Spawn applied.
     pub evidence: String,
     pub request: RunRequest,
 }
@@ -84,31 +89,21 @@ fn nothing<T: Into<String>>(reason: T) -> Result<NextLife> {
     })
 }
 
-/// Whether `run` ended at its life limit: a clean end past it, or why not.
-fn filled(run: &RunView) -> std::result::Result<String, String> {
-    let (occupancy, limit) = match (run.life_occupancy.first(), run.life_limit.first()) {
-        (Some(occupancy), Some(limit)) => (*occupancy, *limit),
-        _ => {
-            return Err(format!(
-                "its life {:x} ended with no life-limit observation: an ordinary end, a stop \
-                 or a failure, or a provider whose transcript settlement does not measure",
-                run.id
-            ))
-        }
+/// How `run` ended, in words: its exit, and the size settlement measured
+/// at its end when it did. An observation of the end, not its cause.
+fn end_of(run: &RunView) -> String {
+    let size = match (run.life_occupancy.first(), run.life_limit.first()) {
+        (Some(occupancy), Some(limit)) => format!(
+            "; settlement measured {occupancy} tokens of context at its end, past its life \
+             limit of {limit} (the size at its end, not its cause)"
+        ),
+        _ => "; settlement measured no context past its life limit".to_owned(),
     };
-    if !ended_clean(run, false) {
-        return Err(format!(
-            "its life {:x} was past its limit ({occupancy} of {limit} tokens) but did not end \
-             cleanly ({}): a stop or a failure, not a filled context",
-            run.id,
-            super::operations::describe_end(run)
-        ));
-    }
-    Ok(format!(
-        "its life {:x} ended cleanly with {occupancy} tokens of context, past its life limit of \
-         {limit}",
-        run.id
-    ))
+    format!(
+        "its life {:x} ended {}{size}",
+        run.id,
+        super::operations::describe_end(run)
+    )
 }
 
 impl Spawn {
@@ -167,10 +162,7 @@ impl Spawn {
                 last.id, placement.declaration
             ));
         }
-        let evidence = match filled(last) {
-            Ok(evidence) => evidence,
-            Err(why) => return nothing(format!("{name}: {why}")),
-        };
+        let evidence = end_of(last);
         let provider = match last.provider.as_slice() {
             [one] => Provider::parse(one)?,
             other => {

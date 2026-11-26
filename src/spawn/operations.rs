@@ -9805,10 +9805,10 @@ mod tests {
 
     /// The rehearsal of a window's life cycle on Spawn alone: a scripted agy
     /// provider, a fake systemd and a disposable signed pile. A life that
-    /// filled its context continues once, under the declaration that stands;
+    /// ended is followed at most once, under the declaration that stands;
     /// a rest, and a placement after it, start nothing from the old end.
     #[test]
-    fn a_resident_continues_once_from_a_filled_life_and_never_from_rest() {
+    fn a_resident_continues_once_per_life_and_never_from_rest() {
         use super::super::declaration::{Place, PlaceWish};
         use super::super::life::{Continued, NextLife};
         let f = fixture();
@@ -9911,50 +9911,67 @@ mod tests {
         assert_eq!(third.persona, first.persona);
     }
 
-    /// Only a filled context continues: an ordinary end, a stop past the
-    /// limit, an unarchived conversation, or a provider whose end is not
-    /// measured (a claude window, today) start nothing.
+    /// Spawn reports how a life ended and does not judge it: an ordinary
+    /// end and a stop may both be followed when asked, each saying what it
+    /// was; the end-size observation is never called a cause. What does
+    /// refuse is the zooid's own rest and a life not yet in the archive.
     #[test]
-    fn a_resident_does_not_continue_from_an_ordinary_end_a_stop_or_an_unarchived_life() {
-        use super::super::declaration::PlaceWish;
+    fn a_next_life_reports_its_predecessors_end_and_refuses_rest_and_an_unarchived_life() {
+        use super::super::declaration::{Place, PlaceWish};
+        use super::super::life::NextLife;
         let f = fixture();
-        let life = |name: &str, provider: Provider| {
+        let life = |name: &str| {
             let mut request = named(&f, &format!("Resident {name}."), name, true);
-            request.provider = provider;
+            request.provider = Provider::Agy;
             let launched = f.spawn.run(&request).unwrap();
             declare_as(&f, name, PlaceWish::Here);
             set_unit(&f, "inactive");
             launched
         };
-        // An ordinary end with room left.
-        let roomy = life("roomy-test", Provider::Agy);
+        let follows = |name: &str| match f.spawn.next_life(name).unwrap() {
+            NextLife::Follows(next) => next.evidence,
+            NextLife::Nothing { reason } => panic!("nothing follows {name}: {reason}"),
+        };
+        // An ordinary end with room left: it may follow, and says so.
+        let roomy = life("roomy-test");
         agy_ran(&agy_home_of(&f, "roomy-test"), &roomy.report, "c-r", &[50_000, 120_000]);
         settle_as(&f, &roomy, Exit::from_systemd("exited", "0", "success")).unwrap();
-        let reason = nothing_follows(&f, "roomy-test");
-        assert!(reason.contains("no life-limit observation"), "{reason}");
-        // Past its limit, but stopped.
-        let stopped = life("stopped-test", Provider::Agy);
+        let evidence = follows("roomy-test");
+        assert!(evidence.contains("measured no context past its life limit"), "{evidence}");
+        // Past its limit but stopped: the size is reported as a size, beside
+        // the stop, not as the reason it ended.
+        let stopped = life("stopped-test");
         agy_ran(&agy_home_of(&f, "stopped-test"), &stopped.report, "c-s", &[50_000, 400_000]);
         settle_as(&f, &stopped, Exit::from_systemd("killed", "TERM", "signal")).unwrap();
-        let reason = nothing_follows(&f, "stopped-test");
-        assert!(reason.contains("did not end cleanly"), "{reason}");
-        // Filled, but its conversation will not import.
-        let lost = life("lost-test", Provider::Agy);
+        let evidence = follows("stopped-test");
+        assert!(evidence.contains("TERM"), "{evidence}");
+        assert!(evidence.contains("not its cause"), "{evidence}");
+        // The zooid puts itself to rest: nothing follows, however it ended.
+        f.spawn
+            .declare(&super::super::declaration::DeclareRequest {
+                name: "roomy-test".to_owned(),
+                place: PlaceWish::At(Place::Rest),
+                model_spec: None,
+                model_label: None,
+                reason: Some("satisfied".to_owned()),
+                persona: "roomy-test".to_owned(),
+            })
+            .unwrap();
+        let reason = nothing_follows(&f, "roomy-test");
+        assert!(reason.contains("at rest"), "{reason}");
+        // A life whose conversation did not import: nothing follows yet.
+        let lost = life("lost-test");
         let home = agy_home_of(&f, "lost-test");
         agy_ran(&home, &lost.report, "c-l", &[50_000, 400_000]);
         let path = super::super::agy::transcript(&home, "c-l").unwrap();
         std::fs::write(&path, "{not json\n").unwrap();
         settle_as(&f, &lost, Exit::from_systemd("exited", "0", "success")).unwrap();
         let reason = nothing_follows(&f, "lost-test");
-        assert!(
-            reason.contains("no life-limit observation") || reason.contains("not in the archive"),
-            "{reason}"
-        );
-        // A claude resident's end carries no life-limit observation yet.
-        let window = life("window-test", Provider::Claude);
-        f.settle("window-test", &window).unwrap();
-        let reason = nothing_follows(&f, "window-test");
-        assert!(reason.contains("no life-limit observation"), "{reason}");
+        assert!(reason.contains("not in the archive"), "{reason}");
+        assert!(matches!(
+            f.spawn.continue_life("lost-test").unwrap(),
+            super::super::life::Continued::Nothing { .. }
+        ));
     }
 
     #[test]

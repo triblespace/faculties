@@ -193,13 +193,14 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         persona: Option<String>,
     },
-    /// Start a resident zooid's next life here, when one follows: one
+    /// Start a resident zooid's next life here, when one may follow: one
     /// declaration places it on this host, its newest life realised that
-    /// declaration and ended cleanly past its life limit, its conversation
-    /// is archived and its unit is not running. Otherwise print why nothing
-    /// follows and start nothing. One launch at most per life: asking again,
-    /// or twice at once, finds the life followed. A rest, an ordinary end or
-    /// a placement newer than the last life never continues.
+    /// declaration and has ended, its conversation is archived and its unit
+    /// is not running. Otherwise print why nothing follows and start
+    /// nothing. One launch at most per life: asking again, or twice at once,
+    /// finds the life followed. A rest, or a placement newer than the last
+    /// life, never continues. When to ask is the caller's (a rule, a
+    /// person): how the life ended is printed, not judged.
     Continue {
         name: String,
         /// Only say whether a next life follows; start nothing.
@@ -698,7 +699,7 @@ pub fn run() -> Result<()> {
                 let text = if check {
                     match spawn.next_life(&name)? {
                         NextLife::Follows(next) => format!(
-                            "{} follows on: {}; its next life would realise declaration {:x}.\n",
+                            "{} may follow on: {}; its next life would realise declaration {:x}.\n",
                             next.name, next.evidence, next.declaration
                         ),
                         NextLife::Nothing { reason } => format!("nothing follows: {reason}\n"),
@@ -709,7 +710,7 @@ pub fn run() -> Result<()> {
                             continuation,
                             launched,
                         } => format!(
-                            "{} continues: {}. Run {:x} (unit {}) follows life {:x} and realises \
+                            "{} continues ({}). Run {:x} (unit {}) follows life {:x} and realises \
                              declaration {:x}.\n",
                             continuation.name,
                             continuation.evidence,
