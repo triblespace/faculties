@@ -3839,15 +3839,11 @@ impl Spawn {
                     path,
                     source: crate::archive::ImportSource::ClaudeCode,
                 }),
-                // A run with no report never answered: with its session
-                // chosen at launch and no transcript anywhere under claude's
-                // projects, claude wrote none.
-                Ok(None) if view.report.is_empty() => Located::Nothing(format!(
-                    "Its session {session} has no transcript under claude's projects: it ended \
-                     before claude wrote one."
-                )),
-                Ok(None) => Located::Refused(format!(
-                    "Its session {session} was not found under claude's projects to archive."
+                // Its session was chosen at launch, and no project under
+                // claude's projects holds it: claude wrote none.
+                Ok(None) => Located::Nothing(format!(
+                    "Its session {session} has no transcript under claude's projects, so there \
+                     was nothing to archive."
                 )),
                 Err(error) => Located::Refused(format!(
                     "Looking for its session {session} under claude's projects failed \
