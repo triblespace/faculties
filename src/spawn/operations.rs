@@ -10209,9 +10209,9 @@ mod tests {
         assert_eq!(texts.len(), 2, "{texts:?}");
         assert!(texts[1].contains("cut short"), "{}", texts[1]);
 
-        // Written whole, with a flush that failed after it: the whole event
-        // was handed over and may have been read, so it counts as shown and
-        // is not sent twice.
+        // Written whole, with a flush that failed after it: whether it was
+        // read is in doubt, so nothing counts as shown. A second showing is
+        // cheap, a lost one is not.
         let news = ScriptedNews::default();
         *news.reads.lock().unwrap() = vec![vec![item(byte_id(7), "News: unflushed", true)]];
         let spawn = f.spawn.clone().with_news(Arc::new(news));
@@ -10229,7 +10229,8 @@ mod tests {
         assert_eq!(texts.len(), 2, "{texts:?}");
         assert!(texts[1].contains("unflushed"), "{}", texts[1]);
         let (_, texts) = feed_once(&spawn, "pipe-test", launched.run, 1);
-        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("unflushed"), "{}", texts[1]);
     }
 
     #[test]
