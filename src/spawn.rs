@@ -178,7 +178,8 @@ pub struct RunFacts {
     pub unit: String,
     pub workdir: String,
     pub effort: String,
-    /// The first input, exactly as the agent was given it.
+    /// The prompt file, exactly as it was written: the first input of every
+    /// provider but the local executor ([`crate::schemas::spawn`]'s `prompt`).
     pub prompt: String,
     /// The wake given to read by tools, when the first input lists its parts
     /// instead of holding it ([`wake_files`]).

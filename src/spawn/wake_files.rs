@@ -121,12 +121,13 @@ pub fn files<'a>(dir: &Path, wake: &'a str) -> Vec<Part<'a>> {
         .collect()
 }
 
-/// Write `parts` (all in one directory) as the directory's only entries:
-/// everything an earlier launch, or anyone, left there is removed first, so
-/// a shorter wake leaves no stale tail and no other file there passes for a
-/// part. Nothing is written through a link: a link found inside is removed
-/// as an entry, each part is a new regular file, and a directory that is
-/// itself a link is refused.
+/// Write `parts` (all in one directory) as the directory's only entries.
+/// What a launch made there before, part files, is removed first, so a
+/// shorter wake leaves no stale tail; so is any link, as an entry, never its
+/// target. Anything else found there (a directory, a file not named as a
+/// part) was not made here: the write is refused and nothing is removed. No
+/// part is written through a link: each is a new regular file, and a
+/// directory that is itself a link is refused.
 pub fn write(dir: &Path, parts: &[Part<'_>]) -> Result<()> {
     if let Some(part) = parts.iter().find(|part| part.path.parent() != Some(dir)) {
         bail!("{} is not in {}", part.path.display(), dir.display());
@@ -146,6 +147,8 @@ pub fn write(dir: &Path, parts: &[Part<'_>]) -> Result<()> {
             dir.display()
         );
     }
+    let mut ours = Vec::new();
+    let mut foreign = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry.with_context(|| format!("read an entry of {}", dir.display()))?;
         let path = entry.path();
@@ -153,12 +156,28 @@ pub fn write(dir: &Path, parts: &[Part<'_>]) -> Result<()> {
         let kind = entry
             .file_type()
             .with_context(|| format!("inspect {}", path.display()))?;
-        if kind.is_dir() {
-            std::fs::remove_dir_all(&path)
+        let part = entry.file_name().to_str().is_some_and(is_part_name);
+        if kind.is_symlink() || (kind.is_file() && part) {
+            ours.push(path);
         } else {
-            std::fs::remove_file(&path)
+            foreign.push(path);
         }
-        .with_context(|| format!("remove {}", path.display()))?;
+    }
+    if !foreign.is_empty() {
+        foreign.sort();
+        bail!(
+            "{} holds what no launch made there: {}. Nothing was removed or written; move it \
+             away and launch again",
+            dir.display(),
+            foreign
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for path in ours {
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
     }
     for part in parts {
         let mut file = std::fs::OpenOptions::new()
@@ -276,17 +295,44 @@ mod tests {
         assert!(long[0].path.ends_with("part-01-of-11.md"));
         assert!(long[10].path.ends_with("part-11-of-11.md"));
         write(dir.path(), &long).unwrap();
-        std::fs::write(dir.path().join("notes.txt"), "not a part").unwrap();
         let short = files(dir.path(), "a short wake\n");
         write(dir.path(), &short).unwrap();
-        let mut names: Vec<String> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        // The directory holds exactly the parts: anything else found there
-        // is removed, so a read of it is never taken for a read of the wake.
-        assert_eq!(names, ["part-1-of-1.md"]);
+        let names = || {
+            let mut names: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(), ["part-1-of-1.md"]);
+        // What no launch made there is neither removed nor written past:
+        // the write is refused and says what it found.
+        for foreign in ["notes.txt", "sub"] {
+            let path = dir.path().join(foreign);
+            if foreign == "sub" {
+                std::fs::create_dir(&path).unwrap();
+                std::fs::write(path.join("kept.txt"), "kept").unwrap();
+            } else {
+                std::fs::write(&path, "not a part").unwrap();
+            }
+            let error = write(dir.path(), &long).unwrap_err();
+            assert!(format!("{error:#}").contains(foreign), "{error:#}");
+            assert_eq!(names(), [foreign, "part-1-of-1.md"]);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("part-1-of-1.md")).unwrap(),
+                "a short wake\n"
+            );
+            if foreign == "sub" {
+                assert_eq!(
+                    std::fs::read_to_string(path.join("kept.txt")).unwrap(),
+                    "kept"
+                );
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }
         assert!(write(dir.path(), &files(&dir.path().join("other"), "x")).is_err());
     }
 

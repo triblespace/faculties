@@ -121,10 +121,13 @@ pub mod spawn {
         "94D1C5DA8C9B004162DBB2D8B0FDDF76" as workdir: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The Claude effort level the run was started with.
         "D819F708F4213FA6188A80F778C33C78" as effort: inlineencodings::Handle<blobencodings::UTF8String>;
-        /// The first input fed to the zooid, byte for byte. Mostly the whole
-        /// opening context: wake, tail, preamble, brief. A life that reads its
-        /// wake by tools is fed who it is, the brief and the list of the wake's
-        /// parts; the wake itself is [`wake`].
+        /// The run's prompt file, byte for byte: the opening context (wake,
+        /// tail, preamble, brief), which claude, codex, vibe and agy read as
+        /// their first input. A fresh agy resident life that reads its wake by
+        /// tools is given who it is, the brief and the list of the wake's
+        /// parts, and that is what is recorded; the wake itself is [`wake`].
+        /// A local executor is given its wake-free brief instead, so its
+        /// prompt is the context assembled for it, not its first input.
         "9E76A94B167864C6C61D1FA7B5369FF2" as prompt: inlineencodings::Handle<blobencodings::UTF8String>;
         /// The wake a life was given to read by tools, as its parts hold it,
         /// joined byte for byte. Whether it was read is the conversation's to
