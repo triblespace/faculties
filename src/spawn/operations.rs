@@ -952,7 +952,27 @@ pub struct Launched {
 pub struct AgyResume {
     /// The conversation `--conversation` continues; `None` starts fresh.
     pub conversation: Option<String>,
+    /// The bytes its transcript held at launch: the earlier lives' part.
+    pub start: Option<u64>,
     pub reason: String,
+}
+
+/// Where an ended run's transcript is ([`Spawn::run_transcript`]).
+enum Located {
+    /// The provider's transcript is not located at settlement.
+    Outside,
+    /// Nothing to archive, and nothing went wrong: why.
+    Nothing(String),
+    /// A transcript that should be found was not: why.
+    Refused(String),
+    Found(RunTranscript),
+}
+
+/// A run's conversation, its transcript file, and the importer that reads it.
+struct RunTranscript {
+    conversation: String,
+    path: PathBuf,
+    source: crate::archive::ImportSource,
 }
 
 /// The files of one run that an agent's command line names.
@@ -1091,7 +1111,20 @@ pub struct RunView {
     /// The conversation the provider recorded, as the archive locates it
     /// (`session/<id>`); `archive thread` reads it once imported.
     pub source_locator: Vec<String>,
+    /// The part of the conversation's transcript that settlement archives
+    /// for this run: its byte length, digest, and the unfinished tail it
+    /// withheld ([`attrs::archive_end`]).
+    pub archive_end: Vec<u64>,
+    pub archive_digest: Vec<DigestValue>,
+    pub archive_withheld: Vec<u64>,
+    /// What each settlement's archive step did, in words.
+    pub archive_outcome: Vec<String>,
+    /// The transcript's length when this run launched to continue it.
+    pub archive_start: Vec<u64>,
 }
+
+/// A BLAKE3 digest as the pile stores it.
+pub type DigestValue = Inline<inlineencodings::Hash<inlineencodings::Blake3>>;
 
 impl RunView {
     pub fn ended(&self) -> bool {
@@ -1908,6 +1941,7 @@ impl Spawn {
     fn agy_resume(&self, spawn: Id, workdir: &str, home: &Path) -> AgyResume {
         let fresh = |reason: String| AgyResume {
             conversation: None,
+            start: None,
             reason,
         };
         let latest = self.observe(|facts, reader| {
@@ -1967,12 +2001,35 @@ impl Spawn {
                 run.workdir.join(", ")
             ));
         }
+        // A transcript that ends inside a line was cut by a killed run.
+        // Continuing it would put that line inside the conversation, which
+        // could then never be archived whole.
+        let start =
+            match super::agy::transcript(home, &conversation).and_then(|path| {
+                std::fs::read(&path).with_context(|| format!("read {}", path.display()))
+            }) {
+                Ok(bytes) if !bytes.is_empty() && !bytes.ends_with(b"\n") => {
+                    return fresh(format!(
+                    "fresh: conversation {conversation}'s transcript ends in an unfinished line \
+                     ({} bytes after the last complete one), left by a run that was stopped \
+                     while it wrote",
+                    bytes.len() - bytes.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1)
+                ));
+                }
+                Ok(bytes) => bytes.len() as u64,
+                Err(error) => {
+                    return fresh(format!(
+                        "fresh: conversation {conversation}'s transcript is unreadable: {error:#}"
+                    ))
+                }
+            };
         match super::agy::read_life(home, Some(&conversation), self.launch.agy_window) {
             Ok(Some(life)) if life.over => fresh(format!(
                 "fresh: conversation {conversation} ended its life at {} of {} tokens",
                 life.occupancy, life.window
             )),
             Ok(Some(life)) => AgyResume {
+                start: Some(start),
                 reason: format!(
                     "continues conversation {conversation} at {} of {} tokens (life limit {})",
                     life.occupancy, life.window, life.limit
@@ -2220,6 +2277,10 @@ impl Spawn {
         let key = crate::storage::signer_path(&pile, self.storage.key_path());
         let key = std::fs::canonicalize(&key).with_context(|| format!("key {}", key.display()))?;
 
+        // Held until the run record is published (or the failed launch has
+        // retired the persona), so a replayed settlement of an earlier run
+        // either sees this run or waits for it.
+        let _zooid_lock = self.zooid_lock(&name)?;
         let persona = match relations.person_state(&name)? {
             Some(state) if !state.retired => {
                 let unit_state = self
@@ -2316,9 +2377,14 @@ impl Spawn {
                 Provider::Agy => self.agy_resume(spawn, &workdir_text, &agy_home),
                 _ => AgyResume::default(),
             };
-            let prompt = match &agy_resume.conversation {
-                Some(conversation) => super::agy_resume_prompt(&name, spawner_label, conversation),
-                None => prompt,
+            // A continued conversation is not fed the cover: the run records
+            // none, so nothing claims it received one.
+            let (prompt, cover) = match &agy_resume.conversation {
+                Some(conversation) => (
+                    super::agy_resume_prompt(&name, spawner_label, conversation),
+                    None,
+                ),
+                None => (prompt, cover),
             };
             let provider_reason = match provider {
                 Provider::Agy => format!("{provider_reason}; {}", agy_resume.reason),
@@ -2481,6 +2547,17 @@ impl Spawn {
             started = true;
             let mut record = spawn_fragment;
             record += run_fragment;
+            if let (Some(conversation), Some(start)) = (&agy_resume.conversation, agy_resume.start)
+            {
+                // A continued conversation is the run's from launch: a later
+                // settlement never has to find it in the home.
+                let locator =
+                    record.put::<blobencodings::UTF8String, _>(format!("session/{conversation}"));
+                record += entity! { ExclusiveId::force_ref(&run) @
+                    crate::schemas::blockdag::source_projection::source_locator: locator,
+                    attrs::archive_start: start,
+                };
+            }
             if let Some(why) = &lexical_fallback {
                 record +=
                     entity! { ExclusiveId::force_ref(&run) @ attrs::lexical_fallback: why.clone() };
@@ -2571,8 +2648,9 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
-        let (already_ended, earlier_message, local, agent) = self.observe(|facts, reader| {
-            Ok((
+        let (already_ended, earlier_message, local, agent, resumed_at) =
+            self.observe(|facts, reader| {
+                Ok((
                 find!(at: IntervalValue, pattern!(facts, [{ run @ metadata::finished_at: ?at }]))
                     .next()
                     .is_some(),
@@ -2588,8 +2666,14 @@ impl Spawn {
                         .next()
                         .and_then(|handle| read_text(reader, handle)),
                 ),
+                find!(
+                    count: Inline<inlineencodings::U256BE>,
+                    pattern!(facts, [{ run @ attrs::archive_start: ?count }])
+                )
+                .next()
+                .and_then(|count| count.try_from_inline::<u64>().ok()),
             ))
-        })?;
+            })?;
         let (agent, agent_model) = agent;
         let mut failures = Vec::new();
         // A hosted run's report or a local run's closing message. Either is
@@ -2636,7 +2720,9 @@ impl Spawn {
             let usage = usage.or_else(|| reported.usage.clone());
             if agent.as_deref() == Some(Provider::Agy.name()) {
                 // The first call's input, as agy itself counted it in the
-                // conversation's transcript: what the cover cost.
+                // conversation's transcript: what the cover cost. A run that
+                // continued the conversation counts its own first call, the
+                // first after the bytes the transcript held at its launch.
                 let conversation = reported
                     .source_locator
                     .as_deref()
@@ -2645,7 +2731,11 @@ impl Spawn {
                     let home = self.launch.file(&request.name, "agy");
                     if let Ok(path) = super::agy::transcript(&home, conversation) {
                         if let Ok(text) = std::fs::read_to_string(&path) {
-                            reported.first_call_input_tokens = super::agy::calls(text.lines())
+                            let own = usize::try_from(resumed_at.unwrap_or(0))
+                                .ok()
+                                .and_then(|start| text.get(start..))
+                                .unwrap_or("");
+                            reported.first_call_input_tokens = super::agy::calls(own.lines())
                                 .first()
                                 .map(|call| call.occupancy);
                         }
@@ -2665,6 +2755,26 @@ impl Spawn {
                 failures.push(error.context("record the run's end"));
             }
         }
+        // The zooid's lock on this host, from reading its newer runs until
+        // the retire is decided: a launch in progress holds it until its run
+        // record is published, so it is either seen here or waits.
+        let lock = self.zooid_lock(&request.name);
+        // Runs of the same zooid that started after this one; `None` when
+        // that is unknown. Then the persona is not retired, and an archive
+        // boundary not recorded yet is not recorded now.
+        let newer = match &lock {
+            Ok(_) => match self.newer_runs(run) {
+                Ok(newer) => Some(newer),
+                Err(error) => {
+                    failures.push(error.context("look for a newer run of the zooid"));
+                    None
+                }
+            },
+            Err(error) => {
+                failures.push(anyhow!("take {}'s lock: {error:#}", request.name));
+                None
+            }
+        };
         // What the pile now says about the run is what the message reports,
         // so a repeated settlement describes the end that was recorded.
         let recorded = self.observe(|facts, reader| {
@@ -2698,10 +2808,12 @@ impl Spawn {
                 )
             }
         };
-        // An agy run's conversation goes into the archive as it ends, whatever
+        // The run's conversation goes into the archive as it ends, whatever
         // the end: a failure is its own line, never the run's result.
         let archived = match (agent.as_deref(), &recorded) {
-            (Some(agent), Ok(Some(view))) => self.archive_run(&request.name, agent, view),
+            (Some(agent), Ok(Some(view))) => {
+                self.archive_run(&request.name, agent, view, newer.as_deref())
+            }
             _ => String::new(),
         };
         let mut message = earlier_message;
@@ -2752,26 +2864,36 @@ impl Spawn {
             }
         }
         // A replayed settlement (to retry its archive import, say) must not
-        // retire a persona that a newer run of the same zooid revived.
-        let superseded = self.newer_run(run).unwrap_or_else(|error| {
-            failures.push(error.context("look for a newer run of the zooid"));
-            None
-        });
-        if let Some(newer) = superseded {
-            let why = format!(
-                "not retiring {}: run {newer:x} of the same zooid started after this one",
-                request.name
-            );
-            let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
-        } else if message.is_some() {
-            if let Err(error) = Relations::with_storage(self.storage.clone()).retire(&request.name)
-            {
-                let why = format!("retire {}: {error:#}", request.name);
-                // Best effort: the failure itself is returned either way.
+        // retire a persona that a newer run of the same zooid revived; one
+        // that cannot tell does not retire it either.
+        match newer.as_deref() {
+            None => {
+                let why = format!(
+                    "not retiring {}: whether a newer run of the same zooid started is unknown",
+                    request.name
+                );
                 let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
-                failures.push(error.context(format!("retire {}", request.name)));
             }
+            Some([newer, ..]) => {
+                let why = format!(
+                    "not retiring {}: run {:x} of the same zooid started after this one",
+                    request.name, newer.id
+                );
+                let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
+            }
+            Some([]) if message.is_some() => {
+                if let Err(error) =
+                    Relations::with_storage(self.storage.clone()).retire(&request.name)
+                {
+                    let why = format!("retire {}: {error:#}", request.name);
+                    // Best effort: the failure itself is returned either way.
+                    let _ = self.publish(super::run_annotation(run, None, Some(&why), None));
+                    failures.push(error.context(format!("retire {}", request.name)));
+                }
+            }
+            Some([]) => {}
         }
+        drop(lock);
         let mut failures = failures.into_iter();
         match failures.next() {
             None => Ok(Settled {
@@ -2932,90 +3054,227 @@ impl Spawn {
     /// Import an ended run's conversation into the archive, from where its
     /// provider keeps it, whatever the end: the seam every provider shares,
     /// each saying where its transcript is and which importer reads it
-    /// ([`Self::run_transcript`]). Importing the same bytes again adds
-    /// nothing. Returns the sentence for the spawner, which says archived
-    /// only when the import succeeded. A failure is recorded on the run as
-    /// a settlement failure and leaves its exit and result alone;
-    /// ingest-sessions finds the transcript again later.
-    fn archive_run(&self, name: &str, agent: &str, view: &RunView) -> String {
-        let (conversation, path, source) = match self.run_transcript(name, agent, view) {
-            Ok(Some(found)) => found,
-            Ok(None) => return String::new(),
-            Err(why) => return format!(" {why}"),
+    /// ([`Self::run_transcript`]). Only the run's own part is imported
+    /// ([`Self::archive_part`]), so importing again adds nothing. The outcome
+    /// is recorded on the run whatever the message path, and a failure also
+    /// as a settlement failure; neither changes its exit or result. Returns
+    /// the sentence for the spawner, which says archived only when the
+    /// import succeeded.
+    fn archive_run(
+        &self,
+        name: &str,
+        agent: &str,
+        view: &RunView,
+        newer: Option<&[RunView]>,
+    ) -> String {
+        let outcome = match self.run_transcript(name, agent, view, newer) {
+            Located::Outside => return String::new(),
+            Located::Nothing(why) => Ok(why),
+            Located::Refused(why) => Err(why),
+            Located::Found(found) => self.archive_part(view, newer, &found),
         };
+        let (mut sentence, failed) = match outcome {
+            Ok(sentence) => (sentence, false),
+            Err(sentence) => (sentence, true),
+        };
+        let mut fragment = Fragment::empty();
+        let text = fragment.put::<blobencodings::UTF8String, _>(sentence.clone());
+        fragment += entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_outcome: text };
+        if failed {
+            fragment += super::run_annotation(view.id, None, Some(&sentence), None);
+        }
+        if let Err(error) = self.publish(fragment) {
+            sentence.push_str(&format!(" (Recording this on the run failed: {error:#}.)"));
+        }
+        format!(" {sentence}")
+    }
+
+    /// Import the run's own part of its conversation's transcript.
+    ///
+    /// The part is bound once, before anything is imported: the bytes
+    /// through the last complete line, their digest, and the unfinished
+    /// tail withheld after them. A replay imports exactly those bytes while
+    /// the file still begins with them, and refuses otherwise, so what a
+    /// later run appended never goes in under this one. A complete line
+    /// that does not parse is damage and fails the import; an unfinished
+    /// last line is not, and is only withheld.
+    ///
+    /// No boundary is bound while a newer run continues the same
+    /// conversation (its end is then not this run's), nor while whether one
+    /// started is unknown.
+    fn archive_part(
+        &self,
+        view: &RunView,
+        newer: Option<&[RunView]>,
+        found: &RunTranscript,
+    ) -> std::result::Result<String, String> {
+        let conversation = &found.conversation;
+        let bytes = crate::archive_source::read_file(&found.path).map_err(|error| {
+            format!(
+                "Reading the transcript of its conversation {conversation} failed ({error:#}); \
+                 nothing was archived, and settling again retries it."
+            )
+        })?;
+        let digest_of =
+            |part: &[u8]| -> DigestValue { Inline::new(*blake3::hash(part).as_bytes()) };
+        let (end, withheld) = match (view.archive_end.as_slice(), view.archive_digest.as_slice()) {
+            ([end], [digest]) => {
+                let part = usize::try_from(*end)
+                    .ok()
+                    .and_then(|end| bytes.as_ref().get(..end));
+                if part.is_none_or(|part| digest_of(part) != *digest) {
+                    return Err(format!(
+                        "The transcript of its conversation {conversation} no longer begins with \
+                         the {end} bytes recorded as this run's part, so nothing was archived."
+                    ));
+                }
+                (*end, view.archive_withheld.first().copied().unwrap_or(0))
+            }
+            ([], []) => {
+                let Some(newer) = newer else {
+                    return Err(format!(
+                        "Whether a newer run of the zooid started is unknown, so this run's part \
+                         of its conversation {conversation} was not bound and nothing was \
+                         archived; settling again retries it."
+                    ));
+                };
+                let locator = format!("session/{conversation}");
+                if let Some(later) = newer
+                    .iter()
+                    .find(|run| run.source_locator.contains(&locator))
+                {
+                    return Ok(format!(
+                        "Run {:x} of the same zooid continues its conversation {conversation}, \
+                         and this run's end in it was never recorded, so nothing was archived \
+                         for this run; that run's settlement archives the conversation.",
+                        later.id
+                    ));
+                }
+                let end = bytes
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |at| at + 1);
+                let withheld = (bytes.len() - end) as u64;
+                let end = end as u64;
+                let digest = digest_of(&bytes.as_ref()[..end as usize]);
+                let bound = entity! { ExclusiveId::force_ref(&view.id) @
+                    attrs::archive_end: end,
+                    attrs::archive_digest: digest,
+                    attrs::archive_withheld?: (withheld > 0).then_some(withheld),
+                };
+                self.publish(bound.into()).map_err(|error| {
+                    format!(
+                        "Recording this run's part of its conversation {conversation} failed \
+                         ({error:#}); nothing was archived, and settling again retries it."
+                    )
+                })?;
+                (end, withheld)
+            }
+            (ends, digests) => {
+                return Err(format!(
+                    "It recorded {} archive ends and {} digests for its conversation \
+                     {conversation}, so nothing was archived.",
+                    ends.len(),
+                    digests.len()
+                ))
+            }
+        };
+        let tail = if withheld > 0 {
+            format!(
+                " An unfinished last line of {withheld} bytes was withheld: the run stopped \
+                 while it was written."
+            )
+        } else {
+            String::new()
+        };
+        if end == 0 {
+            return Ok(format!(
+                "Its conversation {conversation} has no complete line to archive.{tail}"
+            ));
+        }
         let imported = (|| -> Result<usize> {
-            let source_name = path
+            let source_name = found
+                .path
                 .to_str()
-                .ok_or_else(|| anyhow!("{} is not UTF-8", path.display()))?
+                .ok_or_else(|| anyhow!("{} is not UTF-8", found.path.display()))?
                 .to_owned();
-            let bytes = crate::archive_source::read_file(&path)?;
             let receipt = crate::archive::Archive::with_storage(self.storage.clone()).import(
-                source,
+                found.source,
                 &source_name,
-                bytes,
+                bytes.slice(..end as usize),
                 &std::collections::BTreeMap::new(),
             )?;
             Ok(receipt.publication.pieces)
         })();
+        // Pieces are what the import staged; the same bytes again stage the
+        // same pieces, which add nothing new.
         match imported {
-            Ok(0) => format!(" Its conversation {conversation} was already archived."),
-            Ok(pieces) => {
-                format!(" Its conversation {conversation} was archived ({pieces} pieces).")
-            }
-            Err(error) => {
-                let why = format!("archive the conversation {conversation}: {error:#}");
-                let _ = self.publish(super::run_annotation(view.id, None, Some(&why), None));
-                format!(
-                    " Archiving its conversation {conversation} failed ({error:#}); \
-                     ingest-sessions will find it again."
-                )
-            }
+            Ok(pieces) => Ok(format!(
+                "Its conversation {conversation} was archived ({pieces} pieces, {end} bytes).{tail}"
+            )),
+            Err(error) => Err(format!(
+                "Archiving its conversation {conversation} failed ({error:#}); settling again \
+                 retries it.{tail}"
+            )),
         }
     }
 
-    /// A run of the same zooid that started after `run`, if any.
-    fn newer_run(&self, run: Id) -> Result<Option<Id>> {
-        self.observe(|facts, _| {
-            let Some((spawn, started)) = find!(
-                (spawn: Id, started: IntervalValue),
-                pattern!(facts, [{ run @ attrs::of: ?spawn, metadata::started_at: ?started }])
-            )
-            .next() else {
-                return Ok(None);
-            };
+    /// The runs of the same zooid that started after `run`, oldest first.
+    fn newer_runs(&self, run: Id) -> Result<Vec<RunView>> {
+        self.observe(|facts, reader| {
             let start = |at: IntervalValue| {
                 at.try_from_inline::<(Epoch, Epoch)>()
                     .ok()
                     .map(|(from, _)| from)
             };
-            let Some(this) = start(started) else {
-                return Ok(None);
+            let found = find!(
+                (spawn: Id, started: IntervalValue),
+                pattern!(facts, [{ run @ attrs::of: ?spawn, metadata::started_at: ?started }])
+            )
+            .collect::<Vec<_>>();
+            let [(spawn, started)] = found.as_slice() else {
+                bail!(
+                    "run {run:x} records {} spawn and start pairs, so which runs are newer \
+                     cannot be told",
+                    found.len()
+                );
             };
-            Ok(find!(
+            let this = start(*started)
+                .ok_or_else(|| anyhow!("run {run:x}'s start time is not an interval"))?;
+            let mut newer = find!(
                 (other: Id, at: IntervalValue),
                 pattern!(facts, [{ ?other @
                     metadata::tag: KIND_RUN,
-                    attrs::of: spawn,
+                    attrs::of: *spawn,
                     metadata::started_at: ?at,
                 }])
             )
-            .filter(|(other, at)| *other != run && start(*at).is_some_and(|from| from > this))
-            .map(|(other, _)| other)
-            .next())
+            .filter_map(|(other, at)| {
+                let from = start(at)?;
+                (other != run && from > this).then_some((from, other, at))
+            })
+            .collect::<Vec<_>>();
+            newer.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            Ok(newer
+                .into_iter()
+                .map(|(_, other, at)| run_view(facts, reader, other, at))
+                .collect())
         })
     }
 
     /// Where a provider keeps an ended run's transcript, and the importer
-    /// that reads it: the conversation, the file, the source. `Ok(None)`
-    /// when there is nothing to import here; `Err` says, for the spawner,
-    /// why a run that should have one has none.
+    /// that reads it.
     ///
     /// - agy: `transcript_full.jsonl` of the run's conversation in the
-    ///   zooid's own home. A run that recorded none (killed before its
-    ///   result) is matched to the conversation there last written at or
-    ///   after the run started.
+    ///   zooid's own home: the one its result named, or that its launch
+    ///   continued. A run that recorded none (killed before its result) is
+    ///   matched once, at its first archive attempt and only while no newer
+    ///   run of the zooid exists, to the one conversation in its home that
+    ///   changed after it started; several, or a newer run, choose none.
+    ///   The match is recorded on the run before anything is read, so a
+    ///   replay never looks again.
     /// - claude: the session file of the run's `session/<id>` under
-    ///   claude's projects. A run that recorded no session has none here.
+    ///   claude's projects.
     /// - codex, mistral: not located yet (spawn records no rollout or vibe
     ///   session); ingest-sessions reads what it discovers.
     /// - local: Drive archives as it lives.
@@ -3024,14 +3283,15 @@ impl Spawn {
         name: &str,
         agent: &str,
         view: &RunView,
-    ) -> std::result::Result<Option<(String, PathBuf, crate::archive::ImportSource)>, String> {
+        newer: Option<&[RunView]>,
+    ) -> Located {
         let sessions: Vec<&str> = view
             .source_locator
             .iter()
             .filter_map(|locator| locator.strip_prefix("session/"))
             .collect();
         if sessions.len() > 1 {
-            return Err(format!(
+            return Located::Refused(format!(
                 "It recorded {} conversations, so none was archived at settlement.",
                 sessions.len()
             ));
@@ -3039,64 +3299,127 @@ impl Spawn {
         let session = sessions.first().map(|id| id.to_string());
         if agent == Provider::Claude.name() {
             let Some(session) = session else {
-                return Ok(None);
+                return Located::Nothing(
+                    "It recorded no session, so nothing was archived at settlement.".to_owned(),
+                );
             };
             return match self.claude_session_file(&session) {
-                Some(path) => Ok(Some((
-                    session,
+                Some(path) => Located::Found(RunTranscript {
+                    conversation: session,
                     path,
-                    crate::archive::ImportSource::ClaudeCode,
-                ))),
-                None => Err(format!(
+                    source: crate::archive::ImportSource::ClaudeCode,
+                }),
+                None => Located::Refused(format!(
                     "Its session {session} was not found under claude's projects to archive."
                 )),
             };
         }
         if agent != Provider::Agy.name() {
-            return Ok(None);
+            return Located::Outside;
         }
         let home = self.launch.agy_home(name);
         let conversation = match session {
-            Some(id) => Some(id),
-            None => {
-                let started = view
-                    .started
-                    .and_then(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
-                    .map(|(from, _)| from);
-                super::agy::latest_conversation(&home)
-                    .ok()
-                    .flatten()
-                    .filter(|id| {
-                        let modified = super::agy::transcript(&home, id)
-                            .ok()
-                            .and_then(|path| std::fs::metadata(path).ok())
-                            .and_then(|meta| meta.modified().ok())
-                            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok());
-                        match (modified, started) {
-                            (Some(modified), Some(started)) => {
-                                Epoch::from_unix_seconds(modified.as_secs_f64()) >= started
-                            }
-                            _ => false,
-                        }
-                    })
-            }
+            Some(id) => id,
+            None => match self.match_agy_conversation(&home, view, newer) {
+                Ok(id) => id,
+                Err(located) => return located,
+            },
         };
-        let Some(conversation) = conversation else {
-            return Err("It left no conversation to archive.".to_owned());
+        let path = match super::agy::transcript(&home, &conversation) {
+            Ok(path) => path,
+            Err(error) => return Located::Refused(format!("{error:#}")),
         };
-        let path =
-            super::agy::transcript(&home, &conversation).map_err(|error| format!("{error:#}"))?;
         if !path.is_file() {
-            return Err(format!(
+            return Located::Refused(format!(
                 "Its conversation {conversation} has no transcript in {} to archive.",
                 home.display()
             ));
         }
-        Ok(Some((
+        Located::Found(RunTranscript {
             conversation,
             path,
-            crate::archive::ImportSource::Agy,
-        )))
+            source: crate::archive::ImportSource::Agy,
+        })
+    }
+
+    /// The conversation of an agy run that recorded none, from its home,
+    /// recorded on the run as its `session/<id>` ([`Self::run_transcript`]).
+    fn match_agy_conversation(
+        &self,
+        home: &Path,
+        view: &RunView,
+        newer: Option<&[RunView]>,
+    ) -> std::result::Result<String, Located> {
+        match newer {
+            None => {
+                return Err(Located::Refused(
+                    "It recorded no conversation, and whether a newer run of the zooid started \
+                     is unknown, so none was chosen from its home; settling again retries it."
+                        .to_owned(),
+                ))
+            }
+            Some([later, ..]) => {
+                return Err(Located::Refused(format!(
+                    "It recorded no conversation, and run {:x} of the same zooid started after \
+                     it, so which conversation in the home was its own cannot be told; none \
+                     was archived at settlement.",
+                    later.id
+                )))
+            }
+            Some([]) => {}
+        }
+        if !view.archive_outcome.is_empty() {
+            return Err(Located::Refused(
+                "It recorded no conversation, and its first archive attempt found none to \
+                 match, so none is chosen now."
+                    .to_owned(),
+            ));
+        }
+        let started = view
+            .started
+            .and_then(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
+            .map(|(from, _)| from)
+            .ok_or_else(|| Located::Refused("Its start time is unreadable.".to_owned()))?;
+        let changed = super::agy::conversations_changed_since(home, |modified| {
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .is_ok_and(|at| Epoch::from_unix_seconds(at.as_secs_f64()) >= started)
+        })
+        .map_err(|error| {
+            Located::Refused(format!(
+                "Reading the conversations in {} failed ({error:#}); settling again retries it.",
+                home.display()
+            ))
+        })?;
+        let conversation = match changed.as_slice() {
+            [] => {
+                return Err(Located::Nothing(
+                    "It left no conversation in its home to archive.".to_owned(),
+                ))
+            }
+            [one] => one.clone(),
+            several => {
+                return Err(Located::Refused(format!(
+                    "{} conversations in its home changed during the run ({}), so none was \
+                     chosen.",
+                    several.len(),
+                    several.join(", ")
+                )))
+            }
+        };
+        let mut fragment = Fragment::empty();
+        let locator =
+            fragment.put::<blobencodings::UTF8String, _>(format!("session/{conversation}"));
+        fragment += entity! { ExclusiveId::force_ref(&view.id) @
+            crate::schemas::blockdag::source_projection::source_locator: locator,
+        };
+        self.publish(fragment).map_err(|error| {
+            Located::Refused(format!(
+                "Recording that its conversation is {conversation} failed ({error:#}); nothing \
+                 was archived, and settling again retries it."
+            ))
+        })?;
+        Ok(conversation)
     }
 
     /// What the zooid never read: unread messages addressed to it, named in
@@ -3172,6 +3495,26 @@ impl Spawn {
                 Err(error) => inbox_failure(InboxHook::Post, &error),
             },
         }
+    }
+
+    /// The zooid's own lock on this host (`<state>/<name>.lock`, never
+    /// unlinked). Launch holds it from the persona check until the run
+    /// record is published; settlement from reading the zooid's newer runs
+    /// until the retire is decided. A launch on another host is not covered.
+    fn zooid_lock(&self, name: &str) -> Result<std::fs::File> {
+        std::fs::create_dir_all(&self.launch.state_dir)
+            .with_context(|| format!("create {}", self.launch.state_dir.display()))?;
+        let path = self.launch.file(name, "lock");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        Ok(file)
     }
 
     fn post(&self, request: &InboxRequest) -> Result<InboxAnswer> {
@@ -3591,6 +3934,39 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             )
             .collect(),
         ),
+        archive_end: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::archive_end: ?count }])
+            )
+            .collect(),
+        ),
+        archive_digest: find!(
+            digest: DigestValue,
+            pattern!(facts, [{ run @ attrs::archive_digest: ?digest }])
+        )
+        .collect(),
+        archive_withheld: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::archive_withheld: ?count }])
+            )
+            .collect(),
+        ),
+        archive_outcome: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::archive_outcome: ?handle }])
+            )
+            .collect(),
+        ),
+        archive_start: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::archive_start: ?count }])
+            )
+            .collect(),
+        ),
     }
 }
 
@@ -3963,6 +4339,33 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
         }
         if !run.source_locator.is_empty() {
             writeln!(out, "  conversation: {}", run.source_locator.join(", ")).unwrap();
+        }
+        if !run.archive_start.is_empty() {
+            writeln!(
+                out,
+                "  continued its conversation from byte {}",
+                join(&run.archive_start)
+            )
+            .unwrap();
+        }
+        if !run.archive_end.is_empty() {
+            writeln!(
+                out,
+                "  archived part: the first {} bytes of the transcript",
+                join(&run.archive_end)
+            )
+            .unwrap();
+        }
+        if !run.archive_withheld.is_empty() {
+            writeln!(
+                out,
+                "  withheld: an unfinished last line of {} bytes",
+                join(&run.archive_withheld)
+            )
+            .unwrap();
+        }
+        for outcome in &run.archive_outcome {
+            writeln!(out, "  archive: {outcome}").unwrap();
         }
         if !run.input_tokens.is_empty() || !run.output_tokens.is_empty() {
             writeln!(
@@ -7181,7 +7584,7 @@ mod tests {
         assert!(
             run.settle_failure
                 .iter()
-                .any(|why| why.contains("archive the conversation c-9")),
+                .any(|why| why.contains("Archiving its conversation c-9 failed")),
             "{:?}",
             run.settle_failure
         );
@@ -7191,6 +7594,455 @@ mod tests {
             "{told}"
         );
         assert!(!told.contains("was archived"), "{told}");
+    }
+
+    /// One agy transcript line: the brief at step 0, a model call after it.
+    fn agy_line(step: u64, occupancy: u64) -> String {
+        if step == 0 {
+            return r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-26T00:00:00Z","content":"the brief"}"#.to_owned();
+        }
+        format!(
+            r#"{{"step_index":{step},"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T00:00:{step:02}Z","content":"reply at {occupancy}","input_tokens":1000,"cache_read_tokens":{},"output_tokens":10}}"#,
+            occupancy - 1000
+        )
+    }
+
+    /// Write a conversation's transcript in an agy home: whole lines, then
+    /// `tail` as it is (an unfinished line, or nothing).
+    fn agy_transcript(home: &Path, conversation: &str, lines: &[String], tail: &str) -> PathBuf {
+        let path = super::super::agy::transcript(home, conversation).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        text.push_str(tail);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    /// The archive's thread of `locator`, or nothing when no receipt carries
+    /// it: for asserting what was not archived.
+    fn archived_text(f: &Fixture, locator: &str) -> String {
+        let mut text = String::new();
+        let mut collect = |part: Part| {
+            if let Part::Text { text: part } = part {
+                text.push_str(&part);
+            }
+            Ok(())
+        };
+        match crate::archive::Archive::with_storage(f.spawn.storage.clone()).thread(
+            locator,
+            100,
+            None,
+            crate::archive::Reading::default(),
+            &mut Out::new(&mut collect),
+        ) {
+            Ok(_) => text,
+            Err(error) if format!("{error:#}").contains("no Archive receipt carries") => {
+                String::new()
+            }
+            Err(error) => panic!("{error:#}"),
+        }
+    }
+
+    fn append(path: &Path, line: &str) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    /// Every settle message about `name`, oldest first.
+    fn told_all(f: &Fixture, name: &str) -> Vec<String> {
+        f.inbox()
+            .into_iter()
+            .filter_map(|body| match body {
+                crate::message::MessageText::Text(text)
+                    if text.starts_with(&format!("{name} finished")) =>
+                {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn settle_as(f: &Fixture, launched: &Launched, exit: Exit) -> Result<Settled> {
+        f.spawn.settle(&SettleRequest {
+            name: launched.name.clone(),
+            run: launched.run,
+            exit,
+            report: Some(launched.report.clone()),
+            usage: None,
+        })
+    }
+
+    fn killed() -> Exit {
+        Exit::from_systemd("killed", "KILL", "signal")
+    }
+
+    fn agy_home_of(f: &Fixture, name: &str) -> PathBuf {
+        f.directory.path().join("state").join(format!("{name}.agy"))
+    }
+
+    fn is_retired(f: &Fixture, name: &str) -> bool {
+        Relations::with_storage(f.spawn.storage.clone())
+            .person_state(name)
+            .unwrap()
+            .unwrap()
+            .retired
+    }
+
+    #[test]
+    fn a_replay_archives_only_the_part_the_run_reached_when_a_later_run_continues_it() {
+        let f = fixture();
+        let mut request = f.request("Agy task whose conversation goes on.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_ran(&home, &a.report, "c-1", &[50_000, 120_000]);
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        let path = super::super::agy::transcript(&home, "c-1").unwrap();
+        let a_bytes = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(first.archive_end, [a_bytes]);
+        assert_eq!(first.archive_digest.len(), 1);
+        assert!(first.archive_withheld.is_empty());
+        assert!(
+            first.archive_outcome[0].contains("c-1 was archived ("),
+            "{:?}",
+            first.archive_outcome
+        );
+
+        // B continues c-1 and has appended a call when A's settlement is
+        // replayed. A imports its own bytes and nothing of B's.
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.agy_resume.conversation.as_deref(), Some("c-1"));
+        assert_eq!(b.agy_resume.start, Some(a_bytes));
+        let second = &f.spawn.show(&name).unwrap().runs[1];
+        assert_eq!(second.source_locator, ["session/c-1"]);
+        assert_eq!(second.archive_start, [a_bytes]);
+        assert!(second.cover_sizing.is_empty());
+        append(&path, &agy_line(3, 200_000));
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let thread = archived_text(&f, "session/c-1");
+        assert!(thread.contains("reply at 120000"), "{thread}");
+        assert!(!thread.contains("reply at 200000"), "{thread}");
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert_eq!(first.archive_end, [a_bytes]);
+        assert!(
+            first
+                .archive_outcome
+                .iter()
+                .all(|outcome| outcome.contains(&format!(", {a_bytes} bytes)"))),
+            "{:?}",
+            first.archive_outcome
+        );
+        assert!(!is_retired(&f, &name), "the replay retired B's persona");
+
+        // B's own settlement archives what it added, and counts its own
+        // first call, not A's.
+        std::fs::write(
+            &b.report,
+            r#"{"conversation_id":"c-1","status":"SUCCESS","response":"b's report"}"#,
+        )
+        .unwrap();
+        settle_as(&f, &b, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let second = &f.spawn.show(&name).unwrap().runs[1];
+        assert_eq!(second.source_locator, ["session/c-1"]);
+        assert_eq!(second.first_call_input_tokens, [200_000]);
+        assert_eq!(
+            second.archive_end,
+            [std::fs::metadata(&path).unwrap().len()]
+        );
+        assert!(archive_thread(&f, "session/c-1").contains("reply at 200000"));
+
+        // A file that no longer begins with A's bytes is refused, loudly.
+        let mut changed = std::fs::read(&path).unwrap();
+        changed[2] = b'X';
+        std::fs::write(&path, changed).unwrap();
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(
+            first
+                .archive_outcome
+                .iter()
+                .any(|outcome| outcome.contains("no longer begins with")),
+            "{:?}",
+            first.archive_outcome
+        );
+        assert!(first
+            .settle_failure
+            .iter()
+            .any(|why| why.contains("no longer begins with")));
+    }
+
+    #[test]
+    fn a_run_that_recorded_no_conversation_never_takes_a_later_runs() {
+        let f = fixture();
+        let mut request = f.request("Agy task killed before it wrote anything.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        // Killed before agy wrote a conversation or a result.
+        settle_as(&f, &a, killed()).unwrap();
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(first.source_locator.is_empty());
+        assert!(
+            first.archive_outcome[0].contains("left no conversation"),
+            "{:?}",
+            first.archive_outcome
+        );
+
+        // B starts fresh and writes its own conversation. A's settlement,
+        // replayed, does not take it.
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.agy_resume.conversation, None);
+        agy_transcript(&home, "c-b", &[agy_line(0, 0), agy_line(1, 60_000)], "");
+        settle_as(&f, &a, killed()).unwrap();
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(
+            first.source_locator.is_empty(),
+            "{:?}",
+            first.source_locator
+        );
+        assert!(first.archive_end.is_empty());
+        assert!(
+            first
+                .archive_outcome
+                .iter()
+                .any(|outcome| outcome.contains(&format!("run {:x}", b.run))),
+            "{:?}",
+            first.archive_outcome
+        );
+        assert!(!archived_text(&f, "session/c-b").contains("reply at 60000"));
+        assert!(!is_retired(&f, &name));
+    }
+
+    #[test]
+    fn a_run_whose_end_was_never_recorded_leaves_a_continued_conversation_to_the_run_that_continues_it(
+    ) {
+        let f = fixture();
+        let mut request = f.request("Agy task whose first settlement never ran.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_ran(&home, &a.report, "c-1", &[50_000]);
+        // Its settlement did not run: the run names its conversation (as
+        // from its result) and someone retired the persona by hand.
+        let mut fragment = Fragment::empty();
+        let locator = fragment.put::<blobencodings::UTF8String, _>("session/c-1".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&a.run) @
+            crate::schemas::blockdag::source_projection::source_locator: locator,
+        };
+        f.spawn.publish(fragment).unwrap();
+        Relations::with_storage(f.spawn.storage.clone())
+            .retire(&name)
+            .unwrap();
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.agy_resume.conversation.as_deref(), Some("c-1"));
+        let path = super::super::agy::transcript(&home, "c-1").unwrap();
+        append(&path, &agy_line(2, 90_000));
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(first.archive_end.is_empty());
+        assert!(
+            first
+                .archive_outcome
+                .iter()
+                .any(|outcome| outcome.contains("continues its conversation c-1")),
+            "{:?}",
+            first.archive_outcome
+        );
+        assert!(!archived_text(&f, "session/c-1").contains("reply at 90000"));
+        assert!(!is_retired(&f, &name));
+    }
+
+    #[test]
+    fn a_settlement_that_cannot_tell_whether_a_newer_run_started_does_not_retire() {
+        let f = fixture();
+        let mut request = f.request("Agy task whose run record is ambiguous.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, &a.name);
+        agy_ran(&home, &a.report, "c-1", &[50_000]);
+        // A second start time on the run: which runs are newer is unknown.
+        f.spawn
+            .publish(
+                entity! { ExclusiveId::force_ref(&a.run) @
+                    metadata::started_at: crate::clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
+                }
+                .into(),
+            )
+            .unwrap();
+        let settled = settle_as(&f, &a, Exit::from_systemd("exited", "0", "success"));
+        let error = format!("{:#}", settled.unwrap_err());
+        assert!(error.contains("look for a newer run"), "{error}");
+        assert!(!is_retired(&f, &a.name));
+        let view = f.spawn.show(&a.name).unwrap();
+        let run = view.runs.iter().find(|run| run.id == a.run).unwrap();
+        assert!(
+            run.settle_failure
+                .iter()
+                .any(|why| why.contains("whether a newer run of the same zooid started is unknown")),
+            "{:?}",
+            run.settle_failure
+        );
+        // Its part was not bound while that was unknown.
+        assert!(run.archive_end.is_empty());
+        assert!(
+            run.archive_outcome
+                .iter()
+                .any(|outcome| outcome.contains("was not bound")),
+            "{:?}",
+            run.archive_outcome
+        );
+    }
+
+    #[test]
+    fn a_replayed_settlement_waits_for_a_launch_in_progress_and_sees_it() {
+        let f = fixture();
+        let mut request = f.request("Agy task replayed during a launch.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_ran(&home, &a.report, "c-1", &[50_000]);
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let spawn = f.spawn.show(&name).unwrap().id;
+        // A launch holds the lock from the persona check until its run
+        // record is out; a replay started meanwhile waits and then sees it.
+        let held = f.spawn.zooid_lock(&name).unwrap();
+        std::thread::scope(|scope| {
+            let replay = scope
+                .spawn(|| settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap());
+            std::thread::sleep(Duration::from_millis(300));
+            Relations::with_storage(f.spawn.storage.clone())
+                .unretire(&name)
+                .unwrap();
+            f.spawn
+                .publish(
+                    entity! { _ @
+                        metadata::tag: KIND_RUN,
+                        attrs::of: spawn,
+                        metadata::started_at: crate::clock::point_now().unwrap(),
+                    }
+                    .into(),
+                )
+                .unwrap();
+            drop(held);
+            replay.join().unwrap();
+        });
+        assert!(
+            !is_retired(&f, &name),
+            "the replay retired a launching run's persona"
+        );
+        let first = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(
+            first
+                .settle_failure
+                .iter()
+                .any(|why| why.contains("not retiring")),
+            "{:?}",
+            first.settle_failure
+        );
+    }
+
+    #[test]
+    fn an_archive_outcome_is_recorded_on_the_run_after_the_spawner_was_messaged() {
+        let f = fixture();
+        let mut request = f.request("Agy task whose transcript goes missing.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, &a.name);
+        agy_ran(&home, &a.report, "c-1", &[50_000]);
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let path = super::super::agy::transcript(&home, "c-1").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        // One message: the replay's text went nowhere, but its outcome is on the run.
+        assert_eq!(told_all(&f, &a.name).len(), 1);
+        let run = &f.spawn.show(&a.name).unwrap().runs[0];
+        assert_eq!(run.archive_outcome.len(), 2, "{:?}", run.archive_outcome);
+        assert!(run
+            .archive_outcome
+            .iter()
+            .any(|outcome| outcome.contains("has no transcript")));
+        assert!(run
+            .settle_failure
+            .iter()
+            .any(|why| why.contains("has no transcript")));
+        let shown = render_show(&f.spawn.show(&a.name).unwrap(), false);
+        assert!(shown.contains("archive: "), "{shown}");
+    }
+
+    #[test]
+    fn a_killed_runs_complete_lines_are_archived_and_its_unfinished_line_withheld() {
+        let f = fixture();
+        let mut request = f.request("Agy task killed mid-line.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        let tail = r#"{"step_index":2,"source":"MODEL","type":"PLANNER_RES"#;
+        agy_transcript(&home, "c-k", &[agy_line(0, 0), agy_line(1, 50_000)], tail);
+        settle_as(&f, &a, killed()).unwrap();
+        let run = &f.spawn.show(&name).unwrap().runs[0];
+        assert_eq!(run.source_locator, ["session/c-k"]);
+        assert_eq!(run.archive_withheld, [tail.len() as u64]);
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+        let told = f.told(&name);
+        assert!(told.contains("c-k was archived ("), "{told}");
+        assert!(
+            told.contains(&format!(
+                "unfinished last line of {} bytes was withheld",
+                tail.len()
+            )),
+            "{told}"
+        );
+        assert!(archive_thread(&f, "session/c-k").contains("reply at 50000"));
+        // Again: nothing new, the same tail withheld.
+        settle_as(&f, &a, killed()).unwrap();
+        let run = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(run
+            .archive_outcome
+            .iter()
+            .all(|outcome| outcome.contains("c-k was archived") && outcome.contains("withheld")));
+        assert_eq!(run.archive_withheld, [tail.len() as u64]);
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+
+        // Its life had room, but a cut transcript is not continued.
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.agy_resume.conversation, None);
+        assert!(
+            b.agy_resume.reason.contains("ends in an unfinished line"),
+            "{}",
+            b.agy_resume.reason
+        );
+    }
+
+    #[test]
+    fn a_malformed_complete_line_inside_a_transcript_fails_its_archive_visibly() {
+        let f = fixture();
+        let mut request = f.request("Agy task with a damaged interior line.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, &a.name);
+        agy_ran(&home, &a.report, "c-d", &[50_000]);
+        agy_transcript(
+            &home,
+            "c-d",
+            &[agy_line(0, 0), "{not json".to_owned(), agy_line(2, 70_000)],
+            "",
+        );
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let run = &f.spawn.show(&a.name).unwrap().runs[0];
+        assert!(run
+            .settle_failure
+            .iter()
+            .any(|why| why.contains("Archiving its conversation c-d failed")));
+        assert!(run.archive_withheld.is_empty());
+        assert!(!archived_text(&f, "session/c-d").contains("reply at 70000"));
     }
 
     #[test]

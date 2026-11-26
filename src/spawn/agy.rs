@@ -9,10 +9,13 @@
 //! the zooid's tools. The host's own `~/.gemini` (the rules, MCP server and
 //! conversations of an interactive agy there) is never read or written by a zooid.
 //!
-//! There is no summarising. agy compacts a conversation at a token
-//! threshold that cannot be switched off; spawn sets it to the whole window
-//! ([`COMPACT_AT`]) and ends the zooid's life before it is reached
-//! ([`life`]): the next run of the same zooid wakes fresh into the cover.
+//! agy compacts a conversation at a token threshold that cannot be
+//! switched off; spawn sets it to the whole window ([`COMPACT_AT`]) and aims
+//! to end the zooid's life before it is reached ([`life`]), after which the
+//! next run of the same zooid wakes fresh into the cover. The limit is a
+//! bound from the largest step seen, not a guarantee: one larger step can
+//! still reach the threshold. And the hooks that enforce it have not been
+//! run against a real agy yet.
 
 use std::path::Path;
 
@@ -346,6 +349,45 @@ pub fn latest_conversation(home: &Path) -> Result<Option<String>> {
         }
     }
     Ok(latest.map(|(_, name)| name))
+}
+
+/// Every conversation in an agy home whose transcript's modification time
+/// `changed` accepts, sorted: the conversations a run wrote, for one that
+/// recorded none.
+pub fn conversations_changed_since(
+    home: &Path,
+    changed: impl Fn(std::time::SystemTime) -> bool,
+) -> Result<Vec<String>> {
+    let brain = home.join(".gemini/antigravity-cli/brain");
+    let entries = match std::fs::read_dir(&brain) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", brain.display())),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", brain.display()))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !plain_id(&name) {
+            continue;
+        }
+        let path = transcript(home, &name)?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+        };
+        let modified = meta
+            .modified()
+            .with_context(|| format!("read the modification time of {}", path.display()))?;
+        if changed(modified) {
+            found.push(name);
+        }
+    }
+    found.sort();
+    Ok(found)
 }
 
 /// Seconds agy gives one hook before it stops it: a cold pile read for the

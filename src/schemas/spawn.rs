@@ -277,5 +277,27 @@ pub mod spawn {
         /// The declaration a run made true. On the run; it says nothing
         /// about the declaration.
         "24F1A90CFCFB27DF1FA78B2FB10B6DB2" as realises: inlineencodings::GenId;
+        /// How many bytes of the run's conversation transcript a settlement
+        /// archives: everything through its last complete line when the
+        /// run's archive step first read it. Recorded once, before the
+        /// import, so a replayed settlement imports the same part and never
+        /// what a later run appended. Minted with `trible genid` on
+        /// 2026-11-26, like every attribute below.
+        "992DF5A64837FE283F028149B0CA299F" as archive_end: inlineencodings::U256BE;
+        /// The BLAKE3 digest of those [`archive_end`] bytes. A replay
+        /// imports them only while the file still begins with exactly them.
+        "1254841E93B28DF8896F02FEF07B79A9" as archive_digest: inlineencodings::Hash<inlineencodings::Blake3>;
+        /// Bytes after the transcript's last complete line when the end was
+        /// recorded: an unfinished last line (a killed run's), not archived.
+        /// Absent when the transcript ended with a complete line.
+        "210C5D2D3BC8A6E6DB87CF4AC74D1828" as archive_withheld: inlineencodings::U256BE;
+        /// What a settlement's archive step did, in words: archived (with
+        /// pieces and bytes), already archived, or why nothing was. One per
+        /// attempt that said something new.
+        "4D9B338FFF0A45ABA8553BAD17CD85C9" as archive_outcome: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// How many bytes the conversation's transcript held when a run that
+        /// continues it launched: the earlier lives' part. The run's own
+        /// calls are the ones after it.
+        "2524D9660EE6D75B49BC618F98C9FC37" as archive_start: inlineencodings::U256BE;
     }
 }
