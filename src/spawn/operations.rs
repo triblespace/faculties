@@ -10684,7 +10684,7 @@ mod tests {
     /// and characters of several bytes where a cut could fall inside one.
     fn large_wake_renderer() -> (StubRenderer, String) {
         let mut fixed = String::from("\n");
-        for line in 0..3_000 {
+        for line in 0..4_000 {
             fixed.push_str(&format!("{line:05} memory é{}\n", "ü".repeat(line % 97)));
         }
         fixed.push_str(&"long-line-ö".repeat(5_000));
