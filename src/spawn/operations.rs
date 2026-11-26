@@ -9823,6 +9823,130 @@ mod tests {
         assert!(!f.told(&short.name).contains("past its life limit"));
     }
 
+    /// The limit a launch prices a transcript with is raised the way a
+    /// lowered GROWTH_FLOOR raised it on 26 Nov 2026 (370,198 to 399,314):
+    /// the fixture cannot change the floor, so it widens the window, which
+    /// moves W - g - R the same way.
+    fn raise_the_limit(f: &mut Fixture) {
+        f.spawn.launch.agy_window = 1_000_000;
+    }
+
+    #[test]
+    fn a_life_recorded_as_ended_at_its_limit_stays_ended_when_the_limit_is_raised() {
+        let mut f = fixture();
+        let mut request = f.request("Agy life that ends at its limit.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_ran(&home, &a.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let ended = &f.spawn.show(&name).unwrap().runs[0];
+        assert_eq!(ended.life_occupancy, [400_000]);
+        assert_eq!(ended.life_limit, [130_000]);
+
+        // A control: an ordinary life with room, under the same raise.
+        let mut control = f.request("Agy life with room.");
+        control.provider = Provider::Agy;
+        let short = f.spawn.run(&control).unwrap();
+        let short_home = agy_home_of(&f, &short.name);
+        agy_ran(&short_home, &short.report, "c-9", &[50_000, 120_000]);
+        settle_as(&f, &short, Exit::from_systemd("exited", "0", "success")).unwrap();
+
+        // Priced today, c-1 has room again (1,000,000 - 350,000 - 32,000
+        // = 618,000 > 400,000); its recorded end still stands.
+        raise_the_limit(&mut f);
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.name, name);
+        assert_eq!(b.agy_resume.conversation, None, "{}", b.agy_resume.reason);
+        let reason = &b.agy_resume.reason;
+        assert!(
+            reason.contains("conversation c-1 ended its life"),
+            "{reason}"
+        );
+        assert!(reason.contains(&format!("run {:x}", a.run)), "{reason}");
+        assert!(
+            reason.contains("400000 tokens, past its life limit then of 130000"),
+            "{reason}"
+        );
+        assert!(!f.script(2).contains("--conversation"));
+
+        // The ordinary life still continues under today's rules.
+        let again = f.spawn.run(&control).unwrap();
+        assert_eq!(again.name, short.name);
+        assert_eq!(
+            again.agy_resume.conversation.as_deref(),
+            Some("c-9"),
+            "{}",
+            again.agy_resume.reason
+        );
+
+        // The fresh life's own conversation does not inherit c-1's end.
+        agy_ran(&home, &b.report, "c-2", &[50_000, 120_000]);
+        settle_as(&f, &b, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let c = f.spawn.run(&request).unwrap();
+        assert_eq!(
+            c.agy_resume.conversation.as_deref(),
+            Some("c-2"),
+            "{}",
+            c.agy_resume.reason
+        );
+    }
+
+    #[test]
+    fn a_later_run_of_the_conversation_below_a_raised_limit_does_not_hide_its_recorded_end() {
+        let mut f = fixture();
+        let mut request = f.request("Agy life resumed past its end.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_ran(&home, &a.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &a, Exit::from_systemd("exited", "0", "success")).unwrap();
+        assert_eq!(f.spawn.show(&name).unwrap().runs[0].life_limit, [130_000]);
+
+        // B continued c-1 anyway, as a build that re-priced it did (run
+        // 80ad63de on 26 Nov): it names c-1 from launch, whatever this
+        // build's launch decided for it.
+        let b = f.spawn.run(&request).unwrap();
+        let mut fragment = Fragment::empty();
+        let locator = fragment.put::<blobencodings::UTF8String, _>("session/c-1".to_owned());
+        fragment += entity! { ExclusiveId::force_ref(&b.run) @
+            crate::schemas::blockdag::source_projection::source_locator: locator,
+        };
+        f.spawn.publish(fragment).unwrap();
+        let path = super::super::agy::transcript(&home, "c-1").unwrap();
+        append(&path, &agy_line(3, 410_000));
+        std::fs::write(
+            &b.report,
+            r#"{"conversation_id":"c-1","status":"SUCCESS","response":"the report","num_turns":1,"usage":{"input_tokens":3000,"output_tokens":30,"thinking_tokens":0,"cache_read_tokens":40000,"total_tokens":43030}}"#,
+        )
+        .unwrap();
+        // It ends below the raised limit, so its settlement records no end.
+        raise_the_limit(&mut f);
+        settle_as(&f, &b, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let later = f
+            .spawn
+            .show(&name)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == b.run)
+            .unwrap();
+        assert_eq!(later.source_locator, ["session/c-1"]);
+        assert!(later.life_occupancy.is_empty() && later.life_limit.is_empty());
+
+        // The latest run says nothing of an end; the earlier one did.
+        let c = f.spawn.run(&request).unwrap();
+        assert_eq!(c.agy_resume.conversation, None, "{}", c.agy_resume.reason);
+        let reason = &c.agy_resume.reason;
+        assert!(reason.contains(&format!("run {:x}", a.run)), "{reason}");
+        assert!(
+            reason.contains("400000 tokens, past its life limit then of 130000"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn a_residents_fresh_life_waits_for_its_previous_life_in_the_archive() {
         let f = fixture();
