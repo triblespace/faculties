@@ -318,7 +318,9 @@ mod tests {
             }
             let error = write(dir.path(), &long).unwrap_err();
             assert!(format!("{error:#}").contains(foreign), "{error:#}");
-            assert_eq!(names(), [foreign, "part-1-of-1.md"]);
+            let mut expected = vec![foreign, "part-1-of-1.md"];
+            expected.sort();
+            assert_eq!(names(), expected);
             assert_eq!(
                 std::fs::read_to_string(dir.path().join("part-1-of-1.md")).unwrap(),
                 "a short wake\n"
