@@ -892,6 +892,14 @@ pub struct ZooidWish {
     /// only while the zooid's unit runs, and each fresh life wakes into a
     /// window's wake.
     pub resident: bool,
+    /// The declaration this launch makes true: recorded on the run as
+    /// [`attrs::realises`], and checked again under the zooid's lock, so a
+    /// rest or a move recorded since the caller read it starts nothing.
+    pub realises: Option<Id>,
+    /// The run this life follows ([`Spawn::continue_life`]). Under the
+    /// zooid's lock the zooid's newest run must still be that one, so a
+    /// second continuation of the same life starts nothing.
+    pub follows: Option<Id>,
 }
 
 /// What a launch asks of its cover's size: `percent` of the worker's
@@ -2632,6 +2640,71 @@ impl Spawn {
                 held.name
             );
         }
+        // A continuation is admitted again under the lock: what it follows
+        // must still be the newest life, and what it realises must still
+        // stand here. Either changed since the caller read it starts nothing.
+        if let Some(previous) = zooid.follows {
+            let newest = self.observe(|facts, _| {
+                Ok(find!(
+                    (run: Id, started: IntervalValue),
+                    pattern!(facts, [{ ?run @
+                        metadata::tag: KIND_RUN,
+                        attrs::of: spawn,
+                        metadata::started_at: ?started,
+                    }])
+                )
+                .filter_map(|(run, started)| {
+                    let (from, _) = started.try_from_inline::<(Epoch, Epoch)>().ok()?;
+                    Some((from, run))
+                })
+                .max())
+            })?;
+            match newest {
+                Some((_, newest)) if newest == previous => {}
+                Some((_, newest)) => bail!(
+                    "{name}'s life {previous:x} has already been followed by run {newest:x}; \
+                     nothing was started"
+                ),
+                None => bail!("{name} has no run {previous:x} to follow; nothing was started"),
+            }
+        }
+        // What this launch makes true. An explicit one must still stand here;
+        // a resident launch otherwise names the declaration that places it
+        // here, if one does, so a later life can tell it was lived under it.
+        // A read that fails leaves the run naming none: a continuation of it
+        // then says why nothing follows.
+        let standing = |spawn: Id| -> Result<Option<super::declaration::Standing>> {
+            let placed = self.placed(self.local_host()?)?;
+            Ok(placed
+                .zooids
+                .into_iter()
+                .find(|declared| declared.zooid == spawn)
+                .map(|declared| declared.standing))
+        };
+        let realises = match zooid.realises {
+            Some(declaration) => match standing(spawn)? {
+                Some(super::declaration::Standing::Here(placement))
+                    if placement.declaration == declaration =>
+                {
+                    Some(declaration)
+                }
+                Some(super::declaration::Standing::Here(placement)) => bail!(
+                    "{name} now declares {:x}, not {declaration:x}; nothing was started",
+                    placement.declaration
+                ),
+                Some(super::declaration::Standing::Nothing { reason }) => {
+                    bail!("{name} is not placed here any more ({reason}); nothing was started")
+                }
+                None => bail!("{name} declares nothing here; nothing was started"),
+            },
+            None if zooid.resident => match standing(spawn) {
+                Ok(Some(super::declaration::Standing::Here(placement))) => {
+                    Some(placement.declaration)
+                }
+                _ => None,
+            },
+            None => None,
+        };
         // Whether this launch made the persona live: only then does a launch
         // that never started retire it again. A resident adopts a live one.
         let mut revived = true;
@@ -2948,6 +3021,9 @@ impl Spawn {
             started = true;
             let mut record = spawn_fragment;
             record += run_fragment;
+            if let Some(declaration) = realises {
+                record += super::declaration::realises_fragment(run, declaration);
+            }
             if let (Some(conversation), Some(start)) = (&agy_resume.conversation, agy_resume.start)
             {
                 // A continued conversation is the run's from launch: a later
@@ -9494,6 +9570,7 @@ mod tests {
         request.zooid = ZooidWish {
             name: Some(name.to_owned()),
             resident,
+            ..Default::default()
         };
         request
     }
@@ -9701,6 +9778,183 @@ mod tests {
         let run = &f.spawn.show(&short.name).unwrap().runs[0];
         assert!(run.life_occupancy.is_empty() && run.life_limit.is_empty());
         assert!(!f.told(&short.name).contains("past its life limit"));
+    }
+
+    fn declare_as(f: &Fixture, name: &str, place: super::super::declaration::PlaceWish) -> Id {
+        f.spawn
+            .declare(&super::super::declaration::DeclareRequest {
+                name: name.to_owned(),
+                place,
+                model_spec: None,
+                model_label: None,
+                reason: None,
+                persona: "agent-cc".to_owned(),
+            })
+            .unwrap()
+            .declaration
+    }
+
+    fn nothing_follows(f: &Fixture, name: &str) -> String {
+        match f.spawn.next_life(name).unwrap() {
+            super::super::life::NextLife::Nothing { reason } => reason,
+            super::super::life::NextLife::Follows(next) => {
+                panic!("a next life follows: {}", next.evidence)
+            }
+        }
+    }
+
+    /// The rehearsal of a window's life cycle on Spawn alone: a scripted agy
+    /// provider, a fake systemd and a disposable signed pile. A life that
+    /// filled its context continues once, under the declaration that stands;
+    /// a rest, and a placement after it, start nothing from the old end.
+    #[test]
+    fn a_resident_continues_once_from_a_filled_life_and_never_from_rest() {
+        use super::super::declaration::{Place, PlaceWish};
+        use super::super::life::{Continued, NextLife};
+        let f = fixture();
+        let mut request = named(&f, "Resident window.", "life-test", true);
+        request.provider = Provider::Agy;
+        let first = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, "life-test");
+        // Nothing declared: nothing follows, whatever the life does.
+        assert!(
+            nothing_follows(&f, "life-test").contains("declares nothing"),
+            "{}",
+            nothing_follows(&f, "life-test")
+        );
+        let here = declare_as(&f, "life-test", PlaceWish::Here);
+        // Its life runs, then ends unsettled: nothing follows.
+        assert!(nothing_follows(&f, "life-test").contains("no recorded end"));
+        set_unit(&f, "inactive");
+        assert!(nothing_follows(&f, "life-test").contains("no recorded end"));
+        // It fills its context, ends cleanly and is archived.
+        agy_ran(&home, &first.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &first, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let started = f.launcher.started.lock().unwrap().len();
+        let next = match f.spawn.next_life("life-test").unwrap() {
+            NextLife::Follows(next) => next,
+            NextLife::Nothing { reason } => panic!("nothing follows: {reason}"),
+        };
+        // The first life realised nothing: it continues under a declaration
+        // that follows none.
+        assert_eq!(next.previous, first.run);
+        assert_eq!(next.declaration, here);
+        assert!(next.evidence.contains("past its life limit"), "{}", next.evidence);
+        // Asking starts nothing.
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+        let second = match f.spawn.continue_life("life-test").unwrap() {
+            Continued::Started { launched, .. } => *launched,
+            Continued::Nothing { reason } => panic!("nothing started: {reason}"),
+        };
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started + 1);
+        assert_eq!(second.persona, first.persona);
+        // A fresh life, not the filled conversation continued.
+        assert_eq!(second.agy_resume.conversation, None);
+        let view = f.spawn.show("life-test").unwrap();
+        assert_eq!(view.runs.len(), 2);
+        assert_eq!(view.runs[1].realises, [here]);
+        assert!(view.runs[1].resident);
+        // Asked again while it lives: nothing.
+        assert!(matches!(
+            f.spawn.continue_life("life-test").unwrap(),
+            Continued::Nothing { .. }
+        ));
+        // A caller that read the first life's end before the second began
+        // (a repeated or concurrent ask) is refused under the lock, even once
+        // the unit is gone.
+        set_unit(&f, "inactive");
+        let error = f.spawn.run(&next.request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("has already been followed"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started + 1);
+        // The second life fills too, and then the zooid is put to rest.
+        agy_ran(&home, &second.report, "c-2", &[50_000, 400_000]);
+        settle_as(&f, &second, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let stale = match f.spawn.next_life("life-test").unwrap() {
+            NextLife::Follows(next) => next,
+            NextLife::Nothing { reason } => panic!("nothing follows: {reason}"),
+        };
+        let rest = declare_as(&f, "life-test", PlaceWish::At(Place::Rest));
+        assert!(
+            nothing_follows(&f, "life-test").contains("at rest"),
+            "{}",
+            nothing_follows(&f, "life-test")
+        );
+        assert!(matches!(
+            f.spawn.continue_life("life-test").unwrap(),
+            Continued::Nothing { .. }
+        ));
+        // A continuation decided before the rest is refused at admission.
+        let error = f.spawn.run(&stale.request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not placed here any more"),
+            "{error:#}"
+        );
+        // Placed here again after the rest: the old filled life does not
+        // reopen it. Starting it is a new start.
+        let again = declare_as(&f, "life-test", PlaceWish::Here);
+        assert_ne!(again, here);
+        assert_ne!(again, rest);
+        let reason = nothing_follows(&f, "life-test");
+        assert!(
+            reason.contains("did not realise the standing declaration"),
+            "{reason}"
+        );
+        let error = f.spawn.run(&stale.request).unwrap_err();
+        assert!(format!("{error:#}").contains("now declares"), "{error:#}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started + 1);
+        // That new start realises the declaration it was started under.
+        let third = f.spawn.run(&request).unwrap();
+        assert_eq!(f.spawn.show("life-test").unwrap().runs[2].realises, [again]);
+        assert_eq!(third.persona, first.persona);
+    }
+
+    /// Only a filled context continues: an ordinary end, a stop past the
+    /// limit, an unarchived conversation, or a provider whose end is not
+    /// measured (a claude window, today) start nothing.
+    #[test]
+    fn a_resident_does_not_continue_from_an_ordinary_end_a_stop_or_an_unarchived_life() {
+        use super::super::declaration::PlaceWish;
+        let f = fixture();
+        let life = |name: &str, provider: Provider| {
+            let mut request = named(&f, &format!("Resident {name}."), name, true);
+            request.provider = provider;
+            let launched = f.spawn.run(&request).unwrap();
+            declare_as(&f, name, PlaceWish::Here);
+            set_unit(&f, "inactive");
+            launched
+        };
+        // An ordinary end with room left.
+        let roomy = life("roomy-test", Provider::Agy);
+        agy_ran(&agy_home_of(&f, "roomy-test"), &roomy.report, "c-r", &[50_000, 120_000]);
+        settle_as(&f, &roomy, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let reason = nothing_follows(&f, "roomy-test");
+        assert!(reason.contains("no life-limit observation"), "{reason}");
+        // Past its limit, but stopped.
+        let stopped = life("stopped-test", Provider::Agy);
+        agy_ran(&agy_home_of(&f, "stopped-test"), &stopped.report, "c-s", &[50_000, 400_000]);
+        settle_as(&f, &stopped, Exit::from_systemd("killed", "TERM", "signal")).unwrap();
+        let reason = nothing_follows(&f, "stopped-test");
+        assert!(reason.contains("did not end cleanly"), "{reason}");
+        // Filled, but its conversation will not import.
+        let lost = life("lost-test", Provider::Agy);
+        let home = agy_home_of(&f, "lost-test");
+        agy_ran(&home, &lost.report, "c-l", &[50_000, 400_000]);
+        let path = super::super::agy::transcript(&home, "c-l").unwrap();
+        std::fs::write(&path, "{not json\n").unwrap();
+        settle_as(&f, &lost, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let reason = nothing_follows(&f, "lost-test");
+        assert!(
+            reason.contains("no life-limit observation") || reason.contains("not in the archive"),
+            "{reason}"
+        );
+        // A claude resident's end carries no life-limit observation yet.
+        let window = life("window-test", Provider::Claude);
+        f.settle("window-test", &window).unwrap();
+        let reason = nothing_follows(&f, "window-test");
+        assert!(reason.contains("no life-limit observation"), "{reason}");
     }
 
     #[test]

@@ -193,6 +193,19 @@ enum Command {
         #[arg(long, value_name = "PERSONA")]
         persona: Option<String>,
     },
+    /// Start a resident zooid's next life here, when one follows: one
+    /// declaration places it on this host, its newest life realised that
+    /// declaration and ended cleanly past its life limit, its conversation
+    /// is archived and its unit is not running. Otherwise print why nothing
+    /// follows and start nothing. One launch at most per life: asking again,
+    /// or twice at once, finds the life followed. A rest, an ordinary end or
+    /// a placement newer than the last life never continues.
+    Continue {
+        name: String,
+        /// Only say whether a next life follows; start nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// Every zooid, one line each.
     List,
     /// Each parent persona: its doing goals, the zooids it started that have
@@ -607,7 +620,11 @@ pub fn run() -> Result<()> {
                         percent: cover,
                         window,
                     },
-                    zooid: ZooidWish { name, resident },
+                    zooid: ZooidWish {
+                        name,
+                        resident,
+                        ..Default::default()
+                    },
                 })?;
                 print_launched(&launched)
             }
@@ -634,7 +651,11 @@ pub fn run() -> Result<()> {
                         percent: cover,
                         window,
                     },
-                    zooid: ZooidWish { name, resident },
+                    zooid: ZooidWish {
+                        name,
+                        resident,
+                        ..Default::default()
+                    },
                 })?;
                 print_launched(&launched)
             }
@@ -671,6 +692,38 @@ pub fn run() -> Result<()> {
                     name: name.clone(),
                 })?;
                 crate::cli::with_output("zooid", |out| out.line(declaring.line(&name)))
+            }
+            Command::Continue { name, check } => {
+                use super::life::{Continued, NextLife};
+                let text = if check {
+                    match spawn.next_life(&name)? {
+                        NextLife::Follows(next) => format!(
+                            "{} follows on: {}; its next life would realise declaration {:x}.\n",
+                            next.name, next.evidence, next.declaration
+                        ),
+                        NextLife::Nothing { reason } => format!("nothing follows: {reason}\n"),
+                    }
+                } else {
+                    match spawn.continue_life(&name)? {
+                        Continued::Started {
+                            continuation,
+                            launched,
+                        } => format!(
+                            "{} continues: {}. Run {:x} (unit {}) follows life {:x} and realises \
+                             declaration {:x}.\n",
+                            continuation.name,
+                            continuation.evidence,
+                            launched.run,
+                            launched.unit,
+                            continuation.previous,
+                            continuation.declaration
+                        ),
+                        Continued::Nothing { reason } => {
+                            format!("nothing started: {reason}\n")
+                        }
+                    }
+                };
+                crate::cli::with_output("zooid", |out| out.text(text))
             }
             Command::List => {
                 let spawns = spawn.list()?;
