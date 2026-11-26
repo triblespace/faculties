@@ -2901,6 +2901,31 @@ fn discord_presence_text(
 /// when a presence change was seen), then by anchor. Anchors are hashes and
 /// say nothing of time, and for one member coming into and leaving the voice
 /// channel the order is what tells whether they are there now.
+/// When a Discord message (or a heard sentence) was created: the earliest
+/// creation its observations claim.
+fn discord_created(query: &OrientQuery<'_>, anchor: Id) -> Option<Epoch> {
+    find!(
+        created: IntervalValue,
+        pattern!(query.discord, [{
+            _?observation @
+            metadata::tag: archive::kind_message,
+            discord::message: anchor,
+            metadata::created_at: ?created,
+        }])
+    )
+    .chain(find!(
+        created: IntervalValue,
+        pattern!(query.discord, [{
+            anchor @
+            metadata::tag: discord::kind_heard_sentence,
+            metadata::created_at: ?created,
+        }])
+    ))
+    .filter_map(|created| created.try_from_inline::<(Epoch, Epoch)>().ok())
+    .map(|(from, _)| from)
+    .min()
+}
+
 fn discord_in_order(query: &OrientQuery<'_>, anchors: impl IntoIterator<Item = Id>) -> Vec<Id> {
     let mut timed: Vec<(Option<i128>, Id)> = anchors
         .into_iter()
@@ -4975,7 +5000,10 @@ fn attention_items(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<Attention
                 id: event.id(),
                 text: news_report_entry(query, event, persona, &mut mail)?,
                 message: matches!(event, AttentionEvent::Message(_)),
-                at: None,
+                at: match event {
+                    AttentionEvent::Discord(anchor) => discord_created(query, *anchor),
+                    _ => None,
+                },
             })
         })
         .collect()

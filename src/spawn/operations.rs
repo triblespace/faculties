@@ -1491,6 +1491,47 @@ pub enum FeedEnd {
     Rounds,
 }
 
+/// How much of one feeder event reached the agent's input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    /// Written and flushed.
+    Whole,
+    /// Cut inside the event, or written and not flushed: it may have been
+    /// read.
+    Cut,
+    /// Not a byte of it was written.
+    Unsent,
+}
+
+/// Write `text` as one user event, counting what was taken.
+fn send(out: &mut dyn std::io::Write, text: &str) -> Sent {
+    let event = super::agy::user_event(text);
+    let bytes = event.as_bytes();
+    let mut written = 0;
+    while written < bytes.len() {
+        match out.write(&bytes[written..]) {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    match written {
+        0 => Sent::Unsent,
+        n if n < bytes.len() => Sent::Cut,
+        _ if out.flush().is_ok() => Sent::Whole,
+        _ => Sent::Cut,
+    }
+}
+
+fn ids_text(items: &[NewsItem]) -> String {
+    items
+        .iter()
+        .map(|item| format!("{:x}", item.id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// One feeder event: the news items, each once.
 fn feed_text(name: &str, items: &[NewsItem]) -> String {
     let mut text = format!(
@@ -2182,9 +2223,13 @@ impl Spawn {
     }
 
     /// Whether the latest run that ran as `persona` left its life in the
-    /// archive: ended, and, when it recorded a conversation, with the bytes
-    /// of it the import accepted ([`attrs::archive_imported`]). No run is
-    /// no previous life. `Err` says what is missing.
+    /// archive: ended, and, for an agent whose transcript settlement
+    /// archives (agy, claude), with [`attrs::archive_imported`] recorded:
+    /// the bytes an import accepted, or 0 for a life its settlement found
+    /// affirmatively empty. A run with no conversation recorded is not
+    /// enough, as a search that could not tell which conversation was its
+    /// own records none either. No run is no previous life. `Err` says what
+    /// is missing.
     fn previous_life_archived(&self, persona: Id) -> std::result::Result<(), String> {
         let latest = self.observe(|facts, reader| {
             let mut runs = find!(
@@ -2217,16 +2262,23 @@ impl Spawn {
                 run.id
             ));
         }
-        if run.source_locator.is_empty() {
-            // Nothing recorded a conversation: there is nothing to archive.
+        let archived_here = run.provider.iter().any(|provider| {
+            provider == Provider::Agy.name() || provider == Provider::Claude.name()
+        });
+        if !archived_here {
+            // Its transcript is not archived at settlement: nothing to wait for.
             return Ok(());
         }
         if run.archive_imported.is_empty() {
+            let conversation = if run.source_locator.is_empty() {
+                "none recorded".to_owned()
+            } else {
+                run.source_locator.join(", ")
+            };
             return Err(format!(
-                "its previous run {:x}'s conversation ({}) is not in the archive yet{}; settling \
-                 that run again retries the import",
+                "its previous run {:x}'s conversation ({conversation}) is not in the archive \
+                 yet{}; settling that run again retries it",
                 run.id,
-                run.source_locator.join(", "),
                 run.archive_outcome
                     .last()
                     .map(|outcome| format!(" ({outcome})"))
@@ -2277,6 +2329,24 @@ impl Spawn {
                  {given} refuses. Run it without --name, or give the changed name a changed brief"
             ),
             ([], Some(given)) => {
+                // A name is one zooid: a second on the same persona would
+                // make its runs, its rest and `zooid show` ambiguous.
+                let handle = super::text_handle(given);
+                let others: Vec<Id> = self.observe(|facts, _| {
+                    Ok(find!(
+                        other: Id,
+                        pattern!(facts, [{ ?other @ metadata::tag: KIND_SPAWN, attrs::name: handle }])
+                    )
+                    .filter(|other| *other != spawn)
+                    .collect())
+                })?;
+                if let Some(other) = others.first() {
+                    bail!(
+                        "{given} is already the name of zooid {other:x}, from another brief: a \
+                         name stays one zooid. Run that zooid's own brief, or give this one \
+                         another name"
+                    );
+                }
                 return Ok(Naming {
                     name: given.to_owned(),
                     origin: None,
@@ -3169,8 +3239,8 @@ impl Spawn {
                         Ok(Some(view)) => {
                             match (view.life_occupancy.first(), view.life_limit.first()) {
                                 (Some(occupancy), Some(limit)) => format!(
-                                " Its life ended at its limit: {occupancy} tokens in context, past \
-                                 {limit}."
+                                " At its end its context held {occupancy} tokens, past its life \
+                                 limit of {limit}."
                             ),
                                 _ => String::new(),
                             }
@@ -3430,7 +3500,15 @@ impl Spawn {
     ) -> (String, Option<anyhow::Error>) {
         let outcome = match self.run_transcript(name, agent, view, newer) {
             Located::Outside => return (String::new(), None),
-            Located::Nothing(why) => Ok(why),
+            // Affirmatively nothing: the life is whole in the archive, at 0.
+            Located::Nothing(why) => match self.publish(
+                entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: 0u64 }.into(),
+            ) {
+                Ok(()) => Ok(why),
+                Err(error) => Err(format!(
+                    "{why} Recording that failed ({error:#}); settling again records it."
+                )),
+            },
             Located::Refused(why) => Err(why),
             Located::Found(found) => self.archive_part(view, newer, &found),
         };
@@ -3906,60 +3984,77 @@ impl Spawn {
     /// Delivered is kept in the run's inbox state, the file the inbox hooks
     /// keep what they showed in, under the same lock: an item the
     /// PreInvocation hook showed is not fed again, nor one fed here shown
-    /// there. The first read takes what is already there (except unread
-    /// messages) as delivered: the life's past, not news. Nothing is
-    /// acknowledged and no receipt is written.
+    /// there. An item is recorded as delivered once its event was written
+    /// whole, or cut inside it (the agent may have read it); one not a byte
+    /// of which was written stays undelivered. The lock is not held while
+    /// writing, as the agent's own hook may wait for it: a hook and the
+    /// feeder that read the same new item at once can both show it.
+    ///
+    /// The run's first read of news waits for the run's record (the launch
+    /// starts the unit before it publishes it). It takes what is already
+    /// there as the life's past, except unread messages and items that
+    /// happened after the run started. Nothing is acknowledged and no
+    /// receipt is written.
     ///
     /// Before every read the life is checked: once the conversation is past
-    /// its limit the feeder ends, closing the agent's input, so the agent
-    /// ends after its last reply. A failed write means the agent is gone.
-    /// A failed read is logged and tried again at the next one.
+    /// its limit the feeder tells the life so and ends, closing the agent's
+    /// input. A failed write means the agent is gone. A failed read is
+    /// logged and tried again at the next one.
     pub fn feed(&self, request: &FeedRequest, out: &mut dyn std::io::Write) -> Result<FeedEnd> {
         let prompt_path = self.launch.file(&request.name, "prompt");
         let prompt = std::fs::read_to_string(&prompt_path)
             .with_context(|| format!("read {}", prompt_path.display()))?;
-        let write = |out: &mut dyn std::io::Write, text: &str| -> bool {
-            out.write_all(super::agy::user_event(text).as_bytes())
-                .and_then(|()| out.flush())
-                .is_ok()
-        };
-        if !write(out, &prompt) {
+        if send(out, &prompt) != Sent::Whole {
             return Ok(FeedEnd::AgentGone);
         }
-        let run = request.run;
-        let started = self
-            .observe(|facts, _| {
-                Ok(find!(
-                    at: IntervalValue,
-                    pattern!(facts, [{ run @ metadata::started_at: ?at }])
-                )
-                .filter_map(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
-                .map(|(from, _)| from)
-                .next())
-            })
-            .ok()
-            .flatten();
         let home = self.launch.agy_home(&request.name);
+        let mut started = None;
         let mut round = 0u64;
         loop {
-            if self.life_over(&home, request.run, started) {
-                // The hooks tell a turn that is under way; a life that
-                // crossed its limit as a turn ended hears it here, once,
-                // before its input closes.
-                let _ = write(out, &super::agy::life_over_input());
-                return Ok(FeedEnd::LifeOver);
-            }
-            match self.news.news(&self.storage, &request.name) {
-                Ok(items) => {
-                    let new = self.undelivered(&request.name, request.run, items)?;
-                    if !new.is_empty() && !write(out, &feed_text(&request.name, &new)) {
-                        return Ok(FeedEnd::AgentGone);
-                    }
+            if started.is_none() {
+                match self.run_started(request.run) {
+                    Ok(found) => started = found,
+                    Err(error) => eprintln!(
+                        "zooid feed {}: reading the run's start failed: {error:#}",
+                        request.name
+                    ),
                 }
-                Err(error) => eprintln!(
-                    "zooid feed {}: reading news failed: {error:#}",
-                    request.name
-                ),
+            }
+            if let Some(started) = started {
+                if self.life_over(&home, request.run, started) {
+                    // The hooks tell a turn that is under way; a life that
+                    // crossed its limit as a turn ended hears it here, once,
+                    // before its input closes.
+                    let _ = send(out, &super::agy::life_over_input());
+                    return Ok(FeedEnd::LifeOver);
+                }
+                match self.news.news(&self.storage, &request.name) {
+                    Ok(items) => {
+                        let new = self.undelivered(&request.name, request.run, started, items)?;
+                        if !new.is_empty() {
+                            let sent = send(out, &feed_text(&request.name, &new));
+                            if sent != Sent::Unsent {
+                                let ids: Vec<Id> = new.iter().map(|item| item.id).collect();
+                                self.delivered(&request.name, request.run, &ids)?;
+                            }
+                            if sent != Sent::Whole {
+                                if sent == Sent::Cut {
+                                    eprintln!(
+                                        "zooid feed {}: an event was cut while written; its {} \
+                                         item(s) count as delivered",
+                                        request.name,
+                                        ids_text(&new)
+                                    );
+                                }
+                                return Ok(FeedEnd::AgentGone);
+                            }
+                        }
+                    }
+                    Err(error) => eprintln!(
+                        "zooid feed {}: reading news failed: {error:#}",
+                        request.name
+                    ),
+                }
             }
             round += 1;
             if request.rounds.is_some_and(|rounds| round >= rounds) {
@@ -3969,10 +4064,23 @@ impl Spawn {
         }
     }
 
+    /// When `run` started, once its record is here; `None` before.
+    fn run_started(&self, run: Id) -> Result<Option<Epoch>> {
+        self.observe(|facts, _| {
+            Ok(find!(
+                at: IntervalValue,
+                pattern!(facts, [{ run @ metadata::started_at: ?at }])
+            )
+            .filter_map(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
+            .map(|(from, _)| from)
+            .next())
+        })
+    }
+
     /// Whether the conversation of `run` is past its life limit: the one
     /// the run continues, or the one conversation in the zooid's home that
     /// changed since the run started. None found, or several, is not over.
-    fn life_over(&self, home: &Path, run: Id, started: Option<Epoch>) -> bool {
+    fn life_over(&self, home: &Path, run: Id, started: Epoch) -> bool {
         let continued = self
             .observe(|facts, reader| {
                 Ok(find!(
@@ -3990,9 +4098,6 @@ impl Spawn {
         let conversation = match continued {
             Some(conversation) => conversation,
             None => {
-                let Some(started) = started else {
-                    return false;
-                };
                 let since = std::time::SystemTime::UNIX_EPOCH
                     + std::time::Duration::from_secs_f64(started.to_unix_seconds().max(0.0));
                 match super::agy::conversations_changed_since(home, |at| at >= since) {
@@ -4007,11 +4112,14 @@ impl Spawn {
         )
     }
 
-    /// The items not yet delivered to `name` in `run`, recorded as delivered
-    /// in the run's inbox state under its lock. The run's first feeder read
-    /// takes its items other than unread messages as delivered; a feeder
-    /// started again in the same run does not take them again.
-    fn undelivered(&self, name: &str, run: Id, items: Vec<NewsItem>) -> Result<Vec<NewsItem>> {
+    /// The run's inbox state under its lock, changed by `change` and written
+    /// back.
+    fn with_inbox_state<T>(
+        &self,
+        name: &str,
+        run: Id,
+        change: impl FnOnce(&mut InboxState) -> T,
+    ) -> Result<T> {
         let path = self.launch.file(name, "inbox.json");
         std::fs::create_dir_all(&self.launch.state_dir)
             .with_context(|| format!("create {}", self.launch.state_dir.display()))?;
@@ -4034,25 +4142,55 @@ impl Spawn {
                 ..Default::default()
             };
         }
-        let first = !state.fed;
-        state.fed = true;
-        let mut new = Vec::new();
-        for item in items {
-            if state.shown.contains(&item.id) {
-                continue;
-            }
-            state.shown.push(item.id);
-            if first && !item.unread_message {
-                continue;
-            }
-            new.push(item);
-        }
+        let value = change(&mut state);
         use std::io::{Seek as _, Write as _};
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(state.render().as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
-        Ok(new)
+        Ok(value)
+    }
+
+    /// The items not yet delivered to `name` in `run`, not recorded as
+    /// delivered yet ([`Self::delivered`] does that once they are sent).
+    /// The run's first feeder read records what is the life's past (not an
+    /// unread message, and not after `started`) as delivered; a feeder
+    /// started again in the same run does not take a past again.
+    fn undelivered(
+        &self,
+        name: &str,
+        run: Id,
+        started: Epoch,
+        items: Vec<NewsItem>,
+    ) -> Result<Vec<NewsItem>> {
+        self.with_inbox_state(name, run, |state| {
+            let first = !state.fed;
+            state.fed = true;
+            let mut new = Vec::new();
+            for item in items {
+                if state.shown.contains(&item.id) {
+                    continue;
+                }
+                let past = !item.unread_message && item.at.is_none_or(|at| at < started);
+                if first && past {
+                    state.shown.push(item.id);
+                    continue;
+                }
+                new.push(item);
+            }
+            new
+        })
+    }
+
+    /// Record `ids` as delivered to `name` in `run`.
+    fn delivered(&self, name: &str, run: Id, ids: &[Id]) -> Result<()> {
+        self.with_inbox_state(name, run, |state| {
+            for id in ids {
+                if !state.shown.contains(id) {
+                    state.shown.push(*id);
+                }
+            }
+        })
     }
 
     fn post(&self, request: &InboxRequest) -> Result<InboxAnswer> {

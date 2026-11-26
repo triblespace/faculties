@@ -900,10 +900,11 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     if facts.feed {
-        // Not exec: the unit's process is this shell, whose status is the
-        // agent's (the last of the pipeline). The feeder ends when the agent
-        // does (its next write fails) or closes the agent's input itself
-        // once the life is over.
+        // The agent is the unit's process (exec), its input the feeder's
+        // (a process substitution, which the shell does not wait for): the
+        // unit ends when the agent does, however quiet the news, and the
+        // unit's stop ends the feeder with it. The feeder closes the
+        // agent's input itself once the life is over.
         let home = facts
             .home
             .map(|home| format!("HOME={} ", q(home)))
@@ -914,7 +915,7 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
             String::new()
         };
         script.push_str(&format!(
-            "{home}{} feed {} --run {:x} 2>> {} | {agent}{report}\n",
+            "exec {agent} < <({home}{} feed {} --run {:x} 2>> {}){report}\n",
             q(facts.spawn),
             q(facts.name),
             facts.run,

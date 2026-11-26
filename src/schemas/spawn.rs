@@ -309,14 +309,17 @@ pub mod spawn {
         "2524D9660EE6D75B49BC618F98C9FC37" as archive_start: inlineencodings::U256BE;
         /// The bytes of the run's conversation that an import accepted: its
         /// [`archive_end`] once the archive holds them (0 when the
-        /// conversation had no complete line). Recorded only on success, so
+        /// conversation had no complete line, or settlement found
+        /// affirmatively that the run left none). Recorded only on success, so
         /// a fresh life of a resident zooid can tell its previous life is in
         /// the archive. Minted with `trible genid` on 2026-11-26.
         "50E91BF01FCEB1DB2D0971938CD23E72" as archive_imported: inlineencodings::U256BE;
         /// The context of the conversation's latest model call, in tokens,
-        /// when settlement found it past the life limit: an observation that
-        /// the life ended at its limit, read from the provider's own
-        /// transcript, never a plan. Absent for any other end. Minted with
+        /// when settlement found it past the life limit: how large the
+        /// context was at the end, read from the provider's own transcript,
+        /// never a plan. It says nothing of why the run ended (the limit, a
+        /// stop, a crash): read it with the run's exit. Absent when the
+        /// context was within the limit. Minted with
         /// `trible genid` on 2026-11-26.
         "1574FD9F4C9161477B59D8D0E43DB02B" as life_occupancy: inlineencodings::U256BE;
         /// The life limit that occupancy was past, in tokens: the window
