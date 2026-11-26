@@ -133,7 +133,7 @@ enum Command {
         /// Character budget for the journal and, with --about, selected Knowledge
         /// readings. Untinted standing beliefs, goals and diagnostics render
         /// separately. A smaller budget gives a coarser recollection.
-        #[arg(long, default_value_t = 800_000)]
+        #[arg(long, default_value_t = super::WAKE_CHARS)]
         chars: usize,
         /// Max doing goals to show
         #[arg(long, default_value_t = 5)]

@@ -62,9 +62,30 @@ pub struct AgyResult {
 
 /// agy's result object. A conversation id that is empty, or not a plain
 /// name, is none: it is used as a directory name and a `--conversation`
-/// argument. `None` when the bytes are not agy's result.
+/// argument. `None` when the bytes are not agy's result. The output of a
+/// stream-json run, one event per line and a result event after each turn,
+/// is read by its last result event: the run's last reply.
 pub fn agy_result(bytes: &[u8]) -> Option<AgyResult> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(value) => one_result(value),
+        // RED: a stream's last result event is not read yet.
+        Err(_) if true => None,
+        Err(_) => bytes
+            .split(|&byte| byte == b'\n')
+            .rev()
+            .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            .find(|value| value.get("event").is_some_and(|event| event == "result"))
+            .and_then(one_result),
+    }
+}
+
+/// One stream-json user event: what the feeder writes for each input.
+pub fn user_event(text: &str) -> String {
+    let event = serde_json::json!({ "event": "user", "message": { "content": text } });
+    format!("{event}\n")
+}
+
+fn one_result(value: serde_json::Value) -> Option<AgyResult> {
     // stream-json wraps the same object as {"event":"result","result":{..}}.
     let value = match value.get("event") {
         Some(event) if event == "result" => value.get("result")?.clone(),
@@ -758,6 +779,38 @@ mod tests {
         );
         assert_eq!(agy_result(b"plain text"), None);
         assert!(!plain_id("../x") && !plain_id("") && plain_id("abc-1_2"));
+    }
+
+    #[test]
+    fn a_stream_runs_report_is_its_last_result_event() {
+        let result = |response: &str| {
+            format!(
+                r#"{{"event":"result","result":{{"conversation_id":"c-7","status":"SUCCESS","response":"{response}","usage":{{"input_tokens":10,"output_tokens":2,"cache_read_tokens":90,"total_tokens":102}}}}}}"#
+            )
+        };
+        let stream = [
+            r#"{"event":"init","conversation_id":"c-7"}"#.to_owned(),
+            result("the first turn"),
+            r#"{"event":"assistant","message":{"content":"working"}}"#.to_owned(),
+            result("the last turn"),
+            r#"{"event":"assistant","message":{"content":"cut"#.to_owned(),
+        ]
+        .join("\n");
+        let parsed = agy_result(stream.as_bytes()).unwrap();
+        assert_eq!(parsed.response.as_deref(), Some("the last turn"));
+        assert_eq!(parsed.conversation_id.as_deref(), Some("c-7"));
+        assert_eq!(parsed.usage.input_tokens, Some(100));
+        // Events with no result yet are no result.
+        assert_eq!(agy_result(br#"{"event":"init"}"#), None);
+        // What the feeder writes is one user event per line.
+        let event = user_event("line one\nline two");
+        assert!(
+            event.ends_with('\n') && event.matches('\n').count() == 1,
+            "{event}"
+        );
+        let value: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(value["event"], "user");
+        assert_eq!(value["message"]["content"], "line one\nline two");
     }
 
     #[test]

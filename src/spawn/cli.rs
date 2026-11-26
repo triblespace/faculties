@@ -9,8 +9,9 @@ use triblespace::prelude::Id;
 
 use super::operations::{describe_end, render_list, render_show};
 use super::{
-    inbox_failure, CoverWish, DeclareRequest, Exit, GoalRequest, InboxHook, InboxRequest,
-    LaunchConfig, Launched, PlaceWish, Provider, RunRequest, SettleRequest, Spawn,
+    inbox_failure, CoverWish, DeclareRequest, Exit, FeedRequest, GoalRequest, InboxHook,
+    InboxRequest, LaunchConfig, Launched, PlaceWish, Provider, RunRequest, SettleRequest, Spawn,
+    ZooidWish,
 };
 
 #[derive(Parser)]
@@ -76,6 +77,20 @@ enum Command {
         /// recorded). Only used with --cover.
         #[arg(long, value_name = "TOKENS", requires = "cover")]
         window: Option<u64>,
+        /// The zooid's name, for one that has none stored yet: a persona
+        /// label (lowercase letters, digits and dashes) instead of the
+        /// brief's proquints. An existing persona of that label is the
+        /// zooid's. A zooid that has a name keeps it; a different one refuses.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The persona outlives each run: settlement never retires it, the
+        /// launch refuses only while the zooid's unit runs, and a fresh life
+        /// wakes into a window's wake (never a smaller cover; refused with
+        /// --cover) once its previous life is archived. An agy resident is
+        /// fed colony news between turns. `zooid declare --rest` is the
+        /// durable stop; nothing here starts the next life.
+        #[arg(long, conflicts_with = "cover")]
+        resident: bool,
     },
     /// Launch a zooid for a goal: the brief is rendered from the
     /// goal's title, its parent chain and its latest notes, plus the zooid's
@@ -123,6 +138,20 @@ enum Command {
         /// recorded). Only used with --cover.
         #[arg(long, value_name = "TOKENS", requires = "cover")]
         window: Option<u64>,
+        /// The zooid's name, for one that has none stored yet: a persona
+        /// label (lowercase letters, digits and dashes) instead of the
+        /// brief's proquints. An existing persona of that label is the
+        /// zooid's. A zooid that has a name keeps it; a different one refuses.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The persona outlives each run: settlement never retires it, the
+        /// launch refuses only while the zooid's unit runs, and a fresh life
+        /// wakes into a window's wake (never a smaller cover; refused with
+        /// --cover) once its previous life is archived. An agy resident is
+        /// fed colony news between turns. `zooid declare --rest` is the
+        /// durable stop; nothing here starts the next life.
+        #[arg(long, conflicts_with = "cover")]
+        resident: bool,
     },
     /// Record where and how a zooid lives: on one host, on any host, or at
     /// rest.
@@ -192,6 +221,20 @@ enum Command {
         /// Seconds between unit-state checks.
         #[arg(long, default_value_t = 30)]
         poll: u64,
+    },
+    /// A fed resident's input, run by its unit script into the agent's
+    /// stdin: the prompt as the first stream-json user event, then the
+    /// persona's news between turns, each item once, until the life is past
+    /// its limit (then the input closes) or the agent is gone. It
+    /// acknowledges nothing and writes no Orient receipt.
+    Feed {
+        name: String,
+        /// The run being fed (hex id), as `zooid spawn` wrote it into the script.
+        #[arg(long, value_name = "ID")]
+        run: String,
+        /// Seconds between reads of the news.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
     },
     /// The unit's stop-post step: record the end, message the spawner as the
     /// zooid, then retire the persona. Safe to run again after a failure: an
@@ -507,6 +550,27 @@ pub fn run() -> Result<()> {
         return run_inbox(&cli.workspace, cli.pile, cli.key, name, run, hook);
     }
     let storage = cli.workspace.storage(cli.pile, cli.key)?;
+    if let Command::Feed {
+        name,
+        run,
+        interval,
+    } = &command
+    {
+        // Like a wait it lasts a life: every read opens the pile afresh.
+        let run = Id::from_hex(run.trim()).ok_or_else(|| anyhow!("invalid run id {run}"))?;
+        let spawn = Spawn::new(storage, LaunchConfig::from_home_env()?);
+        let end = spawn.feed(
+            &FeedRequest {
+                name: name.clone(),
+                run,
+                interval: Duration::from_secs((*interval).max(1)),
+                rounds: None,
+            },
+            &mut std::io::stdout().lock(),
+        )?;
+        eprintln!("zooid feed {name}: ended ({end:?})");
+        return Ok(());
+    }
     if let Command::Wait { name, poll } = &command {
         // Each check opens the pile afresh, so a wait that lasts hours keeps
         // no store open and reads the settlement another process wrote.
@@ -528,6 +592,8 @@ pub fn run() -> Result<()> {
                 provider,
                 cover,
                 window,
+                name,
+                resident,
             } => {
                 let launched = spawn.run(&RunRequest {
                     brief: read_brief(&brief)?,
@@ -539,6 +605,7 @@ pub fn run() -> Result<()> {
                         percent: cover,
                         window,
                     },
+                    zooid: ZooidWish { name, resident },
                 })?;
                 print_launched(&launched)
             }
@@ -551,6 +618,8 @@ pub fn run() -> Result<()> {
                 provider,
                 cover,
                 window,
+                name,
+                resident,
             } => {
                 let launched = spawn.goal(&GoalRequest {
                     goal,
@@ -563,6 +632,7 @@ pub fn run() -> Result<()> {
                         percent: cover,
                         window,
                     },
+                    zooid: ZooidWish { name, resident },
                 })?;
                 print_launched(&launched)
             }
@@ -608,7 +678,10 @@ pub fn run() -> Result<()> {
                 let view = spawn.show(&name)?;
                 crate::cli::with_output("zooid", |out| out.text(render_show(&view, brief)))
             }
-            Command::Wait { .. } | Command::Inbox { .. } | Command::DriveTask { .. } => {
+            Command::Wait { .. }
+            | Command::Feed { .. }
+            | Command::Inbox { .. }
+            | Command::DriveTask { .. } => {
                 unreachable!("handled above")
             }
             Command::Settle {

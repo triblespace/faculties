@@ -85,6 +85,14 @@ pub const OUTCOME_REFUSED: Id = id_hex!("E11BF1D92608F66308A21E7FCB07B65B");
 /// over. Minted 2026-11-17.
 pub const OUTCOME_TERMINAL: Id = id_hex!("A23987DE98AE18530D7CC04A2E78B432");
 
+/// Tag of a resident run: its persona outlives it. Settlement never retires
+/// it, and a launch refuses only while the zooid's unit runs, not while its
+/// persona is live; `zooid declare --rest` is the durable stop.
+///
+/// Minted with `trible genid` on 2026-11-26:
+/// `19F3B0C6CB649C6EBB17C9D3517700C3`.
+pub const TAG_RESIDENT_RUN: Id = id_hex!("19F3B0C6CB649C6EBB17C9D3517700C3");
+
 /// Kind marker of a declaration of where and how a zooid lives.
 ///
 /// Minted with `trible genid` on 2026-11-24:
@@ -299,5 +307,21 @@ pub mod spawn {
         /// continues it launched: the earlier lives' part. The run's own
         /// calls are the ones after it.
         "2524D9660EE6D75B49BC618F98C9FC37" as archive_start: inlineencodings::U256BE;
+        /// The bytes of the run's conversation that an import accepted: its
+        /// [`archive_end`] once the archive holds them (0 when the
+        /// conversation had no complete line). Recorded only on success, so
+        /// a fresh life of a resident zooid can tell its previous life is in
+        /// the archive. Minted with `trible genid` on 2026-11-26.
+        "50E91BF01FCEB1DB2D0971938CD23E72" as archive_imported: inlineencodings::U256BE;
+        /// The context of the conversation's latest model call, in tokens,
+        /// when settlement found it past the life limit: an observation that
+        /// the life ended at its limit, read from the provider's own
+        /// transcript, never a plan. Absent for any other end. Minted with
+        /// `trible genid` on 2026-11-26.
+        "1574FD9F4C9161477B59D8D0E43DB02B" as life_occupancy: inlineencodings::U256BE;
+        /// The life limit that occupancy was past, in tokens: the window
+        /// less the largest step and the report reserve, as settlement
+        /// computed it. Minted with `trible genid` on 2026-11-26.
+        "01C54945F4EF9CDC1AAA1173A8D86E9B" as life_limit: inlineencodings::U256BE;
     }
 }

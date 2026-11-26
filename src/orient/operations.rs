@@ -327,6 +327,17 @@ impl Orient {
             ))
         })
     }
+    /// One persona's attention set as it stands, nothing consumed: every
+    /// event Orient would show it, each with the `News:` text a report gives
+    /// it, receipts neither read nor written. For a consumer that keeps
+    /// what it delivered itself (a resident zooid's feeder), so two personas
+    /// behind one signing key never consume each other's news. `None` while
+    /// a source is still being prepared or the persona is not known yet.
+    pub fn attention(&self, persona: &str) -> Result<Option<Vec<AttentionItem>>> {
+        self.storage.with_store(|pile, signer, runtime| {
+            runtime.block_on(cmd_attention(&self.storage, pile, signer, persona))
+        })
+    }
     pub fn baseline(&self, persona: &str) -> Result<BaselineReceipt> {
         self.storage.with_store(|pile, signer, runtime| {
             runtime.block_on(cmd_baseline(
@@ -4891,6 +4902,84 @@ async fn cmd_poll(
         Ok(())
     }
     .await
+}
+
+/// One event of a persona's attention set ([`Orient::attention`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttentionItem {
+    /// The event's id: a message's, a Discord message anchor's, a goal
+    /// status event's.
+    pub id: Id,
+    /// Its `News:` lines, as a report shows them.
+    pub text: String,
+    /// A message: in the set until the persona acknowledges it.
+    pub message: bool,
+}
+
+async fn cmd_attention(
+    routing: &Storage,
+    pile: &mut impl FacultyAccess,
+    signer: &SigningKey,
+    input: &str,
+) -> Result<Option<Vec<AttentionItem>>> {
+    let sources = OrientSources::open(routing, pile, signer, false).await?;
+    if let Err(error) = maintain_inputs(pile, signer, &sources).await {
+        if is_preparation_pending(&error) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let observation = match observe_current_sources_acquiring(pile, &sources).await {
+        Ok(observation) => observation,
+        Err(error) if is_preparation_pending(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let items = read(pile, &observation.snapshot, |reader| {
+        let query = observation.query(reader);
+        let persona = resolve_native_persona(&query, input)?;
+        attention_items(&query, persona)
+    })
+    .await;
+    match items {
+        Ok(items) => Ok(Some(items)),
+        Err(error) if is_payload_pending(&error) || is_persona_not_found(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The attention set in the order a report gives it: Discord last, in the
+/// order it happened, everything else by id.
+fn attention_items(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<AttentionItem>> {
+    if true {
+        // RED: the attention set is not read yet.
+        return Ok(Vec::new());
+    }
+    let candidates = load_attention_view(query, persona)?;
+    let discord = discord_in_order(
+        query,
+        candidates.events.values().filter_map(|event| match event {
+            AttentionEvent::Discord(anchor) => Some(*anchor),
+            _ => None,
+        }),
+    );
+    let ordered: Vec<AttentionEvent> = candidates
+        .events
+        .values()
+        .filter(|event| !matches!(event, AttentionEvent::Discord(_)))
+        .cloned()
+        .chain(discord.into_iter().map(AttentionEvent::Discord))
+        .collect();
+    let mut mail = None;
+    ordered
+        .iter()
+        .map(|event| {
+            Ok(AttentionItem {
+                id: event.id(),
+                text: news_report_entry(query, event, persona, &mut mail)?,
+                message: matches!(event, AttentionEvent::Message(_)),
+            })
+        })
+        .collect()
 }
 
 struct WaitOutcome {
@@ -12339,6 +12428,111 @@ mod tests {
         mention_note(&mut facts, goal, "a later reply", cast.bea, &[], 5.0);
         let seen = mention_news(cast.relations, facts, &[cast.ada]);
         assert!(seen[0].0.is_empty(), "{}", seen[0].1);
+    }
+
+    /// The attention set a resident's feeder reads: a Discord line somebody
+    /// else wrote is in it with its `News:` text, the bot's own is not, and
+    /// presenting it to the reader (a receipt under the shared key) does not
+    /// take it out: the set never consults receipts, so a consumer keeping
+    /// its own delivered set is never starved by another persona's window.
+    #[test]
+    fn the_attention_set_holds_discord_lines_and_ignores_receipts() {
+        crate::test_support::clear_ambient_environment();
+        runtime().unwrap().block_on(async {
+            use crate::discord::operations::observed_fragment;
+            use serde_json::json;
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(91);
+            let (profile, _, _) = relations::person_fragment(
+                reader_id,
+                relations::ProfileInput {
+                    label: "resident".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            pile.commit(sources.relations.source, &fixture.signer, profile)
+                .unwrap();
+            let channel = "100000000000000210";
+            let bot = "100000000000000910";
+            let message = |id: &str, author: &str, content: &str| {
+                json!({
+                    "id": id, "channel_id": channel, "guild_id": "100000000000000300",
+                    "type": 0, "content": content,
+                    "author": {"id": author, "username": author, "global_name": "JP"},
+                    "timestamp": "2026-11-26T02:00:00Z", "edited_timestamp": null,
+                    "attachments": [],
+                })
+            };
+            let stored = |message: serde_json::Value| {
+                observed_fragment(message, |_, _| Ok(Vec::new())).unwrap()
+            };
+            let mut facts = crate::discord::bot_account_fragment(bot).unwrap();
+            facts += crate::discord::intake_fragment(channel, 100000000000000000).unwrap();
+            facts += stored(message(
+                "100000000000000601",
+                "100000000000000401",
+                "hi agy",
+            ));
+            facts += stored(message("100000000000000602", bot, "the bot itself"));
+            pile.commit(sources.discord.source, &fixture.signer, facts)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let items = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                attention_items(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert!(items[0].text.contains("hi agy"), "{items:?}");
+            assert!(!items[0].message);
+            assert!(!items[0].text.contains("the bot itself"));
+
+            // Presented to the reader, it is no news to a report again, and
+            // still in the attention set.
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let mut output = Vec::new();
+            apply_news_to_writer(
+                &mut pile,
+                &fixture.signer,
+                reader_id,
+                false,
+                &news,
+                "",
+                &mut output,
+            )
+            .unwrap();
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let again = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            assert!(matches!(again, News::Quiet), "presented news repeated");
+            let observation = observe_current_sources(&mut pile, &sources).unwrap();
+            let after = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                attention_items(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            assert_eq!(after, items);
+        });
     }
 
     /// Discord is read like Teams: a message somebody else wrote is news with

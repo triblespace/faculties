@@ -41,7 +41,7 @@ use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::imagine::imagine as imagine_attrs;
 use crate::schemas::spawn::{
     spawn as attrs, DEFAULT_SCOPE_ID, KIND_OUTCOME, KIND_REQUEST, KIND_RUN, KIND_SPAWN,
-    OUTCOME_ACCEPTED, OUTCOME_REFUSED, OUTCOME_RUNNING, OUTCOME_TERMINAL,
+    OUTCOME_ACCEPTED, OUTCOME_REFUSED, OUTCOME_RUNNING, OUTCOME_TERMINAL, TAG_RESIDENT_RUN,
 };
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
 
@@ -877,6 +877,21 @@ pub struct RunRequest {
     pub spawner: String,
     pub provider: Provider,
     pub cover: CoverWish,
+    pub zooid: ZooidWish,
+}
+
+/// Who a launch makes the zooid: the name it is given instead of the one
+/// its brief hashes to, and whether it is resident, its persona outliving
+/// each run. The default asks neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ZooidWish {
+    /// `--name`: the name of a zooid that has none stored yet. One that has
+    /// a name keeps it; a different one refuses.
+    pub name: Option<String>,
+    /// `--resident`: settlement never retires the persona, a launch refuses
+    /// only while the zooid's unit runs, and each fresh life wakes into a
+    /// window's wake.
+    pub resident: bool,
 }
 
 /// What a launch asks of its cover's size: `percent` of the worker's
@@ -902,6 +917,7 @@ pub struct GoalRequest {
     pub spawner: String,
     pub provider: Provider,
     pub cover: CoverWish,
+    pub zooid: ZooidWish,
 }
 
 /// What one launch runs from: the brief text, the memory tail's topic, and
@@ -1002,6 +1018,8 @@ struct RunFiles {
     brief: PathBuf,
     /// The spawning persona's label, for `{spawner}`.
     spawner: String,
+    /// A fed resident: its input is `zooid feed`'s stream of user events.
+    fed: bool,
 }
 
 /// An agent command line and what the unit gives it.
@@ -1125,6 +1143,15 @@ pub struct RunView {
     pub archive_outcome: Vec<String>,
     /// The transcript's length when this run launched to continue it.
     pub archive_start: Vec<u64>,
+    /// The bytes of its conversation an import accepted: recorded only on
+    /// success ([`attrs::archive_imported`]).
+    pub archive_imported: Vec<u64>,
+    /// A resident run: its persona outlives it ([`TAG_RESIDENT_RUN`]).
+    pub resident: bool,
+    /// The latest call's context and the limit it was past, when the life
+    /// ended at its limit ([`attrs::life_occupancy`]).
+    pub life_occupancy: Vec<u64>,
+    pub life_limit: Vec<u64>,
 }
 
 /// A BLAKE3 digest as the pile stores it.
@@ -1298,6 +1325,9 @@ struct InboxState {
     run: Option<Id>,
     checked_at: Option<u64>,
     shown: Vec<Id>,
+    /// A feeder has read this run's news once: what was there then is in
+    /// `shown`, and everything after is news.
+    fed: bool,
 }
 
 impl InboxState {
@@ -1320,6 +1350,7 @@ impl InboxState {
                 })
                 .transpose()?
                 .unwrap_or_default(),
+            fed: value["fed"].as_bool().unwrap_or(false),
         })
     }
 
@@ -1328,6 +1359,7 @@ impl InboxState {
             "run": self.run.map(|run| format!("{run:x}")),
             "checked_at": self.checked_at,
             "shown": self.shown.iter().map(|id| format!("{id:x}")).collect::<Vec<_>>(),
+            "fed": self.fed,
         });
         format!("{value}\n")
     }
@@ -1387,6 +1419,87 @@ fn post_context(name: &str, new: &[crate::message::MessageObservation]) -> Strin
     )
 }
 
+/// One item of news for one persona, as its source reads it now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewsItem {
+    /// The event's own id (a message's, a Discord message anchor's): what a
+    /// consumer records as delivered.
+    pub id: Id,
+    pub text: String,
+    /// An unread message: news until the persona acknowledges it, whenever
+    /// it arrived. Anything else is news from the moment a consumer first
+    /// looks; what was already there then is the life's past.
+    pub unread_message: bool,
+}
+
+/// The news of one persona: what is news to it now, in order, none of it
+/// consumed by reading. What was delivered is the consumer's to keep (the
+/// run's inbox state), so two personas behind one signing key never consume
+/// each other's news. The node's notification delivery may replace this
+/// source; the feeder does not change with it.
+pub trait NewsSource: Send + Sync {
+    fn news(&self, storage: &Storage, persona: &str) -> Result<Vec<NewsItem>>;
+}
+
+/// Today's source: Orient's attention set for the persona, read without
+/// its receipts ([`crate::orient::Orient::attention`]): messages, Discord
+/// lines in channels addressed to nobody or to the persona, goals and the
+/// rest Orient shows. A set that is still being prepared is no news yet.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrientNews;
+
+impl NewsSource for OrientNews {
+    fn news(&self, storage: &Storage, persona: &str) -> Result<Vec<NewsItem>> {
+        let items = crate::orient::Orient::with_storage(storage.clone()).attention(persona)?;
+        Ok(items
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| NewsItem {
+                id: item.id,
+                text: item.text,
+                unread_message: item.message,
+            })
+            .collect())
+    }
+}
+
+/// `zooid feed`: what a fed resident's feeder is given.
+#[derive(Clone, Debug)]
+pub struct FeedRequest {
+    pub name: String,
+    pub run: Id,
+    /// Between two reads of the news.
+    pub interval: Duration,
+    /// Stop after this many reads (tests); `None` runs until the life is
+    /// over or the agent is gone.
+    pub rounds: Option<u64>,
+}
+
+/// Why a feeder ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeedEnd {
+    /// The life is past its limit: the agent's input is closed, so it ends
+    /// once its last reply is written.
+    LifeOver,
+    /// A write failed: the agent no longer reads.
+    AgentGone,
+    /// The requested number of reads.
+    Rounds,
+}
+
+/// One feeder event: the news items, each once.
+fn feed_text(name: &str, items: &[NewsItem]) -> String {
+    let mut text = format!(
+        "News for {name}, between your turns. Each item is shown once; a message stays unread \
+         until you `message_ack` it (from {name}).\n\n"
+    );
+    for item in items {
+        text.push_str(item.text.trim_end());
+        text.push('\n');
+    }
+    text
+}
+
 /// Configured Spawn operations.
 #[derive(Clone)]
 pub struct Spawn {
@@ -1394,6 +1507,7 @@ pub struct Spawn {
     launch: LaunchConfig,
     launcher: Arc<dyn Launcher>,
     renderer: Arc<dyn Renderer>,
+    news: Arc<dyn NewsSource>,
 }
 
 impl Spawn {
@@ -1403,7 +1517,13 @@ impl Spawn {
             launch,
             launcher: Arc::new(SystemdLauncher),
             renderer: Arc::new(LibraryRenderer::default()),
+            news: Arc::new(OrientNews),
         }
+    }
+
+    pub fn with_news(mut self, news: Arc<dyn NewsSource>) -> Self {
+        self.news = news;
+        self
     }
 
     /// The storage every operation reads and writes through.
@@ -1435,6 +1555,7 @@ impl Spawn {
             &request.spawner,
             request.provider,
             request.cover,
+            &request.zooid,
         )
     }
 
@@ -1459,6 +1580,7 @@ impl Spawn {
             &request.spawner,
             request.provider,
             request.cover,
+            &request.zooid,
         )
     }
 
@@ -1821,17 +1943,22 @@ impl Spawn {
                 // The prompt is stdin (`-p -`): a cover is longer than one
                 // argument may be. The result object is stdout; settlement
                 // reads the reply, usage and conversation id from it.
-                let mut argv = vec![
-                    text(&self.launch.agy),
+                // A fed resident reads user events from the feeder and
+                // writes events: its run spans many turns.
+                let mut argv = vec![text(&self.launch.agy)];
+                if files.fed {
+                    argv.extend(["--input-format".to_owned(), "stream-json".to_owned()]);
+                }
+                argv.extend([
                     "--output-format".to_owned(),
-                    "json".to_owned(),
+                    if files.fed { "stream-json" } else { "json" }.to_owned(),
                     "--dangerously-skip-permissions".to_owned(),
                     "--disable-slash-commands".to_owned(),
                     "--effort".to_owned(),
                     effort.to_owned(),
                     "--settings".to_owned(),
                     text(&files.settings),
-                ];
+                ]);
                 if let Some(model) = &self.launch.agy_model {
                     argv.extend(["--model".to_owned(), model.clone()]);
                 }
@@ -2050,14 +2177,77 @@ impl Spawn {
         }
     }
 
+    /// Whether the latest run that ran as `persona` left its life in the
+    /// archive: ended, and, when it recorded a conversation, with the bytes
+    /// of it the import accepted ([`attrs::archive_imported`]). No run is
+    /// no previous life. `Err` says what is missing.
+    fn previous_life_archived(&self, persona: Id) -> std::result::Result<(), String> {
+        let latest = self.observe(|facts, reader| {
+            let mut runs = find!(
+                (run: Id, started: IntervalValue),
+                pattern!(facts, [{ ?run @
+                    metadata::tag: KIND_RUN,
+                    attrs::persona: persona,
+                    metadata::started_at: ?started,
+                }])
+            )
+            .filter_map(|(run, started)| {
+                let (from, _) = started.try_from_inline::<(Epoch, Epoch)>().ok()?;
+                Some((from, run, started))
+            })
+            .collect::<Vec<_>>();
+            runs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            Ok(runs
+                .pop()
+                .map(|(_, run, started)| run_view(facts, reader, run, started)))
+        });
+        let run = match latest {
+            Ok(Some(run)) => run,
+            Ok(None) => return Ok(()),
+            Err(error) => return Err(format!("reading its previous life failed: {error:#}")),
+        };
+        if !run.ended() {
+            return Err(format!(
+                "its previous run {:x} has no recorded end; settle it first (the settle line of \
+                 its unit script)",
+                run.id
+            ));
+        }
+        if run.source_locator.is_empty() {
+            // Nothing recorded a conversation: there is nothing to archive.
+            return Ok(());
+        }
+        if run.archive_imported.is_empty() {
+            return Err(format!(
+                "its previous run {:x}'s conversation ({}) is not in the archive yet{}; settling \
+                 that run again retries the import",
+                run.id,
+                run.source_locator.join(", "),
+                run.archive_outcome
+                    .last()
+                    .map(|outcome| format!(" ({outcome})"))
+                    .unwrap_or_default()
+            ));
+        }
+        Ok(())
+    }
+
     /// The name for the zooid `spawn`. A zooid that has a stored name keeps
     /// it: a relaunch, a move or a group rename never renames it. A new one
     /// is named after the unique colony its spawner belongs to, or failing
     /// that the unique origin colony of the zooids the spawner ran as (task
     /// zooids are not colony members); otherwise it gets no prefix and the
     /// reason. Two stored names, from hosts that named it apart, refuse: the
-    /// launch would have to pick one.
-    fn naming(&self, spawn: Id, brief: TextHandle, spawner: Id) -> Result<Naming> {
+    /// launch would have to pick one. A `given` name (`--name`) names a zooid
+    /// that has none yet, with no colony prefix; a zooid that has one keeps
+    /// it, and a different given name refuses rather than rename it.
+    fn naming(
+        &self,
+        spawn: Id,
+        brief: TextHandle,
+        spawner: Id,
+        given: Option<&str>,
+    ) -> Result<Naming> {
         let (names, inherited) = self.observe(|facts, reader| {
             let (names, missing) = stored_names(facts, reader, spawn);
             if !missing.is_empty() {
@@ -2077,6 +2267,21 @@ impl Spawn {
             .collect();
             Ok((names, inherited))
         })?;
+        match (names.as_slice(), given) {
+            ([one], Some(given)) if one != given => bail!(
+                "zooid {spawn:x} is named {one}: a relaunch never renames a zooid, so --name \
+                 {given} refuses. Run it without --name, or give the changed name a changed brief"
+            ),
+            ([], Some(given)) => {
+                return Ok(Naming {
+                    name: given.to_owned(),
+                    origin: None,
+                    fresh: true,
+                    unprefixed: None,
+                });
+            }
+            _ => {}
+        }
         match names.as_slice() {
             [one] => {
                 return Ok(Naming {
@@ -2165,7 +2370,11 @@ impl Spawn {
         spawner_label: &str,
         provider: Provider,
         cover_wish: CoverWish,
+        zooid: &ZooidWish,
     ) -> Result<Launched> {
+        // RED: the wish is not wired into the launch yet.
+        let _ = zooid;
+        let zooid = &ZooidWish::default();
         if !super::EFFORTS.contains(&effort) {
             bail!(
                 "effort {:?} is not one of {}",
@@ -2189,6 +2398,16 @@ impl Spawn {
         if cover_wish.window == Some(0) {
             bail!("--window 0 is not a context window");
         }
+        if zooid.resident && cover_wish.percent.is_some() {
+            bail!(
+                "a resident zooid wakes into a window's wake ({} journal characters), never a \
+                 smaller cover: --cover and --resident do not go together",
+                crate::orient::WAKE_CHARS
+            );
+        }
+        if let Some(name) = &zooid.name {
+            super::given_name(name)?;
+        }
         let (provider, provider_reason) = self.resolve_provider(provider)?;
         let (mut spawn_fragment, spawn, brief_handle) = super::spawn_core(&brief.text)?;
         let relations = Relations::with_storage(self.storage.clone());
@@ -2197,7 +2416,7 @@ impl Spawn {
             Some(_) => bail!("spawner {spawner_label} is retired"),
             None => bail!("no persona matches spawner {spawner_label}"),
         };
-        let naming = self.naming(spawn, brief_handle, spawner)?;
+        let naming = self.naming(spawn, brief_handle, spawner, zooid.name.as_deref())?;
         let name = naming.name.clone();
         if naming.fresh {
             spawn_fragment += super::name_fragment(spawn, &name, naming.origin);
@@ -2285,7 +2504,28 @@ impl Spawn {
         // retired the persona), so a replayed settlement of an earlier run
         // either sees this run or waits for it.
         let _zooid_lock = self.zooid_lock(&name)?;
+        // Whether this launch made the persona live: only then does a launch
+        // that never started retire it again. A resident adopts a live one.
+        let mut revived = true;
         let persona = match relations.person_state(&name)? {
+            Some(state) if !state.retired && zooid.resident => {
+                // A resident's persona is live between its lives: what must
+                // not happen twice is the unit.
+                match self.launcher.state(&unit) {
+                    Ok(unit_state) if !is_running(&unit_state) => {
+                        revived = false;
+                        state.person
+                    }
+                    Ok(unit_state) => bail!(
+                        "{name} is running: unit {unit} is {unit_state}. A resident's next life \
+                         starts once this one has ended and settled."
+                    ),
+                    Err(error) => bail!(
+                        "whether {name}'s unit {unit} runs is unknown ({error:#}); nothing was \
+                         started"
+                    ),
+                }
+            }
             Some(state) if !state.retired => {
                 let unit_state = self
                     .launcher
@@ -2311,7 +2551,8 @@ impl Spawn {
                             label: name.clone(),
                             affinities: vec!["zooid".to_owned()],
                             note: Some(format!(
-                                "Task zooid spawned from brief {}.",
+                                "{} zooid spawned from brief {}.",
+                                if zooid.resident { "Resident" } else { "Task" },
                                 super::handle_text(brief_handle)
                             )),
                             ..Default::default()
@@ -2333,7 +2574,7 @@ impl Spawn {
                 scores: None,
                 ..Default::default()
             };
-            let (tint, lexical_fallback) = if about.trim().is_empty() {
+            let (tint, lexical_fallback) = if about.trim().is_empty() || zooid.resident {
                 (lexical(), None)
             } else {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2353,18 +2594,33 @@ impl Spawn {
                     ),
                 }
             };
-            let preamble = super::preamble(&name, spawner_label, provider == Provider::Local);
+            // A fed resident hears colony news between its turns.
+            let fed = zooid.resident && provider == Provider::Agy;
+            let preamble = if zooid.resident {
+                super::resident_preamble(&name, spawner_label, fed)
+            } else {
+                super::preamble(&name, spawner_label, provider == Provider::Local)
+            };
             let assemble = |wake: &str| super::assemble_prompt(wake, &preamble, &brief.text);
             // A local executor reads its own wake: its first input is the rest.
             let first_input = (provider == Provider::Local)
                 .then(|| super::assemble_brief(&preamble, &brief.text));
-            let (prompt, cover) = self.size_cover(
-                provider,
-                model.as_deref(),
-                Some(&tint),
-                cover_wish,
-                &assemble,
-            )?;
+            // A resident wakes as a window does: the personal wake, untinted,
+            // at its full size. A task zooid's cover is tinted by its brief.
+            let (prompt, cover) = if zooid.resident {
+                let wake = self
+                    .renderer
+                    .wake(&self.storage, None, crate::orient::WAKE_CHARS)?;
+                (assemble(&wake), None)
+            } else {
+                self.size_cover(
+                    provider,
+                    model.as_deref(),
+                    Some(&tint),
+                    cover_wish,
+                    &assemble,
+                )?
+            };
             // A local executor that names {resume} continues the zooid's own
             // history. Where it ends is read from the archive; a lookup that
             // refuses fails the launch rather than starting the zooid fresh.
@@ -2394,6 +2650,14 @@ impl Spawn {
                 Provider::Agy => format!("{provider_reason}; {}", agy_resume.reason),
                 _ => provider_reason.clone(),
             };
+            // A resident's fresh life starts only once its previous life is
+            // archived: what it lived is in the archive before a new context
+            // forgets it.
+            if zooid.resident && agy_resume.conversation.is_none() {
+                if let Err(why) = self.previous_life_archived(persona) {
+                    bail!("{name}'s next life was not started: {why}");
+                }
+            }
             let (run_fragment, run) = super::run_fragment(&RunFacts {
                 spawn,
                 started_at: crate::clock::point_now()?,
@@ -2410,6 +2674,7 @@ impl Spawn {
                 untinted: None,
                 resumes,
                 cover: cover.clone(),
+                resident: zooid.resident,
             });
             let text = |path: &Path| path.display().to_string();
             let mut agent = self.agent(
@@ -2431,6 +2696,7 @@ impl Spawn {
                     resume: resumes,
                     brief: brief_path.clone(),
                     spawner: spawner_label.to_owned(),
+                    fed,
                 },
             )?;
             if let Some(input) = &first_input {
@@ -2480,6 +2746,7 @@ impl Spawn {
                 home: (provider == Provider::Agy)
                     .then(|| text(&launch.real_home))
                     .as_deref(),
+                feed: fed,
             });
             std::fs::create_dir_all(&launch.state_dir)
                 .with_context(|| format!("create {}", launch.state_dir.display()))?;
@@ -2634,8 +2901,9 @@ impl Spawn {
                 warnings,
             })
         })();
-        if launched.is_err() && !started {
+        if launched.is_err() && !started && revived {
             // Nothing runs under this persona; leave the brief relaunchable.
+            // A persona that was live before this launch stays as it was.
             if let Err(error) = relations.retire(&name) {
                 return launched.map_err(|launch| {
                     launch.context(format!("retiring {name} afterwards also failed: {error:#}"))
@@ -2813,6 +3081,24 @@ impl Spawn {
                             reported.first_call_input_tokens = super::agy::calls(own.lines())
                                 .first()
                                 .map(|call| call.occupancy);
+                            // Whether the life ended at its limit, read from
+                            // the conversation's own calls: an observation,
+                            // never the plan the hooks enforced.
+                            let life = super::agy::life(
+                                &super::agy::calls(text.lines()),
+                                self.launch.agy_window,
+                            );
+                            if life.over && false {
+                                let observed = entity! { ExclusiveId::force_ref(&run) @
+                                    attrs::life_occupancy: life.occupancy,
+                                    attrs::life_limit: life.limit,
+                                };
+                                if let Err(error) = self.publish(observed.into()) {
+                                    failures.push(
+                                        error.context("record that the life ended at its limit"),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -2878,8 +3164,20 @@ impl Spawn {
         if message.is_none() {
             let sent = match spawner {
                 Some(spawner) => {
+                    let life = match &recorded {
+                        Ok(Some(view)) => {
+                            match (view.life_occupancy.first(), view.life_limit.first()) {
+                                (Some(occupancy), Some(limit)) => format!(
+                                " Its life ended at its limit: {occupancy} tokens in context, past \
+                                 {limit}."
+                            ),
+                                _ => String::new(),
+                            }
+                        }
+                        _ => String::new(),
+                    };
                     let text = format!(
-                        "{} finished, {end}, {}. `zooid show {}` reads it.{}{archived}",
+                        "{} finished, {end}, {}. `zooid show {}` reads it.{life}{}{archived}",
                         request.name,
                         lifecycle_text(local, report, clean),
                         request.name,
@@ -2921,10 +3219,14 @@ impl Spawn {
                 }
             }
         }
+        // A resident's persona outlives each run; one whose run cannot be
+        // read back is not retired either, as it might be a resident's.
+        let resident = false && !matches!(&recorded, Ok(Some(view)) if !view.resident);
         // A replayed settlement (to retry its archive import, say) must not
         // retire a persona that a newer run of the same zooid revived; one
         // that cannot tell does not retire it either.
         match newer.as_deref() {
+            _ if resident => {}
             None => {
                 let why = format!(
                     "not retiring {}: whether a newer run of the same zooid started is unknown",
@@ -3248,7 +3550,25 @@ impl Spawn {
         } else {
             String::new()
         };
+        // What the archive holds is recorded only once it holds it: a fresh
+        // life of a resident waits for this.
+        let imported_fact = |end: u64| {
+            // RED: nothing records what the import accepted yet.
+            if true {
+                return Ok::<(), String>(());
+            }
+            self.publish(
+                entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: end }.into(),
+            )
+            .map_err(|error| {
+                format!(
+                    "Its conversation {conversation} was archived, but recording that failed \
+                         ({error:#}); settling again records it."
+                )
+            })
+        };
         if end == 0 {
+            imported_fact(0)?;
             return Ok(format!(
                 "Its conversation {conversation} has no complete line to archive.{tail}"
             ));
@@ -3270,9 +3590,12 @@ impl Spawn {
         // Pieces are what the import staged; the same bytes again stage the
         // same pieces, which add nothing new.
         match imported {
-            Ok(pieces) => Ok(format!(
-                "Its conversation {conversation} was archived ({pieces} pieces, {end} bytes).{tail}"
-            )),
+            Ok(pieces) => {
+                imported_fact(end)?;
+                Ok(format!(
+                    "Its conversation {conversation} was archived ({pieces} pieces, {end} bytes).{tail}"
+                ))
+            }
             Err(error) => Err(format!(
                 "Archiving its conversation {conversation} failed ({error:#}); settling again \
                  retries it.{tail}"
@@ -3577,6 +3900,161 @@ impl Spawn {
         file.lock()
             .with_context(|| format!("lock {}", path.display()))?;
         Ok(file)
+    }
+
+    /// A fed resident's input, written to `out` (the agent's stdin): its
+    /// prompt as the first user event, then each read of its news that
+    /// holds something not yet delivered, as one user event between turns.
+    ///
+    /// Delivered is kept in the run's inbox state, the file the inbox hooks
+    /// keep what they showed in, under the same lock: an item the
+    /// PreInvocation hook showed is not fed again, nor one fed here shown
+    /// there. The first read takes what is already there (except unread
+    /// messages) as delivered: the life's past, not news. Nothing is
+    /// acknowledged and no receipt is written.
+    ///
+    /// Before every read the life is checked: once the conversation is past
+    /// its limit the feeder ends, closing the agent's input, so the agent
+    /// ends after its last reply. A failed write means the agent is gone.
+    /// A failed read is logged and tried again at the next one.
+    pub fn feed(&self, request: &FeedRequest, out: &mut dyn std::io::Write) -> Result<FeedEnd> {
+        if true {
+            bail!("RED: zooid feed is not built yet");
+        }
+        let prompt_path = self.launch.file(&request.name, "prompt");
+        let prompt = std::fs::read_to_string(&prompt_path)
+            .with_context(|| format!("read {}", prompt_path.display()))?;
+        let write = |out: &mut dyn std::io::Write, text: &str| -> bool {
+            out.write_all(super::agy::user_event(text).as_bytes())
+                .and_then(|()| out.flush())
+                .is_ok()
+        };
+        if !write(out, &prompt) {
+            return Ok(FeedEnd::AgentGone);
+        }
+        let run = request.run;
+        let started = self
+            .observe(|facts, _| {
+                Ok(find!(
+                    at: IntervalValue,
+                    pattern!(facts, [{ run @ metadata::started_at: ?at }])
+                )
+                .filter_map(|at| at.try_from_inline::<(Epoch, Epoch)>().ok())
+                .map(|(from, _)| from)
+                .next())
+            })
+            .ok()
+            .flatten();
+        let home = self.launch.agy_home(&request.name);
+        let mut round = 0u64;
+        loop {
+            if self.life_over(&home, request.run, started) {
+                return Ok(FeedEnd::LifeOver);
+            }
+            match self.news.news(&self.storage, &request.name) {
+                Ok(items) => {
+                    let new = self.undelivered(&request.name, request.run, items)?;
+                    if !new.is_empty() && !write(out, &feed_text(&request.name, &new)) {
+                        return Ok(FeedEnd::AgentGone);
+                    }
+                }
+                Err(error) => eprintln!(
+                    "zooid feed {}: reading news failed: {error:#}",
+                    request.name
+                ),
+            }
+            round += 1;
+            if request.rounds.is_some_and(|rounds| round >= rounds) {
+                return Ok(FeedEnd::Rounds);
+            }
+            std::thread::sleep(request.interval);
+        }
+    }
+
+    /// Whether the conversation of `run` is past its life limit: the one
+    /// the run continues, or the one conversation in the zooid's home that
+    /// changed since the run started. None found, or several, is not over.
+    fn life_over(&self, home: &Path, run: Id, started: Option<Epoch>) -> bool {
+        let continued = self
+            .observe(|facts, reader| {
+                Ok(find!(
+                    handle: TextHandle,
+                    pattern!(facts, [{
+                        run @ crate::schemas::blockdag::source_projection::source_locator: ?handle
+                    }])
+                )
+                .filter_map(|handle| read_text(reader, handle))
+                .filter_map(|locator| locator.strip_prefix("session/").map(str::to_owned))
+                .next())
+            })
+            .ok()
+            .flatten();
+        let conversation = match continued {
+            Some(conversation) => conversation,
+            None => {
+                let Some(started) = started else {
+                    return false;
+                };
+                let since = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs_f64(started.to_unix_seconds().max(0.0));
+                match super::agy::conversations_changed_since(home, |at| at >= since) {
+                    Ok(found) if found.len() == 1 => found.into_iter().next().expect("one"),
+                    _ => return false,
+                }
+            }
+        };
+        matches!(
+            super::agy::read_life(home, Some(&conversation), self.launch.agy_window),
+            Ok(Some(life)) if life.over
+        )
+    }
+
+    /// The items not yet delivered to `name` in `run`, recorded as delivered
+    /// in the run's inbox state under its lock. The run's first feeder read
+    /// takes its items other than unread messages as delivered; a feeder
+    /// started again in the same run does not take them again.
+    fn undelivered(&self, name: &str, run: Id, items: Vec<NewsItem>) -> Result<Vec<NewsItem>> {
+        let path = self.launch.file(name, "inbox.json");
+        std::fs::create_dir_all(&self.launch.state_dir)
+            .with_context(|| format!("create {}", self.launch.state_dir.display()))?;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open the inbox state {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock {}", path.display()))?;
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)
+            .with_context(|| format!("read {}", path.display()))?;
+        let mut state = InboxState::parse(&text).unwrap_or_default();
+        if state.run != Some(run) {
+            state = InboxState {
+                run: Some(run),
+                ..Default::default()
+            };
+        }
+        let first = !state.fed;
+        state.fed = true;
+        let mut new = Vec::new();
+        for item in items {
+            if state.shown.contains(&item.id) {
+                continue;
+            }
+            state.shown.push(item.id);
+            if first && !item.unread_message {
+                continue;
+            }
+            new.push(item);
+        }
+        use std::io::{Seek as _, Write as _};
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(state.render().as_bytes())
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(new)
     }
 
     fn post(&self, request: &InboxRequest) -> Result<InboxAnswer> {
@@ -4026,6 +4504,28 @@ fn run_view<R: BlobStoreGet + ?Sized>(
             find!(
                 count: Inline<inlineencodings::U256BE>,
                 pattern!(facts, [{ run @ attrs::archive_start: ?count }])
+            )
+            .collect(),
+        ),
+        archive_imported: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::archive_imported: ?count }])
+            )
+            .collect(),
+        ),
+        resident: exists!(pattern!(facts, [{ run @ metadata::tag: TAG_RESIDENT_RUN }])),
+        life_occupancy: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::life_occupancy: ?count }])
+            )
+            .collect(),
+        ),
+        life_limit: counts(
+            find!(
+                count: Inline<inlineencodings::U256BE>,
+                pattern!(facts, [{ run @ attrs::life_limit: ?count }])
             )
             .collect(),
         ),
@@ -4679,6 +5179,7 @@ mod tests {
                 spawner: "agent-cc".to_owned(),
                 provider: Provider::Claude,
                 cover: CoverWish::default(),
+                zooid: ZooidWish::default(),
             }
         }
         fn settle(&self, name: &str, launched: &Launched) -> Result<Settled> {
@@ -7334,6 +7835,7 @@ mod tests {
             resume: None,
             brief: PathBuf::from("/s/n.brief"),
             spawner: "s".to_owned(),
+            fed: false,
         };
         for provider in [Provider::Auto, Provider::Local] {
             assert!(f.spawn.agent(provider, "high", &files).is_err());
@@ -8410,6 +8912,7 @@ mod tests {
             spawner: "agent-cc".to_owned(),
             provider: Provider::Claude,
             cover: CoverWish::default(),
+            zooid: ZooidWish::default(),
         };
         let launched = f.spawn.goal(&request).unwrap();
         let view = f.spawn.show(&launched.name).unwrap();
@@ -8698,5 +9201,522 @@ mod tests {
         let error = f.spawn.run(&f.request("Merged task.")).unwrap_err();
         assert!(format!("{error:#}").contains("2 names"), "{error:#}");
         assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+    }
+
+    // ---- Resident zooids: a given name, a persona that outlives its runs,
+    // the limit observed, the archived-first gate and the news feeder.
+
+    fn named(f: &Fixture, brief: &str, name: &str, resident: bool) -> RunRequest {
+        let mut request = f.request(brief);
+        request.zooid = ZooidWish {
+            name: Some(name.to_owned()),
+            resident,
+        };
+        request
+    }
+
+    fn add_person(f: &Fixture, label: &str) -> Id {
+        Relations::with_storage(f.storage.clone())
+            .add(
+                ProfileInput {
+                    label: label.to_owned(),
+                    ..Default::default()
+                },
+                None,
+                &[],
+            )
+            .unwrap()
+            .person
+    }
+
+    fn set_unit(f: &Fixture, state: &str) {
+        *f.launcher.state.lock().unwrap() = state.to_owned();
+    }
+
+    #[test]
+    fn a_given_name_names_a_new_zooid_and_a_relaunch_never_renames_it() {
+        let f = fixture();
+        let launched = f
+            .spawn
+            .run(&named(&f, "Named task.", "solo-test", false))
+            .unwrap();
+        assert_eq!(launched.name, "solo-test");
+        assert_eq!(launched.unit, "spawn-solo-test");
+        assert_eq!(launched.unprefixed, None);
+        set_unit(&f, "inactive");
+        f.settle("solo-test", &launched).unwrap();
+        assert!(f.persona("solo-test").unwrap().retired);
+        // The stored name is the zooid's: without --name it keeps it.
+        let again = f.spawn.run(&f.request("Named task.")).unwrap();
+        assert_eq!(again.name, "solo-test");
+        set_unit(&f, "inactive");
+        f.settle("solo-test", &again).unwrap();
+        // A different name refuses, and starts nothing.
+        let started = f.launcher.started.lock().unwrap().len();
+        let error = f
+            .spawn
+            .run(&named(&f, "Named task.", "other-name", false))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("never renames"), "{error:#}");
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+        // A changed brief may carry the same name: another zooid, the same
+        // persona.
+        let changed = f
+            .spawn
+            .run(&named(&f, "Named task, changed.", "solo-test", false))
+            .unwrap();
+        assert_eq!(changed.name, "solo-test");
+        assert_ne!(changed.spawn, launched.spawn);
+        assert_eq!(changed.persona, launched.persona);
+        // Not a name.
+        for bad in ["Bad", "bad name", "-x", "x-", "x.y", ""] {
+            let error = f
+                .spawn
+                .run(&named(&f, "Badly named.", bad, false))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not a zooid name"),
+                "{bad}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resident_adopts_a_live_persona_wakes_whole_and_settlement_keeps_it() {
+        let f = fixture();
+        let existing = add_person(&f, "agy-test");
+        // Not resident: a live persona of the name refuses, as it always did.
+        let error = f
+            .spawn
+            .run(&named(&f, "Live as agy.", "agy-test", false))
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is still running"),
+            "{error:#}"
+        );
+        assert!(!f.persona("agy-test").unwrap().retired);
+        // Resident and no unit running: the live persona is the zooid's.
+        let launched = f
+            .spawn
+            .run(&named(&f, "Live as agy.", "agy-test", true))
+            .unwrap();
+        assert_eq!(launched.persona, existing);
+        let run = &f.spawn.show("agy-test").unwrap().runs[0];
+        assert!(run.resident);
+        // While its unit runs, a second life refuses.
+        let error = f
+            .spawn
+            .run(&named(&f, "Live as agy.", "agy-test", true))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("is running"), "{error:#}");
+        // It woke as a window does: the untinted wake at the window's size,
+        // and it was told it is resident.
+        let prompt = prompt_of(&f, 0);
+        assert!(prompt.contains("STUB-WAKE untinted"), "{prompt}");
+        assert!(
+            prompt.contains("a resident zooid of this colony"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("Your context ends when the task ends"),
+            "{prompt}"
+        );
+        // Settled, it told its spawner and stays live.
+        set_unit(&f, "inactive");
+        f.settle("agy-test", &launched).unwrap();
+        assert!(f.told("agy-test").starts_with("agy-test finished"));
+        assert!(!f.persona("agy-test").unwrap().retired);
+        let run = &f.spawn.show("agy-test").unwrap().runs[0];
+        assert!(run.settle_failure.is_empty(), "{:?}", run.settle_failure);
+        // Its next life starts while the persona is live.
+        let next = f
+            .spawn
+            .run(&named(&f, "Live as agy.", "agy-test", true))
+            .unwrap();
+        assert_eq!(next.persona, existing);
+        // A smaller cover is refused.
+        let mut covered = named(&f, "Live as agy.", "agy-test", true);
+        covered.cover = CoverWish {
+            percent: Some(20.0),
+            window: Some(200_000),
+        };
+        set_unit(&f, "inactive");
+        let error = f.spawn.run(&covered).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("never a smaller cover"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_resident_wakes_at_the_window_size() {
+        let renderer = StubRenderer::default();
+        let calls = renderer.calls.clone();
+        let f = fixture_full(
+            FakeLauncher::default(),
+            renderer,
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        f.spawn
+            .run(&named(&f, "Whole wake.", "whole-test", true))
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), [crate::orient::WAKE_CHARS]);
+    }
+
+    #[test]
+    fn a_resident_launch_that_never_starts_leaves_a_live_persona_live() {
+        let f = fixture_with(FakeLauncher {
+            refuse: true,
+            ..Default::default()
+        });
+        add_person(&f, "kept-test");
+        assert!(f
+            .spawn
+            .run(&named(&f, "Never starts.", "kept-test", true))
+            .is_err());
+        assert!(!f.persona("kept-test").unwrap().retired);
+        // One the launch made live is retired again, as before.
+        assert!(f
+            .spawn
+            .run(&named(&f, "Never starts.", "fresh-test", true))
+            .is_err());
+        assert!(f.persona("fresh-test").unwrap().retired);
+    }
+
+    #[test]
+    fn an_agy_life_that_ended_at_its_limit_is_observed_as_such() {
+        let f = fixture();
+        let mut request = f.request("Agy life to its limit.");
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, &launched.name);
+        agy_ran(&home, &launched.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &launched, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let run = &f.spawn.show(&launched.name).unwrap().runs[0];
+        // Growth 350,000: the limit is 512,000 - 350,000 - 32,000.
+        assert_eq!(run.life_occupancy, [400_000]);
+        assert_eq!(run.life_limit, [130_000]);
+        let told = f.told(&launched.name);
+        assert!(
+            told.contains("Its life ended at its limit: 400000 tokens"),
+            "{told}"
+        );
+
+        // An ordinary end records nothing of the kind.
+        let mut request = f.request("Agy life with room.");
+        request.provider = Provider::Agy;
+        let short = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, &short.name);
+        agy_ran(&home, &short.report, "c-2", &[50_000, 120_000]);
+        settle_as(&f, &short, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let run = &f.spawn.show(&short.name).unwrap().runs[0];
+        assert!(run.life_occupancy.is_empty() && run.life_limit.is_empty());
+        assert!(!f.told(&short.name).contains("ended at its limit"));
+    }
+
+    #[test]
+    fn a_residents_fresh_life_waits_for_its_previous_life_in_the_archive() {
+        let f = fixture();
+        let mut request = named(&f, "Resident agy.", "res-test", true);
+        request.provider = Provider::Agy;
+        let first = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, "res-test");
+        // A run with no recorded end: nothing new starts.
+        set_unit(&f, "inactive");
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("no recorded end"),
+            "{error:#}"
+        );
+        // Its life ends at its limit and is archived: a fresh life starts.
+        agy_ran(&home, &first.report, "c-1", &[50_000, 400_000]);
+        settle_as(&f, &first, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let run = &f.spawn.show("res-test").unwrap().runs[0];
+        assert_eq!(run.archive_imported, run.archive_end);
+        assert!(!run.archive_imported.is_empty());
+        let second = f.spawn.run(&request).unwrap();
+        assert_eq!(second.agy_resume.conversation, None);
+        // That life's conversation will not import: the next waits.
+        agy_ran(&home, &second.report, "c-2", &[50_000, 400_000]);
+        let path = super::super::agy::transcript(&home, "c-2").unwrap();
+        std::fs::write(&path, "{not json\n").unwrap();
+        set_unit(&f, "inactive");
+        settle_as(&f, &second, Exit::from_systemd("exited", "0", "success")).unwrap();
+        let run = &f.spawn.show("res-test").unwrap().runs[1];
+        assert!(run.archive_imported.is_empty());
+        let started = f.launcher.started.lock().unwrap().len();
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not in the archive yet"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+        assert!(!f.persona("res-test").unwrap().retired);
+    }
+
+    #[test]
+    fn a_fed_resident_reads_its_feeder_and_writes_events() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy.", "fed-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let script = f.script(0);
+        let real = f.directory.path().display().to_string();
+        let line = script
+            .lines()
+            .find(|line| line.contains(" feed fed-test "))
+            .unwrap_or_else(|| panic!("no feeder: {script}"));
+        assert!(
+            line.starts_with(&format!(
+                "HOME={real} zooid feed fed-test --run {:x} 2>> ",
+                launched.run
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("| /fake/agy --input-format stream-json --output-format stream-json "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("-p - > {}", launched.report.display())),
+            "{line}"
+        );
+        assert!(!script.contains("exec /fake/agy"), "{script}");
+        // An unfed one is as it was.
+        let mut request = f.request("Plain agy.");
+        request.provider = Provider::Agy;
+        f.spawn.run(&request).unwrap();
+        let plain = f.script(1);
+        assert!(!plain.contains(" feed "), "{plain}");
+        assert!(
+            plain.contains("exec /fake/agy --output-format json "),
+            "{plain}"
+        );
+    }
+
+    /// A news source that answers each read with the next list it holds,
+    /// the last one again once they run out.
+    #[derive(Default)]
+    struct ScriptedNews {
+        reads: Mutex<Vec<Vec<NewsItem>>>,
+    }
+
+    impl NewsSource for ScriptedNews {
+        fn news(&self, _storage: &Storage, _persona: &str) -> Result<Vec<NewsItem>> {
+            let mut reads = self.reads.lock().unwrap();
+            Ok(if reads.len() > 1 {
+                reads.remove(0)
+            } else {
+                reads.first().cloned().unwrap_or_default()
+            })
+        }
+    }
+
+    fn item(id: Id, text: &str, unread_message: bool) -> NewsItem {
+        NewsItem {
+            id,
+            text: text.to_owned(),
+            unread_message,
+        }
+    }
+
+    /// The user events a feeder wrote, as their texts.
+    fn fed_texts(bytes: &[u8]) -> Vec<String> {
+        std::str::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(event["event"], "user", "{line}");
+                event["message"]["content"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+
+    fn feed_once(spawn: &Spawn, name: &str, run: Id, rounds: u64) -> (FeedEnd, Vec<String>) {
+        let mut out = Vec::new();
+        let end = spawn
+            .feed(
+                &FeedRequest {
+                    name: name.to_owned(),
+                    run,
+                    interval: Duration::from_millis(1),
+                    rounds: Some(rounds),
+                },
+                &mut out,
+            )
+            .unwrap();
+        (end, fed_texts(&out))
+    }
+
+    #[test]
+    fn the_feeder_gives_the_prompt_then_each_news_item_once() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy news.", "news-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        // A message the PreInvocation hook has already shown.
+        let shown = crate::message::Message::with_storage(f.storage.clone())
+            .send(&crate::message::SendOptions {
+                from: "agent-cc",
+                to: "news-test",
+                text: "shown by the hook",
+            })
+            .unwrap()
+            .id;
+        let answer = f.spawn.inbox(&InboxRequest {
+            name: "news-test".to_owned(),
+            run: launched.run,
+            hook: InboxHook::Post,
+            stop_hook_active: false,
+            now: 1_000,
+        });
+        assert!(answer.output.is_some(), "{answer:?}");
+        let (old, unread, new) = (byte_id(1), byte_id(2), byte_id(3));
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![
+            vec![
+                item(old, "News: an old Discord line", false),
+                item(unread, "News: new message from cc", true),
+                item(shown, "News: shown by the hook", true),
+            ],
+            vec![
+                item(old, "News: an old Discord line", false),
+                item(unread, "News: new message from cc", true),
+                item(shown, "News: shown by the hook", true),
+                item(new, "News: JP on Discord", false),
+            ],
+        ];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let (end, texts) = feed_once(&spawn, "news-test", launched.run, 2);
+        assert_eq!(end, FeedEnd::Rounds);
+        assert_eq!(texts.len(), 3, "{texts:?}");
+        assert_eq!(
+            texts[0],
+            std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap()
+        );
+        // The unread message, not the life's past nor what the hook showed.
+        assert!(texts[1].contains("new message from cc"), "{}", texts[1]);
+        assert!(!texts[1].contains("old Discord line") && !texts[1].contains("shown by the hook"));
+        assert!(
+            texts[2].contains("JP on Discord") && !texts[2].contains("from cc"),
+            "{}",
+            texts[2]
+        );
+        // Fed again in the same run (a feeder restarted): nothing twice, and
+        // nothing taken as the past again.
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![
+            item(new, "News: JP on Discord", false),
+            item(byte_id(4), "News: a later line", false),
+        ]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let (_, texts) = feed_once(&spawn, "news-test", launched.run, 1);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("a later line") && !texts[1].contains("JP on Discord"));
+        // Nothing was acknowledged.
+        assert!(f
+            .spawn
+            .unread("news-test")
+            .unwrap()
+            .iter()
+            .any(|m| m.id == shown));
+    }
+
+    #[test]
+    fn the_feeder_ends_at_the_life_limit_and_when_the_agent_is_gone() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy life.", "life-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![item(byte_id(9), "News: a message", true)]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        // An older conversation of the zooid ended at its limit long ago:
+        // not this life.
+        let home = agy_home_of(&f, "life-test");
+        let old = agy_transcript(&home, "c-old", &[agy_line(0, 0), agy_line(1, 450_000)], "");
+        let file = std::fs::File::options().write(true).open(&old).unwrap();
+        file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        let (end, texts) = feed_once(&spawn, "life-test", launched.run, 1);
+        assert_eq!(end, FeedEnd::Rounds);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        // This life's conversation passes its limit: the input closes.
+        agy_transcript(&home, "c-now", &[agy_line(0, 0), agy_line(1, 450_000)], "");
+        let (end, texts) = feed_once(&spawn, "life-test", launched.run, 5);
+        assert_eq!(end, FeedEnd::LifeOver);
+        assert_eq!(texts.len(), 1, "only the prompt: {texts:?}");
+
+        // The agent is gone: the first write fails.
+        struct Closed;
+        impl std::io::Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let end = spawn
+            .feed(
+                &FeedRequest {
+                    name: "life-test".to_owned(),
+                    run: launched.run,
+                    interval: Duration::from_millis(1),
+                    rounds: None,
+                },
+                &mut Closed,
+            )
+            .unwrap();
+        assert_eq!(end, FeedEnd::AgentGone);
+    }
+
+    /// The shared-key case: two personas on one host sign with one key.
+    /// One message to a group holding both, fed to the resident, is still
+    /// news to the other in Orient (no receipt was written) and unread for
+    /// both (nothing was acknowledged).
+    #[test]
+    fn feeding_one_persona_never_consumes_anothers_news_under_one_key() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy shared.", "shared-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let relations = Relations::with_storage(f.storage.clone());
+        relations.group_create("both-test").unwrap();
+        relations.group_add("both-test", "shared-test").unwrap();
+        relations.group_add("both-test", "agent-cc").unwrap();
+        add_person(&f, "sender-test");
+        crate::message::Message::with_storage(f.storage.clone())
+            .send(&crate::message::SendOptions {
+                from: "sender-test",
+                to: "both-test",
+                text: "for both of you",
+            })
+            .unwrap();
+        // The real source: Orient's attention set, no receipts.
+        let (_, texts) = feed_once(&f.spawn, "shared-test", launched.run, 1);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("for both of you"), "{}", texts[1]);
+        let mut text = String::new();
+        let mut collect = |part: Part| {
+            if let Part::Text { text: part } = part {
+                text.push_str(&part);
+            }
+            Ok(())
+        };
+        crate::orient::Orient::with_storage(f.storage.clone())
+            .poll("agent-cc", true, &mut Out::new(&mut collect))
+            .unwrap();
+        assert!(text.contains("for both of you"), "{text}");
+        for persona in ["agent-cc", "shared-test"] {
+            assert!(
+                f.spawn.unread(persona).unwrap().iter().any(|m| matches!(
+                    &m.body,
+                    crate::message::MessageText::Text(body) if body == "for both of you"
+                )),
+                "{persona}"
+            );
+        }
     }
 }

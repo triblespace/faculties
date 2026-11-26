@@ -204,6 +204,7 @@ impl Faculty for Spawn {
                         percent: args.cover_percent,
                         window: args.window,
                     },
+                    zooid: Default::default(),
                 })?;
                 out.line(launched_line(&launched))
             }
@@ -221,6 +222,7 @@ impl Faculty for Spawn {
                         percent: args.cover_percent,
                         window: args.window,
                     },
+                    zooid: Default::default(),
                 })?;
                 out.line(launched_line(&launched))
             }

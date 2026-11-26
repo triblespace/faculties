@@ -22,9 +22,13 @@ mod operations;
 #[cfg(all(test, unix))]
 mod process_tests;
 pub use operations::{
-    BaselineReceipt, NewsForm, Next, NextKind, NextCompletion, Orient, PendingNext, PreparedReport, ShowOptions, WaitOptions,
-    WakeOptions, WakePairsOptions, WakeTint,
+    AttentionItem, BaselineReceipt, NewsForm, Next, NextCompletion, NextKind, Orient, PendingNext,
+    PreparedReport, ShowOptions, WaitOptions, WakeOptions, WakePairsOptions, WakeTint,
 };
+
+/// The journal's character budget of a window's wake (`orient wake`
+/// without `--chars`): what a resident zooid wakes into too.
+pub const WAKE_CHARS: usize = 800_000;
 
 /// Receipt facts for a key-private source collection. Event identity is stable
 /// across retries; observation times annotate that identity, never qualify the

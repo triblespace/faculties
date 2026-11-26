@@ -32,9 +32,10 @@ pub use declaration::{
     Placed, Placement, Standing,
 };
 pub use operations::{
-    choose_provider, inbox_failure, CoverWish, GoalRequest, InboxAnswer, InboxHook, InboxRequest,
-    LaunchConfig, Launched, Launcher, LibraryRenderer, Provider, Renderer, RequestView, RunRequest,
-    RunView, SettleRequest, Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec,
+    choose_provider, inbox_failure, CoverWish, FeedEnd, FeedRequest, GoalRequest, InboxAnswer,
+    InboxHook, InboxRequest, LaunchConfig, Launched, Launcher, LibraryRenderer, NewsItem,
+    NewsSource, OrientNews, Provider, Renderer, RequestView, RunRequest, RunView, SettleRequest,
+    Settled, Spawn, SpawnView, SystemdLauncher, UnitSpec, ZooidWish,
 };
 
 use anyhow::{bail, Result};
@@ -46,7 +47,7 @@ use triblespace::prelude::*;
 use crate::schemas::archive::archive as archive_attrs;
 use crate::schemas::blockdag;
 use crate::schemas::imagine::imagine as imagine_attrs;
-use crate::schemas::spawn::{spawn as attrs, KIND_RUN, KIND_SPAWN};
+use crate::schemas::spawn::{spawn as attrs, KIND_RUN, KIND_SPAWN, TAG_RESIDENT_RUN};
 
 pub type TextHandle = Inline<Handle<UTF8String>>;
 pub type IntervalValue = Inline<NsTAIInterval>;
@@ -190,6 +191,8 @@ pub struct RunFacts {
     /// How the cover was sized, when the launch asked for a share of the
     /// context window (`--cover`).
     pub cover: Option<cover::CoverRecord>,
+    /// A resident run, tagged [`TAG_RESIDENT_RUN`]: its persona outlives it.
+    pub resident: bool,
 }
 
 /// A run: the spawn and start time as its intrinsic core, the rest as
@@ -235,6 +238,9 @@ pub fn run_fragment(run: &RunFacts) -> (Fragment, Id) {
         attrs::model_unset?: model_unset,
         attrs::resumes?: run.resumes,
     };
+    if run.resident {
+        fragment += entity! { ExclusiveId::force_ref(&id) @ metadata::tag: TAG_RESIDENT_RUN };
+    }
     if let Some(cover) = &run.cover {
         fragment += cover_fragment(id, cover);
     }
@@ -474,6 +480,51 @@ pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
          `message_ack` what you have handled. The wake above is the shared self, its memories \
          recalled with this brief in mind.\n"
     )
+}
+
+/// What a resident zooid is told: who it is across lives, how a life ends,
+/// and how news reaches it (`fed`: between turns, from the feeder).
+pub fn resident_preamble(name: &str, spawner: &str, fed: bool) -> String {
+    let news = if fed {
+        "Colony news addressed to you (messages, and Discord lines in the channels that are \
+         yours) arrives as a user turn between your turns, each item once; you need not poll \
+         for it. A message stays unread until you `message_ack` it."
+    } else {
+        "Check your inbox between steps with `orient_poll` (persona {name}, peek true) and \
+         `message_ack` what you have handled."
+    };
+    let news = news.replace("{name}", name);
+    format!(
+        "You are {name}, a resident zooid of this colony, started by {spawner} with the brief \
+         below. Your persona outlives this run: you are {name} before it and after it. Your \
+         context is never summarised: a life ends before the window fills, and the next one \
+         wakes fresh into the wake above, once this one is archived. When you are told the life \
+         is ending, write what you want your next life to know as a memory, then give your \
+         closing reply: it is recorded, and {spawner} is messaged when the life ends. {news} \
+         Do not arm a colony watcher (no `orient wait`, no `orient_next`). Your name is your \
+         persona: pass {name} wherever a write tool takes `from`, `persona`, `by` or `reader`. \
+         The brief is where you start, not a fence. The wake above is the shared self.\n"
+    )
+}
+
+/// Whether `name` may be given to a zooid (`--name`): a persona label that
+/// is also a unit and a file name, 1 to 64 lowercase ASCII letters, digits
+/// and dashes, beginning with a letter and not ending with a dash.
+pub fn given_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|ch: char| ch.is_ascii_lowercase())
+        && !name.ends_with('-')
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-');
+    if !ok {
+        bail!(
+            "--name {name:?} is not a zooid name: 1 to 64 lowercase letters, digits and dashes, \
+             beginning with a letter and not ending with a dash"
+        );
+    }
+    Ok(())
 }
 
 /// A local zooid lives in Drive's loop on this host, which reads its own
@@ -749,6 +800,10 @@ pub struct ScriptFacts<'a> {
     /// agent's HOME, and settlement, the inbox and the server read the
     /// host's spawn state and configuration under the real one.
     pub home: Option<&'a str>,
+    /// A fed resident's news: the agent reads its input from `zooid feed`
+    /// (the prompt, then news between turns) through a pipe instead of from
+    /// the prompt file. The feeder runs with the real home.
+    pub feed: bool,
 }
 
 /// The unit's script. Run without arguments it is the zooid: the agent on
@@ -843,7 +898,28 @@ pub fn unit_script(facts: &ScriptFacts<'_>) -> String {
         .map(|word| q(word))
         .collect::<Vec<_>>()
         .join(" ");
-    if facts.stdout_is_report {
+    if facts.feed {
+        // Not exec: the unit's process is this shell, whose status is the
+        // agent's (the last of the pipeline). The feeder ends when the agent
+        // does (its next write fails) or closes the agent's input itself
+        // once the life is over.
+        let home = facts
+            .home
+            .map(|home| format!("HOME={} ", q(home)))
+            .unwrap_or_default();
+        let report = if facts.stdout_is_report {
+            format!(" > {}", q(facts.report))
+        } else {
+            String::new()
+        };
+        script.push_str(&format!(
+            "{home}{} feed {} --run {:x} 2>> {} | {agent}{report}\n",
+            q(facts.spawn),
+            q(facts.name),
+            facts.run,
+            q(facts.log)
+        ));
+    } else if facts.stdout_is_report {
         script.push_str(&format!(
             "exec {agent} < {} > {}\n",
             q(facts.prompt),
@@ -1170,6 +1246,7 @@ mod tests {
             spawn: "zooid",
             faculties: "/b/faculties",
             home: None,
+            feed: false,
         });
         assert!(script.contains("set -a; . /c/colony.env || exit 78; set +a\n"));
         assert!(script.contains("PERSONA=lusab-babad"));
@@ -1244,6 +1321,7 @@ mod tests {
             spawn: &spawn,
             faculties: "/b/faculties",
             home: None,
+            feed: false,
         });
         let script = dir.path().join("n.sh");
         std::fs::write(&script, script_text).unwrap();
@@ -1296,6 +1374,7 @@ mod tests {
             spawn: "zooid",
             faculties: "/b/faculties",
             home: None,
+            feed: false,
         });
         assert!(script.contains("exec codex exec - < /s/n.prompt\n"));
         assert!(!script.contains(". /"));

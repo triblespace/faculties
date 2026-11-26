@@ -902,6 +902,7 @@ mod tests {
                 untinted: None,
                 resumes: None,
                 cover: None,
+                resident: false,
             });
             Self::add(&mut self.spawn, &mut self.blobs, fragment);
             run
