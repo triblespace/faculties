@@ -148,7 +148,17 @@ longer available; an already-admitted operation can finish on its frozen
 routes. A script launching several commands has several invocation boundaries,
 not an automatic transaction or one frozen binding for the entire script.
 
-Without either selector, existing CLI collection routing remains unchanged.
+Home requires `--workspace REVISION` or `FACULTIES_WORKSPACE` for stored
+settings and light operations, including `bridge`, `bridge set`, address
+overrides and `--no-store`. It refuses a missing selector before opening the
+pile, looking up a secret or contacting the bridge. Select an existing personal
+Home workspace with the intended Home and Secrets routes; selecting a workspace
+does not copy bindings or credentials or grant access. Home help, `discover`
+and `bridge probe ADDRESS` remain independent of stored workspace settings
+(the existing `--pile`/`PILE` argument grammar is unchanged). Native Home callers
+already supplied with Storage, including alarms and app tools, are unchanged.
+
+For other faculties, without either selector, existing CLI collection routing remains unchanged.
 To run a legacy launcher deliberately, unset `FACULTIES_WORKSPACE` as well as
 resetting collection variables: clearing only `TRIBLESPACE_*` does not clear
 the selector. Installing a new cohort does not migrate separately pinned

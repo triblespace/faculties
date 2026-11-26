@@ -9,7 +9,8 @@ use triblespace::prelude::Id;
 #[command(
     version = crate::GIT_VERSION,
     name = "home",
-    about = "Kim's lights through the Hue bridge: rooms, lights, scenes, on/off/dim"
+    about = "Kim's lights through the Hue bridge: rooms, lights, scenes, on/off/dim",
+    after_help = "Stored settings and light operations require --workspace REVISION or FACULTIES_WORKSPACE. Help, discover and bridge probe do not use stored workspace settings."
 )]
 pub(crate) struct Cli {
     #[command(flatten)]
@@ -128,6 +129,13 @@ pub fn run() -> Result<()> {
     {
         let config = Home::probe(address)?;
         return crate::cli::with_output("home", |out| presentation::probe(&config, out));
+    }
+    if cli.workspace.workspace.is_none() {
+        bail!(
+            "Home requires an explicit workspace: choose an exact revision with \
+             `faculties workspace list`, then pass --workspace REVISION or set \
+             FACULTIES_WORKSPACE. Bridge and --no-store overrides do not select a workspace."
+        );
     }
     let pin = cli.pin.as_deref().map(Fingerprint::parse).transpose()?;
     let request = match &command {

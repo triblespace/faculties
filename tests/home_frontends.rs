@@ -386,6 +386,154 @@ fn fresh_pile() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
     (directory, pile, key)
 }
 
+fn home_cli(pile: &std::path::Path, key: &std::path::Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_home"));
+    command
+        .env_clear()
+        .args(["--pile"])
+        .arg(pile)
+        .arg("--key")
+        .arg(key);
+    command
+}
+
+#[test]
+fn cli_missing_workspace_refuses_before_storage_secret_or_bridge() {
+    let bridge = fake_bridge();
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let key = directory.path().join("absent.key");
+    let secret = format!("{:X}", genid().id);
+    let pin = bridge.pin.to_string();
+    let commands: &[&[&str]] = &[
+        &["rooms"],
+        &["lights"],
+        &["scenes"],
+        &["bridge"],
+        &["bridge", "set", &secret, &bridge.base],
+        &["on", "2"],
+        &["off", "2"],
+        &["alert", "2"],
+        &["dim", "2", "50"],
+        &["scene", "2", "Relax"],
+    ];
+    for args in commands {
+        let output = home_cli(&pile, &key)
+            .args([
+                "--bridge",
+                &bridge.base,
+                "--username-secret",
+                &secret,
+                "--pin",
+                &pin,
+                "--no-store",
+            ])
+            .args(*args)
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(
+            error.contains("Home requires an explicit workspace"),
+            "{args:?}: {error}"
+        );
+        assert!(error.contains("FACULTIES_WORKSPACE"), "{error}");
+        assert!(!pile.exists());
+        assert!(!key.exists());
+    }
+    assert!(
+        bridge.seen().is_empty(),
+        "no request precedes workspace admission"
+    );
+}
+
+#[test]
+fn cli_explicit_workspace_flag_and_environment_read_the_selected_binding() {
+    use faculties::schemas::{config::config, workspace as attrs};
+    use faculties::storage::Storage;
+    use triblespace::core::collection::CollectionStoreExt;
+
+    let (_directory, pile, key) = fresh_pile();
+    let storage = Storage::new(pile.clone(), Some(key.clone()));
+    let revision = genid();
+    let secret = genid().id;
+    storage
+        .with_pile(|pile, signer| {
+            let policy = faculties::collection_names::private_policy(signer.verifying_key());
+            let selected = pile.collection("selected Home fixture", policy.clone())?;
+            let route =
+                entity! { config::anchor: DEFAULT_SCOPE_ID, config::selects: selected.handle() };
+            pile.commit(
+                selected,
+                signer,
+                home::binding_fragment("001788fffe000001", secret, Fingerprint([1; 32]), []),
+            )?;
+            let config = pile.collection(faculties::config::COLLECTION_NAME, policy)?;
+            pile.commit(
+                config,
+                signer,
+                entity! { &revision @
+                    metadata::tag: attrs::WORKSPACE, config::anchor: genid().id,
+                    attrs::enrolled: true, metadata::name: "Home CLI fixture",
+                    attrs::workspace_route*: route,
+                },
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // Even an existing valid pile and workspace must not be selected implicitly.
+    let before = std::fs::read(&pile).unwrap();
+    let key_before = std::fs::read(&key).unwrap();
+    let refused = home_cli(&pile, &key).arg("bridge").output().unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Home requires an explicit workspace")
+    );
+    assert_eq!(before, std::fs::read(&pile).unwrap());
+    assert_eq!(key_before, std::fs::read(&key).unwrap());
+    // No Secrets route or secret payload exists: status must only read metadata.
+    for through_env in [false, true] {
+        let mut command = home_cli(&pile, &key);
+        if through_env {
+            command.env("FACULTIES_WORKSPACE", format!("{:X}", revision.id));
+        } else {
+            // The explicit flag overrides an unavailable ambient selection.
+            command
+                .env("FACULTIES_WORKSPACE", format!("{:X}", genid().id))
+                .args(["--workspace", &format!("{:X}", revision.id)]);
+        }
+        let output = command.arg("bridge").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("001788fffe000001"), "{text}");
+        assert!(text.contains(&format!("{secret:x}")), "{text}");
+    }
+}
+
+#[test]
+fn cli_help_and_probe_without_workspace_do_not_open_storage() {
+    let bridge = fake_bridge();
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("absent.pile");
+    let key = directory.path().join("absent.key");
+    for args in [vec!["--help"], vec!["bridge", "probe", &bridge.base]] {
+        let output = home_cli(&pile, &key).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(bridge.seen().len(), 1);
+    assert_eq!(bridge.seen()[0].path, "/api/config");
+    assert!(!pile.exists());
+    assert!(!key.exists());
+}
+
 #[test]
 fn reads_are_live_gets_and_never_touch_storage() {
     let bridge = fake_bridge();
