@@ -265,11 +265,20 @@ fn history<R: BlobStoreGet + ?Sized>(
                 Err(reason) => return Ok(History::Unavailable(format!("Archive {reason}."))),
             };
             match crate::archive::conversation_nodes(archive, &locator)? {
-                Some((leaf, nodes)) => Ok(History::Own {
+                Some((tips, nodes)) => Ok(History::Own {
                     nodes,
                     basis: format!(
-                        "Its own conversation {locator}, which no other run here names: every \
-                         archived node from its root to its newest held leaf {leaf:x}."
+                        "The archived history of {locator}, the conversation this run names. \
+                         No other run here names it; that is what is observed, not proof \
+                         that it holds only this run's life. {}",
+                        match tips.len() {
+                            0 | 1 => "It ends at one held leaf.".to_owned(),
+                            n => format!(
+                                "It branches into {n} held leaves; every branch is shown, each \
+                                 node after its predecessors, branches interleaved by id, not \
+                                 by time."
+                            ),
+                        }
                     ),
                 }),
                 None if imported.contains(&0) => Ok(History::Empty(format!(
@@ -353,6 +362,10 @@ fn drive_history(
             "No archived Drive context of this zooid continues {resumed}, the node it resumed \
              from."
         ))),
+        1 if !other_resumers(spawn, run, resumes).is_empty() => Ok(History::Unlinked(format!(
+            "Other runs also resumed from {resumed}, and one Drive context continues it; \
+             nothing records which run lived it."
+        ))),
         1 => {
             let ctx = *contexts.first().expect("one context");
             let nodes: BTreeSet<Id> = find!(
@@ -371,8 +384,10 @@ fn drive_history(
             Ok(History::Own {
                 nodes: crate::archive::order_nodes(archive, &nodes)?,
                 basis: format!(
-                    "The nodes observed in its Drive context {ctx:x}, which continues {resumed}, \
-                     the node this run resumed from."
+                    "The nodes observed in Drive context {ctx:x}: the one context of this \
+                     zooid's name continuing {resumed}, the node this run (and no other run \
+                     here) resumed from. A candidate link by those recorded facts, not a \
+                     recorded identity of the run's context."
                 ),
             })
         }
@@ -392,6 +407,19 @@ fn drive_history(
 /// shared conversation, for a reader who asks for it as that.
 pub fn conversation(archive: &FactArchive, locator: &str) -> Result<Option<Vec<Id>>> {
     Ok(crate::archive::conversation_nodes(archive, locator)?.map(|(_, nodes)| nodes))
+}
+
+/// The other runs that record resuming from any of `resumes`.
+fn other_resumers(spawn: &FactArchive, run: Id, resumes: &[Id]) -> BTreeSet<Id> {
+    let mut others = BTreeSet::new();
+    for &node in resumes {
+        others.extend(find!(
+            other: Id,
+            pattern!(spawn, [{ ?other @ metadata::tag: KIND_RUN, attrs::resumes: node }])
+        ));
+    }
+    others.remove(&run);
+    others
 }
 
 fn label(specs: &[(Id, &str)], id: Id) -> String {

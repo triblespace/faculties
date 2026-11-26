@@ -419,3 +419,69 @@ fn a_resumed_local_run_lives_exactly_the_context_that_continues_its_node() {
     assert_eq!(own, &[nodes[0]]);
     assert!(basis.contains("Drive context"), "{basis}");
 }
+
+#[test]
+fn a_branched_session_keeps_every_observed_branch() {
+    let mut fixture = Fixture::default();
+    let run = fixture.run("Rewound", PROMPT, "claude", 1);
+    fixture.conversation(run, "session/s-fork", None, None);
+    fixture.settle(run, 9);
+    let mut text = session("s-fork", PROMPT);
+    // A rewind: a second reply to the opening, beside the first branch.
+    text.push_str(
+        r#"{"type":"assistant","sessionId":"s-fork","uuid":"b1","parentUuid":"u1","timestamp":"2026-11-26T10:01:00Z","message":{"role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"The other branch."}]}}
+"#,
+    );
+    fixture.claude_session(&text);
+    let life = fixture.life(run, true);
+    let History::Own { nodes, basis } = &life.history else {
+        panic!("{:?}", life.history)
+    };
+    assert!(basis.contains("branches into 2"), "{basis}");
+    assert!(basis.contains("not proof"), "{basis}");
+    let texts: Vec<String> = fixture
+        .turns(nodes)
+        .into_iter()
+        .flat_map(|turn| turn.parts)
+        .filter_map(|part| match part.body {
+            Body::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert!(texts.contains(&"The other branch.".to_owned()), "{texts:?}");
+    assert!(
+        texts.contains(&"Track two is there.".to_owned()),
+        "{texts:?}"
+    );
+    assert_eq!(texts[0], PROMPT, "the shared root comes first");
+}
+
+#[test]
+fn two_runs_resuming_one_tail_do_not_both_claim_its_context() {
+    let mut fixture = Fixture::default();
+    let tail = *rngid();
+    let run = fixture.run_resuming("Makap", "p", "local", 1, Some(tail));
+    let retry = fixture.run_resuming("Makap", "p", "local", 2, Some(tail));
+    let spawn = archive(&fixture.spawn);
+    let name: TextHandle = find!(
+        name: TextHandle,
+        pattern!(&spawn, [{ run @ attrs::of: _?zooid }, { _?zooid @ attrs::name: ?name }])
+    )
+    .next()
+    .unwrap();
+    let ctx = *rngid();
+    fixture.archived(
+        entity! { ExclusiveId::force_ref(&ctx) @
+            context::continues: tail,
+            context::zooid: name,
+        }
+        .into(),
+    );
+    for run in [run, retry] {
+        assert!(
+            matches!(fixture.life(run, true).history, History::Unlinked(ref why) if why.contains("Other runs also resumed")),
+            "{:?}",
+            fixture.life(run, true).history
+        );
+    }
+}

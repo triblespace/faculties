@@ -67,7 +67,8 @@ struct LifePanel {
     whole: bool,
     conversation: ComputedState<Option<(LifeRevisions, Result<Option<Arc<Vec<Id>>>, String>)>>,
     opening: ComputedState<Option<(LifeRevisions, Vec<Result<Arc<str>, String>>)>>,
-    opening_page: usize,
+    /// The page of each prepared input, by its position on the run.
+    opening_pages: HashMap<usize, usize>,
     page: usize,
     turns: ComputedState<Option<((LifeRevisions, bool, usize), Arc<Vec<Turn>>)>>,
     text_pages: HashMap<(Id, usize), usize>,
@@ -626,12 +627,7 @@ fn draw_opening(
                         ui.weak(format!("Prepared input {}: {why}.", index + 1));
                     }
                     Ok(text) => {
-                        let mut other = 0;
-                        let page = if index == 0 {
-                            &mut panel.opening_page
-                        } else {
-                            &mut other
-                        };
+                        let page = panel.opening_pages.entry(index).or_default();
                         text_pager(ui, ("opening-text", run, index), text, OPENING_PAGE, page);
                         ui.small("End of the prepared opening input.")
                             .on_hover_text(
@@ -697,16 +693,22 @@ fn draw_turns(
     }
     let pages = nodes.len().div_ceil(TURNS_PER_PAGE);
     panel.page = panel.page.min(pages - 1);
-    let first = panel.page * TURNS_PER_PAGE;
-    let last = (first + TURNS_PER_PAGE).min(nodes.len());
+    // The pager moves the page first; the slice and its cache key are both
+    // taken from the page it leaves, so a read never lands under another page.
     ui.horizontal_wrapped(|ui| {
+        let shown_first = panel.page * TURNS_PER_PAGE;
+        let shown_last = (shown_first + TURNS_PER_PAGE).min(nodes.len());
         if ui
             .add_enabled(panel.page > 0, egui::Button::new("◀ Earlier"))
             .clicked()
         {
             panel.page -= 1;
         }
-        ui.small(format!("Turns {}–{last} of {}", first + 1, nodes.len()));
+        ui.small(format!(
+            "Turns {}–{shown_last} of {}",
+            shown_first + 1,
+            nodes.len()
+        ));
         if ui
             .add_enabled(panel.page + 1 < pages, egui::Button::new("Later ▶"))
             .clicked()
@@ -714,6 +716,8 @@ fn draw_turns(
             panel.page += 1;
         }
     });
+    let first = panel.page * TURNS_PER_PAGE;
+    let last = (first + TURNS_PER_PAGE).min(nodes.len());
     let key = (revisions, panel.whole, panel.page);
     panel.turns.poll();
     let current = panel

@@ -208,23 +208,38 @@ fn zooid_leaf(facts: &FactArchive, locator: &Locator) -> Result<(Id, String)> {
     Ok((node, line))
 }
 
-/// The newest held leaf of the conversation `session/<id>` or `thread/<id>`
-/// names (preferring one nothing follows, as `archive thread` does), and its
-/// whole ancestry along `previous`, roots first: every node after all of its
-/// parents, ties by id. `None` when no receipt carries the locator, or it is
-/// neither form. Nothing is cut: the caller pages what it shows.
+/// Every node of the conversation `session/<id>` or `thread/<id>` names:
+/// the ancestry of every leaf its receipts carry, so a conversation that
+/// branched keeps every observed branch. Returns the leaves nothing follows
+/// and the nodes, roots first: every node after all of its parents, ties by
+/// id, which across branches is a deterministic order, not chronology.
+/// `None` when no receipt carries the locator, or it is neither form.
+/// Nothing is cut: the caller pages what it shows.
 pub(crate) fn conversation_nodes(
     facts: &FactArchive,
     locator: &str,
-) -> Result<Option<(Id, Vec<Id>)>> {
+) -> Result<Option<(Vec<Id>, Vec<Id>)>> {
     let locator = match Locator::parse(locator) {
         Some(Locator::Zooid(_)) | None => return Ok(None),
         Some(locator) => locator,
     };
-    let Some(leaf) = select_leaf(facts, &locator) else {
+    let starts: BTreeSet<Id> = selected_receipts(facts, &locator)
+        .into_iter()
+        .map(|(_, node)| node)
+        .collect();
+    if starts.is_empty() {
         return Ok(None);
-    };
-    Ok(Some((leaf.node, ancestry_in_order(facts, [leaf.node])?)))
+    }
+    let nodes = ancestry_in_order(facts, starts.iter().copied())?;
+    let tips = starts
+        .into_iter()
+        .filter(|node| {
+            !exists!(pattern!(facts, [{
+                _?next @ archive_schema::block::previous: *node
+            }]))
+        })
+        .collect();
+    Ok(Some((tips, nodes)))
 }
 
 /// `starts` and every node reached back from them along `previous`, roots
