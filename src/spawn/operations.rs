@@ -1512,46 +1512,12 @@ pub enum FeedEnd {
     Rounds,
 }
 
-/// How much of one feeder event reached the agent's input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sent {
-    /// Written and flushed.
-    Whole,
-    /// Written whole, and the flush after it failed: the whole event was
-    /// handed over and may have been read.
-    Unflushed,
-    /// Cut inside the event: the agent reads no event from half a line.
-    Cut,
-    /// Not a byte of it was written.
-    Unsent,
-}
-
-impl Sent {
-    /// Whether the agent may have read the whole event.
-    fn handed_over(self) -> bool {
-        matches!(self, Sent::Whole | Sent::Unflushed)
-    }
-}
-
-/// Write `text` as one user event, counting what was taken.
-fn send(out: &mut dyn std::io::Write, text: &str) -> Sent {
+/// Write `text` as one user event: whether all of it was written and
+/// flushed. Anything less is doubt, and an event in doubt counts as not
+/// shown: showing news twice is cheap, losing it is not.
+fn send(out: &mut dyn std::io::Write, text: &str) -> bool {
     let event = super::agy::user_event(text);
-    let bytes = event.as_bytes();
-    let mut written = 0;
-    while written < bytes.len() {
-        match out.write(&bytes[written..]) {
-            Ok(0) => break,
-            Ok(n) => written += n,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
-    }
-    match written {
-        0 => Sent::Unsent,
-        n if n < bytes.len() => Sent::Cut,
-        _ if out.flush().is_ok() => Sent::Whole,
-        _ => Sent::Unflushed,
-    }
+    out.write_all(event.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
 fn ids_text(items: &[NewsItem]) -> String {
@@ -4100,10 +4066,10 @@ impl Spawn {
     /// Delivered is kept in the run's inbox state, the file the inbox hooks
     /// keep what they showed in, under the same lock: an item the
     /// PreInvocation hook showed is not fed again, nor one fed here shown
-    /// there. An item is recorded as delivered once its event was written
-    /// whole, flushed or not (the agent may have read it); one whose event
-    /// was cut inside it, or not a byte of which was written, stays
-    /// undelivered, as half a line is no event. The lock is not held while
+    /// there. An item is recorded as delivered only once its event was
+    /// written whole and flushed; an event cut, unwritten or not flushed
+    /// leaves its items undelivered, to be shown again (at least once: a
+    /// second showing is cheap, a lost one is not). The lock is not held while
     /// writing, as the agent's own hook may wait for it: a hook and the
     /// feeder that read the same new item at once can both show it.
     ///
@@ -4137,7 +4103,7 @@ impl Spawn {
         let prompt_path = self.launch.file(&request.name, "prompt");
         let prompt = std::fs::read_to_string(&prompt_path)
             .with_context(|| format!("read {}", prompt_path.display()))?;
-        if send(out, &prompt) != Sent::Whole {
+        if !send(out, &prompt) {
             return Ok(FeedEnd::AgentGone);
         }
         let home = self.launch.agy_home(&request.name);
@@ -4166,33 +4132,17 @@ impl Spawn {
                     Ok(items) => {
                         let new = self.undelivered(&request.name, request.run, started, items)?;
                         if !new.is_empty() {
-                            let sent = send(out, &feed_text(&request.name, &new));
-                            if sent.handed_over() {
-                                let ids: Vec<Id> = new.iter().map(|item| item.id).collect();
-                                self.delivered(&request.name, request.run, &ids)?;
+                            if !send(out, &feed_text(&request.name, &new)) {
+                                eprintln!(
+                                    "zooid feed {}: an event was not written whole; its {} \
+                                     item(s) stay undelivered",
+                                    request.name,
+                                    ids_text(&new)
+                                );
+                                return Ok(FeedEnd::AgentGone);
                             }
-                            match sent {
-                                Sent::Whole => {}
-                                Sent::Unflushed => {
-                                    eprintln!(
-                                        "zooid feed {}: an event was written whole and its flush \
-                                         failed; its {} item(s) count as delivered",
-                                        request.name,
-                                        ids_text(&new)
-                                    );
-                                    return Ok(FeedEnd::AgentGone);
-                                }
-                                Sent::Cut => {
-                                    eprintln!(
-                                        "zooid feed {}: an event was cut while written; its {} \
-                                         item(s) stay undelivered",
-                                        request.name,
-                                        ids_text(&new)
-                                    );
-                                    return Ok(FeedEnd::AgentGone);
-                                }
-                                Sent::Unsent => return Ok(FeedEnd::AgentGone),
-                            }
+                            let ids: Vec<Id> = new.iter().map(|item| item.id).collect();
+                            self.delivered(&request.name, request.run, &ids)?;
                         }
                     }
                     Err(error) => eprintln!(
