@@ -1570,8 +1570,8 @@ fn feed_text(name: &str, items: &[NewsItem]) -> (String, usize) {
     let mut text = format!(
         "News for {name}, between your turns. A message comes at least once, now and then \
          twice, and stays unread until you `message_ack` it (from {name}). Anything else is \
-         what Orient sees as it is read (a goal's status, a Discord line): one that changes \
-         before it is shown is shown as it is then.\n\n"
+         what Orient sees as it is read: one that changes before it is shown is shown as it \
+         is then.\n\n"
     );
     let mut held = 0;
     for item in items {
@@ -10941,7 +10941,8 @@ mod tests {
         assert!(tail.contains("replaced"), "{tail}");
         assert!(texts[2].contains("News: goal done") && texts[2].contains("cut"));
         let tail = &texts[2][texts[2].len() - 600..];
-        assert!(!tail.contains("message_list"), "{tail}");
+        assert!(!tail.contains("whole text is in `message_list`"), "{tail}");
+        assert!(tail.contains("`message_list` does not hold it"), "{tail}");
         assert!(tail.contains("orient_poll"), "{tail}");
     }
 
