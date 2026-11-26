@@ -149,7 +149,7 @@ impl Fixture {
     fn life(&mut self, run: Id, archived: bool) -> Life {
         let spawn = archive(&self.spawn);
         let facts = archive(&self.archive);
-        let reader = self.blobs.reader().unwrap();
+        let reader = self.blobs.snapshot().unwrap();
         let routed = if archived {
             Ok(&facts)
         } else {
@@ -160,7 +160,7 @@ impl Fixture {
 
     fn turns(&mut self, nodes: &[Id]) -> Vec<Turn> {
         let facts = archive(&self.archive);
-        let reader = self.blobs.reader().unwrap();
+        let reader = self.blobs.snapshot().unwrap();
         super::turns(&facts, &reader, nodes)
     }
 }
@@ -251,7 +251,7 @@ fn a_huge_prepared_opening_is_kept_whole_and_a_cut_received_input_stays_beside_i
     fixture.claude_session(&session("s-cut", &received));
 
     let life = fixture.life(run, true);
-    let reader = fixture.blobs.reader().unwrap();
+    let reader = fixture.blobs.snapshot().unwrap();
     let [opening] = life.opening.as_slice() else {
         panic!("one opening")
     };
@@ -384,10 +384,10 @@ fn a_resumed_local_run_lives_exactly_the_context_that_continues_its_node() {
     let mut fixture = Fixture::default();
     let tail = *rngid();
     let run = fixture.run_resuming("Makap", "p", "local", 1, Some(tail));
-    let name = archive(&fixture.spawn);
+    let spawn_facts = archive(&fixture.spawn);
     let name: TextHandle = find!(
         name: TextHandle,
-        pattern!(&name, [{ run @ attrs::of: _?zooid }, { _?zooid @ attrs::name: ?name }])
+        pattern!(&spawn_facts, [{ run @ attrs::of: _?zooid }, { _?zooid @ attrs::name: ?name }])
     )
     .next()
     .unwrap();
@@ -522,7 +522,7 @@ fn an_observed_tool_payload_is_not_promoted_to_the_initial_user_message() {
     let opening = fixture.life(run, false).opening;
     let facts = archive(&fixture.archive);
     let observed = first_observed_input_payload(&facts, &nodes).unwrap();
-    let reader = fixture.blobs.reader().unwrap();
+    let reader = fixture.blobs.snapshot().unwrap();
     assert_eq!(
         read_text(&reader, observed).as_deref(),
         Some("earlier tool output")
@@ -608,7 +608,7 @@ fn each_turn_page_uses_its_snapshot_stop_policy_without_reading_withheld_bodies(
     let node = block.root().unwrap();
     fixture.archived(block);
     let before = archive(&fixture.archive);
-    let reader = fixture.blobs.reader().unwrap();
+    let reader = fixture.blobs.snapshot().unwrap();
     let page = super::turns(&before, &reader, &[node]);
     assert!(!page[0].withheld);
     assert!(
@@ -633,7 +633,7 @@ fn each_turn_page_uses_its_snapshot_stop_policy_without_reading_withheld_bodies(
 
     // A retained old snapshot has its own answer. There is no cross-page or
     // cross-snapshot inventory to carry the newer stop backward.
-    let reader = fixture.blobs.reader().unwrap();
+    let reader = fixture.blobs.snapshot().unwrap();
     let old_page = super::turns(&before, &reader, &[node]);
     assert!(!old_page[0].withheld);
     assert!(
