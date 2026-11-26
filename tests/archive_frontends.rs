@@ -1125,6 +1125,9 @@ fn importers_write_only_content_derived_attributes() {
             }
             // Read from an export directory alone, never from resident bytes.
             ImportSource::ChatGptLibrary => continue,
+            // Read from a run or session directory alone, never from
+            // resident bytes; not in every_source.
+            ImportSource::Vibe => continue,
             ImportSource::ClaudeCode => {
                 faculties::archive_claude_code::project_bytes(&name, bytes, |p| {
                     facts += p.fragment.facts().clone();
