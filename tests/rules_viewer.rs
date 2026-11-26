@@ -31,7 +31,7 @@ use triblespace::core::reactive::collection::schema as environment;
 use triblespace::core::reactive::schema as rule;
 use triblespace::core::reactive::{text, Environment, Progress};
 use triblespace::core::repo::pile::Pile;
-use triblespace::prelude::inlineencodings::Handle;
+use triblespace::prelude::inlineencodings::{GenId, Handle};
 use triblespace::prelude::*;
 use GORBIE::prelude::CardCtx;
 
@@ -198,7 +198,7 @@ impl Fixture {
                 .to_blob();
         pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
             &signer,
-            rules_missing,
+            rules_missing.into(),
             Handle::<blobencodings::SimpleArchive>::to_hash(withheld.get_handle()),
             empty_metadata_handle(),
         )))
