@@ -720,7 +720,8 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         "bytes 0–32768 of",
         "page 1 of",
         "End of the prepared opening input.",
-        "The first input the provider recorded is a different text",
+        "The first observed input payload differs from this prepared text",
+        "It does not establish the initial message or a whole-message match.",
         "<truncated 741501 bytes>",
     ] {
         assert!(

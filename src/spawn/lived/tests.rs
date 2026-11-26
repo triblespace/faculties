@@ -161,7 +161,7 @@ impl Fixture {
     fn turns(&mut self, nodes: &[Id]) -> Vec<Turn> {
         let facts = archive(&self.archive);
         let reader = self.blobs.reader().unwrap();
-        super::turns(&facts, &reader, nodes, |_| false)
+        super::turns(&facts, &reader, nodes)
     }
 }
 
@@ -234,7 +234,7 @@ fn a_claude_run_reads_its_own_session_in_causal_order_with_calls_and_results_lin
     // The archived first input is exactly the prepared text.
     let facts = archive(&fixture.archive);
     assert_eq!(
-        opening_agrees(&life.opening, first_received(&facts, nodes)),
+        opening_agrees(&life.opening, first_observed_input_payload(&facts, nodes)),
         Some(true)
     );
 }
@@ -267,7 +267,7 @@ fn a_huge_prepared_opening_is_kept_whole_and_a_cut_received_input_stays_beside_i
     let turns = fixture.turns(nodes);
     let facts = archive(&fixture.archive);
     assert_eq!(
-        opening_agrees(&life.opening, first_received(&facts, nodes)),
+        opening_agrees(&life.opening, first_observed_input_payload(&facts, nodes)),
         Some(false)
     );
     assert_eq!(
@@ -496,4 +496,147 @@ fn two_runs_resuming_one_tail_do_not_both_claim_its_context() {
             fixture.life(run, true).history
         );
     }
+}
+
+#[test]
+fn an_observed_tool_payload_is_not_promoted_to_the_initial_user_message() {
+    let mut fixture = Fixture::default();
+    let run = fixture.run("Partial history", PROMPT, "claude", 1);
+    let mut nodes = Vec::new();
+    // A partial history starts with a tool result. A later user input equals
+    // the prepared prompt; selecting it instead would invent an opening match.
+    for (modality, text) in [
+        (
+            archive_schema::content_fact::modality::TOOL_RESULT,
+            "earlier tool output",
+        ),
+        (archive_schema::content_fact::modality::TEXT, PROMPT),
+    ] {
+        let fact =
+            crate::blockdag::text_fact(modality, archive_schema::content_fact::direction::IN, text)
+                .unwrap();
+        let (block, _) = crate::blockdag::block_parts(nodes.last().copied(), None, fact).unwrap();
+        nodes.push(block.root().unwrap());
+        fixture.archived(block);
+    }
+    let opening = fixture.life(run, false).opening;
+    let facts = archive(&fixture.archive);
+    let observed = first_observed_input_payload(&facts, &nodes).unwrap();
+    let reader = fixture.blobs.reader().unwrap();
+    assert_eq!(
+        read_text(&reader, observed).as_deref(),
+        Some("earlier tool output")
+    );
+    assert_eq!(opening_agrees(&opening, Some(observed)), Some(false));
+    assert_eq!(
+        opening_agrees(&opening, first_observed_input_payload(&facts, &nodes[1..])),
+        Some(true),
+        "equality of a later observed payload does not make it an initial-message witness"
+    );
+}
+
+#[test]
+fn receipt_nodes_with_external_successors_do_not_claim_one_terminal_leaf() {
+    let mut fixture = Fixture::default();
+    let run = fixture.run("Continued elsewhere", PROMPT, "claude", 1);
+    fixture.conversation(run, "session/s-continued", None, None);
+    fixture.claude_session(&session("s-continued", PROMPT));
+    let before = archive(&fixture.archive);
+    let (tips, expected_nodes) = crate::archive::conversation_nodes(&before, "session/s-continued")
+        .unwrap()
+        .unwrap();
+    assert_eq!(tips.len(), 1);
+    for tip in tips {
+        let fact = crate::blockdag::text_fact(
+            archive_schema::content_fact::modality::TEXT,
+            archive_schema::content_fact::direction::OUT,
+            "a successor outside this locator's receipts",
+        )
+        .unwrap();
+        let (block, _) = crate::blockdag::block_parts([tip], None, fact).unwrap();
+        fixture.archived(block);
+    }
+    let facts = archive(&fixture.archive);
+    let (tips, nodes) = crate::archive::conversation_nodes(&facts, "session/s-continued")
+        .unwrap()
+        .unwrap();
+    assert!(tips.is_empty());
+    assert_eq!(
+        nodes, expected_nodes,
+        "the selected ancestry remains available"
+    );
+    let History::Own { basis, .. } = fixture.life(run, true).history else {
+        panic!("the session link must remain available");
+    };
+    assert!(basis.contains("no terminal leaf is established"), "{basis}");
+    assert!(!basis.contains("one held leaf"), "{basis}");
+}
+
+/// Fails on any body access. The synthetic page has no role payloads, so a
+/// withheld page must never reach this store at all.
+struct NoBodyReads;
+
+impl BlobStoreGet for NoBodyReads {
+    type GetError<E: std::error::Error + Send + Sync + 'static> = std::io::Error;
+
+    fn get<T, E>(
+        &self,
+        _handle: triblespace::core::inline::Inline<
+            triblespace::core::inline::encodings::hash::Handle<E>,
+        >,
+    ) -> std::result::Result<T, Self::GetError<T::Error>>
+    where
+        E: triblespace::core::blob::BlobEncoding + 'static,
+        T: triblespace::core::blob::TryFromBlob<E>,
+        triblespace::core::inline::encodings::hash::Handle<E>:
+            triblespace::core::inline::InlineEncoding,
+    {
+        panic!("a withheld page read body bytes")
+    }
+}
+
+#[test]
+fn each_turn_page_uses_its_snapshot_stop_policy_without_reading_withheld_bodies() {
+    let mut fixture = Fixture::default();
+    let fact = crate::blockdag::text_fact(
+        archive_schema::content_fact::modality::TEXT,
+        archive_schema::content_fact::direction::OUT,
+        "synthetic response body",
+    )
+    .unwrap();
+    let (block, _) = crate::blockdag::block_parts(None, None, fact).unwrap();
+    let node = block.root().unwrap();
+    fixture.archived(block);
+    let before = archive(&fixture.archive);
+    let reader = fixture.blobs.reader().unwrap();
+    let page = super::turns(&before, &reader, &[node]);
+    assert!(!page[0].withheld);
+    assert!(
+        matches!(&page[0].parts[0].body, Body::Text(text) if text == "synthetic response body")
+    );
+    drop(reader);
+
+    // The policy's existing exact recorded stop, not a substring match.
+    let stop = "Your response above was stopped by a safety classifier — this is not a tool or API error. The rest of it was withheld, and tool calls in it that had not finished did not run. Do not produce that content again, even reworded.";
+    let fact = crate::blockdag::text_fact(
+        archive_schema::content_fact::modality::TEXT,
+        archive_schema::content_fact::direction::IN,
+        stop,
+    )
+    .unwrap();
+    let (block, _) = crate::blockdag::block_parts([node], None, fact).unwrap();
+    fixture.archived(block);
+    let after = archive(&fixture.archive);
+    let page = super::turns(&after, &NoBodyReads, &[node]);
+    assert!(page[0].withheld);
+    assert!(page[0].parts.is_empty());
+
+    // A retained old snapshot has its own answer. There is no cross-page or
+    // cross-snapshot inventory to carry the newer stop backward.
+    let reader = fixture.blobs.reader().unwrap();
+    let old_page = super::turns(&before, &reader, &[node]);
+    assert!(!old_page[0].withheld);
+    assert!(
+        matches!(&old_page[0].parts[0].body, Body::Text(text) if text == "synthetic response body")
+    );
 }

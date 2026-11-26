@@ -7,7 +7,7 @@
 //! - A run that records one conversation (`source_projection::source_locator`
 //!   on the run: a Claude session, chosen per run at launch, or the agy
 //!   conversation its settlement read) has as its history every archived
-//!   node from that conversation's root to its newest held leaf, when no
+//!   node in the ancestry of its observed receipt nodes, when no
 //!   other run names the same conversation and it continues no earlier life
 //!   ([`crate::schemas::spawn::spawn::archive_start`]).
 //! - A conversation several runs name is shared. Spawn bounds each run's part
@@ -16,15 +16,16 @@
 //!   handing every run the whole conversation ([`History::Shared`]). The
 //!   whole conversation stays readable, labelled as the conversation.
 //! - A local (Drive) run that resumed from an archived node
-//!   ([`crate::schemas::spawn::spawn::resumes`]) lived the Drive context of
+//!   ([`crate::schemas::spawn::spawn::resumes`]) has the Drive context of
 //!   its zooid's name that continues exactly that node
-//!   (`context::continues`), and its history is the nodes observed in that
-//!   context. A fresh local run records no such link.
+//!   (`context::continues`) only as a candidate history, not a proved run
+//!   identity. A fresh local run records no such link.
 //!
 //! The prepared opening input is the run's `prompt`: what the launch fed the
 //! agent, kept whole. It is no evidence that every byte reached the model;
-//! where the archived conversation's first input is a different text, both
-//! stay and neither replaces the other ([`opening_agrees`]).
+//! it can be compared with the first observed input payload in the displayed
+//! node order. This does not establish the conversation's initial message;
+//! both remain and neither replaces the other ([`opening_agrees`]).
 //!
 //! Every function here is a query over facts the caller holds and a blob
 //! reader; nothing is written, and nothing outside those facts is fetched.
@@ -275,7 +276,10 @@ fn history<R: BlobStoreGet + ?Sized>(
                          No other run here names it; that is what is observed, not proof \
                          that it holds only this run's life. {}",
                         match tips.len() {
-                            0 | 1 => "It ends at one held leaf.".to_owned(),
+                            0 => "Every receipt node has an observed successor; no terminal \
+                                  leaf is established by these receipts."
+                                .to_owned(),
+                            1 => "It ends at one held leaf.".to_owned(),
                             n => format!(
                                 "It branches into {n} held leaves; every branch is shown, each \
                                  node after its predecessors, branches interleaved by id, not \
@@ -434,16 +438,13 @@ fn label(specs: &[(Id, &str)], id: Id) -> String {
 }
 
 /// The nodes `nodes`, read for display: their parts with exact text, the
-/// roles their records claim, the calls they answer. `stopped` says which
-/// nodes a recorded classifier stop followed
-/// (`crate::archive::classifier_stopped`); their content is not read.
-pub fn turns<R: BlobStoreGet + ?Sized>(
-    facts: &FactArchive,
-    reader: &R,
-    nodes: &[Id],
-    stopped: impl Fn(Id) -> bool,
-) -> Vec<Turn> {
+/// roles their records claim, the calls they answer. Nodes a recorded
+/// classifier stop followed have no content read. The stop inventory is
+/// operation-local scratch for this page, derived from this same snapshot;
+/// it is not retained alongside a life or across page reads.
+pub fn turns<R: BlobStoreGet + ?Sized>(facts: &FactArchive, reader: &R, nodes: &[Id]) -> Vec<Turn> {
     use archive_schema::content_fact::direction::{IN, OUT};
+    let stopped = crate::archive::classifier_stopped(facts);
     nodes
         .iter()
         .map(|&node| {
@@ -492,7 +493,7 @@ pub fn turns<R: BlobStoreGet + ?Sized>(
                 [d] if **d == OUT => Direction::Produced,
                 _ => Direction::Unknown,
             };
-            let withheld = stopped(node);
+            let withheld = stopped.contains(&node);
             let mut parts = Vec::new();
             for (fact, modality, direction) in held {
                 let kind = label(v3_fact::modality::SPECS, modality);
@@ -549,9 +550,11 @@ pub fn turns<R: BlobStoreGet + ?Sized>(
         .collect()
 }
 
-/// The first `in` text of `nodes`, by handle: what the provider recorded as
-/// the conversation's first received text. No blob is read.
-pub fn first_received(facts: &FactArchive, nodes: &[Id]) -> Option<TextHandle> {
+/// The first observed `in` payload in the supplied node order, by handle.
+/// Within a node, fact id breaks ties. It can be a tool result or another
+/// input modality, and is not proof of the conversation's initial message
+/// or its complete input. No blob is read.
+pub fn first_observed_input_payload(facts: &FactArchive, nodes: &[Id]) -> Option<TextHandle> {
     use archive_schema::content_fact::direction::IN;
     nodes.iter().find_map(|&node| {
         find!(
@@ -567,11 +570,10 @@ pub fn first_received(facts: &FactArchive, nodes: &[Id]) -> Option<TextHandle> {
     })
 }
 
-/// Whether the archived conversation opens with exactly the prepared input:
-/// `Some(true)` when its first received text is the same text (the same
-/// handle), `Some(false)` when it is a different text, `None` when either is
-/// unknown. Equal handles are equal texts; nothing is read or compared by
-/// content.
+/// Compare one prepared input with the selected observed input payload.
+/// Equal handles establish payload equality, not an initial-message or
+/// whole-message correspondence. `None` means no single comparison is
+/// available. Nothing is read or compared by content.
 pub fn opening_agrees(opening: &[TextHandle], received: Option<TextHandle>) -> Option<bool> {
     let [prepared] = opening else {
         return None;

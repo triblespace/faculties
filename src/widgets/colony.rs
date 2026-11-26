@@ -10,7 +10,7 @@ use crate::widgets::storage::LoadedDataset;
 use crate::widgets::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 use anybytes::View;
 use egui::{RichText, Ui};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use triblespace::core::repo::BlobStoreGet;
@@ -74,16 +74,11 @@ struct LifePanel {
     text_pages: HashMap<(Id, usize), usize>,
 }
 
-/// A run's history as read: the facts' answer, the nodes withheld after a
-/// recorded classifier stop, and whether the archive opens with the
-/// prepared input.
+/// A run's history as read and its handle-only observed payload comparison.
 struct LifeShown {
     life: Life,
     /// The nodes shown for its own or candidate history.
     own: Arc<Vec<Id>>,
-    /// Nodes a recorded classifier stop followed. Ephemeral UI cache of one
-    /// observation, dropped with the panel when the inputs change.
-    stopped: HashSet<Id>,
     agrees: Option<bool>,
 }
 
@@ -387,37 +382,22 @@ fn read_life(sources: &LifeSources, run: Id) -> Result<LifeShown, String> {
     )
     .map_err(|error| format!("{error:#}"))?;
     let archive = archive.ok();
-    let (stopped, agrees) = match (&archive, &life.history) {
+    let agrees = match (&archive, &life.history) {
         (Some(view), History::Own { nodes, .. } | History::Candidate { nodes, .. }) => {
             // Only handles are compared here: no body, and no prepared
             // input, is read before someone opens it.
-            let agrees =
-                lived::opening_agrees(&life.opening, lived::first_received(view.facts, nodes));
-            (
-                crate::archive::classifier_stopped(view.facts)
-                    .into_iter()
-                    .collect(),
-                agrees,
+            lived::opening_agrees(
+                &life.opening,
+                lived::first_observed_input_payload(view.facts, nodes),
             )
         }
-        (Some(view), History::Shared { .. }) => (
-            crate::archive::classifier_stopped(view.facts)
-                .into_iter()
-                .collect(),
-            None,
-        ),
-        _ => (HashSet::new(), None),
+        _ => None,
     };
     let own = Arc::new(match &life.history {
         History::Own { nodes, .. } | History::Candidate { nodes, .. } => nodes.clone(),
         _ => Vec::new(),
     });
-    Ok(LifeShown {
-        life,
-        own,
-        stopped,
-        agrees,
-    })
+    Ok(LifeShown { life, own, agrees })
 }
 
 fn draw_life(ui: &mut Ui, run: Id, panel: &mut LifePanel, sources: &LifeSources) {
@@ -563,7 +543,7 @@ fn draw_life(ui: &mut Ui, run: Id, panel: &mut LifePanel, sources: &LifeSources)
             return;
         }
     };
-    draw_turns(ui, panel, sources, &shown, &nodes);
+    draw_turns(ui, panel, sources, &nodes);
 }
 
 fn draw_opening(
@@ -588,15 +568,21 @@ fn draw_opening(
             );
             match shown.agrees {
                 Some(true) => {
-                    ui.small("The archived conversation opens with exactly this text.");
+                    ui.small("The first observed input payload equals this prepared text.");
                 }
                 Some(false) => {
                     ui.small(
-                        "The first input the provider recorded is a different text; both are \
-                         kept, the recorded one is the first turn below.",
+                        "The first observed input payload differs from this prepared text; \
+                         both are kept.",
                     );
                 }
                 None => {}
+            }
+            if shown.agrees.is_some() {
+                ui.small(
+                    "This compares one payload in the displayed node order, with fact-id \
+                     ties. It does not establish the initial message or a whole-message match.",
+                );
             }
             panel.opening.poll();
             let current = panel
@@ -691,13 +677,7 @@ fn text_pager(ui: &mut Ui, salt: impl std::hash::Hash, text: &str, size: usize, 
     });
 }
 
-fn draw_turns(
-    ui: &mut Ui,
-    panel: &mut LifePanel,
-    sources: &LifeSources,
-    shown: &Arc<LifeShown>,
-    nodes: &Arc<Vec<Id>>,
-) {
+fn draw_turns(ui: &mut Ui, panel: &mut LifePanel, sources: &LifeSources, nodes: &Arc<Vec<Id>>) {
     let revisions = sources.revisions;
     if nodes.is_empty() {
         ui.label("No turns.");
@@ -741,13 +721,10 @@ fn draw_turns(
     let Some(turns) = current else {
         if !panel.turns.is_running() {
             let sources = sources.clone();
-            let shown = shown.clone();
             let page: Vec<Id> = nodes[first..last].to_vec();
             panel.turns.spawn(ui.ctx(), move || {
                 let turns = match sources.archive.as_ref().map(|dataset| dataset.view()) {
-                    Ok(Ok(view)) => lived::turns(view.facts, view.reader, &page, |node| {
-                        shown.stopped.contains(&node)
-                    }),
+                    Ok(Ok(view)) => lived::turns(view.facts, view.reader, &page),
                     _ => Vec::new(),
                 };
                 Some((key, Arc::new(turns)))
