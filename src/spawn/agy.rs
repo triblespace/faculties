@@ -35,11 +35,21 @@ pub const DEFAULT_WINDOW: u64 = 512_000;
 /// report, and the refusals of the tool calls it asked for after the limit.
 pub const REPORT_RESERVE: u64 = 32_000;
 
-/// The step growth assumed until a conversation has shown one of its own.
-/// Measured in the first hour of an interactive agy session (25 Nov 2026):
-/// one step of nine file reads grew its context from 80,759 to 190,561
-/// tokens, 109,802, the largest growth between its twelve calls.
-pub const GROWTH_FLOOR: u64 = 109_802;
+/// The largest step of the first two lives of an agy resident (26 Nov 2026,
+/// conversations 302ce2bf and 69131eef) that was not only reads of its
+/// wake: 53,791 tokens, life 1's steps 45 to 47, the backlog news turn agy
+/// cut at about 192 KB. Its other steps that read no wake stayed under
+/// 17,500. A news turn is now bounded below that cut
+/// ([`super::wake_files::EVENT_BYTES`]).
+pub const LARGEST_STEP_SEEN: u64 = 53_791;
+
+/// The step growth assumed until a conversation has shown a larger one:
+/// [`LARGEST_STEP_SEEN`] and half again, 80,686. It was 109,802, one step
+/// of nine file reads in the first hour of an interactive agy window (25
+/// Nov 2026); with a wake read by tools that floor ended a life before its
+/// first working call (life 2 crossed its limit at 371,013 tokens). A
+/// conversation that shows a larger step widens the margin to it.
+pub const GROWTH_FLOOR: u64 = LARGEST_STEP_SEEN + LARGEST_STEP_SEEN / 2;
 
 /// The home directory's entry an agy zooid gets its own copy of.
 pub const GEMINI_DIR: &str = ".gemini";
@@ -131,12 +141,43 @@ pub struct Call {
     pub step: u64,
     pub occupancy: u64,
     pub output: u64,
+    /// Every tool call it asked for reads a part of the life's wake: the
+    /// growth to the next call is the wake, read once, not a step the rest
+    /// of the life repeats.
+    pub wake_read: bool,
 }
 
 /// The model calls of an agy `transcript_full.jsonl`, in step order: every
 /// `PLANNER_RESPONSE` that carries `input_tokens`. Lines that are not JSON
 /// (a record still being written) are skipped.
 pub fn calls<L: AsRef<str>>(lines: impl IntoIterator<Item = L>) -> Vec<Call> {
+    calls_reading(lines, None)
+}
+
+/// [`calls`], with each call that only reads files in `wake` (the life's
+/// wake parts, [`super::wake_files`]) marked as such: a call with tool calls,
+/// every one agy's `read_file` of a path inside `wake` with no `..` in it.
+pub fn calls_reading<L: AsRef<str>>(
+    lines: impl IntoIterator<Item = L>,
+    wake: Option<&Path>,
+) -> Vec<Call> {
+    let reads_wake = |value: &serde_json::Value| {
+        let Some(dir) = wake else { return false };
+        let Some(tools) = value["tool_calls"].as_array() else {
+            return false;
+        };
+        !tools.is_empty()
+            && tools.iter().all(|tool| {
+                tool["name"] == "read_file"
+                    && tool["args"]["Path"].as_str().is_some_and(|path| {
+                        let path = Path::new(path);
+                        path.starts_with(dir)
+                            && path
+                                .components()
+                                .all(|part| part != std::path::Component::ParentDir)
+                    })
+            })
+    };
     let mut calls: Vec<Call> = lines
         .into_iter()
         .filter_map(|line| {
@@ -153,6 +194,7 @@ pub fn calls<L: AsRef<str>>(lines: impl IntoIterator<Item = L>) -> Vec<Call> {
                 step,
                 occupancy: input + value["cache_read_tokens"].as_u64().unwrap_or(0),
                 output: value["output_tokens"].as_u64().unwrap_or(0),
+                wake_read: reads_wake(&value),
             })
         })
         .collect();
@@ -166,7 +208,8 @@ pub struct Life {
     /// The context of the latest call, in tokens.
     pub occupancy: u64,
     /// The largest growth between two calls of this conversation, or
-    /// [`GROWTH_FLOOR`] while it has shown none as large.
+    /// [`GROWTH_FLOOR`] while it has shown none as large. The growth after
+    /// a call that only read the wake is not counted.
     pub growth: u64,
     pub window: u64,
     /// The latest occupancy at which one more step still leaves the
@@ -184,6 +227,7 @@ pub fn life(calls: &[Call], window: u64) -> Life {
     let occupancy = calls.last().map_or(0, |call| call.occupancy);
     let growth = calls
         .windows(2)
+        .filter(|pair| !pair[0].wake_read)
         .map(|pair| pair[1].occupancy.saturating_sub(pair[0].occupancy))
         .max()
         .unwrap_or(0)
@@ -512,9 +556,15 @@ pub fn hook_input(text: &str) -> Result<HookInput> {
     })
 }
 
-/// The conversation's life, read from its transcript in the zooid's home.
-/// `Ok(None)` when no model call has been recorded yet.
-pub fn read_life(home: &Path, conversation: Option<&str>, window: u64) -> Result<Option<Life>> {
+/// The conversation's life, read from its transcript in the zooid's home;
+/// `wake` is the directory of the life's wake parts. `Ok(None)` when no
+/// model call has been recorded yet.
+pub fn read_life(
+    home: &Path,
+    conversation: Option<&str>,
+    window: u64,
+    wake: &Path,
+) -> Result<Option<Life>> {
     let conversation = match conversation {
         Some(id) => id.to_owned(),
         None => match latest_conversation(home)? {
@@ -528,7 +578,7 @@ pub fn read_life(home: &Path, conversation: Option<&str>, window: u64) -> Result
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
-    let calls = calls(text.lines());
+    let calls = calls_reading(text.lines(), Some(wake));
     Ok((!calls.is_empty()).then(|| life(&calls, window)))
 }
 
@@ -639,7 +689,8 @@ mod tests {
             Call {
                 step: 1,
                 occupancy: 11992,
-                output: 613
+                output: 613,
+                wake_read: false,
             }
         );
         assert_eq!(calls[11].occupancy, 347_270);
@@ -663,6 +714,7 @@ mod tests {
             step: 70,
             occupancy: 347_270 + 109_802,
             output: 0,
+            wake_read: false,
         });
         let over = super::life(&more, DEFAULT_WINDOW);
         assert!(over.over);
@@ -676,29 +728,94 @@ mod tests {
                 step: 1,
                 occupancy: 10_000,
                 output: 0,
+                wake_read: false,
             },
             Call {
                 step: 2,
                 occupancy: 210_000,
                 output: 0,
+                wake_read: false,
             },
         ];
         let life = life(&calls, DEFAULT_WINDOW);
         assert_eq!(life.growth, 200_000);
         assert_eq!(life.limit, DEFAULT_WINDOW - 200_000 - REPORT_RESERVE);
-        // The boundary itself: at the limit one more step still fits.
+        // The boundary itself, for a conversation that has shown no step:
+        // at the limit one more step still fits.
+        assert_eq!(GROWTH_FLOOR, 80_686);
+        let limit = DEFAULT_WINDOW - GROWTH_FLOOR - REPORT_RESERVE;
+        assert_eq!(limit, 399_314);
         let at = [Call {
             step: 1,
-            occupancy: 370_198,
+            occupancy: limit,
             output: 0,
+            wake_read: false,
         }];
         assert!(!super::life(&at, DEFAULT_WINDOW).over);
         let past = [Call {
             step: 1,
-            occupancy: 370_199,
+            occupancy: limit + 1,
             output: 0,
+            wake_read: false,
         }];
         assert!(super::life(&past, DEFAULT_WINDOW).over);
+    }
+
+    /// A planner record with its tool calls, each a (name, Path) pair, in
+    /// the shape of an agy resident's transcript (conversation 69131eef, 26 Nov 2026).
+    fn planner_with(step: u64, occupancy: u64, tools: &[(&str, &str)]) -> String {
+        let tools: Vec<_> = tools
+            .iter()
+            .map(|(name, path)| serde_json::json!({"name": name, "args": {"Path": path}}))
+            .collect();
+        serde_json::json!({
+            "step_index": step, "type": "PLANNER_RESPONSE", "input_tokens": 1000,
+            "cache_read_tokens": occupancy - 1000, "output_tokens": 5, "tool_calls": tools,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_step_that_only_reads_the_wake_is_not_the_lifes_margin() {
+        let wake = Path::new("/s/n.wake");
+        let read = |part: u64| ("read_file", format!("/s/n.wake/part-{part:02}-of-20.md"));
+        let all: Vec<(&str, String)> = (1..=20).map(read).collect();
+        let all: Vec<(&str, &str)> = all.iter().map(|(n, p)| (*n, p.as_str())).collect();
+        let lines = [
+            planner_with(1, 20_000, &all),
+            planner_with(2, 320_000, &[("read_file", "/s/n.wake/part-01-of-20.md")]),
+            planner_with(3, 330_000, &[]),
+        ];
+        let calls = calls_reading(&lines, Some(wake));
+        assert_eq!(
+            calls.iter().map(|call| call.wake_read).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let life = life(&calls, DEFAULT_WINDOW);
+        assert_eq!(life.growth, GROWTH_FLOOR);
+        assert!(!life.over, "{life:?}");
+        // Without the wake named, the same step is the margin and the life
+        // is over as it wakes.
+        assert!(super::life(&super::calls(&lines), DEFAULT_WINDOW).over);
+        // A step that reads anything else besides counts whole; so does a
+        // read that leaves the directory, or one by another tool.
+        for other in [
+            ("read_file", "/work/CLAUDE.md"),
+            ("read_file", "/s/n.wake/../n.prompt"),
+            ("run_command", "/s/n.wake/part-01-of-20.md"),
+        ] {
+            let mut mixed = all.clone();
+            mixed.push(other);
+            let lines = [
+                planner_with(1, 20_000, &mixed),
+                planner_with(2, 320_000, &[]),
+            ];
+            let calls = calls_reading(&lines, Some(wake));
+            assert!(!calls[0].wake_read, "{other:?}");
+            assert_eq!(super::life(&calls, DEFAULT_WINDOW).growth, 300_000);
+        }
+        // A call with no tool calls read nothing.
+        assert!(!calls_reading(&[planner_with(1, 2_000, &[])], Some(wake))[0].wake_read);
     }
 
     fn over_life() -> Life {
@@ -707,6 +824,7 @@ mod tests {
                 step: 1,
                 occupancy: 400_000,
                 output: 0,
+                wake_read: false,
             }],
             DEFAULT_WINDOW,
         )
@@ -719,6 +837,7 @@ mod tests {
                 step: 1,
                 occupancy: 10_000,
                 output: 0,
+                wake_read: false,
             }],
             DEFAULT_WINDOW,
         );
@@ -744,6 +863,7 @@ mod tests {
                 step: 1,
                 occupancy: 490_000,
                 output: 0,
+                wake_read: false,
             }],
             DEFAULT_WINDOW,
         );
@@ -927,17 +1047,25 @@ mod tests {
     fn life_is_read_from_the_conversation_in_the_zooids_home() {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path();
-        assert_eq!(read_life(home, None, DEFAULT_WINDOW).unwrap(), None);
+        assert_eq!(
+            read_life(home, None, DEFAULT_WINDOW, Path::new("/s/n.wake")).unwrap(),
+            None
+        );
         let path = transcript(home, "c-1").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, first_hour().join("\n")).unwrap();
-        let life = read_life(home, None, DEFAULT_WINDOW).unwrap().unwrap();
+        let life = read_life(home, None, DEFAULT_WINDOW, Path::new("/s/n.wake"))
+            .unwrap()
+            .unwrap();
         assert_eq!(life.occupancy, 347_270);
         assert_eq!(
-            read_life(home, Some("c-1"), DEFAULT_WINDOW).unwrap(),
+            read_life(home, Some("c-1"), DEFAULT_WINDOW, Path::new("/s/n.wake")).unwrap(),
             Some(life)
         );
-        assert_eq!(read_life(home, Some("c-2"), DEFAULT_WINDOW).unwrap(), None);
+        assert_eq!(
+            read_life(home, Some("c-2"), DEFAULT_WINDOW, Path::new("/s/n.wake")).unwrap(),
+            None
+        );
         assert!(transcript(home, "../c").is_err());
     }
 }

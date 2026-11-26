@@ -593,6 +593,12 @@ impl LaunchConfig {
         self.file(name, "agy")
     }
 
+    /// The directory of a zooid's wake parts, for a life that reads its
+    /// wake by tools ([`super::wake_files`]).
+    pub fn wake_dir(&self, name: &str) -> PathBuf {
+        self.file(name, "wake")
+    }
+
     fn file(&self, name: &str, suffix: &str) -> PathBuf {
         self.state_dir.join(format!("{name}.{suffix}"))
     }
@@ -1545,17 +1551,51 @@ fn ids_text(items: &[NewsItem]) -> String {
         .join(", ")
 }
 
-/// One feeder event: the news items not delivered before.
-fn feed_text(name: &str, items: &[NewsItem]) -> String {
+/// Bytes kept free in a news event for what is said after its items.
+const FEED_TAIL_BYTES: usize = 1_024;
+
+/// One feeder event: the news items not delivered before, as many as fit
+/// in one user event ([`super::wake_files::EVENT_BYTES`]), and how many of
+/// `items` it holds. The rest wait for the next read, and the event says how
+/// many. An item larger than an event alone is shown cut, and the cut is said.
+fn feed_text(name: &str, items: &[NewsItem]) -> (String, usize) {
+    let cap = super::wake_files::EVENT_BYTES - FEED_TAIL_BYTES;
     let mut text = format!(
         "News for {name}, between your turns. Each item comes at least once, and now and \
          then twice; a message stays unread until you `message_ack` it (from {name}).\n\n"
     );
+    let mut held = 0;
     for item in items {
-        text.push_str(item.text.trim_end());
-        text.push('\n');
+        let body = item.text.trim_end();
+        if text.len() + body.len() + 1 <= cap {
+            text.push_str(body);
+            text.push('\n');
+            held += 1;
+            continue;
+        }
+        if held == 0 {
+            let mut end = cap.saturating_sub(text.len()).min(body.len());
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&body[..end]);
+            text.push_str(&format!(
+                "\n[This item was cut here: it is {} bytes, more than one news turn holds, and \
+                 only its first {end} are shown. A message's whole text is in `message_list` \
+                 (reader {name}).]\n",
+                body.len()
+            ));
+            held = 1;
+        }
+        break;
     }
-    text
+    let waiting = items.len() - held;
+    if waiting > 0 {
+        text.push_str(&format!(
+            "\n{waiting} more item(s) did not fit in this turn: they come in the next news turn.\n"
+        ));
+    }
+    (text, held)
 }
 
 /// Configured Spawn operations.
@@ -2141,7 +2181,7 @@ impl Spawn {
     /// to it), and its transcript in the zooid's home shows room for more
     /// life; otherwise the launch starts fresh into the cover, and the
     /// reason says which.
-    fn agy_resume(&self, spawn: Id, workdir: &str, home: &Path) -> AgyResume {
+    fn agy_resume(&self, spawn: Id, workdir: &str, home: &Path, wake: &Path) -> AgyResume {
         let fresh = |reason: String| AgyResume {
             conversation: None,
             start: None,
@@ -2226,7 +2266,7 @@ impl Spawn {
                     ))
                 }
             };
-        match super::agy::read_life(home, Some(&conversation), self.launch.agy_window) {
+        match super::agy::read_life(home, Some(&conversation), self.launch.agy_window, wake) {
             Ok(Some(life)) if life.over => fresh(format!(
                 "fresh: conversation {conversation} ended its life at {} of {} tokens",
                 life.occupancy, life.window
@@ -2724,8 +2764,11 @@ impl Spawn {
             };
             // A fed resident hears colony news between its turns.
             let fed = zooid.resident && provider == Provider::Agy;
+            // It also reads its wake by tools: agy cuts one user event, and
+            // a resident's whole wake is several times larger.
+            let wake_by_files = fed;
             let preamble = if zooid.resident {
-                super::resident_preamble(&name, spawner_label, fed)
+                super::resident_preamble(&name, spawner_label, fed, wake_by_files)
             } else {
                 super::preamble(&name, spawner_label, provider == Provider::Local)
             };
@@ -2735,11 +2778,14 @@ impl Spawn {
                 .then(|| super::assemble_brief(&preamble, &brief.text));
             // A resident wakes as a window does: the personal wake, untinted,
             // at its full size. A task zooid's cover is tinted by its brief.
+            let mut resident_wake = None;
             let (prompt, cover) = if zooid.resident {
                 let wake = self
                     .renderer
                     .wake(&self.storage, None, crate::orient::WAKE_CHARS)?;
-                (assemble(&wake), None)
+                let prompt = assemble(&wake);
+                resident_wake = Some(wake);
+                (prompt, None)
             } else {
                 self.size_cover(
                     provider,
@@ -2762,7 +2808,9 @@ impl Spawn {
             // has room; a life that ended at its limit, or none, starts
             // fresh into the cover.
             let agy_resume = match provider {
-                Provider::Agy => self.agy_resume(spawn, &workdir_text, &agy_home),
+                Provider::Agy => {
+                    self.agy_resume(spawn, &workdir_text, &agy_home, &launch.wake_dir(&name))
+                }
                 _ => AgyResume::default(),
             };
             // A continued conversation is not fed the cover: the run records
@@ -2773,6 +2821,28 @@ impl Spawn {
                     None,
                 ),
                 None => (prompt, cover),
+            };
+            // A fresh life that reads its wake by tools is first given who it
+            // is, its brief and the wake's parts; the run records the whole
+            // opening context, the wake included, as any other run does.
+            let wake_dir = launch.wake_dir(&name);
+            let (agent_input, wake_parts) = match &resident_wake {
+                Some(wake) if wake_by_files && agy_resume.conversation.is_none() => {
+                    let parts = super::wake_files::files(&wake_dir, wake);
+                    let reading = super::wake_files::reading(&parts, provider == Provider::Agy);
+                    let input = super::wake_files::first_input(&preamble, &brief.text, &reading);
+                    if input.len() > super::wake_files::EVENT_BYTES {
+                        bail!(
+                            "{name}'s first input, who it is, the brief and how to read the \
+                             wake, is {} bytes, more than the {} one user event is given: \
+                             nothing was started. A shorter brief fits",
+                            input.len(),
+                            super::wake_files::EVENT_BYTES
+                        );
+                    }
+                    (input, parts)
+                }
+                _ => (prompt.clone(), Vec::new()),
             };
             let provider_reason = match provider {
                 Provider::Agy => format!("{provider_reason}; {}", agy_resume.reason),
@@ -2923,7 +2993,10 @@ impl Spawn {
                 Provider::Local => {}
                 Provider::Auto => bail!("{} reached the launch unresolved", provider.name()),
             }
-            std::fs::write(&prompt_path, &prompt)?;
+            if !wake_parts.is_empty() {
+                super::wake_files::write(&wake_dir, &wake_parts)?;
+            }
+            std::fs::write(&prompt_path, &agent_input)?;
             if let Some(first_input) = &first_input {
                 std::fs::write(&brief_path, first_input)?;
             }
@@ -3224,7 +3297,10 @@ impl Spawn {
                             // the conversation's own calls: an observation,
                             // never the plan the hooks enforced.
                             let life = super::agy::life(
-                                &super::agy::calls(text.lines()),
+                                &super::agy::calls_reading(
+                                    text.lines(),
+                                    Some(&self.launch.wake_dir(&request.name)),
+                                ),
                                 self.launch.agy_window,
                             );
                             if life.over {
@@ -4106,6 +4182,8 @@ impl Spawn {
     /// A fed resident's input, written to `out` (the agent's stdin): its
     /// prompt as the first user event, then each read of its news that
     /// holds something not yet delivered, as one user event between turns.
+    /// An event holds as many items as fit in one ([`feed_text`]); the rest
+    /// stay undelivered and come with the next read.
     ///
     /// Delivered is kept in the run's inbox state, the file the inbox hooks
     /// keep what they showed in, under the same lock: an item the
@@ -4151,6 +4229,7 @@ impl Spawn {
             return Ok(FeedEnd::AgentGone);
         }
         let home = self.launch.agy_home(&request.name);
+        let wake = self.launch.wake_dir(&request.name);
         let mut started = None;
         let mut round = 0u64;
         loop {
@@ -4165,7 +4244,7 @@ impl Spawn {
             }
             if let Some((started, continued)) = &started {
                 let started = *started;
-                if self.life_over(&home, continued.as_deref(), started) {
+                if self.life_over(&home, continued.as_deref(), started, &wake) {
                     // The hooks tell a turn that is under way; a life that
                     // crossed its limit as a turn ended hears it here, once,
                     // before its input closes.
@@ -4176,12 +4255,14 @@ impl Spawn {
                     Ok(items) => {
                         let new = self.undelivered(&request.name, request.run, started, items)?;
                         if !new.is_empty() {
-                            if !send(out, &feed_text(&request.name, &new)) {
+                            let (text, held) = feed_text(&request.name, &new);
+                            let new = &new[..held];
+                            if !send(out, &text) {
                                 eprintln!(
                                     "zooid feed {}: an event was not written whole; its {} \
                                      item(s) stay undelivered",
                                     request.name,
-                                    ids_text(&new)
+                                    ids_text(new)
                                 );
                                 return Ok(FeedEnd::AgentGone);
                             }
@@ -4234,7 +4315,7 @@ impl Spawn {
     /// Whether the conversation of a run is past its life limit: the one
     /// the run `continued`, or the one conversation in the zooid's home that
     /// changed since the run started. None found, or several, is not over.
-    fn life_over(&self, home: &Path, continued: Option<&str>, started: Epoch) -> bool {
+    fn life_over(&self, home: &Path, continued: Option<&str>, started: Epoch, wake: &Path) -> bool {
         let conversation = match continued {
             Some(conversation) => conversation.to_owned(),
             None => {
@@ -4247,7 +4328,7 @@ impl Spawn {
             }
         };
         matches!(
-            super::agy::read_life(home, Some(&conversation), self.launch.agy_window),
+            super::agy::read_life(home, Some(&conversation), self.launch.agy_window, wake),
             Ok(Some(life)) if life.over
         )
     }

@@ -408,6 +408,7 @@ fn run_agy_hook(
         &config.agy_home(&name),
         input.conversation.as_deref(),
         config.agy_window,
+        &config.wake_dir(&name),
     ) {
         Ok(life) => life,
         Err(error) => {

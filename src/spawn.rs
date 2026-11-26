@@ -22,6 +22,7 @@ pub mod declaration;
 pub mod drive_task;
 pub mod mcp;
 pub mod operations;
+pub mod wake_files;
 
 pub use colony::{
     colony_view, render_colony, ColonyOptions, ColonyRole, ColonyRoles, ColonyView, Evidence,
@@ -484,7 +485,9 @@ pub fn preamble(name: &str, spawner: &str, local: bool) -> String {
 
 /// What a resident zooid is told: who it is across lives, how a life ends,
 /// and how news reaches it (`fed`: between turns, from the feeder).
-pub fn resident_preamble(name: &str, spawner: &str, fed: bool) -> String {
+/// `wake_by_files`: its wake is not above but in files it reads
+/// ([`wake_files`]).
+pub fn resident_preamble(name: &str, spawner: &str, fed: bool, wake_by_files: bool) -> String {
     let news = if fed {
         "Colony news addressed to you (messages, and Discord lines in the channels that are \
          yours) arrives as a user turn between your turns, at least once: an item can now \
@@ -495,17 +498,26 @@ pub fn resident_preamble(name: &str, spawner: &str, fed: bool) -> String {
          `message_ack` what you have handled."
     };
     let news = news.replace("{name}", name);
+    let (next, wake) = if wake_by_files {
+        (
+            "a wake rendered for it",
+            "Your wake is the shared self: it is in the files named under # Wake below, and you \
+             read all of it before anything else.",
+        )
+    } else {
+        ("the wake above", "The wake above is the shared self.")
+    };
     format!(
         "You are {name}, a resident zooid of this colony, started by {spawner} with the brief \
          below. Your persona outlives this run: you are {name} before it and after it. Your \
          context is never summarised: a life ends before the window fills, and the next one \
-         wakes fresh into the wake above, once this one is archived. Write memories as you go: \
+         wakes fresh into {next}, once this one is archived. Write memories as you go: \
          once you are told the life is ending no tool runs any more, and only your closing \
          reply is left. It is recorded with the archived conversation, and {spawner} is \
          messaged when the life ends. {news} \
          Do not arm a colony watcher (no `orient wait`, no `orient_next`). Your name is your \
          persona: pass {name} wherever a write tool takes `from`, `persona`, `by` or `reader`. \
-         The brief is where you start, not a fence. The wake above is the shared self.\n"
+         The brief is where you start, not a fence. {wake}\n"
     )
 }
 
