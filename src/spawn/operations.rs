@@ -10433,4 +10433,117 @@ mod tests {
         );
         assert!(f.launcher.started.lock().unwrap().is_empty());
     }
+
+    /// A reply proves a life was not empty, whatever a search for its
+    /// transcript finds now: with claude's projects missing, or read and
+    /// holding no project, settlement records no zero archive and says so
+    /// as a failure, so a resident's next life waits instead of opening.
+    #[test]
+    fn a_claude_reply_whose_transcript_is_missing_is_not_archived_as_empty() {
+        let f = fixture();
+        for (brief, tree) in [
+            ("Claude replied, no projects.", false),
+            ("Claude replied, empty projects.", true),
+        ] {
+            if tree {
+                std::fs::create_dir_all(f.directory.path().join("claude-projects/-lane")).unwrap();
+            }
+            let launched = f.spawn.run(&f.request(brief)).unwrap();
+            let session = claude_session_in_script(&f, &launched).unwrap();
+            std::fs::write(
+                &launched.report,
+                format!(
+                    r#"{{"type":"result","subtype":"success","is_error":false,"result":"the reply\n","session_id":"{session}"}}"#
+                ),
+            )
+            .unwrap();
+            let _ = f.settle(&launched.name, &launched);
+            let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+            assert_eq!(run.report_text.as_deref(), Some("the reply\n"));
+            assert!(
+                run.archive_imported.is_empty(),
+                "{brief}: {:?} {:?}",
+                run.archive_imported,
+                run.archive_outcome
+            );
+            assert!(
+                run.settle_failure
+                    .iter()
+                    .any(|failure| failure.contains(&session) && failure.contains("missing")),
+                "{brief}: {:?}",
+                run.settle_failure
+            );
+            let told = f.told(&launched.name);
+            assert!(!told.contains("was archived ("), "{told}");
+            assert!(told.contains("missing"), "{told}");
+        }
+    }
+
+    /// Bytes an earlier settlement bound are a conversation that was there:
+    /// a replay that no longer finds the transcript refuses, and never adds
+    /// a zero beside the import it recorded.
+    #[test]
+    fn a_replay_never_records_a_bound_transcript_as_empty() {
+        let f = fixture();
+        let launched = f.spawn.run(&f.request("Claude, bound then gone.")).unwrap();
+        let session = claude_session_in_script(&f, &launched).unwrap();
+        // No reply: only the bound end says the life was not empty.
+        std::fs::write(&launched.report, "").unwrap();
+        claude_transcript(&f, &session, "a turn that was bound");
+        f.settle(&launched.name, &launched).unwrap();
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert!(run.report.is_empty());
+        let imported = run.archive_imported.clone();
+        assert!(
+            imported.first().is_some_and(|bytes| *bytes > 0),
+            "{:?}",
+            run.archive_outcome
+        );
+        std::fs::remove_file(
+            f.directory
+                .path()
+                .join(format!("claude-projects/-lane/{session}.jsonl")),
+        )
+        .unwrap();
+        let _ = f.settle(&launched.name, &launched);
+        let run = f.spawn.show(&launched.name).unwrap().runs[0].clone();
+        assert_eq!(run.archive_imported, imported, "{:?}", run.archive_outcome);
+        assert!(
+            run.settle_failure
+                .iter()
+                .any(|failure| failure.contains("missing")),
+            "{:?}",
+            run.settle_failure
+        );
+    }
+
+    /// A name is one zooid on both paths: a brief named automatically
+    /// refuses a name another brief was given, rather than becoming a
+    /// second zooid on it.
+    #[test]
+    fn an_automatic_name_another_brief_was_given_refuses() {
+        let f = fixture();
+        let brief = "Named automatically, the later brief.";
+        let (_, spawn, handle) = super::super::spawn_core(brief).unwrap();
+        let spawner = Relations::with_storage(f.storage.clone())
+            .person_state("agent-cc")
+            .unwrap()
+            .unwrap()
+            .person;
+        let automatic = f.spawn.naming(spawn, handle, spawner, None).unwrap().name;
+        let given = f
+            .spawn
+            .run(&named(&f, "Given the name first.", &automatic, false))
+            .unwrap();
+        // It has ended and settled: only the name stands in the way.
+        set_unit(&f, "inactive");
+        f.settle(&automatic, &given).unwrap();
+        assert!(f.persona(&automatic).unwrap().retired);
+        let error = f.spawn.run(&f.request(brief)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already the name of zooid"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
+    }
 }
