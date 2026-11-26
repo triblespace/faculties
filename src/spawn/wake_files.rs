@@ -68,6 +68,11 @@ fn part_end(rest: &str) -> usize {
     end
 }
 
+/// Whether `name` is a part's file name.
+pub fn is_part_name(name: &str) -> bool {
+    name.starts_with(PART_PREFIX) && name.ends_with(PART_SUFFIX)
+}
+
 /// One part as a file: where it is written, and its text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part<'a> {
@@ -233,8 +238,59 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, ["notes.txt", "part-1-of-1.md"]);
+        // The directory holds exactly the parts: anything else found there
+        // is removed, so a read of it is never taken for a read of the wake.
+        assert_eq!(names, ["part-1-of-1.md"]);
         assert!(write(dir.path(), &files(&dir.path().join("other"), "x")).is_err());
+    }
+
+    /// A link found in the directory is removed, never written through,
+    /// and a directory that is itself a link is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_wake_directory_is_never_written_through() {
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "keep me").unwrap();
+        let dir = root.path().join("n.wake");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("part-1-of-1.md")).unwrap();
+        std::os::unix::fs::symlink(root.path(), dir.join("elsewhere")).unwrap();
+        let parts = files(&dir, "the wake\n");
+        write(&dir, &parts).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep me");
+        let part = dir.join("part-1-of-1.md");
+        assert!(std::fs::symlink_metadata(&part)
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert_eq!(std::fs::read_to_string(&part).unwrap(), "the wake\n");
+        assert!(std::fs::symlink_metadata(dir.join("elsewhere")).is_err());
+        assert!(root.path().exists() && outside.exists());
+
+        let linked = root.path().join("linked.wake");
+        std::os::unix::fs::symlink(&dir, &linked).unwrap();
+        let error = write(&linked, &files(&linked, "x\n")).unwrap_err();
+        assert!(format!("{error:#}").contains("link"), "{error:#}");
+        assert_eq!(std::fs::read_to_string(&part).unwrap(), "the wake\n");
+    }
+
+    #[test]
+    fn a_part_name_is_one_of_the_parts_pattern_only() {
+        assert!(is_part_name("part-01-of-24.md"));
+        assert!(is_part_name("part-1-of-1.md"));
+        for name in [
+            "notes.txt",
+            "part-01-of-24.txt",
+            "part-25-of-24.md",
+            "part-00-of-24.md",
+            "part--of-24.md",
+            "part-01-of-.md",
+            "part-0x-of-24.md",
+            "xpart-01-of-24.md",
+        ] {
+            assert!(!is_part_name(name), "{name}");
+        }
     }
 
     #[test]

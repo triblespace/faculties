@@ -803,6 +803,11 @@ mod tests {
             ("read_file", "/work/CLAUDE.md"),
             ("read_file", "/s/n.wake/../n.prompt"),
             ("run_command", "/s/n.wake/part-01-of-20.md"),
+            // Inside the directory but not one of its parts.
+            ("read_file", "/s/n.wake/notes.txt"),
+            ("read_file", "/s/n.wake/sub/part-01-of-20.md"),
+            ("read_file", "/s/n.wake/part-21-of-20.md"),
+            ("read_file", "/s/n.wake"),
         ] {
             let mut mixed = all.clone();
             mixed.push(other);

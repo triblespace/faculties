@@ -10751,6 +10751,9 @@ mod tests {
         // The last part is named as the last.
         let last = parts.last().unwrap().file_name().unwrap().to_str().unwrap();
         assert!(first.contains(&format!("{last} is the last")), "{first}");
+        // The run records the exact first input it was given.
+        let run = &f.spawn.show("parts-test").unwrap().runs[0];
+        assert_eq!(run.prompt, [super::super::text_handle(&first)]);
         // The feeder's first event is that small input.
         let (_, texts) = feed_once(&f.spawn, "parts-test", launched.run, 1);
         assert_eq!(texts[0], first);
@@ -10825,6 +10828,77 @@ mod tests {
         assert!(texts[2].contains("News: three") && texts[2].contains("1 more"));
         assert!(texts[3].contains("News: huge") && texts[3].contains("cut"));
         assert!(!texts[3].contains("more item"));
+        // Messages wait as unread messages: the waiting line says that, and
+        // promises nothing about anything else.
+        assert!(
+            !texts[1].contains("they come in the next news turn"),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains("unread"),
+            "{}",
+            &texts[1][texts[1].len() - 400..]
+        );
+        // A cut message points at where its whole text is.
+        assert!(
+            texts[3].contains("message_list"),
+            "{}",
+            &texts[3][texts[3].len() - 400..]
+        );
+    }
+
+    /// What waits behind a full event is read again at the next poll, not
+    /// kept: an observation that is not a message (a goal's status) and is
+    /// replaced before then is never shown, and the event does not promise
+    /// it. A cut observation does not point at `message_list`, which does
+    /// not hold it.
+    #[test]
+    fn news_that_is_not_a_message_is_current_state_and_waits_unpromised() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, goals.", "state-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let later = crate::clock::now().unwrap() + hifitime::Duration::from_seconds(3600.0);
+        let observed = |id: u8, text: String| NewsItem {
+            id: byte_id(id),
+            text,
+            unread_message: false,
+            at: Some(later),
+        };
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![
+            vec![
+                item(
+                    byte_id(41),
+                    &format!("News: message {}", "m".repeat(100_000)),
+                    true,
+                ),
+                observed(42, format!("News: goal doing {}", "g".repeat(30_000))),
+            ],
+            // The message was delivered; the goal's status moved on.
+            vec![observed(
+                43,
+                format!("News: goal done {}", "h".repeat(200_000)),
+            )],
+        ];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let (_, texts) = feed_once(&spawn, "state-test", launched.run, 3);
+        assert_eq!(
+            texts.len(),
+            3,
+            "{:?}",
+            texts.iter().map(String::len).collect::<Vec<_>>()
+        );
+        assert!(texts[1].contains("News: message") && !texts[1].contains("goal doing"));
+        assert!(!texts.iter().any(|text| text.contains("News: goal doing")));
+        let tail = &texts[1][texts[1].len() - 600..];
+        assert!(!tail.contains("they come in the next news turn"), "{tail}");
+        assert!(tail.contains("replaced"), "{tail}");
+        assert!(texts[2].contains("News: goal done") && texts[2].contains("cut"));
+        let tail = &texts[2][texts[2].len() - 600..];
+        assert!(!tail.contains("message_list"), "{tail}");
+        assert!(tail.contains("orient_poll"), "{tail}");
     }
 
     /// A planner record whose tool calls are `calls`, agy's shape.
