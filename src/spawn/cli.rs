@@ -224,8 +224,9 @@ enum Command {
     },
     /// A fed resident's input, run by its unit script into the agent's
     /// stdin: the prompt as the first stream-json user event, then the
-    /// persona's news between turns, each item meant once (a hook showing
-    /// the same item at the same moment can show it twice), until the life is past
+    /// persona's news between turns, each item at least once (a failed
+    /// flush, or a hook showing the same item at the same moment, can show
+    /// it twice), until the life is past
     /// its limit (then the input closes) or the agent is gone. It
     /// acknowledges nothing and writes no Orient receipt.
     Feed {

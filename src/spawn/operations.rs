@@ -977,6 +977,23 @@ pub struct AgyResume {
 /// wrote: final, unlike a search that failed.
 const NO_CONVERSATION: &str = "It left no conversation in its home to archive.";
 
+/// What says an ended run's conversation was not empty, whatever a search
+/// for its transcript finds now: bytes a settlement bound or imported, or
+/// a reply.
+fn lived(view: &RunView) -> Option<String> {
+    let bound = view
+        .archive_end
+        .iter()
+        .chain(&view.archive_imported)
+        .copied()
+        .max()
+        .filter(|bytes| *bytes > 0);
+    match bound {
+        Some(bytes) => Some(format!("a settlement bound {bytes} bytes of it")),
+        None => (!view.report.is_empty()).then(|| "it replied".to_owned()),
+    }
+}
+
 /// Where an ended run's transcript is ([`Spawn::run_transcript`]).
 enum Located {
     /// The provider's transcript is not located at settlement.
@@ -1531,8 +1548,8 @@ fn ids_text(items: &[NewsItem]) -> String {
 /// One feeder event: the news items not delivered before.
 fn feed_text(name: &str, items: &[NewsItem]) -> String {
     let mut text = format!(
-        "News for {name}, between your turns. An item already shown is not shown again; a \
-         message stays unread until you `message_ack` it (from {name}).\n\n"
+        "News for {name}, between your turns. Each item comes at least once, and now and \
+         then twice; a message stays unread until you `message_ack` it (from {name}).\n\n"
     );
     for item in items {
         text.push_str(item.text.trim_end());
@@ -2307,7 +2324,45 @@ impl Spawn {
     /// launch would have to pick one. A `given` name (`--name`) names a zooid
     /// that has none yet, with no colony prefix; a zooid that has one keeps
     /// it, and a different given name refuses rather than rename it.
+    ///
+    /// A name is one zooid, on either path: a fresh name another brief's
+    /// zooid already holds refuses, a given one or the one this brief hashes
+    /// to, since a second zooid on the same persona would make its runs, its
+    /// rest and `zooid show` ambiguous.
     fn naming(
+        &self,
+        spawn: Id,
+        brief: TextHandle,
+        spawner: Id,
+        given: Option<&str>,
+    ) -> Result<Naming> {
+        let naming = self.choose_name(spawn, brief, spawner, given)?;
+        if !naming.fresh {
+            return Ok(naming);
+        }
+        let handle = super::text_handle(&naming.name);
+        let others: Vec<Id> = self.observe(|facts, _| {
+            Ok(find!(
+                other: Id,
+                pattern!(facts, [{ ?other @ metadata::tag: KIND_SPAWN, attrs::name: handle }])
+            )
+            .filter(|other| *other != spawn)
+            .collect())
+        })?;
+        if let Some(other) = others.first() {
+            bail!(
+                "{} is already the name of zooid {other:x}, from another brief: a name stays \
+                 one zooid. Run that zooid's own brief, or give this one another name with \
+                 --name",
+                naming.name
+            );
+        }
+        Ok(naming)
+    }
+
+    /// The name [`Self::naming`] would give `spawn`, before it checks that
+    /// no other zooid holds it.
+    fn choose_name(
         &self,
         spawn: Id,
         brief: TextHandle,
@@ -2339,24 +2394,6 @@ impl Spawn {
                  {given} refuses. Run it without --name, or give the changed name a changed brief"
             ),
             ([], Some(given)) => {
-                // A name is one zooid: a second on the same persona would
-                // make its runs, its rest and `zooid show` ambiguous.
-                let handle = super::text_handle(given);
-                let others: Vec<Id> = self.observe(|facts, _| {
-                    Ok(find!(
-                        other: Id,
-                        pattern!(facts, [{ ?other @ metadata::tag: KIND_SPAWN, attrs::name: handle }])
-                    )
-                    .filter(|other| *other != spawn)
-                    .collect())
-                })?;
-                if let Some(other) = others.first() {
-                    bail!(
-                        "{given} is already the name of zooid {other:x}, from another brief: a \
-                         name stays one zooid. Run that zooid's own brief, or give this one \
-                         another name"
-                    );
-                }
                 return Ok(Naming {
                     name: given.to_owned(),
                     origin: None,
@@ -3448,7 +3485,9 @@ impl Spawn {
 
     /// A claude session's transcript, searched in every project under
     /// claude's projects: `Ok(None)` only when each was read and none holds
-    /// it; a directory that could not be read is an error.
+    /// it, or there are no projects; a directory that could not be read is
+    /// an error. `Ok(None)` is what is there now, not that the session was
+    /// empty ([`lived`]).
     fn claude_session_search(&self, session: &str) -> Result<Option<PathBuf>> {
         if session.is_empty() || session.contains(['/', '.']) {
             bail!("{session:?} is not a session id");
@@ -3565,14 +3604,23 @@ impl Spawn {
     ) -> (String, Option<anyhow::Error>) {
         let outcome = match self.run_transcript(name, agent, view, newer) {
             Located::Outside => return (String::new(), None),
-            // Affirmatively nothing: the life is whole in the archive, at 0.
-            Located::Nothing(why) => match self.publish(
-                entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: 0u64 }.into(),
-            ) {
-                Ok(()) => Ok(why),
-                Err(error) => Err(format!(
-                    "{why} Recording that failed ({error:#}); settling again records it."
+            // A search that found no transcript says what is there now; a
+            // reply, or bytes a settlement bound, say the life was not empty.
+            Located::Nothing(why) => match lived(view) {
+                Some(evidence) => Err(format!(
+                    "{why} But {evidence}, so its transcript is missing, not empty: nothing \
+                     was recorded as archived, and settling again retries it."
                 )),
+                // Affirmatively nothing: the life is whole in the archive, at 0.
+                None => match self.publish(
+                    entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: 0u64 }
+                        .into(),
+                ) {
+                    Ok(()) => Ok(why),
+                    Err(error) => Err(format!(
+                        "{why} Recording that failed ({error:#}); settling again records it."
+                    )),
+                },
             },
             Located::Refused(why) => Err(why),
             Located::Found(found) => self.archive_part(view, newer, &found),
@@ -3840,10 +3888,10 @@ impl Spawn {
                     source: crate::archive::ImportSource::ClaudeCode,
                 }),
                 // Its session was chosen at launch, and no project under
-                // claude's projects holds it: claude wrote none.
+                // claude's projects holds it: claude wrote none, unless the
+                // run says otherwise ([`Self::archive_run`]).
                 Ok(None) => Located::Nothing(format!(
-                    "Its session {session} has no transcript under claude's projects, so there \
-                     was nothing to archive."
+                    "Its session {session} has no transcript under claude's projects."
                 )),
                 Err(error) => Located::Refused(format!(
                     "Looking for its session {session} under claude's projects failed \
@@ -7091,6 +7139,9 @@ mod tests {
         let f = fixture();
         let launched = f.spawn.run(&f.request("Message fails first.")).unwrap();
         std::fs::write(&launched.report, "Report.\n").unwrap();
+        // A run that replied has a transcript; only the message fails.
+        let session = claude_session_in_script(&f, &launched).unwrap();
+        claude_transcript(&f, &session, "the reply");
         // A sender that does not exist cannot message; that is the failure.
         let error = f.settle("nobody-here", &launched).unwrap_err();
         assert!(
