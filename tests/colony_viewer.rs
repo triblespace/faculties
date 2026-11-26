@@ -582,10 +582,12 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
     };
     let ctx = egui::Context::default();
     let nb_host = host.clone();
-    let mut notebook = GORBIE::NotebookConfig::new("Test dashboard")
+    // Exercise the normal Data composition, alongside the Rules card.
+    // Other tests below retain the dedicated Colony target coverage.
+    let mut notebook = GORBIE::NotebookConfig::new("Data")
         .without_editor()
         .embedded(&ctx, move |nb| {
-            compose_hosted(nb, Target::Colony, nb_host.clone())
+            compose_hosted(nb, Target::Dashboard, nb_host.clone())
         });
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
     let mut events = Vec::new();
