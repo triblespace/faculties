@@ -957,6 +957,10 @@ pub struct AgyResume {
     pub reason: String,
 }
 
+/// The archive outcome of an agy run whose home held no conversation it
+/// wrote: final, unlike a search that failed.
+const NO_CONVERSATION: &str = "It left no conversation in its home to archive.";
+
 /// Where an ended run's transcript is ([`Spawn::run_transcript`]).
 enum Located {
     /// The provider's transcript is not located at settlement.
@@ -2648,6 +2652,13 @@ impl Spawn {
     /// settlement can still message as the zooid.
     pub fn settle(&self, request: &SettleRequest) -> Result<Settled> {
         let run = request.run;
+        // The zooid's lock on this host, held for the whole settlement: two
+        // settlements of one run never act on each other's stale reads, and
+        // a launch in progress holds it until its run record is published,
+        // so a newer run is either seen here or waits. When it cannot be
+        // taken the end is still recorded, but nothing is retired and no
+        // archive boundary is bound.
+        let lock = self.zooid_lock(&request.name);
         let (already_ended, earlier_message, local, agent, resumed_at) =
             self.observe(|facts, reader| {
                 Ok((
@@ -2676,6 +2687,62 @@ impl Spawn {
             })?;
         let (agent, agent_model) = agent;
         let mut failures = Vec::new();
+        // Runs of the same zooid that started after this one; `None` when
+        // that is unknown. Then the persona is not retired, and an archive
+        // boundary not recorded yet is not recorded now.
+        let newer = match &lock {
+            Ok(_) => match self.newer_runs(run) {
+                Ok(newer) => Some(newer),
+                Err(error) => {
+                    failures.push(error.context("look for a newer run of the zooid"));
+                    None
+                }
+            },
+            Err(error) => {
+                failures.push(anyhow!("take {}'s lock: {error:#}", request.name));
+                None
+            }
+        };
+        // The report and usage files are the zooid's, not the run's: a newer
+        // run's launch replaced them. A first settlement that comes after
+        // one (a missed settlement recovered by hand) reads neither; its end
+        // is still recorded. While that is unknown it records nothing but
+        // why, so settling again settles it whole.
+        if newer.is_none() && !already_ended {
+            let why = format!(
+                "not settled: whether a newer run of {} replaced its report is unknown",
+                request.name
+            );
+            if let Err(error) = self.publish(super::run_annotation(run, None, Some(&why), None)) {
+                failures.push(error.context("record the settlement failure"));
+            }
+            let mut failures = failures.into_iter();
+            let first = failures.next().unwrap_or_else(|| anyhow!("{why}"));
+            return Err(failures.fold(first.context(why), |error, next| {
+                error.context(format!("also: {next:#}"))
+            }));
+        }
+        let files_are_others = match newer.as_deref() {
+            Some([later, ..]) => Some(format!(
+                "not reading {}'s report or usage: run {:x} of the same zooid started after \
+                 this one and its launch replaced those files",
+                request.name, later.id
+            )),
+            _ => None,
+        };
+        if let (false, Some(why)) = (already_ended, &files_are_others) {
+            if let Err(error) = self.publish(super::run_annotation(run, None, Some(why), None)) {
+                failures.push(error.context("record the settlement failure"));
+            }
+        }
+        let request = &SettleRequest {
+            report: request
+                .report
+                .clone()
+                .filter(|_| files_are_others.is_none()),
+            usage: request.usage.clone().filter(|_| files_are_others.is_none()),
+            ..request.clone()
+        };
         // A hosted run's report or a local run's closing message. Either is
         // optional: no file, or an empty one, records none, and how the run
         // ended is its exit alone.
@@ -2755,26 +2822,6 @@ impl Spawn {
                 failures.push(error.context("record the run's end"));
             }
         }
-        // The zooid's lock on this host, from reading its newer runs until
-        // the retire is decided: a launch in progress holds it until its run
-        // record is published, so it is either seen here or waits.
-        let lock = self.zooid_lock(&request.name);
-        // Runs of the same zooid that started after this one; `None` when
-        // that is unknown. Then the persona is not retired, and an archive
-        // boundary not recorded yet is not recorded now.
-        let newer = match &lock {
-            Ok(_) => match self.newer_runs(run) {
-                Ok(newer) => Some(newer),
-                Err(error) => {
-                    failures.push(error.context("look for a newer run of the zooid"));
-                    None
-                }
-            },
-            Err(error) => {
-                failures.push(anyhow!("take {}'s lock: {error:#}", request.name));
-                None
-            }
-        };
         // What the pile now says about the run is what the message reports,
         // so a repeated settlement describes the end that was recorded.
         let recorded = self.observe(|facts, reader| {
@@ -2812,7 +2859,10 @@ impl Spawn {
         // the end: a failure is its own line, never the run's result.
         let archived = match (agent.as_deref(), &recorded) {
             (Some(agent), Ok(Some(view))) => {
-                self.archive_run(&request.name, agent, view, newer.as_deref())
+                let (sentence, lost) =
+                    self.archive_run(&request.name, agent, view, newer.as_deref());
+                failures.extend(lost);
+                sentence
             }
             _ => String::new(),
         };
@@ -3066,9 +3116,9 @@ impl Spawn {
         agent: &str,
         view: &RunView,
         newer: Option<&[RunView]>,
-    ) -> String {
+    ) -> (String, Option<anyhow::Error>) {
         let outcome = match self.run_transcript(name, agent, view, newer) {
-            Located::Outside => return String::new(),
+            Located::Outside => return (String::new(), None),
             Located::Nothing(why) => Ok(why),
             Located::Refused(why) => Err(why),
             Located::Found(found) => self.archive_part(view, newer, &found),
@@ -3083,10 +3133,13 @@ impl Spawn {
         if failed {
             fragment += super::run_annotation(view.id, None, Some(&sentence), None);
         }
-        if let Err(error) = self.publish(fragment) {
+        // A lost outcome is the settlement's failure, so it is seen even
+        // when no message carries the sentence; the run's exit is untouched.
+        let lost = self.publish(fragment).err().map(|error| {
             sentence.push_str(&format!(" (Recording this on the run failed: {error:#}.)"));
-        }
-        format!(" {sentence}")
+            error.context(format!("record the archive outcome of {name}"))
+        });
+        (format!(" {sentence}"), lost)
     }
 
     /// Import the run's own part of its conversation's transcript.
@@ -3368,10 +3421,15 @@ impl Spawn {
             }
             Some([]) => {}
         }
-        if !view.archive_outcome.is_empty() {
+        // Only a search that found nothing is final; a failed one is retried.
+        if view
+            .archive_outcome
+            .iter()
+            .any(|outcome| outcome == NO_CONVERSATION)
+        {
             return Err(Located::Refused(
-                "It recorded no conversation, and its first archive attempt found none to \
-                 match, so none is chosen now."
+                "It recorded no conversation, and its first search of its home found none, so \
+                 none is chosen now."
                     .to_owned(),
             ));
         }
@@ -3392,11 +3450,7 @@ impl Spawn {
             ))
         })?;
         let conversation = match changed.as_slice() {
-            [] => {
-                return Err(Located::Nothing(
-                    "It left no conversation in its home to archive.".to_owned(),
-                ))
-            }
+            [] => return Err(Located::Nothing(NO_CONVERSATION.to_owned())),
             [one] => one.clone(),
             several => {
                 return Err(Located::Refused(format!(
@@ -7859,6 +7913,75 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_search_of_the_home_is_retried_and_a_found_nothing_is_not() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = fixture();
+        let mut request = f.request("Agy task whose home could not be read.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        agy_transcript(&home, "c-x", &[agy_line(0, 0), agy_line(1, 40_000)], "");
+        let brain = home.join(".gemini/antigravity-cli/brain");
+        std::fs::set_permissions(&brain, std::fs::Permissions::from_mode(0o000)).unwrap();
+        settle_as(&f, &a, killed()).unwrap();
+        std::fs::set_permissions(&brain, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = &f.spawn.show(&name).unwrap().runs[0];
+        assert!(run.source_locator.is_empty());
+        assert!(
+            run.archive_outcome[0].contains("Reading the conversations in"),
+            "{:?}",
+            run.archive_outcome
+        );
+        // Recovered, and still no newer run: the search runs again.
+        settle_as(&f, &a, killed()).unwrap();
+        let run = &f.spawn.show(&name).unwrap().runs[0];
+        assert_eq!(run.source_locator, ["session/c-x"]);
+        assert!(archive_thread(&f, "session/c-x").contains("reply at 40000"));
+    }
+
+    #[test]
+    fn a_late_first_settlement_never_takes_the_next_runs_report() {
+        let f = fixture();
+        let mut request = f.request("Agy task whose settlement was missed.");
+        request.provider = Provider::Agy;
+        let a = f.spawn.run(&request).unwrap();
+        let name = a.name.clone();
+        let home = agy_home_of(&f, &name);
+        // A's settlement never ran; its persona was retired by hand and B
+        // launched, then wrote its own result and conversation.
+        Relations::with_storage(f.spawn.storage.clone())
+            .retire(&name)
+            .unwrap();
+        let b = f.spawn.run(&request).unwrap();
+        assert_eq!(b.report, a.report, "the report file is the zooid's");
+        agy_ran(&home, &b.report, "c-b", &[60_000]);
+        settle_as(&f, &a, killed()).unwrap();
+        let first = f
+            .spawn
+            .show(&name)
+            .unwrap()
+            .runs
+            .into_iter()
+            .find(|run| run.id == a.run)
+            .unwrap();
+        assert!(first.report.is_empty(), "A recorded B's report");
+        assert!(
+            first.source_locator.is_empty(),
+            "{:?}",
+            first.source_locator
+        );
+        assert!(first.input_tokens.is_empty());
+        assert_eq!(first.signal, ["KILL"]);
+        assert!(first
+            .settle_failure
+            .iter()
+            .any(|why| why.contains("not reading") && why.contains(&format!("{:x}", b.run))));
+        assert!(!archived_text(&f, "session/c-b").contains("reply at 60000"));
+        assert!(!is_retired(&f, &name));
+    }
+
+    #[test]
     fn a_settlement_that_cannot_tell_whether_a_newer_run_started_does_not_retire() {
         let f = fixture();
         let mut request = f.request("Agy task whose run record is ambiguous.");
@@ -7881,22 +8004,19 @@ mod tests {
         assert!(!is_retired(&f, &a.name));
         let view = f.spawn.show(&a.name).unwrap();
         let run = view.runs.iter().find(|run| run.id == a.run).unwrap();
+        // Nothing but why: no end, no report, no boundary, no message.
         assert!(
             run.settle_failure
                 .iter()
-                .any(|why| why.contains("whether a newer run of the same zooid started is unknown")),
+                .any(|why| why.contains("not settled: whether a newer run")),
             "{:?}",
             run.settle_failure
         );
-        // Its part was not bound while that was unknown.
+        assert!(run.finished.is_empty());
+        assert!(run.report.is_empty());
         assert!(run.archive_end.is_empty());
-        assert!(
-            run.archive_outcome
-                .iter()
-                .any(|outcome| outcome.contains("was not bound")),
-            "{:?}",
-            run.archive_outcome
-        );
+        assert!(run.archive_outcome.is_empty());
+        assert!(run.message.is_empty());
     }
 
     #[test]
