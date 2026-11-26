@@ -437,6 +437,11 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
         mistral_model: "fake-mistral".to_owned(),
         mistral_key_secret: "00000000000000000000000000000000".to_owned(),
         mistral_max_price: 1.0,
+        agy: PathBuf::from("/fake/agy"),
+        agy_model: None,
+        agy_token: None,
+        agy_window: faculties::spawn::agy::DEFAULT_WINDOW,
+        real_home: base.to_path_buf(),
         secrets: "secrets".to_owned(),
         colony_env: Some(base.join("colony.env")),
         path: format!("/usr/bin:/bin:{}", base.join("bin").display()),
@@ -471,6 +476,7 @@ fn spawn_settles_an_adapter_refusal_as_a_failed_run_without_a_message() {
             spawner: "agent-parent".to_owned(),
             provider: Provider::Local,
             cover: Default::default(),
+            zooid: Default::default(),
         })
         .unwrap();
     let started = launcher.started.lock().unwrap()[0].clone();

@@ -4914,6 +4914,8 @@ pub struct AttentionItem {
     pub text: String,
     /// A message: in the set until the persona acknowledges it.
     pub message: bool,
+    /// When it happened, where Orient knows: a Discord line's creation.
+    pub at: Option<Epoch>,
 }
 
 async fn cmd_attention(
@@ -4973,6 +4975,7 @@ fn attention_items(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<Attention
                 id: event.id(),
                 text: news_report_entry(query, event, persona, &mut mail)?,
                 message: matches!(event, AttentionEvent::Message(_)),
+                at: None,
             })
         })
         .collect()
@@ -12490,6 +12493,10 @@ mod tests {
             assert_eq!(items.len(), 1, "{items:?}");
             assert!(items[0].text.contains("hi agy"), "{items:?}");
             assert!(!items[0].message);
+            // When it was written, so a consumer can tell a line after its
+            // start from its past.
+            let written: Epoch = "2026-11-26T02:00:00 UTC".parse().unwrap();
+            assert_eq!(items[0].at, Some(written));
             assert!(!items[0].text.contains("the bot itself"));
 
             // Presented to the reader, it is no news to a report again, and

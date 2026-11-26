@@ -1430,6 +1430,9 @@ pub struct NewsItem {
     /// it arrived. Anything else is news from the moment a consumer first
     /// looks; what was already there then is the life's past.
     pub unread_message: bool,
+    /// When it happened, when its source knows: one after the run started
+    /// is news even at the first look.
+    pub at: Option<Epoch>,
 }
 
 /// The news of one persona: what is news to it now, in order, none of it
@@ -1458,6 +1461,7 @@ impl NewsSource for OrientNews {
                 id: item.id,
                 text: item.text,
                 unread_message: item.message,
+                at: item.at,
             })
             .collect())
     }
@@ -9253,15 +9257,18 @@ mod tests {
             .unwrap_err();
         assert!(format!("{error:#}").contains("never renames"), "{error:#}");
         assert_eq!(f.launcher.started.lock().unwrap().len(), started);
-        // A changed brief may carry the same name: another zooid, the same
-        // persona.
-        let changed = f
+        // A changed brief may not take the name: it would be another zooid
+        // on the same persona, and its runs, rest and show would not be
+        // told apart from this one's.
+        let error = f
             .spawn
             .run(&named(&f, "Named task, changed.", "solo-test", false))
-            .unwrap();
-        assert_eq!(changed.name, "solo-test");
-        assert_ne!(changed.spawn, launched.spawn);
-        assert_eq!(changed.persona, launched.persona);
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already the name of zooid"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
         // Not a name.
         for bad in ["Bad", "bad name", "-x", "x-", "x.y", ""] {
             let error = f
@@ -9391,8 +9398,11 @@ mod tests {
         assert_eq!(run.life_occupancy, [400_000]);
         assert_eq!(run.life_limit, [130_000]);
         let told = f.told(&launched.name);
+        // What was measured, not why the run ended: that is its exit's.
         assert!(
-            told.contains("Its life ended at its limit: 400000 tokens"),
+            told.contains(
+                "At its end its context held 400000 tokens, past its life limit of 130000."
+            ),
             "{told}"
         );
 
@@ -9405,7 +9415,7 @@ mod tests {
         settle_as(&f, &short, Exit::from_systemd("exited", "0", "success")).unwrap();
         let run = &f.spawn.show(&short.name).unwrap().runs[0];
         assert!(run.life_occupancy.is_empty() && run.life_limit.is_empty());
-        assert!(!f.told(&short.name).contains("ended at its limit"));
+        assert!(!f.told(&short.name).contains("past its life limit"));
     }
 
     #[test]
@@ -9460,22 +9470,25 @@ mod tests {
             .lines()
             .find(|line| line.contains(" feed fed-test "))
             .unwrap_or_else(|| panic!("no feeder: {script}"));
+        // The agent is the unit's process, its input the feeder's: when
+        // the agent ends the unit ends, however quiet the feeder is.
         assert!(
-            line.starts_with(&format!(
-                "HOME={real} zooid feed fed-test --run {:x} 2>> ",
+            line.starts_with(
+                "exec /fake/agy --input-format stream-json --output-format stream-json "
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                " -p - < <(HOME={real} zooid feed fed-test --run {:x} 2>> ",
                 launched.run
             )),
             "{line}"
         );
         assert!(
-            line.contains("| /fake/agy --input-format stream-json --output-format stream-json "),
+            line.ends_with(&format!(") > {}", launched.report.display())),
             "{line}"
         );
-        assert!(
-            line.ends_with(&format!("-p - > {}", launched.report.display())),
-            "{line}"
-        );
-        assert!(!script.contains("exec /fake/agy"), "{script}");
         // An unfed one is as it was.
         let mut request = f.request("Plain agy.");
         request.provider = Provider::Agy;
@@ -9511,6 +9524,7 @@ mod tests {
             id,
             text: text.to_owned(),
             unread_message,
+            at: None,
         }
     }
 
@@ -9714,5 +9728,270 @@ mod tests {
                 "{persona}"
             );
         }
+    }
+
+    #[test]
+    fn a_residents_killed_life_whose_conversation_cannot_be_told_blocks_the_next() {
+        let f = fixture();
+        let mut request = named(&f, "Resident agy, killed.", "killed-test", true);
+        request.provider = Provider::Agy;
+        let first = f.spawn.run(&request).unwrap();
+        let home = agy_home_of(&f, "killed-test");
+        // Killed before its result, with two conversations changed during
+        // it: which one it lived cannot be told, so nothing is archived.
+        agy_transcript(&home, "c-a", &[agy_line(0, 0), agy_line(1, 60_000)], "");
+        agy_transcript(&home, "c-b", &[agy_line(0, 0), agy_line(1, 70_000)], "");
+        set_unit(&f, "inactive");
+        let _ = settle_as(&f, &first, killed());
+        let run = &f.spawn.show("killed-test").unwrap().runs[0];
+        assert!(run.source_locator.is_empty());
+        assert!(run.archive_imported.is_empty());
+        let started = f.launcher.started.lock().unwrap().len();
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not in the archive yet"),
+            "{error:#}"
+        );
+        assert_eq!(f.launcher.started.lock().unwrap().len(), started);
+
+        // Killed with nothing in its home: a life that is affirmatively
+        // empty, and the next one starts.
+        let f = fixture();
+        let mut request = named(&f, "Resident agy, empty.", "empty-test", true);
+        request.provider = Provider::Agy;
+        let first = f.spawn.run(&request).unwrap();
+        set_unit(&f, "inactive");
+        settle_as(&f, &first, killed()).unwrap();
+        let run = &f.spawn.show("empty-test").unwrap().runs[0];
+        assert_eq!(run.archive_imported, [0]);
+        f.spawn.run(&request).unwrap();
+    }
+
+    /// A writer that takes `whole` writes, then `partial` bytes of the
+    /// next, then refuses everything.
+    struct Breaking {
+        bytes: Vec<u8>,
+        whole: usize,
+        partial: usize,
+    }
+
+    impl std::io::Write for Breaking {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.whole > 0 {
+                self.whole -= 1;
+                self.bytes.extend_from_slice(buf);
+                return Ok(buf.len());
+            }
+            if self.partial > 0 {
+                let n = self.partial.min(buf.len());
+                self.partial = 0;
+                self.bytes.extend_from_slice(&buf[..n]);
+                return Ok(n);
+            }
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn feed_into(spawn: &Spawn, name: &str, run: Id, out: &mut dyn std::io::Write) -> FeedEnd {
+        spawn
+            .feed(
+                &FeedRequest {
+                    name: name.to_owned(),
+                    run,
+                    interval: Duration::from_millis(1),
+                    rounds: Some(1),
+                },
+                out,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn news_the_feeder_could_not_send_stays_undelivered() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, broken pipe.", "pipe-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![item(byte_id(5), "News: a message", true)]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        // The prompt goes, the news does not, not a byte of it.
+        let mut out = Breaking {
+            bytes: Vec::new(),
+            whole: 1,
+            partial: 0,
+        };
+        assert_eq!(
+            feed_into(&spawn, "pipe-test", launched.run, &mut out),
+            FeedEnd::AgentGone
+        );
+        assert_eq!(fed_texts(&out.bytes).len(), 1);
+        // So it is still undelivered: fed again, it goes.
+        let (_, texts) = feed_once(&spawn, "pipe-test", launched.run, 1);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("a message"));
+
+        // A delivery cut inside the event may have reached the agent: it
+        // counts as delivered and is not sent twice.
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![item(byte_id(6), "News: cut short", true)]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let mut out = Breaking {
+            bytes: Vec::new(),
+            whole: 1,
+            partial: 10,
+        };
+        assert_eq!(
+            feed_into(&spawn, "pipe-test", launched.run, &mut out),
+            FeedEnd::AgentGone
+        );
+        let (_, texts) = feed_once(&spawn, "pipe-test", launched.run, 1);
+        assert_eq!(texts.len(), 1, "{texts:?}");
+    }
+
+    #[test]
+    fn a_line_written_after_the_launch_is_news_at_the_first_read() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, timed.", "timed-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let now = crate::clock::now().unwrap();
+        let timed = |id: u8, text: &str, at: Epoch| NewsItem {
+            id: byte_id(id),
+            text: text.to_owned(),
+            unread_message: false,
+            at: Some(at),
+        };
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![vec![
+            timed(
+                7,
+                "News: yesterday's line",
+                now - hifitime::Duration::from_seconds(86_400.0),
+            ),
+            timed(
+                8,
+                "News: a line since the launch",
+                now + hifitime::Duration::from_seconds(1.0),
+            ),
+            item(byte_id(9), "News: a goal, no time", false),
+        ]];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let (_, texts) = feed_once(&spawn, "timed-test", launched.run, 1);
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(texts[1].contains("a line since the launch"), "{}", texts[1]);
+        assert!(!texts[1].contains("yesterday") && !texts[1].contains("a goal"));
+    }
+
+    #[test]
+    fn the_feeder_finds_its_run_once_the_launch_has_published_it() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, early.", "early-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        // A run the feeder is started for before its record is published.
+        let (fragment, run) = super::super::run_fragment(&RunFacts {
+            spawn: launched.spawn,
+            started_at: crate::clock::point_now().unwrap(),
+            persona: launched.persona,
+            spawner: launched.persona,
+            unit: launched.unit.clone(),
+            workdir: "/tmp".to_owned(),
+            effort: "high".to_owned(),
+            prompt: "p".to_owned(),
+            provider: "agy".to_owned(),
+            provider_reason: "test".to_owned(),
+            model: None,
+            model_unset: None,
+            untinted: None,
+            resumes: None,
+            cover: None,
+            resident: true,
+        });
+        let home = agy_home_of(&f, "early-test");
+        agy_transcript(&home, "c-past", &[agy_line(0, 0), agy_line(1, 450_000)], "");
+        // The record lands while the feeder already runs.
+        let publisher = f.spawn.clone();
+        let landing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            publisher.publish(fragment).unwrap();
+        });
+        let mut out = Vec::new();
+        let end = f
+            .spawn
+            .clone()
+            .with_news(Arc::new(ScriptedNews::default()))
+            .feed(
+                &FeedRequest {
+                    name: "early-test".to_owned(),
+                    run,
+                    interval: Duration::from_millis(20),
+                    rounds: Some(500),
+                },
+                &mut out,
+            )
+            .unwrap();
+        landing.join().unwrap();
+        let texts = fed_texts(&out);
+        assert_eq!(end, FeedEnd::LifeOver, "{texts:?}");
+    }
+
+    /// The unit script itself, run: an agent that answers its first input
+    /// and exits, fed by a feeder that never writes again. The script ends
+    /// with the agent, so the unit ends and settlement can run.
+    #[test]
+    fn a_fed_unit_ends_when_its_agent_does_however_quiet_the_news() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = fixture();
+        let bin = f.directory.path().join("bin");
+        let agent = bin.join("quick-agy");
+        std::fs::write(
+            &agent,
+            "#!/bin/bash\nread -r first\necho '{\"conversation_id\":\"c-e2e\",\"status\":\"SUCCESS\",\"response\":\"answered\",\"usage\":{}}'\n",
+        )
+        .unwrap();
+        let feeder = bin.join("quiet-zooid");
+        std::fs::write(
+            &feeder,
+            "#!/bin/bash\n[ \"$1\" = feed ] || exit 9\necho '{\"event\":\"user\",\"message\":{\"content\":\"the prompt\"}}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        for path in [&agent, &feeder] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let spawn = f.relaunch(|launch| {
+            launch.agy = agent.clone();
+            launch.spawn = feeder.display().to_string();
+        });
+        let mut request = named(&f, "Fed agy, quick.", "quick-test", true);
+        request.provider = Provider::Agy;
+        let launched = spawn.run(&request).unwrap();
+        let script = f.launcher.started.lock().unwrap()[0].script.clone();
+        let mut child = std::process::Command::new("/bin/bash")
+            .arg(&script)
+            .current_dir(f.directory.path().join("lane"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the unit script outlived its agent by 10 s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success(), "{status}");
+        let report = std::fs::read_to_string(&launched.report).unwrap();
+        assert!(report.contains("answered"), "{report}");
     }
 }
