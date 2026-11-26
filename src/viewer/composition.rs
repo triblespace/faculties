@@ -19,7 +19,7 @@ impl Target {
         match self {
             Self::Dashboard => &SourceKey::ALL,
             Self::Schemas => &[SourceKey::Schemas],
-            Self::Colony => &crate::widgets::colony::INPUTS,
+            Self::Colony => &crate::widgets::colony::SOURCES,
             Self::Discord => &[SourceKey::Discord],
             Self::Files => &[SourceKey::Files],
             Self::KnowledgeHealth => &[SourceKey::Knowledge],

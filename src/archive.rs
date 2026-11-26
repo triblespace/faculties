@@ -8,6 +8,7 @@ mod operations;
 pub mod sessions;
 #[cfg(feature = "widgets")]
 pub(crate) use operations::classifier_stopped;
+pub(crate) use operations::{conversation_nodes, order_nodes};
 pub use operations::{
     parse_tai_timestamp, Archive, ImportReceipt, ImportSource, ImportSummary, Publication, Reading,
 };

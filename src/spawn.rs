@@ -20,6 +20,7 @@ pub mod continuation;
 pub mod cover;
 pub mod declaration;
 pub mod drive_task;
+pub mod lived;
 pub mod mcp;
 pub mod operations;
 
