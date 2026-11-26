@@ -10597,4 +10597,199 @@ mod tests {
         );
         assert_eq!(f.launcher.started.lock().unwrap().len(), 1);
     }
+
+    /// A wake far larger than one user event of agy (26 Nov 2026: one cut at
+    /// 191,985 bytes): lines of every length, one longer than a whole part,
+    /// and characters of several bytes where a cut could fall inside one.
+    fn large_wake_renderer() -> (StubRenderer, String) {
+        let mut fixed = String::from("\n");
+        for line in 0..3_000 {
+            fixed.push_str(&format!("{line:05} memory é{}\n", "ü".repeat(line % 97)));
+        }
+        fixed.push_str(&"long-line-ö".repeat(5_000));
+        fixed.push('\n');
+        fixed.push_str("WAKE-END-MARKER\n");
+        let wake = format!("STUB-WAKE untinted{fixed}");
+        (
+            StubRenderer {
+                fixed,
+                ..Default::default()
+            },
+            wake,
+        )
+    }
+
+    /// A fed resident's first input is small (who it is, the brief, how to
+    /// read the wake), and the same whole wake is in files beside it, in
+    /// parts one file read each takes whole, joined byte for byte.
+    #[test]
+    fn a_fed_residents_wake_is_read_from_parts_and_its_first_input_is_small() {
+        let (renderer, wake) = large_wake_renderer();
+        assert!(wake.len() > 400_000, "{}", wake.len());
+        let f = fixture_full(
+            FakeLauncher::default(),
+            renderer,
+            "export TRIBLESPACE_PEERS=none\n",
+        );
+        let brief = "Live as agy, reading the wake from parts.";
+        let mut request = named(&f, brief, "parts-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let first = std::fs::read_to_string(launched.report.with_extension("prompt")).unwrap();
+        assert!(first.len() <= 128_000, "{}", first.len());
+        assert!(!first.contains("WAKE-END-MARKER") && !first.contains("00042 memory"));
+        assert!(
+            first.contains("You are parts-test") && first.contains(brief),
+            "{first}"
+        );
+        let dir = f.directory.path().join("state").join("parts-test.wake");
+        let mut parts: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        parts.sort();
+        assert!(parts.len() > 10, "{parts:?}");
+        let mut joined = String::new();
+        for (index, part) in parts.iter().enumerate() {
+            let text = std::fs::read_to_string(part).unwrap();
+            assert!(text.len() <= 40_000, "{} {}", part.display(), text.len());
+            assert!(text.lines().count() <= 700, "{}", part.display());
+            // Every part is named in the first input, in order.
+            assert!(
+                first.contains(&part.display().to_string()),
+                "{}",
+                part.display()
+            );
+            if index > 0 {
+                let before = parts[index - 1].display().to_string();
+                assert!(first.find(&before) < first.find(&part.display().to_string()));
+            }
+            joined.push_str(&text);
+        }
+        assert_eq!(joined, wake);
+        // The last part is named as the last.
+        let last = parts.last().unwrap().file_name().unwrap().to_str().unwrap();
+        assert!(first.contains(&format!("{last} is the last")), "{first}");
+        // The feeder's first event is that small input.
+        let (_, texts) = feed_once(&f.spawn, "parts-test", launched.run, 1);
+        assert_eq!(texts[0], first);
+    }
+
+    /// A first input that would not fit one event is refused before
+    /// anything starts, never cut.
+    #[test]
+    fn a_fed_resident_whose_first_input_is_over_one_event_is_not_started() {
+        let f = fixture();
+        let brief = format!("Live as agy. {}", "x".repeat(130_000));
+        let mut request = named(&f, &brief, "huge-test", true);
+        request.provider = Provider::Agy;
+        let error = f.spawn.run(&request).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nothing was started"),
+            "{error:#}"
+        );
+        assert!(f.launcher.started.lock().unwrap().is_empty());
+    }
+
+    /// A batch of news larger than one event is spread over the feeder's
+    /// reads, the waiting count said in words; one item larger than an
+    /// event is cut, and the cut is said.
+    #[test]
+    fn a_news_batch_stays_under_one_event_and_says_what_waits() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, much news.", "batch-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let items = vec![
+            item(
+                byte_id(31),
+                &format!("News: one {}", "a".repeat(60_000)),
+                true,
+            ),
+            item(
+                byte_id(32),
+                &format!("News: two {}", "b".repeat(60_000)),
+                true,
+            ),
+            item(
+                byte_id(33),
+                &format!("News: three {}", "c".repeat(60_000)),
+                true,
+            ),
+            item(
+                byte_id(34),
+                &format!("News: huge {}", "d".repeat(200_000)),
+                true,
+            ),
+        ];
+        let news = ScriptedNews::default();
+        *news.reads.lock().unwrap() = vec![items];
+        let spawn = f.spawn.clone().with_news(Arc::new(news));
+        let (_, texts) = feed_once(&spawn, "batch-test", launched.run, 4);
+        assert_eq!(
+            texts.len(),
+            4,
+            "{:?}",
+            texts.iter().map(String::len).collect::<Vec<_>>()
+        );
+        for text in &texts {
+            assert!(text.len() <= 128_000, "{}", text.len());
+        }
+        assert!(texts[1].contains("News: one") && texts[1].contains("News: two"));
+        assert!(
+            texts[1].contains("2 more"),
+            "{}",
+            &texts[1][texts[1].len() - 300..]
+        );
+        assert!(texts[2].contains("News: three") && texts[2].contains("1 more"));
+        assert!(texts[3].contains("News: huge") && texts[3].contains("cut"));
+        assert!(!texts[3].contains("more item"));
+    }
+
+    /// A planner record whose tool calls are `calls`, agy's shape.
+    fn agy_call(step: u64, occupancy: u64, calls: &[(&str, &str)]) -> String {
+        let tools: Vec<_> = calls
+            .iter()
+            .map(|(name, path)| serde_json::json!({ "name": name, "args": { "Path": path } }))
+            .collect();
+        serde_json::json!({
+            "step_index": step, "source": "MODEL", "type": "PLANNER_RESPONSE",
+            "status": "DONE", "input_tokens": 1000, "cache_read_tokens": occupancy - 1000,
+            "output_tokens": 10, "tool_calls": tools,
+        })
+        .to_string()
+    }
+
+    /// Reading the wake's parts in one step grows the context by the wake,
+    /// once: that step is not the margin the rest of the life keeps.
+    #[test]
+    fn reading_the_wake_parts_at_once_does_not_end_the_life() {
+        let f = fixture();
+        let mut request = named(&f, "Fed agy, reading.", "reading-test", true);
+        request.provider = Provider::Agy;
+        let launched = f.spawn.run(&request).unwrap();
+        let dir = f.directory.path().join("state").join("reading-test.wake");
+        let paths: Vec<String> = (1..=20)
+            .map(|part| {
+                dir.join(format!("part-{part:02}-of-20.md"))
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let reads: Vec<(&str, &str)> = paths.iter().map(|p| ("read_file", p.as_str())).collect();
+        let home = agy_home_of(&f, "reading-test");
+        agy_transcript(
+            &home,
+            "c-wake",
+            &[
+                agy_line(0, 0),
+                agy_call(1, 20_000, &reads),
+                agy_call(2, 320_000, &[]),
+                agy_call(3, 330_000, &[]),
+            ],
+            "",
+        );
+        let (end, _) = feed_once(&f.spawn, "reading-test", launched.run, 1);
+        assert_eq!(end, FeedEnd::Rounds);
+    }
 }
