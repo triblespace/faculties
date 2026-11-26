@@ -10,7 +10,7 @@ use crate::widgets::storage::LoadedDataset;
 use crate::widgets::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
 use anybytes::View;
 use egui::{RichText, Ui};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use triblespace::core::repo::BlobStoreGet;
@@ -79,9 +79,11 @@ struct LifePanel {
 /// prepared input.
 struct LifeShown {
     life: Life,
-    /// The run's own nodes, when its history is its own.
+    /// The nodes shown for its own or candidate history.
     own: Arc<Vec<Id>>,
-    stopped: BTreeSet<Id>,
+    /// Nodes a recorded classifier stop followed. Ephemeral UI cache of one
+    /// observation, dropped with the panel when the inputs change.
+    stopped: HashSet<Id>,
     agrees: Option<bool>,
 }
 
@@ -386,23 +388,28 @@ fn read_life(sources: &LifeSources, run: Id) -> Result<LifeShown, String> {
     .map_err(|error| format!("{error:#}"))?;
     let archive = archive.ok();
     let (stopped, agrees) = match (&archive, &life.history) {
-        (Some(view), History::Own { nodes, .. }) => {
-            let stopped = crate::archive::classifier_stopped(view.facts);
-            let first = lived::turns(
-                view.facts,
-                view.reader,
-                &nodes[..nodes.len().min(8)],
-                &stopped,
-            );
-            (stopped, lived::opening_agrees(&life.opening, &first))
+        (Some(view), History::Own { nodes, .. } | History::Candidate { nodes, .. }) => {
+            // Only handles are compared here: no body, and no prepared
+            // input, is read before someone opens it.
+            let agrees =
+                lived::opening_agrees(&life.opening, lived::first_received(view.facts, nodes));
+            (
+                crate::archive::classifier_stopped(view.facts)
+                    .into_iter()
+                    .collect(),
+                agrees,
+            )
         }
-        (Some(view), History::Shared { .. }) => {
-            (crate::archive::classifier_stopped(view.facts), None)
-        }
-        _ => (BTreeSet::new(), None),
+        (Some(view), History::Shared { .. }) => (
+            crate::archive::classifier_stopped(view.facts)
+                .into_iter()
+                .collect(),
+            None,
+        ),
+        _ => (HashSet::new(), None),
     };
     let own = Arc::new(match &life.history {
-        History::Own { nodes, .. } => nodes.clone(),
+        History::Own { nodes, .. } | History::Candidate { nodes, .. } => nodes.clone(),
         _ => Vec::new(),
     });
     Ok(LifeShown {
@@ -452,6 +459,11 @@ fn draw_life(ui: &mut Ui, run: Id, panel: &mut LifePanel, sources: &LifeSources)
     ui.label(RichText::new("Turns").strong());
     let nodes: Arc<Vec<Id>> = match &shown.life.history {
         History::Own { basis, .. } => {
+            ui.small(basis.as_str());
+            shown.own.clone()
+        }
+        History::Candidate { basis, .. } => {
+            ui.label("Candidate history: linked by matching facts, not by a recorded edge.");
             ui.small(basis.as_str());
             shown.own.clone()
         }
@@ -733,7 +745,9 @@ fn draw_turns(
             let page: Vec<Id> = nodes[first..last].to_vec();
             panel.turns.spawn(ui.ctx(), move || {
                 let turns = match sources.archive.as_ref().map(|dataset| dataset.view()) {
-                    Ok(Ok(view)) => lived::turns(view.facts, view.reader, &page, &shown.stopped),
+                    Ok(Ok(view)) => lived::turns(view.facts, view.reader, &page, |node| {
+                        shown.stopped.contains(&node)
+                    }),
                     _ => Vec::new(),
                 };
                 Some((key, Arc::new(turns)))

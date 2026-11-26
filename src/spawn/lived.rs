@@ -58,6 +58,11 @@ pub enum History {
     /// The run's own archived nodes, roots first, and the recorded relation
     /// that makes them its own.
     Own { nodes: Vec<Id>, basis: String },
+    /// Nodes a run is linked to only by matching recorded facts (a Drive
+    /// context of its zooid's name continuing the node it resumed from), with
+    /// no recorded edge from the run itself: a candidate, never shown as the
+    /// run's own.
+    Candidate { nodes: Vec<Id>, basis: String },
     /// A conversation several lives share, with no recorded per-run node
     /// boundary. `runs` are the runs that name it, this one included.
     Shared {
@@ -119,8 +124,6 @@ pub struct Turn {
     pub answered_by: Vec<Id>,
     /// A recorded classifier stop followed it: its content is not read.
     pub withheld: bool,
-    /// Its first `in` text, by handle, for comparing with the opening.
-    pub first_input: Option<TextHandle>,
 }
 
 fn read_text<R: BlobStoreGet + ?Sized>(reader: &R, handle: TextHandle) -> Option<String> {
@@ -381,13 +384,13 @@ fn drive_history(
                     "Its Drive context {ctx:x} holds no observed node."
                 )));
             }
-            Ok(History::Own {
+            Ok(History::Candidate {
                 nodes: crate::archive::order_nodes(archive, &nodes)?,
                 basis: format!(
                     "The nodes observed in Drive context {ctx:x}: the one context of this \
                      zooid's name continuing {resumed}, the node this run (and no other run \
-                     here) resumed from. A candidate link by those recorded facts, not a \
-                     recorded identity of the run's context."
+                     here) resumed from. Nothing records the run's own context, so this is \
+                     a candidate by matching facts, not its proved history."
                 ),
             })
         }
@@ -431,14 +434,14 @@ fn label(specs: &[(Id, &str)], id: Id) -> String {
 }
 
 /// The nodes `nodes`, read for display: their parts with exact text, the
-/// roles their records claim, the calls they answer. `stopped` are the
+/// roles their records claim, the calls they answer. `stopped` says which
 /// nodes a recorded classifier stop followed
-/// (`crate::archive::classifier_stopped`), whose content is not read.
+/// (`crate::archive::classifier_stopped`); their content is not read.
 pub fn turns<R: BlobStoreGet + ?Sized>(
     facts: &FactArchive,
     reader: &R,
     nodes: &[Id],
-    stopped: &BTreeSet<Id>,
+    stopped: impl Fn(Id) -> bool,
 ) -> Vec<Turn> {
     use archive_schema::content_fact::direction::{IN, OUT};
     nodes
@@ -489,8 +492,7 @@ pub fn turns<R: BlobStoreGet + ?Sized>(
                 [d] if **d == OUT => Direction::Produced,
                 _ => Direction::Unknown,
             };
-            let withheld = stopped.contains(&node);
-            let mut first_input = None;
+            let withheld = stopped(node);
             let mut parts = Vec::new();
             for (fact, modality, direction) in held {
                 let kind = label(v3_fact::modality::SPECS, modality);
@@ -502,9 +504,6 @@ pub fn turns<R: BlobStoreGet + ?Sized>(
                     pattern!(facts, [{ fact @ archive_schema::content_fact::payload: ?text }])
                 )
                 .collect();
-                if direction == IN && first_input.is_none() {
-                    first_input = texts.first().copied();
-                }
                 for text in &texts {
                     parts.push(Part {
                         kind: kind.clone(),
@@ -545,22 +544,39 @@ pub fn turns<R: BlobStoreGet + ?Sized>(
                 answers,
                 answered_by,
                 withheld,
-                first_input,
             }
         })
         .collect()
 }
 
+/// The first `in` text of `nodes`, by handle: what the provider recorded as
+/// the conversation's first received text. No blob is read.
+pub fn first_received(facts: &FactArchive, nodes: &[Id]) -> Option<TextHandle> {
+    use archive_schema::content_fact::direction::IN;
+    nodes.iter().find_map(|&node| {
+        find!(
+            (fact: Id, text: TextHandle),
+            pattern!(facts, [
+                { node @ archive_schema::block::holds: ?fact },
+                { ?fact @ archive_schema::content_fact::direction: IN,
+                  archive_schema::content_fact::payload: ?text },
+            ])
+        )
+        .min_by_key(|(fact, _)| *fact)
+        .map(|(_, text)| text)
+    })
+}
+
 /// Whether the archived conversation opens with exactly the prepared input:
-/// `Some(true)` when its first recorded input is the same text (the same
+/// `Some(true)` when its first received text is the same text (the same
 /// handle), `Some(false)` when it is a different text, `None` when either is
-/// unknown. Equal handles are equal texts; nothing is compared by content.
-pub fn opening_agrees(opening: &[TextHandle], first: &[Turn]) -> Option<bool> {
+/// unknown. Equal handles are equal texts; nothing is read or compared by
+/// content.
+pub fn opening_agrees(opening: &[TextHandle], received: Option<TextHandle>) -> Option<bool> {
     let [prepared] = opening else {
         return None;
     };
-    let received = first.iter().find_map(|turn| turn.first_input)?;
-    Some(received == *prepared)
+    Some(received? == *prepared)
 }
 
 #[cfg(test)]

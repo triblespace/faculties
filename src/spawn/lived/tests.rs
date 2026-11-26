@@ -161,7 +161,7 @@ impl Fixture {
     fn turns(&mut self, nodes: &[Id]) -> Vec<Turn> {
         let facts = archive(&self.archive);
         let reader = self.blobs.reader().unwrap();
-        super::turns(&facts, &reader, nodes, &BTreeSet::new())
+        super::turns(&facts, &reader, nodes, |_| false)
     }
 }
 
@@ -232,7 +232,11 @@ fn a_claude_run_reads_its_own_session_in_causal_order_with_calls_and_results_lin
         .iter()
         .any(|turn| turn.roles.contains(&"assistant".to_owned())));
     // The archived first input is exactly the prepared text.
-    assert_eq!(opening_agrees(&life.opening, &turns), Some(true));
+    let facts = archive(&fixture.archive);
+    assert_eq!(
+        opening_agrees(&life.opening, first_received(&facts, nodes)),
+        Some(true)
+    );
 }
 
 #[test]
@@ -261,7 +265,11 @@ fn a_huge_prepared_opening_is_kept_whole_and_a_cut_received_input_stays_beside_i
         panic!("{:?}", life.history)
     };
     let turns = fixture.turns(nodes);
-    assert_eq!(opening_agrees(&life.opening, &turns), Some(false));
+    let facts = archive(&fixture.archive);
+    assert_eq!(
+        opening_agrees(&life.opening, first_received(&facts, nodes)),
+        Some(false)
+    );
     assert_eq!(
         turns[0].parts[0].body,
         Body::Text(received),
@@ -413,11 +421,15 @@ fn a_resumed_local_run_lives_exactly_the_context_that_continues_its_node() {
         nodes.push(node);
     }
     let life = fixture.life(run, true);
-    let History::Own { nodes: own, basis } = &life.history else {
+    let History::Candidate {
+        nodes: candidate,
+        basis,
+    } = &life.history
+    else {
         panic!("{:?}", life.history)
     };
-    assert_eq!(own, &[nodes[0]]);
-    assert!(basis.contains("Drive context"), "{basis}");
+    assert_eq!(candidate, &[nodes[0]]);
+    assert!(basis.contains("not its proved history"), "{basis}");
 }
 
 #[test]

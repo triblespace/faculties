@@ -24,7 +24,7 @@ use GORBIE::prelude::CardCtx;
 
 /// A prepared opening input larger than a page, Agy's 933,083 bytes.
 fn huge_prompt() -> String {
-    let mut prompt = "wake text ".repeat(93_300);
+    let mut prompt = "wake text ".repeat(93_305);
     prompt.push_str("# Brief\nCheck the second synthetic track.");
     assert!(prompt.len() >= 933_083);
     prompt
