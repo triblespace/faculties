@@ -654,8 +654,11 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         ]
     };
 
-    let texts = wait(&mut frame, &mut events, &fixture.child);
+    // Other Dashboard cards can show the child before Colony's async result.
+    // Wait for the actual Colony control that the next interaction needs.
+    let texts = wait(&mut frame, &mut events, "What it lived");
     let overview = joined(&texts);
+    assert!(overview.contains(&fixture.child));
     for absent in [
         "Listening to fixture",
         "wake text wake",
