@@ -14,9 +14,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-/// The most a provider is given in one user event, in bytes. agy was seen
-/// cutting one at 191,985 bytes (26 Nov 2026, twice): an observation, not a
-/// proved limit, so this keeps a third below it.
+/// The most a provider is given in one user event, in bytes of its text.
+/// agy was seen cutting one at 191,985 bytes (26 Nov 2026, twice): an
+/// observation, not a proved limit, so this keeps a third below it. It
+/// bounds the text, not the stream-json frame that carries it, which is
+/// larger by the text's escaped quotes, backslashes and control characters;
+/// which of the two agy cuts was not established.
 pub const EVENT_BYTES: usize = 128_000;
 
 /// The largest wake part, in bytes: agy's file read takes at most 46,080

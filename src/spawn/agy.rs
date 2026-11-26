@@ -158,7 +158,9 @@ pub fn calls<L: AsRef<str>>(lines: impl IntoIterator<Item = L>) -> Vec<Call> {
 /// `wake` ([`super::wake_files`]) marked as such: a call with tool calls,
 /// every one agy's `read_file` of a file directly in `wake` named as a part
 /// ([`super::wake_files::is_part_name`]). The launch leaves nothing else
-/// there; any other read counts.
+/// there; any other read counts. The mark is from the calls asked for, not
+/// from what the growth after them was: the whole growth to the next call is
+/// taken as the wake's (the occupancy itself is still counted in full).
 pub fn calls_reading<L: AsRef<str>>(
     lines: impl IntoIterator<Item = L>,
     wake: Option<&Path>,
