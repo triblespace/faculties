@@ -6,8 +6,8 @@ use crate::storage::Storage;
 use crate::widgets::{
     BranchTimeline, ColonyViewer, DecisionsPanel, DiagnosticsViewer, DiscordViewer, EventsViewer,
     FilesViewer, GameWrite, GoalsBoard, KnowledgeHealthViewer, KnowledgeViewer, MailViewer,
-    MemoryViewer, MessagesPanel, PriorityGame, ProfilesViewer, RelationsViewer, SchemasViewer,
-    SourceKey, StorageState, TeamsViewer, TimelineSource, WidgetContext,
+    MemoryViewer, MessagesPanel, PriorityGame, ProfilesViewer, RelationsViewer, RulesViewer,
+    SchemasViewer, SourceKey, StorageState, TeamsViewer, TimelineSource, WidgetContext,
 };
 use std::sync::Arc;
 use triblespace::prelude::Id;
@@ -29,6 +29,7 @@ impl Target {
             Self::Events => &[SourceKey::Events],
             Self::Teams => &[SourceKey::Teams],
             Self::Diagnostics => &[SourceKey::Diagnostics],
+            Self::Rules => &crate::widgets::rules::INPUTS,
         }
     }
 }
@@ -238,6 +239,18 @@ pub fn compose_hosted(nb: &mut NotebookCtx, target: Target, host: impl Host) {
             host.clone(),
             "colony",
             ColonyViewer::default,
+            |ctx, panel, sources, _| {
+                panel.render(ctx, sources);
+            },
+        );
+    }
+
+    if target == Target::Dashboard || target == Target::Rules {
+        card(
+            nb,
+            host.clone(),
+            "rules",
+            RulesViewer::default,
             |ctx, panel, sources, _| {
                 panel.render(ctx, sources);
             },

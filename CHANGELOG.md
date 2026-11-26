@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- The viewer has an Avalanche rules card (`rules` target, and on the
+  Dashboard, so in Erlkönig's Data view): the selected workspace's Rules
+  collection as a browsable list of rule revisions, which readings select them,
+  and for an opened rule its clauses, triblespace's exact text projection,
+  stored entities with its conclusion shape and the inputs they name, and a
+  static rule web (maximal consistent overlaps of one rule's outputs with
+  another's matches, remaining conditions, feedback cycles). It is read-only
+  and claims nothing the pile does not hold: no firing history, evaluator
+  status or cause. A cycle without identity construction is reported as
+  settling on finite input; any other cycle is left undecided. `SourceKey::Rules`
+  reads the Rules route like every other source, with no fallback.
+
 - `install-release-cohort` keeps the current and the previous generation and
   removes the others after an activation: not those staged later, held by a
   running process or a loaded unit, or marked with a `.keep` file, and each
