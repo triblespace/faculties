@@ -68,8 +68,6 @@ pub struct AgyResult {
 pub fn agy_result(bytes: &[u8]) -> Option<AgyResult> {
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(value) => one_result(value),
-        // RED: a stream's last result event is not read yet.
-        Err(_) if true => None,
         Err(_) => bytes
             .split(|&byte| byte == b'\n')
             .rev()
@@ -210,6 +208,15 @@ pub fn life_over_reason(life: &Life) -> String {
          stands. The next run of this zooid wakes fresh into the cover.",
         life.occupancy, life.window, life.growth
     )
+}
+
+/// The feeder's last input to a life past its limit: what the hooks say to
+/// a turn, for a life that crossed the limit between turns.
+pub fn life_over_input() -> String {
+    "This life has reached its limit, before the window fills (it is never summarised). No \
+     more tool calls will run. Give your closing reply now: what you did, what is left, and \
+     what your next life should know. The next life wakes fresh into the wake."
+        .to_owned()
 }
 
 /// The zooid's own MCP server, as agy's `mcp_config.json`: its unit script

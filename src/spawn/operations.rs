@@ -2372,9 +2372,6 @@ impl Spawn {
         cover_wish: CoverWish,
         zooid: &ZooidWish,
     ) -> Result<Launched> {
-        // RED: the wish is not wired into the launch yet.
-        let _ = zooid;
-        let zooid = &ZooidWish::default();
         if !super::EFFORTS.contains(&effort) {
             bail!(
                 "effort {:?} is not one of {}",
@@ -3088,7 +3085,7 @@ impl Spawn {
                                 &super::agy::calls(text.lines()),
                                 self.launch.agy_window,
                             );
-                            if life.over && false {
+                            if life.over {
                                 let observed = entity! { ExclusiveId::force_ref(&run) @
                                     attrs::life_occupancy: life.occupancy,
                                     attrs::life_limit: life.limit,
@@ -3221,7 +3218,7 @@ impl Spawn {
         }
         // A resident's persona outlives each run; one whose run cannot be
         // read back is not retired either, as it might be a resident's.
-        let resident = false && !matches!(&recorded, Ok(Some(view)) if !view.resident);
+        let resident = !matches!(&recorded, Ok(Some(view)) if !view.resident);
         // A replayed settlement (to retry its archive import, say) must not
         // retire a persona that a newer run of the same zooid revived; one
         // that cannot tell does not retire it either.
@@ -3553,10 +3550,6 @@ impl Spawn {
         // What the archive holds is recorded only once it holds it: a fresh
         // life of a resident waits for this.
         let imported_fact = |end: u64| {
-            // RED: nothing records what the import accepted yet.
-            if true {
-                return Ok::<(), String>(());
-            }
             self.publish(
                 entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: end }.into(),
             )
@@ -3918,9 +3911,6 @@ impl Spawn {
     /// ends after its last reply. A failed write means the agent is gone.
     /// A failed read is logged and tried again at the next one.
     pub fn feed(&self, request: &FeedRequest, out: &mut dyn std::io::Write) -> Result<FeedEnd> {
-        if true {
-            bail!("RED: zooid feed is not built yet");
-        }
         let prompt_path = self.launch.file(&request.name, "prompt");
         let prompt = std::fs::read_to_string(&prompt_path)
             .with_context(|| format!("read {}", prompt_path.display()))?;
@@ -3949,6 +3939,10 @@ impl Spawn {
         let mut round = 0u64;
         loop {
             if self.life_over(&home, request.run, started) {
+                // The hooks tell a turn that is under way; a life that
+                // crossed its limit as a turn ended hears it here, once,
+                // before its input closes.
+                let _ = write(out, &super::agy::life_over_input());
                 return Ok(FeedEnd::LifeOver);
             }
             match self.news.news(&self.storage, &request.name) {
@@ -9646,7 +9640,9 @@ mod tests {
         agy_transcript(&home, "c-now", &[agy_line(0, 0), agy_line(1, 450_000)], "");
         let (end, texts) = feed_once(&spawn, "life-test", launched.run, 5);
         assert_eq!(end, FeedEnd::LifeOver);
-        assert_eq!(texts.len(), 1, "only the prompt: {texts:?}");
+        // The prompt, then the life's end, and no news.
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert_eq!(texts[1], super::super::agy::life_over_input());
 
         // The agent is gone: the first write fails.
         struct Closed;

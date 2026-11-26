@@ -4950,10 +4950,6 @@ async fn cmd_attention(
 /// The attention set in the order a report gives it: Discord last, in the
 /// order it happened, everything else by id.
 fn attention_items(query: &OrientQuery<'_>, persona: Id) -> Result<Vec<AttentionItem>> {
-    if true {
-        // RED: the attention set is not read yet.
-        return Ok(Vec::new());
-    }
     let candidates = load_attention_view(query, persona)?;
     let discord = discord_in_order(
         query,
