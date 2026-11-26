@@ -132,6 +132,7 @@ impl Fixture {
                 untinted: None,
                 resumes: None,
                 cover: None,
+                resident: false,
             });
             workers += start;
             if index == 1 {
@@ -374,6 +375,7 @@ fn routed_colony_reads_on_open_and_replaces_stale_results() {
         untinted: None,
         resumes: None,
         cover: None,
+        resident: false,
     })
     .0;
     // A request of the removed host queue that nothing ever answered, as it
