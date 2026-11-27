@@ -299,12 +299,18 @@ pub mod spawn {
         /// archives: everything through its last complete line when the
         /// run's archive step first read it. Recorded once, before the
         /// import, so a replayed settlement imports the same part and never
-        /// what a later run appended. Minted with `trible genid` on
-        /// 2026-11-26, like every attribute below.
+        /// what a later run appended. For Vibe, the total bytes in the
+        /// documents read to project its journal, including held-back bytes.
+        /// Minted with `trible genid` on 2026-11-26, like every attribute
+        /// below unless otherwise marked.
         "992DF5A64837FE283F028149B0CA299F" as archive_end: inlineencodings::U256BE;
-        /// The BLAKE3 digest of those [`archive_end`] bytes. A replay
-        /// imports them only while the file still begins with exactly them.
+        /// The BLAKE3 digest of those [`archive_end`] bytes. For Vibe, a
+        /// digest of the named source documents read by the projection.
         "1254841E93B28DF8896F02FEF07B79A9" as archive_digest: inlineencodings::Hash<inlineencodings::Blake3>;
+        /// Absolute path of the fresh Vibe home admitted for this run.
+        /// Its native journal and headless output are both below it.
+        /// Minted with `trible genid` on 2026-11-27.
+        "6F5C4180A4B793B75CA88F732D66FCC6" as vibe_home: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Bytes after the transcript's last complete line when the end was
         /// recorded: an unfinished last line (a killed run's), not archived.
         /// Absent when the transcript ended with a complete line.

@@ -7,7 +7,7 @@ use super::*;
 use crate::schemas::blockdag::{block, content_fact, source_projection};
 
 pub(crate) const SESSION: &str = "bbbbbbbb-bbbb-4bbb-8bbb-000000000001";
-const PREDECESSOR: &str = "bbbbbbbb-bbbb-4bbb-8bbb-000000000002";
+pub(crate) const PREDECESSOR: &str = "bbbbbbbb-bbbb-4bbb-8bbb-000000000002";
 
 fn write_json(path: &Path, json: &Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(json).unwrap();
@@ -193,7 +193,11 @@ fn answer() -> Record {
 }
 
 pub(crate) fn finished_native(root: &Path) {
-    write_current(root, SESSION, 4);
+    finished_native_for(root, SESSION);
+}
+
+pub(crate) fn finished_native_for(root: &Path, session: &str) {
+    write_current(root, session, 4);
     segment(
         root,
         1,

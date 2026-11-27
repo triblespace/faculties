@@ -724,11 +724,9 @@ pub fn vibe_config(script: &Path, model: &str, thinking: &str) -> String {
     )
 }
 
-/// Make `home` a vibe home for one run: created if missing, whatever an
-/// earlier run left there kept (its logs, its trusted folders), and
-/// `config.toml` written fresh, so nothing from an ambient `~/.vibe` applies.
+/// Reserve an empty Vibe home exclusively for one run.
 fn vibe_home_for_run(home: &Path, config: &str) -> Result<()> {
-    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
+    std::fs::create_dir(home).with_context(|| format!("reserve {}", home.display()))?;
     let settings = home.join("config.toml");
     std::fs::write(&settings, config).with_context(|| format!("write {}", settings.display()))
 }
@@ -1009,6 +1007,8 @@ enum Located {
     /// A transcript that should be found was not: why.
     Refused(String),
     Found(RunTranscript),
+    /// A journal of named documents, bound and imported as a unit.
+    Vibe,
 }
 
 /// A run's conversation, its transcript file, and the importer that reads it.
@@ -1179,6 +1179,8 @@ pub struct RunView {
     /// The conversation the provider recorded, as the archive locates it
     /// (`session/<id>`); `archive thread` reads it once imported.
     pub source_locator: Vec<String>,
+    /// The launch's exclusive Vibe home, if it recorded one.
+    pub vibe_home: Vec<String>,
     /// The part of the conversation's transcript that settlement archives
     /// for this run: its byte length, digest, and the unfinished tail it
     /// withheld ([`attrs::archive_end`]).
@@ -2626,11 +2628,6 @@ impl Spawn {
         super::require_unit_safe("settings", &settings.display().to_string())?;
         let codex_home = launch.file(&name, "codex");
         super::require_unit_safe("codex home", &codex_home.display().to_string())?;
-        let vibe_home = launch.file(&name, "vibe");
-        let vibe_out = launch.file(&name, "vibe-out");
-        super::require_unit_safe("vibe home", &vibe_home.display().to_string())?;
-        super::require_unit_safe("vibe output", &vibe_out.display().to_string())?;
-        let usage_path = (provider == Provider::Mistral).then(|| vibe_out.join("export.json"));
         let agy_home = launch.file(&name, "agy");
         super::require_unit_safe("agy home", &agy_home.display().to_string())?;
         if provider == Provider::Agy {
@@ -2908,6 +2905,18 @@ impl Spawn {
             });
             let claude_session = (provider == Provider::Claude).then(|| claude_session_for(run));
             let text = |path: &Path| path.display().to_string();
+            let vibe_home = if provider == Provider::Mistral {
+                std::fs::create_dir_all(&launch.state_dir)?;
+                let state = std::fs::canonicalize(&launch.state_dir)?;
+                let home = state.join(format!("{name}.{run:x}.vibe"));
+                let path = home.to_str().context("Vibe home is not UTF-8")?;
+                super::require_unit_safe("vibe home", path)?;
+                home
+            } else {
+                PathBuf::new()
+            };
+            let vibe_out = vibe_home.join("output");
+            let usage_path = (provider == Provider::Mistral).then(|| vibe_out.join("export.json"));
             let mut agent = self.agent(
                 provider,
                 effort,
@@ -2988,22 +2997,10 @@ impl Spawn {
                     launch.codex_auth.as_deref(),
                     &codex_mcp_config(&script_path),
                 )?,
-                Provider::Mistral => {
-                    vibe_home_for_run(
-                        &vibe_home,
-                        &vibe_config(&script_path, &launch.mistral_model, vibe_thinking(effort)),
-                    )?;
-                    // An earlier run's export must never be read as this
-                    // run's usage.
-                    if let Some(path) = &usage_path {
-                        match std::fs::remove_file(path) {
-                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                                return Err(error).context("remove the previous vibe export");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                Provider::Mistral => vibe_home_for_run(
+                    &vibe_home,
+                    &vibe_config(&script_path, &launch.mistral_model, vibe_thinking(effort)),
+                )?,
                 Provider::Claude => {
                     std::fs::write(&mcp_config, claude_mcp_config(&script_path))
                         .with_context(|| format!("write {}", mcp_config.display()))?;
@@ -3053,6 +3050,10 @@ impl Spawn {
             started = true;
             let mut record = spawn_fragment;
             record += run_fragment;
+            if provider == Provider::Mistral {
+                let home = record.put::<blobencodings::UTF8String, _>(text(&vibe_home));
+                record += entity! { ExclusiveId::force_ref(&run) @ attrs::vibe_home: home };
+            }
             if let (Some(conversation), Some(start)) = (&agy_resume.conversation, agy_resume.start)
             {
                 // A continued conversation is the run's from launch: a later
@@ -3732,6 +3733,9 @@ impl Spawn {
             },
             Located::Refused(why) => Err(why),
             Located::Found(found) => self.archive_part(view, newer, &found),
+            Located::Vibe => self
+                .archive_vibe_run(view)
+                .map_err(|error| format!("{error:#}")),
         };
         let (mut sentence, failed) = match outcome {
             Ok(sentence) => (sentence, false),
@@ -3750,6 +3754,95 @@ impl Spawn {
             error.context(format!("record the archive outcome of {name}"))
         });
         (format!(" {sentence}"), lost)
+    }
+
+    fn archive_vibe_run(&self, view: &RunView) -> Result<String> {
+        let [home] = view.vibe_home.as_slice() else {
+            bail!(
+                "Vibe archive coverage is missing: the run has no unambiguous launch home. +                 Scheduled ingestion can still discover native transcripts."
+            );
+        };
+        let home = Path::new(home);
+        if !home.is_absolute() {
+            bail!("Vibe archive coverage is missing: the recorded launch home is not absolute");
+        }
+        let output = home.join("output");
+        let session = match view.source_locator.as_slice() {
+            [] => {
+                let session = crate::archive_vibe::launched_session(&output, home)
+                    .context("Identifying the Vibe launch's session failed")?
+                    .context("Vibe archive coverage is missing: the launch left no session UUID")?;
+                let mut bound = Fragment::empty();
+                let locator =
+                    bound.put::<blobencodings::UTF8String, _>(format!("session/{session}"));
+                bound += entity! { ExclusiveId::force_ref(&view.id) @
+                    crate::schemas::blockdag::source_projection::source_locator: locator,
+                };
+                self.publish(bound)
+                    .context("Record this run's Vibe session")?;
+                session
+            }
+            [locator] => locator
+                .strip_prefix("session/")
+                .context("The recorded Vibe locator is not a session")?
+                .to_owned(),
+            _ => bail!("Vibe archive coverage is missing: this run records multiple locators"),
+        };
+
+        let mut pieces = Vec::new();
+        let (summary, end, hash) =
+            crate::archive_vibe::project_run_inputs(&output, home, &session, |piece| {
+                pieces.push(piece);
+                Ok(())
+            })
+            .with_context(|| format!("Reading Vibe session {session} for Archive failed"))?
+            .with_context(|| {
+                format!(
+                    "Vibe archive coverage is missing: session {session} has no readable source"
+                )
+            })?;
+        let coverage = summary.coverage();
+        if coverage == "missing" {
+            bail!(
+                "Vibe archive coverage is missing: session {session} yielded no archive pieces +                 (export outcome: {}).",
+                summary.export_outcome.as_deref().unwrap_or("unavailable"),
+            );
+        }
+
+        let digest: DigestValue = Inline::new(*hash.as_bytes());
+        match (view.archive_end.as_slice(), view.archive_digest.as_slice()) {
+            ([], []) => self
+                .publish(
+                    entity! { ExclusiveId::force_ref(&view.id) @
+                        attrs::archive_end: end,
+                        attrs::archive_digest: digest,
+                    }
+                    .into(),
+                )
+                .context("Bind the Vibe documents read for this run")?,
+            ([held_end], [held_digest]) if *held_end == end && *held_digest == digest => {}
+            _ => bail!(
+                "The Vibe source for session {session} differs from the recorded run inputs. +                 Nothing was archived by this attempt."
+            ),
+        }
+        let published = crate::archive::Archive::with_storage(self.storage.clone())
+            .publish_projected_unit(pieces)
+            .with_context(|| format!("Archiving Vibe session {session} failed"))?;
+        // A usable prefix can be published while the continuation gate
+        // still waits for evidence of complete coverage.
+        if coverage == "complete" {
+            self.publish(
+                entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: end }.into(),
+            )
+            .context("Record the completed Vibe archive import")?;
+        }
+        Ok(format!(
+            "Vibe session {session} was archived with {coverage} coverage ({} pieces; export +             outcome: {}; first missing sequence: {}; trailing bytes held: {}).",
+            published.pieces,
+            summary.export_outcome.as_deref().unwrap_or("unavailable"),
+            summary.missing_sequence.map_or_else(|| "none".to_owned(), |n| n.to_string()),
+            summary.trailing_bytes_held,
+        ))
     }
 
     /// Import the run's own part of its conversation's transcript.
@@ -3955,8 +4048,9 @@ impl Spawn {
     ///   replay never looks again.
     /// - claude: the session file of the run's `session/<id>` under
     ///   claude's projects.
-    /// - codex, mistral: not located yet (spawn records no rollout or vibe
-    ///   session); ingest-sessions reads what it discovers.
+    /// - mistral: uses the launch's Vibe home and a multi-document reader
+    ///   ([`Self::archive_vibe_run`]).
+    /// - codex: ingest-sessions locates rollouts.
     /// - local: Drive archives as it lives.
     fn run_transcript(
         &self,
@@ -3965,6 +4059,9 @@ impl Spawn {
         view: &RunView,
         newer: Option<&[RunView]>,
     ) -> Located {
+        if agent == Provider::Mistral.name() {
+            return Located::Vibe;
+        }
         let sessions: Vec<&str> = view
             .source_locator
             .iter()
@@ -4864,6 +4961,13 @@ fn run_view<R: BlobStoreGet + ?Sized>(
                 pattern!(facts, [{
                     run @ crate::schemas::blockdag::source_projection::source_locator: ?handle
                 }])
+            )
+            .collect(),
+        ),
+        vibe_home: texts(
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::vibe_home: ?handle }])
             )
             .collect(),
         ),
@@ -8270,16 +8374,23 @@ mod tests {
         request.provider = Provider::Mistral;
         let state = f.directory.path().join("state");
         let name = super::super::name_for(super::super::text_handle("Mistral task."));
-        // A previous run's export must not be read as this run's usage.
-        let out = state.join(format!("{name}.vibe-out"));
-        std::fs::create_dir_all(&out).unwrap();
-        std::fs::write(out.join("export.json"), "stale").unwrap();
+        let legacy = state.join(format!("{name}.vibe-out"));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("export.json"), "stale").unwrap();
         let launched = f.spawn.run(&request).unwrap();
         assert_eq!(launched.provider, Provider::Mistral);
         assert_eq!(launched.provider_reason, "mistral was asked for");
+        let home = state
+            .canonicalize()
+            .unwrap()
+            .join(format!("{name}.{:x}.vibe", launched.run));
+        let out = home.join("output");
         assert!(!out.join("export.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(legacy.join("export.json")).unwrap(),
+            "stale"
+        );
         let script = f.script(0);
-        let home = state.join(format!("{name}.vibe"));
         let prompt = state.join(format!("{name}.prompt"));
         let workdir = std::fs::canonicalize(f.directory.path().join("lane")).unwrap();
         assert!(
@@ -8332,12 +8443,20 @@ mod tests {
         let run = &f.spawn.show(&launched.name).unwrap().runs[0];
         assert_eq!(run.provider, ["mistral"]);
         assert_eq!(run.model, ["mistral-large-4"]);
+        assert_eq!(run.vibe_home, [home.to_str().unwrap()]);
 
-        // Settlement records vibe's usage and cost with the end.
+        // Settlement records usage and imports the exact session together.
+        use crate::archive_vibe::tests::{finished_native, SESSION};
+        finished_native(&out.join("session"));
         std::fs::write(
             out.join("export.json"),
-            r#"{"outcome":"finished","usage":{"input_tokens":520386,"output_tokens":1243,
-               "cached_input_tokens":518144,"total_tokens":521629},"cost_usd":0.0904}"#,
+            serde_json::json!({
+                "schema_version": 1, "session_id": SESSION, "journal_dir": "session",
+                "outcome": "finished", "cost_usd": 0.0904,
+                "usage": {"input_tokens": 520386, "output_tokens": 1243,
+                          "cached_input_tokens": 518144, "total_tokens": 521629},
+            })
+            .to_string(),
         )
         .unwrap();
         std::fs::write(&launched.report, "done\n").unwrap();
@@ -8357,12 +8476,102 @@ mod tests {
         assert_eq!(run.output_tokens, [1243]);
         assert_eq!(run.cost_usd, [0.0904]);
         assert!(run.settle_failure.is_empty());
+        let locator = format!("session/{SESSION}");
+        assert_eq!(run.source_locator, [locator.clone()]);
+        assert!(!run.archive_imported.is_empty());
+        assert_eq!(run.archive_imported, run.archive_end);
+        assert!(run.archive_outcome[0].contains("complete coverage"));
+        assert!(archived_text(&f, &locator).contains("synthetic answer"));
         let shown = render_show(&view, false);
         assert!(
             shown.contains("tokens: 520386 in (518144 cached), 1243 out"),
             "{shown}"
         );
         assert!(shown.contains("cost: $0.0904"), "{shown}");
+    }
+
+    #[test]
+    fn a_mistral_settlement_archives_native_partial_and_replays_only_its_bound_inputs() {
+        use crate::archive_vibe::{
+            tests::{finished_native_for, PREDECESSOR as OTHER_SESSION, SESSION},
+            NATIVE_SESSIONS,
+        };
+        let f = fixture();
+        let mut request = f.request("Two Vibe lives.");
+        request.provider = Provider::Mistral;
+        let first = f.spawn.run(&request).unwrap();
+        let first_home = PathBuf::from(&newest_run(&f.spawn, &first).vibe_home[0]);
+        let native = first_home.join(NATIVE_SESSIONS).join(SESSION);
+        finished_native_for(&native, SESSION);
+        set_unit(&f, "inactive");
+        settle_as(&f, &first, killed()).unwrap();
+        let held = newest_run(&f.spawn, &first);
+        assert!(held.archive_outcome[0].contains("partial coverage"));
+        assert!(held.archive_imported.is_empty());
+        assert_eq!(held.archive_digest.len(), 1);
+        let first_locator = format!("session/{SESSION}");
+        assert!(archived_text(&f, &first_locator).contains("synthetic answer"));
+
+        let second = f.spawn.run(&request).unwrap();
+        let second_home = PathBuf::from(&newest_run(&f.spawn, &second).vibe_home[0]);
+        assert_ne!(first_home, second_home);
+        let second_native = second_home.join(NATIVE_SESSIONS).join(OTHER_SESSION);
+        finished_native_for(&second_native, OTHER_SESSION);
+        settle_as(&f, &first, killed()).unwrap();
+        let second_locator = format!("session/{OTHER_SESSION}");
+        assert!(archived_text(&f, &second_locator).is_empty());
+        let first_view = || {
+            f.spawn
+                .show(&first.name)
+                .unwrap()
+                .runs
+                .into_iter()
+                .find(|run| run.id == first.run)
+                .unwrap()
+        };
+        let replay = first_view();
+        assert_eq!(replay.archive_digest, held.archive_digest);
+        assert_eq!(replay.archive_outcome, held.archive_outcome);
+        assert_eq!(told_all(&f, &first.name).len(), 1);
+
+        // A valid JSON metadata change leaves the same UUID and calls, but
+        // it is a change to the immutable inputs and settlement must see it.
+        std::fs::write(
+            native.join("meta.json"),
+            serde_json::json!({"session_id": SESSION}).to_string(),
+        )
+        .unwrap();
+        settle_as(&f, &first, killed()).unwrap();
+        let replay = first_view();
+        assert_eq!(replay.archive_digest, held.archive_digest);
+        assert_eq!(replay.signal, held.signal);
+        assert!(replay
+            .settle_failure
+            .iter()
+            .any(|why| why.contains("differs from the recorded run inputs")));
+        assert!(archived_text(&f, &second_locator).is_empty());
+
+        let output = second_home.join("output");
+        finished_native_for(&output.join("session"), OTHER_SESSION);
+        std::fs::write(
+            output.join("export.json"),
+            serde_json::json!({
+                "schema_version": 1, "session_id": OTHER_SESSION,
+                "journal_dir": "session", "outcome": "price_limit",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        set_unit(&f, "inactive");
+        let exit = Exit::from_systemd("exited", "3", "exit-code");
+        settle_as(&f, &second, exit).unwrap();
+        let ended = newest_run(&f.spawn, &second);
+        assert_eq!(ended.exit_code, [3]);
+        assert_eq!(ended.source_locator, [second_locator.clone()]);
+        assert!(ended.archive_outcome[0].contains("partial coverage"));
+        assert!(ended.archive_outcome[0].contains("price_limit"));
+        assert!(ended.archive_imported.is_empty());
+        assert!(archived_text(&f, &second_locator).contains("synthetic answer"));
     }
 
     /// A stand-in for what agy leaves after one run: its result object as
@@ -9158,11 +9367,61 @@ mod tests {
         assert_eq!(run.exit_code, [77]);
         assert_eq!(run.message.len(), 1);
         assert!(run.input_tokens.is_empty() && run.cost_usd.is_empty());
+        assert!(run.source_locator.is_empty());
+        assert!(run.archive_imported.is_empty());
+        assert!(run.archive_outcome[0].contains("coverage is missing"));
+        assert!(f.told(&launched.name).contains("coverage is missing"));
         assert!(
             run.settle_failure.iter().any(|why| why.contains("usage")),
             "{:?}",
             run.settle_failure
         );
+    }
+
+    #[test]
+    fn a_legacy_mistral_settlement_cannot_claim_a_session_from_the_shared_home() {
+        use crate::archive_vibe::{tests::finished_native, tests::SESSION, NATIVE_SESSIONS};
+        let f = fixture();
+        let mut request = f.request("Vibe with a legacy life.");
+        request.provider = Provider::Mistral;
+        let current = f.spawn.run(&request).unwrap();
+        let (legacy, run_id) = super::super::run_fragment(&RunFacts {
+            spawn: current.spawn,
+            started_at: crate::clock::point(Epoch::from_unix_seconds(1.0)).unwrap(),
+            persona: current.persona,
+            spawner: f.persona("agent-cc").unwrap().person,
+            unit: current.unit.clone(),
+            workdir: request.workdir.display().to_string(),
+            effort: request.effort.clone(),
+            prompt: request.brief.clone(),
+            wake: None,
+            provider: Provider::Mistral.name().to_owned(),
+            provider_reason: "legacy launch".to_owned(),
+            model: None,
+            model_unset: None,
+            untinted: None,
+            resumes: None,
+            cover: None,
+            resident: false,
+        });
+        f.spawn.publish(legacy).unwrap();
+        let shared_home = f.spawn.launch.file(&current.name, "vibe");
+        finished_native(&shared_home.join(NATIVE_SESSIONS).join(SESSION));
+
+        let request = SettleRequest {
+            name: current.name.clone(),
+            run: run_id,
+            exit: Exit::from_systemd("exited", "7", "exit-code"),
+            report: None,
+            usage: None,
+        };
+        f.spawn.settle(&request).unwrap();
+        let view = f.spawn.show(&current.name).unwrap();
+        let run = view.runs.iter().find(|run| run.id == run_id).unwrap();
+        assert_eq!(run.exit_code, [7]);
+        assert!(run.source_locator.is_empty() && run.archive_imported.is_empty());
+        assert!(run.archive_outcome[0].contains("no unambiguous launch home"));
+        assert!(archived_text(&f, &format!("session/{SESSION}")).is_empty());
     }
 
     #[test]

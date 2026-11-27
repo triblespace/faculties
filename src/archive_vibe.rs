@@ -204,7 +204,11 @@ pub fn run_source(
 }
 
 fn read_export(path: &Path) -> Result<Export> {
-    let export: Export = decode(&read(path)?, "export")?;
+    decode_export(&read(path)?)
+}
+
+fn decode_export(bytes: &Bytes) -> Result<Export> {
+    let export: Export = decode(bytes, "export")?;
     if export.schema_version != 1
         || export
             .session_id
@@ -243,9 +247,8 @@ struct Store {
     active: u64,
 }
 
-fn read_current(root: &Path, expected: &str) -> Result<(Bytes, Current)> {
-    let pointer = read(&root.join("CURRENT"))?;
-    let current: Current = decode(&pointer, "CURRENT")?;
+fn decode_current(pointer: &Bytes, expected: &str) -> Result<Current> {
+    let current: Current = decode(pointer, "CURRENT")?;
     if current.store_format != STORE_FORMAT
         || current.store_format_minor != 10
         || number(&current.generation).is_none()
@@ -253,7 +256,11 @@ fn read_current(root: &Path, expected: &str) -> Result<(Bytes, Current)> {
     {
         bail!("unsupported Vibe store format or session identity mismatch");
     }
-    Ok((pointer, current))
+    Ok(current)
+}
+
+fn read_current(root: &Path, expected: &str) -> Result<Current> {
+    decode_current(&read(&root.join("CURRENT"))?, expected)
 }
 
 pub(crate) fn active_segment(root: &Path) -> Result<Option<PathBuf>> {
@@ -263,7 +270,7 @@ pub(crate) fn active_segment(root: &Path) -> Result<Option<PathBuf>> {
         .filter(|name| valid_session_id(name))
         .context("Vibe native source must be its exact UUID directory")?;
     match read_current(root, expected) {
-        Ok((_, current)) => {
+        Ok(current) => {
             let active = current
                 .snapshot_sequence
                 .checked_add(1)
@@ -278,13 +285,18 @@ pub(crate) fn active_segment(root: &Path) -> Result<Option<PathBuf>> {
 }
 
 impl Store {
-    fn open(root: &Path, expected: &str) -> Result<Option<Self>> {
-        let (pointer, current) = match read_current(root, expected) {
-            Ok(current) => current,
+    fn open(
+        root: &Path,
+        expected: &str,
+        read_input: &mut impl FnMut(&Path) -> Result<Bytes>,
+    ) -> Result<Option<Self>> {
+        let pointer = match read_input(&root.join("CURRENT")) {
+            Ok(pointer) => pointer,
             Err(error) if is_missing(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let manifest = read(
+        let current = decode_current(&pointer, expected)?;
+        let manifest = read_input(
             &root
                 .join("generations")
                 .join(&current.generation)
@@ -350,7 +362,7 @@ pub fn project_path(
     path: &Path,
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<ProjectionSummary> {
-    project(path, None, emit)
+    project(path, None, read, emit)
 }
 
 /// Project the exact provider session captured for a run. Recheck that UUID
@@ -363,13 +375,88 @@ pub fn project_run(
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<Option<ProjectionSummary>> {
     run_source(output_dir, vibe_home, session_id)?
-        .map(|path| project(&path, Some(session_id), emit))
+        .map(|path| project(&path, Some(session_id), read, emit))
         .transpose()
+}
+
+/// Identify the only session an exclusively allocated launch home holds.
+/// When both sources name a session they must agree.
+pub(crate) fn launched_session(output: &Path, home: &Path) -> Result<Option<String>> {
+    let exported = match read_export(&output.join("export.json")) {
+        Ok(export) => export.session_id,
+        Err(error) if is_missing(&error) => None,
+        Err(error) => return Err(error),
+    };
+    let native = home.join(NATIVE_SESSIONS);
+    let entries = match check_path(&native).and_then(|()| fs::read_dir(&native).map_err(Into::into))
+    {
+        Ok(entries) => entries,
+        Err(error) if is_missing(&error) => return Ok(exported),
+        Err(error) => return Err(error),
+    };
+    let mut session = None;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name.to_str().filter(|id| valid_session_id(id)) else {
+            continue;
+        };
+        if !entry.file_type()?.is_dir() || session.is_some() {
+            bail!("Vibe launch home does not identify one native session");
+        }
+        session = Some(id.to_owned());
+    }
+    if exported
+        .as_ref()
+        .zip(session.as_ref())
+        .is_some_and(|(a, b)| a != b)
+    {
+        bail!("Vibe export and launch home identify different sessions");
+    }
+    Ok(exported.or(session))
+}
+
+/// Read one exact run and fingerprint the bytes actually passed to the parser.
+/// File names, lengths and the selected source kind delimit the input.
+pub(crate) fn project_run_inputs(
+    output: &Path,
+    home: &Path,
+    session: &str,
+    emit: impl FnMut(ProjectedSource) -> Result<()>,
+) -> Result<Option<(ProjectionSummary, u64, blake3::Hash)>> {
+    let Some(path) = run_source(output, home, session)? else {
+        return Ok(None);
+    };
+    let mut digest = blake3::Hasher::new_derive_key("Faculties Vibe settlement source v1");
+    digest.update(if path.as_path() == output {
+        b"export"
+    } else {
+        b"native"
+    });
+    let mut total = 0;
+    let summary = project(
+        &path,
+        Some(session),
+        |input| {
+            let bytes = read(input)?;
+            let name = input.strip_prefix(&path)?.as_os_str().as_encoded_bytes();
+            let len = bytes.len() as u64;
+            digest.update(&(name.len() as u64).to_le_bytes());
+            digest.update(name);
+            digest.update(&len.to_le_bytes());
+            digest.update(&bytes);
+            total += len;
+            Ok(bytes)
+        },
+        emit,
+    )?;
+    Ok(Some((summary, total, digest.finalize())))
 }
 
 fn project(
     path: &Path,
     expected: Option<&str>,
+    mut read_input: impl FnMut(&Path) -> Result<Bytes>,
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<ProjectionSummary> {
     check_path(path).with_context(|| format!("inspect Vibe directory {}", path.display()))?;
@@ -382,7 +469,7 @@ fn project(
     {
         None
     } else {
-        match read_export(&path.join("export.json")) {
+        match read_input(&path.join("export.json")).and_then(|bytes| decode_export(&bytes)) {
             Ok(export) => Some(export),
             Err(error) if is_missing(&error) => None,
             Err(error) => return Err(error),
@@ -424,12 +511,12 @@ fn project(
         }
     };
 
-    let Some(store) = Store::open(&root, &summary.session_id)? else {
+    let Some(store) = Store::open(&root, &summary.session_id, &mut read_input)? else {
         return Ok(summary);
     };
     // The native index metadata may not yet exist after an interruption.
     // When present it must identify the same held session as CURRENT.
-    match read(&root.join("meta.json")) {
+    match read_input(&root.join("meta.json")) {
         Ok(bytes) => {
             let meta: Metadata = decode(&bytes, "session metadata")?;
             if meta.session_id != store.current.session_id {
@@ -450,7 +537,7 @@ fn project(
             summary.missing_sequence = Some(next);
             break;
         }
-        let bytes = read(&segment)?;
+        let bytes = read_input(&segment)?;
         next = scanner.scan_segment(first, bytes, &mut summary)?;
         summary.segments += 1;
     }

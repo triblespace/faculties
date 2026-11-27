@@ -171,6 +171,25 @@ impl Archive {
             })
         })
     }
+
+    pub(crate) fn publish_projected_unit(
+        &self,
+        pieces: Vec<crate::archive_source::ProjectedSource>,
+    ) -> Result<UnitPublication> {
+        self.storage.with_store(|store, signer, runtime| {
+            let mut writer = ArchiveImportWriter::from_store_with_storage(
+                store,
+                signer,
+                runtime.clone(),
+                &self.storage,
+            )?;
+            for piece in pieces {
+                writer.stage(piece.fragment, piece.identity)?;
+            }
+            writer.commit_unit()
+        })
+    }
+
     /// Every read takes a [`Reading`]: whether it is forced, and the
     /// provider the caller declares, which decide what a recorded classifier
     /// stop withholds.

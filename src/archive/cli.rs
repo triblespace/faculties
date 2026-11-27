@@ -54,8 +54,8 @@ pub(super) enum Command {
     /// ~/.gemini/antigravity-cli/brain/<conversation>/, also under Agy zooid
     /// homes (~/.local/state/spawn/<name>.agy/). The Agy transcript is
     /// .system_generated/logs/transcript_full.jsonl within the conversation.
-    /// Vibe zooids are discovered under <name>.vibe/logs/session/unified/<uuid>
-    /// in the same spawn state directory.
+    /// Vibe zooids are discovered under <name>.<run>.vibe/logs/session/unified/<uuid>
+    /// in the same spawn state directory, including older <name>.vibe homes.
     /// Explicit roots replace defaults. Claude and Codex include recursive JSONL
     /// files and subagents. Each file is one import unit, including Claude sidecars.
     ///
