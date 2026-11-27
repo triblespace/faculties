@@ -217,20 +217,60 @@ fn clones_retained_scopes_and_different_bindings_keep_selection_and_owner_separa
 }
 
 #[test]
-fn resident_only_owner_refuses_missing_bytes_without_network_startup() {
+fn resident_only_owner_answers_missing_bytes_as_missing_without_network_startup() {
+    use triblespace::core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+    use triblespace::core::repo::is_missing_blob;
+    use triblespace_net::peer::PeerGetError;
+
     let fixture = Fixture::new();
+    let scope = crate::schemas::wiki::DEFAULT_SCOPE_ID;
+    let away = crate::storage::residual_fixture::strand_in(
+        &fixture.storage,
+        scope,
+        crate::storage::residual_fixture::unrelated_fragment(),
+    );
+    let prompt = std::time::Duration::from_secs(2);
     fixture
         .storage
-        .with_store(|store, _, runtime| {
+        .with_store(|store, signer, runtime| {
             let missing = Inline::<Handle<UnknownBlob>>::new([234; 32]);
-            let outcome = runtime
+            let acquired = runtime
+                .block_on(async { tokio::time::timeout(prompt, store.acquire(missing)).await })
+                .expect("a local owner answers a miss at once");
+            assert_eq!(acquired.unwrap(), None);
+            let snapshot = store.snapshot()?;
+            let read = runtime
                 .block_on(async {
-                    tokio::time::timeout(std::time::Duration::from_secs(2), store.acquire(missing))
-                        .await
+                    tokio::time::timeout(prompt, snapshot.get::<Bytes, UnknownBlob>(missing)).await
                 })
-                .expect("offline missing bytes must fail promptly");
-            assert!(format!("{}", outcome.unwrap_err()).contains("closed"));
-            // Closing acquisition must not close resident snapshots or publication.
+                .expect("a local snapshot answers a miss at once");
+            let error = read.unwrap_err();
+            assert!(matches!(error, PeerGetError::Missing(_)), "{error}");
+            assert!(is_missing_blob(&error));
+
+            // A partial read names the stranded foundation; a strict one refuses.
+            let source =
+                fixture
+                    .storage
+                    .open_collection_local(store, scope, signer.verifying_key())?;
+            store.commit(source, signer, entity! { metadata::name: "here" })?;
+            let succinct = store.attach::<SuccinctArchiveBlob>(source, ())?;
+            let rank9 = store.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+            let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+            let (facts, unread) = acquire_facts_read(&reader, rank9)?.into_parts();
+            assert!(
+                facts.iter().next().is_some(),
+                "the resident foundation is read"
+            );
+            assert_eq!(unread.len(), 1);
+            assert!(unread
+                .members()
+                .any(|handle| hex::encode(handle.raw) == away));
+            let strict = acquire_facts(&reader, rank9).err().unwrap();
+            assert!(strict.downcast_ref::<IncompleteAttachedRead>().is_some());
+            assert!(strict.to_string().contains(&away), "{strict:#}");
+
+            // Local writes and resident snapshots still work.
             let handle = store
                 .collection(
                     "offline-test",

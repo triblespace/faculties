@@ -294,10 +294,10 @@ fn unavailable_file_tag_fails_only_files_and_ordinary_search_reports_it() {
     let error = files
         .search("needle")
         .expect_err("ordinary search must also fail for the missing tag");
-    // read() tries exact-byte acquisition after the tag reader's MissingBlob.
-    // SharedLocal's closed peer can refuse that acquisition, replacing the
-    // inner tag-read context. Assert the actual native error, not one layer's
-    // assumed wording; neither path may turn this failure into empty results.
+    // read() tries exact-byte acquisition after the tag reader's MissingBlob,
+    // which SharedLocal's local peer answers as missing at once. Assert the
+    // actual native error, not one layer's assumed wording; neither path may
+    // turn this failure into empty results.
     assert_eq!(
         message,
         &format!("{error:#}"),
@@ -626,9 +626,23 @@ fn invalid_queries_and_limits_fail_before_source_work() {
 /// owner has no first contact, so the foundation is reported unread at once.
 #[test]
 fn a_stranded_files_foundation_makes_only_files_unavailable_and_names_it() {
-    use crate::storage::residual_fixture::{storage, strand_in, unrelated_fragment};
     let directory = tempfile::tempdir().unwrap();
-    let storage = storage(directory.path());
+    stranded_files_foundation(crate::storage::residual_fixture::storage(directory.path()));
+}
+
+/// The same over a resident-only owner, whose leech has no network at all.
+#[test]
+fn a_stranded_files_foundation_on_a_local_owner_is_named_too() {
+    let directory = tempfile::tempdir().unwrap();
+    let pile = directory.path().join("local.pile");
+    let key = directory.path().join("local.key");
+    std::fs::File::create(&pile).unwrap();
+    crate::storage::initialize_signer(&pile, Some(&key)).unwrap();
+    stranded_files_foundation(Storage::shared_local(pile, Some(key)));
+}
+
+fn stranded_files_foundation(storage: Storage) {
+    use crate::storage::residual_fixture::{strand_in, unrelated_fragment};
     let files = crate::files::Files::with_storage(storage.clone());
     files
         .add_bytes(

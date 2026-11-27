@@ -297,8 +297,10 @@ impl Storage {
         })?(access)
     }
 
-    /// One resident-only application owner. Exact missing bytes fail; neither
-    /// an absent daemon nor ambient discovery is treated as network consent.
+    /// One resident-only application owner: its leech never starts a host,
+    /// dials, or discovers. Exact missing bytes are missing at once, so a
+    /// partial read names them unread; neither an absent daemon nor ambient
+    /// discovery is treated as network consent.
     pub fn shared_local(pile: PathBuf, key: Option<PathBuf>) -> Self {
         let mut storage = Self::shared_with_daemon(pile, key, None);
         storage.local_only = true;
@@ -306,18 +308,13 @@ impl Storage {
     }
 
     fn open_owned_store(&self, host: VerifyingKey) -> Result<FacultyStore> {
-        let mut store = match self.daemon {
-            Some(daemon) => lazy_store(|| open_pile_strict_as(&self.pile, host), daemon)?,
-            None => open_store_as(&self.pile, host)?,
-        };
         if self.local_only {
-            // Closing a dormant acquisition owner starts nothing, preserves
-            // local reads/writes, and prevents retained snapshots waking it.
-            store
-                .shutdown_and_join()
-                .context("disable workspace network acquisition")?;
+            return Ok(FacultyStore::local(open_pile_strict_as(&self.pile, host)?));
         }
-        Ok(store)
+        match self.daemon {
+            Some(daemon) => lazy_store(|| open_pile_strict_as(&self.pile, host), daemon),
+            None => open_store_as(&self.pile, host),
+        }
     }
 
     pub fn key_path(&self) -> Option<&Path> {
