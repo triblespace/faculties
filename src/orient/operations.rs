@@ -962,7 +962,7 @@ impl OrientSource {
     /// Carry the source and attach what the carry leaves, Succinct first,
     /// before selecting the immutable query views. Attached collections need
     /// no WRITE: the store is opened as this signer, whose MAPs are the ones
-    /// believed. A foundation left unattached is read from its own bytes.
+    /// believed. A foundation left unattached remains pending in the read.
     async fn maintain(&self, pile: &mut impl FacultyAccess, signer: &SigningKey) -> Result<()> {
         #[cfg(test)]
         pile.before_orient_maintenance(self.label, "maintain Succinct")?;
@@ -1470,11 +1470,9 @@ fn start_observation(
         if let Some(control) = &control {
             reader = reader.with_control(control.clone());
         }
-        // Each source reads what is here: a foundation the
-        // acquisition could not bring is named in the observation's notes,
-        // and its handle joins the payload read-set, so the observation stops
-        // being current -- and a waiting watcher looks again -- the moment its
-        // bytes arrive. Receipts are per event, so nothing held only there is
+        // Each source reads its stored cover: a foundation without a usable
+        // attachment is named in the observation's notes. A later stored MAP
+        // can expose it on reobservation. Receipts are per event, so nothing held only there is
         // receipted meanwhile: it is news when it can be read.
         let unread = std::cell::RefCell::new(Vec::<(
             &'static str,
@@ -6558,10 +6556,44 @@ async fn wake_selection(
             OrientSource::open(routing, storage, signer, KNOWLEDGE_SCOPE_ID, "Knowledge").await?;
         let latest = knowledge_model::latest_for_source(storage, knowledge.source)
             .context("register Knowledge supersession index")?;
-        let index = topic.map(|_| knowledge_model::recall::topic_index(storage, knowledge.source));
         knowledge.maintain(storage, signer).await?;
         crate::storage::tolerate_own_lag(storage.maintain_attached(latest, signer).await)
             .context("maintain Knowledge supersession index")?;
+        // Explicit bounded upkeep publishes before the shared wake snapshot.
+        // A failed or non-host upkeep never contributes ephemeral index data.
+        let index = if topic.is_some() {
+            Some(
+                async {
+                    let target = knowledge_model::recall::topic_index(storage, knowledge.source)?;
+                    let selected = storage.snapshot()?;
+                    let writer = signer.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    let prepared = tokio::task::spawn_blocking(move || {
+                        let reader =
+                            crate::storage::AcquiringReader::with_handle(selected, runtime);
+                        triblespace::core::collection::prepare_attached_within::<
+                            triblespace_search::portable_bm25::PortableBM25Blob,
+                            _,
+                        >(
+                            &reader,
+                            target,
+                            &writer,
+                            crate::archive_collection::SEARCH_BUILD_BUDGET,
+                        )
+                    })
+                    .await
+                    .context("join bounded Knowledge topic preparation")?;
+                    crate::storage::tolerate_own_lag(
+                        prepared.and_then(|work| work.publish(storage, signer)),
+                    )
+                    .context("publish bounded Knowledge topic attachments")?;
+                    Ok::<_, anyhow::Error>(target)
+                }
+                .await,
+            )
+        } else {
+            None
+        };
         Some((knowledge.rank9, latest, index))
     };
     let snapshot = storage
@@ -6613,14 +6645,11 @@ async fn wake_selection(
                     &unread_order,
                 ));
             }
-            // As in Archive search, keep a bounded part of a cold index. Later reads
-            // reuse those MAPs and ordinary collection maintenance can finish it.
+            // Only stored MAPs from the explicit upkeep above are queried.
             let topic_read = topic_index.map(|target| -> Result<_> {
                 Ok(reader
                     .attached_acquiring(target?)?
-                    .read_within::<knowledge_model::recall::TopicIndex>(
-                        crate::archive_collection::SEARCH_BUILD_BUDGET,
-                    )?)
+                    .read_acquiring::<knowledge_model::recall::TopicIndex>()?)
             });
             Ok::<_, anyhow::Error>((
                 memory_facts,
@@ -6653,15 +6682,6 @@ async fn wake_selection(
                     "Knowledge topic index: {} source commits pending",
                     index.unread().len()
                 ));
-            }
-            if !index.built().is_empty() {
-                if let Err(error) =
-                    crate::storage::tolerate_own_lag(storage.keep_attached(index.built(), signer))
-                {
-                    diagnostics.push(format!(
-                        "Knowledge topic index images were not retained: {error}"
-                    ));
-                }
             }
             let index = index.into_value();
             let needs_postings = match semantic {
@@ -8971,7 +8991,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_acquires_cold_foundations_without_advancing_the_observation() {
+    fn foreground_raw_arrival_stays_pending_until_stored_map_reobservation() {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -9005,7 +9025,7 @@ mod tests {
             let observation = observe_snapshot_acquiring(watermark.clone(), &sources, false)
                 .await
                 .unwrap();
-            assert!(exists!(pattern!(observation.facts.messages.view(), [
+            assert!(!exists!(pattern!(observation.facts.messages.view(), [
                 { metadata::tag: &cold_tag }
             ])));
             assert!(!exists!(pattern!(observation.facts.messages.view(), [
@@ -9014,13 +9034,31 @@ mod tests {
             assert!(observation.snapshot.changes_since(&watermark).is_empty());
             assert!(!observation.snapshot.contains_blob(handle).unwrap());
             assert!(!observation.is_current(&pile.snapshot().unwrap()));
+            assert!(
+                !observation.notes.is_empty(),
+                "pending support must be named"
+            );
+            sources
+                .messages
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
+            let ready = observe_snapshot_acquiring(pile.snapshot().unwrap(), &sources, false)
+                .await
+                .unwrap();
+            assert!(exists!(pattern!(ready.facts.messages.view(), [
+                { metadata::tag: &cold_tag }
+            ])));
+            assert!(exists!(pattern!(ready.facts.messages.view(), [
+                { metadata::tag: &later_tag }
+            ])));
             assert!(pile.health().started_at.is_none());
             pile.close().unwrap();
         });
     }
 
     #[test]
-    fn a_closed_owner_cannot_complete_a_cold_foreground_as_empty() {
+    fn a_closed_owner_raw_foundation_remains_an_explicit_pending_gap() {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -9039,13 +9077,15 @@ mod tests {
             .unwrap();
             let watermark = pile.snapshot().unwrap();
             pile.close().unwrap();
-            // No fallback owner remains. Missing selected support must not
-            // masquerade as a successfully observed empty source.
-            assert!(
-                observe_snapshot_acquiring(watermark.clone(), &sources, false)
-                    .await
-                    .is_err()
-            );
+            // No fallback owner or index construction is needed to report the
+            // known gap. Empty visible facts are not a complete observation.
+            let observation = observe_snapshot_acquiring(watermark.clone(), &sources, false)
+                .await
+                .unwrap();
+            assert!(!observation.notes.is_empty());
+            assert!(!exists!(pattern!(observation.facts.messages.view(), [
+                { metadata::tag: &id(124) }
+            ])));
             assert!(!watermark.contains_blob(handle).unwrap());
         });
     }

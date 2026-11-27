@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cold_residual_block_acquires_its_text_without_changing_residency() {
+    fn explicit_bm25_upkeep_acquires_child_then_reads_fresh_stored_cover() {
         use triblespace::core::collection::{
             AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
         };
@@ -394,6 +394,33 @@ mod tests {
         // Descriptor registration may already have stored schema attachments.
         // The selected document text itself must be genuinely cold.
         assert!(!frozen.contains_blob(text_handle).unwrap());
+        // Missing child bytes leave explicit upkeep pending; a raw source
+        // cannot become an ephemeral query result through an ordinary read.
+        assert_eq!(
+            store
+                .ensure_attached_within_with::<ArchiveTextBm25Mapping>(
+                    target,
+                    &signer,
+                    crate::archive_collection::SEARCH_BUILD_BUDGET,
+                )
+                .unwrap(),
+            0
+        );
+        let pending = frozen
+            .attached(target)
+            .unwrap()
+            .read_with::<ArchiveTextBm25Mapping, ArchiveBM25View>()
+            .unwrap();
+        assert_eq!(pending.unread().len(), 1);
+        assert_eq!(
+            pending
+                .value()
+                .segments()
+                .iter()
+                .map(|s| s.doc_count())
+                .sum::<usize>(),
+            0
+        );
 
         // Exact lookup can now find the bytes in the owning Leech, but the
         // selected node and residency observation remain the older ones.
@@ -404,9 +431,28 @@ mod tests {
         let reader = crate::storage::AcquiringReader::new(frozen, runtime);
         let selected = reader.attached_acquiring(target).unwrap();
         assert_eq!(selected.residual().len(), 1);
+        let before = selected
+            .read_with_acquiring::<ArchiveTextBm25Mapping, ArchiveBM25View>()
+            .unwrap();
+        assert_eq!(before.unread().len(), 1);
+        assert_eq!(
+            store
+                .ensure_attached_within_reading::<ArchiveTextBm25Mapping, _>(
+                    target,
+                    &signer,
+                    crate::archive_collection::SEARCH_BUILD_BUDGET,
+                    &reader,
+                )
+                .unwrap(),
+            1
+        );
+        // Query a new snapshot only after the writer has stored its image/MAP.
+        let fresh = store.snapshot().unwrap();
         let index = crate::storage::require_complete_attached_read(
-            selected
-                .read_with_acquiring::<ArchiveTextBm25Mapping, ArchiveBM25View>()
+            fresh
+                .attached(target)
+                .unwrap()
+                .read_with::<ArchiveTextBm25Mapping, ArchiveBM25View>()
                 .unwrap(),
         )
         .unwrap();
@@ -834,7 +880,7 @@ mod tests {
             let read = attached
                 .read_with::<ArchiveTextBm25Mapping, ArchiveBM25View>()
                 .unwrap();
-            assert!(read.unread().is_empty(), "seed {seed}");
+            assert_eq!(read.unread(), attached.residual(), "seed {seed}");
             // The index of the union of every foundation the read includes.
             let mut union = TribleSet::new();
             for member in attached

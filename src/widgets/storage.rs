@@ -1094,7 +1094,7 @@ fn load_inputs_mode(
 }
 
 /// One scope's facts, read through its attached Rank9 cover with the
-/// residual read from its bytes, over what is here: the facts, the revision
+/// residual reported as pending: the stored facts, the revision
 /// that identifies exactly what that read holds (the foundations it could
 /// not read included, so their arrival moves it), and those foundations.
 /// Bytes that are here but form no archive still fail the read.
@@ -1997,12 +1997,11 @@ mod tests {
     }
 
     /// The revision names exactly what a fact read holds. A commit that
-    /// arrives and that nothing attaches is read from its bytes, and moves
-    /// the revision; a commit whose payload is not here is named unread
-    /// beside the facts that are, and its bytes arriving moves the revision
-    /// again.
+    /// arrives without an attachment remains pending. Raw byte arrival alone
+    /// cannot expose it; a stored host attachment changes the visible facts
+    /// and revision. This exercises the same loader as ordinary Data.
     #[test]
-    fn dataset_revision_changes_when_a_commit_is_read_from_its_bytes() {
+    fn dataset_revision_tracks_pending_foundations_then_stored_attachments() {
         use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace::core::blob::{Blob, IntoBlob};
         use triblespace::core::collection::{
@@ -2043,11 +2042,11 @@ mod tests {
             .unwrap();
         let (facts, read_raw, unread) =
             attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
-        assert!(unread.is_empty());
+        assert_eq!(unread.len(), 1);
         let names = |facts: &FactArchive| -> BTreeSet<Id> {
             find!(id: Id, pattern!(facts, [{ ?id @ metadata::name: _?name }])).collect()
         };
-        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
+        assert_eq!(names(&facts), BTreeSet::from([first.id]));
         assert_ne!(attached, read_raw, "the cover alone did not change");
 
         // A commit whose payload is not here yet.
@@ -2065,21 +2064,36 @@ mod tests {
         let missing_snapshot = store.snapshot().unwrap();
         let (facts, gap, unread) = attached_facts_and_revision(&missing_snapshot, rank9)
             .expect("a foreground dataset shows what is here");
-        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
-        assert_eq!(unread.len(), 1);
-        assert_eq!(unread.members().next(), Some(payload.get_handle()));
+        assert_eq!(names(&facts), BTreeSet::from([first.id]));
+        assert_eq!(unread.len(), 2);
+        assert!(unread.contains(payload.get_handle()));
         // The revision law distinguishes this partial observation from the
         // earlier one and from the later complete one.
         assert_ne!(read_raw, gap);
         store.put::<SimpleArchive, _>(payload).unwrap();
         let (facts, arrived, unread) =
             attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert_eq!(unread.len(), 2);
+        assert_eq!(names(&facts), BTreeSet::from([first.id]));
+        assert_eq!(
+            gap, arrived,
+            "raw byte arrival cannot advance a stored-only view"
+        );
+        let records_before = store.snapshot().unwrap().records().unwrap().count();
+        let _ = attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert_eq!(
+            store.snapshot().unwrap().records().unwrap().count(),
+            records_before
+        );
+        crate::storage::carry_facts(&mut store, source, &signer);
+        let (facts, published, unread) =
+            attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
         assert!(unread.is_empty());
         assert_eq!(
             names(&facts),
             BTreeSet::from([first.id, second.id, third.id])
         );
-        assert_ne!(gap, arrived, "the payload's arrival moves the revision");
+        assert_ne!(gap, published, "persisted attachment advances the revision");
     }
 
     #[test]
@@ -2121,10 +2135,8 @@ mod tests {
             let advanced = ready.attached(target).unwrap();
             let (advanced_index, unread) = advanced.read::<LatestIndex>().unwrap().into_parts();
             let after = DatasetRevision::from_attached(&advanced, &unread);
-            // The index answers alike -- the residual read builds what
-            // maintenance attached -- and the token still moves: it names
-            // what the read took, not what it answered.
-            assert_eq!(
+            // Only upkeep makes the successor's stored index visible.
+            assert_ne!(
                 lagging_index.states().collect::<BTreeSet<_>>(),
                 advanced_index.states().collect::<BTreeSet<_>>()
             );

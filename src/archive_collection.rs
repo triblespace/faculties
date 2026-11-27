@@ -850,7 +850,7 @@ pub fn ensure_search_local_with_storage(
 
 /// How many bytes of Archive source nodes one search maps into BM25 images
 /// for the commits the index does not reach yet
-/// ([`AttachedSnapshot::read_within_with`]). The first is mapped whatever
+/// (explicit bounded attachment upkeep). The first is attempted whatever
 /// its size, so a search on a store whose index reaches nothing still
 /// leaves an attachment, and so a MAP record naming the index.
 ///
@@ -861,28 +861,25 @@ pub fn ensure_search_local_with_storage(
 /// The largest commit is 7.4 MB and the median 82 KB.
 pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
 
-/// Acquire a query's fixed Archive fact and BM25 observations, and keep what
-/// the BM25 read builds.
+/// Publish bounded BM25 upkeep, then select the query's fixed fact and index
+/// observations from one fresh snapshot.
 ///
 /// Both views select their support at the same watermark; exact-byte
 /// arrival below does not reselect either of them. The surrounding operation
 /// owns the store.
 ///
-/// The index is the attached BM25 cover plus images of the residual: the
-/// Archive commits no attachment reaches, mapped in this process up to
+/// The upkeep maps Archive commits no attachment reaches, up to
 /// [`SEARCH_BUILD_BUDGET`] bytes of source nodes, in the residual's order,
-/// looking at no more of it than that. Those images
-/// are kept as this host's attachments (`keep_attached`: the images and
-/// host-signed MAPs), so the next search takes them instead of building
-/// them, and the store's records name the index, which is how a maintainer
-/// finds it. What the budget leaves out is reported as lag. A search never
+/// looking at no more of it than that. Images and host-signed MAPs are
+/// persisted before the query. The query uses only the resulting stored
+/// cover; what the budget leaves out is reported as lag. A search never
 /// maps a whole merge node: on 2026-10-26 a search that maintained first
 /// did, and grew to about 62 GB; `archive index` and maintenance carry and
 /// attach the merged frontier.
 ///
 /// Keeping needs the store opened as the signing key, which every faculty
-/// store is; a key that is not the store's host keeps nothing, and the
-/// search still reads what it built.
+/// store is; a key that is not the store's host publishes nothing, and the
+/// query reports the remaining gap instead of using ephemeral images.
 pub(crate) fn search_views_with_storage(
     storage: &crate::storage::Storage,
 ) -> Result<(
@@ -917,16 +914,20 @@ pub(crate) fn search_views_within(
         )?;
         let target = store.attach_with(source, archive_bm25::ArchiveTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        let upkeep_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::storage::tolerate_own_lag(
+            store.ensure_attached_within_reading::<archive_bm25::ArchiveTextBm25Mapping, _>(
+                target, signer, budget, &upkeep_reader,
+            ),
+        )
+        .context("publish bounded Archive BM25 attachments")?;
+        // Publication precedes this shared query watermark. No read builds.
         let after = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         let facts = after.attached_acquiring(rank9)?;
         let search = after.attached_acquiring(target)?;
         let read = search
-            .read_within_with::<archive_bm25::ArchiveTextBm25Mapping, archive_bm25::ArchiveBM25View>(
-                budget,
-            )
+            .read_with_acquiring::<archive_bm25::ArchiveTextBm25Mapping, archive_bm25::ArchiveBM25View>()
             .map_err(|error| anyhow!("read Archive BM25 cover: {error}"))?;
-        crate::storage::tolerate_own_lag(store.keep_attached(read.built(), signer))
-            .context("keep the Archive BM25 images this search built")?;
         let lag = ArchiveSearchLag {
             facts: FactLag::of(&after, source, succinct, rank9)?,
             index: read.unread().len(),
@@ -2694,6 +2695,80 @@ mod tests {
             "a complete retry publishes no collection records"
         );
         pile.close().unwrap();
+    }
+
+    /// The same bounded path used by search publishes one initial foundation
+    /// even at a zero-byte budget, then stops. A fresh process can read that
+    /// stored index without constructing the other two foundations.
+    #[test]
+    fn bounded_search_publishes_before_read_and_survives_reopen() {
+        assert_eq!(SEARCH_BUILD_BUDGET, 16 * 1024 * 1024);
+        let directory = TempDir::new().unwrap();
+        let pile_path = directory.path().join("bounded-search.pile");
+        let key = directory.path().join("bounded-search.key");
+        std::fs::File::create(&pile_path).unwrap();
+        let signer = initialize_archive_fixture(&pile_path, &key);
+        for (locator, body) in [("one", "mercury"), ("two", "venus"), ("three", "earth")] {
+            commit_projection(&pile_path, &key, locator, body);
+        }
+        let storage = crate::storage::Storage::shared_local(pile_path.clone(), Some(key.clone()));
+        let (facts, index, lag) = search_views_within(&storage, 0).unwrap();
+        assert_eq!(
+            index
+                .segments()
+                .iter()
+                .map(|s| s.doc_count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(lag.index, 2, "budget must not process a second foundation");
+        assert_eq!(
+            facts.residual().len(),
+            3,
+            "BM25 upkeep does not invent fact MAPs"
+        );
+        drop((facts, index));
+        storage.close().unwrap();
+
+        let mut reopened = open_pile_strict_as(&pile_path, signer.verifying_key()).unwrap();
+        let source = test_source(&mut reopened, &pile_path, &key);
+        let target = test_target(&mut reopened, source);
+        let frozen = reopened.snapshot().unwrap();
+        let before = frozen.records().unwrap().count();
+        let read = frozen
+            .attached(target)
+            .unwrap()
+            .read_with::<archive_bm25::ArchiveTextBm25Mapping, archive_bm25::ArchiveBM25View>()
+            .unwrap();
+        assert_eq!(
+            read.value()
+                .segments()
+                .iter()
+                .map(|s| s.doc_count())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(read.unread().len(), 2);
+        assert_eq!(
+            reopened.snapshot().unwrap().records().unwrap().count(),
+            before
+        );
+        drop((read, frozen));
+        reopened.close().unwrap();
+
+        let next = crate::storage::Storage::shared_local(pile_path.clone(), Some(key.clone()));
+        let (facts, index, lag) = search_views_within(&next, 0).unwrap();
+        assert_eq!(
+            index
+                .segments()
+                .iter()
+                .map(|s| s.doc_count())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(lag.index, 1, "the next pass reuses the stored first image");
+        drop((facts, index));
+        next.close().unwrap();
     }
 
     /// A believed MAP whose attachment bytes are not here is not usable: the

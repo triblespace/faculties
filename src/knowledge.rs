@@ -1221,8 +1221,8 @@ pub async fn query_snapshot(
     let facts = store_snapshot
         .read_facts(rank9)
         .context("read Knowledge fact collection")?;
-    // The index over the same foundations the facts read: revisions no
-    // attachment reaches yet are built in memory.
+    // Read the stored supersession index independently; a revision without
+    // an attachment remains pending instead of being built during this read.
     let latest = store_snapshot
         .attached(target)
         .map_err(|error| anyhow!("observe Knowledge supersession index: {error}"))?

@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_cold_text_bm25_residual_fetches_exact_text_on_the_frozen_view() {
+    fn raw_text_arrival_stays_pending_until_explicit_code_index_upkeep() {
         use triblespace::core::blob::encodings::utf8string::UTF8String;
         use triblespace::core::blob::{Blob, IntoBlob};
         use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
@@ -559,6 +559,22 @@ mod tests {
         let reader = AcquiringReader::new(frozen, runtime);
         let selected = reader.attached_acquiring(target).unwrap();
         let read = selected.read_acquiring::<CodeBM25View>().unwrap();
+        assert_eq!(read.unread().len(), 1);
+        assert_eq!(
+            read.value()
+                .segments()
+                .iter()
+                .map(|s| s.doc_count())
+                .sum::<usize>(),
+            0
+        );
+        pollster::block_on(store.ensure_attached(target, &signer)).unwrap();
+        let fresh = store.snapshot().unwrap();
+        let read = fresh
+            .attached(target)
+            .unwrap()
+            .read::<CodeBM25View>()
+            .unwrap();
         assert!(read.unread().is_empty());
         assert_eq!(
             read.value()
@@ -569,6 +585,14 @@ mod tests {
             1
         );
         assert_eq!(selected.residual().len(), 1);
+        assert_eq!(
+            selected
+                .read_acquiring::<CodeBM25View>()
+                .unwrap()
+                .unread()
+                .len(),
+            1
+        );
         assert!(!reader.contains_blob(handle).unwrap());
         assert!(store.health().started_at.is_none());
         store.close().unwrap();

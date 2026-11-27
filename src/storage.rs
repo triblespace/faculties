@@ -16,8 +16,8 @@
 //!   one step, so the host is the signing key by construction.
 //!   [`open_store_as`] and [`open_pile_strict_as`] take the host explicitly.
 //!   [`open_store`] and [`open_pile_strict`] open with no host and believe no
-//!   MERGE or MAP: right for a reader that holds no key (it reads every
-//!   foundation from its bytes), and for a record writer that neither
+//!   MERGE or MAP: right for a reader that holds no key (attached reads report
+//!   the unrepresented foundations as pending), and for a record writer that neither
 //!   publishes nor reads merges or attachments, such as the
 //!   `faculties-migrations` crate. [`open_store`] and [`open_store_as`]
 //!   supply lazy exact-handle acquisition; the `open_pile_*` functions are the
@@ -34,9 +34,9 @@
 //!   attachments; the maintenance daemon, or [`carry_facts`] standing in for
 //!   it, calls [`maintain_downstream`], which carries the source first and
 //!   attaches what the carry leaves. A read ([`FactRead::read_facts`]) takes the
-//!   attached cover and reads the foundations no attachment reaches yet from
-//!   their own bytes, so nothing the source holds here is missing from it;
-//!   [`FactLag`] counts those foundations. Derived collections -- the Files
+//!   stored attached cover only. Foundations no usable attachment reaches remain
+//!   pending, even when their raw bytes are resident; [`FactLag`] counts them.
+//!   Explicit upkeep publishes attachments before a fresh read. Derived collections -- the Files
 //!   semantic index -- still derive their leaves, found from the same
 //!   listing, and carry their own leaves into the host's merges.
 //!
@@ -1211,11 +1211,9 @@ where
 /// store snapshot: the source foundations no usable attachment reaches yet,
 /// per attached collection.
 ///
-/// A foundation without an attachment is read from its own bytes by
-/// [`FactRead::read_facts`], so this is a cost, not missing facts, unless the
-/// read cannot read it: its bytes are not here, or they cannot form one
-/// archive (malformed, or too wide for one segment). Those are the read's
-/// own gap, named by [`attached_facts_read`]. There is no globally
+/// A foundation without a usable stored attachment remains outside the
+/// ordinary fact value, even when its raw bytes are resident. The structured
+/// [`attached_facts_read`] reports that pending support. There is no globally
 /// consistent state to be current against: a read attaches what is present
 /// and reports this, it never waits or refuses.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1270,12 +1268,11 @@ impl std::fmt::Display for FactLag {
 
 /// Read the facts a source holds here through its attached Rank9 cover.
 ///
-/// The attached cover is taken as the snapshot has it; every foundation it
-/// does not reach whose bytes are here is read from those bytes and joined
-/// in as one more shard, so a commit whose attachment is not built yet --
-/// written by another key, or before the last maintenance pass -- is read
-/// all the same. A foundation whose bytes are not here is left out: it is
-/// counted by [`FactLag`], and nothing is fetched for it.
+/// The stored attached cover is taken as the snapshot has it. A foundation
+/// without a usable attachment is left out, even when its raw bytes are here.
+/// Use [`attached_facts_read`] to retain the explicit pending support, or
+/// [`acquire_facts`] where a partial answer would invalidate a decision.
+/// Reads never construct an index or publish an attachment.
 ///
 /// A trait so the read is a method on whatever snapshot the caller holds,
 /// owned or borrowed; [`attached_facts`] reads an attached read already
@@ -1297,8 +1294,9 @@ pub trait FactRead: StoreRead + Sized {
 
 impl<R: StoreRead> FactRead for R {}
 
-/// Select once and read facts through an exact-byte acquiring reader. The
-/// support/cover never changes while its residual payloads are acquired.
+/// Select once and read stored fact attachments through an exact-byte reader.
+/// The support/cover never changes while selected payloads are acquired;
+/// unrepresented foundations cause this strict read to refuse.
 pub fn acquire_facts<R: StoreRead>(
     reader: &R,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -1312,10 +1310,10 @@ pub fn acquire_facts<R: StoreRead>(
 
 /// [`acquire_facts`] for a caller that answers from what is here rather than
 /// refusing: the facts, and the foundations this observation omits beside
-/// them. The acquisition is attempted exactly as in [`acquire_facts`]: a
-/// foundation whose bytes are not here is fetched on demand, and only one
-/// the fetch could not bring stays unread. Storage errors and bytes that
-/// cannot form an archive still fail the read.
+/// them. Acquisition reads the selected stored cover, as in [`acquire_facts`].
+/// A foundation without a usable persisted attachment stays unread even when
+/// its raw bytes are resident. Reads do not build or maintain attachments.
+/// Storage errors and invalid selected attachment bytes still fail the read.
 ///
 /// This is the ordinary read: answer with what was read,
 /// and say what could not be loaded ([`unread_foundations_note`]) instead of
@@ -1477,7 +1475,7 @@ pub fn unread_handles_note(
     ))
 }
 
-/// Acquire residual bytes of an already-selected fact observation, without
+/// Acquire selected stored bytes of an already-selected fact observation, without
 /// selecting again after a cache fill. Refuse a partial operational value;
 /// core's `read_attached_acquiring` retains structured unread support for
 /// callers deliberately reporting partial observations.
@@ -1573,9 +1571,10 @@ where
 
 /// The facts of an attached Rank9 read already taken, as
 /// [`attached_facts`] reads them: the method form, so a caller holding the
-/// read never takes its bare view, which would leave the residual out.
+/// read retains the stored cover; callers needing pending support use the
+/// structured read rather than discarding its `unread` field.
 pub trait FactView {
-    /// The attached cover and the resident residual, as one fact archive.
+    /// The stored attached cover as one fact archive, without residual building.
     fn facts(&self) -> Result<FactArchive>;
 }
 
@@ -1586,7 +1585,7 @@ impl<R: StoreRead> FactView for AttachedSnapshot<R, Rank9AcceleratedSuccinctArch
 }
 
 /// [`FactRead::read_facts`] over an attached read already taken: its cover,
-/// and its residual read from the bytes its snapshot holds
+/// without building residual foundations from their raw bytes
 /// ([`succinctarchive_union::read_attached`]).
 pub fn attached_facts<R>(
     attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
@@ -1598,8 +1597,8 @@ where
 }
 
 /// [`attached_facts`], with the residual foundations the read could not
-/// include named beside the facts: those whose bytes are not here, and
-/// those whose bytes cannot form one archive. A caller that must tell a
+/// include named beside the facts: every foundation without a usable stored
+/// attachment. A caller that must tell a
 /// complete read from a partial one -- a cache key, a lag report -- reads
 /// this.
 pub fn attached_facts_read<R>(
@@ -1622,7 +1621,7 @@ where
 /// and reports nothing); for
 /// an attached one, a key that is not the store's host
 /// ([`CollectionRealizationError::HostMismatch`]), which attaches nothing. In
-/// every case the read attaches what is present and reads or counts the rest
+/// every case the read selects what is stored and counts the rest
 /// ([`FactRead::read_facts`], [`underived`]). Explicit maintenance and a
 /// write's [`ensure_downstream`] still name them. Every other error is
 /// returned unchanged.
@@ -2721,13 +2720,10 @@ mod tests {
         assert_eq!(discovered_records(&after).unwrap().maps().len(), 2);
     }
 
-    /// A write's commit is readable through the fact pair at once, whoever
-    /// wrote it and whether or not its attachment exists yet: the host's
-    /// write attaches the source's frontier, and a read takes what no
-    /// attachment reaches from its own bytes. Another key's commit is
-    /// attached by the host's next write, not left to its writer.
+    /// Raw arrival and a non-host write remain pending. Only explicit upkeep
+    /// by the host makes their stored attachments visible to ordinary reads.
     #[test]
-    fn every_commit_is_readable_through_the_pair_whoever_wrote_it() {
+    fn raw_and_non_host_commits_wait_for_stored_host_attachments() {
         use triblespace::core::collection::grant_collection_write;
 
         let owner = SigningKey::from_bytes(&[11; 32]);
@@ -2757,7 +2753,7 @@ mod tests {
             .unwrap();
         let written = entity! { metadata::name: "another key's write" };
         store.commit(source, &writer, written.clone()).unwrap();
-        // Nothing is attached yet, and the commit is read all the same.
+        // Raw bytes are present, but nothing is attached yet.
         assert_eq!(
             lag(&mut store),
             FactLag {
@@ -2765,7 +2761,11 @@ mod tests {
                 rank9: 1
             }
         );
-        assert_eq!(facts(&mut store), written.facts().clone());
+        assert!(facts(&mut store).is_empty());
+        let pending = store.snapshot().unwrap();
+        let partial = acquire_facts_read(&pending, rank9).unwrap();
+        assert_eq!(partial.unread().len(), 1);
+        assert!(acquire_facts(&pending, rank9).is_err());
 
         let own = entity! { metadata::name: "owner" };
         store.commit(source, &owner, own.clone()).unwrap();
@@ -2777,7 +2777,7 @@ mod tests {
         );
 
         // A key that is not the store's host attaches nothing -- its MAPs
-        // would be believed nowhere -- and its write is read all the same.
+        // would be believed nowhere -- and its write remains pending.
         let later = entity! { metadata::name: "later" };
         store.commit(source, &writer, later.clone()).unwrap();
         let before = store.snapshot().unwrap().records().unwrap().count();
@@ -2785,7 +2785,62 @@ mod tests {
         assert_eq!(store.snapshot().unwrap().records().unwrap().count(), before);
         assert_eq!(
             facts(&mut store),
-            (written.clone() + own.clone() + later).facts().clone()
+            (written.clone() + own.clone()).facts().clone()
+        );
+        let pending = store.snapshot().unwrap();
+        assert_eq!(
+            acquire_facts_read(&pending, rank9).unwrap().unread().len(),
+            1
+        );
+        assert!(acquire_facts(&pending, rank9).is_err());
+        drop(pollster::block_on(ensure_downstream(&mut store, source, &owner)).unwrap());
+        assert_eq!(facts(&mut store), (written + own + later).facts().clone());
+        assert!(acquire_facts_read(&store.snapshot().unwrap(), rank9)
+            .unwrap()
+            .unread()
+            .is_empty());
+    }
+
+    /// A keyless reader cannot borrow another host's MAP authority. Raw facts
+    /// and copied stored attachments do not make its attached view complete.
+    #[test]
+    fn keyless_attached_read_reports_gap_without_publishing_or_building() {
+        use triblespace::core::repo::BlobStorePut;
+        let owner = SigningKey::from_bytes(&[14; 32]);
+        let mut host = MemoryRepo::for_host(owner.verifying_key());
+        let source = crate::collection_names::open(
+            &mut host,
+            crate::schemas::wiki::DEFAULT_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let (_, rank9) = fact_pair(&mut host, source).unwrap();
+        host.commit(source, &owner, entity! { metadata::name: "stored by host" })
+            .unwrap();
+        drop(pollster::block_on(ensure_downstream(&mut host, source, &owner)).unwrap());
+        assert!(!acquire_facts(&host.snapshot().unwrap(), rank9)
+            .unwrap()
+            .is_empty());
+        let full = host.snapshot().unwrap();
+        let mut keyless = MemoryRepo::default();
+        for blob in full.blobs() {
+            let handle = blob.unwrap().handle;
+            keyless
+                .put::<UnknownBlob, _>(full.get::<anybytes::Bytes, _>(handle).unwrap())
+                .unwrap();
+        }
+        for record in full.records().unwrap() {
+            keyless.insert(record.unwrap()).unwrap();
+        }
+        let frozen = keyless.snapshot().unwrap();
+        let before = frozen.records().unwrap().count();
+        let read = acquire_facts_read(&frozen, rank9).unwrap();
+        assert!(read.value().is_empty());
+        assert_eq!(read.unread().len(), 1);
+        assert!(acquire_facts(&frozen, rank9).is_err());
+        assert_eq!(
+            keyless.snapshot().unwrap().records().unwrap().count(),
+            before
         );
     }
 

@@ -936,9 +936,8 @@ where
     let fact_archive = store_snapshot
         .read_facts(rank9)
         .context("read Goals fact collection")?;
-    // The register over the same foundations the facts read: its cover, and
-    // every commit no attachment reaches built in memory, so a status the
-    // facts hold is never missing from its winners.
+    // Read the stored status register independently. Its maintenance may lag
+    // the fact cover; a positive join uses only the winners actually present.
     let status = store_snapshot
         .attached(status_target)
         .context("observe Goals status register")?

@@ -335,8 +335,8 @@ pub async fn materialize_indexed_collection(
     let facts = store_snapshot
         .read_facts(rank9)
         .context("read maintained Body fact collection")?;
-    // The register over the same foundations the facts read, the commits
-    // no attachment reaches built in memory.
+    // Read the stored register independently; unattached intent foundations
+    // remain pending rather than being constructed during this query.
     let intents = store_snapshot
         .attached(target)
         .map_err(|error| anyhow!("observe Body intent register: {error}"))?
