@@ -2749,7 +2749,7 @@ mod tests {
         let fact_read = crate::storage::acquire_attached_facts_read(&facts).unwrap();
         assert_eq!(fact_read.unread().len(), 2);
         assert!(
-            !fact_read.value().is_empty(),
+            fact_read.value().iter().next().is_some(),
             "the index's fact join is usable"
         );
         drop((facts, index));
@@ -2778,7 +2778,7 @@ mod tests {
         let stored_facts = reopened.snapshot().unwrap().attached(rank9).unwrap();
         let fact_read = crate::storage::acquire_attached_facts_read(&stored_facts).unwrap();
         assert_eq!(fact_read.unread().len(), 2);
-        assert!(!fact_read.value().is_empty());
+        assert!(fact_read.value().iter().next().is_some());
         assert_eq!(
             reopened.snapshot().unwrap().records().unwrap().count(),
             before

@@ -2818,9 +2818,11 @@ mod tests {
         host.commit(source, &owner, entity! { metadata::name: "stored by host" })
             .unwrap();
         drop(pollster::block_on(ensure_downstream(&mut host, source, &owner)).unwrap());
-        assert!(!acquire_facts(&host.snapshot().unwrap(), rank9)
+        assert!(acquire_facts(&host.snapshot().unwrap(), rank9)
             .unwrap()
-            .is_empty());
+            .iter()
+            .next()
+            .is_some());
         let full = host.snapshot().unwrap();
         let mut keyless = MemoryRepo::default();
         for blob in full.blobs() {
@@ -2835,7 +2837,7 @@ mod tests {
         let frozen = keyless.snapshot().unwrap();
         let before = frozen.records().unwrap().count();
         let read = acquire_facts_read(&frozen, rank9).unwrap();
-        assert!(read.value().is_empty());
+        assert!(read.value().iter().next().is_none());
         assert_eq!(read.unread().len(), 1);
         assert!(acquire_facts(&frozen, rank9).is_err());
         assert_eq!(

@@ -2124,7 +2124,7 @@ mod tests {
             pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
         let pending_context = pending.loaded_context();
         let gap = pending_context.dataset(SourceKey::Teams).unwrap();
-        assert!(gap.facts.is_empty());
+        assert!(gap.facts.iter().next().is_none());
         assert!(
             !gap.notes.is_empty(),
             "Data must not report empty as complete"
@@ -2151,7 +2151,7 @@ mod tests {
         assert!(visible.notes.is_empty());
         assert_ne!(gap.revision, visible.revision);
         assert!(
-            gap.facts.is_empty(),
+            gap.facts.iter().next().is_none(),
             "a retained Data view must not reselect"
         );
         assert!(!gap.notes.is_empty());
