@@ -3775,6 +3775,7 @@ impl Spawn {
         let session = match view.source_locator.as_slice() {
             [] => {
                 let session = discovered
+                    .as_deref()
                     .context("Vibe archive coverage is missing: the launch left no session UUID")?;
                 let mut bound = Fragment::empty();
                 let locator =
@@ -3784,7 +3785,7 @@ impl Spawn {
                 };
                 self.publish(bound)
                     .context("Record this run's Vibe session")?;
-                session
+                session.to_owned()
             }
             [locator] => locator
                 .strip_prefix("session/")
