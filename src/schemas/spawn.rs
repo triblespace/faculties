@@ -299,12 +299,23 @@ pub mod spawn {
         /// archives: everything through its last complete line when the
         /// run's archive step first read it. Recorded once, before the
         /// import, so a replayed settlement imports the same part and never
-        /// what a later run appended. Minted with `trible genid` on
-        /// 2026-11-26, like every attribute below.
+        /// what a later run appended. For Vibe, the bytes read for its
+        /// initial capture, including held-back bytes.
+        /// Minted with `trible genid` on 2026-11-26, like every attribute
+        /// below unless otherwise marked.
         "992DF5A64837FE283F028149B0CA299F" as archive_end: inlineencodings::U256BE;
-        /// The BLAKE3 digest of those [`archive_end`] bytes. A replay
-        /// imports them only while the file still begins with exactly them.
+        /// The BLAKE3 digest of those [`archive_end`] bytes. For Vibe, a
+        /// digest of the named source documents read by the projection.
         "1254841E93B28DF8896F02FEF07B79A9" as archive_digest: inlineencodings::Hash<inlineencodings::Blake3>;
+        /// Absolute path of the fresh Vibe home admitted for this run.
+        /// Its native journal and headless output are both below it.
+        /// Minted with `trible genid` on 2026-11-27.
+        "6F5C4180A4B793B75CA88F732D66FCC6" as vibe_home: inlineencodings::Handle<blobencodings::UTF8String>;
+        /// Vibe settlement capture receipts: the initial journal prefix and,
+        /// if admitted later, the complete export that extends it. Each
+        /// receipt binds the record count, prefix digest and source documents.
+        /// Minted with `trible genid` on 2026-11-27.
+        "EE9F3E3CFC996FEFF21711D79BC9A7FB" as vibe_archive_capture: inlineencodings::Handle<blobencodings::UTF8String>;
         /// Bytes after the transcript's last complete line when the end was
         /// recorded: an unfinished last line (a killed run's), not archived.
         /// Absent when the transcript ended with a complete line.
@@ -320,9 +331,10 @@ pub mod spawn {
         /// The bytes of the run's conversation that an import accepted: its
         /// [`archive_end`] once the archive holds them (0 when the
         /// conversation had no complete line, or settlement found
-        /// affirmatively that the run left none). Recorded only on success, so
-        /// a fresh life of a resident zooid can tell its previous life is in
-        /// the archive. Minted with `trible genid` on 2026-11-26.
+        /// affirmatively that the run left none). For Vibe, the document byte
+        /// count of a complete capture. Recorded only on success. The
+        /// Claude/Agy resident gate checks this receipt.
+        /// Minted with `trible genid` on 2026-11-26.
         "50E91BF01FCEB1DB2D0971938CD23E72" as archive_imported: inlineencodings::U256BE;
         /// The context of the conversation's latest model call, in tokens,
         /// when settlement found it past the life limit: how large the
