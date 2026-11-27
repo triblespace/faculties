@@ -71,6 +71,7 @@ impl Target {
                 "knowledge-health",
                 "knowledge",
                 "goals",
+                "priority-game",
                 "decisions",
                 "mail",
                 "events",
