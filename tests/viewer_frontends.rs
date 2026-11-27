@@ -81,6 +81,7 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
 }
 
 #[test]
+#[cfg(feature = "widgets")]
 fn dashboard_capture_labels_follow_rendered_card_order() {
     use GORBIE::prelude::CardCtx;
     use faculties::storage::Storage;
