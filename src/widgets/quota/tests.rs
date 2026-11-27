@@ -260,6 +260,157 @@ fn explicitly_refuses_a_preview_with_more_values_than_it_can_safely_draw() {
     pile.close().unwrap();
 }
 
+#[test]
+fn long_labels_stay_bounded_without_merging_native_allowances() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let signer = SigningKey::from_bytes(&[51; 32]);
+    let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+    let collection = pile.collection("quota", open()).unwrap();
+    let now = 1_790_000_000;
+    let prefix = "é".repeat(20_000);
+    for (suffix, used) in [("first", 12.0), ("second", 34.0)] {
+        let mut input = reading("same-account", now - 1, used);
+        input.bucket = Some(format!("{prefix}{suffix}"));
+        publish(&mut pile, &signer, collection, input);
+    }
+    let unknown = ufoid();
+    pile.commit(
+        collection,
+        &signer,
+        entity! {
+            &unknown @ metadata::name: format!("{prefix}provider"),
+        },
+    )
+    .unwrap();
+    let short = pile.put::<blobencodings::UTF8String, _>("café").unwrap();
+    let observed = observe(&mut pile, &signer, Some(collection));
+    let view = observed.loaded_context().dataset(SourceKey::Quota).unwrap();
+    let Projection::Ready(history) = project(view, unix_to_tai_ns(now), DAY) else {
+        panic!("long display labels must not reject otherwise usable readings");
+    };
+    assert_eq!(history.allowances.len(), 2);
+    let a = &history.allowances[0];
+    let b = &history.allowances[1];
+    assert_ne!(a.key.bucket, b.key.bucket);
+    assert_ne!(a.label, b.label);
+    let mut used = vec![a.readings[0].used[0], b.readings[0].used[0]];
+    used.sort_by(f64::total_cmp);
+    assert_eq!(used, [12.0, 34.0]);
+    for allowance in &history.allowances {
+        assert!(allowance.label.contains("long label ["));
+        assert!(allowance.label.len() < 128);
+        assert!(!allowance.label.contains('é'));
+    }
+    let provider_label = allowance_label(
+        view,
+        GroupKey {
+            provider: unknown.id,
+            ..a.key
+        },
+    );
+    assert!(provider_label.starts_with("long label ["));
+    assert!(provider_label.len() < 128);
+    assert!(!provider_label.contains('é'));
+    // A short multibyte name remains complete; neither byte boundaries nor
+    // a Unicode label require replacing the actual grouping identity.
+    assert_eq!(display_text(view.reader, short).as_deref(), Some("café"));
+    drop(observed);
+    pile.close().unwrap();
+}
+
+#[test]
+fn earlier_reading_click_changes_the_visible_native_observation() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let signer = SigningKey::from_bytes(&[52; 32]);
+    let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+    let collection = pile.collection("quota", open()).unwrap();
+    let now = 1_790_000_000;
+    publish(
+        &mut pile,
+        &signer,
+        collection,
+        reading("account", now - 600, 20.0),
+    );
+    publish(
+        &mut pile,
+        &signer,
+        collection,
+        reading("account", now - 60, 80.0),
+    );
+    let observed = observe(&mut pile, &signer, Some(collection));
+    let view = observed.loaded_context().dataset(SourceKey::Quota).unwrap();
+    let now = unix_to_tai_ns(now);
+    let Projection::Ready(history) = project(view, now, DAY) else {
+        panic!("history")
+    };
+    let ctx = egui::Context::default();
+    let (mut selected, mut inspected) = (None, None);
+    let (mut allowance_page, mut reading_page) = (0, 0);
+    let mut render = |events| {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(900.0, 900.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                draw_history(
+                    ui,
+                    &history,
+                    now,
+                    &mut selected,
+                    &mut allowance_page,
+                    &mut inspected,
+                    &mut reading_page,
+                )
+            },
+        )
+    };
+    let first = render(vec![]);
+    fn text_position(shape: &Shape, wanted: &str) -> Option<Pos2> {
+        match shape {
+            Shape::Text(text) if text.galley.text() == wanted => {
+                Some(text.pos + text.galley.size() * 0.5)
+            }
+            Shape::Vec(shapes) => shapes.iter().find_map(|s| text_position(s, wanted)),
+            _ => None,
+        }
+    }
+    let button = first
+        .shapes
+        .iter()
+        .find_map(|s| text_position(&s.shape, "Earlier reading"))
+        .expect("actual Earlier reading button");
+    let mut before = Frame::default();
+    for shape in &first.shapes {
+        before.visit(&shape.shape);
+    }
+    assert!(before.text.iter().any(|s| s.contains("80% used")));
+    for pressed in [true, false] {
+        let output = render(vec![
+            egui::Event::PointerMoved(button),
+            egui::Event::PointerButton {
+                pos: button,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]);
+        if !pressed {
+            let mut after = Frame::default();
+            for shape in &output.shapes {
+                after.visit(&shape.shape);
+            }
+            assert!(after.text.iter().any(|s| s.contains("20% used")));
+            assert!(!after.text.iter().any(|s| s.contains("80% used")));
+        }
+    }
+    drop(render);
+    assert_eq!(inspected, Some(history.allowances[0].readings[0].at));
+    drop(observed);
+    pile.close().unwrap();
+}
+
 fn reading(account: &str, observed_at: i64, used_percent: f64) -> Observation {
     Observation {
         provider: PROVIDER_CLAUDE,

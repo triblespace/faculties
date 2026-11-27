@@ -7,7 +7,9 @@ use GORBIE::dataflow::ComputedState;
 use GORBIE::prelude::CardCtx;
 
 use crate::quota::history::rows_in_range;
-use crate::quota::operations::{provider_name, read_text};
+use triblespace::core::{metadata, repo::BlobStoreGet};
+use triblespace::prelude::*;
+
 use crate::quota::render::{format_age, format_percent, format_window, remaining_percent};
 use crate::quota::{reading_values, tai_ns_to_unix, unix_to_tai_ns, GroupKey, STALE_AFTER_SECONDS};
 use crate::widgets::{DatasetRevision, DatasetView, SourceKey, WidgetContext};
@@ -19,6 +21,7 @@ const MAX_VALUES: usize = 16_384;
 const MAX_VALUES_PER_READING: usize = 64;
 const MAX_ALLOWANCES: usize = 256;
 const PAGE_SIZE: usize = 8;
+const MAX_LABEL_BYTES: usize = 128;
 const RANGES: [(i64, &str); 4] = [
     (3_600, "1h"),
     (DAY, "24h"),
@@ -183,9 +186,17 @@ fn project(view: DatasetView<'_>, now: i128, seconds: i64) -> Projection {
 }
 
 fn allowance_label(view: DatasetView<'_>, key: GroupKey) -> String {
-    let name = provider_name(view.facts, view.reader, key.provider)
-        .ok()
-        .flatten();
+    let provider = key.provider;
+    let name = crate::quota::known_provider_name(key.provider)
+        .map(str::to_owned)
+        .or_else(|| {
+            find!(
+                name: crate::quota::TextHandle,
+                pattern!(view.facts, [{ provider @ metadata::name: ?name }])
+            )
+            .next()
+            .and_then(|handle| display_text(view.reader, handle))
+        });
     let provider = match name.as_deref() {
         Some("claude") => "Claude".into(),
         Some("codex") => "Codex".into(),
@@ -205,13 +216,27 @@ fn allowance_label(view: DatasetView<'_>, key: GroupKey) -> String {
     };
     match key.bucket {
         Some(handle) => {
-            let bucket = read_text(view.reader, handle, "bucket").unwrap_or_else(|_| {
+            let bucket = display_text(view.reader, handle).unwrap_or_else(|| {
                 format!("bucket {} label unavailable", hex::encode(&handle.raw[..5]))
             });
             format!("{provider} · Account {account} · {window} · {bucket}")
         }
         None => format!("{provider} · Account {account} · {window} · No bucket"),
     }
+}
+
+// Read from the already-selected snapshot, not an acquiring reader. Inspect
+// byte length before UTF-8 validation or String allocation. Oversized labels
+// remain distinguishable without decoding/copying their text; GroupKey
+// continues to retain the full native handle, never this display alias.
+// The store still validates content identity on get: this is a bound on
+// display decoding/allocation/layout, not a new bound on storage validation.
+fn display_text(reader: &impl BlobStoreGet, handle: crate::quota::TextHandle) -> Option<String> {
+    let blob: Blob<blobencodings::UTF8String> = reader.get(handle).ok()?;
+    if blob.bytes.len() > MAX_LABEL_BYTES {
+        return Some(format!("long label [{}]", hex::encode(&handle.raw[..5])));
+    }
+    std::str::from_utf8(&blob.bytes).ok().map(str::to_owned)
 }
 
 impl QuotaViewer {
