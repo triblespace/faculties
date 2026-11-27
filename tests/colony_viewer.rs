@@ -621,7 +621,7 @@ fn the_opening_renders_the_exact_prompt_without_reading_a_separate_wake() {
         )
         .unwrap();
     let (mut facts, spawn_id, _, _) = spawn::spawn_fragment("Separate prompt and wake").unwrap();
-    facts += spawn::run_fragment(&spawn::RunFacts {
+    let (recorded, run) = spawn::run_fragment(&spawn::RunFacts {
         spawn: spawn_id,
         started_at: clock::point_now().unwrap(),
         persona: genid().id,
@@ -639,8 +639,16 @@ fn the_opening_renders_the_exact_prompt_without_reading_a_separate_wake() {
         resumes: None,
         cover: None,
         resident: true,
-    })
-    .0;
+    });
+    let prompt: Blob<blobencodings::UTF8String> = PROMPT.to_blob();
+    let wake: Blob<blobencodings::UTF8String> = WAKE.to_blob();
+    let prompt_handle = prompt.get_handle();
+    let wake_handle = wake.get_handle();
+    assert!(exists!(pattern!(recorded.facts(), [{ run @
+        schemas::spawn::spawn::prompt: prompt_handle,
+        schemas::spawn::spawn::wake: wake_handle,
+    }])), "the real run fragment must contain both distinct inputs");
+    facts += recorded;
     let route = runs.handle();
     fixture.pile.commit(runs, &fixture.signer, facts).unwrap();
     fixture.routes.insert(schemas::spawn::DEFAULT_SCOPE_ID, route);
