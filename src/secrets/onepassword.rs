@@ -14,7 +14,8 @@ use std::io::{Cursor, Read};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::capability::policy::resource_handle;
 use triblespace::core::collection::{
-    Collection, CollectionHandle, CollectionRecord, CollectionRecordSelector, CollectionStoreExt,
+    prepare_attached, AttachmentLimit, Collection, CollectionHandle, CollectionRecord,
+    CollectionRecordSelector, CollectionStoreExt,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, Store, StoreRead};
@@ -464,8 +465,37 @@ impl<'a> OnePasswordArchive<'a> {
         fragment += receipt.fragment;
         fragment += entity! { ExclusiveId::force_ref(&receipt_id) @
         metadata::tag: KIND_1PASSWORD_IMPORT, source_fingerprint: fingerprint };
-        store.commit(collection.source(), signer, fragment)
-            .map_err(|_| anyhow!("1Password import: publication failed; retry the same export to inspect receipt"))?;
+        store
+            .commit(collection.source(), signer, fragment)
+            .map_err(|_| {
+                anyhow!(
+                    "1Password import: publication failed; retry the same export to inspect receipt"
+                )
+            })?;
+        // This synchronous writer verifies its publication through stored views.
+        // Publish the ordinary host's two attachment hops before selecting the
+        // receipt; a read must not construct a transient replacement for them.
+        // Completed MAPs survive a later failure, just like the source COMMIT.
+        let upkeep = (|| -> Result<()> {
+            prepare_attached(
+                &store.snapshot()?,
+                collection.succinct(),
+                signer,
+                AttachmentLimit::Full,
+            )?
+            .publish(store, signer)?;
+            prepare_attached(
+                &store.snapshot()?,
+                collection.rank9(),
+                signer,
+                AttachmentLimit::Full,
+            )?
+            .publish(store, signer)?;
+            Ok(())
+        })();
+        upkeep.map_err(|_| {
+            anyhow!("1Password import committed; verification pending; retry the same export")
+        })?;
         let after = super::storage::snapshot(
             store.snapshot().map_err(|_| {
                 anyhow!("1Password import committed; verification pending; retry the same export")
@@ -1217,6 +1247,17 @@ pub(crate) mod tests {
         assert!(before.facts().is_none());
         let after = super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(after.support().len(), 1);
+        assert!(after.lag().is_current());
+        assert_eq!(
+            after
+                .store_snapshot()
+                .records()
+                .unwrap()
+                .filter(|record| matches!(record.as_ref().unwrap(), CollectionRecord::Commit(_)))
+                .count(),
+            1,
+            "attachment upkeep does not split the encrypted publication"
+        );
         assert_eq!(after.open(report.archive, &signer).unwrap(), *bytes);
         assert_eq!(
             super::super::secret_rows(after.facts().unwrap()).len(),
@@ -1284,11 +1325,16 @@ pub(crate) mod tests {
             "import never grants"
         );
         assert_no_private(after.store_snapshot());
+        let records_before_retry = after.store_snapshot().records().unwrap().count();
         let retry = archive
             .import(&mut store, &signer, collection, &after, at())
             .unwrap();
         assert!(retry.reused);
         assert_eq!(retry.item_bodies, report.item_bodies);
+        assert_eq!(
+            store.snapshot().unwrap().records().unwrap().count(),
+            records_before_retry
+        );
         assert_eq!(retry.delivery_resources, report.delivery_resources);
         assert_eq!(
             super::super::storage::snapshot(store.snapshot().unwrap(), collection)
@@ -1296,6 +1342,54 @@ pub(crate) mod tests {
                 .support(),
             after.support()
         );
+    }
+
+    #[test]
+    fn an_importing_writer_cannot_publish_another_hosts_attachment() {
+        let bytes = fixture();
+        let archive = OnePasswordArchive::parse(&bytes, ImportLimits::default()).unwrap();
+        let signer = SigningKey::from_bytes(&[71; 32]);
+        let host = SigningKey::from_bytes(&[72; 32]);
+        let mut store = MemoryRepo::for_host(host.verifying_key());
+        let collection = collection(&mut store, &signer);
+        let before =
+            super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
+        let error = archive
+            .import(&mut store, &signer, collection, &before, at())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "1Password import committed; verification pending; retry the same export"
+        );
+        let raw = store.snapshot().unwrap();
+        assert_eq!(
+            raw.records()
+                .unwrap()
+                .filter(|record| matches!(record.as_ref().unwrap(), CollectionRecord::Commit(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            raw.records()
+                .unwrap()
+                .filter(|record| matches!(record.as_ref().unwrap(), CollectionRecord::Map(_)))
+                .count(),
+            0
+        );
+        let pending = super::super::storage::snapshot(raw, collection).unwrap();
+        assert_eq!(pending.support().len(), 0);
+        assert_eq!(pending.lag().rank9, 1);
+        // The actual host can complete the immutable publication; the writer
+        // then verifies that exact receipt without another commit or MAP.
+        drop(pollster::block_on(collection.ensure(&mut store, &host)).unwrap());
+        let observed =
+            super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
+        let count = observed.store_snapshot().records().unwrap().count();
+        let retry = archive
+            .import(&mut store, &signer, collection, &observed, at())
+            .unwrap();
+        assert!(retry.reused);
+        assert_eq!(store.snapshot().unwrap().records().unwrap().count(), count);
     }
 
     #[test]
@@ -1397,6 +1491,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &signer, fragment)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         let first = archive
@@ -1424,6 +1519,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &signer, additions)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         let retry = archive
@@ -1497,6 +1593,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &signer, locator.clone())
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(observed.open(receipt, &signer).is_ok());
@@ -1509,6 +1606,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &signer, binding.clone())
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(
@@ -1535,6 +1633,7 @@ pub(crate) mod tests {
         let empty = super::super::storage::snapshot(store.snapshot().unwrap(), elsewhere).unwrap();
         assert!(archive.verified_receipt(&empty, &signer).unwrap().is_none());
         store.commit(elsewhere.source(), &signer, binding).unwrap();
+        drop(pollster::block_on(elsewhere.ensure(&mut store, &signer)).unwrap());
         let carried =
             super::super::storage::snapshot(store.snapshot().unwrap(), elsewhere).unwrap();
         assert_eq!(
@@ -1611,6 +1710,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &attacker, fragment)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &owner)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         let wraps = super::super::add_recipient_envelopes_from_facts(
@@ -1624,6 +1724,7 @@ pub(crate) mod tests {
         store
             .commit(collection.source(), &attacker, wraps.fragment)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &owner)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(
@@ -1691,6 +1792,7 @@ pub(crate) mod tests {
             .unwrap();
         // Directly inspect the opaque candidate without depending on query
         // iteration ordering among concurrently valid receipt alternatives.
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         let content: Blob<SimpleArchive> = Blob::new(super::super::encrypted::clear_bytes(
@@ -1753,6 +1855,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(count, 3);
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let delivered =
             super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(delivered.open(report.archive, &bob).unwrap(), bytes);

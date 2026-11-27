@@ -133,11 +133,10 @@ impl SecretsCollection {
 
 /// Read the configured collection at one immutable store boundary.
 ///
-/// This never performs maintenance. It takes the attachments the snapshot
-/// holds, reads every source foundation no attachment reaches from its own
-/// bytes when they are here, and reports how many foundations each encoding
-/// has no attachment for ([`SecretsLag`]); a foundation whose bytes are not
-/// here is left out, never waited for.
+/// This never performs maintenance. It reads only the stored attachments the
+/// snapshot holds and reports how many foundations each encoding has no
+/// attachment for ([`SecretsLag`]). Even resident raw source bytes remain
+/// pending until explicit host upkeep publishes their attachments.
 pub fn snapshot<R>(store_snapshot: R, collection: SecretsCollection) -> Result<SecretsSnapshot<R>>
 where
     R: StoreRead,
@@ -194,8 +193,8 @@ where
         let (facts, unread) = read
             .context("read maintained Secrets collection")?
             .into_parts();
-        // What the facts stand for: the attachments' foundations and every
-        // residual one read from its bytes.
+        // What the facts stand for: the stored attachments' foundations.
+        // Stored-only readers leave every raw residual foundation unread.
         let read = observed
             .residual()
             .difference(&unread)
@@ -229,8 +228,8 @@ where
 /// snapshot.
 ///
 /// A read never refuses for lagging. A key that is not the store's host
-/// cannot attach, and reads the attachments present and the rest from its
-/// bytes; the snapshot's [`SecretsSnapshot::lag`] counts the source
+/// cannot attach, and reads only the attachments present; the snapshot's
+/// [`SecretsSnapshot::lag`] counts the source
 /// foundations no attachment reaches. Other errors propagate. Nothing is
 /// carried.
 pub async fn ensure_and_snapshot<S>(

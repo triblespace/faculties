@@ -109,15 +109,15 @@ fn legacy_local_get_and_list_need_no_replication_or_delivery_authority() {
         .unwrap();
     assert!(pollster::block_on(collection.ensure(&mut pile, &recipient)).is_err());
 
-    // Nothing is attached yet, and the read-only view reads the owner's
-    // commit from its own bytes all the same, saying how far the
-    // attachments lag.
+    // Nothing is attached yet. The stored-only view keeps that foundation
+    // pending even though its source bytes are resident; it cannot build on
+    // behalf of a host this store does not have.
     let observed = pollster::block_on(secrets::storage::ensure_and_snapshot(
         &mut pile, collection, &recipient,
     ))
     .unwrap();
-    assert_eq!(observed.support().len(), 1);
-    assert!(observed.contains(secret));
+    assert_eq!(observed.support().len(), 0);
+    assert!(!observed.contains(secret));
     assert_eq!(observed.lag().succinct, 1);
     drop(observed);
     assert_eq!(

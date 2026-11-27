@@ -312,8 +312,8 @@ impl Secrets {
                 )?;
             }
             // A failed attachment does not undo publication. Returning the
-            // receipt makes committed success explicit; ordinary later reads
-            // can realize the source fragments without this optional upkeep.
+            // receipt makes committed success explicit; later explicit host
+            // upkeep can publish any remaining derived views.
             report.view_maintenance_pending = runtime
                 .block_on(crate::storage::ensure_downstream(
                     pile,
@@ -1972,13 +1972,12 @@ mod tests {
             .add("eager fixture", b"generated disposable secret")
             .unwrap();
 
-        let mut pile = crate::storage::open_pile_strict(&path).unwrap();
+        let mut pile = crate::storage::open_pile_strict_as(&path, signer.verifying_key()).unwrap();
         let collection = open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
-        // The ordinary read path prepares the target, exactly as get/list do.
-        let snapshot = pollster::block_on(secret_storage::ensure_and_snapshot(
-            &mut pile, collection, &signer,
-        ))
-        .unwrap();
+        // The normal add already published its host's stored views. This
+        // fresh observation performs no upkeep that could hide a missing one.
+        let snapshot = secret_storage::snapshot(pile.snapshot().unwrap(), collection).unwrap();
+        assert!(snapshot.lag().is_current());
         assert!(secrets::secret_rows(snapshot.facts().unwrap())
             .iter()
             .any(|row| row.id == id));

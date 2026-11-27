@@ -528,6 +528,7 @@ mod tests {
             .receipt;
         assert_eq!(retained, expected);
         assert_eq!(store.attempts, 1);
+        drop(pollster::block_on(collection.ensure(&mut store.inner, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.inner.snapshot().unwrap(), collection)
                 .unwrap();
@@ -560,6 +561,21 @@ mod tests {
         let first = prepared.publish(&mut store, &signer, collection).unwrap();
         assert!(!first.reused);
         assert!(first.delivery_resources.is_empty());
+        // Publication is deliberately separate from host upkeep. Repeated
+        // passive observations cannot construct a view of the new source.
+        let records = store.snapshot().unwrap().records().unwrap().count();
+        for _ in 0..2 {
+            let pending =
+                super::super::super::storage::snapshot(store.snapshot().unwrap(), collection)
+                    .unwrap();
+            assert_eq!(pending.support().len(), 0);
+            assert_eq!(pending.lag().rank9, 1);
+            assert_eq!(
+                store.snapshot().unwrap().records().unwrap().count(),
+                records
+            );
+        }
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let after =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(after.support().len(), 1);
@@ -674,6 +690,7 @@ mod tests {
             .unwrap();
         assert_ne!(protected.archive, ordinary.archive);
         assert_ne!(protected.receipt, ordinary.receipt);
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert_eq!(observed.open(ordinary.archive, &signer).unwrap(), bytes);
@@ -821,6 +838,8 @@ mod tests {
                 prepared.fragment.unwrap().into_facts().into(),
             )
             .unwrap();
+        // The fact indexes are available; encrypted dependencies remain absent.
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(archive
@@ -848,6 +867,7 @@ mod tests {
             .commit(collection.source(), &signer, fragment)
             .unwrap();
         store.commit(collection.source(), &signer, marker).unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(archive
@@ -858,6 +878,7 @@ mod tests {
         store
             .commit(collection.source(), &signer, complete)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(archive
@@ -912,6 +933,7 @@ mod tests {
         store
             .commit(collection.source(), &signer, fragment.into_facts().into())
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         assert!(archive
@@ -934,6 +956,7 @@ mod tests {
         store
             .commit(collection.source(), &foreign, annotation)
             .unwrap();
+        drop(pollster::block_on(collection.ensure(&mut store, &signer)).unwrap());
         let observed =
             super::super::super::storage::snapshot(store.snapshot().unwrap(), collection).unwrap();
         let retry = archive
