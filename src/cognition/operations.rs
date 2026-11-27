@@ -94,7 +94,11 @@ impl Cognition {
                 .kmerge()
                 .dedup()
                 .inspect(|_| facts += 1);
-            super::validate_payloads(&snapshot, None::<&crate::storage::PileSnapshot>, rows)
+            super::validate_payloads(
+                &snapshot,
+                None::<&triblespace::core::repo::pile::PileSnapshot>,
+                rows,
+            )
                 .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
             Ok(CheckReport { facts, notes })
         })

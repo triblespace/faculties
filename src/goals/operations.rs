@@ -4005,7 +4005,7 @@ mod tests {
             .unwrap()
             .notes
             .is_empty());
-        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, GOALS_SCOPE_ID);
         let error = goals.board(ListOptions::default()).unwrap_err();
         assert!(
             error
