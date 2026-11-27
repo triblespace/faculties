@@ -156,7 +156,14 @@ mod tests {
         );
         let error = store.show("ab").unwrap_err();
         assert!(format!("{error:#}").contains(&away), "{error:#}");
-        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let pending = malformed_in(&storage, DEFAULT_SCOPE_ID);
+        assert!(store
+            .list()
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains(&pending)));
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         assert!(is_fault(&store.list().unwrap_err()));
         storage.close().unwrap();
     }

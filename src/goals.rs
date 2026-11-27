@@ -24,8 +24,8 @@ pub mod operations;
 mod render;
 
 pub use operations::{
-    AddOptions, AddedGoal, AddedNote, Board, Goals, GoalNote, GoalReading, GoalState,
-    ListOptions, MovedGoal, NoteOptions, PriorityChange, TaggedGoal,
+    AddOptions, AddedGoal, AddedNote, Board, GoalNote, GoalReading, GoalState, Goals, ListOptions,
+    MovedGoal, NoteOptions, PriorityChange, TaggedGoal,
 };
 
 use crate::storage::FactRead;
@@ -866,10 +866,7 @@ pub fn require_text_payloads(reader: &impl BlobStoreGet, facts: &TribleSet) -> R
         if texts.contains(fact.a()) {
             let handle = *fact.v::<inlineencodings::Handle<blobencodings::UTF8String>>();
             let _: View<str> = reader.get(handle).with_context(|| {
-                format!(
-                    "read Goals text payload {}",
-                    hex::encode_upper(handle.raw)
-                )
+                format!("read Goals text payload {}", hex::encode_upper(handle.raw))
             })?;
         }
     }
@@ -1007,7 +1004,7 @@ mod tests {
     /// names it, so no maintenance pass finds it -- reads every goal's
     /// status all the same, from the commits' own bytes.
     #[test]
-    fn a_status_register_nothing_attached_reads_every_status() {
+    fn an_unmaintained_status_register_waits_for_upkeep() {
         pollster::block_on(async {
             let owner = SigningKey::from_bytes(&[25; 32]);
             let mut store = MemoryRepo::for_host(owner.verifying_key());
@@ -1028,15 +1025,35 @@ mod tests {
                 .unwrap()
                 .cover()
                 .is_empty());
+            assert!(crate::schemas::compass::latest_status_event(
+                resident.facts(),
+                resident.status_register(),
+                goal,
+            )
+            .is_none());
+            assert_eq!(
+                store
+                    .snapshot()
+                    .unwrap()
+                    .attached(register)
+                    .unwrap()
+                    .residual()
+                    .len(),
+                1
+            );
+            carry(&mut store, source, &owner).await;
+            let current = materialize_indexed_source(&mut store, source)
+                .await
+                .unwrap();
             assert_eq!(
                 crate::schemas::compass::latest_status_event(
-                    resident.facts(),
-                    resident.status_register(),
+                    current.facts(),
+                    current.status_register(),
                     goal,
                 )
                 .unwrap()
                 .1,
-                crate::schemas::compass::text_handle("doing"),
+                crate::schemas::compass::text_handle("doing")
             );
         });
     }
@@ -1080,12 +1097,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
 
-            // Neither an unadmitted reader nor the owner advances the chain on
-            // a read, and neither publishes anything. The facts read the new
-            // commit from its own bytes, and so does the status register: the
-            // two answer for the same foundations, so the goal's newer status
-            // and the new goal's status are winners before the worker
-            // attaches the commit.
+            // Stored facts/status remain stable; pending input is not built by reads.
             for _signer in [&reader, &owner] {
                 let resident = materialize_indexed_source(&mut store, source)
                     .await
@@ -1093,7 +1105,7 @@ mod tests {
                 assert_eq!(
                     find!(id: Id, pattern!(resident.facts(), [{ ?id @ metadata::tag: &KIND_GOAL_ID }]))
                         .collect::<BTreeSet<_>>(),
-                    BTreeSet::from([goal, new_goal]),
+                    BTreeSet::from([goal]),
                 );
                 assert_eq!(
                     crate::schemas::compass::latest_status_event(
@@ -1103,18 +1115,14 @@ mod tests {
                     )
                     .unwrap()
                     .1,
-                    crate::schemas::compass::text_handle("done"),
-                );
-                assert_eq!(
-                    crate::schemas::compass::latest_status_event(
-                        resident.facts(),
-                        resident.status_register(),
-                        new_goal,
-                    )
-                    .unwrap()
-                    .1,
                     crate::schemas::compass::text_handle("todo"),
                 );
+                assert!(crate::schemas::compass::latest_status_event(
+                    resident.facts(),
+                    resident.status_register(),
+                    new_goal,
+                )
+                .is_none());
                 assert_eq!(
                     resident
                         .store_snapshot()
@@ -1388,10 +1396,7 @@ mod tests {
             metadata::created_at: at(1),
             board::status: doing,
         };
-        cases.push((
-            "a goal carrying a Goals attribute outside its core",
-            extra,
-        ));
+        cases.push(("a goal carrying a Goals attribute outside its core", extra));
 
         let entity = genid().id;
         let mut two_kinds = Fragment::empty();

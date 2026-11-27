@@ -259,6 +259,16 @@ fn resident_only_owner_answers_missing_bytes_as_missing_without_network_startup(
             let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
             let (facts, unread) = acquire_facts_read(&reader, rank9)?.into_parts();
             assert!(
+                facts.iter().next().is_none(),
+                "raw arrival is pending, not an implicit build"
+            );
+            assert_eq!(unread.len(), 2);
+            drop(reader);
+            runtime.block_on(store.ensure_attached(succinct, signer))?;
+            runtime.block_on(store.ensure_attached(rank9, signer))?;
+            let reader = AcquiringReader::new(store.snapshot()?, runtime.clone());
+            let (facts, unread) = acquire_facts_read(&reader, rank9)?.into_parts();
+            assert!(
                 facts.iter().next().is_some(),
                 "the resident foundation is read"
             );

@@ -5572,7 +5572,7 @@ mod tests {
     /// Bytes that are here and form no archive are a fault, never a
     /// foundation that is away: a read fails loudly.
     #[test]
-    fn discord_reads_fail_loudly_on_a_malformed_foundation() {
+    fn discord_names_raw_pending_but_rejects_malformed_selected_attachments() {
         let directory = tempfile::tempdir().unwrap();
         let (pile, key) = fresh_storage(&directory);
         let storage = crate::storage::Storage::new(pile, Some(key));
@@ -5589,6 +5589,16 @@ mod tests {
         storage
             .with_pile(|pile, signer| {
                 crate::storage::residual_fixture::malformed(pile, collection, signer)
+            })
+            .unwrap();
+        assert!(!discord
+            .read(ReadOptions::default())
+            .unwrap()
+            .notes
+            .is_empty());
+        storage
+            .with_pile(|pile, signer| {
+                crate::storage::residual_fixture::malformed_attachment(pile, collection, signer)
             })
             .unwrap();
         let error = discord.read(ReadOptions::default()).unwrap_err();

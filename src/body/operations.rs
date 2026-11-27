@@ -522,7 +522,8 @@ mod projection_tests {
 mod residual_tests {
     use super::*;
     use crate::storage::residual_fixture::{
-        is_fault, malformed_in, refuses_incomplete, storage, strand_in, unrelated_fragment,
+        is_fault, malformed_attachment_in, malformed_in, refuses_incomplete, storage, strand_in,
+        unrelated_fragment,
     };
 
     fn touch(note: &str) -> CaptureInput {
@@ -559,11 +560,14 @@ mod residual_tests {
     }
 
     #[test]
-    fn a_malformed_body_foundation_fails_loudly() {
+    fn body_names_raw_pending_but_rejects_malformed_selected_attachments() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage(directory.path());
         let body = Body::with_storage(storage.clone());
-        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let pending = malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let listed = body.list().unwrap();
+        assert!(listed.notes.iter().any(|note| note.contains(&pending)));
+        malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         let error = body.list().unwrap_err();
         assert!(is_fault(&error), "{error:#}");
         storage.close().unwrap();

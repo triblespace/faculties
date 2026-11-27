@@ -63,6 +63,13 @@ impl Fixture {
                     runtime,
                 )?;
                 store.commit(source, signer, fragment)?;
+                // Match the ordinary faculty writer: publish durable views
+                // before the search reader freezes its stored observation.
+                if scope == KNOWLEDGE {
+                    let latest = crate::knowledge::latest_for_source(store, source)?;
+                    runtime.block_on(crate::storage::seed_attached(store, latest, signer))?;
+                }
+                runtime.block_on(crate::storage::ensure_downstream(store, source, signer))?;
                 Ok(())
             })
             .unwrap();

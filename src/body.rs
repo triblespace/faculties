@@ -446,8 +446,8 @@ mod tests {
             let intent_collection = snapshot.attached(target).unwrap();
             // The facts have attached the second intent; the register's
             // attachments lag the source by exactly that commit. Its cover
-            // alone answers as it stands; the whole read builds the commit in
-            // memory and answers like the facts.
+            // and ordinary read both answer as stored, naming the pending
+            // newer intent rather than building it in memory.
             assert!(
                 crate::storage::FactLag::of(&snapshot, source, succinct, rank9)
                     .unwrap()
@@ -465,13 +465,13 @@ mod tests {
                 first_id
             );
             let whole = intent_collection.read::<LwwIndex>().unwrap();
-            assert!(whole.unread().is_empty());
+            assert_eq!(whole.unread().len(), 1);
             assert_eq!(
                 latest_intent(&facts, &whole.into_value().query().unwrap())
                     .unwrap()
                     .unwrap()
                     .id,
-                second_id
+                first_id
             );
 
             let snapshot = pile.maintain_attached(target, &signer).await.unwrap();

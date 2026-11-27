@@ -85,13 +85,23 @@ fn reads_and_proposals_go_on_while_a_decisions_foundation_is_away() {
 }
 
 #[test]
-fn a_malformed_decisions_foundation_fails_loudly() {
-    use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
+fn decisions_name_raw_pending_but_reject_malformed_selected_attachments() {
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_attachment_in, malformed_in, storage,
+    };
     let directory = tempfile::tempdir().unwrap();
     let storage = storage(directory.path());
     let decide = Decisions::with_storage(storage.clone());
-    malformed_in(&storage, DEFAULT_SCOPE_ID);
+    let pending = malformed_in(&storage, DEFAULT_SCOPE_ID);
+    let listed = decide
+        .list(ListOptions {
+            all: true,
+            forced: false,
+        })
+        .unwrap();
+    assert!(listed.notes.iter().any(|note| note.contains(&pending)));
     let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
+    malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
     fault(
         decide
             .list(ListOptions {

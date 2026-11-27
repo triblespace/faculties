@@ -2199,6 +2199,19 @@ mod tests {
         let higher = plain_goal(&mut fragment, "higher", 1.0);
         let lower = plain_goal(&mut fragment, "lower", 1.0);
         pile.commit(source, &signer, fragment).unwrap();
+        let pending = pollster::block_on(prioritize_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            higher,
+            lower,
+            || panic!("pending input must not reach publication"),
+        ))
+        .unwrap_err();
+        assert!(pending
+            .downcast_ref::<storage::IncompleteAttachedRead>()
+            .is_some());
+        storage::carry_facts(&mut pile, source, &signer);
         let count = |pile: &mut Pile| {
             pile.snapshot()
                 .unwrap()
@@ -2282,6 +2295,19 @@ mod tests {
         let goal = plain_goal(&mut fragment, "puzzling", 1.0);
         let other = plain_goal(&mut fragment, "plain", 1.0);
         pile.commit(source, &signer, fragment).unwrap();
+        let pending = pollster::block_on(mark_unclear_in(
+            &mut pile,
+            &signer,
+            source.handle(),
+            goal,
+            None,
+            || panic!("pending input must not reach publication"),
+        ))
+        .unwrap_err();
+        assert!(pending
+            .downcast_ref::<storage::IncompleteAttachedRead>()
+            .is_some());
+        storage::carry_facts(&mut pile, source, &signer);
         let count = |pile: &mut Pile| {
             pile.snapshot()
                 .unwrap()
@@ -3971,10 +3997,16 @@ mod tests {
     /// Bytes that are here and form no archive are a fault, not a foundation
     /// that is away: the board fails loudly.
     #[test]
-    fn goals_fail_loudly_on_a_malformed_foundation() {
+    fn goals_name_raw_pending_but_reject_malformed_selected_attachments() {
         let (_directory, storage, resident, _) =
             goals_with_residual(crate::storage::residual_fixture::malformed);
-        let goals = Goals::with_storage(storage);
+        let goals = Goals::with_storage(storage.clone());
+        assert!(!goals
+            .board(ListOptions::default())
+            .unwrap()
+            .notes
+            .is_empty());
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         let error = goals.board(ListOptions::default()).unwrap_err();
         assert!(
             error

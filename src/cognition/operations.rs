@@ -3,12 +3,12 @@
 
 use std::path::PathBuf;
 
+use anybytes::View;
 use anyhow::{Context, Result};
-use triblespace::core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
-use triblespace::core::collection::CollectionStoreExt;
-use triblespace::core::repo::SnapshotSource;
+use itertools::Itertools;
+use triblespace::core::blob::encodings::simplearchive::CanonicalTribles;
+use triblespace::core::collection::CollectionSnapshotExt;
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 
 use crate::schemas::cognition::DEFAULT_SCOPE_ID;
 use crate::storage::Storage;
@@ -21,8 +21,8 @@ pub struct Cognition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckReport {
     pub facts: usize,
-    /// Selected foundations whose bytes could not be loaded: the check
-    /// validates every other one and names these
+    /// Selected raw source-cover members whose bytes could not be loaded:
+    /// the check validates every other one and names these
     /// ([`crate::storage::unread_foundations_note`]).
     pub notes: Vec<String>,
 }
@@ -54,26 +54,49 @@ impl Cognition {
                 signer.verifying_key(),
                 runtime,
             )?;
-            let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-            let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
             let snapshot = crate::storage::AcquiringReader::new(
                 pile.snapshot()
                     .context("freeze Cognition fact collection")?,
                 runtime.clone(),
             );
-            // Validate what is here and name what is not; bytes that are
-            // here but form no archive, or payloads its facts reference and
-            // cannot be read, still fail the check.
-            let mut notes = Vec::new();
-            let facts =
-                crate::storage::acquire_facts_noted(&snapshot, rank9, "Cognition", &mut notes)
-                    .context("read Cognition Rank9 collection")?;
-            super::validate_archive(&snapshot, &facts)
+            // This explicit diagnostic validates the selected raw source,
+            // independently of attachment upkeep. CanonicalTribles checks
+            // bytes in place; no indexed representation is built/published.
+            let selected = snapshot.collection_acquiring(source)?;
+            let mut shards = Vec::<View<CanonicalTribles>>::new();
+            let mut unread = Vec::new();
+            for handle in selected.cover().members() {
+                match snapshot.get::<View<CanonicalTribles>, _>(handle) {
+                    Ok(shard) => shards.push(shard),
+                    Err(error) if triblespace::core::repo::is_missing_blob(&error) => {
+                        unread.push(handle)
+                    }
+                    Err(error) => {
+                        return Err(
+                            anyhow::Error::new(error).context("validate raw Cognition source")
+                        )
+                    }
+                }
+            }
+            let notes: Vec<_> = crate::storage::unread_handles_note(
+                "Cognition source cover",
+                unread.iter().copied(),
+                unread.len(),
+            )
+            .into_iter()
+            .collect();
+            // Preserve logical set/count semantics while streaming the sorted
+            // raw shards, rather than flattening them into another database.
+            let mut facts = 0;
+            let rows = shards
+                .iter()
+                .map(|shard| shard.as_tribles().iter().copied())
+                .kmerge()
+                .dedup()
+                .inspect(|_| facts += 1);
+            super::validate_payloads(&snapshot, None::<&crate::storage::PileSnapshot>, rows)
                 .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
-            Ok(CheckReport {
-                facts: facts.iter().count(),
-                notes,
-            })
+            Ok(CheckReport { facts, notes })
         })
     }
 }
@@ -87,10 +110,43 @@ mod tests {
 
     #[test]
     fn a_check_validates_what_is_here_and_names_a_foundation_that_is_away() {
+        use triblespace::core::collection::{CollectionRead, CollectionStoreExt};
         let directory = tempfile::tempdir().unwrap();
         let storage = storage(directory.path());
         let cognition = Cognition::with_storage(storage.clone());
         assert!(cognition.check().unwrap().notes.is_empty());
+        let first = unrelated_fragment();
+        let mut second = first.clone();
+        second += unrelated_fragment();
+        let expected = second.facts().len();
+        let before = storage
+            .with_pile(|pile, signer| {
+                let source = storage.open_collection_local(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                pile.commit(source, signer, first)?;
+                pile.commit(source, signer, second)?;
+                Ok(pile.snapshot()?.records()?.count())
+            })
+            .unwrap();
+        let report = cognition.check().unwrap();
+        assert_eq!(
+            report.facts, expected,
+            "raw validation preserves union deduplication"
+        );
+        assert!(
+            report.notes.is_empty(),
+            "a valid raw source needs no attachment upkeep"
+        );
+        let after = storage
+            .with_pile(|pile, _| Ok(pile.snapshot()?.records()?.count()))
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "diagnostic validation must not publish MAPs or merges"
+        );
         let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
         let report = cognition.check().unwrap();
         assert!(

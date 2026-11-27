@@ -2824,13 +2824,21 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_habit_foundation_fails_loudly() {
+    fn habits_name_raw_pending_but_reject_malformed_selected_attachments() {
         let fixture = Fixture::new();
         let api = api(&fixture);
         let resident = api
             .add("resident habit", "every 1h", "observe", None, &[], &[])
             .unwrap();
-        plant(&fixture, crate::storage::residual_fixture::malformed);
+        let pending = plant(&fixture, crate::storage::residual_fixture::malformed);
+        assert!(api
+            .list(false)
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains(&pending)));
+        let storage = crate::storage::Storage::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         let fault = |error: anyhow::Error| {
             assert!(
                 error

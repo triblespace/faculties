@@ -198,9 +198,10 @@ fn an_alarm_raise_missing_optional_fields_still_lists() {
 }
 
 /// A commit can arrive before its member blob (knowledge db1046cc, instance 4):
-/// it is left out and counted, never an error, and read once it arrives.
+/// it is left out and counted, never an error. Raw arrival alone stays
+/// pending; explicit host upkeep makes the newly arrived input readable.
 #[test]
-fn an_alarm_commit_whose_member_blob_has_not_arrived_is_skipped_then_read() {
+fn alarm_raw_arrival_stays_pending_until_host_upkeep() {
     let signer = SigningKey::from_bytes(&[7; 32]);
     let mut source = MemoryRepo::for_host(signer.verifying_key());
     let root = crate::collection_names::open(&mut source, DEFAULT_SCOPE_ID, signer.verifying_key())
@@ -232,6 +233,22 @@ fn an_alarm_commit_whose_member_blob_has_not_arrived_is_skipped_then_read() {
     }
     let observed = observe(&local.snapshot().unwrap(), rank9)
         .expect("a commit whose bytes are in flight must not fail the read");
+    assert_eq!(
+        observed.unread, 2,
+        "neither raw foundation has a stored attachment"
+    );
+    assert!(list(&observed.facts).is_empty());
+    let before = local.snapshot().unwrap().records().unwrap().count();
+    let _ = observe(&local.snapshot().unwrap(), rank9).unwrap();
+    assert_eq!(
+        local.snapshot().unwrap().records().unwrap().count(),
+        before,
+        "passive Alarm observation must not build or publish"
+    );
+
+    // This mirrors the explicit upkeep in normal Alarm.state/list callers.
+    crate::storage::carry_facts(&mut local, root, &signer);
+    let observed = observe(&local.snapshot().unwrap(), rank9).unwrap();
     assert_eq!(observed.unread, 1);
     let rows = list(&observed.facts);
     assert_eq!(
@@ -239,10 +256,20 @@ fn an_alarm_commit_whose_member_blob_has_not_arrived_is_skipped_then_read() {
         vec![first_id]
     );
 
-    // The bytes arrive; the next read sees both.
+    // The bytes arrive, but the next ordinary read still names the gap.
     local
         .put::<UnknownBlob, _>(full.get::<anybytes::Bytes, _>(withheld).unwrap())
         .unwrap();
+    let observed = observe(&local.snapshot().unwrap(), rank9).unwrap();
+    assert_eq!(observed.unread, 1);
+    assert_eq!(
+        list(&observed.facts)
+            .iter()
+            .map(|row| row.alarm)
+            .collect::<Vec<_>>(),
+        vec![first_id]
+    );
+    crate::storage::carry_facts(&mut local, root, &signer);
     let observed = observe(&local.snapshot().unwrap(), rank9).unwrap();
     assert_eq!(observed.unread, 0);
     let mut seen: Vec<Id> = list(&observed.facts).iter().map(|row| row.alarm).collect();

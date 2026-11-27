@@ -1093,9 +1093,8 @@ mod tests {
                 pile.commit(message_source, &owner, message).unwrap();
             }
             let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-            // The observer attaches nothing; it reads the attached views and
-            // the newer commits from their own bytes, and publishes nothing.
-            let (snapshot, relation_facts, message_facts, _) = runtime
+            // The observer sees stored cover and names newer raw input.
+            let (snapshot, relation_facts, message_facts, notes) = runtime
                 .block_on(message_views(
                     &mut pile,
                     &observer,
@@ -1106,8 +1105,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 relations::person_anchors(&relation_facts).contains(&later_person),
-                grown
+                false
             );
+            assert_eq!(notes.is_empty(), !grown);
             let mut input = MessageStorage {
                 pile: &mut pile,
                 signer: &observer,
@@ -1125,11 +1125,7 @@ mod tests {
                     .iter()
                     .map(|entry| entry.id)
                     .collect::<BTreeSet<_>>(),
-                if grown {
-                    BTreeSet::from([first_id, second_id])
-                } else {
-                    BTreeSet::from([first_id])
-                }
+                BTreeSet::from([first_id])
             );
             let first = result
                 .entries
@@ -1388,8 +1384,8 @@ mod tests {
             relations: &relation_facts,
             notes: Vec::new(),
         };
-        // The sender is not the host, so its writes attach nothing; every
-        // reader reads them from their bytes until the host's worker does.
+        // The sender is not the host: publication succeeds, but its new
+        // facts remain pending until the host performs maintenance.
         runtime
             .block_on(send(
                 &mut input,
@@ -1417,8 +1413,7 @@ mod tests {
             CollectionRecord::Commit(commit) if commit.collection() == message_source.handle()
         )));
 
-        // The sender's two commits are the attachments' lag, counted as such,
-        // and already readable.
+        // The sender's two commits remain named attachment lag.
         let lag = |pile: &mut FacultyStore| {
             let snapshot = pile.snapshot().unwrap();
             let succinct = pile
@@ -1436,7 +1431,7 @@ mod tests {
                 rank9: 2
             }
         );
-        let (snapshot, relation_facts, message_facts, _) = runtime
+        let (snapshot, relation_facts, message_facts, pending_notes) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
@@ -1457,10 +1452,12 @@ mod tests {
         let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("sender")))
             .unwrap();
-        assert_eq!(listed.entries.len(), 2);
+        assert_eq!(listed.entries.len(), 1);
+        assert!(!pending_notes.is_empty());
+        assert_eq!(listed.entries[0].status, MessageStatus::Unread);
 
         // The host's worker attaches them: a MAP is a function of the node,
-        // so no grant is needed, and the read is the same.
+        // so no grant is needed, and the next read sees the new facts.
         carry(&mut pile, &runtime, message_source, &owner);
         assert!(lag(&mut pile).is_current(), "{:?}", lag(&mut pile));
         let (snapshot, relation_facts, message_facts, _) = runtime
@@ -1493,7 +1490,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_message_foundation_still_fails_the_read() {
+    fn message_names_raw_pending_but_rejects_malformed_selected_attachments() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[98; 32]);
@@ -1510,8 +1507,20 @@ mod tests {
         carry(&mut pile, &runtime, relations_source, &owner);
         carry(&mut pile, &runtime, message_source, &owner);
         crate::storage::residual_fixture::malformed(&mut pile, message_source, &owner).unwrap();
-        // Bytes that form no archive are not a foundation that is away:
-        // the read fails loudly.
+        let (_, _, _, notes) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                MessageRead::Resident,
+            ))
+            .unwrap();
+        assert!(!notes.is_empty());
+        crate::storage::residual_fixture::malformed_attachment(&mut pile, message_source, &owner)
+            .unwrap();
+        // Corrupt selected cover remains an error; pending raw bytes are
+        // never parsed by an ordinary reader.
         assert!(runtime
             .block_on(message_views(
                 &mut pile,
@@ -1693,9 +1702,8 @@ mod tests {
         for handle in &missing {
             assert!(!after.contains_blob(*handle).unwrap());
         }
-        // Unlike the resident read above, demanding the missing selected
-        // foundation starts the foreground Peer even when no provider has it.
-        assert!(pile.health().started_at.is_some());
+        // Naming raw pending input must not demand its body or start Peer.
+        assert!(pile.health().started_at.is_none());
         // A send reads no Message facts at all, so the stranded Message
         // foundation is not even mentioned; the Relations one it read is.
         let (snapshot, relation_facts, message_facts, notes) = runtime
@@ -1810,9 +1818,8 @@ mod tests {
         };
         let before = records(&mut pile);
 
-        // A read takes what the worker attached and reads the fresh commits
-        // in both chains from their own bytes; it publishes nothing.
-        let (_, relation_facts, message_facts, _) = runtime
+        // A read takes stored cover; both fresh raw commits remain pending.
+        let (_, relation_facts, message_facts, notes) = runtime
             .block_on(message_views(
                 &mut pile,
                 &message_owner,
@@ -1823,16 +1830,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             relations::person_anchors(&relation_facts),
-            BTreeSet::from([first_person, second_person])
+            BTreeSet::from([first_person])
         );
-        assert_eq!(
-            visible(&message_facts),
-            BTreeSet::from([first_message, second_message])
-        );
+        assert_eq!(visible(&message_facts), BTreeSet::from([first_message]));
+        assert_eq!(notes.len(), 2);
         assert_eq!(records(&mut pile), before, "a read publishes nothing");
 
-        // Once the worker carries both chains again, the same read sees the
-        // same facts, now through attachments alone.
+        // Maintenance makes the newer facts visible through stored cover.
         carry(&mut pile, &runtime, relations_source, &message_owner);
         carry(&mut pile, &runtime, message_source, &message_owner);
         let (_, relation_facts, message_facts, _) = runtime
@@ -2454,7 +2458,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_see_fresh_commits_and_publish_nothing() {
+    fn reads_name_fresh_pending_commits_and_publish_nothing() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[93; 32]);
@@ -2547,7 +2551,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let (_, relation_facts, message_facts, _) = runtime
+        let (_, relation_facts, message_facts, notes) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
@@ -2567,13 +2571,11 @@ mod tests {
             before, after,
             "a read publishes nothing, even for the owner"
         );
-        // The fresh commits are read from their own bytes before any
-        // worker attaches them; the earlier read stays as it was taken.
-        assert_eq!(
-            visible(&message_facts),
-            BTreeSet::from([first_id, second_id])
-        );
-        assert!(relations::person_anchors(&relation_facts).contains(&later_person));
+        // The new raw commits are pending; both observations retain the
+        // stored facts until explicit host upkeep.
+        assert_eq!(visible(&message_facts), BTreeSet::from([first_id]));
+        assert_eq!(notes.len(), 2);
+        assert!(!relations::person_anchors(&relation_facts).contains(&later_person));
         assert_eq!(visible(&old_messages), BTreeSet::from([first_id]));
         assert!(!relations::person_anchors(&old_relations).contains(&later_person));
         assert_eq!(pile.snapshot().unwrap().wants().unwrap().count(), 0);

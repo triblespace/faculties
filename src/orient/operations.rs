@@ -8977,12 +8977,12 @@ mod tests {
                 "unrelated records do not invalidate the selected attention inputs"
             );
 
-            // The bytes arriving moves the receipt read, and only it: the
-            // receipt is read from them, and upkeep then attaches it.
+            // Arrival can invalidate the observation, but raw bytes alone
+            // do not supply stored membership; explicit upkeep does.
             pile.put::<SimpleArchive, _>(bytes).unwrap();
             let arrived = pile.snapshot().unwrap();
             assert!(!observation.facts.presentations.is_current(&arrived));
-            assert!(observe_snapshot(arrived, &sources)
+            assert!(!observe_snapshot(arrived, &sources)
                 .unwrap()
                 .facts
                 .presentations
@@ -10183,6 +10183,9 @@ mod tests {
                 "Swarm health",
             ))
             .unwrap();
+            // Exit publication is best effort and commit-only. Query its
+            // stored view only after explicit host maintenance.
+            test_block_on(health.maintain(&mut pile, &fixture.signer)).unwrap();
             let snapshot = pile.snapshot().unwrap();
             let facts = health.observe(&snapshot).unwrap();
             let beats = find!(
@@ -10704,7 +10707,8 @@ mod tests {
         // refuses construction from a wired peer, so the stall comes from
         // having nowhere to ask rather than from a dead wire.
         let mut pile: FacultyStore = FacultyStore::lazy(
-            crate::storage::open_pile_strict(&fixture.path).unwrap(),
+            crate::storage::open_pile_strict_as(&fixture.path, fixture.signer.verifying_key())
+                .unwrap(),
             fixture.signer.clone(),
             PeerConfig {
                 daemon: None,
@@ -11228,10 +11232,10 @@ mod tests {
 
     /// The status register's attachments may lag the facts' -- the facts
     /// attached a commit the register has not -- and a read still answers
-    /// for every status the facts hold: the register's residual is built in
-    /// memory. An observation taken earlier keeps its own answer.
+    /// only for its stored status cover. Pending updates need explicit host
+    /// upkeep. An observation taken earlier keeps its own answer.
     #[test]
-    fn a_status_register_whose_attachments_lag_still_answers_for_the_facts() {
+    fn a_status_register_keeps_stored_winners_until_explicit_upkeep() {
         test_block_on(async {
             let fixture = TestPile::new();
             let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
@@ -11284,23 +11288,18 @@ mod tests {
                 .await
                 .unwrap();
             let lagging = observe_sources(snapshot, &sources).unwrap();
-            // The facts attached the new commit and the status register has
-            // not; its read builds that commit in memory and answers for it.
+            // Facts are current, while the stored status register is not.
             let status = lagging.snapshot.attached(sources.goals_status).unwrap();
             assert_eq!(status.residual().len(), 1);
             drop(status);
             let query = lagging.query(&lagging.snapshot);
             assert_eq!(
                 latest_goal_status(&query.goals(), goal).unwrap().unwrap().0,
-                next_id
+                initial_id
             );
-            assert_eq!(
-                latest_goal_status(&query.goals(), unseen_goal)
-                    .unwrap()
-                    .unwrap()
-                    .0,
-                unseen_id
-            );
+            assert!(latest_goal_status(&query.goals(), unseen_goal)
+                .unwrap()
+                .is_none());
 
             let ready = pile
                 .maintain_attached(sources.goals_status, &fixture.signer)
@@ -12841,6 +12840,13 @@ mod tests {
                 &mut output,
             )
             .unwrap();
+            // The fixture's publication helper is commit-only. Use the
+            // ordinary explicit receipt upkeep before the next observation.
+            sources
+                .presentations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
             let again = read(&mut pile, &observation.snapshot, |reader| {
                 let query = observation.query(reader);

@@ -202,6 +202,14 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
     drop(snapshot);
     pile.close().unwrap();
 
+    // This command uses a different local host key. Its existing input
+    // must be maintained under that host; the owner's MAPs are not cover.
+    let mut writer_pile = Pile::open_as(&fixture.pile, writer.verifying_key()).unwrap();
+    carry_facts(&mut writer_pile, relations, &writer);
+    carry_facts(&mut writer_pile, source, &writer);
+    pollster::block_on(writer_pile.maintain_attached(status, &writer)).unwrap();
+    writer_pile.close().unwrap();
+
     let records = || {
         let mut pile = Pile::open(&fixture.pile).unwrap();
         let records = pile
@@ -362,9 +370,8 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
         .unwrap();
     check(&before, &priority);
 
-    // The owner reads the writer's actions from their bytes before its
-    // worker attaches them, and after: its reads answer for every commit
-    // its store holds, whoever signed it.
+    // The owner's stored view remains pending until its maintenance carries
+    // the other host's actions. The writer's MAPs are not a substitute.
     for carried in [false, true] {
         if carried {
             fixture.carry();
@@ -376,13 +383,16 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
                 ..Default::default()
             })
             .unwrap();
-        assert!(listing.contains("appended child"), "{listing}");
-        assert!(fixture
-            .operations()
-            .show(&first_id)
-            .unwrap()
-            .text
-            .contains("source-only research note"));
+        assert_eq!(listing.contains("appended child"), carried, "{listing}");
+        assert_eq!(
+            fixture
+                .operations()
+                .show(&first_id)
+                .unwrap()
+                .text
+                .contains("source-only research note"),
+            carried
+        );
     }
 }
 

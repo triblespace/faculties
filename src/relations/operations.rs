@@ -1748,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn non_writer_reads_and_prepares_pending_updates_from_their_bytes_without_publishing() {
+    fn strict_non_writer_refuses_pending_updates_without_publishing() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = Arc::new(runtime().unwrap());
         let owner = SigningKey::from_bytes(&[91; 32]);
@@ -1809,57 +1809,28 @@ mod tests {
                 .0,
         )
         .unwrap();
-        // The second person is not attached yet: a reader reads its commit
-        // from the bytes, and attaches nothing.
+        // Neither strict reading nor mutation preparation may silently omit
+        // pending input or publish on this reader's behalf.
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        with_relations_view(
-            &mut pile,
-            &reader,
-            &runtime,
-            source,
-            true,
-            None,
-            |storage| {
-                assert_eq!(
-                    relations::person_anchors(storage.facts),
-                    BTreeSet::from([first, second])
-                );
-                let list = list_people(storage, 20, false, false)?;
-                assert!(list.contains("Ada"));
-                assert!(list.contains("Grace"));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
-            before
-        );
-
-        // Preparation attaches only what the preparer wrote. A non-writer
-        // owns nothing here, so it publishes nothing, and prepares on the same
-        // read. The attachments' lag counts the unattached commit for whoever
-        // asks, as this test does below.
-        let mut mutation_prepared = false;
-        with_relations_view(
-            &mut pile,
-            &reader,
-            &runtime,
-            source,
-            false,
-            None,
-            |storage| {
-                mutation_prepared = true;
-                assert!(list_people(storage, 20, false, false)?.contains("Grace"));
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(mutation_prepared);
-        assert_eq!(
-            pile.snapshot().unwrap().select_records(&selectors).unwrap(),
-            before
-        );
+        for read_only in [true, false] {
+            let error = with_relations_view(
+                &mut pile,
+                &reader,
+                &runtime,
+                source,
+                read_only,
+                None,
+                |_| -> Result<()> { panic!("pending input reached preparation") },
+            )
+            .unwrap_err();
+            assert!(error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_some());
+            assert_eq!(
+                pile.snapshot().unwrap().select_records(&selectors).unwrap(),
+                before
+            );
+        }
         let lag = crate::storage::FactLag::of(&pile.snapshot().unwrap(), source, succinct, rank9)
             .unwrap();
         assert_eq!(lag.succinct, 1);
@@ -2325,13 +2296,20 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_relations_foundation_fails_loudly() {
+    fn relations_name_raw_pending_but_reject_malformed_selected_attachments() {
         use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
         let directory = tempfile::tempdir().unwrap();
         let storage = storage(directory.path());
         let faculty = Relations::with_storage(storage.clone());
         faculty.add(profile("Ada"), None, &[]).unwrap();
-        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let pending = malformed_in(&storage, DEFAULT_SCOPE_ID);
+        assert!(faculty
+            .list(10, PeopleFilter::Active)
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains(&pending)));
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
         fault(faculty.list(10, PeopleFilter::Active).unwrap_err());
         fault(faculty.add(profile("Bob"), None, &[]).unwrap_err());

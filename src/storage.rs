@@ -1917,6 +1917,43 @@ pub(crate) mod residual_fixture {
         hex::encode(handle.raw)
     }
 
+    /// Valid source facts, but a host-signed MAP selects malformed Rank9
+    /// bytes. This tests ordinary readers' validation of their actual cover,
+    /// separately from a malformed raw foundation they correctly leave pending.
+    pub fn malformed_attachment_in(storage: &super::Storage, scope: triblespace::prelude::Id) {
+        storage
+            .with_pile(|pile, signer| {
+                let source = storage.open_collection_local(pile, scope, signer.verifying_key())?;
+                malformed_attachment(pile, source, signer)
+            })
+            .unwrap();
+    }
+
+    pub fn malformed_attachment<S>(
+        pile: &mut S,
+        source: Collection<SimpleArchive>,
+        signer: &SigningKey,
+    ) -> Result<()>
+    where
+        S: triblespace::core::repo::Store
+            + triblespace::core::repo::async_store::AsyncBlobStoreAcquire
+            + Send,
+    {
+        let (_, rank9) = super::fact_pair(pile, source)?;
+        let commit = pile.commit(source, signer, unrelated_fragment())?;
+        let bytes = triblespace::core::blob::Bytes::from_source(vec![0xEE; 63]);
+        let attachment = pile.put::<UnknownBlob, _>(bytes)?;
+        pile.insert(CollectionRecord::Map(
+            triblespace::core::collection::CollectionMap::sign(
+                signer,
+                rank9.handle(),
+                commit.data(),
+                Handle::<UnknownBlob>::to_hash(attachment),
+            ),
+        ))?;
+        Ok(())
+    }
+
     /// A fragment of one tagged entity: enough to be a foundation of any
     /// collection without meaning anything to its faculty.
     pub fn unrelated_fragment() -> Fragment {

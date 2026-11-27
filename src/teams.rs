@@ -1947,8 +1947,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("teams-secrets.pile");
         std::fs::File::create(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
         let signer = SigningKey::from_bytes(&[0x31; 32]);
+        let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
         let collection =
             crate::storage::open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
 

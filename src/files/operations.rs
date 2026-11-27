@@ -3304,7 +3304,7 @@ mod tests {
     }
 
     #[test]
-    fn every_reader_sees_every_files_commit_attached_or_not() {
+    fn strict_files_reads_require_local_stored_cover() {
         let test_pile = TestPile::new();
         let owner = Storage::new(test_pile.path.clone(), None);
         let first = file_capability::stage(b"first".to_vec(), "first.txt", "text/plain").unwrap();
@@ -3335,17 +3335,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        // A read maintains nothing: it takes the attachment of the carried
-        // commit and reads the uncarried one from its own bytes.
-        with_files_view(&owner, |_, _, _, space, _, _| {
-            assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
-            Ok(())
-        })
-        .unwrap();
-
-        // A second key reads the owner's collection: it must neither fail
-        // for want of rights nor publish anything, and it sees what the owner
-        // saw, from the bytes, since it believes none of the owner's MAPs.
+        let pending = with_files_view(&owner, |_, _, _, _, _, _| Ok(())).unwrap_err();
+        assert!(pending
+            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .is_some());
+        // A different local host cannot use the owner's MAPs as its cover.
         let reader_key = test_pile.dir.join("reader.key");
         initialize_signer(&test_pile.path, Some(&reader_key)).unwrap();
         let reader = Storage::new(test_pile.path.clone(), Some(reader_key));
@@ -3360,16 +3354,12 @@ mod tests {
                     signer,
                     runtime,
                     None,
-                    |_, _, _, space, _, _| {
-                        assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
-                        Ok(())
-                    },
+                    |_, _, _, _, _, _| Ok(()),
                 )
             })
-            .unwrap();
+            .expect_err("foreign MAPs must not satisfy the strict reader");
 
-        // Once the worker carries the second commit, both readers still see
-        // both.
+        // Each host explicitly maintains its own cover before strict reading.
         with_files_store(&owner, |store, collection, signer, _| {
             crate::storage::carry_facts(store, collection, signer);
             Ok(())
@@ -3384,6 +3374,7 @@ mod tests {
             .with_store(|store, signer, runtime| {
                 let collection = open(store, DEFAULT_SCOPE_ID, authority)
                     .context("open the owner's Files collection")?;
+                crate::storage::carry_facts(store, collection, signer);
                 files_view_in(
                     store,
                     collection,
@@ -3901,7 +3892,7 @@ mod residual_tests {
     }
 
     #[test]
-    fn a_malformed_files_foundation_fails_loudly() {
+    fn files_name_raw_pending_but_reject_malformed_selected_attachments() {
         let directory = tempfile::tempdir().unwrap();
         let storage = storage(directory.path());
         let files = Files::with_storage(storage.clone());
@@ -3913,7 +3904,14 @@ mod residual_tests {
                 &[],
             )
             .unwrap();
-        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let pending = malformed_in(&storage, DEFAULT_SCOPE_ID);
+        assert!(files
+            .list(&[], None)
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.contains(&pending)));
+        crate::storage::residual_fixture::malformed_attachment_in(&storage, DEFAULT_SCOPE_ID);
         let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
         fault(files.list(&[], None).unwrap_err());
         fault(files.search("resident").unwrap_err());
