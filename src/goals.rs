@@ -1000,9 +1000,8 @@ mod tests {
         drop(store.maintain_attached(status, signer).await.unwrap());
     }
 
-    /// A host where nothing ever attached the status register -- no MAP
-    /// names it, so no maintenance pass finds it -- reads every goal's
-    /// status all the same, from the commits' own bytes.
+    /// An unmaintained register has no stored winners. The source remains
+    /// named pending input until the host explicitly maintains its targets.
     #[test]
     fn an_unmaintained_status_register_waits_for_upkeep() {
         pollster::block_on(async {

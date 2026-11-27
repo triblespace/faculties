@@ -1283,7 +1283,7 @@ mod tests {
     /// The owner's next maintenance pass derives both, without any grant,
     /// and every reader sees them.
     #[test]
-    fn source_only_writer_sends_and_acks_readably_before_maintenance_attaches_them() {
+    fn nonhost_writer_commits_send_and_ack_pending_until_host_upkeep() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = storage::runtime().unwrap();
         let owner = SigningKey::from_bytes(&[95; 32]);
@@ -1741,7 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_see_every_commit_whether_its_chain_was_carried_or_not() {
+    fn reads_keep_each_chains_stored_cover_until_host_upkeep() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let runtime = storage::runtime().unwrap();
         let relations_owner = SigningKey::from_bytes(&[93; 32]);

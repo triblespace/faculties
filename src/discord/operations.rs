@@ -5569,8 +5569,7 @@ mod tests {
         assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![away]);
     }
 
-    /// Bytes that are here and form no archive are a fault, never a
-    /// foundation that is away: a read fails loudly.
+    /// Raw bytes remain pending; malformed selected cover is a read fault.
     #[test]
     fn discord_names_raw_pending_but_rejects_malformed_selected_attachments() {
         let directory = tempfile::tempdir().unwrap();

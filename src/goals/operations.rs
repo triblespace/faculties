@@ -3994,8 +3994,7 @@ mod tests {
         );
     }
 
-    /// Bytes that are here and form no archive are a fault, not a foundation
-    /// that is away: the board fails loudly.
+    /// Pending raw input and malformed selected cover remain distinct.
     #[test]
     fn goals_name_raw_pending_but_reject_malformed_selected_attachments() {
         let (_directory, storage, resident, _) =
