@@ -613,9 +613,6 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         open: Rc::new(Cell::new(true)),
     };
     let ctx = egui::Context::default();
-    // This checks content and real clicks, not decorative expansion timing.
-    // Keep native background reads/waits; remove only animated clipping.
-    ctx.global_style_mut(|style| style.animation_time = 0.0);
     let nb_host = host.clone();
     // Exercise the normal Data composition, alongside the Rules card.
     // Other tests below retain the dedicated Colony target coverage.
@@ -624,6 +621,11 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         .embedded(&ctx, move |nb| {
             compose_hosted(nb, Target::Dashboard, nb_host.clone())
         });
+    // embedded installs its themes: set this afterwards so it remains effective.
+    // This checks content and real clicks, not decorative expansion timing.
+    // Keep native background reads/waits; remove only animated clipping.
+    ctx.global_style_mut(|style| style.animation_time = 0.0);
+    assert_eq!(ctx.global_style().animation_time, 0.0);
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
     let geometry = FrameDiagnostics::default();
     let mut events = Vec::new();
