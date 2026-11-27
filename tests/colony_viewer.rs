@@ -560,14 +560,46 @@ fn export_colony_fixture() {
     fixture.pile.close().unwrap();
 }
 
-/// Every text shape this frame drew, with where it is.
-fn shape_texts(shape: &Shape, result: &mut Vec<(String, egui::Rect)>) {
+/// Only the latest synthetic frame, printed on failure, never a history cache.
+#[derive(Default)]
+struct FrameDiagnostics(RefCell<Vec<String>>);
+
+impl Drop for FrameDiagnostics {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::Write;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "Latest frame geometry (at most 256 text shapes):");
+            for line in self.0.get_mut().iter() {
+                let _ = writeln!(stderr, "{line}");
+            }
+        }
+    }
+}
+
+/// Text shapes with a visible intersection, and a visible interaction anchor.
+/// Galley text is layout content, not proof that every glyph is on screen.
+fn shape_texts(
+    shape: &Shape,
+    clip: egui::Rect,
+    result: &mut Vec<(String, egui::Rect)>,
+    geometry: &mut Vec<String>,
+) {
     match shape {
-        Shape::Text(t) => result.push((
-            t.galley.text().to_owned(),
-            t.galley.rect.translate(t.pos.to_vec2()),
-        )),
-        Shape::Vec(v) => v.iter().for_each(|shape| shape_texts(shape, result)),
+        Shape::Text(t) => {
+            let rect = t.galley.rect.translate(t.pos.to_vec2());
+            let visible = rect.intersect(clip);
+            if geometry.len() <= 256 {
+                let label: String = t.galley.text().chars().take(96).collect();
+                geometry.push(format!(
+                    "{label:?}: rect={rect:?}, clip={clip:?}, visible={visible:?}"
+                ));
+            }
+            if visible.is_positive() {
+                result.push((t.galley.text().to_owned(), visible));
+            }
+        }
+        Shape::Vec(v) => v.iter().for_each(|shape| shape_texts(shape, clip, result, geometry)),
         _ => {}
     }
 }
@@ -581,6 +613,9 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         open: Rc::new(Cell::new(true)),
     };
     let ctx = egui::Context::default();
+    // This checks content and real clicks, not decorative expansion timing.
+    // Keep native background reads/waits; remove only animated clipping.
+    ctx.global_style_mut(|style| style.animation_time = 0.0);
     let nb_host = host.clone();
     // Exercise the normal Data composition, alongside the Rules card.
     // Other tests below retain the dedicated Colony target coverage.
@@ -590,6 +625,7 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
             compose_hosted(nb, Target::Dashboard, nb_host.clone())
         });
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
+    let geometry = FrameDiagnostics::default();
     let mut events = Vec::new();
     let mut frame = |events: Vec<egui::Event>| {
         let input = egui::RawInput {
@@ -599,8 +635,11 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         };
         let output = ctx.run_ui(input, |ui| notebook.show(ui, None));
         let mut texts = vec![];
+        let mut geometry = geometry.0.borrow_mut();
+        geometry.clear();
+        geometry.push(format!("viewport={screen:?}"));
         for shape in output.shapes {
-            shape_texts(&shape.shape, &mut texts);
+            shape_texts(&shape.shape, shape.clip_rect, &mut texts, &mut geometry);
         }
         texts
     };
@@ -831,6 +870,7 @@ fn a_workspace_without_the_archive_route_says_so_and_still_shows_the_prepared_in
             compose_hosted(nb, Target::Colony, nb_host.clone())
         });
     let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 20_000.0));
+    let geometry = FrameDiagnostics::default();
     let mut frame = |events: Vec<egui::Event>| {
         let output = ctx.run_ui(
             egui::RawInput {
@@ -841,8 +881,11 @@ fn a_workspace_without_the_archive_route_says_so_and_still_shows_the_prepared_in
             |ui| notebook.show(ui, None),
         );
         let mut texts = vec![];
+        let mut geometry = geometry.0.borrow_mut();
+        geometry.clear();
+        geometry.push(format!("viewport={screen:?}"));
         for shape in output.shapes {
-            shape_texts(&shape.shape, &mut texts);
+            shape_texts(&shape.shape, shape.clip_rect, &mut texts, &mut geometry);
         }
         texts
     };
