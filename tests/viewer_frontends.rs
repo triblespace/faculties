@@ -27,14 +27,14 @@ fn tiny_page() -> CapturePage {
 
 #[test]
 fn target_inventory_and_original_dashboard_order_are_explicit() {
-    assert_eq!(Target::ALL.len(), 13);
+    assert_eq!(Target::ALL.len(), 14);
     assert_eq!(
         Target::ALL
             .into_iter()
             .map(Target::name)
             .collect::<BTreeSet<_>>()
             .len(),
-        13
+        14
     );
     assert_eq!(
         Target::Dashboard.card_names(),
@@ -43,6 +43,7 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
             "profiles",
             "colony",
             "rules",
+            "quota",
             "timeline",
             "knowledge-health",
             "knowledge",
@@ -83,12 +84,12 @@ fn target_inventory_and_original_dashboard_order_are_explicit() {
 #[test]
 #[cfg(feature = "widgets")]
 fn dashboard_capture_labels_follow_rendered_card_order() {
-    use GORBIE::prelude::CardCtx;
     use faculties::storage::Storage;
-    use faculties::viewer::{Host, HostAction, compose_hosted};
+    use faculties::viewer::{compose_hosted, Host, HostAction};
     use faculties::widgets::{SourceKey, StorageState, WidgetContext};
     use std::cell::RefCell;
     use std::rc::Rc;
+    use GORBIE::prelude::CardCtx;
 
     fn text(shape: &egui::epaint::Shape, output: &mut Vec<String>) {
         match shape {
@@ -181,6 +182,7 @@ fn dashboard_capture_labels_follow_rendered_card_order() {
     let cards = cards.borrow();
     assert_eq!(cards.len() + 1, Target::Dashboard.card_names().len());
     for (title, name) in [
+        ("Quota", "quota"),
         ("Goals", "goals"),
         ("Priority game", "priority-game"),
         ("Decisions", "decisions"),

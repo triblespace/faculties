@@ -16,7 +16,6 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{CollectionCommit, CollectionStoreExt};
-use triblespace::core::inline::encodings::time::Lower;
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::prelude::*;
@@ -242,17 +241,8 @@ pub fn observe_at(
             let event = row.event;
             let provider = row.key.provider;
             let provider_name = provider_name(&facts, &snapshot, provider)?;
-            let used_percent = find!(
-                used: f64,
-                pattern!(&facts, [{ event @ attributes::used_percent: ?used }])
-            )
-            .collect();
-            let mut resets_at: Vec<i128> = find!(
-                at: Lower,
-                pattern!(&facts, [{ event @ attributes::resets_at: ?at }])
-            )
-            .map(|at| at.0)
-            .collect();
+            let (used_percent, resets_at) = quota::reading_values(&facts, event);
+            let mut resets_at = resets_at.collect::<Vec<_>>();
             resets_at.sort_unstable();
             let mut host = find!(
                 host: TextHandle,
@@ -273,7 +263,7 @@ pub fn observe_at(
                     .map(|bucket| read_text(&snapshot, bucket, "bucket"))
                     .transpose()?,
                 observed: row.observed,
-                used_percent,
+                used_percent: used_percent.collect(),
                 resets_at,
                 host,
             })
@@ -406,9 +396,9 @@ fn observe_statuses(
 }
 
 /// This build's name for a provider, else the name the pile carries for it.
-pub(super) fn provider_name(
+pub(crate) fn provider_name(
     facts: &FactArchive,
-    snapshot: &AcquiringReader<FacultySnapshot>,
+    snapshot: &(impl BlobStoreGet + ?Sized),
     provider: Id,
 ) -> Result<Option<String>> {
     match quota::known_provider_name(provider) {
@@ -423,7 +413,7 @@ pub(super) fn provider_name(
     }
 }
 
-pub(super) fn read_text<Store>(reader: &Store, handle: TextHandle, what: &str) -> Result<String>
+pub(crate) fn read_text<Store>(reader: &Store, handle: TextHandle, what: &str) -> Result<String>
 where
     Store: BlobStoreGet + ?Sized,
 {

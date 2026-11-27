@@ -8,7 +8,7 @@ use triblespace::core::query::rangeconstraint::value_range;
 use triblespace::prelude::*;
 
 use super::operations::{provider_name, read_text};
-use super::{quota, QuotaGroup, TextHandle};
+use super::{group_observations, quota, ObservationRow, QuotaGroup, TextHandle};
 use crate::out::Out;
 use crate::schemas::quota::KIND_QUOTA_OBSERVATION;
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
@@ -23,12 +23,12 @@ pub struct HistoryView {
     pub rows: Vec<QuotaGroup>,
 }
 
-pub(super) fn observe(
+pub(crate) fn rows_in_range(
     facts: &FactArchive,
-    snapshot: &AcquiringReader<FacultySnapshot>,
     since: i64,
     until: i64,
-) -> Result<HistoryView> {
+) -> Result<impl Iterator<Item = ObservationRow> + '_> {
+    anyhow::ensure!(since < until, "since must be before until");
     // `value_range` has inclusive raw-byte bounds (core/query/rangeconstraint.rs).
     // NsTAIInterval orders by lower then upper (core/inline/encodings/time.rs).
     // Start with the native encoder, then make a range sentinel just below
@@ -37,10 +37,12 @@ pub(super) fn observe(
     let min = super::unix_point(since)?;
     let mut max = super::unix_point(until)?;
     let encoded_lower = u128::from_be_bytes(max.raw[..16].try_into()?);
-    max.raw[..16].copy_from_slice(&(encoded_lower - 1).to_be_bytes());
+    let below_until = encoded_lower
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("until precedes the supported time range"))?;
+    max.raw[..16].copy_from_slice(&below_until.to_be_bytes());
     max.raw[16..].fill(255);
-    let mut rows = Vec::new();
-    for (event, provider, account, window, observed) in find!(
+    let rows = find!(
         (event: Id, provider: Id, account: TextHandle, window: i128, observed: Lower),
         and!(
             pattern!(facts, [{ ?event @
@@ -52,18 +54,22 @@ pub(super) fn observe(
             }]),
             value_range(observed, min, max),
         )
-    ) {
-        let used_percent = find!(
-            used: f64,
-            pattern!(facts, [{ event @ quota::used_percent: ?used }])
-        )
-        .collect::<Vec<_>>();
-        let mut resets_at = find!(
-            at: Lower,
-            pattern!(facts, [{ event @ quota::resets_at: ?at }])
-        )
-        .map(|at| at.0)
-        .collect::<Vec<_>>();
+    );
+    Ok(group_observations(facts, rows))
+}
+
+pub(super) fn observe(
+    facts: &FactArchive,
+    snapshot: &AcquiringReader<FacultySnapshot>,
+    since: i64,
+    until: i64,
+) -> Result<HistoryView> {
+    let mut rows = Vec::new();
+    for row in rows_in_range(facts, since, until)? {
+        let event = row.event;
+        let key = row.key;
+        let (used_percent, resets_at) = super::reading_values(facts, event);
+        let mut resets_at = resets_at.collect::<Vec<_>>();
         resets_at.sort_unstable();
         let mut host = find!(
             host: TextHandle,
@@ -72,31 +78,21 @@ pub(super) fn observe(
         .map(|host| read_text(snapshot, host, "host"))
         .collect::<Result<Vec<_>>>()?;
         host.sort();
-        let mut buckets = find!(
-            bucket: TextHandle,
-            pattern!(facts, [{ event @ quota::bucket: ?bucket }])
-        )
-        .map(|bucket| read_text(snapshot, bucket, "bucket").map(Some))
-        .collect::<Result<Vec<_>>>()?;
-        if buckets.is_empty() {
-            buckets.push(None);
-        }
-        let account = read_text(snapshot, account, "account")?;
-        let provider_name = provider_name(facts, snapshot, provider)?;
-        for bucket in buckets {
-            rows.push(QuotaGroup {
-                event,
-                provider,
-                provider_name: provider_name.clone(),
-                account: account.clone(),
-                window_secs: i64::try_from(window / 1_000_000_000).unwrap_or(i64::MAX),
-                bucket,
-                observed: observed.0,
-                used_percent: used_percent.clone(),
-                resets_at: resets_at.clone(),
-                host: host.clone(),
-            });
-        }
+        rows.push(QuotaGroup {
+            event,
+            provider: key.provider,
+            provider_name: provider_name(facts, snapshot, key.provider)?,
+            account: read_text(snapshot, key.account, "account")?,
+            window_secs: i64::try_from(key.window / 1_000_000_000).unwrap_or(i64::MAX),
+            bucket: key
+                .bucket
+                .map(|handle| read_text(snapshot, handle, "bucket"))
+                .transpose()?,
+            observed: row.observed,
+            used_percent: used_percent.collect(),
+            resets_at,
+            host,
+        });
     }
     rows.sort_by(|a, b| {
         (

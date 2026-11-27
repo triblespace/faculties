@@ -13,6 +13,7 @@ pub enum Target {
     Schemas,
     Colony,
     Rules,
+    Quota,
     Discord,
     Files,
     KnowledgeHealth,
@@ -25,11 +26,12 @@ pub enum Target {
 }
 
 impl Target {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Dashboard,
         Self::Schemas,
         Self::Colony,
         Self::Rules,
+        Self::Quota,
         Self::Discord,
         Self::Files,
         Self::KnowledgeHealth,
@@ -47,6 +49,7 @@ impl Target {
             Self::Schemas => "schemas",
             Self::Colony => "colony",
             Self::Rules => "rules",
+            Self::Quota => "quota",
             Self::Discord => "discord",
             Self::Files => "files",
             Self::KnowledgeHealth => "knowledge-health",
@@ -67,6 +70,7 @@ impl Target {
                 "profiles",
                 "colony",
                 "rules",
+                "quota",
                 "timeline",
                 "knowledge-health",
                 "knowledge",
@@ -87,6 +91,7 @@ impl Target {
             Self::Schemas => &["storage", "schemas"],
             Self::Colony => &["storage", "colony"],
             Self::Rules => &["storage", "rules"],
+            Self::Quota => &["storage", "quota"],
             Self::Discord => &["storage", "discord"],
             Self::Files => &["storage", "files"],
             Self::KnowledgeHealth => &["storage", "knowledge-health"],
