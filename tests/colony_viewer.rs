@@ -928,7 +928,8 @@ fn a_workspace_without_the_archive_route_says_so_and_still_shows_the_prepared_in
             .map(|(text, _)| text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        if joined.contains("Archive history unavailable") {
+        // The heading can paint before its reason during header expansion.
+        if joined.contains("Archive route missing from this workspace.") {
             break joined;
         }
         assert!(Instant::now() < deadline, "{joined}");
@@ -938,6 +939,7 @@ fn a_workspace_without_the_archive_route_says_so_and_still_shows_the_prepared_in
         shown.contains("Archive route missing from this workspace."),
         "{shown}"
     );
+    assert!(shown.contains("Archive history unavailable."), "{shown}");
     assert!(shown.contains("Prepared opening input"), "{shown}");
     assert!(!shown.contains("Listening to fixture"), "{shown}");
     fixture.pile.close().unwrap();
