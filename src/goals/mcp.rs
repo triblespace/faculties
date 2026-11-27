@@ -229,7 +229,7 @@ impl Faculty for Goals {
             }
             "goals_show" => {
                 let args: ShowArguments = decode_arguments(arguments)?;
-                output.text(self.operations.show(&args.id)?)
+                render::board(&self.operations.show(&args.id)?, output)
             }
             "goals_prioritize" => {
                 let args: PriorityArguments = decode_arguments(arguments)?;

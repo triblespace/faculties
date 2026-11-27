@@ -100,12 +100,7 @@ impl Memory {
     pub fn raw(&self, id: Id, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| {
             let (loaded, unread) = storage.load_read()?;
-            if unread != 0 {
-                out.note(format!(
-                    "{unread} foundation(s) of Memory could not be read, \
-                     so this view omits whatever they hold"
-                ))?;
-            }
+            note_unread(out, &unread)?;
             let handle = chunk_summary_handle(&loaded.memory.facts, id)
                 .with_context(|| format!("memory {id:x} has no text summary"))?;
             let summary: View<str> = loaded
@@ -127,12 +122,7 @@ impl Memory {
     pub fn show_many(&self, selectors: &[String], out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| {
             let (loaded, unread) = storage.load_read()?;
-            if unread != 0 {
-                out.note(format!(
-                    "{unread} foundation(s) of Memory could not be read, \
-                     so this view omits whatever they hold"
-                ))?;
-            }
+            note_unread(out, &unread)?;
             for (index, raw) in selectors.iter().enumerate() {
                 let id = if raw.contains("..") {
                     let (start, end) = parse_time_range(raw)?;
@@ -152,7 +142,8 @@ impl Memory {
     }
     pub fn turn(&self, turn: &str, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| {
-            let loaded = storage.load()?;
+            let (loaded, unread) = storage.load_read()?;
+            note_unread(out, &unread)?;
             print_turn_facets(&loaded.memory.reader, &loaded.memory.facts, turn, out)
         })
     }
@@ -262,8 +253,22 @@ impl Memory {
         let range = range.unwrap_or((now - moment(), now));
         require_duration(range)?;
         self.with_operation(|storage| {
-            let loaded = storage.load()?;
-            let id = create_chunk(storage, &loaded, summary, range, tags, now)?;
+            // Writing an entry reads nothing unless it links to one: the
+            // journal stays writable while a foundation is away (2026-11-26).
+            // A link resolves against what is here, and a target that could
+            // not be found says what could not be loaded.
+            let references = if scan_hard_references(summary).is_empty() {
+                BTreeSet::new()
+            } else {
+                let (loaded, unread) = storage.load_read()?;
+                resolve_hard_references(&loaded, summary).map_err(|error| {
+                    match crate::storage::unread_foundations_note("Memory", &unread) {
+                        Some(note) => error.context(note),
+                        None => error,
+                    }
+                })?
+            };
+            let id = publish_text_chunk(storage, references, summary, range, tags, now)?;
             Ok(CreatedMemory {
                 id,
                 start: range.0,
@@ -307,7 +312,10 @@ impl Memory {
             bail!("sim_threshold must be a finite number in [0, 1]");
         }
         self.with_operation(|storage| {
-            let loaded = storage.load()?;
+            // The cover is what a wake reads: one foundation that could not
+            // be loaded leaves its memories out and says so in the
+            // diagnostics, rather than leaving the wake with no cover.
+            let (loaded, unread) = storage.load_read()?;
             #[cfg(feature = "wemm")]
             let mut session = None;
             #[cfg(feature = "wemm")]
@@ -315,12 +323,16 @@ impl Memory {
             #[cfg(not(feature = "wemm"))]
             let mut semantic =
                 |_: &str| -> Result<Option<std::collections::HashMap<Id, f32>>> { Ok(None) };
-            crate::memory_cover::render_cover_report(
+            let mut report = crate::memory_cover::render_cover_report(
                 &loaded.memory.facts,
                 &loaded.memory.reader,
                 options,
                 &mut semantic,
-            )
+            )?;
+            report
+                .diagnostics
+                .extend(crate::storage::unread_foundations_note("Memory", &unread));
+            Ok(report)
         })
     }
     /// Every recollection's score by meaning against `query`, as
@@ -331,7 +343,10 @@ impl Memory {
     pub fn about_scores(&self, query: &str) -> Result<Option<std::collections::HashMap<Id, f32>>> {
         #[cfg(feature = "wemm")]
         return self.with_operation(|storage| {
-            let loaded = storage.load()?;
+            // A tint over what is here: a memory in a foundation that could
+            // not be loaded is simply unscored, and the cover it tints says
+            // what it omits.
+            let (loaded, _unread) = storage.load_read()?;
             let mut session = None;
             crate::memory_cover::about_scores_if_choice(&loaded.memory.facts, query, &mut |query| {
                 semantic_scores(storage, &loaded, &mut session, query)
@@ -459,7 +474,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::blob::Bytes;
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt, Support};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::BlobStoreGet;
@@ -503,6 +518,9 @@ struct LoadedProvenance {
     memory: LoadedMemory,
     cognition: CollectionView,
     archive: CollectionView,
+    /// What each of the three reads could not load, one note per
+    /// collection that left something out.
+    unread: Vec<String>,
 }
 
 impl MemoryStorage<'_> {
@@ -539,14 +557,14 @@ impl MemoryStorage<'_> {
         })
     }
 
-    /// [`Self::attach_collection`] for a lookup: answer from the foundations
-    /// this observation could read, and carry the ones it could not so the
-    /// caller can say so. Never for an answer that depends on absence.
+    /// [`Self::attach_collection`] for an answer over what is here: the
+    /// foundations this observation could read, and the ones it could not,
+    /// so the caller can say so ([`note_unread`]).
     fn attach_collection_read(
         collection: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
         store_snapshot: &PileSnapshot,
         label: &str,
-    ) -> Result<(CollectionView, usize)> {
+    ) -> Result<(CollectionView, Support<blobencodings::SimpleArchive>)> {
         let (facts, unread) = crate::storage::acquire_facts_read(store_snapshot, collection)
             .with_context(|| format!("attach maintained {label} collection"))?
             .into_parts();
@@ -555,7 +573,7 @@ impl MemoryStorage<'_> {
                 facts,
                 reader: store_snapshot.clone(),
             },
-            unread.len(),
+            unread,
         ))
     }
 
@@ -567,10 +585,10 @@ impl MemoryStorage<'_> {
         Ok(LoadedMemory { memory })
     }
 
-    /// Freeze maintained Memory alone for a lookup, with the number of
-    /// foundations the observation omits. A caller that reports that number
-    /// reads this; one whose answer depends on absence calls [`Self::load`].
-    fn load_read(&self) -> Result<(LoadedMemory, usize)> {
+    /// Freeze maintained Memory alone, with the foundations the observation
+    /// could not load. Every view reads this and says what it omits; only a
+    /// write that supersedes what it saw calls [`Self::load`].
+    fn load_read(&self) -> Result<(LoadedMemory, Support<blobencodings::SimpleArchive>)> {
         self.load_with(Self::attach_collection_read)
             .map(|(loaded, unread, _)| (loaded, unread))
     }
@@ -684,7 +702,8 @@ impl MemoryStorage<'_> {
     }
 
     /// Freeze Memory, Cognition, and Archive from exactly one pile snapshot
-    /// for a coherent cross-scope provenance read.
+    /// for a coherent cross-scope provenance read, each read from what is
+    /// here, with a note for every collection that left something out.
     fn load_provenance(&self) -> Result<LoadedProvenance> {
         let scopes = [
             MEMORY_SCOPE_ID,
@@ -761,15 +780,23 @@ impl MemoryStorage<'_> {
                     .context("freeze maintained Memory/Cognition/Archive snapshot")?,
                 runtime.clone(),
             );
-            let memory = Self::load_memory_from_snapshot(memory_collection, &store_snapshot)?;
+            let mut unread = Vec::new();
+            let mut read = |collection, label| {
+                let (view, missing) =
+                    Self::attach_collection_read(collection, &store_snapshot, label)?;
+                unread.extend(crate::storage::unread_foundations_note(label, &missing));
+                Ok::<_, anyhow::Error>(view)
+            };
+            let memory = LoadedMemory {
+                memory: read(memory_collection, "Memory")?,
+            };
+            let cognition = read(cognition_collection, "Cognition")?;
+            let archive = read(archive_collection, "Archive")?;
             Ok(LoadedProvenance {
                 memory,
-                cognition: Self::attach_collection(
-                    cognition_collection,
-                    &store_snapshot,
-                    "Cognition",
-                )?,
-                archive: Self::attach_collection(archive_collection, &store_snapshot, "Archive")?,
+                cognition,
+                archive,
+                unread,
             })
         })
     }
@@ -974,6 +1001,14 @@ fn search_hits(
     let (loaded, (), collection) = storage.load_with(|collection, snapshot, label| {
         MemoryStorage::attach_collection(collection, snapshot, label).map(|view| (view, ()))
     })?;
+    Ok(crate::search::SourceRead {
+        collection,
+        hits: scored_hits(&loaded, query)?,
+    })
+}
+
+/// The BM25 hits for `query` over one frozen Memory view, best first.
+fn scored_hits(loaded: &LoadedMemory, query: &str) -> Result<Vec<SearchHit>> {
     let mut rows: Vec<(Id, f32)> = crate::memory_cover::lexical_relevance_scores(
         &loaded.memory.facts,
         &loaded.memory.reader,
@@ -1010,11 +1045,16 @@ fn search_hits(
             summary_handles: summaries.into_iter().map(|h| hex::encode(h.raw)).collect(),
         });
     }
-    Ok(crate::search::SourceRead { collection, hits })
+    Ok(hits)
 }
 
 fn search(storage: MemoryStorage<'_>, query: &str, out: &mut Out<'_>) -> Result<()> {
-    let hits = search_hits(storage, query)?.hits;
+    if query.is_empty() {
+        bail!("memory search requires a query");
+    }
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
+    let hits = scored_hits(&loaded, query)?;
     if hits.is_empty() {
         return out.line("no matches.");
     }
@@ -1116,7 +1156,8 @@ fn similar(
     let scores = storage.cosines(session, query)?;
     scores.require_rows("Memory")?;
     let cosines = &scores.cosines;
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let space = &loaded.memory.facts;
     let mut ranked: Vec<(f64, Id)> = chunk_cosines(space, cosines)
         .into_iter()
@@ -1485,14 +1526,30 @@ fn create_chunk(
     tags: &[String],
     observed_at: Epoch,
 ) -> Result<Id> {
-    let hard_refs = scan_hard_references(summary_text);
+    let references = resolve_hard_references(loaded, summary_text)?;
+    publish_text_chunk(storage, references, summary_text, range, tags, observed_at)
+}
+
+/// The chunks `summary_text`'s hard references `[text](memory:<hex>)` name.
+fn resolve_hard_references(loaded: &LoadedMemory, summary_text: &str) -> Result<BTreeSet<Id>> {
     let mut reference_ids = BTreeSet::new();
-    for hex in &hard_refs {
+    for hex in &scan_hard_references(summary_text) {
         let target = resolve_chunk_id(loaded, hex)
             .map_err(|e| anyhow!("hard reference (memory:{hex}): {e}"))?;
         reference_ids.insert(target);
     }
+    Ok(reference_ids)
+}
 
+/// Publish a text chunk whose references are already resolved.
+fn publish_text_chunk(
+    storage: MemoryStorage<'_>,
+    reference_ids: BTreeSet<Id>,
+    summary_text: &str,
+    range: (Epoch, Epoch),
+    tags: &[String],
+    observed_at: Epoch,
+) -> Result<Id> {
     let start_at = clock::point(range.0)?;
     let end_at = clock::point(range.1)?;
     let observed_at = clock::point(observed_at)?;
@@ -1671,7 +1728,8 @@ fn humanize_ns(ns: i128) -> String {
 fn list_tags(storage: MemoryStorage<'_>, wanted: Option<&str>, out: &mut Out<'_>) -> Result<()> {
     type TextHandle = Inline<Handle<UTF8String>>;
     let wanted = wanted.map(|tag| tag.trim().to_lowercase());
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let space = &loaded.memory.facts;
     let reader = &loaded.memory.reader;
     let mut names: BTreeMap<TextHandle, String> = BTreeMap::new();
@@ -1818,7 +1876,8 @@ fn list(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -> R
         Some(raw) => Some((raw.to_owned(), parse_grain(raw)?)),
         None => None,
     };
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let mut chunks = collect_chunk_spans(&loaded.memory.facts);
     if chunks.is_empty() {
         out.line(format!("no memory chunks"))?;
@@ -1892,7 +1951,8 @@ fn churn(storage: MemoryStorage<'_>, opts: &ChurnOptions, out: &mut Out<'_>) -> 
         steps,
         step_units,
     } = *opts;
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let rows = crate::memory_cover::replay_cover(
         &loaded.memory.facts,
         &loaded.memory.reader,
@@ -1981,7 +2041,8 @@ fn churn(storage: MemoryStorage<'_>, opts: &ChurnOptions, out: &mut Out<'_>) -> 
 
 fn check(storage: MemoryStorage<'_>, grain_raw: &str, out: &mut Out<'_>) -> Result<()> {
     let grain_ns = parse_grain(grain_raw)?;
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let all = collect_chunk_spans(&loaded.memory.facts);
     if all.is_empty() {
         out.line(format!("no memory chunks"))?;
@@ -2053,7 +2114,8 @@ fn density(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -
         Some(raw) => Some(parse_grain(raw)?),
         None => None,
     };
-    let loaded = storage.load()?;
+    let (loaded, unread) = storage.load_read()?;
+    note_unread(out, &unread)?;
     let spans = collect_chunk_spans(&loaded.memory.facts);
     if spans.is_empty() {
         out.line(format!("no memory chunks"))?;
@@ -2198,6 +2260,9 @@ fn density(storage: MemoryStorage<'_>, grain: Option<&str>, out: &mut Out<'_>) -
 
 fn meta(storage: MemoryStorage<'_>, raw: &str, out: &mut Out<'_>) -> Result<()> {
     let loaded = storage.load_provenance()?;
+    for note in &loaded.unread {
+        out.note(note.clone())?;
+    }
     let memory = &loaded.memory;
     let space = &memory.memory.facts;
     let chunk_id = if raw.contains("..") {
@@ -2548,6 +2613,9 @@ fn find_archive_in_range<P: TriblePattern>(
 /// automatically associates it with that chunk.
 fn provenance(storage: MemoryStorage<'_>, chunk_arg: &str, out: &mut Out<'_>) -> Result<()> {
     let loaded = storage.load_provenance()?;
+    for note in &loaded.unread {
+        out.note(note.clone())?;
+    }
     let memory_catalog = &loaded.memory.memory.facts;
     let chunk_id = resolve_chunk_id(&loaded.memory, chunk_arg)
         .map_err(|e| anyhow!("resolve chunk id `{chunk_arg}`: {e}"))?;
@@ -2616,6 +2684,15 @@ fn print_chunk<P: TriblePattern>(
 
 fn fmt_id(id: Id) -> String {
     format!("{id:x}")
+}
+
+/// Say beside an answer which Memory foundations its read could not load
+/// ([`crate::storage::unread_foundations_note`]); nothing when it read all.
+fn note_unread(out: &mut Out<'_>, unread: &Support<blobencodings::SimpleArchive>) -> Result<()> {
+    match crate::storage::unread_foundations_note("Memory", unread) {
+        Some(note) => out.note(note),
+        None => Ok(()),
+    }
 }
 
 fn resolve_chunk_id(loaded: &LoadedMemory, raw: &str) -> Result<Id> {
@@ -3577,9 +3654,10 @@ mod tests {
         // (MCP included) sees that this view is incomplete.
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(
-            notes[0].starts_with("1 foundation(s) of Memory could not be read"),
+            notes[0].starts_with("1 foundation(s) of Memory could not be loaded"),
             "{notes:?}"
         );
+        assert!(notes[0].contains(&hex::encode(cold.raw)), "{notes:?}");
         // Raw answer bytes stay separate from the same frontend-neutral
         // incomplete-view evidence; there is no fabricated terminal newline.
         let mut raw_parts = Vec::new();
@@ -3603,19 +3681,7 @@ mod tests {
                 },
             ]
         );
-        // A write depends on absence, so it still refuses and names the
-        // unread member.
-        for summary in [
-            "a later journal entry".to_owned(),
-            format!("[earlier](memory:{warm:x})"),
-        ] {
-            let error = memory.create(&summary, Some(range), &[]).unwrap_err();
-            let incomplete = error
-                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
-                .unwrap();
-            assert_eq!(incomplete.unread.collection(), source);
-            assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
-        }
+        // Reading changed nothing: no record, no fetched bytes, no want.
         fixture
             .storage
             .with_pile(|pile, _| {
@@ -3626,6 +3692,96 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // Journaling goes on while the foundation is away (2026-11-26): an
+        // entry without links reads nothing, and a link to a resident memory
+        // resolves against what is here.
+        let later = memory
+            .create("a later journal entry", Some(range), &[])
+            .unwrap();
+        let relinked = memory
+            .create(
+                &format!("[earlier again](memory:{warm:x})"),
+                Some(range),
+                &[],
+            )
+            .unwrap();
+        let (loaded, unread) = storage.load_read().unwrap();
+        assert_eq!(unread.members().collect::<Vec<_>>(), vec![cold]);
+        assert_eq!(
+            resolve_chunk_id(&loaded, &format!("{:x}", later.id)).unwrap(),
+            later.id
+        );
+        assert_eq!(
+            chunk_references(&loaded.memory.facts, relinked.id),
+            vec![warm]
+        );
+        // A link that names nothing here fails, and says what could not be
+        // loaded, since the target may be there.
+        let error = memory
+            .create(
+                &format!("[missing](memory:{:x})", unknown.id),
+                Some(range),
+                &[],
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("no chunk id matches"), "{rendered}");
+        assert!(rendered.contains("could not be loaded"), "{rendered}");
+        assert!(rendered.contains(&hex::encode(cold.raw)), "{rendered}");
+        // The cover a wake reads keeps the resident journal and names the gap.
+        let report = memory.context(&CoverOpts::plain(100_000)).unwrap();
+        assert!(report.text.contains("already resident history"));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|line| line.contains(&hex::encode(cold.raw))),
+            "{:?}",
+            report.diagnostics
+        );
+        // Only a write that supersedes what it saw still refuses.
+        let incomplete = storage.load().err().expect("strict Memory view");
+        let incomplete = incomplete
+            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+            .unwrap();
+        assert_eq!(incomplete.unread.collection(), source);
+        assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![cold]);
+    }
+
+    /// Bytes that are here and form no archive are a fault, not a gap: every
+    /// read fails loudly rather than answering without them.
+    #[test]
+    fn memory_reads_fail_loudly_on_a_malformed_foundation() {
+        let fixture = TestPile::new();
+        let storage = fixture.storage();
+        let memory = Memory::with_storage(fixture.storage.clone());
+        let warm = publish_chunk(
+            storage,
+            text_draft(
+                "resident before the fault",
+                "2026-09-01T00:00:00",
+                "2026-09-01T01:00:00",
+            ),
+        );
+        fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, MEMORY_SCOPE_ID, signer.verifying_key())?;
+                crate::storage::residual_fixture::malformed(pile, source, signer)?;
+                Ok(())
+            })
+            .unwrap();
+        let error = memory
+            .show(&format!("{warm:x}"), &mut Out::new(&mut |_| Ok(())))
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_none(),
+            "a fault is not an unread gap: {error:#}"
+        );
+        assert!(memory.context(&CoverOpts::plain(100_000)).is_err());
+        assert!(storage.load_read().is_err());
     }
 
     #[test]
@@ -3708,13 +3864,28 @@ mod tests {
                 Ok((cold, records))
             })
             .unwrap();
+        // Provenance reads what is here and names each collection's gap.
+        let provenance = storage.load_provenance().unwrap();
+        assert_eq!(
+            resolve_chunk_id(&provenance.memory, &format!("{warm:x}")).unwrap(),
+            warm
+        );
+        assert_eq!(provenance.unread.len(), 3, "{:?}", provenance.unread);
+        for ((note, label), handle) in provenance
+            .unread
+            .iter()
+            .zip(["Memory", "Cognition", "Archive"])
+            .zip([cold[0], cold[2], cold[3]])
+        {
+            assert!(
+                note.contains(&format!("of {label} could not be loaded")),
+                "{note}"
+            );
+            assert!(note.contains(&hex::encode(handle.raw)), "{note}");
+        }
         for error in [
             storage.load().err().expect("incomplete memory view"),
             storage.load_comb().err().expect("incomplete comb view"),
-            storage
-                .load_provenance()
-                .err()
-                .expect("incomplete provenance"),
         ] {
             let incomplete = error
                 .downcast_ref::<crate::storage::IncompleteAttachedRead>()

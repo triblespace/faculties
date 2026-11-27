@@ -7,9 +7,18 @@ use crate::out::Out;
 
 pub(super) fn added(receipt: &AddedGoal, output: &mut Out<'_>) -> Result<()> {
     warn_unresolved(&receipt.unresolved_mentions);
+    notes(&receipt.notes, output)?;
     output.line(format!("Added goal {:x}", receipt.goal))?;
     if let Some(note) = receipt.note {
         output.line(format!("Added note {note:x} to goal {:x}", receipt.goal))?;
+    }
+    Ok(())
+}
+
+/// Each note on what a read could not load, beside the receipt.
+fn notes(notes: &[String], output: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        output.note(note.clone())?;
     }
     Ok(())
 }
@@ -23,6 +32,7 @@ fn warn_unresolved(labels: &[String]) {
 }
 
 pub(super) fn moved(receipt: &MovedGoal, output: &mut Out<'_>) -> Result<()> {
+    notes(&receipt.notes, output)?;
     output.line(format!(
         "Moved goal {:x} to {}",
         receipt.goal, receipt.status
@@ -30,6 +40,7 @@ pub(super) fn moved(receipt: &MovedGoal, output: &mut Out<'_>) -> Result<()> {
 }
 
 pub(super) fn tagged(receipt: &TaggedGoal, output: &mut Out<'_>) -> Result<()> {
+    notes(&receipt.notes, output)?;
     if !receipt.added.is_empty() {
         output.line(format!(
             "Tagged goal {:x}: {}",
@@ -49,6 +60,7 @@ pub(super) fn tagged(receipt: &TaggedGoal, output: &mut Out<'_>) -> Result<()> {
 
 pub(super) fn noted(receipt: &AddedNote, output: &mut Out<'_>) -> Result<()> {
     warn_unresolved(&receipt.unresolved_mentions);
+    notes(&receipt.notes, output)?;
     output.line(format!(
         "Added note {:x} to goal {:x}",
         receipt.note, receipt.goal

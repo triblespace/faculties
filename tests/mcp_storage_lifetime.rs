@@ -214,7 +214,8 @@ fn catalog_retains_one_open_pile_across_tools_adapters_and_protocol_sessions() {
     assert!(!fixture.pile.exists());
     let persisted = Goals::new(renamed, Some(fixture.key.clone()))
         .show(&goal)
-        .unwrap();
+        .unwrap()
+        .text;
     assert!(persisted.contains("shared-pile-record"), "{persisted}");
     assert!(persisted.contains("doing"), "{persisted}");
 }

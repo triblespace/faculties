@@ -70,8 +70,7 @@ impl Fixture {
             let source = open_configured(&mut pile, scope, signer.verifying_key()).unwrap();
             carry_facts(&mut pile, source, &signer);
         }
-        let status =
-            goals::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
+        let status = goals::status_register_collection(&mut pile, signer.verifying_key()).unwrap();
         pollster::block_on(async { drop(pile.maintain_attached(status, &signer).await.unwrap()) });
         pile.close().unwrap();
     }
@@ -382,6 +381,7 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
             .operations()
             .show(&first_id)
             .unwrap()
+            .text
             .contains("source-only research note"));
     }
 }
@@ -471,7 +471,7 @@ fn direct_operations_return_action_ids_and_preserve_additive_semantics() {
     assert_ne!(priority.event, removed.event);
     assert!(operations.deprioritize(&child_id, &other_id, None).is_err());
 
-    let show = operations.show(&parent_id).unwrap();
+    let show = operations.show(&parent_id).unwrap().text;
     assert!(show.contains("initial note"));
     assert!(show.contains("replacement"));
     assert!(show.contains(&format!("supersedes: {}", supersedes[0])));
@@ -514,11 +514,11 @@ fn cli_mcp_and_direct_reads_agree() {
     let faculty = fixture.mcp();
     assert_eq!(
         fixture.cli(&["show", &id], None),
-        operations.show(&id).unwrap()
+        operations.show(&id).unwrap().text
     );
     assert_eq!(
         call(&faculty, "goals_show", serde_json::json!({"id":id})),
-        operations.show(&id).unwrap()
+        operations.show(&id).unwrap().text
     );
     assert_eq!(
         fixture.cli(&["list"], None),
@@ -741,7 +741,7 @@ fn mcp_title_and_notes_are_literal_even_when_a_matching_host_file_exists() {
         "goals_note",
         serde_json::json!({"id":id,"note":literal}),
     );
-    let shown = fixture.operations().show(&id).unwrap();
+    let shown = fixture.operations().show(&id).unwrap().text;
     assert!(shown.contains(&format!("Title: {literal}")));
     assert!(shown.contains("  @-"));
     assert!(!shown.contains("HOST CONTENT"));
@@ -771,9 +771,15 @@ fn cli_keeps_file_stdin_and_literal_escape_input_conventions() {
         .operations()
         .show(&id)
         .unwrap()
+        .text
         .contains("note from file"));
     fixture.cli(&["note", &id, "@@-"], None);
-    assert!(fixture.operations().show(&id).unwrap().contains("  @-"));
+    assert!(fixture
+        .operations()
+        .show(&id)
+        .unwrap()
+        .text
+        .contains("  @-"));
     fixture.cli(&["add", "@-"], Some("title from stdin"));
     fixture.cli(&["add", "@@literal title"], None);
     let listed = fixture
@@ -819,14 +825,8 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
         ("goals_list", r#"{"tags":[1]}"#),
         ("goals_priorities", r#"{"tags":[1]}"#),
         ("goals_move", r#"{"id":"x","status":1}"#),
-        (
-            "goals_note",
-            r#"{"id":"x","note":"first","note":"second"}"#,
-        ),
-        (
-            "goals_note",
-            r#"{"id":"x","note":"ok","supersedes":true}"#,
-        ),
+        ("goals_note", r#"{"id":"x","note":"first","note":"second"}"#),
+        ("goals_note", r#"{"id":"x","note":"ok","supersedes":true}"#),
         ("goals_show", r#"{"id":"x","key":"wrong"}"#),
         ("goals_prioritize", r#"{"higher":"x","over":[]}"#),
         (
@@ -834,10 +834,7 @@ fn discovery_and_invalid_arguments_do_not_open_the_pile() {
             r#"{"higher":"x","over":"y","persona":true}"#,
         ),
         ("goals_deprioritize", r#"{"higher":"x"}"#),
-        (
-            "goals_resolve",
-            r#"{"prefix":"x","output":"/tmp/target"}"#,
-        ),
+        ("goals_resolve", r#"{"prefix":"x","output":"/tmp/target"}"#),
     ] {
         let error = collect(|out| faculty.call(tool, Bytes::from(raw.as_bytes().to_vec()), out))
             .unwrap_err();

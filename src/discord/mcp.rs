@@ -164,7 +164,8 @@ impl Faculty for Discord {
         match name {
             "discord_auth_status" => {
                 let _: Empty = decode_arguments(arguments)?;
-                render::auth(&self.operations.auth_status()?, out)
+                let (status, notes) = self.operations.auth_status_read()?;
+                render::auth(&status, &notes, out)
             }
             "discord_auth_set" => {
                 let args: AuthSet = decode_arguments(arguments)?;

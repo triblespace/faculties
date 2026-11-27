@@ -86,6 +86,9 @@ pub struct AddedGoal {
     /// `@label` tokens in the title or note that named no Relations person
     /// or group. The write succeeded; nobody was addressed by these.
     pub unresolved_mentions: Vec<String>,
+    /// What the reads behind the write could not load
+    /// ([`storage::unread_foundations_note`]); the write is stored.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,6 +96,8 @@ pub struct MovedGoal {
     pub goal: Id,
     pub event: Id,
     pub status: String,
+    /// What the read that resolved the goal could not load.
+    pub notes: Vec<String>,
 }
 
 /// The tags one tag operation asserted on a goal.
@@ -103,6 +108,9 @@ pub struct TaggedGoal {
     pub added: Vec<String>,
     /// Requested tags the goal already held; nothing was written for them.
     pub held: Vec<String>,
+    /// What the read that found the goal could not load: a tag held only
+    /// there is asserted again, which changes nothing.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +120,8 @@ pub struct AddedNote {
     /// `@label` tokens in the note that named no Relations person or group.
     /// The write succeeded; nobody was addressed by these.
     pub unresolved_mentions: Vec<String>,
+    /// What the reads behind the write could not load.
+    pub notes: Vec<String>,
 }
 
 /// One goal as a structured reading, for a caller that renders its own text
@@ -154,8 +164,9 @@ pub struct GoalNote {
 /// A rendered board and the advisory notes about it.
 ///
 /// `notes` is empty for every board a well-behaved, sequential writer
-/// produces. It speaks only of priority data such writers do not make (a
-/// cycle, a snapshot that ranks over itself); the board is read regardless.
+/// produces over a complete read. It speaks of priority data such writers do
+/// not make (a cycle, a snapshot that ranks over itself), and of foundations
+/// the read could not load; the board is read regardless.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Board {
     pub text: String,
@@ -288,7 +299,8 @@ impl Goals {
         for status in &statuses {
             validate_label("status", status)?;
         }
-        self.storage().with_view(|space, reader, status_register| {
+        let storage = self.storage();
+        let (mut board, unread) = storage.with_view_read(|space, reader, status_register| {
             render_priorities(
                 reader,
                 space,
@@ -297,7 +309,9 @@ impl Goals {
                 options.tags,
                 options.all,
             )
-        })
+        })?;
+        board.notes.extend(unread);
+        Ok(board)
     }
 
     pub fn move_goal(&self, id: &str, status: &str, persona: Option<&str>) -> Result<MovedGoal> {
@@ -333,14 +347,17 @@ impl Goals {
     /// until a note on the goal supersedes it.
     pub fn mark_unclear(&self, id: &str, persona: Option<&str>) -> Result<AddedNote> {
         let id = id.to_owned();
-        self.storage().update(
+        let (mut added, notes) = self.storage().update_with(
+            GoalsRead::Resident,
             persona,
             &[],
             |space, _reader, by_id, _mentions| Ok((resolve_task_id(&id, space)?, by_id)),
             |(goal, by_id)| {
                 author_unclear_note(goal, by_id).map(|(fragment, note)| (Some(fragment), note))
             },
-        )
+        )?;
+        added.notes = notes;
+        Ok(added)
     }
 
     /// Every goal's current status and tags, read from one frozen view.
@@ -350,7 +367,8 @@ impl Goals {
         })
     }
 
-    pub fn show(&self, id: &str) -> Result<String> {
+    /// One goal as text, with a note for anything the read could not load.
+    pub fn show(&self, id: &str) -> Result<Board> {
         show(self.storage(), id.to_owned())
     }
 
@@ -533,11 +551,32 @@ impl GoalsStorage<'_> {
     }
 
     /// Prepare a pure read against fixed facts/status and an acquiring blob
-    /// reader. Printing and other effects belong after this returns.
+    /// reader, refused when a foundation of either cannot be loaded. Only
+    /// for an answer absence would invalidate: whether someone has been
+    /// active, the states a rule decides on. Printing and other effects
+    /// belong after this returns.
     fn with_view<T>(
         &self,
-        mut f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
+        f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
     ) -> Result<T> {
+        self.with_view_mode(true, f).map(|(value, _)| value)
+    }
+
+    /// [`Self::with_view`] over what this observation could load, with a
+    /// note for each of the facts and the status register that left
+    /// something out (JP, 2026-11-26): every board and lookup.
+    fn with_view_read<T>(
+        &self,
+        f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
+    ) -> Result<(T, Vec<String>)> {
+        self.with_view_mode(false, f)
+    }
+
+    fn with_view_mode<T>(
+        &self,
+        complete: bool,
+        mut f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,
+    ) -> Result<(T, Vec<String>)> {
         self.with_pile(|pile, signer, runtime| {
             let source = self.storage.open_collection_read(
                 pile,
@@ -552,22 +591,69 @@ impl GoalsStorage<'_> {
                 pile.snapshot().context("freeze Goals facts and status")?,
                 runtime.clone(),
             );
-            let facts = storage::acquire_facts(&reader, rank9)?;
-            let status = storage::require_complete_attached_read(
-                reader
-                    .attached_acquiring(status_target)?
-                    .read_acquiring::<LwwIndex>()?,
-            )?
-            .query()?;
-            f(&facts, &reader, &status)
+            let (facts, unread_facts) = storage::acquire_facts_read(&reader, rank9)?.into_parts();
+            let (status, unread_status) = reader
+                .attached_acquiring(status_target)?
+                .read_acquiring::<LwwIndex>()?
+                .into_parts();
+            for unread in [&unread_facts, &unread_status] {
+                if complete && !unread.is_empty() {
+                    return Err(storage::IncompleteAttachedRead {
+                        unread: unread.clone(),
+                    }
+                    .into());
+                }
+            }
+            // The status register stands on the same foundations as the
+            // facts: name it only for one the facts did not miss.
+            let mut notes: Vec<String> = storage::unread_foundations_note("Goals", &unread_facts)
+                .into_iter()
+                .collect();
+            if unread_status
+                .members()
+                .any(|member| !unread_facts.contains(member))
+            {
+                notes.extend(storage::unread_foundations_note(
+                    "Goals status",
+                    &unread_status,
+                ));
+            }
+            let status = status.query()?;
+            let value = f(&facts, &reader, &status).map_err(|error| with_notes(error, &notes))?;
+            Ok((value, notes))
         })
     }
 
-    /// Prepare reads against one frozen view, then author and publish once.
-    /// The author runs outside retries, so event clocks and publication cannot
-    /// be repeated by a missing attachment. `None` is a genuine no-op.
+    /// Prepare reads against one frozen, complete view, then author and
+    /// publish once: refused when a foundation cannot be loaded. Only for a
+    /// write that supersedes what it saw (a priority snapshot replaces the
+    /// higher goal's current one). The author runs outside retries, so event
+    /// clocks and publication cannot be repeated by a missing attachment.
+    /// `None` is a genuine no-op.
     fn update<P, T>(
         &self,
+        persona: Option<&str>,
+        mentions: &[String],
+        prepare: impl FnMut(
+            &FactArchive,
+            &AcquiringReader<FacultySnapshot>,
+            Option<Id>,
+            &Mentions,
+        ) -> Result<P>,
+        author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
+    ) -> Result<T> {
+        self.update_with(GoalsRead::Complete, persona, mentions, prepare, author)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::update`] prepared as `read` asks: [`GoalsRead::Resident`] for
+    /// an append (a goal, a status, a tag, a note), over what the observation
+    /// could load, with a note for each collection that left something out;
+    /// [`GoalsRead::Skip`] reads no Goals facts at all, for a write that names
+    /// no goal.
+    fn update_with<P, T>(
+        &self,
+        read: GoalsRead,
         persona: Option<&str>,
         mentions: &[String],
         mut prepare: impl FnMut(
@@ -577,7 +663,7 @@ impl GoalsStorage<'_> {
             &Mentions,
         ) -> Result<P>,
         author: impl FnOnce(P) -> Result<(Option<Fragment>, T)>,
-    ) -> Result<T> {
+    ) -> Result<(T, Vec<String>)> {
         self.with_pile(|pile, signer, runtime| {
             // Register every representation and attach the resident views
             // through one query snapshot for this action; the write authors,
@@ -617,8 +703,7 @@ impl GoalsStorage<'_> {
             // validation and persona resolution cannot mix collection
             // watermarks.
             let reader = AcquiringReader::new(
-                pile.snapshot()
-                    .context("freeze Goals/Relations snapshot")?,
+                pile.snapshot().context("freeze Goals/Relations snapshot")?,
                 runtime.clone(),
             );
             // No read refuses for being behind. There is no globally
@@ -628,11 +713,27 @@ impl GoalsStorage<'_> {
             // the branching of one entity's history a little. A priority
             // change reads what it can see, like everything else, and
             // ensures its own images after it commits.
-            let facts = storage::acquire_facts(&reader, goals_rank9)
-                .context("read Goals fact collection")?;
+            let complete = matches!(read, GoalsRead::Complete);
+            let mut notes = Vec::new();
+            let mut read_facts = |rank9, label: &str| -> Result<FactArchive> {
+                let (facts, unread) = storage::acquire_facts_read(&reader, rank9)?.into_parts();
+                if complete && !unread.is_empty() {
+                    return Err(storage::IncompleteAttachedRead { unread }.into());
+                }
+                notes.extend(storage::unread_foundations_note(label, &unread));
+                Ok(facts)
+            };
+            let facts = match read {
+                GoalsRead::Skip => FactArchive::new(vec![
+                    triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
+                        &TribleSet::new(),
+                    ),
+                ]),
+                _ => read_facts(goals_rank9, "Goals").context("read Goals fact collection")?,
+            };
             let relations = relations_rank9
                 .map(|rank9| {
-                    storage::acquire_facts(&reader, rank9)
+                    read_facts(rank9, "Relations")
                         .context("read Relations fact collection for Goals persona and mentions")
                 })
                 .transpose()?;
@@ -653,7 +754,8 @@ impl GoalsStorage<'_> {
                     resolved.0.insert(key, (label.clone(), targets));
                 }
             }
-            let prepared = prepare(&facts, &reader, by, &resolved)?;
+            let prepared = prepare(&facts, &reader, by, &resolved)
+                .map_err(|error| with_notes(error, &notes))?;
             let (fragment, value) = author(prepared)?;
             if let Some(fragment) = fragment {
                 crate::collection_names::require_command_write_admission_acquiring(
@@ -666,9 +768,28 @@ impl GoalsStorage<'_> {
                 )?;
                 runtime.block_on(publish_goals(pile, goals_source, signer, fragment))?;
             }
-            Ok(value)
+            Ok((value, notes))
         })
     }
+}
+
+/// Which Goals facts an update prepares over.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalsRead {
+    /// Every foundation, or refuse.
+    Complete,
+    /// What this observation could load.
+    Resident,
+    /// None: the write names no goal.
+    Skip,
+}
+
+/// `error`, with the notes of what its read could not load: a goal or note
+/// not found may be in one of them.
+fn with_notes(error: anyhow::Error, notes: &[String]) -> anyhow::Error {
+    notes
+        .iter()
+        .fold(error, |error, note| error.context(note.clone()))
 }
 
 /// Every distinct title of a goal, sorted by text.
@@ -985,10 +1106,8 @@ fn render_board<P: TriblePattern>(
     show_done: bool,
 ) -> Result<String> {
     let goal_ids = all_goal_ids(space);
-    let priority_ranks = goals::priority_ranks(
-        goal_ids.iter().copied(),
-        &goals::goal_priority_edges(space),
-    );
+    let priority_ranks =
+        goals::priority_ranks(goal_ids.iter().copied(), &goals::goal_priority_edges(space));
 
     let mut columns: HashMap<String, Vec<TaskRow>> = HashMap::new();
     let text_handle = crate::schemas::compass::text_handle;
@@ -1248,7 +1367,15 @@ fn add_goal(
             .map(goals::mention_labels)
             .unwrap_or_default(),
     );
-    storage.update(
+    // A goal without a parent names no other goal, so nothing of Goals is
+    // read: adding one never waits on a foundation that is away.
+    let read = if parent.is_some() {
+        GoalsRead::Resident
+    } else {
+        GoalsRead::Skip
+    };
+    let (mut added, notes) = storage.update_with(
+        read,
         persona,
         &labels,
         |space, _reader, by_id, mentions| {
@@ -1286,10 +1413,13 @@ fn add_goal(
                     status_event,
                     note: note_ref,
                     unresolved_mentions: mentions.unresolved(),
+                    notes: Vec::new(),
                 },
             ))
         },
-    )
+    )?;
+    added.notes = notes;
+    Ok(added)
 }
 
 #[cfg(test)]
@@ -1313,7 +1443,7 @@ fn board(
         validate_label("status", status)?;
     }
 
-    storage.with_view(|space, reader, status_register| {
+    let (mut board, unread) = storage.with_view_read(|space, reader, status_register| {
         let text = render_board(
             reader,
             space,
@@ -1328,7 +1458,9 @@ fn board(
             &goals::goal_priority_edges(space),
         );
         Ok(Board { text, notes })
-    })
+    })?;
+    board.notes.extend(unread);
+    Ok(board)
 }
 
 fn move_goal(
@@ -1339,7 +1471,8 @@ fn move_goal(
 ) -> Result<MovedGoal> {
     let status = goals::canonical_status(status)?;
     let rendered_status = status.clone();
-    storage.update(
+    let (mut moved, notes) = storage.update_with(
+        GoalsRead::Resident,
         persona,
         &[],
         |space, _reader, by_id, _| Ok((resolve_task_id(&id, space)?, by_id)),
@@ -1354,10 +1487,13 @@ fn move_goal(
                     goal: task_id,
                     event,
                     status: rendered_status,
+                    notes: Vec::new(),
                 },
             ))
         },
-    )
+    )?;
+    moved.notes = notes;
+    Ok(moved)
 }
 
 fn tag_goal(storage: GoalsStorage<'_>, id: String, tags: Vec<String>) -> Result<TaggedGoal> {
@@ -1365,7 +1501,8 @@ fn tag_goal(storage: GoalsStorage<'_>, id: String, tags: Vec<String>) -> Result<
     if tags.is_empty() {
         bail!("at least one tag is required");
     }
-    storage.update(
+    let (mut tagged, notes) = storage.update_with(
+        GoalsRead::Resident,
         None,
         &[],
         |space, _reader, _by, _| {
@@ -1387,9 +1524,19 @@ fn tag_goal(storage: GoalsStorage<'_>, id: String, tags: Vec<String>) -> Result<
                 change += goals::tag_fragment(goal, &added);
                 change
             });
-            Ok((change, TaggedGoal { goal, added, held }))
+            Ok((
+                change,
+                TaggedGoal {
+                    goal,
+                    added,
+                    held,
+                    notes: Vec::new(),
+                },
+            ))
         },
-    )
+    )?;
+    tagged.notes = notes;
+    Ok(tagged)
 }
 
 fn add_note(
@@ -1413,7 +1560,8 @@ fn add_note(
     references.dedup();
 
     let labels = goals::mention_labels(&note);
-    storage.update(
+    let (mut added, notes) = storage.update_with(
+        GoalsRead::Resident,
         persona,
         &labels,
         |space, _reader, by_id, mentions| {
@@ -1428,15 +1576,8 @@ fn add_note(
             let now = clock::point_now()?;
             let mut change = goals::kind_catalog_fragment();
             let note_mentions = mentions.targets(&note);
-            let (record, note_id) = goals::note_fragment(
-                task_id,
-                note,
-                tags,
-                references,
-                superseded_ids,
-                by_id,
-                now,
-            )?;
+            let (record, note_id) =
+                goals::note_fragment(task_id, note, tags, references, superseded_ids, by_id, now)?;
             change += record;
             change += goals::mention_fragment(note_id, &note_mentions);
             Ok((
@@ -1445,10 +1586,13 @@ fn add_note(
                     goal: task_id,
                     note: note_id,
                     unresolved_mentions: mentions.unresolved(),
+                    notes: Vec::new(),
                 },
             ))
         },
-    )
+    )?;
+    added.notes = notes;
+    Ok(added)
 }
 
 fn render_goal<P: TriblePattern>(
@@ -1690,11 +1834,12 @@ fn goal_reading<P: TriblePattern>(
     })
 }
 
-fn show(storage: GoalsStorage<'_>, id: String) -> Result<String> {
-    storage.with_view(|space, reader, status_register| {
+fn show(storage: GoalsStorage<'_>, id: String) -> Result<Board> {
+    let (text, notes) = storage.with_view_read(|space, reader, status_register| {
         let task_id = resolve_task_id(&id, space)?;
         render_goal(reader, space, status_register, task_id)
-    })
+    })?;
+    Ok(Board { text, notes })
 }
 
 fn prioritize(
@@ -1834,6 +1979,7 @@ fn author_unclear_note(goal: Id, by: Option<Id>) -> Result<(Fragment, AddedNote)
             goal,
             note,
             unresolved_mentions: Vec::new(),
+            notes: Vec::new(),
         },
     ))
 }
@@ -2347,12 +2493,9 @@ mod tests {
         let signer = SigningKey::from_bytes(&[7; 32]);
         let mut store = AcquiringPile::new(fragment.blobs().clone(), signer.verifying_key());
         fragment.blobs_mut().keep([]);
-        let source = crate::collection_names::open(
-            &mut store.pile,
-            GOALS_SCOPE_ID,
-            signer.verifying_key(),
-        )
-        .unwrap();
+        let source =
+            crate::collection_names::open(&mut store.pile, GOALS_SCOPE_ID, signer.verifying_key())
+                .unwrap();
         store.pile.commit(source, &signer, fragment).unwrap();
         carry(&mut store.pile, source, &signer);
         let view = pollster::block_on(goals::materialize_indexed_collection(
@@ -2396,8 +2539,7 @@ mod tests {
         let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
             .try_to_inline()
             .unwrap();
-        let (mut fragment, goal) =
-            goals::goal_fragment("selected goal", vec![], None, at).unwrap();
+        let (mut fragment, goal) = goals::goal_fragment("selected goal", vec![], None, at).unwrap();
         let (note, note_id) = goals::note_fragment(
             goal,
             "selected note",
@@ -2529,8 +2671,7 @@ mod tests {
         let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
             .try_to_inline()
             .unwrap();
-        let (mut fragment, parent) =
-            goals::goal_fragment("parent goal", vec![], None, at).unwrap();
+        let (mut fragment, parent) = goals::goal_fragment("parent goal", vec![], None, at).unwrap();
         let (child, goal) =
             goals::goal_fragment("selected goal", vec![], Some(parent), at).unwrap();
         fragment += child;
@@ -2606,8 +2747,7 @@ mod tests {
         let at: IntervalValue = (Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(0.0))
             .try_to_inline()
             .unwrap();
-        let (mut fragment, goal) =
-            goals::goal_fragment("selected goal", vec![], None, at).unwrap();
+        let (mut fragment, goal) = goals::goal_fragment("selected goal", vec![], None, at).unwrap();
         let (note, note_id) = goals::note_fragment(
             goal,
             "selected note",
@@ -2661,8 +2801,7 @@ mod tests {
         let later: IntervalValue = (Epoch::from_tai_seconds(1.0), Epoch::from_tai_seconds(1.0))
             .try_to_inline()
             .unwrap();
-        let (mut fragment, goal) =
-            goals::goal_fragment("original goal", vec![], None, at).unwrap();
+        let (mut fragment, goal) = goals::goal_fragment("original goal", vec![], None, at).unwrap();
         fragment += goals::status_fragment(goal, "todo", None, at).unwrap();
         let (mut store, view, source, signer) = sparse_view(fragment);
         let original_support = source.admitted(view.store_snapshot()).unwrap();
@@ -2954,8 +3093,7 @@ mod tests {
         .unwrap()
         .0;
         let mover = genid().id;
-        fragment +=
-            goals::status_fragment(blocked, "blocked", Some(mover), point(310.0)).unwrap();
+        fragment += goals::status_fragment(blocked, "blocked", Some(mover), point(310.0)).unwrap();
         // Tags and priority events do not become attributed notes or moves.
         fragment += entity! { ExclusiveId::force_ref(&blocked) @
             board::tag: format!("{actor:x}"),
@@ -2971,15 +3109,11 @@ mod tests {
         let active = vec!["doing".to_owned(), "blocked".to_owned()];
         let at = |seconds| Epoch::from_unix_seconds(seconds);
         assert!(goals.has_activity(actor, at(100.25), &active).unwrap());
-        assert!(!goals
-            .has_activity(actor, at(100.250001), &active)
-            .unwrap());
+        assert!(!goals.has_activity(actor, at(100.250001), &active).unwrap());
         assert!(!goals.has_activity(absent, at(0.0), &active).unwrap());
         assert!(goals.has_activity(other, at(300.0), &active).unwrap());
         assert!(goals.has_activity(mover, at(310.0), &active).unwrap());
-        assert!(!goals
-            .has_activity(mover, at(310.000001), &active)
-            .unwrap());
+        assert!(!goals.has_activity(mover, at(310.000001), &active).unwrap());
         assert!(!goals
             .has_activity(actor, at(0.0), &["todo".into()])
             .unwrap());
@@ -3245,8 +3379,8 @@ mod tests {
         );
         assert_eq!(board.matches(&format!("[{goal:x}]")).count(), 1, "{board}");
 
-        let shown = show(handle, format!("{goal:x}")).unwrap();
-        assert_eq!(shown, show(handle, format!("{goal:x}")).unwrap());
+        let shown = show(handle, format!("{goal:x}")).unwrap().text;
+        assert_eq!(shown, show(handle, format!("{goal:x}")).unwrap().text);
         assert!(shown.contains("Title: alpha\nTitle: beta\n"), "{shown}");
         let (low, high) = if first_parent < second_parent {
             (first_parent, second_parent)
@@ -3293,7 +3427,7 @@ mod tests {
 
         let board = list(handle, vec![], vec![], false).unwrap();
         assert!(board.contains("noted goal (1 note)\n"), "{board}");
-        let shown = show(handle, format!("{goal:x}")).unwrap();
+        let shown = show(handle, format!("{goal:x}")).unwrap().text;
         let first_at = shown.find("  first body\n").expect("first body shown");
         let second_at = shown.find("  second body\n").expect("second body shown");
         assert!(first_at < second_at, "{shown}");
@@ -3315,7 +3449,7 @@ mod tests {
         };
         let (_directory, storage) = raw_pile(fragment);
         let handle = GoalsStorage { storage: &storage };
-        let shown = show(handle, format!("{goal:x}")).unwrap();
+        let shown = show(handle, format!("{goal:x}")).unwrap().text;
         assert!(
             shown.starts_with(&format!("Goal {goal:x}\nCreated: ")),
             "{shown}"
@@ -3371,7 +3505,7 @@ mod tests {
         let board = list(handle, vec![], vec![], false).unwrap();
         assert!(board.contains("inverted goal (1 note)"), "{board}");
         assert!(board.contains("ordinary goal"), "{board}");
-        let shown = show(handle, format!("{goal:x}")).unwrap();
+        let shown = show(handle, format!("{goal:x}")).unwrap().text;
         assert!(!shown.contains("Created:"), "{shown}");
         assert!(!shown.contains("inverted note"), "{shown}");
         show(handle, format!("{other:x}")).unwrap();
@@ -3439,7 +3573,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let shown = show(handle, format!("{goal:x}")).unwrap();
+        let shown = show(handle, format!("{goal:x}")).unwrap().text;
         assert!(shown.contains(&format!("[{:x}]", added.note)), "{shown}");
         assert!(
             shown.contains(&format!("supersedes: {early_id:x}")),
@@ -3715,5 +3849,139 @@ mod tests {
                 notes: vec![],
             }
         );
+    }
+
+    /// A Goals pile whose collection holds `resident`, then one more
+    /// foundation put there by `plant` through the raw pile.
+    fn goals_with_residual(
+        plant: impl FnOnce(
+            &mut triblespace::core::repo::pile::Pile,
+            triblespace::core::collection::Collection<SimpleArchive>,
+            &SigningKey,
+        ) -> Result<Inline<inlineencodings::Handle<SimpleArchive>>>,
+    ) -> (
+        tempfile::TempDir,
+        Storage,
+        Id,
+        Inline<inlineencodings::Handle<SimpleArchive>>,
+    ) {
+        let mut fragment = Fragment::empty();
+        let resident = plain_goal(&mut fragment, "resident goal", 1.0);
+        let (directory, storage) = raw_pile(fragment);
+        let planted = storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, GOALS_SCOPE_ID, signer.verifying_key())?;
+                plant(pile, source, signer)
+            })
+            .unwrap();
+        (directory, storage, resident, planted)
+    }
+
+    /// 26 November 2026: one foundation stranded on another host and every
+    /// Goals command refused. Appends now go on, the board and a goal are
+    /// shown from what is here with a note naming what is not, and only an
+    /// answer absence would invalidate (activity, a priority snapshot that
+    /// replaces the one it saw) still refuses.
+    #[test]
+    fn goals_go_on_while_a_foundation_is_away() {
+        let (_directory, storage, resident, away) = goals_with_residual(|pile, source, signer| {
+            let mut fragment = Fragment::empty();
+            plain_goal(&mut fragment, "away goal", 2.0);
+            crate::storage::residual_fixture::strand(pile, source, signer, fragment)
+        });
+        let away_hex = hex::encode(away.raw);
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away_hex));
+        let goals = Goals::with_storage(storage);
+        let resident_hex = format!("{resident:x}");
+
+        // (a) Appends are stored; those that resolved a goal say what their
+        // read could not load. A goal without a parent reads no Goals facts.
+        let added = goals.add("added meanwhile", AddOptions::default()).unwrap();
+        assert!(added.notes.is_empty(), "{:?}", added.notes);
+        let child = goals
+            .add(
+                "child meanwhile",
+                AddOptions {
+                    parent: Some(&resident_hex),
+                    ..AddOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(named(&child.notes), "{:?}", child.notes);
+        let moved = goals.move_goal(&resident_hex, "doing", None).unwrap();
+        assert!(named(&moved.notes), "{:?}", moved.notes);
+        let noted = goals
+            .note(&resident_hex, "still writable", NoteOptions::default())
+            .unwrap();
+        assert!(named(&noted.notes), "{:?}", noted.notes);
+        let tagged = goals.tag(&resident_hex, &["outage".to_owned()]).unwrap();
+        assert!(named(&tagged.notes), "{:?}", tagged.notes);
+
+        // (b) The board shows what is here, and says what is not.
+        let board = goals.board(ListOptions::default()).unwrap();
+        for title in ["resident goal", "added meanwhile", "child meanwhile"] {
+            assert!(board.text.contains(title), "{}", board.text);
+        }
+        assert!(!board.text.contains("away goal"), "{}", board.text);
+        assert!(named(&board.notes), "{:?}", board.notes);
+        let mut parts = Vec::new();
+        super::super::render::board(
+            &board,
+            &mut crate::out::Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert!(parts.iter().any(|part| matches!(
+            part,
+            crate::out::Part::Note { text } if text.contains(&away_hex)
+        )));
+        let shown = goals.show(&resident_hex).unwrap();
+        assert!(shown.text.contains("resident goal"), "{}", shown.text);
+        assert!(named(&shown.notes), "{:?}", shown.notes);
+        let priorities = goals.priorities(ListOptions::default()).unwrap();
+        assert!(named(&priorities.notes), "{:?}", priorities.notes);
+        // A goal not found may be the one away, and the error says so. (A
+        // full id resolves without a lookup, so ask by a prefix.)
+        let error = goals.show("fffffff").unwrap_err();
+        assert!(format!("{error:#}").contains(&away_hex), "{error:#}");
+
+        // Absence still refuses where it would change the answer.
+        let error = goals
+            .has_activity(genid().id, Epoch::from_unix_seconds(0.0), &["doing".into()])
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{error:#}"
+        );
+        let error = goals
+            .prioritize(&resident_hex, &format!("{:x}", added.goal), None)
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{error:#}"
+        );
+    }
+
+    /// Bytes that are here and form no archive are a fault, not a foundation
+    /// that is away: the board fails loudly.
+    #[test]
+    fn goals_fail_loudly_on_a_malformed_foundation() {
+        let (_directory, storage, resident, _) =
+            goals_with_residual(crate::storage::residual_fixture::malformed);
+        let goals = Goals::with_storage(storage);
+        let error = goals.board(ListOptions::default()).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<storage::IncompleteAttachedRead>()
+                .is_none(),
+            "a fault is not a gap: {error:#}"
+        );
+        assert!(goals.show(&format!("{resident:x}")).is_err());
     }
 }

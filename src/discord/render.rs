@@ -3,7 +3,10 @@ use super::operations::*;
 use crate::out::Out;
 use anyhow::Result;
 
-pub fn auth(status: &super::AuthStatus, out: &mut Out<'_>) -> Result<()> {
+pub fn auth(status: &super::AuthStatus, notes: &[String], out: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        out.note(note.clone())?;
+    }
     out.line(if status.heads.is_empty() {
         "Discord authentication: unset"
     } else if status.selected().is_ok() {
@@ -77,6 +80,9 @@ fn reply_label(target: &ReplyTarget) -> String {
     format!("reply to {id} by {quotes}")
 }
 pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
+    for note in &value.notes {
+        out.note(note.clone())?;
+    }
     if value.messages.is_empty() {
         return out.line(match value.channel_id.as_deref() {
             Some(channel) => format!("(no messages in collection for channel {channel})"),
@@ -209,6 +215,9 @@ pub fn history(value: &History, out: &mut Out<'_>) -> Result<()> {
 }
 pub fn channel_receipt(value: &ChannelReceipt, out: &mut Out<'_>) -> Result<()> {
     channel_receipt_counts(value, out)?;
+    for note in &value.notes {
+        out.note(format!("{}: {note}", value.channel_id))?;
+    }
     for unreadable in &value.unreadable_replies {
         out.line(format!(
             "  ! {}: message {} stored without its reply relation, which is unreadable ({})",
@@ -308,7 +317,10 @@ fn channel_type_label(kind: i64) -> &'static str {
 
 /// One line per channel: who it is addressed to, and the addressing a call
 /// published when it had to publish one.
-pub fn addressed(channels: &[AddressedChannel], out: &mut Out<'_>) -> Result<()> {
+pub fn addressed(channels: &[AddressedChannel], notes: &[String], out: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        out.note(note.clone())?;
+    }
     if channels.is_empty() {
         return out.line("(no channel is addressed to anybody)");
     }

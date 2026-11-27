@@ -56,7 +56,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
 use triblespace::core::collection::{
-    records::CollectionHandle, Collection, CollectionCommit, CollectionStoreExt,
+    records::CollectionHandle, Collection, CollectionCommit, CollectionStoreExt, Support,
 };
 use triblespace::core::metadata;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -246,6 +246,11 @@ pub struct ChannelReceipt {
     /// Stored messages whose reply relation could not be read, so they were
     /// stored without it.
     pub unreadable_replies: Vec<UnreadableReply>,
+    /// What the pull's view of the collection could not load
+    /// ([`crate::storage::unread_foundations_note`]): its coverage, and the
+    /// attachment bytes it reuses, are read from the rest, so it may fetch
+    /// again what those foundations hold, never lose it.
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct ChannelPull {
@@ -439,6 +444,10 @@ pub(crate) fn unix_millisecond(milliseconds: u64) -> Inline<NsTAIInterval> {
 pub struct History {
     pub channel_id: Option<String>,
     pub messages: Vec<ObservedMessage>,
+    /// What this read of the collection could not load
+    /// ([`crate::storage::unread_foundations_note`]): the messages are those
+    /// of the rest.
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Channel {
@@ -498,8 +507,18 @@ impl Discord {
     }
     /// Metadata only: this does not open a Secrets version.
     pub fn auth_status(&self) -> Result<discord_model::AuthStatus> {
-        self.storage()
-            .with_session(|session| Ok(discord_model::auth_status(&session.facts)))
+        self.auth_status_read().map(|(status, _)| status)
+    }
+    /// [`Self::auth_status`] over what this observation could load, with the
+    /// foundations it could not: a newer binding among them would be missed,
+    /// so a frontend says so beside the status.
+    pub fn auth_status_read(&self) -> Result<(discord_model::AuthStatus, Vec<String>)> {
+        self.storage().with_session_read(|session| {
+            Ok((
+                discord_model::auth_status(&session.facts),
+                session.view().notes(),
+            ))
+        })
     }
     /// Bind one exact existing Secrets version, reconciling every observed
     /// authentication head. No credential is imported, delivered or granted.
@@ -676,7 +695,7 @@ impl Discord {
     pub fn read(&self, options: ReadOptions) -> Result<History> {
         options.validate()?;
         self.storage()
-            .with_session(|session| read_history(&session.view(), &options))
+            .with_session_read(|session| read_history(&session.view(), &options))
     }
     /// Pull one complete forward interval plus bounded recent edits, optionally for every visible channel.
     /// Per-channel failures in an all-visible pull are retained explicitly in the report.
@@ -714,7 +733,7 @@ impl Discord {
                 storage: owner,
                 collection: storage.collection,
             };
-            let mut view = storage.with_session(|session| Ok(session.view()))?;
+            let mut view = storage.with_session_read(|session| Ok(session.view()))?;
             pull_channel(
                 storage,
                 &mut view,
@@ -790,8 +809,8 @@ impl Discord {
         let source: discord_model::TextHandle = source_id.to_owned().to_blob().get_handle();
         let name: discord_model::TextHandle =
             file_capability::leaf_name(filename).to_blob().get_handle();
-        self.storage().with_session(|session| {
-            Ok(find!(
+        self.storage().with_session_read(|session| {
+            let found = find!(
                 (attachment: Id, content: file_capability::ContentHandle),
                 pattern!(&session.facts, [
                     {
@@ -807,7 +826,16 @@ impl Discord {
             .find_map(|(attachment, content)| {
                 let bytes = session.reader.get::<Bytes, RawBytes>(content).ok()?;
                 Some((attachment, bytes))
-            }))
+            });
+            // Bytes found are the answer. None found while a foundation
+            // could not be loaded is not "none held": they may be there.
+            if found.is_none() && !session.unread.is_empty() {
+                return Err(crate::storage::IncompleteAttachedRead {
+                    unread: session.unread.clone(),
+                }
+                .into());
+            }
+            Ok(found)
         })
     }
     /// Store a sentence somebody finished in a voice channel while they went
@@ -1005,11 +1033,22 @@ impl Discord {
             })
         })
     }
-    /// Every addressed channel and who it is addressed to now, by channel id.
-    pub fn channel_addressing(&self) -> Result<Vec<AddressedChannel>> {
+    /// Every addressed channel and who it is addressed to now, by channel id,
+    /// over what this observation could load, with a note for each of the
+    /// Discord and Relations collections that left something out.
+    pub fn channel_addressing(&self) -> Result<(Vec<AddressedChannel>, Vec<String>)> {
         let storage = self.storage();
-        storage.with_session(|session| {
-            let (relations, reader) = storage.relations(session)?;
+        storage.with_session_read(|session| {
+            let mut notes = Vec::new();
+            notes.extend(crate::storage::unread_foundations_note(
+                "Discord",
+                &session.unread,
+            ));
+            let (relations, reader, unread_relations) = storage.relations_read(session)?;
+            notes.extend(crate::storage::unread_foundations_note(
+                "Relations",
+                &unread_relations,
+            ));
             let mut channels = Vec::new();
             for (handle, addressing) in discord_model::channel_addressing(&session.facts) {
                 channels.push(AddressedChannel {
@@ -1027,7 +1066,7 @@ impl Discord {
                 });
             }
             channels.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
-            Ok(channels)
+            Ok((channels, notes))
         })
     }
 }
@@ -1062,6 +1101,8 @@ struct DiscordStorage<'a> {
 struct CollectionView {
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
+    /// What the read of `facts` could not load; empty for a complete read.
+    unread: Support<SimpleArchive>,
 }
 
 struct DiscordSession<'a> {
@@ -1072,6 +1113,38 @@ struct DiscordSession<'a> {
     signer: SigningKey,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
+    /// Whether this session refuses a read that leaves a foundation out
+    /// ([`DiscordStorage::with_session`]) or answers over the rest
+    /// ([`DiscordStorage::with_session_read`]); a commit reads again the
+    /// same way.
+    complete: bool,
+    /// What the read of `facts` could not load; always empty when
+    /// `complete`.
+    unread: Support<SimpleArchive>,
+}
+
+/// The Discord facts of `rank9` in `reader`, and what the read could not
+/// load: refused when `complete` is asked for ([`crate::storage::acquire_facts`]),
+/// else carried beside them.
+fn read_discord_facts(
+    reader: &AcquiringReader<FacultySnapshot>,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    complete: bool,
+) -> Result<(FactArchive, Support<SimpleArchive>)> {
+    let (facts, unread) = crate::storage::acquire_facts_read(reader, rank9)?.into_parts();
+    if complete && !unread.is_empty() {
+        return Err(crate::storage::IncompleteAttachedRead { unread }.into());
+    }
+    Ok((facts, unread))
+}
+
+impl CollectionView {
+    /// What this view could not load, as the note a frontend shows.
+    fn notes(&self) -> Vec<String> {
+        crate::storage::unread_foundations_note("Discord", &self.unread)
+            .into_iter()
+            .collect()
+    }
 }
 
 impl DiscordSession<'_> {
@@ -1079,37 +1152,53 @@ impl DiscordSession<'_> {
         CollectionView {
             facts: self.facts.clone(),
             reader: self.reader.clone(),
+            unread: self.unread.clone(),
         }
     }
 
-    fn commit(&mut self, mut fragment: Fragment, description: String) -> Result<CollectionCommit> {
-        fragment.describe_with(entity! { metadata::description: description });
-        let commit = self
-            .pile
-            .commit(self.collection, &self.signer, fragment)
-            .context("publish Discord collection fragment")?;
-        // Like every other write: derive this key's own leaves into the
-        // views, and refuse to call the commit done if no reader can see it.
-        // Merges are the maintenance daemon's.
-        drop(
-            self.runtime
-                .block_on(crate::storage::ensure_downstream(
-                    self.pile,
-                    self.collection,
-                    &self.signer,
-                ))
-                .context("Discord fragment was committed, but ensuring its derived views failed")?,
-        );
+    fn commit(&mut self, fragment: Fragment, description: String) -> Result<CollectionCommit> {
+        let commit = commit_discord_fragment(
+            self.pile,
+            self.runtime,
+            self.collection,
+            &self.signer,
+            fragment,
+            description,
+        )?;
         self.reader = AcquiringReader::new(
             self.pile
                 .snapshot()
                 .context("freeze Discord fact collection after commit")?,
             self.runtime.clone(),
         );
-        self.facts = crate::storage::acquire_facts(&self.reader, self.rank9)
+        (self.facts, self.unread) = read_discord_facts(&self.reader, self.rank9, self.complete)
             .context("read maintained Discord fact collection after commit")?;
         Ok(commit)
     }
+}
+
+/// Commit `fragment` into `collection` and derive this key's own leaves
+/// into the views, refusing to call the commit done if no reader can see
+/// it. Merges are the maintenance daemon's. Nothing of the collection is
+/// read first, so an append never waits on a foundation that is away.
+fn commit_discord_fragment(
+    pile: &mut FacultyStore,
+    runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    collection: Collection<SimpleArchive>,
+    signer: &SigningKey,
+    mut fragment: Fragment,
+    description: String,
+) -> Result<CollectionCommit> {
+    fragment.describe_with(entity! { metadata::description: description });
+    let commit = pile
+        .commit(collection, signer, fragment)
+        .context("publish Discord collection fragment")?;
+    drop(
+        runtime
+            .block_on(crate::storage::ensure_downstream(pile, collection, signer))
+            .context("Discord fragment was committed, but ensuring its derived views failed")?,
+    );
+    Ok(commit)
 }
 
 impl DiscordStorage<'_> {
@@ -1194,8 +1283,66 @@ impl DiscordStorage<'_> {
         Ok((facts, reader))
     }
 
+    /// [`Self::relations`] over what this observation could load, with the
+    /// foundations it could not.
+    fn relations_read(
+        &self,
+        session: &mut DiscordSession<'_>,
+    ) -> Result<(
+        FactArchive,
+        AcquiringReader<FacultySnapshot>,
+        Support<SimpleArchive>,
+    )> {
+        let source = self.storage.open_collection_read(
+            session.pile,
+            crate::schemas::relations::DEFAULT_SCOPE_ID,
+            session.signer.verifying_key(),
+            session.runtime,
+        )?;
+        let succinct = session
+            .pile
+            .attach::<SuccinctArchiveBlob>(source, ())
+            .context("register Relations Succinct collection")?;
+        let rank9 = session
+            .pile
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
+            .context("register Relations Rank9 collection")?;
+        let reader = AcquiringReader::new(
+            session
+                .pile
+                .snapshot()
+                .context("freeze Relations fact collection")?,
+            session.runtime.clone(),
+        );
+        let (facts, unread) = crate::storage::acquire_facts_read(&reader, rank9)
+            .context("read Relations fact collection")?
+            .into_parts();
+        Ok((facts, reader, unread))
+    }
+
+    /// A session over the complete collection: refused when a foundation
+    /// cannot be loaded. Only for an answer absence would invalidate --
+    /// replaying an unsettled say request, superseding a binding or an
+    /// addressing it saw.
     fn with_session<T>(
         &self,
+        operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_session_mode(true, operation)
+    }
+
+    /// A session over what this observation could load, naming the rest in
+    /// [`DiscordSession::unread`] (JP, 2026-11-26): every read and pull.
+    fn with_session_read<T>(
+        &self,
+        operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_session_mode(false, operation)
+    }
+
+    fn with_session_mode<T>(
+        &self,
+        complete: bool,
         operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
@@ -1211,8 +1358,9 @@ impl DiscordStorage<'_> {
                     pile.snapshot().context("freeze Discord fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
-                    .context("read maintained Discord fact collection")?;
+                let (facts, unread) =
+                    read_discord_facts(&store_snapshot, maintained_rank9, complete)
+                        .context("read maintained Discord fact collection")?;
                 operation(&mut DiscordSession {
                     pile,
                     runtime,
@@ -1221,6 +1369,8 @@ impl DiscordStorage<'_> {
                     signer: signer.clone(),
                     facts,
                     reader: store_snapshot,
+                    complete,
+                    unread,
                 })
             })();
             result
@@ -1232,8 +1382,15 @@ impl DiscordStorage<'_> {
         self.with_session(|session| Ok(session.view()))
     }
 
+    /// Append `fragment` without reading the collection: what intake hears
+    /// and what a say request becomes are stored whatever foundation is away
+    /// (on 26 November 2026 five stranded on another host stopped intake for
+    /// five hours).
     fn publish(&self, fragment: Fragment, description: String) -> Result<CollectionCommit> {
-        self.with_session(|session| session.commit(fragment, description))
+        self.storage.with_store(|store, signer, runtime| {
+            let collection = self.open_collection(store, signer.verifying_key(), runtime)?;
+            commit_discord_fragment(store, runtime, collection, signer, fragment, description)
+        })
     }
 }
 
@@ -1266,12 +1423,19 @@ fn send_with(
     // the id comes from a read, and one the channel does not hold is a
     // mistaken target, never a reason to post an ordinary message instead.
     if let Some(target) = reply_to {
-        let stored = storage.with_session(|session| {
-            Ok(discord_model::message_stored_in(
-                &session.facts,
-                channel_id,
-                target,
-            ))
+        let stored = storage.with_session_read(|session| {
+            let stored = discord_model::message_stored_in(&session.facts, channel_id, target);
+            // Not found while a foundation could not be loaded is not "not
+            // stored": it may be there, so refuse for that reason instead.
+            if !stored && !session.unread.is_empty() {
+                return Err(anyhow::Error::from(crate::storage::IncompleteAttachedRead {
+                    unread: session.unread.clone(),
+                })
+                .context(format!(
+                    "message {target} was not found in channel {channel_id}, so nothing was sent"
+                )));
+            }
+            Ok(stored)
         })?;
         ensure!(
             stored,
@@ -1587,7 +1751,7 @@ fn pull(storage: DiscordStorage<'_>, token: &str, options: PullOptions) -> Resul
             storage: owner,
             collection: storage.collection,
         };
-        let mut view = storage.with_session(|session| Ok(session.view()))?;
+        let mut view = storage.with_session_read(|session| Ok(session.view()))?;
         let Some(channel_id) = options.channel_id.as_deref() else {
             let channels = list_visible_text_channels(token)?;
             let mut report = PullReport {
@@ -1719,7 +1883,7 @@ fn pull_channel(
                     "discord: channel {channel_id} is heard from {}",
                     format_interval(from)
                 );
-                let (recorded, after) = storage.with_session(|session| {
+                let (recorded, after) = storage.with_session_read(|session| {
                     let commit = session.commit(intake, description)?;
                     Ok((commit, session.view()))
                 })?;
@@ -1734,6 +1898,7 @@ fn pull_channel(
             commit,
             more: false,
             unreadable_replies: unreadable,
+            notes: view.notes(),
         });
     }
 
@@ -1763,7 +1928,7 @@ fn pull_channel(
     };
     // The selected coverage remains frozen while REST payloads and attachments
     // are fetched. Reenter the local owner only after the fragment is complete.
-    let (commit, after) = storage.with_session(|session| {
+    let (commit, after) = storage.with_session_read(|session| {
         let commit = session.commit(fragment, description)?;
         Ok((commit, session.view()))
     })?;
@@ -1775,6 +1940,7 @@ fn pull_channel(
         commit: Some(commit),
         more: forward.more,
         unreadable_replies: unreadable,
+        notes: view.notes(),
     })
 }
 
@@ -2452,6 +2618,7 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
         return Ok(History {
             channel_id: options.channel_id.clone(),
             messages: Vec::new(),
+            notes: view.notes(),
         });
     }
     let channel_names = discord_model::channel_labels(&view.facts, &view.reader)?;
@@ -2481,6 +2648,7 @@ fn read_history(view: &CollectionView, options: &ReadOptions) -> Result<History>
     Ok(History {
         channel_id: options.channel_id.clone(),
         messages: rows,
+        notes: view.notes(),
     })
 }
 
@@ -2931,6 +3099,7 @@ mod tests {
             &History {
                 channel_id: None,
                 messages,
+                notes: Vec::new(),
             },
             &mut crate::out::Out::new(&mut |part| {
                 if let crate::out::Part::Text { text } = part {
@@ -2968,6 +3137,7 @@ mod tests {
             &History {
                 channel_id: None,
                 messages,
+                notes: Vec::new(),
             },
             &mut crate::out::Out::new(&mut |part| {
                 if let crate::out::Part::Text { text: line } = part {
@@ -3384,7 +3554,7 @@ mod tests {
         assert!(two.published.is_some());
         assert_eq!(two.addressees, both);
         assert_eq!(
-            discord.channel_addressing().unwrap(),
+            discord.channel_addressing().unwrap().0,
             vec![AddressedChannel {
                 channel_id: channel.to_owned(),
                 published: None,
@@ -3398,7 +3568,7 @@ mod tests {
         let nobody = discord.address_channel(channel, &[]).unwrap();
         assert!(nobody.published.is_some());
         assert_eq!(
-            discord.channel_addressing().unwrap(),
+            discord.channel_addressing().unwrap().0,
             vec![AddressedChannel {
                 channel_id: channel.to_owned(),
                 published: None,
@@ -5210,5 +5380,170 @@ mod tests {
         assert!(discord_model::validate_snowflake("01").is_err());
         assert!(discord_model::validate_snowflake("not-an-id").is_err());
         assert!(discord_model::validate_snowflake("18446744073709551616").is_err());
+    }
+
+    /// The Discord collection of a fresh test pile, opened as intake opens it.
+    fn discord_collection(storage: &crate::storage::Storage) -> Collection<SimpleArchive> {
+        test_storage(storage)
+            .with_session(|session| Ok(session.collection))
+            .unwrap()
+    }
+
+    /// 26 November 2026: five foundations written on another host stranded
+    /// there, and every Discord write and read refused for five hours. An
+    /// append reads nothing; a read answers over what is here and names
+    /// what it could not load; only replaying an unsettled say request,
+    /// which absence would turn into speaking twice, still refuses.
+    #[test]
+    fn intake_and_reads_go_on_while_a_foundation_is_away() {
+        use crate::storage::IncompleteAttachedRead;
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::new(pile, Some(key));
+        let discord = Discord::with_storage(storage.clone());
+        let channel = "100000000000000701";
+        let floor = 100000000000000700;
+        let message = |id: &str, content: &str| message_json(id, channel, content, None, json!([]));
+        discord
+            .observe(
+                message("100000000000000710", "before"),
+                floor,
+                &mut OnePage(vec![]),
+            )
+            .unwrap();
+        let collection = discord_collection(&storage);
+        let away = storage
+            .with_pile(|pile, signer| {
+                crate::storage::residual_fixture::strand(
+                    pile,
+                    collection,
+                    signer,
+                    discord_model::bot_account_fragment("100000000000000799")?,
+                )
+            })
+            .unwrap();
+        let away_hex = hex::encode(away.raw);
+
+        // (a) Every append is stored.
+        discord
+            .observe(
+                message("100000000000000711", "during"),
+                floor,
+                &mut OnePage(vec![]),
+            )
+            .unwrap();
+        discord.record_bot_account("100000000000000798").unwrap();
+        let request = discord
+            .request_speech(
+                None,
+                channel,
+                "Hello.",
+                &crate::voice::options::SpeechOptions::default(),
+                Some("ada"),
+            )
+            .unwrap();
+        discord
+            .record_speech(request, discord_model::SayOutcome::Started)
+            .unwrap();
+
+        // (b) A read shows what is here and says what is not.
+        let history = discord
+            .read(ReadOptions {
+                channel_id: Some(channel.to_owned()),
+                limit: 0,
+                ..ReadOptions::default()
+            })
+            .unwrap();
+        let contents: Vec<&str> = history
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.contains(&"before") && contents.contains(&"during"),
+            "{contents:?}"
+        );
+        assert_eq!(history.notes.len(), 1, "{:?}", history.notes);
+        assert!(history.notes[0].contains(&away_hex), "{:?}", history.notes);
+        let mut notes = Vec::new();
+        super::super::render::history(
+            &history,
+            &mut crate::out::Out::new(&mut |part| {
+                if let crate::out::Part::Note { text } = part {
+                    notes.push(text);
+                }
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert_eq!(notes, history.notes);
+        let receipt = discord
+            .pull_channel(
+                channel,
+                None,
+                &mut OnePage(vec![message("100000000000000712", "pulled")]),
+            )
+            .unwrap();
+        assert!(receipt.commit.is_some());
+        assert!(
+            receipt.notes.iter().any(|note| note.contains(&away_hex)),
+            "{:?}",
+            receipt.notes
+        );
+        let (_, notes) = discord.auth_status_read().unwrap();
+        assert!(
+            notes.iter().any(|note| note.contains(&away_hex)),
+            "{notes:?}"
+        );
+        let (_, notes) = discord.channel_addressing().unwrap();
+        assert!(
+            notes.iter().any(|note| note.contains(&away_hex)),
+            "{notes:?}"
+        );
+        // Bytes not found while a foundation is away may be there.
+        let error = discord
+            .attachment_bytes("100000000000000790", "voice-message.ogg")
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<IncompleteAttachedRead>().is_some(),
+            "{error:#}"
+        );
+
+        // (d) Absence would replay a request that may have been spoken.
+        let error = discord.unsettled_speech(channel).unwrap_err();
+        let incomplete = error.downcast_ref::<IncompleteAttachedRead>().unwrap();
+        assert_eq!(incomplete.unread.members().collect::<Vec<_>>(), vec![away]);
+    }
+
+    /// Bytes that are here and form no archive are a fault, never a
+    /// foundation that is away: a read fails loudly.
+    #[test]
+    fn discord_reads_fail_loudly_on_a_malformed_foundation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::new(pile, Some(key));
+        let discord = Discord::with_storage(storage.clone());
+        let channel = "100000000000000702";
+        discord
+            .observe(
+                message_json("100000000000000720", channel, "resident", None, json!([])),
+                100000000000000700,
+                &mut OnePage(vec![]),
+            )
+            .unwrap();
+        let collection = discord_collection(&storage);
+        storage
+            .with_pile(|pile, signer| {
+                crate::storage::residual_fixture::malformed(pile, collection, signer)
+            })
+            .unwrap();
+        let error = discord.read(ReadOptions::default()).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_none(),
+            "a fault is not a gap: {error:#}"
+        );
+        assert!(discord.unsettled_speech(channel).is_err());
     }
 }

@@ -346,7 +346,10 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
     };
     match command {
         CommandMode::Auth { command } => match command {
-            AuthCommand::Status => render::auth(&operations.auth_status()?, out),
+            AuthCommand::Status => {
+                let (status, notes) = operations.auth_status_read()?;
+                render::auth(&status, &notes, out)
+            }
             AuthCommand::Set { secret_version } => {
                 let revision = operations.auth_set(secret_version)?;
                 out.line(format!(
@@ -407,10 +410,17 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
             command: ChannelsCommand::Address {
                 channel_id, people, ..
             },
-        } => render::addressed(&[operations.address_channel(&channel_id, &people)?], out),
+        } => render::addressed(
+            &[operations.address_channel(&channel_id, &people)?],
+            &[],
+            out,
+        ),
         CommandMode::Channels {
             command: ChannelsCommand::Addressed,
-        } => render::addressed(&operations.channel_addressing()?, out),
+        } => {
+            let (channels, notes) = operations.channel_addressing()?;
+            render::addressed(&channels, &notes, out)
+        }
     }
 }
 

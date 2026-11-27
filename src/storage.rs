@@ -97,9 +97,9 @@ pub type FacultySnapshot = <FacultyStore as SnapshotSource>::Snapshot;
 pub use triblespace::core::repo::async_store::AcquiringReader;
 
 mod borrowed;
-pub(crate) use borrowed::{BorrowedStore, FacultyAccess};
 #[cfg(test)]
 pub(crate) use borrowed::registration_test;
+pub(crate) use borrowed::{BorrowedStore, FacultyAccess};
 
 /// Explicit application bindings from a faculty role to one exact descriptor.
 /// Roles are the schema IDs in [`crate::collection_names::table`], not names
@@ -1315,14 +1315,19 @@ pub fn acquire_facts<R: StoreRead>(
 
 /// [`acquire_facts`] for a caller that answers from what is here rather than
 /// refusing: the facts, and the foundations this observation omits beside
-/// them. The acquisition is attempted exactly as in [`acquire_facts`]; only
-/// its outcome differs, so this is not a cheaper or a laxer fetch.
+/// them. The acquisition is attempted exactly as in [`acquire_facts`]: a
+/// foundation whose bytes are not here is fetched on demand, and only one
+/// the fetch could not bring stays unread. Storage errors and bytes that
+/// cannot form an archive still fail the read.
 ///
-/// Read this only where the answer does not depend on absence -- a lookup of
-/// a named record, a preview -- and say what was unread. A reader whose
-/// answer is a count, a ranking, a cover or a latest-of must keep
-/// [`acquire_facts`], because an omitted foundation changes such an answer
-/// silently.
+/// This is the ordinary read (JP, 2026-11-26): answer with what was read,
+/// and say what could not be loaded ([`unread_foundations_note`]) instead of
+/// refusing the whole collection for one absent foundation. A count, a list
+/// or a cover read this way is the answer over what is here, and the note
+/// beside it keeps it from claiming more. Keep [`acquire_facts`] only where
+/// absence would invalidate a decision that cannot be taken back -- a write
+/// that supersedes what it saw, or a side effect such as speaking a say
+/// request no outcome has settled.
 pub fn acquire_facts_read<R: StoreRead>(
     reader: &R,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -1333,6 +1338,32 @@ pub fn acquire_facts_read<R: StoreRead>(
             .context("select Rank9 fact cover")?,
     )
     .context("acquire the selected Rank9 facts")
+}
+
+/// A note naming the foundations of `label`'s collection a read could not
+/// load, for the caller to deliver beside its answer, or `None` when the read
+/// was complete. Names at most eight, as [`IncompleteAttachedRead`] does.
+pub fn unread_foundations_note(label: &str, unread: &Support<SimpleArchive>) -> Option<String> {
+    if unread.is_empty() {
+        return None;
+    }
+    let named = unread
+        .members()
+        .take(8)
+        .map(|handle| hex::encode(handle.raw))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = unread.len().saturating_sub(8);
+    Some(format!(
+        "{} foundation(s) of {label} could not be loaded, so this answer omits whatever \
+         they hold: {named}{}",
+        unread.len(),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        },
+    ))
 }
 
 /// Acquire residual bytes of an already-selected fact observation, without
@@ -1673,6 +1704,60 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
         (Err(error), Err(close_error)) => {
             Err(error.context(format!("closing pile also failed: {close_error}")))
         }
+    }
+}
+
+/// Foundations a read cannot simply read, planted in a test pile: one this
+/// pile has the signed record of but not the bytes (a commit stranded on
+/// another host, as on 26 November 2026), and one whose bytes are here and
+/// form no archive.
+#[cfg(test)]
+pub(crate) mod residual_fixture {
+    use anyhow::Result;
+    use ed25519_dalek::SigningKey;
+    use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace::core::blob::encodings::UnknownBlob;
+    use triblespace::core::collection::{
+        empty_metadata_handle, Collection, CollectionCommit, CollectionData, CollectionRecord,
+        CollectionStore, CollectionStoreExt,
+    };
+    use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::core::inline::Inline;
+    use triblespace::core::repo::memoryrepo::MemoryRepo;
+    use triblespace::core::repo::pile::Pile;
+    use triblespace::core::repo::BlobStorePut;
+    use triblespace::core::trible::Fragment;
+
+    /// Commit `fragment` into `source` elsewhere and give `pile` only the
+    /// signed record: the foundation is admitted here, its bytes are not.
+    pub fn strand(
+        pile: &mut Pile,
+        source: Collection<SimpleArchive>,
+        signer: &SigningKey,
+        fragment: Fragment,
+    ) -> Result<Inline<Handle<SimpleArchive>>> {
+        let arriving = MemoryRepo::default().commit(source, signer, fragment)?;
+        pile.insert(CollectionRecord::Commit(arriving))?;
+        Ok(Handle::<SimpleArchive>::from_hash(arriving.data()))
+    }
+
+    /// A signed commit into `source` whose bytes are here but are no
+    /// archive at all.
+    pub fn malformed(
+        pile: &mut Pile,
+        source: Collection<SimpleArchive>,
+        signer: &SigningKey,
+    ) -> Result<Inline<Handle<SimpleArchive>>> {
+        let bytes = triblespace::core::blob::Bytes::from_source(vec![0xEE; 63]);
+        let data: CollectionData = Inline::new(pile.put::<UnknownBlob, _>(bytes)?.raw);
+        pile.put::<SimpleArchive, _>(triblespace::core::trible::TribleSet::new())?;
+        pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            signer,
+            source.handle(),
+            data,
+            empty_metadata_handle(),
+        )))?;
+        Ok(Handle::<SimpleArchive>::from_hash(data))
     }
 }
 

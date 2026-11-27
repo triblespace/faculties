@@ -250,7 +250,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             )?;
             render::noted(&receipt, output)
         }
-        Command::Show { id } => output.text(goals.show(&id)?),
+        Command::Show { id } => render::board(&goals.show(&id)?, output),
         Command::Prioritize { higher, over } => {
             render::prioritized(&goals.prioritize(&higher, &over, persona)?, output)
         }
