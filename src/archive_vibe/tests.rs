@@ -49,7 +49,7 @@ pub(crate) fn write_current(root: &Path, session: &str, sequence: u64) {
     );
 }
 
-fn write_export(root: &Path, session: &str) {
+pub(crate) fn write_export(root: &Path, session: &str) {
     fs::create_dir_all(root).unwrap();
     write_json(
         &root.join("export.json"),
@@ -197,11 +197,39 @@ pub(crate) fn finished_native(root: &Path) {
 }
 
 pub(crate) fn finished_native_for(root: &Path, session: &str) {
+    finished_with_answer(root, session, "synthetic answer");
+}
+
+pub(crate) fn finished_with_answer(root: &Path, session: &str, text: &str) {
     write_current(root, session, 4);
     segment(
         root,
         1,
-        &[initial(), first_completion(), second_intent(), answer()],
+        &[
+            initial(),
+            first_completion(),
+            second_intent(),
+            success("second-action", json!([{"type": "text", "text": text}])),
+        ],
+        b"",
+    );
+    segment(root, 5, &[], b"");
+}
+
+pub(crate) fn partial_native(root: &Path) {
+    write_current(root, SESSION, 0);
+    segment(root, 1, &[initial(), first_completion()], b"{");
+}
+
+pub(crate) fn finished_with_rewritten_prefix(root: &Path) {
+    write_current(root, SESSION, 4);
+    let mut intent = initial();
+    intent.1["request"]["model_input"]["messages"]["messages"][1]["content"][0]["text"] =
+        json!("rewritten question");
+    segment(
+        root,
+        1,
+        &[intent, first_completion(), second_intent(), answer()],
         b"",
     );
     segment(root, 5, &[], b"");

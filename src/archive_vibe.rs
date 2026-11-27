@@ -183,28 +183,65 @@ pub fn run_source(
     if !valid_session_id(session_id) {
         bail!("invalid expected Vibe session id");
     }
-    let export = read_export(&output_dir.join("export.json"));
-    match export {
-        Ok(export)
-            if export.session_id.as_deref() == Some(session_id)
-                && export.journal_dir.as_deref() == Some("session") =>
-        {
-            match read_current(&output_dir.join("session"), session_id) {
-                Ok(_) => return Ok(Some(output_dir.to_owned())),
-                Err(error) if is_missing(&error) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(_) => {}
-        Err(error) if is_missing(&error) => {}
+    let export = match read_export(&output_dir.join("export.json")) {
+        Ok(export) => Some(export),
+        Err(error) if is_missing(&error) => None,
         Err(error) => return Err(error),
+    };
+    if has_export_store(output_dir, session_id, export)? {
+        return Ok(Some(output_dir.to_owned()));
     }
     let native = vibe_home.join(NATIVE_SESSIONS).join(session_id);
     Ok(active_segment(&native)?.map(|_| native))
 }
 
+fn has_export_store(output: &Path, session: &str, export: Option<Export>) -> Result<bool> {
+    if !export.is_some_and(|export| {
+        export.session_id.as_deref() == Some(session)
+            && export.journal_dir.as_deref() == Some("session")
+    }) {
+        return Ok(false);
+    }
+    match read_current(&output.join("session"), session) {
+        Ok(_) => Ok(true),
+        Err(error) if is_missing(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn read_export(path: &Path) -> Result<Export> {
     decode_export(&read(path)?)
+}
+
+/// Unsupported export metadata cannot establish a session or an outcome. A
+/// UUID it does name can still contradict the independently identified run.
+fn settlement_export(path: &Path, expected: Option<&str>) -> Result<(Option<Export>, bool)> {
+    let bytes = match read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if is_missing(&error) => return Ok((None, false)),
+        Err(error) => return Err(error),
+    };
+    let export = decode_export(&bytes).ok();
+    let claimed = match &export {
+        Some(export) => export.session_id.clone(),
+        None => decode::<serde_json::Value>(&bytes, "export")
+            .ok()
+            .and_then(|json| {
+                json.get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| valid_session_id(id))
+                    .map(str::to_owned)
+            }),
+    };
+    if claimed
+        .as_deref()
+        .zip(expected)
+        .is_some_and(|(a, b)| a != b)
+    {
+        bail!("Vibe export and launch home identify different sessions");
+    }
+    let unsupported = export.is_none();
+    Ok((export, unsupported))
 }
 
 fn decode_export(bytes: &Bytes) -> Result<Export> {
@@ -362,7 +399,7 @@ pub fn project_path(
     path: &Path,
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<ProjectionSummary> {
-    project(path, None, read, emit)
+    project(path, None, read, None, emit)
 }
 
 /// Project the exact provider session captured for a run. Recheck that UUID
@@ -375,27 +412,22 @@ pub fn project_run(
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<Option<ProjectionSummary>> {
     run_source(output_dir, vibe_home, session_id)?
-        .map(|path| project(&path, Some(session_id), read, emit))
+        .map(|path| project(&path, Some(session_id), read, None, emit))
         .transpose()
 }
 
 /// Identify the only session an exclusively allocated launch home holds.
 /// When both sources name a session they must agree.
 pub(crate) fn launched_session(output: &Path, home: &Path) -> Result<Option<String>> {
-    let exported = match read_export(&output.join("export.json")) {
-        Ok(export) => export.session_id,
-        Err(error) if is_missing(&error) => None,
-        Err(error) => return Err(error),
-    };
     let native = home.join(NATIVE_SESSIONS);
     let entries = match check_path(&native).and_then(|()| fs::read_dir(&native).map_err(Into::into))
     {
-        Ok(entries) => entries,
-        Err(error) if is_missing(&error) => return Ok(exported),
+        Ok(entries) => Some(entries),
+        Err(error) if is_missing(&error) => None,
         Err(error) => return Err(error),
     };
     let mut session = None;
-    for entry in entries {
+    for entry in entries.into_iter().flatten() {
         let entry = entry?;
         let name = entry.file_name();
         let Some(id) = name.to_str().filter(|id| valid_session_id(id)) else {
@@ -406,14 +438,48 @@ pub(crate) fn launched_session(output: &Path, home: &Path) -> Result<Option<Stri
         }
         session = Some(id.to_owned());
     }
-    if exported
-        .as_ref()
-        .zip(session.as_ref())
-        .is_some_and(|(a, b)| a != b)
-    {
-        bail!("Vibe export and launch home identify different sessions");
+    let (export, _) = settlement_export(&output.join("export.json"), session.as_deref())?;
+    Ok(export.and_then(|export| export.session_id).or(session))
+}
+
+/// A run-local receipt for the documents and for the validated journal prefix.
+/// The journal digest covers complete records in sequence across all segments.
+#[derive(Debug, Eq, PartialEq, serde::Serialize, Deserialize)]
+pub(crate) struct RunCapture {
+    pub bytes: u64,
+    pub documents: String,
+    pub records: usize,
+    pub journal: String,
+    pub complete: bool,
+}
+
+pub(crate) struct RunInputs {
+    pub summary: ProjectionSummary,
+    pub capture: RunCapture,
+    pub unsupported_export: bool,
+    journal_prefixes: Vec<blake3::Hash>,
+}
+
+impl RunInputs {
+    pub(crate) fn extends(&self, held: &RunCapture) -> bool {
+        held.records
+            .checked_sub(1)
+            .and_then(|index| self.journal_prefixes.get(index))
+            .is_some_and(|digest| digest.to_hex().as_str() == held.journal)
     }
-    Ok(exported.or(session))
+}
+
+struct JournalProof {
+    digest: blake3::Hasher,
+    prefixes: Vec<blake3::Hash>,
+}
+
+impl JournalProof {
+    fn record(&mut self, line: &[u8]) {
+        self.digest.update(line);
+        self.digest.update(b"\n");
+        self.prefixes.push(self.digest.finalize());
+    }
 }
 
 /// Read one exact run and fingerprint the bytes actually passed to the parser.
@@ -423,23 +489,59 @@ pub(crate) fn project_run_inputs(
     home: &Path,
     session: &str,
     emit: impl FnMut(ProjectedSource) -> Result<()>,
-) -> Result<Option<(ProjectionSummary, u64, blake3::Hash)>> {
-    let Some(path) = run_source(output, home, session)? else {
+) -> Result<Option<RunInputs>> {
+    if !valid_session_id(session) {
+        bail!("invalid expected Vibe session id");
+    }
+    let (export, unsupported) = settlement_export(&output.join("export.json"), Some(session))?;
+    if has_export_store(output, session, export)? {
+        return read_run_inputs(output, session, true, emit).map(Some);
+    }
+    let mut native = project_native_inputs(home, session, emit)?;
+    match native.as_mut() {
+        Some(native) => native.unsupported_export = unsupported,
+        None if unsupported => {
+            bail!("Vibe export metadata is unsupported and no native source is readable")
+        }
+        None => {}
+    }
+    Ok(native)
+}
+
+pub(crate) fn project_native_inputs(
+    home: &Path,
+    session: &str,
+    emit: impl FnMut(ProjectedSource) -> Result<()>,
+) -> Result<Option<RunInputs>> {
+    if !valid_session_id(session) {
+        bail!("invalid expected Vibe session id");
+    }
+    let path = home.join(NATIVE_SESSIONS).join(session);
+    if active_segment(&path)?.is_none() {
         return Ok(None);
-    };
+    }
+    read_run_inputs(&path, session, false, emit).map(Some)
+}
+
+fn read_run_inputs(
+    path: &Path,
+    session: &str,
+    exported: bool,
+    emit: impl FnMut(ProjectedSource) -> Result<()>,
+) -> Result<RunInputs> {
     let mut digest = blake3::Hasher::new_derive_key("Faculties Vibe settlement source v1");
-    digest.update(if path.as_path() == output {
-        b"export"
-    } else {
-        b"native"
-    });
+    digest.update(if exported { b"export" } else { b"native" });
     let mut total = 0;
+    let mut proof = JournalProof {
+        digest: blake3::Hasher::new_derive_key("Faculties Vibe settlement journal v1"),
+        prefixes: Vec::new(),
+    };
     let summary = project(
-        &path,
+        path,
         Some(session),
         |input| {
             let bytes = read(input)?;
-            let name = input.strip_prefix(&path)?.as_os_str().as_encoded_bytes();
+            let name = input.strip_prefix(path)?.as_os_str().as_encoded_bytes();
             let len = bytes.len() as u64;
             digest.update(&(name.len() as u64).to_le_bytes());
             digest.update(name);
@@ -448,15 +550,29 @@ pub(crate) fn project_run_inputs(
             total += len;
             Ok(bytes)
         },
+        Some(&mut proof),
         emit,
     )?;
-    Ok(Some((summary, total, digest.finalize())))
+    let capture = RunCapture {
+        bytes: total,
+        documents: digest.finalize().to_hex().to_string(),
+        records: summary.journal_records,
+        journal: proof.digest.finalize().to_hex().to_string(),
+        complete: summary.coverage() == "complete",
+    };
+    Ok(RunInputs {
+        summary,
+        capture,
+        unsupported_export: false,
+        journal_prefixes: proof.prefixes,
+    })
 }
 
 fn project(
     path: &Path,
     expected: Option<&str>,
     mut read_input: impl FnMut(&Path) -> Result<Bytes>,
+    mut proof: Option<&mut JournalProof>,
     emit: impl FnMut(ProjectedSource) -> Result<()>,
 ) -> Result<ProjectionSummary> {
     check_path(path).with_context(|| format!("inspect Vibe directory {}", path.display()))?;
@@ -538,7 +654,7 @@ fn project(
             break;
         }
         let bytes = read_input(&segment)?;
-        next = scanner.scan_segment(first, bytes, &mut summary)?;
+        next = scanner.scan_segment(first, bytes, &mut summary, proof.as_deref_mut())?;
         summary.segments += 1;
     }
     if read(&root.join("CURRENT"))? != store.pointer {

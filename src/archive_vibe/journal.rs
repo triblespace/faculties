@@ -14,7 +14,7 @@ use crate::archive_source::{
 };
 use crate::schemas::blockdag::content_fact::{direction as directions, modality as modalities};
 
-use super::ProjectionSummary;
+use super::{JournalProof, ProjectionSummary};
 
 const DIGEST_FIELD: &[u8] = b",\"record_sha256\":\"";
 
@@ -98,6 +98,7 @@ impl Scanner {
         first: u64,
         bytes: Bytes,
         summary: &mut ProjectionSummary,
+        mut proof: Option<&mut JournalProof>,
     ) -> Result<u64> {
         let mut offset = 0;
         let mut sequence = first;
@@ -107,6 +108,9 @@ impl Scanner {
             let current = self
                 .scan_record(line, sequence, previous.as_deref(), summary)
                 .with_context(|| format!("Vibe journal sequence {sequence}"))?;
+            if let Some(proof) = proof.as_deref_mut() {
+                proof.record(&bytes[offset..newline]);
+            }
             previous = Some(current);
             sequence = sequence.checked_add(1).context("Vibe sequence overflow")?;
             summary.journal_records += 1;

@@ -3757,9 +3757,12 @@ impl Spawn {
     }
 
     fn archive_vibe_run(&self, view: &RunView) -> Result<String> {
+        use crate::archive_vibe::{self, RunCapture};
+
         let [home] = view.vibe_home.as_slice() else {
             bail!(
-                "Vibe archive coverage is missing: the run has no unambiguous launch home. +                 Scheduled ingestion can still discover native transcripts."
+                "Vibe archive coverage is missing: the run has no unambiguous launch home. \
+                 Scheduled ingestion can still discover native transcripts."
             );
         };
         let home = Path::new(home);
@@ -3767,10 +3770,11 @@ impl Spawn {
             bail!("Vibe archive coverage is missing: the recorded launch home is not absolute");
         }
         let output = home.join("output");
+        let discovered = archive_vibe::launched_session(&output, home)
+            .context("Identifying the Vibe launch's session failed")?;
         let session = match view.source_locator.as_slice() {
             [] => {
-                let session = crate::archive_vibe::launched_session(&output, home)
-                    .context("Identifying the Vibe launch's session failed")?
+                let session = discovered
                     .context("Vibe archive coverage is missing: the launch left no session UUID")?;
                 let mut bound = Fragment::empty();
                 let locator =
@@ -3788,59 +3792,134 @@ impl Spawn {
                 .to_owned(),
             _ => bail!("Vibe archive coverage is missing: this run records multiple locators"),
         };
+        if discovered.as_deref().is_some_and(|id| id != session) {
+            bail!("The Vibe launch home no longer identifies the recorded session {session}");
+        }
 
         let mut pieces = Vec::new();
-        let (summary, end, hash) =
-            crate::archive_vibe::project_run_inputs(&output, home, &session, |piece| {
-                pieces.push(piece);
-                Ok(())
-            })
-            .with_context(|| format!("Reading Vibe session {session} for Archive failed"))?
-            .with_context(|| {
-                format!(
-                    "Vibe archive coverage is missing: session {session} has no readable source"
-                )
-            })?;
+        let input = archive_vibe::project_run_inputs(&output, home, &session, |piece| {
+            pieces.push(piece);
+            Ok(())
+        })
+        .with_context(|| format!("Reading Vibe session {session} for Archive failed"))?
+        .with_context(|| {
+            format!("Vibe archive coverage is missing: session {session} has no readable source")
+        })?;
+        let summary = &input.summary;
+        let capture = &input.capture;
         let coverage = summary.coverage();
         if coverage == "missing" {
             bail!(
-                "Vibe archive coverage is missing: session {session} yielded no archive pieces +                 (export outcome: {}).",
+                "Vibe archive coverage is missing: session {session} yielded no archive pieces \
+                 (export outcome: {}).",
                 summary.export_outcome.as_deref().unwrap_or("unavailable"),
             );
         }
 
-        let digest: DigestValue = Inline::new(*hash.as_bytes());
-        match (view.archive_end.as_slice(), view.archive_digest.as_slice()) {
-            ([], []) => self
-                .publish(
-                    entity! { ExclusiveId::force_ref(&view.id) @
-                        attrs::archive_end: end,
+        let run = view.id;
+        let mut held = self.observe(|facts, reader| {
+            find!(
+                handle: TextHandle,
+                pattern!(facts, [{ run @ attrs::vibe_archive_capture: ?handle }])
+            )
+            .map(|handle| {
+                let text = reader
+                    .get::<View<str>, _>(handle)
+                    .context("Read the recorded Vibe capture")?;
+                serde_json::from_str::<RunCapture>(&text)
+                    .context("Decode the recorded Vibe capture")
+            })
+            .collect::<Result<Vec<_>>>()
+        })?;
+        held.sort_by_key(|receipt| receipt.complete);
+        let mut binding = Fragment::empty();
+        let differs = || {
+            anyhow!(
+                "The Vibe source for session {session} differs from the recorded run inputs. \
+             Nothing was archived by this attempt."
+            )
+        };
+        let matches_initial = |receipt: &RunCapture, end: u64, digest: DigestValue| {
+            let hash = blake3::Hash::from_hex(&receipt.documents)
+                .context("Decode the Vibe document digest")?;
+            Ok::<_, anyhow::Error>(receipt.bytes == end && Inline::new(*hash.as_bytes()) == digest)
+        };
+        let mut legacy = None;
+        if held.is_empty() {
+            match (view.archive_end.as_slice(), view.archive_digest.as_slice()) {
+                ([], []) => {
+                    let hash = blake3::Hash::from_hex(&capture.documents)?;
+                    let digest: DigestValue = Inline::new(*hash.as_bytes());
+                    binding += entity! { ExclusiveId::force_ref(&run) @
+                        attrs::archive_end: capture.bytes,
                         attrs::archive_digest: digest,
+                    };
+                }
+                ([end], [digest]) if matches_initial(capture, *end, *digest)? => {}
+                ([end], [digest]) if capture.complete && view.archive_imported.is_empty() => {
+                    // The old document digest supplies no journal boundary.
+                    // Recover it only by reading a native capture that still
+                    // reproduces the exact documents previously bound.
+                    let prior = archive_vibe::project_native_inputs(home, &session, |_| Ok(()))?
+                        .ok_or_else(differs)?;
+                    if !matches_initial(&prior.capture, *end, *digest)? {
+                        return Err(differs());
                     }
-                    .into(),
-                )
-                .context("Bind the Vibe documents read for this run")?,
-            ([held_end], [held_digest]) if *held_end == end && *held_digest == digest => {}
-            _ => bail!(
-                "The Vibe source for session {session} differs from the recorded run inputs. +                 Nothing was archived by this attempt."
-            ),
+                    legacy = Some(prior.capture);
+                }
+                _ => return Err(differs()),
+            }
+        }
+        let record = match held.as_slice() {
+            [] => match legacy.as_ref() {
+                Some(prior) if input.extends(prior) => true,
+                Some(_) => return Err(differs()),
+                None => true,
+            },
+            [initial] if capture == initial => false,
+            [initial] if !initial.complete && capture.complete && input.extends(initial) => true,
+            [initial, complete]
+                if !initial.complete && complete.complete && capture == complete =>
+            {
+                false
+            }
+            _ => return Err(differs()),
+        };
+        if record {
+            for receipt in legacy.iter().chain(std::iter::once(capture)) {
+                let text =
+                    binding.put::<blobencodings::UTF8String, _>(serde_json::to_string(receipt)?);
+                binding +=
+                    entity! { ExclusiveId::force_ref(&run) @ attrs::vibe_archive_capture: text };
+            }
+            self.publish(binding)
+                .context("Bind the Vibe capture to this run")?;
         }
         let published = crate::archive::Archive::with_storage(self.storage.clone())
             .publish_projected_unit(pieces)
             .with_context(|| format!("Archiving Vibe session {session} failed"))?;
-        // A usable prefix can be published while the continuation gate
-        // still waits for evidence of complete coverage.
-        if coverage == "complete" {
+        // Vibe stores partial evidence too. The resident archive gate
+        // currently applies to Claude and Agy.
+        if capture.complete {
             self.publish(
-                entity! { ExclusiveId::force_ref(&view.id) @ attrs::archive_imported: end }.into(),
+                entity! { ExclusiveId::force_ref(&run) @ attrs::archive_imported: capture.bytes }
+                    .into(),
             )
             .context("Record the completed Vibe archive import")?;
         }
+        let export_note = if input.unsupported_export {
+            " The export metadata is unsupported; coverage is from the native journal."
+        } else {
+            ""
+        };
         Ok(format!(
-            "Vibe session {session} was archived with {coverage} coverage ({} pieces; export +             outcome: {}; first missing sequence: {}; trailing bytes held: {}).",
+            "Vibe session {session} was archived with {coverage} coverage ({} pieces; export \
+             outcome: {}; first missing sequence: {}; trailing bytes held: {}).{export_note}",
             published.pieces,
             summary.export_outcome.as_deref().unwrap_or("unavailable"),
-            summary.missing_sequence.map_or_else(|| "none".to_owned(), |n| n.to_string()),
+            summary
+                .missing_sequence
+                .map_or_else(|| "none".to_owned(), |n| n.to_string()),
             summary.trailing_bytes_held,
         ))
     }
@@ -5407,7 +5486,15 @@ pub fn render_show(spawn: &SpawnView, with_brief: bool) -> String {
             )
             .unwrap();
         }
-        if !run.archive_end.is_empty() {
+        if !run.archive_end.is_empty() && run.provider.iter().any(|p| p == Provider::Mistral.name())
+        {
+            writeln!(
+                out,
+                "  initial Vibe source: {} document bytes",
+                join(&run.archive_end)
+            )
+            .unwrap();
+        } else if !run.archive_end.is_empty() {
             writeln!(
                 out,
                 "  archived part: the first {} bytes of the transcript",
@@ -8571,7 +8658,180 @@ mod tests {
         assert!(ended.archive_outcome[0].contains("partial coverage"));
         assert!(ended.archive_outcome[0].contains("price_limit"));
         assert!(ended.archive_imported.is_empty());
+        assert!(ended.settle_failure.is_empty());
         assert!(archived_text(&f, &second_locator).contains("synthetic answer"));
+    }
+
+    #[test]
+    fn a_vibe_export_can_extend_a_bound_prefix_but_cannot_rewrite_it() {
+        use crate::archive_vibe::{
+            tests::{
+                finished_native, finished_with_answer, finished_with_rewritten_prefix,
+                partial_native, write_export, SESSION,
+            },
+            NATIVE_SESSIONS,
+        };
+        let f = fixture();
+        let mut request = f.request("A Vibe prefix followed by an export.");
+        request.provider = Provider::Mistral;
+        let launched = f.spawn.run(&request).unwrap();
+        let home = PathBuf::from(&newest_run(&f.spawn, &launched).vibe_home[0]);
+        let native = home.join(NATIVE_SESSIONS).join(SESSION);
+        partial_native(&native);
+        let locator = format!("session/{SESSION}");
+        let settle = || {
+            settle_as(&f, &launched, Exit::from_systemd("exited", "0", "success")).unwrap();
+            newest_run(&f.spawn, &launched)
+        };
+        let initial = settle();
+        assert!(initial.archive_imported.is_empty());
+        assert!(initial.settle_failure.is_empty());
+        let before = archived_text(&f, &locator);
+        assert!(before.contains("synthetic question"));
+        assert!(!before.contains("synthetic answer"));
+        assert!(initial.archive_outcome[0].ends_with("trailing bytes held: 1)."));
+
+        // The proof must come from the bound prefix even after the native
+        // copy is gone. Both export candidates carry a valid UUID and chain.
+        std::fs::remove_dir_all(&native).unwrap();
+        let output = home.join("output");
+        write_export(&output, SESSION);
+        let exported = output.join("session");
+        finished_with_rewritten_prefix(&exported);
+        let rejected = settle();
+        assert!(rejected.archive_imported.is_empty());
+        assert_eq!(
+            rejected.settle_failure,
+            [format!(
+                "The Vibe source for session {SESSION} differs from the recorded run inputs. \
+                 Nothing was archived by this attempt."
+            )]
+        );
+        assert_eq!(archived_text(&f, &locator), before);
+
+        finished_native(&exported);
+        let complete = settle();
+        assert_eq!(complete.exit_code, [0]);
+        assert_eq!(complete.archive_end, initial.archive_end);
+        assert_eq!(complete.archive_digest, initial.archive_digest);
+        assert_eq!(complete.archive_imported.len(), 1);
+        assert!(complete.archive_imported[0] > initial.archive_end[0]);
+        assert!(complete.archive_outcome.iter().any(
+            |why| why.contains("complete coverage") && why.contains("export outcome: finished")
+        ));
+        let after = archived_text(&f, &locator);
+        assert!(after.contains("synthetic question") && after.contains("synthetic answer"));
+        assert!(!after.contains("rewritten question"));
+        assert_eq!(told_all(&f, &launched.name).len(), 1);
+        let replay = settle();
+        assert_eq!(replay.archive_imported, complete.archive_imported);
+        assert_eq!(replay.archive_outcome, complete.archive_outcome);
+        assert_eq!(replay.settle_failure, complete.settle_failure);
+        assert_eq!(archived_text(&f, &locator), after);
+
+        finished_with_answer(&exported, SESSION, "rewritten answer");
+        let replay = settle();
+        assert_eq!(replay.archive_imported, complete.archive_imported);
+        assert_eq!(replay.settle_failure, rejected.settle_failure);
+        assert_eq!(archived_text(&f, &locator), after);
+        assert_eq!(told_all(&f, &launched.name).len(), 1);
+    }
+
+    #[test]
+    fn a_vibe_capture_with_only_the_old_document_digest_can_upgrade_with_its_native_copy() {
+        use crate::archive_vibe::{
+            self,
+            tests::{finished_native, partial_native, write_export, SESSION},
+            NATIVE_SESSIONS,
+        };
+        let f = fixture();
+        let mut request = f.request("Upgrade an older Vibe binding.");
+        request.provider = Provider::Mistral;
+        let launched = f.spawn.run(&request).unwrap();
+        let home = PathBuf::from(&newest_run(&f.spawn, &launched).vibe_home[0]);
+        partial_native(&home.join(NATIVE_SESSIONS).join(SESSION));
+        let held = archive_vibe::project_native_inputs(&home, SESSION, |_| Ok(()))
+            .unwrap()
+            .unwrap()
+            .capture;
+        let hash = blake3::Hash::from_hex(&held.documents).unwrap();
+        let digest: DigestValue = Inline::new(*hash.as_bytes());
+        f.spawn
+            .publish(
+                entity! { ExclusiveId::force_ref(&launched.run) @
+                    attrs::archive_end: held.bytes,
+                    attrs::archive_digest: digest,
+                }
+                .into(),
+            )
+            .unwrap();
+        let output = home.join("output");
+        write_export(&output, SESSION);
+        finished_native(&output.join("session"));
+        settle_as(&f, &launched, killed()).unwrap();
+        let run = newest_run(&f.spawn, &launched);
+        assert_eq!(run.archive_end, [held.bytes]);
+        assert_eq!(run.archive_digest, [digest]);
+        assert_eq!(run.archive_imported.len(), 1);
+        assert!(run.settle_failure.is_empty());
+        assert!(archived_text(&f, &format!("session/{SESSION}")).contains("synthetic answer"));
+    }
+
+    #[test]
+    fn an_unsupported_vibe_export_preserves_only_matching_native_evidence() {
+        use crate::archive_vibe::{
+            tests::{finished_native, PREDECESSOR as OTHER_SESSION, SESSION},
+            NATIVE_SESSIONS,
+        };
+        let f = fixture();
+        let mut request = f.request("Unsupported Vibe export with a native journal.");
+        request.provider = Provider::Mistral;
+        let launched = f.spawn.run(&request).unwrap();
+        let home = PathBuf::from(&newest_run(&f.spawn, &launched).vibe_home[0]);
+        finished_native(&home.join(NATIVE_SESSIONS).join(SESSION));
+        let output = home.join("output");
+        std::fs::create_dir_all(&output).unwrap();
+        let export = output.join("export.json");
+        let write_unknown = |session| {
+            std::fs::write(
+                &export,
+                serde_json::json!({
+                    "schema_version": 1, "session_id": session, "journal_dir": "session",
+                    "outcome": "a_new_outcome",
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let settle = || {
+            settle_as(&f, &launched, Exit::from_systemd("exited", "0", "success")).unwrap();
+            newest_run(&f.spawn, &launched)
+        };
+        write_unknown(SESSION);
+        let native = settle();
+        assert_eq!(native.exit_code, [0]);
+        assert!(native.settle_failure.is_empty());
+        assert!(native.archive_imported.is_empty());
+        assert!(native.archive_outcome[0].contains("partial coverage"));
+        assert!(native.archive_outcome[0]
+            .ends_with("The export metadata is unsupported; coverage is from the native journal."));
+        let locator = format!("session/{SESSION}");
+        let archived = archived_text(&f, &locator);
+        assert!(archived.contains("synthetic answer"));
+
+        std::fs::write(&export, "{").unwrap();
+        let replay = settle();
+        assert_eq!(replay.archive_outcome, native.archive_outcome);
+        assert!(replay.settle_failure.is_empty());
+        assert_eq!(archived_text(&f, &locator), archived);
+
+        write_unknown(OTHER_SESSION);
+        let conflicting = settle();
+        assert!(conflicting.archive_imported.is_empty());
+        assert!(conflicting.settle_failure[0].ends_with("identify different sessions"));
+        assert!(archived_text(&f, &format!("session/{OTHER_SESSION}")).is_empty());
+        assert_eq!(archived_text(&f, &locator), archived);
+        assert_eq!(told_all(&f, &launched.name).len(), 1);
     }
 
     /// A stand-in for what agy leaves after one run: its result object as
@@ -9369,7 +9629,10 @@ mod tests {
         assert!(run.input_tokens.is_empty() && run.cost_usd.is_empty());
         assert!(run.source_locator.is_empty());
         assert!(run.archive_imported.is_empty());
-        assert!(run.archive_outcome[0].contains("coverage is missing"));
+        assert_eq!(
+            run.archive_outcome,
+            ["Vibe archive coverage is missing: the launch left no session UUID"]
+        );
         assert!(f.told(&launched.name).contains("coverage is missing"));
         assert!(
             run.settle_failure.iter().any(|why| why.contains("usage")),
