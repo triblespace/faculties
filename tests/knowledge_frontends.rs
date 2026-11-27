@@ -443,15 +443,14 @@ fn mcp_tools_are_explicit_finite_and_have_valid_independent_schemas() {
     Server::new(&registered).unwrap();
 }
 
-/// A writer with source WRITE and nothing else creates, imports and edits,
-/// and every command succeeds. The CLI opens the store as the writer's key,
-/// so the writer is the host of that store: its write attaches what it
-/// wrote under its own key -- MAPs no other key believes. The owner's reads
-/// see the writer's revisions from their bytes before its worker attaches
-/// them, and after. The attached fact pairs and the supersession index name
-/// no policy, so there is no grant to give.
+/// Source WRITE admits the writer's commits, but does not make another
+/// host's MAPs usable. Explicit upkeep first makes the received revisions
+/// readable to the writer. Its subsequent creates, imports and edits then
+/// attach their own writes. The owner retains its stored prefix until its
+/// own upkeep carries the received revisions. The attached fact pairs and
+/// supersession index name no policy, so there is no grant to give.
 #[test]
-fn source_writer_commits_revisions_and_every_reader_sees_them() {
+fn source_writer_reads_received_revisions_after_its_own_host_upkeep() {
     use std::collections::BTreeSet;
     use triblespace::core::collection::{grant_collection_write, CollectionRecord};
     use triblespace::prelude::*;
@@ -570,6 +569,31 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
     };
     let before = records();
     let body = format!("#link(\"wiki:{first:x}\")[the resident revision]");
+    let pending = command(&writer_key)
+        .args(["create", "source writer", &body])
+        .output()
+        .unwrap();
+    assert!(!pending.status.success(), "{pending:?}");
+    let stderr = String::from_utf8_lossy(&pending.stderr);
+    assert!(stderr.contains("foundation(s) of Knowledge"), "{stderr}");
+    assert!(
+        stderr.contains("Knowledge link validation failed"),
+        "{stderr}"
+    );
+    assert_eq!(records(), before, "a refused read must publish no records");
+
+    // WRITE authority does not imply receipt of another host's derived
+    // views. Use the existing explicit writer operation, not a read-time
+    // fallback, to make this host's received source usable.
+    let mut local = Pile::open_as(&fixture.pile, writer.verifying_key()).unwrap();
+    pollster::block_on(async {
+        local.ensure_attached(latest, &writer).await.unwrap();
+        faculties::storage::ensure_downstream(&mut local, source, &writer)
+            .await
+            .unwrap();
+    });
+    local.close().unwrap();
+    let before = records();
     let created = command(&writer_key)
         .args(["create", "source writer", &body])
         .output()
@@ -614,10 +638,9 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         "failed append operations must publish no records"
     );
 
-    // An edit supersedes the frontier this node can see, and no read refuses
-    // for being behind: there is no globally consistent state to be behind
-    // of. Editing from a frontier another node has already moved branches
-    // that entry's history, which is what a monotone store is for.
+    // An edit supersedes the stored frontier this node can see. Editing
+    // from a frontier another node has already moved branches that entry's
+    // history; it does not require a globally consistent frontier.
     let edited = command(&writer_key)
         .args([
             "edit",
@@ -628,8 +651,9 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
         .unwrap();
     check(&before, &edited);
 
-    // The owner's read sees the writer's revisions from their bytes before
-    // its worker attaches them, and after.
+    // The owner's passive read retains its own stored prefix and reports
+    // the new pending foundations. Only its explicit upkeep changes that
+    // visible view, even though the raw bytes were already resident.
     for carried in [false, true] {
         if carried {
             faculties::storage::carry_scope(
@@ -639,9 +663,18 @@ fn source_writer_commits_revisions_and_every_reader_sees_them() {
             )
             .unwrap();
         }
+        let before = records();
         let listing = fixture.knowledge().list(&ListOptions::default()).unwrap();
-        assert!(listing.contains("source writer"), "{listing}");
-        assert!(listing.contains("imported by source writer"), "{listing}");
+        assert_eq!(records(), before, "a listing must not publish upkeep");
+        assert!(listing.contains("resident reference"), "{listing}");
+        assert!(listing.contains("projected at once"), "{listing}");
+        assert_eq!(listing.contains("source writer"), carried, "{listing}");
+        assert_eq!(
+            listing.contains("imported by source writer"),
+            carried,
+            "{listing}"
+        );
+        assert_eq!(listing.notes.is_empty(), carried, "{:?}", listing.notes);
     }
 }
 
