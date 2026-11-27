@@ -686,10 +686,13 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
 
     // The open run (fixture-0) lists first under its spawner.
     events = click(&texts, "What it lived", 0);
-    let texts = wait(&mut frame, &mut events, "Turns 1–");
+    // The page count appears before the asynchronous turn bodies arrive.
+    let texts = wait(&mut frame, &mut events, "End of the archived history.");
     let lived = joined(&texts);
     for expected in [
-        "Its own conversation session/fixture-0",
+        "The archived history of session/fixture-0, the conversation this run names.",
+        "No other run here names it; that is what is observed, not proof that it holds only this run's life.",
+        "Turns 1–",
         "Received",
         "Produced",
         "Listening to fixture-0 first.",
@@ -712,7 +715,12 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
     // The ended run with the huge prompt: its input loads only when opened.
     let texts = frame(Vec::new());
     events = click(&texts, "What it lived", 1);
-    let texts = wait(&mut frame, &mut events, "Prepared opening input");
+    // The first run already has a prepared-input header; await this run.
+    let texts = wait(
+        &mut frame,
+        &mut events,
+        "The archived history of session/fixture-1,",
+    );
     assert!(
         !fetched(&tracker),
         "a collapsed prepared input is not loaded"
@@ -727,7 +735,6 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         "End of the prepared opening input.",
         "The first observed input payload differs from this prepared text",
         "It does not establish the initial message or a whole-message match.",
-        "<truncated 741501 bytes>",
     ] {
         assert!(
             opened.contains(expected),
@@ -771,6 +778,37 @@ fn an_opened_run_shows_its_prepared_input_and_its_own_turns_on_demand() {
         texts = frame(Vec::new());
     }
     assert!(joined(&texts).contains("Check the second synthetic track."));
+
+    // The received payload is separately paged. Close the prepared input so
+    // the remaining text pager belongs to the received payload, and wait for
+    // its turn bodies rather than the already-visible page count.
+    events = click(&texts, "Prepared opening input", 1);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut texts = loop {
+        let texts = frame(std::mem::take(&mut events));
+        let shown = joined(&texts);
+        if shown.contains("Listening to fixture-1 first.") && !shown.contains("of 933") {
+            break texts;
+        }
+        assert!(Instant::now() < deadline, "{shown}");
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    const CUT_MARKER: &str = "<truncated 741501 bytes>";
+    assert!(
+        !joined(&texts).contains(CUT_MARKER),
+        "the received payload's first page does not contain its final marker"
+    );
+    // The fixture's received text needs twelve 16-KiB pages, not one eager
+    // body. Navigate the actual pager, preserving the end-marker assertion.
+    for _ in 0..16 {
+        if joined(&texts).contains(CUT_MARKER) {
+            break;
+        }
+        events = click(&texts, "▶", 0);
+        frame(std::mem::take(&mut events));
+        texts = frame(Vec::new());
+    }
+    assert!(joined(&texts).contains(CUT_MARKER));
     fixture.pile.close().unwrap();
 }
 
