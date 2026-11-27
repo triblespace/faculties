@@ -150,6 +150,10 @@ pub struct ParentView {
     /// Ended runs whose report message is not unread: acknowledged, or
     /// never sent (see `zooid show`).
     pub settled: usize,
+    /// Every ended run that is not in [`Self::unreviewed`], newest end
+    /// first: the `settled` and `review_unknown` runs, so a reader can open
+    /// what each lived.
+    pub ended: Vec<WorkerLine>,
     /// Ended runs whose review state cannot be read here (Message or
     /// Relations unavailable).
     pub review_unknown: usize,
@@ -399,6 +403,7 @@ pub fn colony_view<R: BlobStoreGet>(
             unreviewed: Vec::new(),
             settled: 0,
             review_unknown: 0,
+            ended: Vec::new(),
             last_message: None,
             last_spawn: None,
             unread: None,
@@ -453,8 +458,14 @@ pub fn colony_view<R: BlobStoreGet>(
                     Some(unread) if run.message.iter().any(|id| unread.contains(id)) => {
                         parent.unreviewed.push(worker_line(view, run, unit_state))
                     }
-                    Some(_) => parent.settled += 1,
-                    None => parent.review_unknown += 1,
+                    Some(_) => {
+                        parent.settled += 1;
+                        parent.ended.push(worker_line(view, run, unit_state));
+                    }
+                    None => {
+                        parent.review_unknown += 1;
+                        parent.ended.push(worker_line(view, run, unit_state));
+                    }
                 }
             }
         }
@@ -463,6 +474,9 @@ pub fn colony_view<R: BlobStoreGet>(
             .sort_by_key(|line| std::cmp::Reverse(start_key(line.started)));
         parent
             .unreviewed
+            .sort_by_key(|line| std::cmp::Reverse(start_key(line.finished)));
+        parent
+            .ended
             .sort_by_key(|line| std::cmp::Reverse(start_key(line.finished)));
 
         if let (Some(states), Ok(goals), Ok(register)) =
@@ -519,6 +533,7 @@ pub fn colony_view<R: BlobStoreGet>(
             unreviewed: Vec::new(),
             settled: 0,
             review_unknown: 0,
+            ended: Vec::new(),
             last_message: None,
             last_spawn: None,
             unread: None,
