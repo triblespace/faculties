@@ -210,6 +210,14 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
     pollster::block_on(writer_pile.maintain_attached(status, &writer)).unwrap();
     writer_pile.close().unwrap();
 
+    // The denied command must reach the source-WRITE check, not fail
+    // earlier because this third host cannot resolve its persona. Local
+    // attachment upkeep grants no source publication authority.
+    let denied_signer = load_signer(&fixture.pile, Some(&denied_key)).unwrap();
+    let mut denied_pile = Pile::open_as(&fixture.pile, denied_signer.verifying_key()).unwrap();
+    carry_facts(&mut denied_pile, relations, &denied_signer);
+    denied_pile.close().unwrap();
+
     let records = || {
         let mut pile = Pile::open(&fixture.pile).unwrap();
         let records = pile
@@ -338,8 +346,11 @@ fn source_writer_appends_actions_and_reads_them_without_view_grants() {
         .output()
         .unwrap();
     assert!(!denied.status.success());
-    assert!(String::from_utf8_lossy(&denied.stderr)
-        .contains("is not admitted to write the Goals collection"));
+    assert!(
+        String::from_utf8_lossy(&denied.stderr)
+            .contains("is not admitted to write the Goals collection"),
+        "{denied:?}"
+    );
     assert_eq!(records(), before, "a refused command publishes nothing");
 
     // A prefix resolves against what the writer's store reads, which holds

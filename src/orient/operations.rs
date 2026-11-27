@@ -11324,15 +11324,11 @@ mod tests {
                     .unwrap()
                     .unwrap()
                     .0,
-                next_id
+                initial_id
             );
-            assert_eq!(
-                latest_goal_status(&frozen.goals(), unseen_goal)
-                    .unwrap()
-                    .unwrap()
-                    .0,
-                unseen_id
-            );
+            assert!(latest_goal_status(&frozen.goals(), unseen_goal)
+                .unwrap()
+                .is_none());
             assert_eq!(
                 latest_goal_status(&observation.query(&observation.snapshot).goals(), goal)
                     .unwrap()

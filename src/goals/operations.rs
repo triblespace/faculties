@@ -2380,7 +2380,9 @@ mod tests {
             point(4.0e9),
         )
         .unwrap();
-        pile.commit(source, &signer, progress).unwrap();
+        // These later notes model ordinary Goals writes, whose publication
+        // boundary maintains stored views before returning.
+        pollster::block_on(publish_goals(&mut pile, source, &signer, progress)).unwrap();
         assert_eq!(
             goals::unclear_goals(&facts(&mut pile)),
             BTreeSet::from([goal])
@@ -2396,7 +2398,7 @@ mod tests {
             point(4.1e9),
         )
         .unwrap();
-        pile.commit(source, &signer, explanation).unwrap();
+        pollster::block_on(publish_goals(&mut pile, source, &signer, explanation)).unwrap();
         assert!(goals::unclear_goals(&facts(&mut pile)).is_empty());
 
         assert!(pollster::block_on(mark_unclear_in(
