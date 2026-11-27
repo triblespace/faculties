@@ -2901,7 +2901,7 @@ mod tests {
     };
     use crate::secrets::storage as secret_storage;
     use crate::storage::{
-        load_signer, open_pile_strict, open_secrets_collection, open_secrets_collection_read,
+        load_signer, open_pile_strict_as, open_secrets_collection, open_secrets_collection_read,
         publish_fragment,
     };
     use crate::test_support::initialize_open_collection_fixture;
@@ -2955,7 +2955,7 @@ mod tests {
 
         fn views(&self) -> Views {
             let signer = load_signer(&self.pile, Some(&self.key)).unwrap();
-            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
             let secrets_collection =
                 open_secrets_collection_read(&mut pile, signer.verifying_key()).unwrap();
             let secrets = pollster::block_on(secret_storage::ensure_and_snapshot(
@@ -3014,7 +3014,7 @@ mod tests {
 
         fn add_secret(&self, name: &str, plaintext: &[u8], created_at: IntervalValue) -> Id {
             let signer = self.signer();
-            let mut pile = open_pile_strict(&self.pile).unwrap();
+            let mut pile = open_pile_strict_as(&self.pile, signer.verifying_key()).unwrap();
             let collection = open_secrets_collection(&mut pile, signer.verifying_key()).unwrap();
             let secret = secret_storage::add_secret(
                 &mut pile, &signer, collection, name, plaintext, created_at,

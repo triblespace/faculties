@@ -21,7 +21,7 @@ use crate::schemas::{
 };
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
-use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
+use crate::storage::{load_signer, open_pile_strict_as};
 use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Noted};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -480,11 +480,10 @@ impl Storage {
                     relations_collection,
                     relations_succinct,
                 )?;
-                // Attach the views as they stand through the same final
-                // target snapshot as the configured Secrets view. A read
-                // never maintains and never waits for a source commit nothing
-                // has attached yet, which it reads from its own bytes; a write
-                // attaches the source's frontier after its commit.
+                // Select the stored Mail/Files/Decide/Relations cover through
+                // the same final snapshot as the explicit Secrets upkeep below.
+                // Raw residual foundations stay pending; writers attach their
+                // source's frontier after publication.
                 let secrets = runtime.block_on(async {
                     let secrets =
                         secret_storage::ensure_and_snapshot(pile, secrets_collection, &self.signer)
@@ -1632,7 +1631,7 @@ mod tests {
 
             let account = id(70);
             let signer = load_signer(&pile, Some(&key)).unwrap();
-            let mut store = open_pile_strict(&pile).unwrap();
+            let mut store = open_pile_strict_as(&pile, signer.verifying_key()).unwrap();
             let collection = open_secrets_collection(&mut store, signer.verifying_key()).unwrap();
             let credential_id = secret_storage::add_secret(
                 &mut store,
@@ -1883,6 +1882,68 @@ mod tests {
             .credential;
         assert_ne!(credential, fixture.credential);
         assert!(after.secrets.contains(credential));
+    }
+
+    #[test]
+    fn password_account_write_is_readable_without_reader_upkeep() {
+        let fixture = Fixture::new();
+        let facade = Mail::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let receipt = facade
+            .account_set_with_password(
+                AccountOptions {
+                    account: Some(format!("{:x}", fixture.account)),
+                    address: "me@example.test".into(),
+                    display_name: "Me".into(),
+                    imap_endpoint: "imap.example.test:993".into(),
+                    smtp_endpoint: "smtp.example.test:465".into(),
+                    username: None,
+                    credential_version: None,
+                    disabled: false,
+                    quiet: false,
+                },
+                "fresh mailbox password".into(),
+            )
+            .unwrap();
+        assert!(receipt.changed);
+        assert_ne!(receipt.credential, fixture.credential);
+
+        // Reopen as the actual host and read only persisted attachments. Calling
+        // Storage::views here would run Secrets upkeep and hide a writer omission.
+        let signer = load_signer(&fixture.pile, Some(&fixture.key)).unwrap();
+        let mut pile = open_pile_strict_as(&fixture.pile, signer.verifying_key()).unwrap();
+        let secrets_collection =
+            crate::storage::open_secrets_collection_read(&mut pile, signer.verifying_key())
+                .unwrap();
+        let mail = open_configured(&mut pile, scopes().mail, signer.verifying_key()).unwrap();
+        let succinct = pile.attach::<SuccinctArchiveBlob>(mail, ()).unwrap();
+        let rank9 = pile
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(mail, succinct)
+            .unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        let before = snapshot
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let secrets = secret_storage::snapshot(snapshot.clone(), secrets_collection).unwrap();
+        assert!(secrets.lag().is_current());
+        assert!(secrets.contains(receipt.credential));
+        let facts = snapshot.read_facts(rank9).unwrap();
+        let account =
+            mail::open_account(&snapshot, &facts, &secrets, receipt.account, &signer).unwrap();
+        assert_eq!(account.config, receipt.config);
+        assert_eq!(account.password, "fresh mailbox password");
+        assert_eq!(
+            pile.snapshot()
+                .unwrap()
+                .records()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            before,
+            "verification must not publish missing indexes",
+        );
+        pile.close().unwrap();
     }
 
     #[test]
