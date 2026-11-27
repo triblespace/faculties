@@ -14,7 +14,7 @@ use triblespace::prelude::Id;
 const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
 /// Compact age like "42s" / "17m" / "7h05m" / "3d".
-fn format_age(seconds: i64) -> String {
+pub(crate) fn format_age(seconds: i64) -> String {
     let seconds = seconds.max(0);
     if seconds < 60 {
         format!("{seconds}s")
@@ -28,7 +28,7 @@ fn format_age(seconds: i64) -> String {
 }
 
 /// Window length in the largest unit that divides it: "5h", "7d", "90m".
-fn format_window(seconds: i64) -> String {
+pub(crate) fn format_window(seconds: i64) -> String {
     if seconds > 0 && seconds % 86_400 == 0 {
         format!("{}d", seconds / 86_400)
     } else if seconds > 0 && seconds % 3_600 == 0 {
@@ -41,7 +41,7 @@ fn format_window(seconds: i64) -> String {
 }
 
 /// A percentage as reported, without inventing precision: "3", "7.5", "12.34".
-fn format_percent(value: f64) -> String {
+pub(crate) fn format_percent(value: f64) -> String {
     let text = format!("{value:.2}");
     let text = text.trim_end_matches('0').trim_end_matches('.');
     format!("{text}%")
@@ -145,7 +145,7 @@ fn derive(now: i128, group: &QuotaGroup) -> Derived {
     }
 }
 
-fn remaining_percent(used: f64) -> f64 {
+pub(crate) fn remaining_percent(used: f64) -> f64 {
     (100.0 - used).max(0.0)
 }
 

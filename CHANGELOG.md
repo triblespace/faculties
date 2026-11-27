@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+- Dashboard capture metadata includes the existing Priority game card, so
+  subsequent pages keep their actual card names and the final Schemas page
+  is named instead of null.
+
 - A fed agy resident (`zooid spawn --provider agy --resident`) no longer gets
   its wake inside its first input, which agy cut at about 192 KB. The first
   input holds who it is, the brief and a list of the wake's parts in

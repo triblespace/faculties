@@ -48,6 +48,7 @@ use crate::schemas::mail::DEFAULT_SCOPE_ID as MAIL_SCOPE_ID;
 use crate::schemas::memory::DEFAULT_SCOPE_ID as MEMORY_SCOPE_ID;
 use crate::schemas::message::DEFAULT_SCOPE_ID as MESSAGES_SCOPE_ID;
 use crate::schemas::planner::DEFAULT_SCOPE_ID as EVENTS_SCOPE_ID;
+use crate::schemas::quota::DEFAULT_SCOPE_ID as QUOTA_SCOPE_ID;
 use crate::schemas::relations::DEFAULT_SCOPE_ID as RELATIONS_SCOPE_ID;
 use crate::schemas::rules::DEFAULT_SCOPE_ID as RULES_SCOPE_ID;
 use crate::schemas::spawn::DEFAULT_SCOPE_ID as SPAWN_SCOPE_ID;
@@ -85,6 +86,7 @@ pub enum SourceKey {
     Reason,
     Relations,
     Rules,
+    Quota,
     Secrets,
     Spawn,
     Teams,
@@ -94,7 +96,7 @@ pub enum SourceKey {
 
 impl SourceKey {
     /// Every logical input understood by the viewer core.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Archive,
         Self::Schemas,
         Self::Goals,
@@ -109,6 +111,7 @@ impl SourceKey {
         Self::Reason,
         Self::Relations,
         Self::Rules,
+        Self::Quota,
         Self::Secrets,
         Self::Spawn,
         Self::Teams,
@@ -605,6 +608,11 @@ const COLLECTION_SOURCE_CATALOG: &[CollectionSource] = &[
         key: SourceKey::Rules,
         scope: RULES_SCOPE_ID,
         label: "Rules",
+    },
+    CollectionSource {
+        key: SourceKey::Quota,
+        scope: QUOTA_SCOPE_ID,
+        label: "Quota",
     },
     CollectionSource {
         key: SourceKey::Spawn,

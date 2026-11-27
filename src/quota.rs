@@ -231,7 +231,7 @@ pub fn observation_rows<P>(facts: &P) -> Vec<ObservationRow>
 where
     P: TriblePattern + ?Sized,
 {
-    let rows: Vec<_> = find!(
+    let rows = find!(
         (event: Id, provider: Id, account: TextHandle, window: i128, observed: Lower),
         pattern!(facts, [{ ?event @
             metadata::tag: &KIND_QUOTA_OBSERVATION,
@@ -240,31 +240,53 @@ where
             quota::window: ?window,
             metadata::created_at: ?observed,
         }])
-    )
-    .collect();
-    rows.into_iter()
-        .flat_map(|(event, provider, account, window, observed)| {
-            let mut buckets: Vec<Option<TextHandle>> = find!(
-                bucket: TextHandle,
-                pattern!(facts, [{ event @ quota::bucket: ?bucket }])
-            )
-            .map(Some)
-            .collect();
-            if buckets.is_empty() {
-                buckets.push(None);
-            }
-            buckets.into_iter().map(move |bucket| ObservationRow {
-                event,
-                key: GroupKey {
-                    provider,
-                    account,
-                    window,
-                    bucket,
-                },
-                observed: observed.0,
-            })
+    );
+    group_observations(facts, rows).collect()
+}
+
+fn group_observations<'a, P: TriblePattern + ?Sized>(
+    facts: &'a P,
+    rows: impl Iterator<Item = (Id, Id, TextHandle, i128, Lower)> + 'a,
+) -> impl Iterator<Item = ObservationRow> + 'a {
+    rows.flat_map(move |(event, provider, account, window, observed)| {
+        let mut buckets = find!(
+            bucket: TextHandle,
+            pattern!(facts, [{ event @ quota::bucket: ?bucket }])
+        )
+        .map(Some)
+        .peekable();
+        let unbucketed = buckets.peek().is_none().then_some(None);
+        buckets.chain(unbucketed).map(move |bucket| ObservationRow {
+            event,
+            key: GroupKey {
+                provider,
+                account,
+                window,
+                bucket,
+            },
+            observed: observed.0,
         })
-        .collect()
+    })
+}
+
+pub(crate) fn reading_values<P: TriblePattern + ?Sized>(
+    facts: &P,
+    event: Id,
+) -> (
+    impl Iterator<Item = f64> + '_,
+    impl Iterator<Item = i128> + '_,
+) {
+    (
+        find!(
+            used: f64,
+            pattern!(facts, [{ event @ quota::used_percent: ?used }])
+        ),
+        find!(
+            at: Lower,
+            pattern!(facts, [{ event @ quota::resets_at: ?at }])
+        )
+        .map(|at| at.0),
+    )
 }
 
 /// The latest observation per group: larger observed time wins, the larger
