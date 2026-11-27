@@ -12,7 +12,7 @@ use anybytes::View;
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::succinctarchive::Rank9AcceleratedSuccinctArchiveBlob;
-use triblespace::core::collection::AttachedSnapshot;
+use triblespace::core::collection::{AttachedSnapshot, Support};
 use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::query::TriblePattern;
 use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
@@ -71,6 +71,10 @@ pub struct Provenance {
     pub units: usize,
     pub placements: usize,
     pub extractor: String,
+    /// What this answer's read could not load
+    /// ([`crate::storage::unread_foundations_note`]): the denominator above
+    /// counts only what is here.
+    pub notes: Vec<String>,
 }
 
 /// One located declaration, as a reader sees it.
@@ -375,11 +379,12 @@ impl Code {
 
     fn find_scoped(&self, name: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
-        let provenance = provenance(&facts, &scans);
+        let provenance = provenance(&facts, &scans, &notes);
 
         let handle = code::text_handle(name);
         let mut hits = Vec::new();
@@ -428,11 +433,12 @@ impl Code {
 
     fn uses_scoped(&self, identifier: &str, filter: &Filter) -> Result<Answer> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
-        let provenance = provenance(&facts, &scans);
+        let provenance = provenance(&facts, &scans, &notes);
 
         let handle = code::text_handle(identifier);
         let mut hits = Vec::new();
@@ -466,11 +472,12 @@ impl Code {
 
     fn imports_scoped(&self, root: &str, filter: &Filter) -> Result<(usize, Provenance)> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
-        let provenance = provenance(&facts, &scans);
+        let provenance = provenance(&facts, &scans, &notes);
         let count = code::import_root_frequency(&facts, code::text_handle(root));
         Ok((count, provenance))
     }
@@ -482,14 +489,16 @@ impl Code {
 
     fn show_scoped(&self, selector: &str, with_source: bool) -> Result<ItemDetail> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let filter = Filter::default();
         let scans = select_scans(&facts, &mut texts, &filter)?;
-        let provenance = provenance(&facts, &scans);
+        let provenance = provenance(&facts, &scans, &notes);
 
-        let item = resolve_item(&facts, &mut texts, &scans, selector)?;
+        let item = resolve_item(&facts, &mut texts, &scans, selector)
+            .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
         // Placements of exactly this item, in every selected scan.
         let mut places = Vec::new();
         for scan in &scans {
@@ -503,7 +512,8 @@ impl Code {
         let head = places
             .first()
             .cloned()
-            .ok_or_else(|| anyhow!("item {item:x} has no placement in the selected revisions"))?;
+            .ok_or_else(|| anyhow!("item {item:x} has no placement in the selected revisions"))
+            .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
 
         let source = if with_source {
             item_source(&facts, reader, &head)?
@@ -541,11 +551,12 @@ impl Code {
         filter: &Filter,
     ) -> Result<DuplicateReport> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
-        let provenance = provenance(&facts, &scans);
+        let provenance = provenance(&facts, &scans, &notes);
 
         let mut pairs: BTreeSet<(Id, Id, Id)> = BTreeSet::new();
         for (index, left_scan) in scans.iter().enumerate() {
@@ -633,7 +644,8 @@ impl Code {
 
     fn stats_scoped(&self, filter: &Filter) -> Result<StatsReport> {
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
+        let (facts, unread) = read_facts(&observed)?;
+        let notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -685,6 +697,7 @@ impl Code {
                 units: total_units,
                 placements: total_placements,
                 extractor: EXTRACTOR_RUST_SYN_V1_NAME.to_owned(),
+                notes,
             },
         })
     }
@@ -1036,7 +1049,39 @@ fn interval_start(interval: code::IntervalValue) -> Epoch {
     Epoch::from_tai_duration(hifitime::Duration::from_total_nanoseconds(lower))
 }
 
-pub(crate) fn provenance(facts: &FactArchive, scans: &[ScanSummary]) -> Provenance {
+/// The facts of one frozen Code observation over what is here, and the
+/// foundations it could not load. A question answers from them; ingest and
+/// share, which decide from what they do not see, read completely.
+pub(crate) fn read_facts(observed: &Observed) -> Result<(FactArchive, Support)> {
+    Ok(crate::storage::acquire_attached_facts_read(observed)
+        .context("read Code facts")?
+        .into_parts())
+}
+
+/// The notes beside an answer: the fact foundations that could not be
+/// loaded, and an index's only where it misses a foundation the facts did
+/// not, since an index stands on the same foundations.
+pub(crate) fn read_notes(unread: &Support, indexes: &[Support]) -> Vec<String> {
+    let mut notes: Vec<String> = crate::storage::unread_foundations_note("Code", unread)
+        .into_iter()
+        .collect();
+    for index in indexes {
+        if index.members().any(|member| !unread.contains(member)) {
+            notes.extend(crate::storage::unread_foundations_note(
+                "the Code search index",
+                index,
+            ));
+        }
+    }
+    notes.dedup();
+    notes
+}
+
+pub(crate) fn provenance(
+    facts: &FactArchive,
+    scans: &[ScanSummary],
+    notes: &[String],
+) -> Provenance {
     let mut units = 0;
     let mut placements = 0;
     for scan in scans {
@@ -1048,6 +1093,7 @@ pub(crate) fn provenance(facts: &FactArchive, scans: &[ScanSummary]) -> Provenan
         units,
         placements,
         extractor: EXTRACTOR_RUST_SYN_V1_NAME.to_owned(),
+        notes: notes.to_vec(),
     }
 }
 

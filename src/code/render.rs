@@ -45,6 +45,7 @@ fn first_line(text: &str, limit: usize) -> String {
 }
 
 pub fn provenance(provenance: &Provenance, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&provenance.notes)?;
     if provenance.scans.is_empty() {
         return out.line(
             "searched NOTHING: this pile holds no Code scan. Run `code ingest <dir>...` first.",
@@ -387,6 +388,7 @@ pub fn ingest(report: &IngestReport, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn index(report: &IndexReport, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&report.notes)?;
     out.line(format!(
         "Code: {} collection element(s) — the signed COMMITs the covers derive from",
         grouped(report.source_elements)

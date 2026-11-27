@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::schemas::imagine::{imagine, DEFAULT_SCOPE_ID, KIND_AUTH, PROVIDER_OPENAI};
 use crate::secrets::item::{ItemBody, PrivateText};
-use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultyStore, Storage};
+use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultyStore, Noted, Storage};
 
 /// A remote provider that needs a credential. The local FLUX path needs none.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -218,11 +218,26 @@ pub fn binding_fragment(
     }
 }
 
-/// Metadata only: no Secrets version is opened.
-pub fn auth_status(storage: &Storage, provider: Provider) -> Result<AuthStatus> {
+/// Metadata only: no Secrets version is opened. Read over what is here: a
+/// newer binding held in a foundation that could not be loaded would be
+/// missed, so the notes name each such foundation beside the status.
+pub fn auth_status(storage: &Storage, provider: Provider) -> Result<Noted<AuthStatus>> {
     storage.with_store(|pile, signer, runtime| {
-        let facts = observe(storage, pile, signer, runtime)?;
-        Ok(status(&facts, provider))
+        let mut notes = Vec::new();
+        let facts = observe(storage, pile, signer, runtime, Some(&mut notes))?;
+        Ok(Noted {
+            value: status(&facts, provider),
+            notes,
+        })
+    })
+}
+
+/// The binding a generation authenticates with, read completely: choosing
+/// a credential from what is here could leave a superseded key selected.
+fn selected_credential(storage: &Storage, provider: Provider) -> Result<Credential> {
+    storage.with_store(|pile, signer, runtime| {
+        let facts = observe(storage, pile, signer, runtime, None)?;
+        status(&facts, provider).selected(provider)
     })
 }
 
@@ -239,7 +254,7 @@ pub fn auth_set(
         let credential = resolve(storage, selector)?;
         drop(open(storage, credential)?);
         storage.with_store(|pile, signer, runtime| {
-            let facts = observe(storage, pile, signer, runtime)?;
+            let facts = observe(storage, pile, signer, runtime, None)?;
             let current = status(&facts, provider);
             if current.selected(provider).ok() == Some(credential) {
                 return Ok((*current.heads.first().expect("settled head"), credential));
@@ -254,7 +269,7 @@ pub fn auth_set(
 
 /// Open the bound key for `provider`.
 pub(crate) fn open_key(storage: &Storage, provider: Provider) -> Result<Zeroizing<String>> {
-    let credential = auth_status(storage, provider)?.selected(provider)?;
+    let credential = selected_credential(storage, provider)?;
     open(storage, credential)
 }
 
@@ -320,12 +335,15 @@ fn open(storage: &Storage, credential: Credential) -> Result<Zeroizing<String>> 
     Ok(Zeroizing::new(key.to_owned()))
 }
 
-/// Advance this key's own commits into the Rank9 view and read it.
+/// Advance this key's own commits into the Rank9 view and read it. With
+/// `notes`, the read answers over what is here and names the foundations it
+/// could not load there; without, it refuses an incomplete read.
 fn observe(
     storage: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
+    notes: Option<&mut Vec<String>>,
 ) -> Result<FactArchive> {
     let source =
         storage.open_collection_read(pile, DEFAULT_SCOPE_ID, signer.verifying_key(), runtime)?;
@@ -343,7 +361,11 @@ fn observe(
             .context("freeze maintained Imagine snapshot")?,
         Arc::clone(runtime),
     );
-    crate::storage::acquire_facts(&snapshot, rank9).context("read Imagine Rank9 collection")
+    match notes {
+        Some(notes) => crate::storage::acquire_facts_noted(&snapshot, rank9, "Imagine", notes),
+        None => crate::storage::acquire_facts(&snapshot, rank9),
+    }
+    .context("read Imagine Rank9 collection")
 }
 
 fn commit(

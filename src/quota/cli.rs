@@ -142,10 +142,13 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             Ok(())
         }
         Command::History { since, until } => {
-            super::history::show_json(&operations.history(since, until)?, output)
+            let view = operations.history(since, until)?;
+            output.notes(&view.notes)?;
+            super::history::show_json(&view, output)
         }
         Command::Show { json } => {
-            let view = operations.show()?;
+            let view = operations.show_read()?;
+            output.notes(&view.notes)?;
             if json {
                 render::show_json(&view, output)
             } else {

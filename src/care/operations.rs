@@ -489,6 +489,9 @@ fn resolve_subject(
 }
 
 /// The maintained Relations relation, read only to resolve the subject.
+/// Read completely: every Care operation seals, grants or shows health
+/// records for the one person a selector resolves to, and a second match
+/// held in a foundation that is away would not be seen to make it ambiguous.
 fn observe_relations(
     storage: &Storage,
     pile: &mut FacultyStore,

@@ -219,13 +219,21 @@ impl Faculty for Imagine {
             "imagine_generate" => {}
             "imagine_auth_status" => {
                 let _: Empty = decode_arguments(arguments)?;
+                let mut notes = Vec::new();
+                let mut lines = Vec::new();
                 for provider in Provider::ALL {
                     let status = self.operations.auth_status(*provider)?;
-                    out.line(format!(
+                    lines.push(format!(
                         "{}: {}",
                         provider.label(),
                         status.describe(*provider)
-                    ))?;
+                    ));
+                    notes.extend(status.notes);
+                }
+                notes.dedup();
+                out.notes(&notes)?;
+                for line in lines {
+                    out.line(line)?;
                 }
                 return Ok(());
             }

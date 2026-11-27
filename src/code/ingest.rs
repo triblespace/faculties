@@ -162,6 +162,10 @@ where
             })
             .context("maintain Code import facts")?;
         let reader = crate::storage::AcquiringReader::new(pile.snapshot()?, runtime.clone());
+        // Read completely: what is already catalogued decides what is parsed
+        // and staged, and whether a scan gets its first observation time, so
+        // a foundation that is away would make an ingest write as if it had
+        // never seen what that foundation holds.
         let current =
             crate::storage::acquire_facts(&reader, rank9).context("read Code import facts")?;
         Ok((source, current))

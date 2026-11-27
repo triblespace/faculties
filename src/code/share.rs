@@ -184,6 +184,9 @@ impl Code {
 
     fn share_plan_scoped(&self, request: &ShareRequest) -> Result<SharePlan> {
         let observed = self.observe()?;
+        // Read completely: a share sends only an unambiguous match, and a
+        // second candidate held in a foundation that is away would not be
+        // seen to make the selector ambiguous.
         let facts = crate::storage::acquire_attached_facts(&observed).context("read Code facts")?;
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);

@@ -212,10 +212,21 @@ fn run_auth(cli: &Cli, command: &AuthCommand) -> Result<()> {
     let imagine = Imagine::with_storage(storage);
     crate::cli::with_output("imagine", |out| match command {
         AuthCommand::Status => {
+            let mut notes = Vec::new();
+            let mut lines = Vec::new();
             for provider in Provider::ALL {
                 let status = imagine.auth_status(*provider)?;
-                let line = status.describe(*provider);
-                out.line(format!("{}: {line}", provider.label()))?;
+                lines.push(format!(
+                    "{}: {}",
+                    provider.label(),
+                    status.describe(*provider)
+                ));
+                notes.extend(status.notes);
+            }
+            notes.dedup();
+            out.notes(&notes)?;
+            for line in lines {
+                out.line(line)?;
             }
             Ok(())
         }

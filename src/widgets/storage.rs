@@ -230,6 +230,10 @@ pub struct DatasetView<'a> {
     pub facts: &'a FactArchive,
     pub reader: &'a PileSnapshot,
     pub revision: DatasetRevision,
+    /// What this dataset's read could not load
+    /// ([`crate::storage::unread_foundations_note`]): `facts` omits whatever
+    /// those foundations hold, so an empty answer over them is not "none".
+    pub notes: &'a [String],
     lww_registers: &'a BTreeMap<(Id, Id), LwwQuery>,
     latest_indexes: &'a BTreeMap<Id, LatestIndex>,
 }
@@ -274,6 +278,14 @@ impl<'a> WidgetContext<'a> {
         self.datasets?.get(&key).map(|dataset| dataset.revision)
     }
 
+    /// What the read behind `key` could not load; empty for a complete read
+    /// or an absent source.
+    pub fn notes(&self, key: SourceKey) -> &'a [String] {
+        self.datasets
+            .and_then(|datasets| datasets.get(&key))
+            .map_or(&[], |dataset| dataset.notes.as_slice())
+    }
+
     /// Keep this frozen input on an asynchronous card worker. Archives, snapshots
     /// and prepared indexes share their underlying observation.
     pub(super) fn owned_dataset(&self, key: SourceKey) -> Option<LoadedDataset> {
@@ -308,6 +320,7 @@ pub(super) struct LoadedDataset {
     facts: DatasetFacts,
     reader: PileSnapshot,
     revision: DatasetRevision,
+    notes: Arc<Vec<String>>,
     lww_registers: Arc<BTreeMap<(Id, Id), LwwQuery>>,
     latest_indexes: Arc<BTreeMap<Id, LatestIndex>>,
 }
@@ -329,6 +342,7 @@ impl LoadedDataset {
     fn new(
         facts: FactArchive,
         revision: DatasetRevision,
+        notes: Arc<Vec<String>>,
         reader: PileSnapshot,
         lww_registers: BTreeMap<(Id, Id), LwwQuery>,
         latest_indexes: BTreeMap<Id, LatestIndex>,
@@ -337,6 +351,7 @@ impl LoadedDataset {
             facts: DatasetFacts::Ready(facts),
             reader,
             revision,
+            notes,
             lww_registers: Arc::new(lww_registers),
             latest_indexes: Arc::new(latest_indexes),
         }
@@ -347,7 +362,9 @@ impl LoadedDataset {
         selected: AttachedSnapshot<WidgetReader, Rank9AcceleratedSuccinctArchiveBlob>,
     ) -> Self {
         // A usable archive has no unread residual. An incomplete read below
-        // returns an error and can never expose a partial dataset at this token.
+        // returns an error and can never expose a partial dataset at this token:
+        // the token is fixed before the archive is decoded, so it could not
+        // tell a partial read from the complete one of the same selection.
         let empty = selected
             .residual()
             .difference(selected.residual())
@@ -360,9 +377,21 @@ impl LoadedDataset {
             })),
             reader,
             revision,
+            notes: Default::default(),
             lww_registers: Default::default(),
             latest_indexes: Default::default(),
         }
+    }
+
+    /// [`Self::view`] only when its read loaded every foundation, for a
+    /// widget that states a property of the whole collection (a rule
+    /// program's termination, say), which a partial read would make false.
+    /// Otherwise the error names what could not be loaded.
+    pub(super) fn complete_view(&self) -> Result<DatasetView<'_>, String> {
+        if !self.notes.is_empty() {
+            return Err(self.notes.join("; "));
+        }
+        self.view().map_err(str::to_owned)
     }
 
     pub(super) fn view(&self) -> Result<DatasetView<'_>, &str> {
@@ -385,6 +414,7 @@ impl LoadedDataset {
             facts,
             reader: &self.reader,
             revision: self.revision,
+            notes: &self.notes,
             lww_registers: &self.lww_registers,
             latest_indexes: &self.latest_indexes,
         })
@@ -432,6 +462,13 @@ impl WorkspaceObservation {
             secrets: self.0.secrets.as_ref(),
             routed_but_unavailable: Some(&self.0.unavailable),
         }
+    }
+
+    /// What each loaded dataset's read could not load: those views show what
+    /// is here, and an empty one is not known to be empty. A host shows these
+    /// beside the views, as it shows [`Self::unavailable_labels`].
+    pub fn partial_notes(&self) -> impl Iterator<Item = &str> + '_ {
+        partial_notes(&self.0.datasets)
     }
 
     pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
@@ -723,6 +760,11 @@ impl StorageState {
         Ok(state)
     }
 
+    /// [`WorkspaceObservation::partial_notes`] for the loaded observation.
+    pub fn partial_notes(&self) -> impl Iterator<Item = &str> + '_ {
+        self.datasets.iter().flat_map(partial_notes)
+    }
+
     pub fn unavailable_labels(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.unavailable.iter().map(|key| {
             COLLECTION_SOURCE_CATALOG
@@ -929,6 +971,17 @@ impl StorageState {
     }
 }
 
+/// Each distinct note of the datasets' reads; scopes shared by several
+/// sources carry one note.
+fn partial_notes(datasets: &BTreeMap<SourceKey, LoadedDataset>) -> impl Iterator<Item = &str> {
+    let mut seen = BTreeSet::new();
+    datasets
+        .values()
+        .flat_map(|dataset| dataset.notes.iter())
+        .filter(move |note| seen.insert(note.as_str()))
+        .map(String::as_str)
+}
+
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     let metadata = std::fs::metadata(path)
         .map_err(|error| format!("inspect pile {}: {error}", path.display()))?;
@@ -1041,12 +1094,14 @@ fn load_inputs_mode(
 }
 
 /// One scope's facts, read through its attached Rank9 cover with the
-/// residual read from its bytes, and the revision that identifies exactly
-/// what that read holds.
+/// residual read from its bytes, over what is here: the facts, the revision
+/// that identifies exactly what that read holds (the foundations it could
+/// not read included, so their arrival moves it), and those foundations.
+/// Bytes that are here but form no archive still fail the read.
 fn attached_facts_and_revision<R>(
     snapshot: &R,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
-) -> anyhow::Result<(FactArchive, DatasetRevision)>
+) -> anyhow::Result<(FactArchive, DatasetRevision, Support)>
 where
     R: triblespace::core::repo::StoreRead,
 {
@@ -1056,8 +1111,18 @@ where
     let read =
         triblespace::core::collection::succinctarchive_union::read_attached_acquiring(&attached)?;
     let revision = DatasetRevision::from_attached(&attached, read.unread());
-    let facts = crate::storage::require_complete_attached_read(read)?;
-    Ok((facts, revision))
+    let (facts, unread) = read.into_parts();
+    Ok((facts, revision, unread))
+}
+
+/// A note for an index over the same foundations as its facts, only where it
+/// misses one the facts did not.
+fn index_note(label: &str, unread: &Support, facts_unread: &Support) -> Option<String> {
+    unread
+        .members()
+        .any(|member| !facts_unread.contains(member))
+        .then(|| crate::storage::unread_foundations_note(label, unread))
+        .flatten()
 }
 
 fn load_inputs_from_store(
@@ -1251,8 +1316,11 @@ fn read_inputs(
             continue;
         }
         let read = (|| {
-            let (facts, mut revision) = attached_facts_and_revision(&snapshot, rank9)
+            let (facts, mut revision, unread) = attached_facts_and_revision(&snapshot, rank9)
                 .map_err(|error| format!("read {label}: {error:#}"))?;
+            let mut notes: Vec<String> = crate::storage::unread_foundations_note(label, &unread)
+                .into_iter()
+                .collect();
             let mut lww = BTreeMap::new();
             let mut latest = BTreeMap::new();
             if scope == GOALS_SCOPE_ID {
@@ -1260,14 +1328,12 @@ fn read_inputs(
                     let collection = snapshot
                         .attached_acquiring(target)
                         .map_err(|e| e.to_string())?;
-                    let (index, unread) = collection
+                    let (index, status_unread) = collection
                         .read_acquiring::<LwwIndex>()
                         .map_err(|e| e.to_string())?
                         .into_parts();
-                    if !unread.is_empty() {
-                        return Err("Goals status is unavailable.".into());
-                    }
-                    revision.include_attached(&collection, &unread);
+                    notes.extend(index_note("Goals status", &status_unread, &unread));
+                    revision.include_attached(&collection, &status_unread);
                     lww.insert(
                         (
                             crate::schemas::compass::board::status_of.id(),
@@ -1282,21 +1348,23 @@ fn read_inputs(
                     let collection = snapshot
                         .attached_acquiring(target)
                         .map_err(|e| e.to_string())?;
-                    let (index, unread) = collection
+                    let (index, latest_unread) = collection
                         .read_acquiring::<LatestIndex>()
                         .map_err(|e| e.to_string())?
                         .into_parts();
-                    if !unread.is_empty() {
-                        return Err("Knowledge supersession is unavailable.".into());
-                    }
-                    revision.include_attached(&collection, &unread);
+                    notes.extend(index_note(
+                        "Knowledge supersession",
+                        &latest_unread,
+                        &unread,
+                    ));
+                    revision.include_attached(&collection, &latest_unread);
                     latest.insert(triblespace::core::metadata::supersedes.id(), index);
                 }
             }
-            Ok::<_, String>((facts, revision, lww, latest))
+            Ok::<_, String>((facts, revision, Arc::new(notes), lww, latest))
         })();
         match read {
-            Ok((facts, revision, lww, latest)) => {
+            Ok((facts, revision, notes, lww, latest)) => {
                 for source in COLLECTION_SOURCE_CATALOG
                     .iter()
                     .filter(|entry| entry.scope == scope && sources.contains(&entry.key))
@@ -1306,6 +1374,7 @@ fn read_inputs(
                         LoadedDataset::new(
                             facts.clone(),
                             revision,
+                            Arc::clone(&notes),
                             snapshot.clone(),
                             lww.clone(),
                             latest.clone(),
@@ -1929,8 +1998,9 @@ mod tests {
 
     /// The revision names exactly what a fact read holds. A commit that
     /// arrives and that nothing attaches is read from its bytes, and moves
-    /// the revision; a commit whose payload is not here refuses the dataset
-    /// as incomplete, and its bytes arriving moves the revision again.
+    /// the revision; a commit whose payload is not here is named unread
+    /// beside the facts that are, and its bytes arriving moves the revision
+    /// again.
     #[test]
     fn dataset_revision_changes_when_a_commit_is_read_from_its_bytes() {
         use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -1960,7 +2030,8 @@ mod tests {
             )
             .unwrap();
         crate::storage::carry_facts(&mut store, source, &signer);
-        let (_, attached) = attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        let (_, attached, _) =
+            attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
 
         // A commit arrives, as sync would bring it; nothing attaches it.
         store
@@ -1970,8 +2041,9 @@ mod tests {
                 entity! { &second @ metadata::name: "second" },
             )
             .unwrap();
-        let (facts, read_raw) =
+        let (facts, read_raw, unread) =
             attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert!(unread.is_empty());
         let names = |facts: &FactArchive| -> BTreeSet<Id> {
             find!(id: Id, pattern!(facts, [{ ?id @ metadata::name: _?name }])).collect()
         };
@@ -1991,27 +2063,18 @@ mod tests {
             )))
             .unwrap();
         let missing_snapshot = store.snapshot().unwrap();
-        let error = attached_facts_and_revision(&missing_snapshot, rank9)
-            .err()
-            .expect("a foreground dataset must not silently omit the missing commit");
-        let incomplete = error
-            .downcast_ref::<crate::storage::IncompleteAttachedRead>()
-            .expect("the failure names incomplete selected support");
-        assert_eq!(incomplete.unread.len(), 1);
-        assert_eq!(
-            incomplete.unread.members().next(),
-            Some(payload.get_handle())
-        );
-        // The revision law still distinguishes this failed observation from
-        // the later complete one; no partial dataset is exposed or cached.
-        let gap = DatasetRevision::from_attached(
-            &missing_snapshot.attached_acquiring(rank9).unwrap(),
-            &incomplete.unread,
-        );
+        let (facts, gap, unread) = attached_facts_and_revision(&missing_snapshot, rank9)
+            .expect("a foreground dataset shows what is here");
+        assert_eq!(names(&facts), BTreeSet::from([first.id, second.id]));
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread.members().next(), Some(payload.get_handle()));
+        // The revision law distinguishes this partial observation from the
+        // earlier one and from the later complete one.
         assert_ne!(read_raw, gap);
         store.put::<SimpleArchive, _>(payload).unwrap();
-        let (facts, arrived) =
+        let (facts, arrived, unread) =
             attached_facts_and_revision(&store.snapshot().unwrap(), rank9).unwrap();
+        assert!(unread.is_empty());
         assert_eq!(
             names(&facts),
             BTreeSet::from([first.id, second.id, third.id])

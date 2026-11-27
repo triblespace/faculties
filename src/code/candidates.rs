@@ -3,13 +3,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use triblespace::prelude::*;
 
 use super::index::{entity_scores, ranked_entities, score_texts, LexicalScores, Tier};
 use super::operations::{
-    hit, item_source, keeps, placements_of_item, provenance, select_scans, Code, Filter, Hit,
-    Provenance, Texts,
+    hit, item_source, keeps, placements_of_item, provenance, read_facts, read_notes, select_scans,
+    Code, Filter, Hit, Provenance, Texts,
 };
 use super::{Located, SpanValue, TextHandle};
 use crate::schemas::code::attrs;
@@ -72,7 +72,8 @@ impl Code {
     ) -> Result<CandidateReport> {
         let targets = self.lexical_targets()?;
         let observed = self.observe()?;
-        let facts = crate::storage::acquire_attached_facts(&observed)?;
+        let (facts, unread) = read_facts(&observed)?;
+        let fact_notes = read_notes(&unread, &[]);
         let reader = observed.snapshot();
         let mut texts = Texts::new(reader);
         let scans = select_scans(&facts, &mut texts, filter)?;
@@ -89,13 +90,18 @@ impl Code {
             query.push('\n');
         }
         if query.is_empty() {
-            bail!("no catalogued source tokens for item {seed:x}");
+            return Err(crate::storage::with_unread_notes(
+                anyhow::anyhow!("no catalogued source tokens for item {seed:x}"),
+                &fact_notes,
+            ));
         }
         for doc in super::item_doc(&facts, seed) {
             query.push_str(&texts.get(doc)?);
             query.push('\n');
         }
-        let scores = entity_scores(&facts, &score_texts(reader, targets, &query, Tier::Both)?);
+        let (text_scores, index_unread) = score_texts(reader, targets, &query, Tier::Both)?;
+        let notes = read_notes(&unread, &index_unread);
+        let scores = entity_scores(&facts, &text_scores);
         let mut exact_placements = Vec::new();
         for scan in &scans {
             for located in placements_of_item(&facts, scan.id, seed) {
@@ -219,7 +225,7 @@ impl Code {
             top,
             lexical_items: lexical_order.len(),
             mention_items: mention_order.len(),
-            provenance: provenance(&facts, &scans),
+            provenance: provenance(&facts, &scans, &notes),
         };
         // Lexical candidates first, then additional mention candidates. No score
         // fusion: both independent ranks and each selection budget are reported.

@@ -73,7 +73,9 @@ impl RulesViewer {
                 if let Some(rules) = readable {
                     let schemas = sources.owned_dataset(SourceKey::Schemas);
                     self.result.spawn(ctx.ui_mut().ctx(), move || {
-                        let loaded = rules.view().map_err(str::to_owned).map(|view| {
+                        // Complete only: the card states properties of the
+                        // whole program, which a partial read would falsify.
+                        let loaded = rules.complete_view().map(|view| {
                             let schemas = schemas.as_ref().and_then(|s| s.view().ok());
                             let view = projection::project(view, schemas);
                             let web = web::web(&view);

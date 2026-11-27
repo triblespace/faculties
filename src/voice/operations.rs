@@ -7,7 +7,7 @@ use crate::schemas::voice::{CHANNEL_SAY, CHANNEL_SHOUT, COLLECTION_SCOPE_ID};
 #[cfg(test)]
 use crate::storage::open_pile_strict_as;
 use crate::storage::FacultySnapshot;
-use crate::storage::{AcquiringReader, FactArchive, FacultyStore};
+use crate::storage::{AcquiringReader, FactArchive, FacultyStore, Noted};
 use crate::voice as voice_model;
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -98,9 +98,12 @@ impl Voice {
             storage: &self.storage,
         }
     }
-    pub fn routes(&self) -> Result<Vec<RoutePolicy>> {
-        self.storage().with_session(|session| {
-            [Channel::Say, Channel::Shout]
+    /// Every channel's policy, for display, read over what is here: a newer
+    /// route set held in a foundation that could not be loaded would be
+    /// missed, so the notes name each such foundation.
+    pub fn routes(&self) -> Result<Noted<Vec<RoutePolicy>>> {
+        self.storage().with_session(false, |session| {
+            let policies = [Channel::Say, Channel::Shout]
                 .into_iter()
                 .map(|channel| {
                     Ok(RoutePolicy {
@@ -108,17 +111,28 @@ impl Voice {
                         devices: load_route(&session.reader, &session.facts, channel.name())?,
                     })
                 })
-                .collect()
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Noted {
+                value: policies,
+                notes: session.notes.clone(),
+            })
         })
     }
+    /// The policy speech is played through, read completely: an older
+    /// generation, or the defaults, standing in for a newer set that is away
+    /// would play through a device the newer one excluded.
     pub fn route(&self, channel: Channel) -> Result<Vec<String>> {
-        self.storage()
-            .with_session(|session| load_route(&session.reader, &session.facts, channel.name()))
+        self.storage().with_session(true, |session| {
+            load_route(&session.reader, &session.facts, channel.name())
+        })
     }
+    /// A whole new generation: written over what is here, since it replaces
+    /// by its time and not by the heads it saw.
     pub fn set_route(&self, channel: Channel, devices: &[String]) -> Result<RouteReceipt> {
         validate_devices(devices)?;
-        self.storage()
-            .with_session(|session| store_route(session, channel.name(), devices))?;
+        self.storage().with_session(false, |session| {
+            store_route(session, channel.name(), devices)
+        })?;
         Ok(RouteReceipt {
             policy: RoutePolicy {
                 channel,
@@ -148,7 +162,7 @@ impl Voice {
         let at = clock::point_now()?;
         let fragment = voice_model::utterance_fragment(channel.name(), text, audio, at)?;
         let id = fragment.root().context("Voice utterance has no root")?;
-        self.storage().with_session(move |session| {
+        self.storage().with_session(false, move |session| {
             session.commit(fragment, description)?;
             Ok(id)
         })
@@ -187,6 +201,8 @@ struct VoiceSession<'a> {
     signer: &'a ed25519_dalek::SigningKey,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
+    /// What a read over what is here could not load.
+    notes: Vec<String>,
 }
 
 impl VoiceSession<'_> {
@@ -223,8 +239,12 @@ impl VoiceSession<'_> {
 }
 
 impl VoiceStorage<'_> {
+    /// One session over the maintained facts. `complete` refuses a read that
+    /// could not load every foundation; otherwise the session's notes name
+    /// the ones it could not.
     fn with_session<T>(
         &self,
+        complete: bool,
         operation: impl FnOnce(&mut VoiceSession<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|store, signer, runtime| {
@@ -258,8 +278,18 @@ impl VoiceStorage<'_> {
                         .context("freeze maintained Voice fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
-                    .context("read maintained Voice fact collection")?;
+                let mut notes = Vec::new();
+                let facts = if complete {
+                    crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
+                } else {
+                    crate::storage::acquire_facts_noted(
+                        &store_snapshot,
+                        maintained_rank9,
+                        "Voice",
+                        &mut notes,
+                    )
+                }
+                .context("read maintained Voice fact collection")?;
                 operation(&mut VoiceSession {
                     pile,
                     runtime,
@@ -267,6 +297,7 @@ impl VoiceStorage<'_> {
                     signer,
                     facts,
                     reader: store_snapshot,
+                    notes,
                 })
             })();
             result
@@ -373,12 +404,12 @@ mod tests {
 
         let route = vec!["AirPods Max".to_owned(), "AirPods Pro".to_owned()];
         storage
-            .with_session(|session| store_route(session, CHANNEL_SAY, &route))
+            .with_session(false, |session| store_route(session, CHANNEL_SAY, &route))
             .unwrap();
         let wav = directory.path().join("utterance.wav");
         std::fs::write(&wav, b"synthetic wav bytes").unwrap();
         storage
-            .with_session(|session| {
+            .with_session(true, |session| {
                 session.commit(
                     voice_model::utterance_fragment(
                         CHANNEL_SAY,
@@ -392,7 +423,7 @@ mod tests {
             .unwrap();
 
         storage
-            .with_session(|session| {
+            .with_session(true, |session| {
                 assert_eq!(
                     load_route(&session.reader, &session.facts, CHANNEL_SAY)?,
                     route
@@ -701,5 +732,56 @@ mod tests {
             Routed::Soma("http://body:8383".into()).describe(),
             "Soma speaker (http://body:8383)"
         );
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+
+    /// A foundation of the Voice collection is stranded on another host: a
+    /// route set and an utterance are still written, the policy display
+    /// answers over what is here and names it, and the policy speech is
+    /// played through refuses the incomplete read.
+    #[test]
+    fn routes_are_set_and_shown_while_a_voice_foundation_is_away() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let voice = Voice::with_storage(storage.clone());
+        let away = strand_in(&storage, COLLECTION_SCOPE_ID, unrelated_fragment());
+
+        let devices = vec!["AirPods Max".to_owned()];
+        voice.set_route(Channel::Say, &devices).unwrap();
+        voice
+            .record(Channel::Say, "hello", None, "voice: test utterance")
+            .unwrap();
+        let routes = voice.routes().unwrap();
+        assert!(
+            routes.notes.iter().any(|note| note.contains(&away)),
+            "{:?}",
+            routes.notes
+        );
+        let say = routes
+            .iter()
+            .find(|policy| policy.channel == Channel::Say)
+            .unwrap();
+        assert_eq!(say.devices, devices);
+        let error = voice.route(Channel::Say).unwrap_err();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_voice_foundation_fails_loudly() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let voice = Voice::with_storage(storage.clone());
+        malformed_in(&storage, COLLECTION_SCOPE_ID);
+        let error = voice.routes().unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        storage.close().unwrap();
     }
 }

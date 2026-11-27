@@ -334,7 +334,10 @@ impl WebStorage<'_> {
                 Ok::<_, anyhow::Error>((profiles_rank9, secrets))
             })?;
             // Every query shares one frozen prefix. Only exact payload reads
-            // acquire bytes; no key or message selection is retried.
+            // acquire bytes; no key or message selection is retried. Profiles
+            // is read completely: it selects the API key a search sends, and a
+            // newer binding held in a foundation that is away would leave a
+            // superseded key selected.
             let reader = crate::storage::AcquiringReader::new(
                 secrets.store_snapshot().clone(),
                 runtime.clone(),

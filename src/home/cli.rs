@@ -206,7 +206,11 @@ pub fn run() -> Result<()> {
                 }
                 Ok(())
             }
-            Command::Bridge { action: None } => presentation::status(&home.bridge_status()?, out),
+            Command::Bridge { action: None } => {
+                let status = home.bridge_status()?;
+                out.notes(&status.notes)?;
+                presentation::status(&status, out)
+            }
             Command::Bridge {
                 action: Some(BridgeAction::Set { secret, address }),
             } => {

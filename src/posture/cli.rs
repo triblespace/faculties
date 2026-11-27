@@ -248,9 +248,15 @@ fn execute_in(storage: &crate::storage::Storage, cli: Cli, out: &mut Out<'_>) ->
             out,
         ),
         Command::Coverage { scan } => {
-            presentation::coverage(posture.coverage(scan_id(scan.as_deref())?)?.as_ref(), out)
+            let coverage = posture.coverage(scan_id(scan.as_deref())?)?;
+            out.notes(&coverage.notes)?;
+            presentation::coverage(coverage.value.as_ref(), out)
         }
-        Command::Scans => presentation::scans(&posture.scans()?, out),
+        Command::Scans => {
+            let scans = posture.scans()?;
+            out.notes(&scans.notes)?;
+            presentation::scans(&scans, out)
+        }
         Command::Vocab { command } => match command {
             VocabCommand::Add { term, channel, why } => {
                 presentation::policy(&posture.vocab_add(&term, &channel, why.as_deref())?, out)

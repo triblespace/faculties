@@ -23,7 +23,7 @@ use zeroize::Zeroizing;
 use super::bridge::{self, Bridge, BridgeConfig, Change, Discovered, Group, Light, Scene};
 use super::tls::{self, Fingerprint, Transport, Trust};
 use crate::schemas::home::{home, Sha256, DEFAULT_SCOPE_ID, KIND_ACTION, KIND_BRIDGE};
-use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultyStore, Storage};
+use crate::storage::{AcquiringReader, FactArchive, FacultyAccess, FacultyStore, Noted, Storage};
 
 type TextHandle = Inline<Handle<UTF8String>>;
 type CertificateHash = Inline<inlineencodings::Hash<Sha256>>;
@@ -273,11 +273,19 @@ impl Home {
         bridge::public_config(&Transport::new(Trust::Observe)?, &tls::base_url(address)?)
     }
 
-    /// Metadata only: this does not open a Secrets version.
-    pub fn bridge_status(&self) -> Result<BindingStatus> {
+    /// Metadata only: this does not open a Secrets version. Read over what
+    /// is here: a newer binding held in a foundation that could not be loaded
+    /// would be missed, so the notes name each such foundation. Binding and
+    /// connecting read the binding completely.
+    pub fn bridge_status(&self) -> Result<Noted<BindingStatus>> {
         self.storage.with_store(|pile, signer, runtime| {
-            let (facts, reader) = observe(&self.storage, pile, signer, runtime)?;
-            binding_status(&facts, &reader)
+            let mut notes = Vec::new();
+            let (facts, reader) = observe(&self.storage, pile, signer, runtime, Some(&mut notes))?;
+            Ok(Noted {
+                value: binding_status(&facts, &reader)
+                    .map_err(|error| crate::storage::with_unread_notes(error, &notes))?,
+                notes,
+            })
         })
     }
 
@@ -313,7 +321,7 @@ impl Home {
         let certificate = config.certificate;
         self.storage.scope(|storage| {
             let earlier = storage.with_store(|pile, signer, runtime| {
-                let (facts, reader) = observe(storage, pile, signer, runtime)?;
+                let (facts, reader) = observe(storage, pile, signer, runtime, None)?;
                 binding_status(&facts, &reader)
             })?;
             if self.pin.is_none()
@@ -339,7 +347,7 @@ impl Home {
                 .get("config")
                 .context("prove the username with the bridge")?;
             storage.with_store(|pile, signer, runtime| {
-                let (facts, reader) = observe(storage, pile, signer, runtime)?;
+                let (facts, reader) = observe(storage, pile, signer, runtime, None)?;
                 let status = binding_status(&facts, &reader)?;
                 if let Ok(current) = status.selected() {
                     if current.bridge_id == config.bridge_id
@@ -420,7 +428,7 @@ impl Home {
                     None
                 } else {
                     Some(storage.with_store(|pile, signer, runtime| {
-                        let (facts, reader) = observe(storage, pile, signer, runtime)?;
+                        let (facts, reader) = observe(storage, pile, signer, runtime, None)?;
                         binding_status(&facts, &reader)?.selected()
                     })?)
                 };
@@ -791,11 +799,16 @@ where
 }
 
 /// Advance this key's own commits into the Rank9 view and freeze it.
+///
+/// With `notes`, the read answers over what is here and names the
+/// foundations it could not load there; without, it refuses an incomplete
+/// read: a pin check, a rebinding and a connection decide on the binding.
 fn observe(
     storage: &Storage,
     pile: &mut FacultyStore,
     signer: &SigningKey,
     runtime: &Arc<tokio::runtime::Runtime>,
+    notes: Option<&mut Vec<String>>,
 ) -> Result<(
     FactArchive,
     AcquiringReader<crate::storage::FacultySnapshot>,
@@ -815,8 +828,11 @@ fn observe(
         pile.snapshot().context("freeze maintained Home snapshot")?,
         Arc::clone(runtime),
     );
-    let facts =
-        crate::storage::acquire_facts(&snapshot, rank9).context("read Home Rank9 collection")?;
+    let facts = match notes {
+        Some(notes) => crate::storage::acquire_facts_noted(&snapshot, rank9, "Home", notes),
+        None => crate::storage::acquire_facts(&snapshot, rank9),
+    }
+    .context("read Home Rank9 collection")?;
     Ok((facts, snapshot))
 }
 
@@ -858,6 +874,42 @@ fn commit(
 mod tests {
     use super::*;
     use triblespace::core::id::ExclusiveId;
+
+    /// A foundation of the Home collection is stranded on another host: the
+    /// binding status answers over what is here and names it, while a
+    /// connection, which selects the bridge, its pin and its username from
+    /// the binding, refuses the incomplete read before reaching any bridge.
+    #[test]
+    fn status_reads_but_connecting_refuses_while_a_home_foundation_is_away() {
+        use crate::storage::residual_fixture::{
+            refuses_incomplete, storage, strand_in, unrelated_fragment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let secret = triblespace::prelude::genid().id;
+        let binding = binding_fragment("bridge-1", secret, Fingerprint([7; 32]), []);
+        storage
+            .with_store(|pile, signer, runtime| {
+                commit(&storage, pile, signer, runtime, binding).map(drop)
+            })
+            .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let home = Home::with_storage(storage.clone());
+
+        let status = home.bridge_status().unwrap();
+        assert_eq!(status.selected().unwrap().secret, secret);
+        assert!(
+            status.notes.iter().any(|note| note.contains(&away)),
+            "{:?}",
+            status.notes
+        );
+        let error = home
+            .rooms()
+            .err()
+            .expect("a connection reads the binding completely");
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
+    }
 
     fn group(id: &str, name: &str, kind: &str, lights: &[&str]) -> Group {
         Group {
