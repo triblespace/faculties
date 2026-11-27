@@ -848,10 +848,11 @@ pub fn ensure_search_local_with_storage(
     })
 }
 
-/// How many bytes of Archive source nodes one search maps into BM25 images
-/// for the commits the index does not reach yet
-/// (explicit bounded attachment upkeep). The first is attempted whatever
-/// its size, so a search on a store whose index reaches nothing still
+/// Successful source bytes per mapping pass of foreground search upkeep.
+/// Search runs separate Succinct, Rank9 and BM25 passes, each with this
+/// budget. This is not an aggregate memory, dependency-I/O or time limit.
+/// Each pass permits one initial successful foundation whatever its size,
+/// so a search on a store whose index reaches nothing still
 /// leaves an attachment, and so a MAP record naming the index.
 ///
 /// Measured read-only on sky's pile, 2026-11-12 (lane
@@ -861,16 +862,18 @@ pub fn ensure_search_local_with_storage(
 /// The largest commit is 7.4 MB and the median 82 KB.
 pub const SEARCH_BUILD_BUDGET: u64 = 16 << 20;
 
-/// Publish bounded BM25 upkeep, then select the query's fixed fact and index
+/// Publish bounded fact-pair and BM25 upkeep, then select fixed fact and index
 /// observations from one fresh snapshot.
 ///
 /// Both views select their support at the same watermark; exact-byte
 /// arrival below does not reselect either of them. The surrounding operation
 /// owns the store.
 ///
-/// The upkeep maps Archive commits no attachment reaches, up to
-/// [`SEARCH_BUILD_BUDGET`] bytes of source nodes, in the residual's order,
-/// looking at no more of it than that. Images and host-signed MAPs are
+/// Each of the three passes maps residual Archive foundations, up to
+/// [`SEARCH_BUILD_BUDGET`] successful source bytes in residual order, with
+/// one initial oversized success allowed. Missing dependencies stay pending;
+/// attempts and dependency/output sizes are not bounded by that input budget.
+/// Images and host-signed MAPs are
 /// persisted before the query. The query uses only the resulting stored
 /// cover; what the budget leaves out is reported as lag. A search never
 /// maps a whole merge node: on 2026-10-26 a search that maintained first
@@ -914,6 +917,29 @@ pub(crate) fn search_views_within(
         )?;
         let target = store.attach_with(source, archive_bm25::ArchiveTextBm25Mapping)?;
         let (succinct, rank9) = crate::storage::fact_pair(store, source)?;
+        // BM25 hits join back to Archive facts. Publish both prerequisite
+        // mappings explicitly; ordinary fact reads must never build them.
+        // Do not use frontier maintenance here: one merged Archive can be
+        // much larger than this foreground per-foundation budget.
+        let fact_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::storage::tolerate_own_lag(
+            triblespace::core::collection::prepare_attached_within::<SuccinctArchiveBlob, _>(
+                &fact_reader, succinct, signer, budget,
+            )
+            .and_then(|prepared| prepared.publish(store, signer)),
+        )
+        .context("publish bounded Archive Succinct attachments")?;
+        // Rank9's dependency is the just-published same-foundation Succinct
+        // MAP, so it must plan from a fresh observation.
+        let fact_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
+        crate::storage::tolerate_own_lag(
+            triblespace::core::collection::prepare_attached_within::<
+                Rank9AcceleratedSuccinctArchiveBlob,
+                _,
+            >(&fact_reader, rank9, signer, budget)
+            .and_then(|prepared| prepared.publish(store, signer)),
+        )
+        .context("publish bounded Archive Rank9 attachments")?;
         let upkeep_reader = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
         crate::storage::tolerate_own_lag(
             store.ensure_attached_within_reading::<archive_bm25::ArchiveTextBm25Mapping, _>(
@@ -2724,8 +2750,14 @@ mod tests {
         assert_eq!(lag.index, 2, "budget must not process a second foundation");
         assert_eq!(
             facts.residual().len(),
-            3,
-            "BM25 upkeep does not invent fact MAPs"
+            2,
+            "fact upkeep publishes one foundation per pass at the zero budget"
+        );
+        let fact_read = crate::storage::acquire_attached_facts_read(&facts).unwrap();
+        assert_eq!(fact_read.unread().len(), 2);
+        assert!(
+            !fact_read.value().is_empty(),
+            "the index's fact join is usable"
         );
         drop((facts, index));
         storage.close().unwrap();
@@ -2749,6 +2781,11 @@ mod tests {
             1
         );
         assert_eq!(read.unread().len(), 2);
+        let (_, rank9) = crate::storage::fact_pair(&mut reopened, source).unwrap();
+        let stored_facts = reopened.snapshot().unwrap().attached(rank9).unwrap();
+        let fact_read = crate::storage::acquire_attached_facts_read(&stored_facts).unwrap();
+        assert_eq!(fact_read.unread().len(), 2);
+        assert!(!fact_read.value().is_empty());
         assert_eq!(
             reopened.snapshot().unwrap().records().unwrap().count(),
             before
@@ -2767,6 +2804,11 @@ mod tests {
             2
         );
         assert_eq!(lag.index, 1, "the next pass reuses the stored first image");
+        assert_eq!(
+            facts.residual().len(),
+            1,
+            "fact upkeep also makes bounded progress"
+        );
         drop((facts, index));
         next.close().unwrap();
     }

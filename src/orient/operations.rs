@@ -1370,9 +1370,8 @@ fn observe_sources(
         .map(|source| source.observe(&snapshot))
         .transpose()?;
     let presentations = sources.presentations.observe(&snapshot)?;
-    // Positive known-winner membership is an ordinary relation over the
-    // same foundations the facts read: a status no attachment reaches yet is
-    // built in memory, so the register never answers for less than the facts.
+    // Positive known-winner membership uses the stored status cover. It may
+    // lag the fact cover; this passive test helper never builds the residual.
     let status_collection = trace_refresh_call("Goals status", "attach", || {
         snapshot.attached(sources.goals_status)
     })
@@ -8127,7 +8126,7 @@ mod tests {
     }
 
     #[test]
-    fn nonwriter_observes_lagging_external_input_and_retains_own_receipts() {
+    fn nonhost_input_and_receipts_wait_for_host_upkeep() {
         test_block_on(async {
             let fixture = TestPile::new();
             let reader_key = SigningKey::from_bytes(&[73; 32]);
@@ -8178,12 +8177,13 @@ mod tests {
             .unwrap();
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-            // The unattached input is read from its own bytes.
+            // Raw resident input stays pending until host upkeep publishes it.
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
             assert_eq!(
                 person_anchors(observation.facts.relations.view()),
-                BTreeSet::from([known, pending]),
+                BTreeSet::from([known]),
             );
+            assert_eq!(observation.facts.relations.collection.residual().len(), 1);
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -8203,19 +8203,27 @@ mod tests {
                 .await
                 .unwrap();
             let next = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(next.facts.presentations.contains(event));
+            assert!(!next.facts.presentations.contains(event));
+            assert_eq!(next.facts.presentations.collection.residual().len(), 1);
             assert_eq!(
                 person_anchors(next.facts.relations.view()),
-                BTreeSet::from([known, pending])
+                BTreeSet::from([known])
             );
 
-            // External upkeep attaches the new input; the read is unchanged.
+            // The actual local host can attach both external input and the
+            // other signer's receipt. Nonhost MAPs did not supply visibility.
             sources
                 .relations
                 .maintain(&mut pile, &fixture.signer)
                 .await
                 .unwrap();
+            sources
+                .presentations
+                .maintain(&mut pile, &fixture.signer)
+                .await
+                .unwrap();
             let caught_up = observe_current_sources(&mut pile, &sources).unwrap();
+            assert!(caught_up.facts.presentations.contains(event));
             assert_eq!(
                 person_anchors(caught_up.facts.relations.view()),
                 BTreeSet::from([known, pending]),
@@ -8242,10 +8250,14 @@ mod tests {
             .unwrap();
             let before = pile.snapshot().unwrap();
             let records: Vec<_> = before.records().unwrap().map(Result::unwrap).collect();
-            // An unattached receipt is read from its own bytes, without
-            // upkeep and without blocking.
+            // An unattached receipt stays pending without blocking. Until
+            // upkeep, a report can repeat; a passive read never publishes.
             let observation = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(observation.facts.presentations.contains(id(76)));
+            assert!(!observation.facts.presentations.contains(id(76)));
+            assert_eq!(
+                observation.facts.presentations.collection.residual().len(),
+                1
+            );
             assert_eq!(
                 pile.snapshot()
                     .unwrap()
@@ -8269,11 +8281,11 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_one_shot_sees_its_receipts_before_any_upkeep() {
+    fn a_fresh_one_shot_sees_its_receipts_after_host_upkeep() {
         test_block_on(async {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let mut pile = open_store_as(&fixture.path, reader.verifying_key()).unwrap();
             let sources = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
@@ -8289,9 +8301,9 @@ mod tests {
                 .unwrap();
             assert_eq!(output, b"News: one delivery\n");
 
-            // A fresh one-shot sees the same signer-owned receipt descriptors,
-            // and reads the receipt from its bytes before any upkeep attaches
-            // it: nothing repeats, and observing publishes nothing.
+            // A fresh one-shot sees the same signer-owned receipt descriptors.
+            // Ordinary observation reports the receipt pending until the host
+            // publishes its projection; observing itself publishes nothing.
             let restarted = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
@@ -8302,7 +8314,7 @@ mod tests {
             let unattached = observe_current_sources(&mut pile, &restarted).unwrap();
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
-            assert!(attention
+            assert!(!attention
                 .pending(unattached.facts.presentations.view())
                 .is_empty());
             assert_eq!(
@@ -8315,12 +8327,22 @@ mod tests {
                 records,
                 "observation publishes nothing",
             );
+            restarted
+                .presentations
+                .maintain(&mut pile, &reader)
+                .await
+                .unwrap();
+            let projected = observe_current_sources(&mut pile, &restarted).unwrap();
+            assert!(attention
+                .pending(projected.facts.presentations.view())
+                .is_empty());
 
             // Routing aliases do not split one zooid's receipt authority.
             save_test_presentations(&mut pile, &reader, [id(80)]).unwrap();
             let aliases = ReceiptSource::register(&mut pile, &reader).unwrap();
             assert_eq!(aliases.source, restarted.presentations.source);
             assert_eq!(aliases.rank9, restarted.presentations.rank9);
+            aliases.maintain(&mut pile, &reader).await.unwrap();
             let refreshed = observe_current_sources(&mut pile, &restarted).unwrap();
             assert_eq!(
                 refreshed.facts.presentations.presented_events(),
@@ -8332,13 +8354,13 @@ mod tests {
 
     /// A run that is about to report refreshes the receipt projection itself,
     /// through the production helper, and says nothing when that succeeds;
-    /// the event it presented does not repeat either before or after.
+    /// the event it presented no longer repeats after that explicit upkeep.
     #[test]
     fn a_reporting_run_refreshes_the_receipt_set_so_it_does_not_repeat_itself() {
         test_block_on(async {
             let fixture = TestPile::new();
             let reader = SigningKey::from_bytes(&[73; 32]);
-            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let mut pile = open_store_as(&fixture.path, reader.verifying_key()).unwrap();
             let sources = OrientSources::open(&test_storage(), &mut pile, &reader, false)
                 .await
                 .unwrap();
@@ -8356,7 +8378,7 @@ mod tests {
             let mut attention = AttentionView::default();
             attention.insert(AttentionEvent::Message(event));
             let unattached = observe_current_sources(&mut pile, &sources).unwrap();
-            assert!(attention
+            assert!(!attention
                 .pending(unattached.facts.presentations.view())
                 .is_empty());
 

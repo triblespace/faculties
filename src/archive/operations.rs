@@ -385,8 +385,8 @@ impl ArchiveStorage<'_> {
                 let rank9 = pile
                     .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
                     .context("register Rank9 Comb cursor collection")?;
-                // The source is carried and its frontier attached; a cursor
-                // left unattached is read from its own bytes.
+                // The source is carried and its frontier attached; the strict
+                // read below refuses any cursor still left unattached.
                 crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)
                     .context("maintain Succinct Comb cursor collection")?;
                 crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
@@ -2089,8 +2089,9 @@ fn run_search(
     if !lag.is_current() {
         out.note(format!(
             "searching what is present; facts: {}; index: {} source commit(s) not yet \
-             indexed (a search indexes up to {} MiB of them and keeps them; `archive index` \
-             indexes the rest)",
+             indexed (search publishes up to {} MiB of successful source input per \
+             Succinct, Rank9 and BM25 pass, allowing one initial oversized success each; \
+             `archive index` maintains the rest)",
             lag.facts,
             lag.index,
             archive_collection::SEARCH_BUILD_BUDGET >> 20,
@@ -3233,8 +3234,8 @@ mod tests {
             "the vocabulary and the unit's two"
         );
 
-        // The facts are not maintained here, so their lag is still named;
-        // the index's is not.
+        // Foreground upkeep now publishes the fact pair as well: a raw-only
+        // import must be usable for the hit-to-block join on this first search.
         let index_current = |notes: &[String]| {
             notes
                 .iter()

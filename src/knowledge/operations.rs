@@ -565,9 +565,9 @@ fn views_in<T>(
     let (facts, unread_facts) = crate::storage::acquire_attached_facts_read(&observed_facts)
         .context("read Knowledge fact collection")?
         .into_parts();
-    // The index over the same foundations the facts read: a revision no
-    // attachment reaches yet is built in memory. It stands on the facts'
-    // foundations, so it is named only for one the facts did not miss.
+    // Read stored latest membership independently. A revision without a
+    // usable attachment stays unread; name its gap separately only when the
+    // facts' note does not already cover it (strict reads check both).
     let (latest, unread_latest) = observed_latest
         .read_acquiring::<LatestIndex>()
         .context("read Knowledge supersession index")?

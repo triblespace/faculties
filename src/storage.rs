@@ -3439,8 +3439,9 @@ where
 /// some own foundations the mapping cannot represent counts as realized:
 /// those foundations are its lag ([`tolerate_own_lag`]), kept in
 /// [`Self::lagging`], and the pass goes on. An attached collection has no
-/// such lag: what its mapping cannot represent is left to finer nodes, and a
-/// reader reads what no attachment reaches from its own bytes.
+/// such derived-leaf report: what its mapping cannot represent is left to
+/// finer nodes. Unattached foundations remain explicit unread support in an
+/// ordinary read; raw bytes alone do not fill the gap.
 #[derive(Clone, Debug, Default)]
 pub struct FacultiesRealizer {
     /// Each derived target that left own foundations without a leaf, with
@@ -3576,10 +3577,10 @@ where
 /// later. The store must be opened as `signer`: only its MAPs are believed.
 ///
 /// A commit whose attachment could not be built -- its mapping refused it,
-/// or a dependency is not here -- is still readable: [`FactRead::read_facts`]
-/// reads it from its own bytes. So is every commit of a writer that is not
-/// the store's host: such a key attaches nothing, and the write is done
-/// once its commit is. An attached collection whose upkeep fails is named
+/// or a dependency is not here -- remains committed but pending in attached
+/// reads. A writer that is not the store's host likewise attaches nothing;
+/// host upkeep must publish a usable MAP before attached readers see it.
+/// An attached collection whose upkeep fails is named
 /// in the report's `failed_attached`, and the others are still attached.
 pub async fn ensure_downstream<S>(
     pile: &mut S,

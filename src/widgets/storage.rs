@@ -153,10 +153,10 @@ fn source_closure(sources: impl IntoIterator<Item = SourceKey>) -> BTreeSet<Sour
 /// Widgets compare revisions for equality; the storage backend owns their
 /// construction. The digest includes each attached relation's descriptor,
 /// its already-attached resident cover, and what the read took beside the
-/// cover: the residual foundations and the ones among them it could not
-/// read. Those three sets decide what the read holds, so a commit read from
-/// its own bytes before anything attaches it moves the token as surely as
-/// maintenance does. It is a widget cache token, not a durable collection
+/// cover: the residual foundations and unread support. A raw-only commit
+/// moves the token because it adds a known pending gap; raw payload arrival
+/// alone does not make that commit visible. A later stored MAP changes the
+/// visible cover. It is a widget cache token, not a durable collection
 /// record or an authorization proof. Equivalent physical compaction may
 /// invalidate a cached projection, but computing the token never resolves
 /// the cover's historical support.
@@ -1096,8 +1096,8 @@ fn load_inputs_mode(
 /// One scope's facts, read through its attached Rank9 cover with the
 /// residual reported as pending: the stored facts, the revision
 /// that identifies exactly what that read holds (the foundations it could
-/// not read included, so their arrival moves it), and those foundations.
-/// Bytes that are here but form no archive still fail the read.
+/// not read included), and those foundations. Raw payload arrival alone
+/// does not advance it. Invalid selected attachment bytes still fail the read.
 fn attached_facts_and_revision<R>(
     snapshot: &R,
     rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
@@ -1559,6 +1559,12 @@ mod tests {
         ]);
         pile.commit(teams, &signer, entity! { metadata::name: "before" })
             .unwrap();
+        // This fixture's initial positive view is published by the owner;
+        // observing the workspace itself must not construct its raw commit.
+        drop(
+            pollster::block_on(crate::storage::ensure_downstream(&mut pile, teams, &signer))
+                .unwrap(),
+        );
         let first =
             pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
         let first_context = first.loaded_context();
@@ -2094,6 +2100,63 @@ mod tests {
             BTreeSet::from([first.id, second.id, third.id])
         );
         assert_ne!(gap, published, "persisted attachment advances the revision");
+    }
+
+    /// Exercise ordinary Data's routed backend, not only the fact-read helper.
+    /// The same frozen pending view must remain pending after later upkeep.
+    #[test]
+    fn workspace_data_reports_raw_only_gap_then_reads_stored_host_map() {
+        use triblespace::core::collection::{AdmissionPolicy, CollectionPolicy};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let signer = SigningKey::from_bytes(&[36; 32]);
+        let mut pile = Pile::open_as(file.path(), signer.verifying_key()).unwrap();
+        let source = pile
+            .collection(
+                "Data stored-only fixture",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        let routes = CollectionRoutes::from([(TEAMS_SCOPE_ID, source.handle())]);
+        pile.commit(source, &signer, entity! { metadata::name: "pending team" })
+            .unwrap();
+        let before = pile.snapshot().unwrap().records().unwrap().count();
+        let pending =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        let pending_context = pending.loaded_context();
+        let gap = pending_context.dataset(SourceKey::Teams).unwrap();
+        assert!(gap.facts.is_empty());
+        assert!(
+            !gap.notes.is_empty(),
+            "Data must not report empty as complete"
+        );
+        assert_eq!(
+            pile.snapshot().unwrap().records().unwrap().count(),
+            before,
+            "ordinary Data observation must publish no MAP or merge"
+        );
+        drop(
+            pollster::block_on(crate::storage::ensure_downstream(
+                &mut pile, source, &signer,
+            ))
+            .unwrap(),
+        );
+        let complete =
+            pollster::block_on(WorkspaceObservation::observe(&mut pile, &signer, &routes)).unwrap();
+        let complete_context = complete.loaded_context();
+        let visible = complete_context.dataset(SourceKey::Teams).unwrap();
+        assert_eq!(
+            find!(name: Inline<_>, pattern!(visible.facts, [{ metadata::name: ?name }])).count(),
+            1
+        );
+        assert!(visible.notes.is_empty());
+        assert_ne!(gap.revision, visible.revision);
+        assert!(
+            gap.facts.is_empty(),
+            "a retained Data view must not reselect"
+        );
+        assert!(!gap.notes.is_empty());
+        drop((pending, complete));
+        pile.close().unwrap();
     }
 
     #[test]
