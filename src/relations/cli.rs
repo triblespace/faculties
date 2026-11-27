@@ -522,9 +522,9 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
             } else {
                 PeopleFilter::Active
             };
-            output.text(operations.list(limit, filter)?)
+            output.noted_text(operations.list(limit, filter)?)
         }
-        Command::Show { person } => output.text(operations.show(&person)?),
+        Command::Show { person } => output.noted_text(operations.show(&person)?),
         Command::Retire { person } => render::lifecycle(&operations.retire(&person)?, true, output),
         Command::Unretire { person } => {
             render::lifecycle(&operations.unretire(&person)?, false, output)
@@ -549,8 +549,8 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 &operations.group_reconcile(&group, name.as_deref())?,
                 output,
             ),
-            GroupCommand::List => output.text(operations.group_list()?),
-            GroupCommand::Show { group } => output.text(operations.group_show(&group)?),
+            GroupCommand::List => output.noted_text(operations.group_list()?),
+            GroupCommand::Show { group } => output.noted_text(operations.group_show(&group)?),
         },
         Command::Identity { command } => match command {
             IdentityCommand::Resolve {
@@ -563,7 +563,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 same,
                 output,
             ),
-            IdentityCommand::List => output.text(operations.identity_list()?),
+            IdentityCommand::List => output.noted_text(operations.identity_list()?),
         },
         Command::Org { command } => match command {
             OrgCommand::Add {
@@ -596,9 +596,11 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 } else {
                     PeopleFilter::Active
                 };
-                output.text(operations.org_list(limit, filter)?)
+                output.noted_text(operations.org_list(limit, filter)?)
             }
-            OrgCommand::Show { organisation } => output.text(operations.org_show(&organisation)?),
+            OrgCommand::Show { organisation } => {
+                output.noted_text(operations.org_show(&organisation)?)
+            }
             OrgCommand::Retire { organisation } => {
                 render::lifecycle(&operations.org_retire(&organisation)?, true, output)
             }
@@ -639,7 +641,7 @@ pub fn execute(cli: Cli, output: &mut Out<'_>) -> Result<()> {
                 output,
             ),
         },
-        Command::Ties { entry } => output.text(operations.ties(&entry)?),
+        Command::Ties { entry } => output.noted_text(operations.ties(&entry)?),
     }
 }
 

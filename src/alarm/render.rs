@@ -158,7 +158,7 @@ pub fn list(view: &ListView, output: &mut Out<'_>) -> Result<()> {
             view.unread
         ))?;
     }
-    Ok(())
+    output.notes(&view.notes)
 }
 
 pub fn show(view: &ShowView, output: &mut Out<'_>) -> Result<()> {
@@ -229,7 +229,7 @@ pub fn show(view: &ShowView, output: &mut Out<'_>) -> Result<()> {
             view.unread
         ))?;
     }
-    Ok(())
+    output.notes(&view.notes)
 }
 
 pub fn ended(alarm: triblespace::prelude::Id, ended: Ended, output: &mut Out<'_>) -> Result<()> {

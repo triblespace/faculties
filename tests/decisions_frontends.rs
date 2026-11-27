@@ -214,7 +214,12 @@ fn mcp_literal_prose_and_cli_file_input_share_the_same_operations() {
     })
     .unwrap();
     let decide = fixture.operations();
-    let first = decide.list(ListOptions::default()).unwrap().remove(0).id;
+    let first = decide
+        .list(ListOptions::default())
+        .unwrap()
+        .value
+        .remove(0)
+        .id;
     assert_eq!(
         decide
             .show(&format!("{first:x}"))

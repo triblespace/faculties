@@ -28,17 +28,23 @@ impl Diagnostics {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
+    /// Every report reads what is here: the notes naming each foundation
+    /// that could not be loaded are delivered before it, and an error carries
+    /// them. A report is a reading, never a decision taken from absence.
     fn with_snapshot(
         &self,
-        operation: impl FnOnce(&DiagnosticsSnapshot) -> Result<()>,
+        out: &mut Out<'_>,
+        operation: impl FnOnce(&DiagnosticsSnapshot, &mut Out<'_>) -> Result<()>,
     ) -> Result<()> {
         self.storage.with_store(|store, signer, runtime| {
             let snapshot = DiagnosticsSnapshot::load(&self.storage, store, signer, runtime)?;
-            operation(&snapshot)
+            out.notes(&snapshot.notes)?;
+            operation(&snapshot, out)
+                .map_err(|error| crate::storage::with_unread_notes(error, &snapshot.notes))
         })
     }
     pub fn scan(&self, options: &InspectOptions, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| {
+        self.with_snapshot(out, |snapshot, out| {
             scan(
                 snapshot,
                 self.storage.path(),
@@ -50,24 +56,26 @@ impl Diagnostics {
         })
     }
     pub fn loops(&self, recent: usize, min_repeat: usize, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| loops(snapshot, recent, min_repeat, out))
+        self.with_snapshot(out, |snapshot, out| {
+            loops(snapshot, recent, min_repeat, out)
+        })
     }
     pub fn timeline(&self, recent: usize, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| timeline(snapshot, recent, out))
+        self.with_snapshot(out, |snapshot, out| timeline(snapshot, recent, out))
     }
     pub fn cover(&self, full: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| cover(snapshot, full, out))
+        self.with_snapshot(out, |snapshot, out| cover(snapshot, full, out))
     }
     pub fn chunk(&self, id: &str, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| chunk(snapshot, id, out))
+        self.with_snapshot(out, |snapshot, out| chunk(snapshot, id, out))
     }
     pub fn turn(&self, turn: usize, full: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| self::turn(snapshot, turn, full, out))
+        self.with_snapshot(out, |snapshot, out| self::turn(snapshot, turn, full, out))
     }
     /// Raw mode is formatted reconstructed context-candidate JSON, not an
     /// original-byte export. Every candidate is retained, as in normal mode.
     pub fn context(&self, turn: usize, full: bool, raw: bool, out: &mut Out<'_>) -> Result<()> {
-        self.with_snapshot(|snapshot| context(snapshot, turn, full, raw, out))
+        self.with_snapshot(out, |snapshot, out| context(snapshot, turn, full, raw, out))
     }
 }
 
@@ -133,6 +141,9 @@ struct DiagnosticsSnapshot {
     store_snapshot: DiagnosticsReader,
     collections: BTreeMap<Id, FactArchive>,
     secrets: SecretsSnapshot<DiagnosticsReader>,
+    /// What the collection reads could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    notes: Vec<String>,
 }
 
 impl DiagnosticsSnapshot {
@@ -197,9 +208,15 @@ impl DiagnosticsSnapshot {
         let secrets =
             secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
         let mut collections = BTreeMap::new();
+        let mut notes = Vec::new();
         for ((scope, label), collection) in registered.iter().zip(&rank9) {
-            let archive = crate::storage::acquire_facts(&store_snapshot, *collection)
-                .with_context(|| format!("read maintained {label} collection"))?;
+            let archive = crate::storage::acquire_facts_noted(
+                &store_snapshot,
+                *collection,
+                label,
+                &mut notes,
+            )
+            .with_context(|| format!("read maintained {label} collection"))?;
             collections.insert(*scope, archive);
         }
 
@@ -207,6 +224,7 @@ impl DiagnosticsSnapshot {
             store_snapshot,
             collections,
             secrets,
+            notes,
         })
     }
 
@@ -1441,5 +1459,38 @@ mod tests {
         assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "chain"]).is_err());
         assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "repair"]).is_err());
         assert!(Cli::try_parse_from(["diagnostics", "--pile", "x", "migrate-legacy"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, storage, strand_in, unrelated_fragment,
+    };
+
+    fn notes_of(read: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<Vec<String>> {
+        let mut notes = Vec::new();
+        read(&mut Out::new(&mut |part| {
+            if let crate::out::Part::Note { text } = part {
+                notes.push(text);
+            }
+            Ok(())
+        }))?;
+        Ok(notes)
+    }
+
+    #[test]
+    fn reports_name_a_foundation_that_is_away_and_a_fault_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let diagnostics = Diagnostics::with_storage(storage.clone());
+        let away = strand_in(&storage, COGNITION_SCOPE_ID, unrelated_fragment());
+        let notes = notes_of(|out| diagnostics.timeline(10, out)).unwrap();
+        assert!(notes.iter().any(|note| note.contains(&away)), "{notes:?}");
+        malformed_in(&storage, MEMORY_SCOPE_ID);
+        let error = notes_of(|out| diagnostics.timeline(10, out)).unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        storage.close().unwrap();
     }
 }

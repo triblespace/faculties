@@ -584,6 +584,9 @@ async fn ensure_facts(
 pub struct SuccinctIndexReport {
     pub source_elements: usize,
     pub lag: FactLag,
+    /// Selected foundations whose bytes could not be loaded here: the
+    /// acquisition reads every other one, and these are reported beside it.
+    pub unread: usize,
     pub source_collection: Inline<Handle<SimpleArchive>>,
     pub target_collection: Inline<Handle<SimpleArchive>>,
 }
@@ -615,7 +618,12 @@ pub fn ensure_succinct_index_with_storage(
             Ok::<_, anyhow::Error>(())
         })?;
         let snapshot = crate::storage::AcquiringReader::new(store.snapshot()?, runtime.clone());
-        crate::storage::acquire_facts(&snapshot, rank9)?;
+        // The acquisition loads what it can; a foundation whose bytes are away
+        // is counted, not a refusal of the whole index. Bytes that are here
+        // but form no archive still fail it.
+        let unread = crate::storage::acquire_facts_read(&snapshot, rank9)?
+            .unread()
+            .len();
         let source_elements = snapshot
             .collection(source)
             .context("attach Archive source")?
@@ -624,6 +632,7 @@ pub fn ensure_succinct_index_with_storage(
             .len();
         Ok(SuccinctIndexReport {
             source_elements,
+            unread,
             lag: FactLag::of(&snapshot, source, succinct, rank9)?,
             source_collection: source.handle(),
             target_collection: rank9.handle(),

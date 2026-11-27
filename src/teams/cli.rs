@@ -339,6 +339,9 @@ fn archive_access(sync: bool) -> ArchiveAccess {
 }
 
 fn host_activity<T>(result: Activity<T>) -> T {
+    for note in result.notes {
+        eprintln!("{}", crate::out::labelled_note(&note));
+    }
     eprint!("{}", render::context_banner(&result.context));
     for notice in result.notices {
         eprintln!("{notice}");
@@ -494,7 +497,11 @@ pub fn execute(mut cli: Cli, out: &mut Out<'_>) -> Result<()> {
                     out,
                 )
             }
-            ContextCommand::Show => render::context(&operations.context_show()?, out),
+            ContextCommand::Show => {
+                let context = operations.context_show()?;
+                out.notes(&context.notes)?;
+                render::context(&context, out)
+            }
         },
         CommandMode::Auth { command } => match command {
             AuthCommand::Status => out.text(host_activity(operations.auth_status()?)),

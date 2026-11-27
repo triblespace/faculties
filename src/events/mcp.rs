@@ -176,10 +176,9 @@ impl Faculty for Events {
                 let args: List = decode_arguments(arguments)?;
                 let window =
                     super::event_window(&args.from, Some(&args.to)).map_err(invalid_arguments)?;
-                presentation::occurrences(
-                    &self.operations.list(window, args.include_cancelled)?,
-                    out,
-                )
+                let listed = self.operations.list(window, args.include_cancelled)?;
+                out.notes(&listed.notes)?;
+                presentation::occurrences(&listed, out)
             }
             "events_next" => {
                 let args: Next = decode_arguments(arguments)?;
@@ -191,6 +190,7 @@ impl Faculty for Events {
                     .map_err(invalid_arguments)?
                     .map(super::chrono_to_epoch);
                 let next = self.operations.next(after)?;
+                out.notes(&next.notes)?;
                 presentation::occurrences(next.as_ref().map_or(&[], std::slice::from_ref), out)
             }
             "events_note" => {
@@ -211,7 +211,9 @@ impl Faculty for Events {
             "events_resolve" => {
                 let args: Prefix = decode_arguments(arguments)?;
                 selector(&args.prefix)?;
-                out.line(format!("{:x}", self.operations.resolve(&args.prefix)?))
+                let resolved = self.operations.resolve(&args.prefix)?;
+                out.notes(&resolved.notes)?;
+                out.line(format!("{:x}", resolved.value))
             }
             "events_ingest" => {
                 let args: Ingest = decode_arguments(arguments)?;

@@ -16,7 +16,7 @@ use triblespace::prelude::{find, pattern, Id};
 
 use super::{named_entries, named_entry, SchemasEntry};
 use crate::schemas::atlas::DEFAULT_SCOPE_ID;
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Storage};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Noted, Storage};
 
 /// An acquiring Schemas reader. Each operation opens the existing collection
 /// mappings, then projects facts and attachments from one final snapshot.
@@ -42,7 +42,9 @@ impl Store {
     }
 
     /// Every named entity, ordered by all name variants and then entity id.
-    pub fn list(&self) -> Result<Vec<SchemasEntry>> {
+    /// Read over what is here, as [`Self::show`] is: the answer carries a
+    /// note naming each foundation the read could not load.
+    pub fn list(&self) -> Result<Noted<Vec<SchemasEntry>>> {
         self.with_view(|facts, reader| {
             let mut rows = named_entries(reader, facts)?;
             rows.sort_by(|left, right| {
@@ -56,7 +58,8 @@ impl Store {
 
     /// One named entity selected by a case-insensitive hexadecimal id prefix.
     /// Missing and ambiguous prefixes are errors, never arbitrary winners.
-    pub fn show(&self, prefix: &str) -> Result<SchemasEntry> {
+    /// Not finding a prefix while a foundation is away refuses with the note.
+    pub fn show(&self, prefix: &str) -> Result<Noted<SchemasEntry>> {
         self.with_view(|facts, reader| {
             let id = resolve_prefix(facts, prefix)?;
             named_entry(reader, facts, id)?
@@ -81,8 +84,9 @@ impl Store {
     fn with_view<T>(
         &self,
         operation: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>) -> Result<T>,
-    ) -> Result<T> {
-        self.storage.with_store(|pile, signer, runtime| {
+    ) -> Result<Noted<T>> {
+        let mut notes = Vec::new();
+        let result = self.storage.with_store(|pile, signer, runtime| {
             let source = self.storage.open_collection_read(
                 pile,
                 DEFAULT_SCOPE_ID,
@@ -96,10 +100,19 @@ impl Store {
                 pile.snapshot().context("freeze Schemas fact collection")?,
                 std::sync::Arc::clone(runtime),
             );
-            let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
-                .context("read maintained Schemas fact collection")?;
+            let facts = crate::storage::acquire_facts_noted(
+                &store_snapshot,
+                collection_rank9,
+                "Schemas",
+                &mut notes,
+            )
+            .context("read maintained Schemas fact collection")?;
             operation(&facts, &store_snapshot)
-        })
+        });
+        match result {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
+        }
     }
 }
 
@@ -119,5 +132,32 @@ fn resolve_prefix<P: TriblePattern>(facts: &P, prefix: &str) -> Result<Id> {
         (None, _) => bail!("no id matches prefix '{prefix}'"),
         (Some(id), None) => Ok(id),
         (Some(_), Some(_)) => bail!("multiple ids match prefix '{prefix}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, storage, strand_in, unrelated_fragment,
+    };
+
+    #[test]
+    fn reads_name_a_schemas_foundation_that_is_away_and_a_fault_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let store = Store::with_storage(storage.clone());
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let listed = store.list().unwrap();
+        assert!(
+            listed.notes.iter().any(|note| note.contains(&away)),
+            "{:?}",
+            listed.notes
+        );
+        let error = store.show("ab").unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        assert!(is_fault(&store.list().unwrap_err()));
+        storage.close().unwrap();
     }
 }

@@ -5,6 +5,7 @@ use super::{
     ProposedDecision, Resolution, ResolutionReceipt, ResolutionSnapshot,
 };
 use crate::out::Out;
+use crate::storage::Noted;
 use anyhow::{anyhow, Result};
 use hifitime::Epoch;
 use triblespace::prelude::*;
@@ -57,7 +58,8 @@ fn list_status(resolution: &Resolution) -> String {
     }
 }
 
-pub fn proposed(receipt: &ProposedDecision, out: &mut Out<'_>) -> Result<()> {
+pub fn proposed(receipt: &Noted<ProposedDecision>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&receipt.notes)?;
     out.line(format!("Proposed decision {:x}", receipt.decision))
 }
 pub fn factor(receipt: &AddedFactor, out: &mut Out<'_>) -> Result<()> {
@@ -95,7 +97,9 @@ pub fn resolved(receipt: &ResolutionReceipt, reconciled: bool, out: &mut Out<'_>
     }
     Ok(())
 }
-pub fn list(rows: &[DecisionSummary], out: &mut Out<'_>) -> Result<()> {
+pub fn list(listed: &Noted<Vec<DecisionSummary>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&listed.notes)?;
+    let rows = &listed.value;
     if rows.is_empty() {
         return out.line("(no decisions)");
     }
@@ -195,7 +199,8 @@ fn snapshot(
     }
     Ok(())
 }
-pub fn show(report: &DecisionDetail, out: &mut Out<'_>) -> Result<()> {
+pub fn show(report: &Noted<DecisionDetail>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&report.notes)?;
     out.line(format!("decision {:x}", report.id))?;
     out.line(format!("  title: {}", report.title))?;
     out.line(format!(

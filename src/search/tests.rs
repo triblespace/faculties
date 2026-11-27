@@ -618,3 +618,51 @@ fn invalid_queries_and_limits_fail_before_source_work() {
         assert!(!error.to_string().is_empty());
     }
 }
+
+/// A Files foundation is stranded on another host: the cross-faculty search
+/// keeps its contract (a source answers from a complete read or is
+/// unavailable, naming why) and the other sources still answer, while the
+/// faculty's own search answers over what is here and names the gap. The
+/// owner has no first contact, so the foundation is reported unread at once.
+#[test]
+fn a_stranded_files_foundation_makes_only_files_unavailable_and_names_it() {
+    use crate::storage::residual_fixture::{storage, strand_in, unrelated_fragment};
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let files = crate::files::Files::with_storage(storage.clone());
+    files
+        .add_bytes(
+            anybytes::Bytes::from(b"body".to_vec()),
+            "needle.txt",
+            "text/plain",
+            &[],
+        )
+        .unwrap();
+    let away = strand_in(&storage, FILES, unrelated_fragment());
+    let report = Search::with_storage(storage.clone())
+        .query(Options {
+            query: "needle",
+            limit_per_source: 10,
+        })
+        .unwrap();
+    answered(&report.sources[0]);
+    answered(&report.sources[1]);
+    let Outcome::Unavailable { message } = &report.sources[2].outcome else {
+        panic!(
+            "a partial Files read is unavailable: {:#?}",
+            report.sources[2]
+        );
+    };
+    assert!(message.contains(&away), "{message}");
+    let json = report.json().unwrap();
+    assert!(json.contains("\"status\": \"unavailable\""), "{json}");
+
+    let found = files.search("needle").unwrap();
+    assert!(found.contains("needle.txt"), "{found}");
+    assert!(
+        found.notes.iter().any(|note| note.contains(&away)),
+        "{:?}",
+        found.notes
+    );
+    storage.close().unwrap();
+}

@@ -67,10 +67,10 @@ fn collect_text(operation: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<St
 fn direct_store_reads_owned_variants_and_refreshes_between_operations() {
     let (_directory, pile, key, expected) = fixture();
     let store = Store::open(&pile, Some(&key)).unwrap();
-    let before = store.list().unwrap();
+    let before = store.list().unwrap().value;
     assert_eq!(before, [expected.clone()]);
     assert_eq!(
-        store.show(&format!("  {:X}  ", expected.id)).unwrap(),
+        store.show(&format!("  {:X}  ", expected.id)).unwrap().value,
         expected
     );
     assert!(store
@@ -90,7 +90,10 @@ fn direct_store_reads_owned_variants_and_refreshes_between_operations() {
     publish_fragment(&pile, Some(&key), DEFAULT_SCOPE_ID, addition).unwrap();
     let mut after = expected.clone();
     after.names.push("Gamma".into());
-    assert_eq!(store.show(&format!("{:x}", expected.id)).unwrap(), after);
+    assert_eq!(
+        store.show(&format!("{:x}", expected.id)).unwrap().value,
+        after
+    );
     assert_eq!(
         before,
         [expected],

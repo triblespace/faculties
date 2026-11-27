@@ -60,7 +60,8 @@ impl Faculty for Schemas {
             "schemas_list" => {
                 let _: ListArguments = decode_arguments(arguments)?;
                 self.operations.list().and_then(|rows| {
-                    for row in rows {
+                    output.notes(&rows.notes)?;
+                    for row in rows.value {
                         output.line(render::list_line(&row))?;
                     }
                     Ok(())
@@ -69,6 +70,7 @@ impl Faculty for Schemas {
             "schemas_show" => {
                 let arguments: ShowArguments = decode_arguments(arguments)?;
                 self.operations.show(&arguments.id).and_then(|row| {
+                    output.notes(&row.notes)?;
                     for line in render::show_lines(&row) {
                         output.line(line)?;
                     }

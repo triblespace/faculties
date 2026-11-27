@@ -679,7 +679,7 @@ fn import_shape(files: &Files, import: &str) -> (Vec<String>, String) {
         .map(str::to_owned)
         .collect();
     lines.sort();
-    (lines, files.tree(import, None).unwrap())
+    (lines, files.tree(import, None).unwrap().value)
 }
 
 fn fresh_files(directory: &std::path::Path) -> Files {

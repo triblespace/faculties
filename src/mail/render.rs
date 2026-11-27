@@ -1,6 +1,7 @@
 //! Mail presentation over owned observations and explicit durable receipts.
 use super::operations::*;
 use crate::out::Out;
+use crate::storage::Noted;
 use anyhow::Result;
 
 pub fn account_set(value: &AccountSetReceipt, out: &mut Out<'_>) -> Result<()> {
@@ -16,7 +17,9 @@ pub fn account_set(value: &AccountSetReceipt, out: &mut Out<'_>) -> Result<()> {
         ))
     }
 }
-pub fn accounts(values: &[AccountSummary], out: &mut Out<'_>) -> Result<()> {
+pub fn accounts(read: &Noted<Vec<AccountSummary>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     for value in values {
         match &value.state {
             AccountState::Missing => out.line(format!("{:x}  MISSING", value.account))?,
@@ -94,7 +97,9 @@ pub fn sent(value: &SendReceipt, out: &mut Out<'_>) -> Result<()> {
         )),
     }
 }
-pub fn outbox(values: &[DraftStatus], out: &mut Out<'_>) -> Result<()> {
+pub fn outbox(read: &Noted<Vec<DraftStatus>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     for value in values {
         let state = match value.delivery {
             DraftDelivery::Pending => "pending".to_owned(),
@@ -106,7 +111,9 @@ pub fn outbox(values: &[DraftStatus], out: &mut Out<'_>) -> Result<()> {
     }
     Ok(())
 }
-pub fn inbox(values: &[InboxMessage], out: &mut Out<'_>) -> Result<()> {
+pub fn inbox(read: &Noted<Vec<InboxMessage>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     for value in values {
         let view = &value.projection;
         out.line(format!(
@@ -120,10 +127,13 @@ pub fn inbox(values: &[InboxMessage], out: &mut Out<'_>) -> Result<()> {
     }
     Ok(())
 }
-pub fn read(value: &ReadReceipt, out: &mut Out<'_>) -> Result<()> {
+pub fn read(value: &Noted<ReadReceipt>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&value.notes)?;
     out.line(format!("Read {:x} ({:x})", value.wire, value.observation))
 }
-pub fn show(values: &[super::ProjectionView], out: &mut Out<'_>) -> Result<()> {
+pub fn show(read: &Noted<Vec<super::ProjectionView>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     for view in values {
         out.line(format!("Wire: {:x}", view.wire))?;
         out.line(format!(
@@ -155,7 +165,9 @@ pub fn show(values: &[super::ProjectionView], out: &mut Out<'_>) -> Result<()> {
     }
     Ok(())
 }
-pub fn search(values: &[super::ProjectionView], out: &mut Out<'_>) -> Result<()> {
+pub fn search(read: &Noted<Vec<super::ProjectionView>>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     for view in values {
         out.line(format!(
             "{:x}  {}  {}",
@@ -167,10 +179,12 @@ pub fn search(values: &[super::ProjectionView], out: &mut Out<'_>) -> Result<()>
     Ok(())
 }
 pub fn attachments(
-    values: &[AttachmentListing],
+    read: &Noted<Vec<AttachmentListing>>,
     saved: Option<&[super::cli::Saved]>,
     out: &mut Out<'_>,
 ) -> Result<()> {
+    out.notes(&read.notes)?;
+    let values = &read.value;
     if values.is_empty() {
         return out.line("No attachments.");
     }

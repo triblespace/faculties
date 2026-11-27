@@ -59,6 +59,7 @@ fn event_and_initial_note_publish_as_one_signed_mutation() {
     let (pile, key) = fresh_storage(&directory);
     let storage = EventsStorage {
         storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
+        notes: None,
     };
     let mut fragment = event_fragment(&fixture_draft("one@example", "meeting")).unwrap();
     let event = fragment.root().unwrap();
@@ -99,6 +100,7 @@ fn same_batch_duplicate_collapses_and_changed_definition_is_a_revision() {
     let (pile, key) = fresh_storage(&directory);
     let storage = EventsStorage {
         storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
+        notes: None,
     };
     storage
         .with_view(|loaded| {
@@ -155,6 +157,7 @@ fn exact_reingest_does_not_publish_another_authored_commit() {
     .unwrap();
     let storage = EventsStorage {
         storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
+        notes: None,
     };
 
     let text = fs::read_to_string(&ics).unwrap();
@@ -208,6 +211,7 @@ fn cancel_adds_one_assertion_without_mutating_baseline_status() {
     let (pile, key) = fresh_storage(&directory);
     let storage = EventsStorage {
         storage: &crate::storage::Storage::new(pile.clone(), Some(key.clone())),
+        notes: None,
     };
     let event = event_fragment(&fixture_draft("cancel@example", "meeting")).unwrap();
     let event_id = event.root().unwrap();
@@ -582,6 +586,7 @@ fn starts_in(events: &Events, from: &str, to: &str) -> Vec<(String, DateTime<Utc
             false,
         )
         .unwrap()
+        .value
         .into_iter()
         .map(|occurrence| {
             (
@@ -667,6 +672,7 @@ fn exdate_and_recurrence_id_override_replace_master_instances() {
     let next = events
         .next(Some(chrono_to_epoch(utc("2026-10-16T00:00:00Z"))))
         .unwrap()
+        .value
         .unwrap();
     assert_eq!(next.summary, "moved");
 }
@@ -873,7 +879,7 @@ fn a_local_cancellation_holds_for_later_versions_and_old_versions_stay_readable(
     assert!(starts_in(&events, "2026-11-20T00:00:00Z", "2026-11-21T00:00:00Z").is_empty());
     let current = events.show(&format!("{new:x}")).unwrap();
     assert!(current.cancelled);
-    assert_eq!(current.notes.len(), 1, "notes belong to the lineage");
+    assert_eq!(current.value.notes.len(), 1, "notes belong to the lineage");
     // The superseded version is still what the first export said.
     let shown = events.show(&format!("{old:x}")).unwrap();
     assert_eq!(
@@ -1310,4 +1316,71 @@ fn a_complete_export_needs_one_dated_document() {
         listed(&events).is_empty(),
         "a refused ingest publishes nothing"
     );
+}
+
+/// A foundation of the collection is stranded on another host: adds, notes
+/// and cancellations are written and every read answers over what is here,
+/// naming it; an ingest, which replaces readings and decides from what a
+/// complete export does not hold, refuses the incomplete read.
+#[test]
+fn reads_and_appends_go_on_while_an_events_foundation_is_away() {
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let events = Events::with_storage(storage.clone());
+    let window = (
+        chrono_to_epoch(utc("2026-11-20T10:00:00Z")),
+        chrono_to_epoch(utc("2026-11-20T11:00:00Z")),
+    );
+    let resident = events.add(&AddOptions::new("resident", window)).unwrap();
+    assert!(resident.notes.is_empty(), "{:?}", resident.notes);
+    let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+    let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+    let id = format!("{:x}", resident.event);
+
+    let added = events.add(&AddOptions::new("meanwhile", window)).unwrap();
+    assert!(named(&added.notes), "{:?}", added.notes);
+    assert!(named(&events.note(&id, "a note").unwrap().notes));
+    let listed = events.list(default_window(), false).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(named(&listed.notes), "{:?}", listed.notes);
+    let next = events.next(Some(window.0)).unwrap();
+    assert!(next.is_some() && named(&next.notes));
+    let shown = events.show(&id).unwrap();
+    assert_eq!(shown.value.notes.len(), 1);
+    assert!(named(&shown.notes));
+    assert!(named(&events.resolve(&id).unwrap().notes));
+    assert!(named(&events.cancel(&id).unwrap().notes));
+
+    let error = events.show(&format!("{:x}", genid().id)).unwrap_err();
+    assert!(format!("{error:#}").contains(&away), "{error:#}");
+    let error = events
+        .ingest(
+            &[CalendarInput {
+                name: "export.ics",
+                text: &vevent_calendar(&vevent(
+                    "late@example",
+                    &["DTSTART:20261121T190000Z", "DTEND:20261121T200000Z"],
+                )),
+            }],
+            IngestOptions::default(),
+        )
+        .unwrap_err();
+    assert!(refuses_incomplete(&error, &away), "{error:#}");
+    storage.close().unwrap();
+}
+
+#[test]
+fn a_malformed_events_foundation_fails_loudly() {
+    use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let events = Events::with_storage(storage.clone());
+    malformed_in(&storage, DEFAULT_SCOPE_ID);
+    let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
+    fault(events.list(default_window(), false).unwrap_err());
+    fault(events.resolve("00").unwrap_err());
+    storage.close().unwrap();
 }

@@ -35,7 +35,9 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
     match cli.command {
         Command::Check => {
             let cognition = Cognition::with_storage(cli.workspace.storage(cli.pile, cli.key)?);
-            out.line(cognition.check()?.summary())
+            let report = cognition.check()?;
+            out.notes(&report.notes)?;
+            out.line(report.summary())
         }
     }
 }

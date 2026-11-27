@@ -10,7 +10,7 @@ use crate::decisions::{
     self, DecisionGenesis, FactorRecord, FactorSide, IntervalValue, Resolution, ResolutionSnapshot,
 };
 use crate::schemas::decide::DEFAULT_SCOPE_ID;
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Noted};
 use anyhow::{anyhow, bail, Context, Result};
 use hifitime::Epoch;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -111,9 +111,34 @@ impl Decisions {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
+    /// Decide on a complete observation: a selected foundation whose bytes
+    /// cannot be loaded refuses the operation. A factor or a resolution
+    /// refuses to follow a resolution it cannot see, and a resolution's
+    /// evidence is every factor, so these decide on a complete read.
     fn storage(&self) -> DecisionsStorage<'_> {
         DecisionsStorage {
             storage: &self.storage,
+            notes: None,
+        }
+    }
+
+    /// Over what is here: `operation` reads what this observation could load,
+    /// and the answer carries a note naming each foundation it could not.
+    /// Not finding something while one is away refuses with the note,
+    /// rather than answering "none".
+    fn read<T>(
+        &self,
+        operation: impl FnOnce(DecisionsStorage<'_>) -> Result<T>,
+    ) -> Result<Noted<T>> {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let result = operation(DecisionsStorage {
+            storage: &self.storage,
+            notes: Some(&notes),
+        });
+        let notes = notes.into_inner();
+        match result {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
         }
     }
     pub fn propose(
@@ -121,21 +146,24 @@ impl Decisions {
         title: &str,
         context: Option<&str>,
         about: Option<Id>,
-    ) -> Result<ProposedDecision> {
+    ) -> Result<Noted<ProposedDecision>> {
         validate_prose(title, "decision title")?;
         if let Some(context) = context {
             validate_prose(context, "decision context")?;
         }
         let decision = genid().id;
-        self.storage().update("propose Decisions decision", |_| {
-            let (fragment, genesis) = decisions::decision_fragment(
-                decision,
-                title,
-                context.map(str::to_owned),
-                about,
-                epoch_interval(now_epoch()?),
-            )?;
-            Ok((fragment, ProposedDecision { decision, genesis }))
+        // A new decision reads nothing it could miss.
+        self.read(|storage| {
+            storage.update("propose Decisions decision", |_| {
+                let (fragment, genesis) = decisions::decision_fragment(
+                    decision,
+                    title,
+                    context.map(str::to_owned),
+                    about,
+                    epoch_interval(now_epoch()?),
+                )?;
+                Ok((fragment, ProposedDecision { decision, genesis }))
+            })
         })
     }
     pub fn factor(&self, input: &str, text: &str, side: FactorSide) -> Result<AddedFactor> {
@@ -233,94 +261,102 @@ impl Decisions {
             ))
         })
     }
-    pub fn list(&self, options: ListOptions) -> Result<Vec<DecisionSummary>> {
-        self.storage().with_view(|view| {
-            collect_decisions(view)?
-                .into_iter()
-                .filter(|row| {
-                    if options.forced {
-                        common_snapshot(&row.resolution).is_some_and(|snapshot| snapshot.forced)
-                    } else if options.all {
-                        true
-                    } else {
-                        matches!(
-                            row.resolution,
-                            Resolution::Missing | Resolution::Forked(_) | Resolution::Invalid(_)
-                        )
-                    }
-                })
-                .map(|row| {
-                    let title = decisions::read_text(&view.reader, row.genesis.title)?;
-                    let outcome = common_snapshot(&row.resolution)
-                        .map(|snapshot| decisions::read_text(&view.reader, snapshot.outcome))
-                        .transpose()?;
-                    Ok(DecisionSummary {
-                        id: row.id,
-                        genesis: row.genesis,
-                        title,
-                        pros: row.pros,
-                        cons: row.cons,
-                        resolution: row.resolution,
-                        outcome,
+    pub fn list(&self, options: ListOptions) -> Result<Noted<Vec<DecisionSummary>>> {
+        self.read(|storage| {
+            storage.with_view(|view| {
+                collect_decisions(view)?
+                    .into_iter()
+                    .filter(|row| {
+                        if options.forced {
+                            common_snapshot(&row.resolution).is_some_and(|snapshot| snapshot.forced)
+                        } else if options.all {
+                            true
+                        } else {
+                            matches!(
+                                row.resolution,
+                                Resolution::Missing
+                                    | Resolution::Forked(_)
+                                    | Resolution::Invalid(_)
+                            )
+                        }
                     })
-                })
-                .collect()
-        })
-    }
-    pub fn show(&self, input: &str) -> Result<DecisionDetail> {
-        self.storage().with_view(|view| {
-            let id = resolve_decision(input, &view.facts)?;
-            let genesis = decisions::genesis_for_decision(&view.facts, id)?
-                .ok_or_else(|| anyhow!("decision {id:x} has no genesis"))?;
-            let title = decisions::read_text(&view.reader, genesis.title)?;
-            let context = genesis
-                .context
-                .map(|handle| decisions::read_text(&view.reader, handle))
-                .transpose()?;
-            let factors = decisions::factors_for_decision(&view.facts, id)?
-                .into_iter()
-                .map(|record| {
-                    Ok(FactorDetail {
-                        text: decisions::read_text(&view.reader, record.text)?,
-                        record,
+                    .map(|row| {
+                        let title = decisions::read_text(&view.reader, row.genesis.title)?;
+                        let outcome = common_snapshot(&row.resolution)
+                            .map(|snapshot| decisions::read_text(&view.reader, snapshot.outcome))
+                            .transpose()?;
+                        Ok(DecisionSummary {
+                            id: row.id,
+                            genesis: row.genesis,
+                            title,
+                            pros: row.pros,
+                            cons: row.cons,
+                            resolution: row.resolution,
+                            outcome,
+                        })
                     })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let resolution = decisions::resolution(&view.facts, id);
-            let snapshots: &[ResolutionSnapshot] = match &resolution {
-                Resolution::Unique(snapshot) => std::slice::from_ref(snapshot),
-                Resolution::Agreed(snapshots) | Resolution::Forked(snapshots) => snapshots,
-                Resolution::Missing | Resolution::Invalid(_) => &[],
-            };
-            let outcomes = snapshots
-                .iter()
-                .map(|snapshot| {
-                    Ok(ResolutionText {
-                        head: snapshot.id,
-                        outcome: decisions::read_text(&view.reader, snapshot.outcome)?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(DecisionDetail {
-                id,
-                genesis,
-                title,
-                context,
-                factors,
-                resolution,
-                outcomes,
+                    .collect()
             })
         })
     }
-    pub fn resolve_id(&self, prefix: &str) -> Result<Id> {
-        self.storage()
-            .with_view(|view| resolve_decision(prefix, &view.facts))
+    pub fn show(&self, input: &str) -> Result<Noted<DecisionDetail>> {
+        self.read(|storage| {
+            storage.with_view(|view| {
+                let id = resolve_decision(input, &view.facts)?;
+                let genesis = decisions::genesis_for_decision(&view.facts, id)?
+                    .ok_or_else(|| anyhow!("decision {id:x} has no genesis"))?;
+                let title = decisions::read_text(&view.reader, genesis.title)?;
+                let context = genesis
+                    .context
+                    .map(|handle| decisions::read_text(&view.reader, handle))
+                    .transpose()?;
+                let factors = decisions::factors_for_decision(&view.facts, id)?
+                    .into_iter()
+                    .map(|record| {
+                        Ok(FactorDetail {
+                            text: decisions::read_text(&view.reader, record.text)?,
+                            record,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let resolution = decisions::resolution(&view.facts, id);
+                let snapshots: &[ResolutionSnapshot] = match &resolution {
+                    Resolution::Unique(snapshot) => std::slice::from_ref(snapshot),
+                    Resolution::Agreed(snapshots) | Resolution::Forked(snapshots) => snapshots,
+                    Resolution::Missing | Resolution::Invalid(_) => &[],
+                };
+                let outcomes = snapshots
+                    .iter()
+                    .map(|snapshot| {
+                        Ok(ResolutionText {
+                            head: snapshot.id,
+                            outcome: decisions::read_text(&view.reader, snapshot.outcome)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(DecisionDetail {
+                    id,
+                    genesis,
+                    title,
+                    context,
+                    factors,
+                    resolution,
+                    outcomes,
+                })
+            })
+        })
+    }
+    pub fn resolve_id(&self, prefix: &str) -> Result<Noted<Id>> {
+        self.read(|storage| storage.with_view(|view| resolve_decision(prefix, &view.facts)))
     }
 }
 
 #[derive(Clone, Copy)]
 struct DecisionsStorage<'a> {
     storage: &'a crate::storage::Storage,
+    /// Where a read over what is here leaves the notes of what it could not
+    /// load; `None` reads strictly ([`Decisions::storage`]).
+    notes: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
 struct CollectionView {
@@ -357,8 +393,16 @@ impl DecisionsStorage<'_> {
                         .context("freeze Decisions fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, maintained_rank9)
-                    .context("read maintained Decisions fact collection")?;
+                let facts = match self.notes {
+                    Some(notes) => crate::storage::acquire_facts_noted(
+                        &store_snapshot,
+                        maintained_rank9,
+                        "Decisions",
+                        &mut notes.borrow_mut(),
+                    ),
+                    None => crate::storage::acquire_facts(&store_snapshot, maintained_rank9),
+                }
+                .context("read maintained Decisions fact collection")?;
                 operation(
                     pile,
                     collection,

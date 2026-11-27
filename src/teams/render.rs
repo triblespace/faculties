@@ -22,6 +22,7 @@ pub fn context_banner(context: &PresentationContext) -> String {
 }
 
 pub fn activity<T>(value: &Activity<T>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&value.notes)?;
     out.text(context_banner(&value.context))?;
     for notice in &value.notices {
         out.line(notice)?;

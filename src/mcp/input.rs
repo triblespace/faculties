@@ -203,7 +203,9 @@ pub fn read_file_id(files: &crate::files::operations::Files, id: &str) -> Result
             "file_id must be an exact 32-character Files entity or single-file import id",
         ));
     }
-    files.get(id).map(|export| export.bytes)
+    // A file found here is its bytes; the notes of a partial read matter
+    // only for a file not found, which refuses with them.
+    files.get(id).map(|export| export.value.bytes)
 }
 
 #[cfg(test)]

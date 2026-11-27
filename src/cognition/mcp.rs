@@ -39,7 +39,9 @@ impl Faculty for Cognition {
         match name {
             "cognition_check" => {
                 let _: Check = decode_arguments(arguments)?;
-                out.line(self.operations.check()?.summary())
+                let report = self.operations.check()?;
+                out.notes(&report.notes)?;
+                out.line(report.summary())
             }
             _ => bail!("unknown Cognition MCP tool {name:?}"),
         }

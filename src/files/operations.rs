@@ -11,7 +11,9 @@ use crate::out::Out;
 use crate::schemas::files::{file, DEFAULT_SCOPE_ID, KIND_DIRECTORY, KIND_FILE, KIND_IMPORT};
 #[cfg(test)]
 use crate::storage::FactRead;
-use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{
+    read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Noted, Storage,
+};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use hifitime::efmt::consts::ISO8601_DATE;
@@ -395,8 +397,32 @@ fn with_files_view<T>(
     ) -> Result<T>,
 ) -> Result<T> {
     with_files_store(storage, |store, collection, signer, runtime| {
-        files_view_in(store, collection, signer, runtime, f)
+        files_view_in(store, collection, signer, runtime, None, f)
     })
+}
+
+/// [`with_files_view`] over what is here: `f` reads what this observation
+/// could load, and the answer carries a note naming each foundation it could
+/// not. Not finding something while one is away refuses with the note,
+/// rather than answering "none".
+fn with_files_view_noted<T>(
+    storage: &Storage,
+    f: impl FnOnce(
+        &mut FacultyStore,
+        Collection<SimpleArchive>,
+        &SigningKey,
+        &FactArchive,
+        &FacultySnapshot,
+        &std::sync::Arc<tokio::runtime::Runtime>,
+    ) -> Result<T>,
+) -> Result<Noted<T>> {
+    let mut notes = Vec::new();
+    match with_files_store(storage, |store, collection, signer, runtime| {
+        files_view_in(store, collection, signer, runtime, Some(&mut notes), f)
+    }) {
+        Ok(value) => Ok(Noted { value, notes }),
+        Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
+    }
 }
 
 /// Attach the Files views of one already-opened source collection; see
@@ -406,6 +432,7 @@ fn files_view_in<T>(
     collection: Collection<SimpleArchive>,
     signer: &SigningKey,
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    notes: Option<&mut Vec<String>>,
     f: impl FnOnce(
         &mut FacultyStore,
         Collection<SimpleArchive>,
@@ -426,8 +453,11 @@ fn files_view_in<T>(
             .snapshot()
             .context("freeze the Files views as they stand")?;
         let acquiring = AcquiringReader::new(reader.clone(), runtime.clone());
-        let space = crate::storage::acquire_facts(&acquiring, rank9)
-            .context("read Files fact collection")?;
+        let space = match notes {
+            Some(notes) => crate::storage::acquire_facts_noted(&acquiring, rank9, "Files", notes),
+            None => crate::storage::acquire_facts(&acquiring, rank9),
+        }
+        .context("read Files fact collection")?;
         f(store, collection, signer, &space, &reader, runtime)
     }
 }
@@ -1918,8 +1948,8 @@ impl Files {
     }
 
     /// Original payload only: neither MIME nor filename is needed for export.
-    pub fn get(&self, id: &str) -> Result<Export> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn get(&self, id: &str) -> Result<Noted<Export>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             load_export(store, rt, facts, snapshot, id)
         })
     }
@@ -1928,16 +1958,21 @@ impl Files {
         &self,
         id: &str,
         options: &super::presentation::ViewOptions,
-    ) -> Result<crate::out::Part> {
+    ) -> Result<Noted<crate::out::Part>> {
         options.validate()?;
-        let selected = with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+        let selected = with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             load_view(store, rt, facts, snapshot, id)
         })?;
-        super::presentation::present(selected.bytes, &selected.mime_type, options)
+        let notes = selected.notes;
+        let selected = selected.value;
+        Ok(Noted {
+            value: super::presentation::present(selected.bytes, &selected.mime_type, options)?,
+            notes,
+        })
     }
 
-    pub fn extract(&self, id: &str, destination: Option<&Path>) -> Result<Extraction> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn extract(&self, id: &str, destination: Option<&Path>) -> Result<Noted<Extraction>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             prepare_extraction(store, rt, facts, snapshot, id, destination)
         })
     }
@@ -2057,22 +2092,24 @@ impl Files {
         }
     }
 
-    pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn list(&self, tags: &[String], mime: Option<&str>) -> Result<Noted<String>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_list(facts, reader, tags, mime)
             }))
         })
     }
 
-    pub fn show(&self, id: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn show(&self, id: &str) -> Result<Noted<String>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| cmd_show(facts, reader, id)))
         })
     }
 
+    /// A tag is one more fact beside the file, so it is written over what is
+    /// here.
     pub fn tag(&self, id: &str, name: &str, out: &mut Out<'_>) -> Result<()> {
-        with_files_view(
+        let tagged = with_files_view_noted(
             &self.storage,
             |store, collection, signer, facts, snapshot, rt| {
                 self.storage.open_collection_write(
@@ -2085,7 +2122,8 @@ impl Files {
                     store, rt, collection, signer, facts, snapshot, id, name, out,
                 )
             },
-        )
+        )?;
+        out.notes(&tagged.notes)
     }
 
     pub fn fetch(&self, options: &FetchOptions<'_>, out: &mut Out<'_>) -> Result<()> {
@@ -2106,8 +2144,20 @@ impl Files {
         })
     }
 
-    pub fn search(&self, query: &str) -> Result<String> {
-        render_search(query, &self.search_hits(query)?.hits)
+    /// The faculty's own search reads what is here. [`Self::search_hits`],
+    /// one source of the cross-faculty search, refuses a partial read as
+    /// the other sources there do.
+    pub fn search(&self, query: &str) -> Result<Noted<String>> {
+        let hits = with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
+            rt.block_on(read(store, snapshot, |reader| {
+                search_hits(facts, reader, query)
+            }))
+        })?;
+        let notes = hits.notes;
+        Ok(Noted {
+            value: render_search(query, &hits.value)?,
+            notes,
+        })
     }
 
     pub fn search_hits(&self, query: &str) -> Result<crate::search::SourceRead<SearchHit>> {
@@ -2147,14 +2197,15 @@ impl Files {
         out: &mut Out<'_>,
     ) -> Result<()> {
         options.validate()?;
-        with_files_view(
+        let ranked = with_files_view_noted(
             &self.storage,
             |store, collection, _, facts, snapshot, runtime| {
                 cmd_similar(
                     store, collection, runtime, facts, snapshot, session, options, out,
                 )
             },
-        )
+        )?;
+        out.notes(&ranked.notes)
     }
 
     #[cfg(not(feature = "wemm"))]
@@ -2173,14 +2224,14 @@ impl Files {
         })
     }
 
-    pub fn imports(&self) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn imports(&self) -> Result<Noted<String>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| cmd_imports(facts, reader)))
         })
     }
 
-    pub fn tree(&self, id: &str, depth: Option<usize>) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn tree(&self, id: &str, depth: Option<usize>) -> Result<Noted<String>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_tree(facts, reader, id, depth)
             }))
@@ -2194,29 +2245,41 @@ impl Files {
     /// one, is refused by name rather than flattened, because a caller that
     /// wants one file's bytes cannot use a tree.
     pub fn file_entity(&self, id: &str) -> Result<Id> {
-        with_files_view(&self.storage, |_, _, _, facts, _, _| {
+        // A file found here is that file; one not found while a foundation
+        // is away refuses with the note.
+        with_files_view_noted(&self.storage, |_, _, _, facts, _, _| {
             let target = selected_target(facts, id)?;
             if !is_file(facts, target) {
                 return Err(not_a_file(id).into());
             }
             Ok(target)
         })
+        .map(|found| found.value)
     }
 
     pub fn resolve(
         &self,
         selectors: &[String],
     ) -> Result<Vec<Result<file_capability::FileReference>>> {
-        with_files_view(&self.storage, |_, _, _, facts, _, _| {
+        // Each miss carries the notes of what the read could not load.
+        let resolved = with_files_view_noted(&self.storage, |_, _, _, facts, _, _| {
             Ok(selectors
                 .iter()
                 .map(|selector| file_capability::resolve_reference(facts, selector))
-                .collect())
-        })
+                .collect::<Vec<_>>())
+        })?;
+        let notes = resolved.notes;
+        Ok(resolved
+            .value
+            .into_iter()
+            .map(|reference| {
+                reference.map_err(|error| crate::storage::with_unread_notes(error, &notes))
+            })
+            .collect())
     }
 
-    pub fn diff(&self, left: &str, right: &str) -> Result<String> {
-        with_files_view(&self.storage, |store, _, _, facts, snapshot, rt| {
+    pub fn diff(&self, left: &str, right: &str) -> Result<Noted<String>> {
+        with_files_view_noted(&self.storage, |store, _, _, facts, snapshot, rt| {
             rt.block_on(read(store, snapshot, |reader| {
                 cmd_diff(facts, reader, left, right)
             }))
@@ -3296,6 +3359,7 @@ mod tests {
                     collection,
                     signer,
                     runtime,
+                    None,
                     |_, _, _, space, _, _| {
                         assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
                         Ok(())
@@ -3325,6 +3389,7 @@ mod tests {
                     collection,
                     signer,
                     runtime,
+                    None,
                     |_, _, _, space, _, _| {
                         assert_eq!(file_ids(space), BTreeSet::from([first_id, second_id]));
                         Ok(())
@@ -3768,5 +3833,90 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+
+    /// A foundation of the collection is stranded on another host: adding a
+    /// file reads nothing, the reads answer over what is here and name it,
+    /// and the cross-faculty search source refuses the partial read as the
+    /// other sources there do.
+    #[test]
+    fn reads_and_appends_go_on_while_a_files_foundation_is_away() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let files = Files::with_storage(storage.clone());
+        let first = files
+            .add_bytes(
+                anybytes::Bytes::from(b"resident".to_vec()),
+                "resident.txt",
+                "text/plain",
+                &["kept".to_owned()],
+            )
+            .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        let second = files
+            .add_bytes(
+                anybytes::Bytes::from(b"added meanwhile".to_vec()),
+                "meanwhile.txt",
+                "text/plain",
+                &[],
+            )
+            .unwrap();
+
+        let listed = files.list(&[], None).unwrap();
+        assert!(
+            listed.contains("resident.txt") && listed.contains("meanwhile.txt"),
+            "{listed}"
+        );
+        assert!(named(&listed.notes), "{:?}", listed.notes);
+        let shown = files.show(&format!("{first:x}")).unwrap();
+        assert!(named(&shown.notes));
+        let got = files.get(&format!("{second:x}")).unwrap();
+        assert_eq!(got.value.bytes.as_ref(), b"added meanwhile");
+        assert!(named(&got.notes));
+        assert!(named(&files.search("resident").unwrap().notes));
+        assert!(named(&files.imports().unwrap().notes));
+        assert_eq!(files.file_entity(&format!("{first:x}")).unwrap(), first);
+
+        // Not finding a file while a foundation is away says so.
+        let missing = format!("{:x}", genid().id);
+        let error = files.show(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+        // An exact id resolves to its reference without a lookup.
+        assert!(files.resolve(&[missing]).unwrap()[0].is_ok());
+
+        // One source of the cross-faculty search reads completely.
+        let error = files.search_hits("resident").err().unwrap();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_files_foundation_fails_loudly() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let files = Files::with_storage(storage.clone());
+        files
+            .add_bytes(
+                anybytes::Bytes::from(b"resident".to_vec()),
+                "resident.txt",
+                "text/plain",
+                &[],
+            )
+            .unwrap();
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
+        fault(files.list(&[], None).unwrap_err());
+        fault(files.search("resident").unwrap_err());
+        storage.close().unwrap();
     }
 }

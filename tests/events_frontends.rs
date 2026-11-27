@@ -4,12 +4,12 @@ use anybytes::Bytes;
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use faculties::collection_names::open_configured;
-use faculties::mcp::{Faculty, InvalidArguments};
-use faculties::out::{Out, Part};
 use faculties::events::{
-    self, cli, mcp, AddOptions, CalendarInput, IngestOptions, Events, STATUS_CANCELLED,
+    self, cli, mcp, AddOptions, CalendarInput, Events, IngestOptions, STATUS_CANCELLED,
     STATUS_CONFIRMED,
 };
+use faculties::mcp::{Faculty, InvalidArguments};
+use faculties::out::{Out, Part};
 use faculties::schemas::planner::DEFAULT_SCOPE_ID;
 use faculties::storage::{initialize_signer, load_signer, open_pile_strict};
 use std::fs;
@@ -101,8 +101,8 @@ fn direct_add_and_initial_note_are_one_publication_and_cancel_is_monotone() {
     let detail = events.show(&id).unwrap();
     assert_eq!(detail.uid, receipt.uid);
     assert_eq!(detail.description.as_deref(), Some("@/literal-description"));
-    assert_eq!(detail.notes[0].row.id, receipt.note.unwrap());
-    assert_eq!(detail.notes[0].text, "@-");
+    assert_eq!(detail.value.notes[0].row.id, receipt.note.unwrap());
+    assert_eq!(detail.value.notes[0].text, "@-");
     assert_eq!(events.list(window(), false).unwrap().len(), 1);
     assert!(!events.cancel(&id).unwrap().already_cancelled);
     assert!(events.cancel(&id).unwrap().already_cancelled);
@@ -241,7 +241,7 @@ fn mcp_resident_names_and_notes_are_literal_and_reports_match_cli() {
         )
     })
     .unwrap();
-    assert_eq!(events.show(&id).unwrap().notes[0].text, "@-");
+    assert_eq!(events.show(&id).unwrap().value.notes[0].text, "@-");
     for (tool, args, cli_args) in [
         (
             "events_show",
@@ -294,7 +294,7 @@ fn cli_file_and_prose_inputs_remain_cli_only() {
     collect(|out| cli::execute(fixture.cli(&["note", &format!("{event:x}"), &marker]), out))
         .unwrap();
     assert_eq!(
-        events.show(&format!("{event:x}")).unwrap().notes[0].text,
+        events.show(&format!("{event:x}")).unwrap().value.notes[0].text,
         "read by CLI, not interpreted in operations"
     );
     let before = fixture.commits();

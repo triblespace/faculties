@@ -434,7 +434,9 @@ impl Faculty for Teams {
             }
             "teams_context_show" => {
                 let args: Tenant = decode_arguments(arguments)?;
-                render::context(&self.selected(args.tenant)?.context_show()?, out)
+                let context = self.selected(args.tenant)?.context_show()?;
+                out.notes(&context.notes)?;
+                render::context(&context, out)
             }
             "teams_auth_status" => {
                 let args: Tenant = decode_arguments(arguments)?;

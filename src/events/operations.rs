@@ -13,7 +13,7 @@ use crate::events::{
     STATUS_CANCELLED, STATUS_CONFIRMED, STATUS_TENTATIVE, TRANSP_OPAQUE,
 };
 use crate::schemas::planner::{event, DEFAULT_SCOPE_ID, KIND_EVENT_ID, KIND_EXPORT_ID};
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Noted};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use hifitime::Epoch;
@@ -206,12 +206,33 @@ impl Events {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
+    /// Decide on a complete observation: a selected foundation whose bytes
+    /// cannot be loaded refuses the operation.
     fn storage(&self) -> EventsStorage<'_> {
         EventsStorage {
             storage: &self.storage,
+            notes: None,
         }
     }
-    pub fn add(&self, options: &AddOptions) -> Result<AddedEvent> {
+
+    /// Over what is here: `operation` reads what this observation could load,
+    /// and the answer carries a note naming each foundation it could not.
+    /// Not finding something while one is away refuses with the note,
+    /// rather than answering "none".
+    fn read<T>(&self, operation: impl FnOnce(EventsStorage<'_>) -> Result<T>) -> Result<Noted<T>> {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let result = operation(EventsStorage {
+            storage: &self.storage,
+            notes: Some(&notes),
+        });
+        let notes = notes.into_inner();
+        match result {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
+        }
+    }
+    /// A new event reads nothing it could miss.
+    pub fn add(&self, options: &AddOptions) -> Result<Noted<AddedEvent>> {
         options.validate()?;
         let uid = format!("{:x}@triblespace", genid().id);
         let mut draft = empty_event_draft(
@@ -234,103 +255,120 @@ impl Events {
         } else {
             None
         };
-        self.storage().update("add event", |_| {
-            Ok((Some(fragment), AddedEvent { event, uid, note }))
+        self.read(|storage| {
+            storage.update("add event", |_| {
+                Ok((Some(fragment), AddedEvent { event, uid, note }))
+            })
         })
     }
-    pub fn list(&self, window: Window, include_cancelled: bool) -> Result<Vec<Occurrence>> {
+    pub fn list(&self, window: Window, include_cancelled: bool) -> Result<Noted<Vec<Occurrence>>> {
         validate_window(window)?;
-        self.storage().with_view(|loaded| {
-            Ok(collect_occurrences(
-                &loaded.reader,
-                &loaded.facts,
-                window,
-                include_cancelled,
-            ))
+        self.read(|storage| {
+            storage.with_view(|loaded| {
+                Ok(collect_occurrences(
+                    &loaded.reader,
+                    &loaded.facts,
+                    window,
+                    include_cancelled,
+                ))
+            })
         })
     }
     /// Next occurrence overlapping [after, 2100-01-01]; None means capture now.
-    pub fn next(&self, after: Option<Epoch>) -> Result<Option<Occurrence>> {
+    /// Over what is here: an occurrence held only in a foundation that is
+    /// away is not considered, and the answer's note says so.
+    pub fn next(&self, after: Option<Epoch>) -> Result<Noted<Option<Occurrence>>> {
         let start = match after {
             Some(start) => start,
             None => clock::now()?,
         };
         let window = (start, default_window().1);
         validate_window(window)?;
-        self.storage()
-            .with_view(|loaded| Ok(next_occurrence(&loaded.reader, &loaded.facts, window)))
-    }
-    pub fn note(&self, id: &str, text: &str) -> Result<AddedNote> {
-        self.storage().update("add event note", |loaded| {
-            let event = resolve_event_id(id, &loaded.facts)?;
-            let fragment = note_fragment(event, text, clock::point_now()?)?;
-            let note = fragment.root().expect("note fragment has one root");
-            Ok((Some(fragment), AddedNote { event, note }))
+        self.read(|storage| {
+            storage.with_view(|loaded| Ok(next_occurrence(&loaded.reader, &loaded.facts, window)))
         })
     }
-    pub fn show(&self, id: &str) -> Result<EventDetail> {
-        self.storage().with_view(|loaded| {
-            let event_id = resolve_event_id(id, &loaded.facts)?;
-            let event = events_model::event(&loaded.facts, event_id).ok_or_else(|| {
-                anyhow!(
-                    "event {} has no readable Events projection",
-                    fmt_id(event_id)
-                )
-            })?;
-            let uid = read_text(&loaded.reader, event.uid)?;
-            let summary = read_text(&loaded.reader, event.summary)?;
-            let rrule = event
-                .rrule
-                .map(|handle| read_text(&loaded.reader, handle))
-                .transpose()?;
-            let location = event
-                .location
-                .map(|handle| read_text(&loaded.reader, handle))
-                .transpose()?;
-            let status = read_text(&loaded.reader, event.status)?;
-            let description = event
-                .description
-                .map(|handle| read_text(&loaded.reader, handle))
-                .transpose()?;
-            let cancelled = events_model::event_is_cancelled(&loaded.facts, event_id);
-            // Notes belong to the lineage: one written on an earlier version
-            // still shows on the version that replaced it.
-            let mut notes = events_model::lineage_versions(&loaded.facts, &event)
-                .into_iter()
-                .flat_map(|version| events_model::notes_for_event(&loaded.facts, version.id))
-                .collect::<Vec<_>>();
-            notes.sort_by_key(|row| (interval_key(row.created_at), row.id));
-            let notes = notes
-                .into_iter()
-                .map(|row| {
-                    Ok(NoteDetail {
-                        text: read_text(&loaded.reader, row.text)?,
-                        row,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(EventDetail {
-                event,
-                summary,
-                rrule,
-                location,
-                status,
-                uid,
-                description,
-                cancelled,
-                notes,
+    /// A note is one more record beside its event, so it is written over
+    /// what is here.
+    pub fn note(&self, id: &str, text: &str) -> Result<Noted<AddedNote>> {
+        self.read(|storage| {
+            storage.update("add event note", |loaded| {
+                let event = resolve_event_id(id, &loaded.facts)?;
+                let fragment = note_fragment(event, text, clock::point_now()?)?;
+                let note = fragment.root().expect("note fragment has one root");
+                Ok((Some(fragment), AddedNote { event, note }))
             })
         })
     }
-    pub fn cancel(&self, id: &str) -> Result<CancellationReceipt> {
-        cancel(self.storage(), id)
+    pub fn show(&self, id: &str) -> Result<Noted<EventDetail>> {
+        self.read(|storage| {
+            storage.with_view(|loaded| {
+                let event_id = resolve_event_id(id, &loaded.facts)?;
+                let event = events_model::event(&loaded.facts, event_id).ok_or_else(|| {
+                    anyhow!(
+                        "event {} has no readable Events projection",
+                        fmt_id(event_id)
+                    )
+                })?;
+                let uid = read_text(&loaded.reader, event.uid)?;
+                let summary = read_text(&loaded.reader, event.summary)?;
+                let rrule = event
+                    .rrule
+                    .map(|handle| read_text(&loaded.reader, handle))
+                    .transpose()?;
+                let location = event
+                    .location
+                    .map(|handle| read_text(&loaded.reader, handle))
+                    .transpose()?;
+                let status = read_text(&loaded.reader, event.status)?;
+                let description = event
+                    .description
+                    .map(|handle| read_text(&loaded.reader, handle))
+                    .transpose()?;
+                let cancelled = events_model::event_is_cancelled(&loaded.facts, event_id);
+                // Notes belong to the lineage: one written on an earlier version
+                // still shows on the version that replaced it.
+                let mut notes = events_model::lineage_versions(&loaded.facts, &event)
+                    .into_iter()
+                    .flat_map(|version| events_model::notes_for_event(&loaded.facts, version.id))
+                    .collect::<Vec<_>>();
+                notes.sort_by_key(|row| (interval_key(row.created_at), row.id));
+                let notes = notes
+                    .into_iter()
+                    .map(|row| {
+                        Ok(NoteDetail {
+                            text: read_text(&loaded.reader, row.text)?,
+                            row,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(EventDetail {
+                    event,
+                    summary,
+                    rrule,
+                    location,
+                    status,
+                    uid,
+                    description,
+                    cancelled,
+                    notes,
+                })
+            })
+        })
     }
-    pub fn resolve(&self, prefix: &str) -> Result<Id> {
-        self.storage()
-            .with_view(|loaded| resolve_event_id(prefix, &loaded.facts))
+    /// A cancellation is one intrinsic record beside its event: writing it
+    /// again changes nothing, so it is written over what is here, and
+    /// `already_cancelled` reports what this read could see.
+    pub fn cancel(&self, id: &str) -> Result<Noted<CancellationReceipt>> {
+        self.read(|storage| cancel(storage, id))
+    }
+    pub fn resolve(&self, prefix: &str) -> Result<Noted<Id>> {
+        self.read(|storage| storage.with_view(|loaded| resolve_event_id(prefix, &loaded.facts)))
     }
     /// All resident calendars are staged before one publication. Exact
-    /// duplicates are skipped. A changed definition of a known UID is a new
+    /// duplicates are skipped. The read is complete or refused: a rereading
+    /// replaces a resident version, and a complete export decides from what
+    /// it does not hold, so neither is decided over a foundation that is away. A changed definition of a known UID is a new
     /// version recorded beside the old one; nothing is replaced or refused,
     /// and readers pick the current version per lineage.
     pub fn ingest(
@@ -365,6 +403,9 @@ fn cancel(storage: EventsStorage<'_>, id: &str) -> Result<CancellationReceipt> {
 #[derive(Clone, Copy)]
 struct EventsStorage<'a> {
     storage: &'a crate::storage::Storage,
+    /// Where a read over what is here leaves the notes of what it could not
+    /// load; `None` reads strictly ([`Events::storage`]).
+    notes: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
 struct LoadedEvents {
@@ -411,8 +452,16 @@ impl EventsStorage<'_> {
                         .context("freeze maintained Events fact collection")?,
                     runtime.clone(),
                 );
-                let facts = crate::storage::acquire_facts(&store_snapshot, collection_rank9)
-                    .context("attach maintained Events fact collection")?;
+                let facts = match self.notes {
+                    Some(notes) => crate::storage::acquire_facts_noted(
+                        &store_snapshot,
+                        collection_rank9,
+                        "Events",
+                        &mut notes.borrow_mut(),
+                    ),
+                    None => crate::storage::acquire_facts(&store_snapshot, collection_rank9),
+                }
+                .context("attach maintained Events fact collection")?;
                 let loaded = LoadedEvents {
                     facts,
                     reader: store_snapshot,

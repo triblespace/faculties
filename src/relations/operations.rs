@@ -22,7 +22,7 @@ use crate::relations::{
     SelectorOutcome, TieAnnotation,
 };
 use crate::schemas::relations::DEFAULT_SCOPE_ID;
-use crate::storage::{FactArchive, FacultyStore, Storage};
+use crate::storage::{FactArchive, FacultyStore, Noted, Storage};
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::SigningKey;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -1275,9 +1275,39 @@ impl Relations {
         Self { storage }
     }
 
+    /// Decide on a complete observation: a selected foundation whose bytes
+    /// cannot be loaded refuses the operation. For an update that supersedes
+    /// what it saw (a newer head may be held in the unread foundation), for a
+    /// refusal that depends on absence, and for the lookups other faculties
+    /// decide on.
     fn with_relations<T>(
         &self,
         read_only: bool,
+        execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_relations_in(read_only, None, execute)
+    }
+
+    /// Over what is here: `execute` reads what this observation could load,
+    /// and the answer carries a note naming each foundation it could not.
+    /// Not finding something while one is away refuses with the note, rather
+    /// than answering "none".
+    fn with_relations_noted<T>(
+        &self,
+        read_only: bool,
+        execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
+    ) -> Result<Noted<T>> {
+        let mut notes = Vec::new();
+        match self.with_relations_in(read_only, Some(&mut notes), execute) {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
+        }
+    }
+
+    fn with_relations_in<T>(
+        &self,
+        read_only: bool,
+        notes: Option<&mut Vec<String>>,
         execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
     ) -> Result<T> {
         self.storage.with_store(|pile, signer, runtime| {
@@ -1295,7 +1325,7 @@ impl Relations {
                     runtime,
                 )?;
             }
-            with_relations_view(pile, signer, runtime, collection, read_only, execute)
+            with_relations_view(pile, signer, runtime, collection, read_only, notes, execute)
         })
     }
 
@@ -1304,8 +1334,9 @@ impl Relations {
         profile: ProfileInput,
         id: Option<Id>,
         sources: &[String],
-    ) -> Result<AddedPerson> {
-        self.with_relations(false, |storage| {
+    ) -> Result<Noted<AddedPerson>> {
+        // A new anchor reads nothing it could miss.
+        self.with_relations_noted(false, |storage| {
             add_person(storage, profile, id, sources.to_vec())
         })
     }
@@ -1335,8 +1366,8 @@ impl Relations {
             reconcile_profile(storage, person.to_owned(), base.map(str::to_owned), patch)
         })
     }
-    pub fn list(&self, limit: usize, filter: PeopleFilter) -> Result<String> {
-        self.with_relations(true, |storage| {
+    pub fn list(&self, limit: usize, filter: PeopleFilter) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| {
             list_people(
                 storage,
                 limit,
@@ -1346,8 +1377,8 @@ impl Relations {
         })
     }
     /// Show a person or an organisation, with its ties.
-    pub fn show(&self, entry: &str) -> Result<String> {
-        self.with_relations(true, |storage| {
+    pub fn show(&self, entry: &str) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| {
             show_entry(storage, entry.to_owned(), &EntryKind::ALL)
         })
     }
@@ -1401,8 +1432,8 @@ impl Relations {
             )
         })
     }
-    pub fn org_list(&self, limit: usize, filter: PeopleFilter) -> Result<String> {
-        self.with_relations(true, |storage| {
+    pub fn org_list(&self, limit: usize, filter: PeopleFilter) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| {
             list_entries(
                 storage,
                 EntryKind::Organisation,
@@ -1412,8 +1443,8 @@ impl Relations {
             )
         })
     }
-    pub fn org_show(&self, organisation: &str) -> Result<String> {
-        self.with_relations(true, |storage| {
+    pub fn org_show(&self, organisation: &str) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| {
             show_entry(storage, organisation.to_owned(), &[EntryKind::Organisation])
         })
     }
@@ -1437,8 +1468,10 @@ impl Relations {
             )
         })
     }
-    pub fn tie_add(&self, request: TieRequest) -> Result<AddedTie> {
-        self.with_relations(false, |storage| add_tie(storage, request))
+    /// A tie is an intrinsic claim with an annotation beside it: it
+    /// supersedes nothing, so it is written over what is here.
+    pub fn tie_add(&self, request: TieRequest) -> Result<Noted<AddedTie>> {
+        self.with_relations_noted(false, |storage| add_tie(storage, request))
     }
     pub fn tie_end(
         &self,
@@ -1446,8 +1479,9 @@ impl Relations {
         until: &str,
         sources: &[String],
         persona: Option<&str>,
-    ) -> Result<EndedTie> {
-        self.with_relations(false, |storage| {
+    ) -> Result<Noted<EndedTie>> {
+        // An end date is one more annotation beside the claim.
+        self.with_relations_noted(false, |storage| {
             end_tie(
                 storage,
                 tie.to_owned(),
@@ -1458,8 +1492,8 @@ impl Relations {
         })
     }
     /// Every tie with `entry` as subject or object.
-    pub fn ties(&self, entry: &str) -> Result<String> {
-        self.with_relations(true, |storage| list_ties(storage, entry.to_owned()))
+    pub fn ties(&self, entry: &str) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| list_ties(storage, entry.to_owned()))
     }
     pub fn group_create(&self, name: &str) -> Result<AddedGroup> {
         self.with_relations(false, |storage| create_group(storage, name.to_owned()))
@@ -1506,11 +1540,11 @@ impl Relations {
             reconcile_group(storage, group.to_owned(), name.map(str::to_owned))
         })
     }
-    pub fn group_list(&self) -> Result<String> {
-        self.with_relations(true, list_groups)
+    pub fn group_list(&self) -> Result<Noted<String>> {
+        self.with_relations_noted(true, list_groups)
     }
-    pub fn group_show(&self, group: &str) -> Result<String> {
-        self.with_relations(true, |storage| show_group(storage, group.to_owned()))
+    pub fn group_show(&self, group: &str) -> Result<Noted<String>> {
+        self.with_relations_noted(true, |storage| show_group(storage, group.to_owned()))
     }
     pub fn identity_resolve(
         &self,
@@ -1522,8 +1556,8 @@ impl Relations {
             resolve_identity(storage, first.to_owned(), second.to_owned(), same)
         })
     }
-    pub fn identity_list(&self) -> Result<String> {
-        self.with_relations(true, list_identities)
+    pub fn identity_list(&self) -> Result<Noted<String>> {
+        self.with_relations_noted(true, list_identities)
     }
 }
 
@@ -1533,6 +1567,7 @@ fn with_relations_view<T>(
     runtime: &Arc<tokio::runtime::Runtime>,
     collection: Collection<SimpleArchive>,
     read_only: bool,
+    notes: Option<&mut Vec<String>>,
     execute: impl FnOnce(&mut RelationsStorage<'_>) -> Result<T>,
 ) -> Result<T> {
     let facts_succinct = pile.attach::<SuccinctArchiveBlob>(collection, ())?;
@@ -1561,8 +1596,11 @@ fn with_relations_view<T>(
     let observed = reader
         .attached_acquiring(facts_rank9)
         .context("observe Relations Rank9 projection")?;
-    let view = crate::storage::acquire_attached_facts(&observed)
-        .context("read Relations Rank9 projection")?;
+    let view = match notes {
+        Some(notes) => crate::storage::acquire_attached_facts_noted(&observed, "Relations", notes),
+        None => crate::storage::acquire_attached_facts(&observed),
+    }
+    .context("read Relations Rank9 projection")?;
     // Only exact payload gets may acquire here. Facts, records, proofs,
     // and their interpretation instant remain those of this observation.
     // Dispatch stays outside block_on: exact byte reads use the retained runtime.
@@ -1738,17 +1776,25 @@ mod tests {
         .unwrap();
         // The worker carries the newly authored person; a read attaches it.
         crate::storage::carry_facts(&mut pile, source, &owner);
-        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
+        with_relations_view(&mut pile, &owner, &runtime, source, true, None, |storage| {
             assert!(list_people(storage, 20, false, false)?.contains("Ada"));
             Ok(())
         })
         .unwrap();
 
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
-            assert!(show_entry(storage, "Ada".to_owned(), &EntryKind::ALL)?.contains("Ada"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            source,
+            true,
+            None,
+            |storage| {
+                assert!(show_entry(storage, "Ada".to_owned(), &EntryKind::ALL)?.contains("Ada"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -1766,16 +1812,24 @@ mod tests {
         // The second person is not attached yet: a reader reads its commit
         // from the bytes, and attaches nothing.
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        with_relations_view(&mut pile, &reader, &runtime, source, true, |storage| {
-            assert_eq!(
-                relations::person_anchors(storage.facts),
-                BTreeSet::from([first, second])
-            );
-            let list = list_people(storage, 20, false, false)?;
-            assert!(list.contains("Ada"));
-            assert!(list.contains("Grace"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            source,
+            true,
+            None,
+            |storage| {
+                assert_eq!(
+                    relations::person_anchors(storage.facts),
+                    BTreeSet::from([first, second])
+                );
+                let list = list_people(storage, 20, false, false)?;
+                assert!(list.contains("Ada"));
+                assert!(list.contains("Grace"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
@@ -1787,11 +1841,19 @@ mod tests {
         // read. The attachments' lag counts the unattached commit for whoever
         // asks, as this test does below.
         let mut mutation_prepared = false;
-        with_relations_view(&mut pile, &reader, &runtime, source, false, |storage| {
-            mutation_prepared = true;
-            assert!(list_people(storage, 20, false, false)?.contains("Grace"));
-            Ok(())
-        })
+        with_relations_view(
+            &mut pile,
+            &reader,
+            &runtime,
+            source,
+            false,
+            None,
+            |storage| {
+                mutation_prepared = true;
+                assert!(list_people(storage, 20, false, false)?.contains("Grace"));
+                Ok(())
+            },
+        )
         .unwrap();
         assert!(mutation_prepared);
         assert_eq!(
@@ -1805,7 +1867,7 @@ mod tests {
         // Once the worker has carried the second person, the read is the
         // same, now from the attachment.
         crate::storage::carry_facts(&mut pile, source, &owner);
-        with_relations_view(&mut pile, &owner, &runtime, source, true, |storage| {
+        with_relations_view(&mut pile, &owner, &runtime, source, true, None, |storage| {
             assert_eq!(
                 relations::person_anchors(storage.facts),
                 BTreeSet::from([first, second])
@@ -2192,5 +2254,92 @@ mod tests {
         assert!(faculty
             .tie_add(tie_request("Nobody", "knows", "BAB"))
             .is_err());
+    }
+
+    /// A foundation of the collection is stranded on another host: reads
+    /// answer over what is here and name it, pure appends are written, and
+    /// whatever supersedes a head, refuses from absence, or is decided on by
+    /// another faculty refuses the incomplete read.
+    #[test]
+    fn reads_and_appends_go_on_while_a_relations_foundation_is_away() {
+        use crate::storage::residual_fixture::{refuses_incomplete, storage, strand_in};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let faculty = Relations::with_storage(storage.clone());
+        let ada = faculty.add(profile("Ada"), None, &[]).unwrap();
+        assert!(ada.notes.is_empty(), "{:?}", ada.notes);
+        let (away, _, _) = relations::person_fragment(
+            genid().id,
+            ProfileInput {
+                label: "Away".to_owned(),
+                ..ProfileInput::default()
+            },
+        )
+        .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, away);
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        // Pure appends are written, their receipts naming the gap.
+        let bob = faculty.add(profile("Bob"), None, &[]).unwrap();
+        assert!(named(&bob.notes), "{:?}", bob.notes);
+        let tie = faculty.tie_add(tie_request("Ada", "knows", "Bob")).unwrap();
+        assert!(named(&tie.notes), "{:?}", tie.notes);
+        let tie_id = format!("{:x}", tie.tie);
+        assert!(named(
+            &faculty
+                .tie_end(&tie_id, "2026-01-01", &[], None)
+                .unwrap()
+                .notes
+        ));
+
+        // Reads answer over what is here and name it.
+        let listed = faculty.list(10, PeopleFilter::Active).unwrap();
+        assert!(listed.contains("Ada") && listed.contains("Bob"), "{listed}");
+        assert!(named(&listed.notes), "{:?}", listed.notes);
+        assert!(named(&faculty.show("Ada").unwrap().notes));
+        assert!(named(&faculty.ties("Ada").unwrap().notes));
+        assert!(named(&faculty.group_list().unwrap().notes));
+        assert!(named(&faculty.identity_list().unwrap().notes));
+        assert!(named(
+            &faculty.org_list(10, PeopleFilter::All).unwrap().notes
+        ));
+
+        // Not finding someone while a foundation is away says so.
+        let error = faculty.show("Away").unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+
+        // A supersession, a refusal from absence, and a lookup another
+        // faculty decides on refuse the incomplete read.
+        let patch = ProfilePatch {
+            company: Some("Engines".into()),
+            ..ProfilePatch::default()
+        };
+        let refused = |error: anyhow::Error| {
+            assert!(refuses_incomplete(&error, &away), "{error:#}");
+        };
+        refused(faculty.set("Ada", patch, &[]).unwrap_err());
+        refused(faculty.retire("Bob").unwrap_err());
+        refused(faculty.group_create("crew").unwrap_err());
+        refused(faculty.person_state("Ada").unwrap_err());
+        storage.close().unwrap();
+    }
+
+    #[test]
+    fn a_malformed_relations_foundation_fails_loudly() {
+        use crate::storage::residual_fixture::{is_fault, malformed_in, storage};
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let faculty = Relations::with_storage(storage.clone());
+        faculty.add(profile("Ada"), None, &[]).unwrap();
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let fault = |error: anyhow::Error| assert!(is_fault(&error), "{error:#}");
+        fault(faculty.list(10, PeopleFilter::Active).unwrap_err());
+        fault(faculty.add(profile("Bob"), None, &[]).unwrap_err());
+        fault(
+            faculty
+                .set("Ada", ProfilePatch::default(), &[])
+                .unwrap_err(),
+        );
+        storage.close().unwrap();
     }
 }

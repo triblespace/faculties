@@ -341,3 +341,67 @@ fn alarm_ack_resolve_and_note_close_annotate_and_count_false_alarms() {
         .unwrap();
     assert!(late.was_closed);
 }
+
+/// A Relations foundation is stranded on another host: display names it
+/// beside the answer without counting it as unread alarm commits (which
+/// would hold the follower's rungs), and a raise, which resolves its raiser
+/// and the person it is for against all of Relations, refuses.
+#[test]
+fn a_stranded_relations_foundation_is_named_by_display_and_refuses_a_raise() {
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let storage = storage(directory.path());
+    let relations = Relations::with_storage(storage.clone());
+    relations
+        .add(
+            ProfileInput {
+                label: "cyan".to_owned(),
+                affinities: vec![ZOOID_AFFINITY.to_owned()],
+                ..Default::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap();
+    relations
+        .add(
+            ProfileInput {
+                label: "jp".to_owned(),
+                ..Default::default()
+            },
+            None,
+            &[],
+        )
+        .unwrap();
+    let alarm = Alarm::with_storage(storage.clone());
+    let mut clock = FakeClock { now: T0 };
+    let mut runner = FakeRunner::default();
+    let Raised::Alarm { alarm: raised, .. } = alarm
+        .raise(&request("cyan", "pile truncated"), &mut runner, &mut clock)
+        .unwrap()
+    else {
+        panic!("a first raise starts a ladder");
+    };
+    let away = strand_in(
+        &storage,
+        crate::schemas::relations::DEFAULT_SCOPE_ID,
+        unrelated_fragment(),
+    );
+    let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+    let listed = alarm.list(false, None, &mut clock).unwrap();
+    assert_eq!((listed.alarms.len(), listed.unread), (1, 0));
+    assert!(named(&listed.notes), "{:?}", listed.notes);
+    let shown = alarm.show(&format!("{raised:x}")).unwrap();
+    assert!(named(&shown.notes), "{:?}", shown.notes);
+    assert_eq!(alarm.state(raised, None).unwrap().unread, 0);
+
+    let error = alarm
+        .raise(&request("cyan", "another"), &mut runner, &mut clock)
+        .err()
+        .unwrap();
+    assert!(refuses_incomplete(&error, &away), "{error:#}");
+    storage.close().unwrap();
+}

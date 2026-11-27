@@ -205,11 +205,11 @@ impl Faculty for Files {
             }
             "files_list" => {
                 let args: List = decode_arguments(arguments)?;
-                out.text(files.list(&args.tags, args.mime.as_deref())?)
+                out.noted_text(files.list(&args.tags, args.mime.as_deref())?)
             }
             "files_show" => {
                 let args: Id = decode_arguments(arguments)?;
-                out.text(files.show(&args.id)?)
+                out.noted_text(files.show(&args.id)?)
             }
             "files_view" => {
                 let args: View = decode_arguments(arguments)?;
@@ -219,11 +219,15 @@ impl Faculty for Files {
                     max_dimension: args.max_dimension,
                 };
                 options.validate().map_err(crate::mcp::invalid_arguments)?;
-                out.emit(files.view(&args.id, &options)?)
+                let viewed = files.view(&args.id, &options)?;
+                out.notes(&viewed.notes)?;
+                out.emit(viewed.value)
             }
             "files_get" => {
                 let args: Id = decode_arguments(arguments)?;
                 let export = files.get(&args.id)?;
+                out.notes(&export.notes)?;
+                let export = export.value;
                 let uri = export.uri();
                 out.blob(export.bytes, "application/octet-stream", uri)
             }
@@ -246,7 +250,7 @@ impl Faculty for Files {
             }
             "files_search" => {
                 let args: Search = decode_arguments(arguments)?;
-                out.text(files.search(&args.query)?)
+                out.noted_text(files.search(&args.query)?)
             }
             "files_similar" => {
                 let args: Similar = decode_arguments(arguments)?;
@@ -263,11 +267,11 @@ impl Faculty for Files {
             }
             "files_imports" => {
                 let _: Empty = decode_arguments(arguments)?;
-                out.text(files.imports()?)
+                out.noted_text(files.imports()?)
             }
             "files_tree" => {
                 let args: Tree = decode_arguments(arguments)?;
-                out.text(files.tree(&args.id, args.depth)?)
+                out.noted_text(files.tree(&args.id, args.depth)?)
             }
             "files_resolve" => {
                 let args: Resolve = decode_arguments(arguments)?;
@@ -276,7 +280,7 @@ impl Faculty for Files {
             }
             "files_diff" => {
                 let args: Diff = decode_arguments(arguments)?;
-                out.text(files.diff(&args.left, &args.right)?)
+                out.noted_text(files.diff(&args.left, &args.right)?)
             }
             other => bail!("Files MCP has no tool {other:?}"),
         }

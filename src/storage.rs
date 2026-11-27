@@ -1367,6 +1367,14 @@ impl<T> Noted<T> {
             notes: Vec::new(),
         }
     }
+
+    /// The same notes beside another answer derived from this one.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Noted<U> {
+        Noted {
+            value: f(self.value),
+            notes: self.notes,
+        }
+    }
 }
 
 impl<T> std::ops::Deref for Noted<T> {
@@ -1393,6 +1401,38 @@ impl PartialEq<String> for Noted<String> {
     fn eq(&self, other: &String) -> bool {
         self.value == *other
     }
+}
+
+impl PartialEq<&str> for Noted<String> {
+    fn eq(&self, other: &&str) -> bool {
+        self.value == *other
+    }
+}
+
+/// [`acquire_facts_read`] for a caller collecting notes: the facts read here,
+/// and a note in `notes` naming `label`'s foundations that could not be
+/// loaded ([`unread_foundations_note`]).
+pub fn acquire_facts_noted<R: StoreRead>(
+    reader: &R,
+    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+    label: &str,
+    notes: &mut Vec<String>,
+) -> Result<FactArchive> {
+    let (facts, unread) = acquire_facts_read(reader, rank9)?.into_parts();
+    notes.extend(unread_foundations_note(label, &unread));
+    Ok(facts)
+}
+
+/// [`acquire_attached_facts_read`] for a caller collecting notes, as
+/// [`acquire_facts_noted`] does.
+pub fn acquire_attached_facts_noted<R: StoreRead>(
+    attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+    label: &str,
+    notes: &mut Vec<String>,
+) -> Result<FactArchive> {
+    let (facts, unread) = acquire_attached_facts_read(attached)?.into_parts();
+    notes.extend(unread_foundations_note(label, &unread));
+    Ok(facts)
 }
 
 /// `error`, with each note of what its read could not load as context: a
@@ -1840,6 +1880,70 @@ pub(crate) mod residual_fixture {
             empty_metadata_handle(),
         )))?;
         Ok(Handle::<SimpleArchive>::from_hash(data))
+    }
+
+    /// A fresh pile and signer in `directory`, and a storage owner over it
+    /// with no first contact: a foundation whose bytes are not here has no
+    /// one to be fetched from, so a read reports it unread at once instead of
+    /// waiting out a fetch deadline. Close it with [`super::Storage::close`].
+    pub fn storage(directory: &std::path::Path) -> super::Storage {
+        let pile = directory.join("residual.pile");
+        let key = directory.join("residual.key");
+        std::fs::File::create(&pile).unwrap();
+        super::initialize_signer(&pile, Some(&key)).unwrap();
+        super::Storage::shared_with_daemon(pile, Some(key), None)
+    }
+
+    /// [`strand`] into the collection `storage` selects for `scope`, by its
+    /// signer: the foundation's hex handle.
+    pub fn strand_in(
+        storage: &super::Storage,
+        scope: triblespace::prelude::Id,
+        fragment: Fragment,
+    ) -> String {
+        let handle = storage
+            .with_pile(|pile, signer| {
+                let source = storage.open_collection_local(pile, scope, signer.verifying_key())?;
+                strand(pile, source, signer, fragment)
+            })
+            .unwrap();
+        hex::encode(handle.raw)
+    }
+
+    /// [`malformed`] into the collection `storage` selects for `scope`.
+    pub fn malformed_in(storage: &super::Storage, scope: triblespace::prelude::Id) -> String {
+        let handle = storage
+            .with_pile(|pile, signer| {
+                let source = storage.open_collection_local(pile, scope, signer.verifying_key())?;
+                malformed(pile, source, signer)
+            })
+            .unwrap();
+        hex::encode(handle.raw)
+    }
+
+    /// A fragment of one tagged entity: enough to be a foundation of any
+    /// collection without meaning anything to its faculty.
+    pub fn unrelated_fragment() -> Fragment {
+        use triblespace::core::metadata;
+        let tag = triblespace::prelude::Id::new([0x5A; 16]).unwrap();
+        let entity = triblespace::prelude::ufoid();
+        triblespace::macros::entity! { &entity @ metadata::tag: &tag }
+    }
+
+    /// Whether `error` is a fault (bytes here that form no archive), not an
+    /// unread gap.
+    pub fn is_fault(error: &anyhow::Error) -> bool {
+        error
+            .downcast_ref::<super::IncompleteAttachedRead>()
+            .is_none()
+    }
+
+    /// Whether `error` refuses an incomplete read naming `handle`.
+    pub fn refuses_incomplete(error: &anyhow::Error, handle: &str) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.is::<super::IncompleteAttachedRead>())
+            && format!("{error:#}").contains(handle)
     }
 }
 

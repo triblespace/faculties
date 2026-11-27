@@ -18,9 +18,13 @@ pub struct Cognition {
     storage: Storage,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckReport {
     pub facts: usize,
+    /// Selected foundations whose bytes could not be loaded: the check
+    /// validates every other one and names these
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 
 impl CheckReport {
@@ -57,12 +61,46 @@ impl Cognition {
                     .context("freeze Cognition fact collection")?,
                 runtime.clone(),
             );
-            let facts = crate::storage::acquire_facts(&snapshot, rank9)
-                .context("read Cognition Rank9 collection")?;
-            super::validate_archive(&snapshot, &facts)?;
+            // Validate what is here and name what is not; bytes that are
+            // here but form no archive, or payloads its facts reference and
+            // cannot be read, still fail the check.
+            let mut notes = Vec::new();
+            let facts =
+                crate::storage::acquire_facts_noted(&snapshot, rank9, "Cognition", &mut notes)
+                    .context("read Cognition Rank9 collection")?;
+            super::validate_archive(&snapshot, &facts)
+                .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
             Ok(CheckReport {
                 facts: facts.iter().count(),
+                notes,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        is_fault, malformed_in, storage, strand_in, unrelated_fragment,
+    };
+
+    #[test]
+    fn a_check_validates_what_is_here_and_names_a_foundation_that_is_away() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let cognition = Cognition::with_storage(storage.clone());
+        assert!(cognition.check().unwrap().notes.is_empty());
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let report = cognition.check().unwrap();
+        assert!(
+            report.notes.iter().any(|note| note.contains(&away)),
+            "{:?}",
+            report.notes
+        );
+        malformed_in(&storage, DEFAULT_SCOPE_ID);
+        let error = cognition.check().unwrap_err();
+        assert!(is_fault(&error), "{error:#}");
+        storage.close().unwrap();
     }
 }

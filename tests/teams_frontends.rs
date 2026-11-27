@@ -426,7 +426,7 @@ fn context_and_auth_frontends_share_receipts_but_keep_literal_mcp_strings() {
         context.source,
         teams::source_fragment(TENANT).root().unwrap()
     );
-    assert_eq!(native.context_show().unwrap(), context.value);
+    assert_eq!(native.context_show().unwrap().value, context.value);
     let mcp = fixture.mcp();
     call(
         &mcp,

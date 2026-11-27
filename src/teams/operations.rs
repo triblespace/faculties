@@ -14,7 +14,7 @@ use crate::storage::initialize_signer;
 use crate::storage::open_secrets_collection;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict};
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Noted, Storage};
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use hifitime::{Epoch, TimeScale};
@@ -63,6 +63,9 @@ pub struct Activity<T> {
     pub value: T,
     /// Durable credential publication/recovery and delta-reset notices.
     pub notices: Vec<String>,
+    /// What the read behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -290,7 +293,10 @@ impl Teams {
                 operation(runtime.source_id, session)
             });
         }
-        storage(&self.config).with_session(|session| {
+        // The resident archive is read over what is here; synchronizing
+        // selects a credential and advances the delta cursor, so it decides on
+        // a complete read (above).
+        storage(&self.config).with_session_read(|session| {
             let source = match self.config.tenant_selector.as_deref() {
                 Some(tenant) => source_id_for_tenant(tenant)?,
                 None => sole(
@@ -304,6 +310,7 @@ impl Teams {
                 context,
                 value,
                 notices: std::mem::take(&mut session.notices),
+                notes: std::mem::take(&mut session.notes),
             })
         })
     }
@@ -430,8 +437,8 @@ impl Teams {
         storage(&self.config)
             .with_session(|session| store_context(session, source, tenant, present_as, boundary))
     }
-    pub fn context_show(&self) -> Result<PresentationContext> {
-        storage(&self.config).with_session(|session| {
+    pub fn context_show(&self) -> Result<Noted<PresentationContext>> {
+        storage(&self.config).with_session_read(|session| {
             let source = match self.config.tenant_selector.as_deref() {
                 Some(tenant) => source_id_for_tenant(tenant)?,
                 None => sole(
@@ -439,12 +446,17 @@ impl Teams {
                     "Teams source (select a tenant when more than one exists)",
                 )?,
             };
-            load_context(&session.reader, &session.facts, source)
+            Ok(Noted {
+                value: load_context(&session.reader, &session.facts, source)?,
+                notes: std::mem::take(&mut session.notes),
+            })
         })
     }
     /// Safe metadata and exact encrypted version IDs, never credential plaintext.
+    /// Read over what is here: it selects nothing for use, and names the
+    /// foundations it could not load.
     pub fn auth_status(&self) -> Result<Activity<String>> {
-        storage(&self.config).with_session(|session| {
+        storage(&self.config).with_session_read(|session| {
             let sources = teams_core::auth_profile_sources(&session.facts);
             let source = match self.config.tenant_selector.as_deref() {
                 Some(tenant) => Some(source_id_for_tenant(tenant)?),
@@ -459,6 +471,7 @@ impl Teams {
                 context,
                 value,
                 notices: std::mem::take(&mut session.notices),
+                notes: std::mem::take(&mut session.notes),
             })
         })
     }
@@ -568,6 +581,9 @@ struct TeamsSession {
     secret_collection: secret_storage::SecretsCollection,
     secrets: SecretsSnapshot<AcquiringReader<FacultySnapshot>>,
     notices: Vec<String>,
+    /// What a session read over what is here could not load; always empty
+    /// for a session that decides on a complete read.
+    notes: Vec<String>,
 }
 
 impl TeamsSession {
@@ -723,7 +739,30 @@ impl TeamsSession {
 }
 
 impl TeamsStorage {
+    /// Decide on a complete observation: a selected Teams foundation whose
+    /// bytes cannot be loaded refuses the operation. Everything that selects
+    /// a credential or presentation identity, or supersedes a context, auth
+    /// profile or delta cursor, decides here: a newer binding may be held in
+    /// the unread foundation.
     fn with_session<T>(&self, operation: impl FnOnce(&mut TeamsSession) -> Result<T>) -> Result<T> {
+        self.with_session_in(false, operation)
+    }
+
+    /// Over what is here: the session's Teams facts are what this observation
+    /// could load, and `session.notes` names each foundation it could not.
+    /// An error carries the notes as context.
+    fn with_session_read<T>(
+        &self,
+        operation: impl FnOnce(&mut TeamsSession) -> Result<T>,
+    ) -> Result<T> {
+        self.with_session_in(true, operation)
+    }
+
+    fn with_session_in<T>(
+        &self,
+        partial: bool,
+        operation: impl FnOnce(&mut TeamsSession) -> Result<T>,
+    ) -> Result<T> {
         self.storage.scope(|storage| {
             let mut session = storage.with_store(|pile, signer, runtime| {
                 let collection = self.storage.open_collection_read(
@@ -769,8 +808,13 @@ impl TeamsStorage {
                     .attached_acquiring(maintained_rank9)
                     .context("observe Teams through Secrets snapshot")?;
                 let support = observed.support().clone();
-                let facts = crate::storage::acquire_attached_facts(&observed)
-                    .context("read Teams through Secrets snapshot")?;
+                let mut notes = Vec::new();
+                let facts = if partial {
+                    crate::storage::acquire_attached_facts_noted(&observed, "Teams", &mut notes)
+                } else {
+                    crate::storage::acquire_attached_facts(&observed)
+                }
+                .context("read Teams through Secrets snapshot")?;
                 drop(observed);
                 Ok(TeamsSession {
                     storage: storage.clone(),
@@ -783,15 +827,22 @@ impl TeamsStorage {
                     secret_collection,
                     secrets,
                     notices: Vec::new(),
+                    notes,
                 })
             })?;
             // Graph/OAuth requests run with frozen observations and no
             // borrowed backend. Publication reacquires the same store only
             // for its append/maintenance step.
+            let notes = session.notes.clone();
             match operation(&mut session) {
                 Ok(value) => Ok(value),
-                Err(error) if session.notices.is_empty() => Err(error),
-                Err(error) => Err(error.context(session.notices.join("\n"))),
+                Err(error) if session.notices.is_empty() => {
+                    Err(crate::storage::with_unread_notes(error, &notes))
+                }
+                Err(error) => Err(crate::storage::with_unread_notes(
+                    error.context(session.notices.join("\n")),
+                    &notes,
+                )),
             }
         })
     }
@@ -909,6 +960,7 @@ fn with_teams_context<T>(
             context,
             value,
             notices: std::mem::take(&mut session.notices),
+            notes: Vec::new(),
         })
     })
 }
@@ -5626,5 +5678,58 @@ mod tests {
             (Some("attachment"), "42")
         );
         assert_eq!(parse_attachment_reference("42"), (None, "42"));
+    }
+
+    /// A Teams foundation is stranded on another host: the resident archive,
+    /// the presentation context and the auth status read what is here and
+    /// name it, while what selects a credential or supersedes a context
+    /// refuses the incomplete read before any request is made.
+    #[test]
+    fn resident_reads_go_on_while_a_teams_foundation_is_away() {
+        use crate::storage::residual_fixture::{
+            refuses_incomplete, storage, strand_in, unrelated_fragment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let (page, _) = page_fragment(
+            "tenant-a",
+            vec![graph_message(
+                "chat",
+                "message",
+                "2026-08-01T10:00:00Z",
+                "2026-08-01T10:00:00Z",
+                "resident",
+            )],
+            1,
+            [],
+            "https://graph.example/delta-1",
+        );
+        TeamsStorage {
+            storage: storage.clone(),
+        }
+        .publish(page, "test Teams page")
+        .unwrap();
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+        let teams = Teams::with_storage(storage.clone());
+
+        let read = teams
+            .read(ReadOptions::default(), ArchiveAccess::Resident)
+            .unwrap();
+        assert_eq!(read.value.len(), 1);
+        assert!(named(&read.notes), "{:?}", read.notes);
+        assert!(named(&teams.context_show().unwrap().notes));
+        assert!(named(&teams.auth_status().unwrap().notes));
+
+        let refused =
+            |error: anyhow::Error| assert!(refuses_incomplete(&error, &away), "{error:#}");
+        refused(teams.pull().err().unwrap());
+        refused(
+            teams
+                .context_set("tenant-a", "Tester", "work only")
+                .err()
+                .unwrap(),
+        );
+        storage.close().unwrap();
     }
 }

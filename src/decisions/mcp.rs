@@ -195,7 +195,9 @@ impl Faculty for Decisions {
             "decisions_resolve_id" => {
                 let args: Prefix = decode_arguments(arguments)?;
                 selector(&args.prefix)?;
-                out.line(format!("{:x}", self.operations.resolve_id(&args.prefix)?))
+                let resolved = self.operations.resolve_id(&args.prefix)?;
+                out.notes(&resolved.notes)?;
+                out.line(format!("{:x}", resolved.value))
             }
             _ => bail!("unknown Decisions tool '{name}'"),
         }

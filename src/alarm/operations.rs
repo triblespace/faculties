@@ -169,6 +169,9 @@ pub struct ListView {
     pub false_alarms: Vec<(String, usize)>,
     /// Commits of the alarm collection this observation could not read.
     pub unread: usize,
+    /// What the Relations read behind the labels could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 
 /// One record about an alarm, as `show` lists it.
@@ -200,6 +203,8 @@ pub struct ShowView {
     pub steps: Vec<StepLine>,
     pub events: Vec<Event>,
     pub unread: usize,
+    /// What the Relations read behind the labels could not load.
+    pub notes: Vec<String>,
 }
 
 /// What the follower reads on each turn.
@@ -238,6 +243,10 @@ pub(crate) struct View {
     pub discord: Option<FactArchive>,
     pub reader: Reader,
     pub unread: usize,
+    /// A tolerant observation's note of the Relations foundations it could
+    /// not load; it is never counted in `unread`, which says whether the
+    /// alarm itself was read completely.
+    pub notes: Vec<String>,
 }
 
 impl Alarm {
@@ -473,7 +482,8 @@ impl Alarm {
         self.storage.with_store(|pile, signer, runtime| {
             let view = observe(&self.storage, pile, signer, runtime, false, false)?;
             let alarm = resolve_alarm(&view.alarm, alarm)?;
-            let by = resolve_active(&view, by)?;
+            let by = resolve_active(&view, by)
+                .map_err(|error| crate::storage::with_unread_notes(error, &view.notes))?;
             let was_closed = is_closed(&view.alarm, alarm);
             let (fragment, record) = build(alarm, by)?;
             commit_alarm(&self.storage, pile, signer, runtime, fragment)?;
@@ -568,6 +578,7 @@ impl Alarm {
                 alarms,
                 false_alarms,
                 unread: view.unread,
+                notes: view.notes.clone(),
             })
         })
     }
@@ -947,6 +958,7 @@ fn show_from(view: &View, alarm: Id) -> Result<ShowView> {
         steps,
         events,
         unread: view.unread,
+        notes: view.notes.clone(),
     })
 }
 
@@ -975,8 +987,11 @@ fn attach(
 
 /// One observation of the alarm and Relations collections. `strict` refuses
 /// an alarm observation that cannot read every selected commit; otherwise
-/// the commits it could not read are counted in `unread`. Relations is
-/// always read completely: a raiser is resolved against all of it.
+/// the commits it could not read are counted in `unread`. Relations is read
+/// as strictly: a raise resolves its raiser and the person it is for against
+/// all of it, while a tolerant observation (display, the follower, an ack or
+/// note recorded by a person found here) names the Relations foundations it
+/// could not load in `notes`.
 pub(crate) fn observe(
     storage: &Storage,
     pile: &mut FacultyStore,
@@ -1020,8 +1035,13 @@ pub(crate) fn observe(
         let unread = read.unread().len();
         (read.into_value(), unread)
     };
-    let relations =
-        crate::storage::acquire_facts(&reader, relation).context("read Relations facts")?;
+    let mut notes = Vec::new();
+    let relations = if strict {
+        crate::storage::acquire_facts(&reader, relation)
+    } else {
+        crate::storage::acquire_facts_noted(&reader, relation, "Relations", &mut notes)
+    }
+    .context("read Relations facts")?;
     // Discord is read tolerantly: a message still in flight is one the next
     // read will see, and nothing here counts or ranks by absence.
     let discord = match discord {
@@ -1034,6 +1054,7 @@ pub(crate) fn observe(
         discord,
         reader,
         unread,
+        notes,
     })
 }
 

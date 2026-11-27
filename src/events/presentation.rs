@@ -5,6 +5,7 @@ use super::{
     STATUS_CANCELLED, STATUS_CONFIRMED,
 };
 use crate::out::Out;
+use crate::storage::Noted;
 use anyhow::Result;
 use triblespace::prelude::Id;
 fn fmt_id(id: Id) -> String {
@@ -54,13 +55,16 @@ pub fn occurrences(occurrences: &[Occurrence], out: &mut Out<'_>) -> Result<()> 
     Ok(())
 }
 
-pub fn added(receipt: &AddedEvent, out: &mut Out<'_>) -> Result<()> {
+pub fn added(receipt: &Noted<AddedEvent>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&receipt.notes)?;
     out.line(format!("Added event {}", fmt_id(receipt.event)))
 }
-pub fn noted(receipt: &AddedNote, out: &mut Out<'_>) -> Result<()> {
+pub fn noted(receipt: &Noted<AddedNote>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&receipt.notes)?;
     out.line(format!("Added note to event {}", fmt_id(receipt.event)))
 }
-pub fn cancelled(receipt: &CancellationReceipt, out: &mut Out<'_>) -> Result<()> {
+pub fn cancelled(receipt: &Noted<CancellationReceipt>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&receipt.notes)?;
     if receipt.already_cancelled {
         out.line(format!(
             "Event {} is already cancelled",
@@ -99,7 +103,9 @@ pub fn ingested(receipt: &IngestReceipt, out: &mut Out<'_>) -> Result<()> {
     }
     Ok(())
 }
-pub fn show(detail: &EventDetail, out: &mut Out<'_>) -> Result<()> {
+pub fn show(detail: &Noted<EventDetail>, out: &mut Out<'_>) -> Result<()> {
+    out.notes(&detail.notes)?;
+    let detail = &detail.value;
     let row = &detail.event;
     out.line(format!("event {}  {}", fmt_id(row.id), detail.summary))?;
     out.line(format!("  time:     {}", fmt_interval(row.time)?))?;

@@ -95,19 +95,33 @@ impl Profiles {
             operation(&context)
         })
     }
+    /// Without secrets, read over what is here and name what could not be
+    /// loaded. Opening the active profile's secrets selects them, so that
+    /// reads completely: a newer binding may be held in a foundation that is
+    /// away. Every command that changes the configuration decides on a
+    /// complete read, as it supersedes the heads it saw.
     pub fn show(&self, show_secrets: bool, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| {
-            let views = storage.views()?;
-            let opened = if show_secrets {
-                open_display_secrets(storage, &views)?
-            } else {
-                None
-            };
-            print_profiles(&views, opened.as_ref(), out)
+            if show_secrets {
+                let views = storage.views()?;
+                let opened = open_display_secrets(storage, &views)?;
+                return print_profiles(&views, opened.as_ref(), out);
+            }
+            let mut notes = Vec::new();
+            let views = storage.views_read(&mut notes)?;
+            out.notes(&notes)?;
+            print_profiles(&views, None, out)
+                .map_err(|error| crate::storage::with_unread_notes(error, &notes))
         })
     }
     pub fn list(&self, out: &mut Out<'_>) -> Result<()> {
-        self.with_operation(|storage| print_profile_list(&storage.views()?, out))
+        self.with_operation(|storage| {
+            let mut notes = Vec::new();
+            let views = storage.views_read(&mut notes)?;
+            out.notes(&notes)?;
+            print_profile_list(&views, out)
+                .map_err(|error| crate::storage::with_unread_notes(error, &notes))
+        })
     }
     pub fn use_profile(&self, selector: &str, out: &mut Out<'_>) -> Result<()> {
         self.with_operation(|storage| use_profile(storage, selector, out))
@@ -193,7 +207,18 @@ impl Storage {
         ))
     }
 
+    /// Every view read completely, or refused.
     fn views(&self) -> Result<Views> {
+        self.views_in(None)
+    }
+
+    /// Profiles over what is here; a note in `notes` names each foundation
+    /// that could not be loaded.
+    fn views_read(&self, notes: &mut Vec<String>) -> Result<Views> {
+        self.views_in(Some(notes))
+    }
+
+    fn views_in(&self, notes: Option<&mut Vec<String>>) -> Result<Views> {
         self.storage.with_store(|pile, _, runtime| {
             let source = self.storage.open_collection_read(
                 pile,
@@ -232,8 +257,16 @@ impl Storage {
             let secrets = secret_storage::snapshot_acquiring(reader.clone(), secrets_collection)?;
             // Attach Profiles through the same final immutable physical snapshot
             // that backs every Secrets lookup in this view.
-            let facts = crate::storage::acquire_facts(&reader, collection_rank9)
-                .context("read maintained Profiles collection")?;
+            let facts = match notes {
+                Some(notes) => crate::storage::acquire_facts_noted(
+                    &reader,
+                    collection_rank9,
+                    "Profiles",
+                    notes,
+                ),
+                None => crate::storage::acquire_facts(&reader, collection_rank9),
+            }
+            .context("read maintained Profiles collection")?;
             let profiles = CollectionView { facts, reader };
             Ok(Views { profiles, secrets })
         })
@@ -1187,5 +1220,43 @@ mod tests {
         assert!(command
             .get_arguments()
             .any(|argument| argument.get_id() == "key"));
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::storage::residual_fixture::{
+        refuses_incomplete, storage, strand_in, unrelated_fragment,
+    };
+
+    fn notes_of(read: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<Vec<String>> {
+        let mut notes = Vec::new();
+        read(&mut Out::new(&mut |part| {
+            if let crate::out::Part::Note { text } = part {
+                notes.push(text);
+            }
+            Ok(())
+        }))?;
+        Ok(notes)
+    }
+
+    /// A Profiles foundation is stranded on another host: show and list read
+    /// what is here and name it, while opening secrets or switching the
+    /// active profile, which select a binding, refuse the incomplete read.
+    #[test]
+    fn reads_go_on_while_a_profiles_foundation_is_away() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let profiles = Profiles::with_storage(storage.clone());
+        let away = strand_in(&storage, DEFAULT_SCOPE_ID, unrelated_fragment());
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+        assert!(named(&notes_of(|out| profiles.list(out)).unwrap()));
+        assert!(named(&notes_of(|out| profiles.show(false, out)).unwrap()));
+        let refused =
+            |error: anyhow::Error| assert!(refuses_incomplete(&error, &away), "{error:#}");
+        refused(notes_of(|out| profiles.show(true, out)).unwrap_err());
+        refused(notes_of(|out| profiles.use_profile("default", out)).unwrap_err());
+        storage.close().unwrap();
     }
 }

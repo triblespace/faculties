@@ -97,6 +97,22 @@ impl<'a> Out<'a> {
         self.emit(Part::Note { text: text.into() })
     }
 
+    /// Deliver each note a read left beside its answer
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub fn notes(&mut self, notes: &[String]) -> Result<()> {
+        for note in notes {
+            self.note(note.clone())?;
+        }
+        Ok(())
+    }
+
+    /// A text answer read over what is here, with the notes of what its read
+    /// could not load delivered first.
+    pub fn noted_text(&mut self, answer: crate::storage::Noted<String>) -> Result<()> {
+        self.notes(&answer.notes)?;
+        self.text(answer.value)
+    }
+
     /// Export bytes without interpreting them as text or a displayed modality.
     pub fn blob(
         &mut self,

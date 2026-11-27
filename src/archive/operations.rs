@@ -78,14 +78,26 @@ impl Archive {
     fn storage(&self) -> ArchiveStorage<'_> {
         ArchiveStorage {
             storage: &self.storage,
+            notes: None,
         }
     }
+    /// The reads list, show, thread and search answer over what is here
+    /// ([`ArchiveStorage::read_facts`]); an error carries the notes of what
+    /// they could not load. Replay advances its cursor past what it emits, so
+    /// it reads completely: a turn held only in a foundation that is away
+    /// would otherwise be passed over for good.
     fn with_operation<T>(
         &self,
         operation: impl FnOnce(ArchiveStorage<'_>) -> Result<T>,
     ) -> Result<T> {
-        self.storage
-            .scope(|storage| operation(ArchiveStorage { storage }))
+        let notes = std::cell::RefCell::new(Vec::new());
+        let result = self.storage.scope(|storage| {
+            operation(ArchiveStorage {
+                storage,
+                notes: Some(&notes),
+            })
+        });
+        result.map_err(|error| crate::storage::with_unread_notes(error, &notes.borrow()))
     }
     /// Publish one resident source atomically after complete successful scanning.
     /// Attachments are resident export filenames for ChatGPT and exact pointer
@@ -329,6 +341,9 @@ use anybytes::Bytes;
 #[derive(Clone, Copy)]
 struct ArchiveStorage<'a> {
     storage: &'a crate::storage::Storage,
+    /// Where a read over what is here leaves the notes of what it could not
+    /// load, for an error to carry.
+    notes: Option<&'a std::cell::RefCell<Vec<String>>>,
 }
 
 struct ReplayView {
@@ -337,6 +352,19 @@ struct ReplayView {
 }
 
 impl ArchiveStorage<'_> {
+    /// The facts `observed` holds here, its unread foundations named beside
+    /// the answer on `out` (and kept for an error to carry). Bytes that are
+    /// here but form no archive still fail the read.
+    fn read_facts(&self, observed: &FactSnapshot, out: &mut Out<'_>) -> Result<FactArchive> {
+        let mut notes = Vec::new();
+        let facts = crate::storage::acquire_attached_facts_noted(observed, "Archive", &mut notes)?;
+        out.notes(&notes)?;
+        if let Some(kept) = self.notes {
+            kept.borrow_mut().extend(notes);
+        }
+        Ok(facts)
+    }
+
     fn load(&self) -> Result<FactSnapshot> {
         archive_collection::ensure_acquiring_with_storage(self.storage)
     }
@@ -366,6 +394,8 @@ impl ArchiveStorage<'_> {
                 Ok::<_, anyhow::Error>(rank9)
             })?;
             let reader = AcquiringReader::new(pile.snapshot()?, runtime.clone());
+            // A cursor update supersedes the cursor it read, so a cursor held
+            // only in a foundation that is away refuses it rather than forking.
             crate::storage::acquire_facts(&reader, rank9).context("read Comb cursor collection")
         })
     }
@@ -1443,7 +1473,7 @@ fn run_list(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let facts = storage.read_facts(&observed, out)?;
     for projection in newest_projections(&facts, limit) {
         out.line(format!(
             "{}",
@@ -1508,7 +1538,7 @@ fn library_media_types(
 
 fn run_list_library(storage: ArchiveStorage<'_>, limit: usize, out: &mut Out<'_>) -> Result<()> {
     let observed = storage.load()?;
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let facts = storage.read_facts(&observed, out)?;
     let reader = observed.snapshot();
     let held: BTreeSet<Id> = find!(
         file: Id,
@@ -1761,7 +1791,7 @@ fn run_show(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let facts = storage.read_facts(&observed, out)?;
     if let Some(file) = library_file(&facts, prefix) {
         return out.text(render_library_file(&facts, observed.snapshot(), file)?);
     }
@@ -2005,7 +2035,7 @@ fn run_thread(
     out: &mut Out<'_>,
 ) -> Result<()> {
     let observed = storage.load()?;
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let facts = storage.read_facts(&observed, out)?;
     // A `session/<id>` or `thread/<id>` names that conversation's newest
     // held leaf, and `zooid/<name>` where that zooid's history ends, said in
     // one line before the thread.
@@ -2066,7 +2096,7 @@ fn run_search(
             archive_collection::SEARCH_BUILD_BUDGET >> 20,
         ))?;
     }
-    let facts = crate::storage::acquire_attached_facts(&observed)?;
+    let facts = storage.read_facts(&observed, out)?;
     let query = index.query().context("prepare Archive BM25 query")?;
     // The documents are texts. Walk them best first and join each to the
     // nodes holding it; a node holding several hits is shown once, at its
@@ -2132,6 +2162,12 @@ fn run_search(
 fn run_index(storage: ArchiveStorage<'_>, out: &mut Out<'_>) -> Result<()> {
     let facts = archive_collection::ensure_succinct_index_with_storage(storage.storage)?;
     let bm25 = archive_collection::ensure_bm25_index_with_storage(storage.storage)?;
+    if facts.unread > 0 {
+        out.note(format!(
+            "{} foundation(s) of Archive could not be loaded here; the index covers the rest",
+            facts.unread
+        ))?;
+    }
     out.line(format!(
         "Archive: {} distinct source element(s); accelerated-Succinct lag: {}",
         facts.source_elements, facts.lag,
@@ -2377,6 +2413,7 @@ mod tests {
     fn storage(fixture: &Fixture) -> ArchiveStorage<'_> {
         ArchiveStorage {
             storage: &fixture.storage,
+            notes: None,
         }
     }
 
@@ -5098,5 +5135,77 @@ mod tests {
             assert!(replayed.contains(body), "{body}: {replayed}");
         }
         assert!(replayed.contains("nothing remains"), "{replayed}");
+    }
+
+    /// Run `read` and return its text and its notes.
+    fn parts(read: impl FnOnce(&mut Out<'_>) -> Result<()>) -> Result<(String, Vec<String>)> {
+        let (mut text, mut notes) = (String::new(), Vec::new());
+        read(&mut Out::new(&mut |part| {
+            match part {
+                crate::out::Part::Text { text: part } => text.push_str(&part),
+                crate::out::Part::Note { text: note } => notes.push(note),
+                _ => {}
+            }
+            Ok(())
+        }))?;
+        Ok((text, notes))
+    }
+
+    /// An Archive foundation is stranded on another host: an import reads
+    /// nothing, list, show and search answer over what is here and name it,
+    /// and replay, which advances its cursor past what it emits, refuses the
+    /// incomplete read, as a cursor update does over a Comb gap.
+    #[test]
+    fn reads_and_imports_go_on_while_an_archive_foundation_is_away() {
+        use crate::storage::residual_fixture::{
+            refuses_incomplete, storage, strand_in, unrelated_fragment,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = storage(directory.path());
+        let archive = Archive::with_storage(storage.clone());
+        archive
+            .import(
+                ImportSource::ChatGpt,
+                "conversations.json",
+                br#"[{"id":"resident-chatgpt","mapping":{"node":{"id":"node","parent":null,"message":{"id":"message","author":{"role":"user"},"content":{"content_type":"text","parts":["resident comet"]}}}}}]"#.to_vec().into(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        // A replay cursor set while everything is here.
+        archive
+            .replay_start("reader", Epoch::from_tai_seconds(0.0))
+            .unwrap();
+        let away = strand_in(
+            &storage,
+            archive_schema::DEFAULT_SCOPE_ID,
+            unrelated_fragment(),
+        );
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        archive
+            .import(
+                ImportSource::ClaudeWeb,
+                "claude.json",
+                br#"[{"uuid":"meanwhile-claude","chat_messages":[{"uuid":"message","sender":"human","text":"meanwhile comet"}]}]"#.to_vec().into(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let (listed, notes) = parts(|out| archive.list(10, Reading::default(), out)).unwrap();
+        assert!(named(&notes), "{notes:?}");
+        assert_eq!(listed.lines().count(), 2, "{listed}");
+        let (found, notes) =
+            parts(|out| archive.search("comet", 10, Reading::default(), out)).unwrap();
+        assert!(named(&notes), "{notes:?}");
+        assert!(found.contains("meanwhile"), "{found}");
+        let error = parts(|out| archive.show("ffffffff", Reading::default(), out)).unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+
+        let error =
+            parts(|out| archive.replay("reader", 10, false, Reading::default(), out)).unwrap_err();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        let comb = strand_in(&storage, DEFAULT_COMB_SCOPE_ID, unrelated_fragment());
+        let error = archive.replay_stop("reader").unwrap_err();
+        assert!(refuses_incomplete(&error, &comb), "{error:#}");
+        storage.close().unwrap();
     }
 }

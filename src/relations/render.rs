@@ -5,9 +5,11 @@ use super::{
     ProfileReconciliation, ProfileUpdate,
 };
 use crate::out::Out;
+use crate::storage::Noted;
 use anyhow::Result;
 
-pub fn added(receipt: &AddedPerson, output: &mut Out<'_>) -> Result<()> {
+pub fn added(receipt: &Noted<AddedPerson>, output: &mut Out<'_>) -> Result<()> {
+    output.notes(&receipt.notes)?;
     output.line(format!("person: {:x}", receipt.person))?;
     output.line(format!("profile: {:x}", receipt.profile))?;
     output.line(format!("lifecycle: {:x}", receipt.lifecycle))
@@ -110,7 +112,8 @@ pub fn organisation_added(receipt: &AddedOrganisation, output: &mut Out<'_>) -> 
     output.line(format!("profile: {:x}", receipt.profile))?;
     output.line(format!("lifecycle: {:x}", receipt.lifecycle))
 }
-pub fn tie_added(receipt: &AddedTie, output: &mut Out<'_>) -> Result<()> {
+pub fn tie_added(receipt: &Noted<AddedTie>, output: &mut Out<'_>) -> Result<()> {
+    output.notes(&receipt.notes)?;
     output.line(format!("tie: {:x}", receipt.tie))?;
     output.line(format!(
         "{:x} -> {:x}{}",
@@ -123,6 +126,7 @@ pub fn tie_added(receipt: &AddedTie, output: &mut Out<'_>) -> Result<()> {
         }
     ))
 }
-pub fn tie_ended(receipt: &EndedTie, output: &mut Out<'_>) -> Result<()> {
+pub fn tie_ended(receipt: &Noted<EndedTie>, output: &mut Out<'_>) -> Result<()> {
+    output.notes(&receipt.notes)?;
     output.line(format!("tie: {:x} until {}", receipt.tie, receipt.until))
 }

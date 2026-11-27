@@ -180,6 +180,10 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             presentation::list(&decide.list(ListOptions { all, forced })?, out)
         }
         Command::Show { decision } => presentation::show(&decide.show(&decision)?, out),
-        Command::ResolveId { prefix } => out.line(format!("{:x}", decide.resolve_id(&prefix)?)),
+        Command::ResolveId { prefix } => {
+            let resolved = decide.resolve_id(&prefix)?;
+            out.notes(&resolved.notes)?;
+            out.line(format!("{:x}", resolved.value))
+        }
     }
 }

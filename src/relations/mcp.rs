@@ -537,11 +537,11 @@ impl Faculty for Relations {
             }
             "relations_list" => {
                 let args: ListArguments = decode_arguments(arguments)?;
-                output.text(self.operations.list(args.limit, args.filter.into())?)
+                output.noted_text(self.operations.list(args.limit, args.filter.into())?)
             }
             "relations_show" => {
                 let args: PersonArguments = decode_arguments(arguments)?;
-                output.text(self.operations.show(&args.person)?)
+                output.noted_text(self.operations.show(&args.person)?)
             }
             "relations_retire" => {
                 let args: PersonArguments = decode_arguments(arguments)?;
@@ -591,11 +591,11 @@ impl Faculty for Relations {
             }
             "relations_group_list" => {
                 let _: EmptyArguments = decode_arguments(arguments)?;
-                output.text(self.operations.group_list()?)
+                output.noted_text(self.operations.group_list()?)
             }
             "relations_group_show" => {
                 let args: GroupArguments = decode_arguments(arguments)?;
-                output.text(self.operations.group_show(&args.group)?)
+                output.noted_text(self.operations.group_show(&args.group)?)
             }
             "relations_identity_resolve" => {
                 let args: IdentityArguments = decode_arguments(arguments)?;
@@ -609,7 +609,7 @@ impl Faculty for Relations {
             }
             "relations_identity_list" => {
                 let _: EmptyArguments = decode_arguments(arguments)?;
-                output.text(self.operations.identity_list()?)
+                output.noted_text(self.operations.identity_list()?)
             }
             "relations_org_add" => {
                 let args: OrgAddArguments = decode_arguments(arguments)?;
@@ -655,11 +655,11 @@ impl Faculty for Relations {
             }
             "relations_org_list" => {
                 let args: OrgListArguments = decode_arguments(arguments)?;
-                output.text(self.operations.org_list(args.limit, args.filter.into())?)
+                output.noted_text(self.operations.org_list(args.limit, args.filter.into())?)
             }
             "relations_org_show" => {
                 let args: OrgArguments = decode_arguments(arguments)?;
-                output.text(self.operations.org_show(&args.organisation)?)
+                output.noted_text(self.operations.org_show(&args.organisation)?)
             }
             "relations_org_retire" => {
                 let args: OrgArguments = decode_arguments(arguments)?;
@@ -707,7 +707,7 @@ impl Faculty for Relations {
             }
             "relations_ties" => {
                 let args: EntryArguments = decode_arguments(arguments)?;
-                output.text(self.operations.ties(&args.entry)?)
+                output.noted_text(self.operations.ties(&args.entry)?)
             }
             other => bail!("Relations MCP has no tool {other:?}"),
         }

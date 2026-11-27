@@ -169,16 +169,23 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             if let Some(to) = to {
                 end = super::chrono_to_epoch(super::parse_iso8601(&to)?);
             }
-            presentation::occurrences(&events.list((start, end), all)?, out)
+            let listed = events.list((start, end), all)?;
+            out.notes(&listed.notes)?;
+            presentation::occurrences(&listed, out)
         }
         Command::Today => {
-            presentation::occurrences(&events.list(super::local_day_window(1)?, false)?, out)
+            let listed = events.list(super::local_day_window(1)?, false)?;
+            out.notes(&listed.notes)?;
+            presentation::occurrences(&listed, out)
         }
         Command::Week => {
-            presentation::occurrences(&events.list(super::local_day_window(7)?, false)?, out)
+            let listed = events.list(super::local_day_window(7)?, false)?;
+            out.notes(&listed.notes)?;
+            presentation::occurrences(&listed, out)
         }
         Command::Next => {
             let next = events.next(None)?;
+            out.notes(&next.notes)?;
             presentation::occurrences(next.as_ref().map_or(&[], std::slice::from_ref), out)
         }
         Command::Note { id, text } => {
@@ -186,7 +193,11 @@ pub fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         }
         Command::Show { id } => presentation::show(&events.show(&id)?, out),
         Command::Cancel { id } => presentation::cancelled(&events.cancel(&id)?, out),
-        Command::Resolve { prefix } => out.line(format!("{:x}", events.resolve(&prefix)?)),
+        Command::Resolve { prefix } => {
+            let resolved = events.resolve(&prefix)?;
+            out.notes(&resolved.notes)?;
+            out.line(format!("{:x}", resolved.value))
+        }
         Command::Ingest {
             files,
             floating_zone,

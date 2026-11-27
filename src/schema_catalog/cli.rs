@@ -62,12 +62,16 @@ pub fn execute(invocation: &Invocation, output: &mut Out<'_>) -> Result<()> {
     let result = (|| {
         match invocation.verb().name {
             "list" => {
-                for row in store.list()? {
+                let rows = store.list()?;
+                output.notes(&rows.notes)?;
+                for row in rows.value {
                     output.line(render::list_line(&row))?;
                 }
             }
             "show" => {
-                for line in render::show_lines(&store.show(invocation.require("id")?)?) {
+                let row = store.show(invocation.require("id")?)?;
+                output.notes(&row.notes)?;
+                for line in render::show_lines(&row) {
                     output.line(line)?;
                 }
             }
@@ -110,7 +114,8 @@ mod tests {
             assert_eq!(invocation.get("workspace"), Some(id.as_str()));
         }
         assert!(matches!(
-            SPEC.lower_cli_from(["schemas", "--workspace", &id]).unwrap(),
+            SPEC.lower_cli_from(["schemas", "--workspace", &id])
+                .unwrap(),
             CliRequest::Help(_)
         ));
     }

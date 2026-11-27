@@ -22,7 +22,7 @@ use crate::schemas::{
 use crate::secrets::{storage as secret_storage, SecretsSnapshot};
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict, open_pile_strict_as};
-use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot};
+use crate::storage::{AcquiringReader, FactArchive, FacultySnapshot, Noted};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::SigningKey;
@@ -32,7 +32,7 @@ use lettre::{SmtpTransport, Transport};
 use triblespace::core::blob::encodings::succinctarchive::{
     Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
 };
-use triblespace::core::collection::CollectionStoreExt;
+use triblespace::core::collection::{Collection, CollectionStoreExt};
 use triblespace::core::metadata;
 use triblespace::core::query::TriblePattern;
 type PileSnapshot = AcquiringReader<FacultySnapshot>;
@@ -214,6 +214,29 @@ impl Mail {
             }
         })
     }
+    /// [`Self::with_operation`] over what is here: `execute` reads through
+    /// [`Storage::views_read`], and the answer carries a note naming each
+    /// foundation the read could not load. Not finding something while one
+    /// is away refuses with the note. Everything that selects an account
+    /// configuration or credential, supersedes one, or sends decides on a
+    /// complete read instead ([`Storage::views`]): a newer, disabled or
+    /// revoked binding may be held in the unread foundation.
+    fn with_read_operation<T>(
+        &self,
+        execute: impl FnOnce(&Storage) -> Result<T>,
+    ) -> Result<Noted<T>> {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let result = self.with_operation(|storage| {
+            let result = execute(storage);
+            *notes.borrow_mut() = storage.notes.take();
+            result
+        });
+        let notes = notes.into_inner();
+        match result {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
+        }
+    }
     pub fn account_set(&self, input: AccountOptions) -> Result<AccountSetReceipt> {
         self.update_account(input, None)
     }
@@ -246,8 +269,8 @@ impl Mail {
             )
         })
     }
-    pub fn account_list(&self) -> Result<Vec<AccountSummary>> {
-        self.with_operation(account_list)
+    pub fn account_list(&self) -> Result<Noted<Vec<AccountSummary>>> {
+        self.with_read_operation(account_list)
     }
     /// Observe every enabled account's selected mailboxes read-only over IMAP:
     /// EXAMINE, UID SEARCH, and BODY.PEEK[] for each UID not yet observed under
@@ -267,26 +290,33 @@ impl Mail {
     pub fn send(&self, draft: &str) -> Result<SendReceipt> {
         self.with_operation(|storage| cmd_send(storage, draft))
     }
-    pub fn outbox(&self) -> Result<Vec<DraftStatus>> {
-        self.with_operation(cmd_outbox)
+    pub fn outbox(&self) -> Result<Noted<Vec<DraftStatus>>> {
+        self.with_read_operation(cmd_outbox)
     }
-    pub fn list(&self, persona: &str, unread: bool, spam: bool) -> Result<Vec<InboxMessage>> {
-        self.with_operation(|storage| cmd_list(storage, persona, unread, spam))
+    pub fn list(
+        &self,
+        persona: &str,
+        unread: bool,
+        spam: bool,
+    ) -> Result<Noted<Vec<InboxMessage>>> {
+        self.with_read_operation(|storage| cmd_list(storage, persona, unread, spam))
     }
-    /// Add intrinsic seen evidence; this does not display the message.
-    pub fn read(&self, persona: &str, message: &str) -> Result<ReadReceipt> {
-        self.with_operation(|storage| cmd_read(storage, message, persona))
+    /// Add intrinsic seen evidence; this does not display the message. The
+    /// evidence is one more record beside the message, so it is written over
+    /// what is here.
+    pub fn read(&self, persona: &str, message: &str) -> Result<Noted<ReadReceipt>> {
+        self.with_read_operation(|storage| cmd_read(storage, message, persona))
     }
-    pub fn show(&self, message: &str) -> Result<Vec<mail::ProjectionView>> {
-        self.with_operation(|storage| cmd_show(storage, message))
+    pub fn show(&self, message: &str) -> Result<Noted<Vec<mail::ProjectionView>>> {
+        self.with_read_operation(|storage| cmd_show(storage, message))
     }
     /// List every attachment occurrence of one wire message with its exact
     /// bytes. A pure read: publishes nothing, records no read evidence.
-    pub fn attachments(&self, message: &str) -> Result<Vec<AttachmentListing>> {
-        self.with_operation(|storage| cmd_attachments(storage, message))
+    pub fn attachments(&self, message: &str) -> Result<Noted<Vec<AttachmentListing>>> {
+        self.with_read_operation(|storage| cmd_attachments(storage, message))
     }
-    pub fn search(&self, query: &str) -> Result<Vec<mail::ProjectionView>> {
-        self.with_operation(|storage| cmd_search(storage, query))
+    pub fn search(&self, query: &str) -> Result<Noted<Vec<mail::ProjectionView>>> {
+        self.with_read_operation(|storage| cmd_search(storage, query))
     }
 }
 
@@ -325,6 +355,8 @@ struct Storage {
     signer: SigningKey,
     scopes: Scopes,
     notices: RefCell<Vec<String>>,
+    /// What reads through [`Self::views_read`] could not load.
+    notes: RefCell<Vec<String>>,
     // Whether this action already committed, so a later failure reports that
     // its publication was not rolled back.
     published: std::cell::Cell<bool>,
@@ -338,6 +370,7 @@ impl Storage {
             signer,
             scopes,
             notices: RefCell::new(Vec::new()),
+            notes: RefCell::new(Vec::new()),
             published: std::cell::Cell::new(false),
         })
     }
@@ -350,7 +383,32 @@ impl Storage {
         )
     }
 
+    /// Every view read completely, or refused.
     fn views(&self) -> Result<Views> {
+        self.views_in(false)
+    }
+
+    /// Every view over what is here; a note in [`Self::notes`] names each
+    /// foundation that could not be loaded.
+    fn views_read(&self) -> Result<Views> {
+        self.views_in(true)
+    }
+
+    fn views_in(&self, partial: bool) -> Result<Views> {
+        let read = |snapshot: &PileSnapshot,
+                    rank9: Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+                    label: &str| {
+            if partial {
+                crate::storage::acquire_facts_noted(
+                    snapshot,
+                    rank9,
+                    label,
+                    &mut self.notes.borrow_mut(),
+                )
+            } else {
+                crate::storage::acquire_facts(snapshot, rank9)
+            }
+        };
         self.storage.with_store(|store, _, runtime| {
             for scope in [
                 self.scopes.mail,
@@ -442,16 +500,14 @@ impl Storage {
                     AcquiringReader::new(secrets.store_snapshot().clone(), runtime.clone());
                 let secrets =
                     secret_storage::snapshot_acquiring(store_snapshot.clone(), secrets_collection)?;
-                let mail_facts = crate::storage::acquire_facts(&store_snapshot, mail_rank9)
+                let mail_facts = read(&store_snapshot, mail_rank9, "Mail")
                     .context("read maintained Mail fact collection")?;
-                let files_facts = crate::storage::acquire_facts(&store_snapshot, files_rank9)
+                let files_facts = read(&store_snapshot, files_rank9, "Files")
                     .context("read maintained Files fact collection")?;
-                let decisions_facts =
-                    crate::storage::acquire_facts(&store_snapshot, decisions_rank9)
-                        .context("read maintained Decide fact collection")?;
-                let relations_facts =
-                    crate::storage::acquire_facts(&store_snapshot, relations_rank9)
-                        .context("read maintained Relations fact collection")?;
+                let decisions_facts = read(&store_snapshot, decisions_rank9, "Decisions")
+                    .context("read maintained Decide fact collection")?;
+                let relations_facts = read(&store_snapshot, relations_rank9, "Relations")
+                    .context("read maintained Relations fact collection")?;
                 (
                     mail_facts,
                     files_facts,
@@ -737,7 +793,7 @@ fn account_set(
 }
 
 fn account_list(storage: &Storage) -> Result<Vec<AccountSummary>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let mut result = Vec::new();
     for account in mail::account_anchors(&views.mail.facts) {
         let state = match mail::account_head(&views.mail.facts, account)? {
@@ -1231,7 +1287,7 @@ fn cmd_send_with<S: mail::SmtpSubmit>(
 }
 
 fn cmd_outbox(storage: &Storage) -> Result<Vec<DraftStatus>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let drafts: BTreeSet<Id> = find!(
         id: Id,
         pattern!(&views.mail.facts, [{ ?id @ metadata::tag: &mail_schema::KIND_DRAFT_INTENT }])
@@ -1266,7 +1322,7 @@ fn cmd_list(
     unread_only: bool,
     spam_only: bool,
 ) -> Result<Vec<InboxMessage>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let persona = relation_persona(&views, persona)?;
     let mut result = Vec::new();
     for row in mail::inbox_projection(&views.mail.facts, &views.relations.facts, persona)? {
@@ -1286,7 +1342,7 @@ fn cmd_list(
 }
 
 fn cmd_read(storage: &Storage, selector: &str, persona: &str) -> Result<ReadReceipt> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let wire = resolve_wire(&views.mail.facts, selector)?;
     let reader = relation_persona(&views, persona)?;
     let (fragment, id) = mail::read_observation_fragment(wire, reader);
@@ -1316,7 +1372,7 @@ fn wire_projections(views: &Views, selector: &str) -> Result<BTreeSet<Id>> {
 }
 
 fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionView>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     wire_projections(&views, selector)?
         .into_iter()
         .map(|id| mail::projection_view(&views.mail.reader, &views.mail.facts, id))
@@ -1324,7 +1380,7 @@ fn cmd_show(storage: &Storage, selector: &str) -> Result<Vec<mail::ProjectionVie
 }
 
 fn cmd_attachments(storage: &Storage, selector: &str) -> Result<Vec<AttachmentListing>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let reader = &views.files.reader;
     let mut result = Vec::new();
     for projection in wire_projections(&views, selector)? {
@@ -1372,7 +1428,7 @@ fn resident_attachment(reader: &PileSnapshot, file: mail::OccurrenceFile) -> Att
 }
 
 fn cmd_search(storage: &Storage, query: &str) -> Result<Vec<mail::ProjectionView>> {
-    let views = storage.views()?;
+    let views = storage.views_read()?;
     let needle = query.to_lowercase();
     let projections: BTreeSet<Id> = find!(
         id: Id,
@@ -2716,5 +2772,50 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("POP-era configuration"), "{message}");
         assert!(message.contains("--imap-endpoint"), "{message}");
+    }
+
+    /// A Mail foundation is stranded on another host: the accounts, outbox
+    /// and searches read what is here and name it, while a draft, which
+    /// selects the account's current configuration, refuses the incomplete
+    /// read: a newer, disabled configuration may be the one away.
+    #[test]
+    fn reads_go_on_while_a_mail_foundation_is_away() {
+        use crate::storage::residual_fixture::{refuses_incomplete, strand_in, unrelated_fragment};
+        let fixture = Fixture::new();
+        let storage = crate::storage::Storage::shared_with_daemon(
+            fixture.pile.clone(),
+            Some(fixture.key.clone()),
+            None,
+        );
+        let away = strand_in(
+            &storage,
+            mail_schema::DEFAULT_SCOPE_ID,
+            unrelated_fragment(),
+        );
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+        let facade = Mail::with_storage(storage.clone());
+
+        let accounts = facade.account_list().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(named(&accounts.notes), "{:?}", accounts.notes);
+        assert!(named(&facade.outbox().unwrap().notes));
+        assert!(named(&facade.search("Hello").unwrap().notes));
+        let error = facade.show(&format!("{:x}", id(71))).err().unwrap();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+
+        let error = facade
+            .draft(DraftRequest {
+                account: format!("{:x}", fixture.account),
+                to: vec!["recipient@example.test".into()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+                subject: "while away".into(),
+                body: "must not be drafted".into(),
+                attachments: Vec::new(),
+            })
+            .err()
+            .unwrap();
+        assert!(refuses_incomplete(&error, &away), "{error:#}");
+        storage.close().unwrap();
     }
 }

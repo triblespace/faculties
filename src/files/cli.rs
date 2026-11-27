@@ -200,8 +200,8 @@ fn execute_with_input(
             invocation.flag("dry-run"),
             out,
         ),
-        "list" => out.text(files.list(invocation.values("tag"), invocation.get("mime"))?),
-        "show" => out.text(files.show(invocation.require("id")?)?),
+        "list" => out.noted_text(files.list(invocation.values("tag"), invocation.get("mime"))?),
+        "show" => out.noted_text(files.show(invocation.require("id")?)?),
         "view" => {
             let mut options = ViewOptions::default();
             options.max_bytes = invocation
@@ -231,18 +231,24 @@ fn execute_with_input(
                 .map(str::to_owned)
                 .to_vec();
             }
-            out.emit(files.view(invocation.require("id")?, &options)?)
+            let viewed = files.view(invocation.require("id")?, &options)?;
+            out.notes(&viewed.notes)?;
+            out.emit(viewed.value)
         }
         "get" => {
             let id = invocation.require("id")?;
             match invocation.path("output") {
                 Some(path) if path == Path::new("@-") => {
                     let export = files.get(id)?;
+                    out.notes(&export.notes)?;
+                    let export = export.value;
                     let uri = export.uri();
                     out.blob(export.bytes, "application/octet-stream", uri)
                 }
                 destination => {
                     let plan = files.extract(id, destination)?;
+                    out.notes(&plan.notes)?;
+                    let plan = plan.value;
                     let path = plan.destination.clone();
                     plan.write()?;
                     eprintln!("Extracted to {}", path.display());
@@ -264,7 +270,7 @@ fn execute_with_input(
             },
             out,
         ),
-        "search" => out.text(files.search(invocation.require("query")?)?),
+        "search" => out.noted_text(files.search(invocation.require("query")?)?),
         "similar" => files.similar(
             &SimilarityOptions {
                 id: invocation.get("id"),
@@ -282,8 +288,8 @@ fn execute_with_input(
             },
             out,
         ),
-        "imports" => out.text(files.imports()?),
-        "tree" => out.text(
+        "imports" => out.noted_text(files.imports()?),
+        "tree" => out.noted_text(
             files.tree(
                 invocation.require("id")?,
                 invocation
@@ -318,7 +324,9 @@ fn execute_with_input(
                 out.line(results.remove(0)?.hex())
             }
         }
-        "diff" => out.text(files.diff(invocation.require("left")?, invocation.require("right")?)?),
+        "diff" => {
+            out.noted_text(files.diff(invocation.require("left")?, invocation.require("right")?)?)
+        }
         other => bail!("Files CLI has no command {other:?}"),
     }
 }
