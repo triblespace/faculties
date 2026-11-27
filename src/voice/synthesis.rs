@@ -103,7 +103,19 @@ impl BreezeSources {
                     .as_ref()
                     .expect("a Files reader exists for a files: source")
                     .get(selector)
-                    .map(|export| export.bytes)
+                    .and_then(|export| {
+                        // A reference chosen from a partial read could be the
+                        // wrong version of the file, so a read with unread
+                        // support refuses and names it.
+                        if export.notes.is_empty() {
+                            Ok(export.value.bytes)
+                        } else {
+                            Err(crate::storage::with_unread_notes(
+                                anyhow::anyhow!("the reference is not fully readable here"),
+                                &export.notes,
+                            ))
+                        }
+                    })
                     .with_context(|| {
                         format!(
                             "read Breeze reference {what} {source} from {}",
