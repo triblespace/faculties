@@ -46,12 +46,16 @@ impl Faculty for KnowledgeHealth {
             "knowledge_hubs" | "knowledge_orphans" => {
                 let args: Limit = decode_arguments(arguments)?;
                 if name == "knowledge_hubs" {
-                    presentation::hubs(&self.operations.hubs(args.top.unwrap_or(15))?, out)
-                } else {
-                    presentation::orphans(
-                        &self.operations.orphans(args.top.unwrap_or(20))?,
-                        false,
+                    presentation::noted(
+                        &self.operations.hubs(args.top.unwrap_or(15))?,
                         out,
+                        presentation::hubs,
+                    )
+                } else {
+                    presentation::noted(
+                        &self.operations.orphans(args.top.unwrap_or(20))?,
+                        out,
+                        |report, out| presentation::orphans(report, false, out),
                     )
                 }
             }
@@ -61,10 +65,20 @@ impl Faculty for KnowledgeHealth {
             | "knowledge_risk" => {
                 let _: Empty = decode_arguments(arguments)?;
                 match name {
-                    "knowledge_health" => presentation::health(&self.operations.health()?, out),
-                    "knowledge_tag_counts" => presentation::tags(&self.operations.tags()?, out),
-                    "knowledge_quality" => presentation::quality(&self.operations.quality()?, out),
-                    _ => presentation::risk(&self.operations.risk()?, out),
+                    "knowledge_health" => {
+                        presentation::noted(&self.operations.health()?, out, presentation::health)
+                    }
+                    "knowledge_tag_counts" => {
+                        presentation::noted(&self.operations.tags()?, out, |rows, out| {
+                            presentation::tags(rows, out)
+                        })
+                    }
+                    "knowledge_quality" => {
+                        presentation::noted(&self.operations.quality()?, out, |rows, out| {
+                            presentation::quality(rows, out)
+                        })
+                    }
+                    _ => presentation::noted(&self.operations.risk()?, out, presentation::risk),
                 }
             }
             _ => bail!("Knowledge health MCP has no tool {name:?}"),

@@ -14,7 +14,7 @@ use crate::schemas::relations::{
     group as relation_group, DEFAULT_SCOPE_ID as DEFAULT_RELATIONS_SCOPE_ID,
 };
 use crate::storage::{self, FactArchive, FacultySnapshot, FacultyStore, Storage};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use itertools::Itertools;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -89,6 +89,9 @@ pub struct SentMessage {
     pub from: Id,
     /// The exact recipient, including a group's witnessed delivery snapshot.
     pub recipient: message::Recipient,
+    /// What the Relations read that resolved sender and recipient could not
+    /// load ([`storage::unread_foundations_note`]); the message is stored.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -144,13 +147,20 @@ pub struct MessageList {
     pub reader: Id,
     pub observed_at: IntervalValue,
     pub entries: Vec<MessageObservation>,
+    /// What the read could not load: the list is the answer over what is
+    /// here, and a message held only there is not in it.
+    pub notes: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Acknowledgement {
     pub message: Id,
     pub reader: Id,
+    /// Over what the read could load: a receipt held only in a foundation
+    /// that is away reads as unread, and acknowledging again changes nothing.
     pub already_read: bool,
+    /// What the read could not load.
+    pub notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +168,9 @@ pub struct AcknowledgedMessages {
     pub reader: Id,
     /// Envelopes acknowledged by this operation, empty for an idempotent replay.
     pub message_ids: Vec<Id>,
+    /// What the read could not load: a message held only there is not
+    /// acknowledged by this call.
+    pub notes: Vec<String>,
 }
 
 impl Message {
@@ -171,25 +184,27 @@ impl Message {
 
     pub fn send(&self, options: &SendOptions<'_>) -> Result<SentMessage> {
         options.validate()?;
-        with_storage(self, |storage, runtime| {
+        // A send names no message, so nothing of Message is read: sending
+        // never waits on a Message foundation that is away.
+        with_storage(self, MessageRead::Skip, |storage, runtime| {
             runtime.block_on(send(storage, options))
         })
     }
 
     pub fn list(&self, options: &ListOptions<'_>) -> Result<MessageList> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, MessageRead::Resident, |storage, runtime| {
             runtime.block_on(list(storage, options))
         })
     }
 
     pub fn ack(&self, id: &str, by: &str) -> Result<Acknowledgement> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, MessageRead::Resident, |storage, runtime| {
             runtime.block_on(ack(storage, id, by))
         })
     }
 
     pub fn ack_all(&self, options: &AckAllOptions<'_>) -> Result<AcknowledgedMessages> {
-        with_storage(self, |storage, runtime| {
+        with_storage(self, MessageRead::Resident, |storage, runtime| {
             runtime.block_on(ack_all(storage, options))
         })
     }
@@ -208,6 +223,27 @@ struct MessageStorage<'a> {
     reader: &'a FacultySnapshot,
     messages: &'a MessageFacts,
     relations: &'a MessageFacts,
+    /// What the Relations and Message reads could not load
+    /// ([`storage::unread_foundations_note`]).
+    notes: Vec<String>,
+}
+
+/// Which Message facts an operation reads. Relations is always read over
+/// what is here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MessageRead {
+    /// What this observation could load.
+    Resident,
+    /// None: the operation names no message.
+    Skip,
+}
+
+/// `error`, with the notes of what its read could not load: a person or a
+/// message not found may be in one of them.
+fn with_notes(error: anyhow::Error, notes: &[String]) -> anyhow::Error {
+    notes
+        .iter()
+        .fold(error, |error, note| error.context(note.clone()))
 }
 
 impl MessageStorage<'_> {
@@ -518,7 +554,9 @@ async fn send(storage: &mut MessageStorage<'_>, options: &SendOptions<'_>) -> Re
             .require_unique(options.to)?;
         Ok((from_id, recipient))
     })
-    .await?;
+    .await
+    .map_err(|error| with_notes(error, &storage.notes))?;
+    let notes = storage.notes.clone();
     storage
         .update("local message", |_, _| {
             let (fragment, id) =
@@ -529,6 +567,7 @@ async fn send(storage: &mut MessageStorage<'_>, options: &SendOptions<'_>) -> Re
                     id,
                     from: from_id,
                     recipient,
+                    notes,
                 },
             ))
         })
@@ -540,7 +579,9 @@ async fn ack(storage: &mut MessageStorage<'_>, id: &str, by: &str) -> Result<Ack
     let reader_id = storage::read(storage.pile, storage.reader, |reader| {
         message::resolve_person(reader, relation_facts, by)?.require_unique("active person", by)
     })
-    .await?;
+    .await
+    .map_err(|error| with_notes(error, &storage.notes))?;
+    let notes = storage.notes.clone();
     storage
         .update("local message read", |message_facts, relation_facts| {
             let identities = IdentityComponents::from_facts(relation_facts)?;
@@ -548,16 +589,20 @@ async fn ack(storage: &mut MessageStorage<'_>, id: &str, by: &str) -> Result<Ack
             // The prefix resolves against exactly what this reader may
             // acknowledge, so an id outside that inbox never names a message.
             let delivered = inbox(message_facts, relation_facts, &mine);
-            let message_id = crate::resolve_id_prefix(id, delivered.iter().map(envelope_id))?;
+            let message_id = crate::resolve_id_prefix(id, delivered.iter().map(envelope_id))
+                .map_err(|error| with_notes(error, &notes))?;
             if !delivered
                 .iter()
                 .any(|envelope| envelope_id(envelope) == message_id)
             {
-                bail!(
-                    "message {} is not in {}'s inbox",
-                    fmt_id(message_id),
-                    fmt_id(reader_id)
-                );
+                return Err(with_notes(
+                    anyhow::anyhow!(
+                        "message {} is not in {}'s inbox",
+                        fmt_id(message_id),
+                        fmt_id(reader_id)
+                    ),
+                    &notes,
+                ));
             }
             let already_read = read_by(message_facts, message_id, &mine);
             let fragment = if already_read {
@@ -571,6 +616,7 @@ async fn ack(storage: &mut MessageStorage<'_>, id: &str, by: &str) -> Result<Ack
                     message: message_id,
                     reader: reader_id,
                     already_read,
+                    notes: notes.clone(),
                 },
             ))
         })
@@ -594,7 +640,9 @@ async fn ack_all(
             .transpose()?;
         Ok((reader_id, from))
     })
-    .await?;
+    .await
+    .map_err(|error| with_notes(error, &storage.notes))?;
+    let notes = storage.notes.clone();
     storage
         .update(
             "local messages bulk read",
@@ -620,6 +668,7 @@ async fn ack_all(
                     AcknowledgedMessages {
                         reader: reader_id,
                         message_ids,
+                        notes,
                     },
                 ))
             },
@@ -634,7 +683,8 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
         message::resolve_person(reader, relation_facts, options.reader)?
             .require_unique("active person", options.reader)
     })
-    .await?;
+    .await
+    .map_err(|error| with_notes(error, &storage.notes))?;
     let identities = IdentityComponents::from_facts(relation_facts)?;
     let mine = settled_identity(&identities, reader_id);
 
@@ -704,11 +754,13 @@ async fn list(storage: &mut MessageStorage<'_>, options: &ListOptions<'_>) -> Re
         reader: reader_id,
         observed_at,
         entries,
+        notes: storage.notes.clone(),
     })
 }
 
 fn with_storage<T>(
     capability: &Message,
+    read: MessageRead,
     operation: impl FnOnce(&mut MessageStorage<'_>, &tokio::runtime::Runtime) -> Result<T>,
 ) -> Result<T> {
     capability.storage.with_store(|pile, signer, runtime| {
@@ -724,11 +776,12 @@ fn with_storage<T>(
             signer.verifying_key(),
             runtime,
         )?;
-        let (reader, relation_facts, message_facts) = runtime.block_on(message_views(
+        let (reader, relation_facts, message_facts, notes) = runtime.block_on(message_views(
             pile,
             signer,
             relations_source,
             message_source,
+            read,
         ))?;
         let mut storage = MessageStorage {
             pile,
@@ -737,6 +790,7 @@ fn with_storage<T>(
             reader: &reader,
             messages: &message_facts,
             relations: &relation_facts,
+            notes,
         };
         operation(&mut storage, runtime)
     })
@@ -747,7 +801,8 @@ async fn message_views(
     _signer: &SigningKey,
     relations_source: Collection<SimpleArchive>,
     message_source: Collection<SimpleArchive>,
-) -> Result<(FacultySnapshot, MessageFacts, MessageFacts)> {
+    read: MessageRead,
+) -> Result<(FacultySnapshot, MessageFacts, MessageFacts, Vec<String>)> {
     let trace = std::env::var_os("MESSAGE_RESIDUAL_TRACE").is_some();
     let started = std::time::Instant::now();
     // Reads attach what the maintenance worker carried and never maintain:
@@ -760,15 +815,33 @@ async fn message_views(
     let reader = pile.snapshot().context("freeze Message observation")?;
     let acquiring_snapshot = reader.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (relation_facts, message_facts) = tokio::task::spawn_blocking(move || {
+    let (relation_facts, message_facts, notes) = tokio::task::spawn_blocking(move || {
         // Select only once, after resolving definitions against this frozen
         // proof/record evidence. No cache fill advances the observation.
+        // Both are read over what is here: a foundation the
+        // acquisition could not bring is named beside the answer, and an
+        // operation that does not find what it looks for says so with it.
         let acquiring = storage::AcquiringReader::with_handle(acquiring_snapshot, runtime);
-        let relations = storage::acquire_facts(&acquiring, relations_rank9)
-            .context("read Relations Rank9 projection")?;
-        let messages = storage::acquire_facts(&acquiring, message_rank9)
-            .context("read Message Rank9 projection")?;
-        Ok::<_, anyhow::Error>((relations, messages))
+        let mut notes = Vec::new();
+        let (relations, unread) = storage::acquire_facts_read(&acquiring, relations_rank9)
+            .context("read Relations Rank9 projection")?
+            .into_parts();
+        notes.extend(storage::unread_foundations_note("Relations", &unread));
+        let messages = match read {
+            MessageRead::Skip => FactArchive::new(vec![
+                triblespace::core::blob::encodings::succinctarchive::SuccinctArchive::from(
+                    &triblespace::core::trible::TribleSet::new(),
+                ),
+            ]),
+            MessageRead::Resident => {
+                let (messages, unread) = storage::acquire_facts_read(&acquiring, message_rank9)
+                    .context("read Message Rank9 projection")?
+                    .into_parts();
+                notes.extend(storage::unread_foundations_note("Message", &unread));
+                messages
+            }
+        };
+        Ok::<_, anyhow::Error>((relations, messages, notes))
     })
     .await
     .context("join Message observation acquisition")??;
@@ -780,7 +853,7 @@ async fn message_views(
             attached_at - registered_at
         );
     }
-    Ok((reader, relation_facts, message_facts))
+    Ok((reader, relation_facts, message_facts, notes))
 }
 
 /// Register the Succinct and Rank9 pair over `source` and return the Rank9
@@ -1022,12 +1095,13 @@ mod tests {
             let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
             // The observer attaches nothing; it reads the attached views and
             // the newer commits from their own bytes, and publishes nothing.
-            let (snapshot, relation_facts, message_facts) = runtime
+            let (snapshot, relation_facts, message_facts, _) = runtime
                 .block_on(message_views(
                     &mut pile,
                     &observer,
                     relations_source,
                     message_source,
+                    MessageRead::Resident,
                 ))
                 .unwrap();
             assert_eq!(
@@ -1041,6 +1115,7 @@ mod tests {
                 reader: &snapshot,
                 messages: &message_facts,
                 relations: &relation_facts,
+                notes: Vec::new(),
             };
             let result = runtime.block_on(list(&mut input, &options)).unwrap();
             assert_eq!(result.reader, recipient);
@@ -1070,12 +1145,13 @@ mod tests {
         }
 
         let before = pile.snapshot().unwrap().select_records(&selectors).unwrap();
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &observer,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1085,6 +1161,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let error = runtime
             .block_on(send(
@@ -1109,12 +1186,13 @@ mod tests {
             before
         );
 
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1124,6 +1202,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let acknowledgement = runtime
             .block_on(ack(&mut input, &fmt_id(first_id), "reader"))
@@ -1131,12 +1210,13 @@ mod tests {
         assert!(!acknowledgement.already_read);
         // The owner carries its receipt before returning; acknowledging the
         // same observed receipt again is a no-op that publishes nothing.
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let before_noop = pile.snapshot().unwrap().select_records(&selectors).unwrap();
@@ -1147,6 +1227,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         assert!(
             runtime
@@ -1158,12 +1239,13 @@ mod tests {
             pile.snapshot().unwrap().select_records(&selectors).unwrap(),
             before_noop
         );
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1173,6 +1255,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let result = runtime.block_on(list(&mut input, &options)).unwrap();
         assert_eq!(result.entries.len(), 2);
@@ -1253,6 +1336,7 @@ mod tests {
                     &sender,
                     relations_source,
                     message_source,
+                    MessageRead::Resident,
                 ))
                 .unwrap(),
         );
@@ -1283,12 +1367,13 @@ mod tests {
             .unwrap()
             .map(|record| record.unwrap())
             .collect::<BTreeSet<_>>();
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &sender,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         assert!(message_source
@@ -1301,6 +1386,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         // The sender is not the host, so its writes attach nothing; every
         // reader reads them from their bytes until the host's worker does.
@@ -1350,12 +1436,13 @@ mod tests {
                 rank9: 2
             }
         );
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1365,6 +1452,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("sender")))
@@ -1375,12 +1463,13 @@ mod tests {
         // so no grant is needed, and the read is the same.
         carry(&mut pile, &runtime, message_source, &owner);
         assert!(lag(&mut pile).is_current(), "{:?}", lag(&mut pile));
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1390,6 +1479,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("sender")))
@@ -1399,6 +1489,48 @@ mod tests {
             |entry| entry.body == MessageText::Text("published without index WRITE".to_owned())
         ));
         assert!(pile.health().started_at.is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn malformed_message_foundation_still_fails_the_read() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let runtime = storage::runtime().unwrap();
+        let owner = SigningKey::from_bytes(&[98; 32]);
+        let mut pile = storage::open_store_as(file.path(), owner.verifying_key()).unwrap();
+        let relations_source = crate::collection_names::open(
+            &mut pile,
+            DEFAULT_RELATIONS_SCOPE_ID,
+            owner.verifying_key(),
+        )
+        .unwrap();
+        let message_source =
+            crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
+                .unwrap();
+        carry(&mut pile, &runtime, relations_source, &owner);
+        carry(&mut pile, &runtime, message_source, &owner);
+        crate::storage::residual_fixture::malformed(&mut pile, message_source, &owner).unwrap();
+        // Bytes that form no archive are not a foundation that is away:
+        // the read fails loudly.
+        assert!(runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                MessageRead::Resident,
+            ))
+            .is_err());
+        // A send reads no Message facts, so it is not stopped by them.
+        runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                MessageRead::Skip,
+            ))
+            .unwrap();
         pile.close().unwrap();
     }
 
@@ -1444,12 +1576,13 @@ mod tests {
         carry(&mut pile, &runtime, message_source, &owner);
         assert!(pile.health().started_at.is_none());
 
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -1459,6 +1592,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("reader")))
@@ -1500,21 +1634,53 @@ mod tests {
             .unwrap()
             .map(|record| record.unwrap())
             .collect::<Vec<_>>();
-        let error = runtime
+        // A foundation of each collection is away: the views answer with
+        // what is here and name both, rather than refusing.
+        let (snapshot, relation_facts, message_facts, notes) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
-            .err()
-            .expect("an unavailable selected member must not become a partial success");
-        let unread = &error
-            .downcast_ref::<storage::IncompleteAttachedRead>()
-            .expect("preserve the typed incomplete observation")
-            .unread;
-        assert_eq!(unread.collection(), relations_source);
-        assert_eq!(unread.members().collect::<Vec<_>>(), vec![missing[0]]);
+            .unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains(&hex::encode(missing[0].raw)), "{notes:?}");
+        assert!(notes[1].contains(&hex::encode(missing[1].raw)), "{notes:?}");
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+            notes,
+        };
+        let listed = runtime
+            .block_on(list(&mut input, &ListOptions::new("reader")))
+            .unwrap();
+        assert_eq!(listed.entries.len(), 1);
+        assert_eq!(listed.entries[0].id, first_id);
+        assert_eq!(listed.notes.len(), 2);
+        // A person not found while a Relations foundation is away refuses,
+        // naming the gap, rather than answering as if nobody were there.
+        let unknown = runtime
+            .block_on(list(&mut input, &ListOptions::new("nobody")))
+            .unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains(&hex::encode(missing[0].raw)),
+            "{unknown:#}"
+        );
+        // So does a message not found in the inbox.
+        let absent = runtime
+            .block_on(ack(&mut input, &format!("{:x}", test_id(99)), "reader"))
+            .unwrap_err();
+        assert!(
+            format!("{absent:#}").contains(&hex::encode(missing[1].raw)),
+            "{absent:#}"
+        );
+        drop(input);
         let after = pile.snapshot().unwrap();
         assert_eq!(
             after
@@ -1524,12 +1690,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             before
         );
-        for handle in missing {
-            assert!(!after.contains_blob(handle).unwrap());
+        for handle in &missing {
+            assert!(!after.contains_blob(*handle).unwrap());
         }
         // Unlike the resident read above, demanding the missing selected
         // foundation starts the foreground Peer even when no provider has it.
         assert!(pile.health().started_at.is_some());
+        // A send reads no Message facts at all, so the stranded Message
+        // foundation is not even mentioned; the Relations one it read is.
+        let (snapshot, relation_facts, message_facts, notes) = runtime
+            .block_on(message_views(
+                &mut pile,
+                &owner,
+                relations_source,
+                message_source,
+                MessageRead::Skip,
+            ))
+            .unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let mut input = MessageStorage {
+            pile: &mut pile,
+            signer: &owner,
+            collection: message_source,
+            reader: &snapshot,
+            messages: &message_facts,
+            relations: &relation_facts,
+            notes,
+        };
+        let sent = runtime
+            .block_on(send(
+                &mut input,
+                &SendOptions {
+                    from: "reader",
+                    to: "reader",
+                    text: "sent while a foundation is away",
+                },
+            ))
+            .unwrap();
+        assert_eq!(sent.notes.len(), 1);
+        assert!(sent.notes[0].contains(&hex::encode(missing[0].raw)));
         pile.close().unwrap();
     }
 
@@ -1613,12 +1812,13 @@ mod tests {
 
         // A read takes what the worker attached and reads the fresh commits
         // in both chains from their own bytes; it publishes nothing.
-        let (_, relation_facts, message_facts) = runtime
+        let (_, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &message_owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         assert_eq!(
@@ -1635,12 +1835,13 @@ mod tests {
         // same facts, now through attachments alone.
         carry(&mut pile, &runtime, relations_source, &message_owner);
         carry(&mut pile, &runtime, message_source, &message_owner);
-        let (_, relation_facts, message_facts) = runtime
+        let (_, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &message_owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         assert_eq!(
@@ -2069,12 +2270,13 @@ mod tests {
         pile.commit(message_source, &owner, readable).unwrap();
         carry(&mut pile, &runtime, relations_source, &owner);
         carry(&mut pile, &runtime, message_source, &owner);
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -2084,6 +2286,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let listed = runtime
             .block_on(list(&mut input, &ListOptions::new("reader")))
@@ -2306,12 +2509,13 @@ mod tests {
         // Start with a carried view, then append facts no worker has seen.
         carry(&mut pile, &runtime, relations_source, &owner);
         carry(&mut pile, &runtime, message_source, &owner);
-        let (_old_reader, old_relations, old_messages) = runtime
+        let (_old_reader, old_relations, old_messages, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let later_person = test_id(65);
@@ -2343,12 +2547,13 @@ mod tests {
             .unwrap()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let (_, relation_facts, message_facts) = runtime
+        let (_, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let after = pile
@@ -2390,12 +2595,13 @@ mod tests {
             CollectionRecord::Map(_) | CollectionRecord::Merge(_)
         )));
         let bytes_after = std::fs::metadata(file.path()).unwrap().len();
-        let (_, relation_facts, message_facts) = runtime
+        let (_, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         assert_eq!(
@@ -2456,12 +2662,13 @@ mod tests {
         // send then ensures its own images before it returns, which is the
         // property under test.
         carry(&mut pile, &runtime, relations_source, &owner);
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -2471,6 +2678,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let mut sent = Vec::new();
         for text in ["first eager message", "second eager message"] {
@@ -2500,12 +2708,13 @@ mod tests {
             "the operation view stays frozen"
         );
 
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -2515,6 +2724,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let acknowledged = runtime
             .block_on(ack(&mut input, &fmt_id(sent[0]), "reader"))
@@ -2527,12 +2737,13 @@ mod tests {
         assert!(!read_by(&facts, sent[1], &[recipient]));
         assert!(!read_by(&message_facts, sent[0], &[recipient]));
 
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         let mut input = MessageStorage {
@@ -2542,6 +2753,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let acknowledged = runtime
             .block_on(ack_all(
@@ -2578,12 +2790,13 @@ mod tests {
         let message_source =
             crate::collection_names::open(&mut pile, DEFAULT_SCOPE_ID, owner.verifying_key())
                 .unwrap();
-        let (snapshot, relation_facts, message_facts) = runtime
+        let (snapshot, relation_facts, message_facts, _) = runtime
             .block_on(message_views(
                 &mut pile,
                 &owner,
                 relations_source,
                 message_source,
+                MessageRead::Resident,
             ))
             .unwrap();
         // This admitted but malformed input arrives after the operation's
@@ -2614,6 +2827,7 @@ mod tests {
             reader: &snapshot,
             messages: &message_facts,
             relations: &relation_facts,
+            notes: Vec::new(),
         };
         let error = runtime
             .block_on(input.update("failure witness", |_, _| Ok((Some(fragment), id))))

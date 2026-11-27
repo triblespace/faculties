@@ -12,6 +12,18 @@ fn fraction(numerator: usize, denominator: usize) -> f64 {
         100.0 * numerator as f64 / denominator as f64
     }
 }
+/// Deliver a report with the notes of what its read could not load.
+pub fn noted<T>(
+    answer: &crate::storage::Noted<T>,
+    out: &mut Out<'_>,
+    render: impl FnOnce(&T, &mut Out<'_>) -> Result<()>,
+) -> Result<()> {
+    for note in &answer.notes {
+        out.note(note.clone())?;
+    }
+    render(&answer.value, out)
+}
+
 pub fn health(report: &Health, out: &mut Out<'_>) -> Result<()> {
     out.line("=== KNOWLEDGE HEALTH: Research Health ===\n")?;
     out.line(format!("Logical entries:       {}", report.entries))?;

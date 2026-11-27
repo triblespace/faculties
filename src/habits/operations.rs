@@ -17,7 +17,7 @@ use triblespace::core::blob::encodings::succinctarchive::{
 };
 use triblespace::core::collection::{Collection, CollectionCommit, CollectionStoreExt};
 use triblespace::core::repo::pile::Pile;
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::prelude::*;
 
 #[derive(Clone, Debug)]
@@ -34,7 +34,13 @@ pub struct AddedHabit {
     pub supersedes: Vec<Id>,
     pub personas: Vec<Id>,
     pub sharing: Vec<Id>,
+    /// Over what the read could load: a definition held only in a foundation
+    /// that is away is neither present nor sharing, and committing the same
+    /// definition again changes nothing.
     pub already_present: bool,
+    /// What the reads behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct HabitObservation {
@@ -44,6 +50,9 @@ pub struct HabitObservation {
     /// carries several values. Each is read; none is chosen as the winner.
     pub alternatives: Vec<Habit>,
     pub superseded: bool,
+    /// What the reads behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 /// What one explicit `habit check` observed.
 #[derive(Clone, Debug)]
@@ -51,6 +60,9 @@ pub struct HabitCheck {
     /// Upper-case hex content identity of the Habit collection.
     pub collection: String,
     pub audit: habits::Audit,
+    /// Admitted foundations whose bytes could not be loaded: the audit reads
+    /// every other one.
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct EvaluatedHabit {
@@ -62,12 +74,18 @@ pub struct HabitList {
     pub entries: Vec<EvaluatedHabit>,
     pub observed_seconds: i64,
     pub superseded: usize,
+    /// What the reads behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct HabitOccurrence {
     pub habit: Id,
     pub label: String,
     pub event: Id,
+    /// What the reads behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct HabitStateChange {
@@ -75,6 +93,9 @@ pub struct HabitStateChange {
     pub label: String,
     pub event: Option<Id>,
     pub state: DeclaredState,
+    /// What the reads behind this answer could not load
+    /// ([`crate::storage::unread_foundations_note`]).
+    pub notes: Vec<String>,
 }
 
 impl Habits {
@@ -139,7 +160,14 @@ impl Habits {
                 })?;
                 let snapshot =
                     AcquiringReader::new(session.pile.snapshot()?, session.runtime.clone());
-                let facts = crate::storage::acquire_facts(&snapshot, rank9)?;
+                let (facts, unread) =
+                    crate::storage::acquire_facts_read(&snapshot, rank9)?.into_parts();
+                session
+                    .notes
+                    .extend(crate::storage::unread_foundations_note(
+                        "Relations",
+                        &unread,
+                    ));
                 for input in personas {
                     let input = input.trim();
                     targets.push(match Id::from_hex(input) {
@@ -192,6 +220,7 @@ impl Habits {
                 personas: targets,
                 sharing,
                 already_present,
+                notes: session.notes.clone(),
             })
         })
     }
@@ -206,6 +235,7 @@ impl Habits {
                 superseded: habits::is_superseded(&session.facts, id),
                 definition,
                 alternatives: readings.collect(),
+                notes: session.notes.clone(),
             })
         })
     }
@@ -213,11 +243,15 @@ impl Habits {
     /// true, stored predicates run in the pile directory after the frozen
     /// observation has been acquired and storage closed.
     pub fn list(&self, evaluate_conditions: bool) -> Result<HabitList> {
-        let (rows, superseded) = with_habits(&self.storage, false, |session| {
+        let (rows, superseded, notes) = with_habits(&self.storage, false, |session| {
             let rows = habits::rows(&session.reader, &session.facts)?;
             let ids = habits::definition_ids(&session.facts);
             let superseded = habits::superseded_definition_ids(&session.facts);
-            Ok((rows, ids.intersection(&superseded).count()))
+            Ok((
+                rows,
+                ids.intersection(&superseded).count(),
+                session.notes.clone(),
+            ))
         })?;
         let observed_seconds = (clock::tai_nanoseconds_now()? / 1_000_000_000) as i64;
         let entries = rows
@@ -232,6 +266,7 @@ impl Habits {
             entries,
             observed_seconds,
             superseded,
+            notes,
         })
     }
     pub fn done(&self, selector: &str) -> Result<HabitOccurrence> {
@@ -245,9 +280,14 @@ impl Habits {
                 habit: habit.id,
                 label: habit.label,
                 event,
+                notes: session.notes.clone(),
             })
         })
     }
+    /// Over what the read could load: a state head held only in a
+    /// foundation that is away is not superseded by this event and stays a
+    /// head beside it, which the activation reports as a fork once both are
+    /// here.
     pub fn set_state(&self, selector: &str, state: DeclaredState) -> Result<HabitStateChange> {
         with_habits(&self.storage, false, |session| {
             let definitions = habits::definitions(&session.reader, &session.facts)?;
@@ -271,6 +311,7 @@ impl Habits {
                 label: habit.label,
                 event,
                 state,
+                notes: session.notes.clone(),
             })
         })
     }
@@ -295,14 +336,31 @@ impl Habits {
             // bytes may arrive, but the admitted set stays this one observation.
             let admitted = collection.admitted(&reader)?;
             let mut facts = TribleSet::new();
+            let mut unread = Vec::new();
             for payload in admitted.members() {
-                facts += reader
-                    .get::<TribleSet, _>(payload)
-                    .context("read admitted Habit foundation")?;
+                match reader.get::<TribleSet, _>(payload) {
+                    Ok(read) => facts += read,
+                    // The acquisition could not bring these bytes: the audit
+                    // reads every other foundation and names this one. Bytes
+                    // that are here but form no archive still fail it.
+                    Err(_) if !reader.contains_blob(payload)? => unread.push(payload),
+                    Err(error) => {
+                        return Err(
+                            anyhow::Error::from(error).context("read admitted Habit foundation")
+                        )
+                    }
+                }
             }
             Ok(HabitCheck {
                 collection: hex::encode_upper(collection.handle().raw),
                 audit: habits::audit(&reader, &facts),
+                notes: crate::storage::unread_handles_note(
+                    "Habits",
+                    unread.iter().copied(),
+                    unread.len(),
+                )
+                .into_iter()
+                .collect(),
             })
         })
     }
@@ -316,6 +374,8 @@ struct HabitSession<'a> {
     signer: &'a SigningKey,
     facts: FactArchive,
     reader: AcquiringReader<FacultySnapshot>,
+    /// What the Habit (and, for `add`, Relations) reads could not load.
+    notes: Vec<String>,
 }
 
 impl HabitSession<'_> {
@@ -393,15 +453,29 @@ fn with_habits<T>(
             pile.snapshot().context("freeze Habit fact collection")?,
             runtime.clone(),
         );
-        let facts = crate::storage::acquire_facts(&reader, maintained_rank9)
-            .context("read maintained Habit fact collection")?;
-        operation(&mut HabitSession {
+        // Every command reads what is here: a foundation the
+        // acquisition could not bring is named beside the answer, and a
+        // selector that finds nothing says so with it.
+        let (facts, unread) = crate::storage::acquire_facts_read(&reader, maintained_rank9)
+            .context("read maintained Habit fact collection")?
+            .into_parts();
+        let mut session = HabitSession {
             pile,
             runtime,
             collection,
             signer,
             facts,
             reader,
+            notes: crate::storage::unread_foundations_note("Habits", &unread)
+                .into_iter()
+                .collect(),
+        };
+        let result = operation(&mut session);
+        result.map_err(|error| {
+            session
+                .notes
+                .iter()
+                .fold(error, |error, note| error.context(note.clone()))
         })
     })
 }

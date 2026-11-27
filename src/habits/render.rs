@@ -21,7 +21,16 @@ fn persona_targets(personas: &[Id]) -> String {
     }
 }
 
+/// Deliver the notes of what a read could not load beside its answer.
+fn notes(notes: &[String], out: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        out.note(note.clone())?;
+    }
+    Ok(())
+}
+
 pub fn added(receipt: &AddedHabit, out: &mut Out<'_>) -> Result<()> {
+    notes(&receipt.notes, out)?;
     if receipt.already_present {
         out.line(format!("Habit already present [{:x}]", receipt.id))?;
         return out.line(format!(
@@ -69,6 +78,7 @@ pub fn added(receipt: &AddedHabit, out: &mut Out<'_>) -> Result<()> {
 /// One block per reading. A definition with a single reading renders exactly
 /// as it always has; further readings follow, each complete.
 pub fn shown(observation: &HabitObservation, out: &mut Out<'_>) -> Result<()> {
+    notes(&observation.notes, out)?;
     shown_reading(&observation.definition, observation.superseded, out)?;
     let total = observation.alternatives.len() + 1;
     for (index, habit) in observation.alternatives.iter().enumerate() {
@@ -119,6 +129,7 @@ fn shown_reading(habit: &Habit, superseded: bool, out: &mut Out<'_>) -> Result<(
 /// here is a verdict, so the command succeeds whatever it observed.
 pub fn checked(check: &HabitCheck, out: &mut Out<'_>) -> Result<()> {
     let audit = &check.audit;
+    notes(&check.notes, out)?;
     out.line(format!(
         "Habit collection {} (scope {:X}): {} definitions ({} live, {} carrying their own script), {} completions, {} state assertions read",
         check.collection,
@@ -136,10 +147,12 @@ pub fn checked(check: &HabitCheck, out: &mut Out<'_>) -> Result<()> {
 }
 
 pub fn completed(receipt: &HabitOccurrence, out: &mut Out<'_>) -> Result<()> {
+    notes(&receipt.notes, out)?;
     out.line(format!("done {} [{:x}]", receipt.label, receipt.event))
 }
 
 pub fn state_changed(receipt: &HabitStateChange, out: &mut Out<'_>) -> Result<()> {
+    notes(&receipt.notes, out)?;
     match receipt.event {
         Some(id) => out.line(format!(
             "{} {} [{id:x}]",
@@ -172,6 +185,9 @@ fn state_detail(state: &State) -> Option<String> {
 pub struct Listing {
     pub text: String,
     pub diagnostics: Vec<String>,
+    /// What the read could not load: delivered beside the text as notes,
+    /// never as a failed evaluation.
+    pub notes: Vec<String>,
 }
 
 /// Format already observed/evaluated rows. No predicates run while rendering.
@@ -284,5 +300,9 @@ pub fn listed(report: &HabitList, only_due: bool) -> Listing {
         )
         .unwrap();
     }
-    Listing { text, diagnostics }
+    Listing {
+        text,
+        diagnostics,
+        notes: report.notes.clone(),
+    }
 }

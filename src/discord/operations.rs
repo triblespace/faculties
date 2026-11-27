@@ -557,7 +557,14 @@ impl Discord {
             }
             return Ok(token.clone());
         }
-        self.open_token(self.auth_status()?.selected()?)
+        // Strict: a newer binding held in a foundation that is away would
+        // otherwise leave the previous bot's still-valid token selected, and
+        // the send would post as that bot. `auth status` reads what is here;
+        // choosing whom to post as does not.
+        let secret = self
+            .storage()
+            .with_session(|session| discord_model::auth_status(&session.facts).selected())?;
+        self.open_token(secret)
     }
     /// Post literal text, after proving collection WRITE admission, then persist the returned observation.
     pub fn send(&self, channel_id: &str, text: &str) -> Result<SendReceipt> {
@@ -1332,7 +1339,7 @@ impl DiscordStorage<'_> {
     }
 
     /// A session over what this observation could load, naming the rest in
-    /// [`DiscordSession::unread`] (JP, 2026-11-26): every read and pull.
+    /// [`DiscordSession::unread`]: every read and pull.
     fn with_session_read<T>(
         &self,
         operation: impl FnOnce(&mut DiscordSession<'_>) -> Result<T>,
@@ -5387,6 +5394,53 @@ mod tests {
         test_storage(storage)
             .with_session(|session| Ok(session.collection))
             .unwrap()
+    }
+
+    /// Two valid bot credentials, the newer binding stranded on another
+    /// host: `auth status` answers over what is here and names the gap, but
+    /// choosing the token to post with refuses rather than posting as the
+    /// previous bot.
+    #[test]
+    fn a_stranded_newer_auth_binding_never_selects_the_previous_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let (pile, key) = fresh_storage(&directory);
+        let storage = crate::storage::Storage::shared(pile, Some(key));
+        let operations = Discord::with_storage(storage.clone());
+        let secrets = crate::secrets::Secrets::with_storage(storage.clone());
+        let first = secrets.add("bot", b"synthetic-first-token").unwrap();
+        let revision = operations.auth_set(first).unwrap();
+        assert_eq!(
+            operations.token().unwrap().as_str(),
+            "synthetic-first-token"
+        );
+        let second = secrets.add("bot", b"synthetic-second-token").unwrap();
+        let collection = discord_collection(&storage);
+        let away = storage
+            .with_pile(|pile, signer| {
+                crate::storage::residual_fixture::strand(
+                    pile,
+                    collection,
+                    signer,
+                    discord_model::auth_fragment(second, [revision]),
+                )
+            })
+            .unwrap();
+        let away_hex = hex::encode(away.raw);
+
+        let (status, notes) = operations.auth_status_read().unwrap();
+        assert_eq!(status.selected().unwrap(), first);
+        assert!(
+            notes.iter().any(|note| note.contains(&away_hex)),
+            "{notes:?}"
+        );
+        let error = operations.token().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("synthetic-first-token"));
     }
 
     /// 26 November 2026: five foundations written on another host stranded

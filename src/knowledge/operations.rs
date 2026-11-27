@@ -26,7 +26,9 @@ use crate::knowledge::{
 use crate::schemas::files::DEFAULT_SCOPE_ID as FILES_SCOPE_ID;
 use crate::schemas::files::{file, KIND_FILE};
 use crate::schemas::wiki::{self as schema, extract_link_targets};
-use crate::storage::{read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Storage};
+use crate::storage::{
+    read, AcquiringReader, FactArchive, FacultySnapshot, FacultyStore, Noted, Storage,
+};
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(test)]
 use hifitime::Epoch;
@@ -101,19 +103,54 @@ impl Knowledge {
     pub fn with_storage(storage: Storage) -> Self {
         Self { storage }
     }
+    /// Strict: every selected foundation is read, or the command refuses.
+    /// For a write that supersedes the frontier it saw (edit, tag, archive,
+    /// restore, revert, the importers), where a newer head held in a
+    /// foundation that is away would be forked past without the writer
+    /// knowing it, and for whole-collection exports a caller keeps.
     fn storage(&self) -> KnowledgeStorage<'_> {
         KnowledgeStorage {
             storage: &self.storage,
+            notes: None,
+        }
+    }
+
+    /// Over what is here: `operation` reads what this
+    /// observation could load, and the answer carries a note naming each
+    /// foundation it could not. Not finding something while one is away
+    /// refuses with the note, rather than answering "none".
+    fn read<T>(
+        &self,
+        operation: impl FnOnce(KnowledgeStorage<'_>) -> Result<T>,
+    ) -> Result<Noted<T>> {
+        let notes = std::cell::RefCell::new(Vec::new());
+        let result = operation(KnowledgeStorage {
+            storage: &self.storage,
+            notes: Some(&notes),
+        });
+        let notes = notes.into_inner();
+        match result {
+            Ok(value) => Ok(Noted { value, notes }),
+            Err(error) => Err(crate::storage::with_unread_notes(error, &notes)),
         }
     }
     pub fn create(&self, title: &str, content: &str, tags: &[String], force: bool) -> Result<Id> {
-        cmd_create(
-            self.storage(),
-            title.into(),
-            content.into(),
-            tags.to_vec(),
-            force,
-        )
+        self.create_noted(title, content, tags, force)
+            .map(|created| created.value)
+    }
+    /// [`Self::create`], with the notes of what its read could not load. A
+    /// new entry supersedes nothing, so it is written over what is here: its
+    /// links and tags resolve against what this observation could load, and
+    /// a link it cannot find while a foundation is away refuses with the
+    /// note.
+    pub fn create_noted(
+        &self,
+        title: &str,
+        content: &str,
+        tags: &[String],
+        force: bool,
+    ) -> Result<Noted<Id>> {
+        self.read(|storage| cmd_create(storage, title.into(), content.into(), tags.to_vec(), force))
     }
     pub fn edit(
         &self,
@@ -132,14 +169,14 @@ impl Knowledge {
             force,
         )
     }
-    pub fn show(&self, id: &str, exact: bool) -> Result<String> {
-        cmd_show(self.storage(), id.into(), exact)
+    pub fn show(&self, id: &str, exact: bool) -> Result<Noted<String>> {
+        self.read(|storage| cmd_show(storage, id.into(), exact))
     }
-    pub fn export(&self, id: &str, exact: bool) -> Result<Export> {
-        cmd_export(self.storage(), id.into(), exact)
+    pub fn export(&self, id: &str, exact: bool) -> Result<Noted<Export>> {
+        self.read(|storage| cmd_export(storage, id.into(), exact))
     }
-    pub fn diff(&self, id: &str, from: Option<usize>, to: Option<usize>) -> Result<String> {
-        cmd_diff(self.storage(), id.into(), from, to)
+    pub fn diff(&self, id: &str, from: Option<usize>, to: Option<usize>) -> Result<Noted<String>> {
+        self.read(|storage| cmd_diff(storage, id.into(), from, to))
     }
     pub fn archive(&self, id: &str) -> Result<Option<Id>> {
         self.tag(id, "archived", true)
@@ -157,33 +194,42 @@ impl Knowledge {
         strict: bool,
         out: &mut Out<'_>,
     ) -> Result<()> {
-        cmd_links(self.storage(), id.map(str::to_owned), top, strict, out)
+        let done =
+            self.read(|storage| cmd_links(storage, id.map(str::to_owned), top, strict, out))?;
+        deliver_notes(&done.notes, out)
     }
-    pub fn list(&self, options: &ListOptions) -> Result<String> {
-        cmd_list(
-            self.storage(),
-            options.tags.clone(),
-            options.with_backlink_tag.clone(),
-            options.without_backlink_tag.clone(),
-            options.with_backlink_type.clone(),
-            options.without_backlink_type.clone(),
-            options.all,
-        )
+    pub fn list(&self, options: &ListOptions) -> Result<Noted<String>> {
+        self.read(|storage| {
+            cmd_list(
+                storage,
+                options.tags.clone(),
+                options.with_backlink_tag.clone(),
+                options.without_backlink_tag.clone(),
+                options.with_backlink_type.clone(),
+                options.without_backlink_type.clone(),
+                options.all,
+            )
+        })
     }
-    pub fn history(&self, id: &str) -> Result<String> {
-        cmd_history(self.storage(), id.into())
+    pub fn history(&self, id: &str) -> Result<Noted<String>> {
+        self.read(|storage| cmd_history(storage, id.into()))
     }
     pub fn tag(&self, id: &str, name: &str, add: bool) -> Result<Option<Id>> {
         mutate_tags(self.storage(), id.into(), name, add)
     }
     pub fn tags(&self, out: &mut Out<'_>) -> Result<()> {
-        cmd_tag_list(self.storage(), out)
+        let done = self.read(|storage| cmd_tag_list(storage, out))?;
+        deliver_notes(&done.notes, out)
     }
+    /// A tag is minted once per name over what is here: a name held only in
+    /// a foundation that is away is minted again, as the same content-derived
+    /// tag.
     pub fn mint_tag(&self, name: &str) -> Result<Id> {
-        cmd_tag_mint(self.storage(), name.into())
+        self.read(|storage| cmd_tag_mint(storage, name.into()))
+            .map(|minted| minted.value)
     }
-    pub fn search(&self, query: &str, context: bool, all: bool) -> Result<String> {
-        cmd_search(self.storage(), query.into(), context, all)
+    pub fn search(&self, query: &str, context: bool, all: bool) -> Result<Noted<String>> {
+        self.read(|storage| cmd_search(storage, query.into(), context, all))
     }
     pub fn search_hits(
         &self,
@@ -203,14 +249,18 @@ impl Knowledge {
     /// Rank current revisions by meaning, binding the model the environment
     /// names.
     #[cfg(feature = "wemm")]
-    pub fn similar(&self, query: &str) -> Result<String> {
+    pub fn similar(&self, query: &str) -> Result<Noted<String>> {
         self.storage.require_ambient_models("knowledge similar")?;
         self.similar_with(&crate::wemm::Session::from_env(self.storage.path())?, query)
     }
     /// [`Self::similar`] with a model already bound.
     #[cfg(feature = "wemm")]
-    pub fn similar_with(&self, session: &crate::wemm::Session, query: &str) -> Result<String> {
-        cmd_similar(self.storage(), session, query.into())
+    pub fn similar_with(
+        &self,
+        session: &crate::wemm::Session,
+        query: &str,
+    ) -> Result<Noted<String>> {
+        self.read(|storage| cmd_similar(storage, session, query.into()))
     }
     /// Every current revision's best WeMM cosine to `query`, highest first:
     /// the scores [`Self::similar_with`] prints the top of, for a host that
@@ -225,17 +275,24 @@ impl Knowledge {
         similar_scores(self.storage(), session, query)
     }
     #[cfg(not(feature = "wemm"))]
-    pub fn similar(&self, _query: &str) -> Result<String> {
+    pub fn similar(&self, _query: &str) -> Result<Noted<String>> {
         crate::wemm_unavailable()
     }
     pub fn check(&self, compile: bool, out: &mut Out<'_>) -> Result<()> {
-        cmd_check(self.storage(), compile, out)
+        let done = self.read(|storage| cmd_check(storage, compile, out))?;
+        deliver_notes(&done.notes, out)
     }
     pub fn fix_truncated(&self, input: &str, out: &mut Out<'_>) -> Result<()> {
         cmd_fix_truncated(self.storage(), input.into(), out)
     }
+    /// A lint that only reports reads what is here; `--fix` rewrites entries,
+    /// so it supersedes what it saw and stays strict.
     pub fn lint(&self, fix: bool, check: bool, out: &mut Out<'_>) -> Result<()> {
-        cmd_lint(self.storage(), fix, check, out)
+        if fix {
+            return cmd_lint(self.storage(), fix, check, out);
+        }
+        let done = self.read(|storage| cmd_lint(storage, fix, check, out))?;
+        deliver_notes(&done.notes, out)
     }
     pub fn import_texts(&self, documents: Vec<ImportDocument>, tags: &[String]) -> Result<Vec<Id>> {
         cmd_import(self.storage(), documents, tags.to_vec())
@@ -311,6 +368,24 @@ impl Knowledge {
 #[derive(Clone, Copy)]
 struct KnowledgeStorage<'a> {
     storage: &'a Storage,
+    /// Where a read over what is here leaves the notes of what it could not
+    /// load; `None` reads strictly, refusing an observation that misses a
+    /// foundation ([`Knowledge::storage`]).
+    notes: Option<&'a std::cell::RefCell<Vec<String>>>,
+}
+
+/// Deliver the notes of what a read could not load beside its answer.
+pub(super) fn deliver_notes(notes: &[String], out: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        out.note(note.clone())?;
+    }
+    Ok(())
+}
+
+/// Deliver a text answer and the notes of what its read could not load.
+pub(super) fn noted_text(answer: Noted<String>, out: &mut Out<'_>) -> Result<()> {
+    deliver_notes(&answer.notes, out)?;
+    out.text(answer.value)
 }
 
 #[derive(Clone)]
@@ -359,7 +434,15 @@ impl KnowledgeStorage<'_> {
                 )?;
                 auxiliaries.push((collection, label));
             }
-            views_in(pile, source, signer, &auxiliaries, runtime, prepare)
+            views_in(
+                pile,
+                source,
+                signer,
+                &auxiliaries,
+                runtime,
+                self.notes,
+                prepare,
+            )
         })
     }
 
@@ -428,6 +511,7 @@ fn views_in<T>(
     _signer: &ed25519_dalek::SigningKey,
     scopes: &[(Collection<blobencodings::SimpleArchive>, &str)],
     runtime: &std::sync::Arc<tokio::runtime::Runtime>,
+    notes: Option<&std::cell::RefCell<Vec<String>>>,
     mut prepare: impl FnMut(&KnowledgeView, &[FactArchive]) -> Result<T>,
 ) -> Result<T> {
     let knowledge_succinct = pile
@@ -464,21 +548,52 @@ fn views_in<T>(
     // never silently turn a selected-but-unread foundation into absence.
     // An unseen later commit can still branch an edit's history. The edit
     // ensures its own images after it commits.
-    let facts = crate::storage::acquire_attached_facts(&observed_facts)
-        .context("read Knowledge fact collection")?;
+    //
+    // With a notes sink the read is over what is here instead: a foundation
+    // the acquisition could not bring is named in a note, not refused.
+    let mut unread_notes = Vec::new();
+    let mut keep =
+        |unread: triblespace::core::collection::Support<blobencodings::SimpleArchive>,
+         label: &str|
+         -> Result<()> {
+            if notes.is_none() && !unread.is_empty() {
+                return Err(crate::storage::IncompleteAttachedRead { unread }.into());
+            }
+            unread_notes.extend(crate::storage::unread_foundations_note(label, &unread));
+            Ok(())
+        };
+    let (facts, unread_facts) = crate::storage::acquire_attached_facts_read(&observed_facts)
+        .context("read Knowledge fact collection")?
+        .into_parts();
     // The index over the same foundations the facts read: a revision no
-    // attachment reaches yet is built in memory.
-    let latest = crate::storage::require_complete_attached_read(
-        observed_latest
-            .read_acquiring::<LatestIndex>()
-            .context("read Knowledge supersession index")?,
-    )?;
+    // attachment reaches yet is built in memory. It stands on the facts'
+    // foundations, so it is named only for one the facts did not miss.
+    let (latest, unread_latest) = observed_latest
+        .read_acquiring::<LatestIndex>()
+        .context("read Knowledge supersession index")?
+        .into_parts();
+    let latest_beyond_facts = unread_latest
+        .members()
+        .any(|member| !unread_facts.contains(member));
+    keep(unread_facts, "Knowledge")?;
+    if latest_beyond_facts || notes.is_none() {
+        keep(unread_latest, "Knowledge supersession index")?;
+    }
     let mut auxiliary_facts = Vec::with_capacity(auxiliaries.len());
     for (rank9, label) in &auxiliaries {
-        auxiliary_facts.push(
-            crate::storage::acquire_facts(&acquiring, *rank9)
-                .with_context(|| format!("read {label} fact collection"))?,
-        );
+        let (facts, unread) = crate::storage::acquire_facts_read(&acquiring, *rank9)
+            .with_context(|| format!("read {label} fact collection"))?
+            .into_parts();
+        keep(unread, label)?;
+        auxiliary_facts.push(facts);
+    }
+    if let Some(sink) = notes {
+        let mut sink = sink.borrow_mut();
+        for note in unread_notes {
+            if !sink.contains(&note) {
+                sink.push(note);
+            }
+        }
     }
     let mut view = KnowledgeView {
         source: knowledge_source.handle(),
@@ -2777,12 +2892,20 @@ fn similar_scores(
         let query = crate::wemm::Query::Text(query);
         let scores = session.cosines(pile, source, &content_attributes(), runtime, query)?;
         scores.require_rows("Knowledge")?;
-        views_in(pile, source, signer, &[], runtime, |view, _| {
-            Ok((
-                similar_revisions(view, &scores.cosines),
-                scores.partial_note("Knowledge"),
-            ))
-        })
+        views_in(
+            pile,
+            source,
+            signer,
+            &[],
+            runtime,
+            storage.notes,
+            |view, _| {
+                Ok((
+                    similar_revisions(view, &scores.cosines),
+                    scores.partial_note("Knowledge"),
+                ))
+            },
+        )
     })
 }
 
@@ -2802,24 +2925,32 @@ fn cmd_similar(
         let query = crate::wemm::Query::Text(&query);
         let scores = session.cosines(pile, source, &content_attributes(), runtime, query)?;
         scores.require_rows("Knowledge")?;
-        views_in(pile, source, signer, &[], runtime, |view, _| {
-            let mut report = String::new();
-            for (score, revision) in similar_revisions(view, &scores.cosines)
-                .into_iter()
-                .take(10)
-            {
-                let title = knowledge_model::revision_records(&view.facts, revision)
-                    .first()
-                    .map(|row| revision_title(&view.reader, row))
-                    .transpose()?
-                    .unwrap_or_default();
-                writeln!(report, "{score:6.3}  {revision:x}  {title}").unwrap();
-            }
-            if let Some(note) = scores.partial_note("Knowledge") {
-                writeln!(report, "{note}").unwrap();
-            }
-            Ok(report)
-        })
+        views_in(
+            pile,
+            source,
+            signer,
+            &[],
+            runtime,
+            storage.notes,
+            |view, _| {
+                let mut report = String::new();
+                for (score, revision) in similar_revisions(view, &scores.cosines)
+                    .into_iter()
+                    .take(10)
+                {
+                    let title = knowledge_model::revision_records(&view.facts, revision)
+                        .first()
+                        .map(|row| revision_title(&view.reader, row))
+                        .transpose()?
+                        .unwrap_or_default();
+                    writeln!(report, "{score:6.3}  {revision:x}  {title}").unwrap();
+                }
+                if let Some(note) = scores.partial_note("Knowledge") {
+                    writeln!(report, "{note}").unwrap();
+                }
+                Ok(report)
+            },
+        )
     })
 }
 
@@ -2962,6 +3093,7 @@ mod tests {
         fn storage(&self) -> KnowledgeStorage<'_> {
             KnowledgeStorage {
                 storage: &self.storage,
+                notes: None,
             }
         }
 
@@ -2980,6 +3112,116 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    /// Plant one more Knowledge foundation through the raw pile, returning
+    /// its handle in hex.
+    fn plant_knowledge(
+        fixture: &Fixture,
+        plant: impl FnOnce(
+            &mut triblespace::core::repo::pile::Pile,
+            Collection<blobencodings::SimpleArchive>,
+            &ed25519_dalek::SigningKey,
+        )
+            -> Result<Inline<inlineencodings::Handle<blobencodings::SimpleArchive>>>,
+    ) -> String {
+        let handle = fixture
+            .storage
+            .with_pile(|pile, signer| {
+                let source =
+                    open_configured(pile, schema::DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                plant(pile, source, signer)
+            })
+            .unwrap();
+        hex::encode(handle.raw)
+    }
+
+    /// A Knowledge foundation stranded on another host: reads
+    /// and a new entry answer over what is here and name it; a write that
+    /// supersedes the frontier it saw still refuses, because a newer head
+    /// may be held in the foundation that is away.
+    #[test]
+    fn reads_go_on_while_a_knowledge_foundation_is_away() {
+        let fixture = Fixture::new();
+        let knowledge = Knowledge::with_storage(fixture.storage.clone());
+        let here = knowledge
+            .create("resident page", "Resident body.", &[], false)
+            .unwrap();
+        let (away_tag, _, _) = knowledge_model::tag_record("away tag").unwrap();
+        let away = plant_knowledge(&fixture, |pile, source, signer| {
+            crate::storage::residual_fixture::strand(pile, source, signer, away_tag)
+        });
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+        let selector = format!("{here:x}");
+
+        // (a) A new entry supersedes nothing: it is written, naming the gap.
+        let created = knowledge
+            .create_noted("added meanwhile", "Added body.", &[], false)
+            .unwrap();
+        assert!(named(&created.notes), "{:?}", created.notes);
+
+        // (b) Reads answer over what is here and name it.
+        let shown = knowledge.show(&selector, false).unwrap();
+        assert!(shown.contains("Resident body.") && named(&shown.notes));
+        let listed = knowledge.list(&ListOptions::default()).unwrap();
+        assert!(listed.contains("resident page") && listed.contains("added meanwhile"));
+        assert!(named(&listed.notes));
+        assert!(named(&knowledge.history(&selector).unwrap().notes));
+        assert!(named(
+            &knowledge.search("Resident", false, false).unwrap().notes
+        ));
+        let health =
+            crate::knowledge::health::KnowledgeHealth::with_storage(fixture.storage.clone());
+        assert!(named(&health.health().unwrap().notes));
+        let mut parts = Vec::new();
+        knowledge
+            .tags(&mut Out::new(&mut |part| {
+                parts.push(part);
+                Ok(())
+            }))
+            .unwrap();
+        assert!(
+            parts.iter().any(|part| format!("{part:?}").contains(&away)),
+            "{parts:?}"
+        );
+
+        // Not finding an entry while a foundation is away says so.
+        let missing = knowledge.show("0123456789abcdef", false).unwrap_err();
+        assert!(format!("{missing:#}").contains(&away), "{missing:#}");
+
+        // (d) Superseding writes stay strict.
+        let edit = knowledge
+            .edit(&selector, Some("Edited body."), None, &[], false)
+            .unwrap_err();
+        assert!(
+            edit.downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{edit:#}"
+        );
+        assert!(knowledge.archive(&selector).is_err());
+    }
+
+    #[test]
+    fn a_malformed_knowledge_foundation_fails_reads_loudly() {
+        let fixture = Fixture::new();
+        let knowledge = Knowledge::with_storage(fixture.storage.clone());
+        let here = knowledge
+            .create("resident page", "Resident body.", &[], false)
+            .unwrap();
+        plant_knowledge(&fixture, crate::storage::residual_fixture::malformed);
+        let error = knowledge.show(&format!("{here:x}"), false).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_none(),
+            "a fault is not an unread gap: {error:#}"
+        );
+        assert!(knowledge.list(&ListOptions::default()).is_err());
+        assert!(
+            crate::knowledge::health::KnowledgeHealth::with_storage(fixture.storage.clone())
+                .health()
+                .is_err()
+        );
     }
 
     #[test]
@@ -3100,7 +3342,7 @@ mod tests {
         let owner_read = || {
             storage
                 .with_pile(|pile, signer, runtime| {
-                    views_in(pile, source, signer, &[], runtime, |view, _| {
+                    views_in(pile, source, signer, &[], runtime, None, |view, _| {
                         Ok(view.clone())
                     })
                 })
@@ -3228,6 +3470,7 @@ mod tests {
                         signer,
                         &[(auxiliary, "Files")],
                         runtime,
+                        None,
                         |view, auxiliaries| {
                             let entry = knowledge_model::entry(&view.facts, &view.latest, root).unwrap();
                             assert_eq!(
@@ -3294,6 +3537,7 @@ mod tests {
                         signer,
                         &[(auxiliary, "Files")],
                         runtime,
+                        None,
                         |_, _| -> Result<()> {
                             panic!("an incomplete observation must not reach the reader")
                         },

@@ -603,23 +603,48 @@ impl Spawn {
                 pile.snapshot().context("freeze the colony observation")?,
                 runtime.clone(),
             );
+            // Each role reads what is here: the view is the
+            // colony as these foundations hold it, and each one the read
+            // could not load is named among the unreadable sources.
+            let labels = ["Spawn", "Message", "Relations", "Goals"];
+            let mut notes = Vec::new();
+            let mut unread_goals = None;
             let facts: Vec<Result<FactArchive, String>> = registered
                 .iter()
-                .map(|registered| match registered {
-                    Ok((_, rank9)) => {
-                        crate::storage::acquire_facts(&reader, *rank9).map_err(|e| format!("{e:#}"))
-                    }
+                .zip(labels)
+                .map(|(registered, label)| match registered {
+                    Ok((_, rank9)) => crate::storage::acquire_facts_read(&reader, *rank9)
+                        .map(|read| {
+                            let (facts, unread) = read.into_parts();
+                            notes.extend(crate::storage::unread_foundations_note(label, &unread));
+                            if label == "Goals" {
+                                unread_goals = Some(unread);
+                            }
+                            facts
+                        })
+                        .map_err(|e| format!("{e:#}")),
                     Err(error) => Err(error.clone()),
                 })
                 .collect();
             let status: Result<LwwQuery, String> = register_target.and_then(|target| {
                 (|| -> Result<LwwQuery> {
-                    Ok(crate::storage::require_complete_attached_read(
-                        reader
-                            .attached_acquiring(target)?
-                            .read_acquiring::<LwwIndex>()?,
-                    )?
-                    .query()?)
+                    let (status, unread) = reader
+                        .attached_acquiring(target)?
+                        .read_acquiring::<LwwIndex>()?
+                        .into_parts();
+                    // The status register stands on the Goals foundations:
+                    // name it only for one the facts did not miss.
+                    if unread.members().any(|member| {
+                        !unread_goals
+                            .as_ref()
+                            .is_some_and(|goals| goals.contains(member))
+                    }) {
+                        notes.extend(crate::storage::unread_foundations_note(
+                            "Goals status",
+                            &unread,
+                        ));
+                    }
+                    Ok(status.query()?)
                 })()
                 .map_err(|e| format!("{e:#}"))
             });
@@ -636,13 +661,9 @@ impl Spawn {
                     .unwrap_or_else(|error| format!("unreadable: {error:#}"))
             };
             let observe: &dyn Fn(&str) -> String = &observe;
-            Ok(colony_view(
-                roles,
-                &reader,
-                observed_at,
-                Some(observe),
-                options,
-            ))
+            let mut view = colony_view(roles, &reader, observed_at, Some(observe), options);
+            view.unreadable.extend(notes);
+            Ok(view)
         })
     }
 }

@@ -117,7 +117,12 @@ pub fn run() -> Result<()> {
             let due = matches!(command, Command::Due);
             let report = habits.list(true)?;
             let listing = render::listed(&report, due);
-            crate::cli::with_output("habit", |out| out.text(listing.text))?;
+            crate::cli::with_output("habit", |out| {
+                for note in &listing.notes {
+                    out.note(note.clone())?;
+                }
+                out.text(listing.text)
+            })?;
             if !listing.diagnostics.is_empty() {
                 crate::cli::with_diagnostic_output("habit", |out| {
                     for message in &listing.diagnostics {

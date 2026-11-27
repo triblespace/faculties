@@ -564,7 +564,7 @@ impl GoalsStorage<'_> {
 
     /// [`Self::with_view`] over what this observation could load, with a
     /// note for each of the facts and the status register that left
-    /// something out (JP, 2026-11-26): every board and lookup.
+    /// something out: every board and lookup.
     fn with_view_read<T>(
         &self,
         f: impl FnMut(&FactArchive, &AcquiringReader<FacultySnapshot>, &LwwQuery) -> Result<T>,

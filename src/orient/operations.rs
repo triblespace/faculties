@@ -1253,6 +1253,10 @@ struct OrientObservation {
     facts: OrientFacts,
     goals_status: LwwQuery,
     goals_status_collection: AttachedSnapshot<FacultySnapshot, LwwRegisterBlob>,
+    /// What this observation could not load
+    /// ([`crate::storage::unread_foundations_note`]): every answer it gives
+    /// is over what is here, and these say what that omits.
+    notes: Vec<String>,
 }
 
 impl OrientObservation {
@@ -1396,6 +1400,7 @@ fn observe_sources(
         },
         goals_status,
         goals_status_collection: status_collection,
+        notes: Vec::new(),
     })
 }
 
@@ -1465,6 +1470,16 @@ fn start_observation(
         if let Some(control) = &control {
             reader = reader.with_control(control.clone());
         }
+        // Each source reads what is here: a foundation the
+        // acquisition could not bring is named in the observation's notes,
+        // and its handle joins the payload read-set, so the observation stops
+        // being current -- and a waiting watcher looks again -- the moment its
+        // bytes arrive. Receipts are per event, so nothing held only there is
+        // receipted meanwhile: it is news when it can be read.
+        let unread = std::cell::RefCell::new(Vec::<(
+            &'static str,
+            triblespace::core::collection::Support<SimpleArchive>,
+        )>::new());
         // The stage lines are the refresh probe's evidence of which targets a
         // refresh attached again; the acquiring reader must keep emitting them.
         let observe = |source: OrientSource| -> Result<OrientFact> {
@@ -1474,9 +1489,13 @@ fn start_observation(
             let collection = trace_refresh_call(source.label, "attach", || {
                 reader.attached_acquiring(source.rank9)
             })?;
-            let view = trace_refresh_call(source.label, "view", || {
-                crate::storage::acquire_attached_facts(&collection)
-            })?;
+            let (view, missing) = trace_refresh_call(source.label, "view", || {
+                crate::storage::acquire_attached_facts_read(&collection)
+            })?
+            .into_parts();
+            if !missing.is_empty() {
+                unread.borrow_mut().push((source.label, missing));
+            }
             Ok(OrientFact {
                 collection: collection.into_frozen(),
                 view,
@@ -1504,29 +1523,51 @@ fn start_observation(
         let status_collection = trace_refresh_call("Goals status", "attach", || {
             reader.attached_acquiring(status_target)
         })?;
-        let status_index = trace_refresh_call("Goals status", "view", || {
-            crate::storage::require_complete_attached_read(
-                status_collection.read_acquiring::<LwwIndex>()?,
-            )
-        })?;
+        let (status_index, unread_status) = trace_refresh_call("Goals status", "view", || {
+            status_collection.read_acquiring::<LwwIndex>()
+        })?
+        .into_parts();
+        let facts = OrientFacts {
+            messages: observe(messages)?,
+            mail: observe(mail)?,
+            teams: observe(teams)?,
+            discord: observe(discord)?,
+            goals: observe(goals)?,
+            relations: observe(relations)?,
+            habits: habits.map(observe).transpose()?,
+            presentations: ReceiptObservation {
+                collection: presentations,
+                view: presentation_view,
+            },
+        };
+        let mut unread = unread.into_inner();
+        // The status register stands on the Goals foundations: name it only
+        // for one the Goals facts did not miss.
+        if unread_status.members().any(|member| {
+            !unread
+                .iter()
+                .any(|(label, missing)| *label == "Goals" && missing.contains(member))
+        }) {
+            unread.push(("Goals status", unread_status));
+        }
+        let payloads = DependencyTracker::default();
+        let mut notes = Vec::new();
+        {
+            let mut read_set = payloads.lock().expect("payload read-set is not poisoned");
+            for (label, missing) in &unread {
+                notes.extend(crate::storage::unread_foundations_note(label, missing));
+                for member in missing.members() {
+                    read_set.blobs.insert(Inline::new(member.raw));
+                }
+            }
+        }
         Ok(OrientObservation {
             snapshot,
-            payloads: DependencyTracker::default(),
-            facts: OrientFacts {
-                messages: observe(messages)?,
-                mail: observe(mail)?,
-                teams: observe(teams)?,
-                discord: observe(discord)?,
-                goals: observe(goals)?,
-                relations: observe(relations)?,
-                habits: habits.map(observe).transpose()?,
-                presentations: ReceiptObservation {
-                    collection: presentations,
-                    view: presentation_view,
-                },
-            },
+            payloads,
+            facts,
             goals_status: trace_refresh_call("Goals status", "query", || status_index.query())?,
             goals_status_collection: status_collection.into_frozen(),
+            notes,
         })
     })
 }
@@ -1599,22 +1640,37 @@ impl GoalsSources {
         snapshot: &FacultySnapshot,
         doing: usize,
         todo: usize,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<String>)> {
         let frozen = snapshot.clone();
         let runtime = tokio::runtime::Handle::current();
-        let (facts, status) = tokio::task::spawn_blocking(move || {
+        // Over what is here: the overview names each Goals
+        // foundation it could not load instead of refusing the wake.
+        let (facts, status, notes) = tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
-            let facts = crate::storage::acquire_facts(&reader, self.facts.rank9)?;
-            let index = crate::storage::require_complete_attached_read(
-                reader
-                    .attached_acquiring(self.status)?
-                    .read_acquiring::<LwwIndex>()?,
-            )?;
-            Ok::<_, anyhow::Error>((facts, index.query()?))
+            let (facts, unread_facts) =
+                crate::storage::acquire_facts_read(&reader, self.facts.rank9)?.into_parts();
+            let (index, unread_status) = reader
+                .attached_acquiring(self.status)?
+                .read_acquiring::<LwwIndex>()?
+                .into_parts();
+            let mut notes: Vec<String> =
+                crate::storage::unread_foundations_note("Goals", &unread_facts)
+                    .into_iter()
+                    .collect();
+            if unread_status
+                .members()
+                .any(|member| !unread_facts.contains(member))
+            {
+                notes.extend(crate::storage::unread_foundations_note(
+                    "Goals status",
+                    &unread_status,
+                ));
+            }
+            Ok::<_, anyhow::Error>((facts, index.query()?, notes))
         })
         .await
         .context("join frozen Goals selection")??;
-        crate::storage::read_presentable(store, snapshot, |reader, unreadable| {
+        let text = crate::storage::read_presentable(store, snapshot, |reader, unreadable| {
             let query = GoalsQuery {
                 goals: &facts,
                 goals_status: &status,
@@ -1624,7 +1680,8 @@ impl GoalsSources {
             goals.push_str(&render_native_horizons(&query, unreadable)?);
             Ok(goals)
         })
-        .await
+        .await?;
+        Ok((text, notes))
     }
 }
 
@@ -4196,6 +4253,9 @@ async fn cmd_show(
             .await?;
         let health = health_sources.observe_acquiring(pile, signer).await?;
         let health_report = health.report_acquiring().await?;
+        for note in &health.notes {
+            output.note(note.clone())?;
+        }
         write_complete_report(
             output,
             &health_report.text,
@@ -4276,6 +4336,9 @@ async fn cmd_show(
             ),
         };
 
+        for note in &observation.notes {
+            output.note(note.clone())?;
+        }
         let mut report = String::new();
         writeln!(report, "Orient").unwrap();
         report.push_str(&messages);
@@ -4912,6 +4975,12 @@ async fn cmd_poll(
             }
             Err(error) => return Err(error),
         };
+        // News over what is here says so beside it; a quiet poll stays quiet.
+        if matches!(news, News::Report { .. }) {
+            for note in &observation.notes {
+                output.note(note.clone())?;
+            }
+        }
         apply_prepared_news(
             pile,
             signer,
@@ -5918,6 +5987,12 @@ async fn observe_wait(
         }
         .unwrap_or_default();
         let arm_fired = !arm_report.is_empty();
+        // News over what is here says so beside it; a quiet arm stays quiet.
+        if initial_report {
+            for note in &current.notes {
+                output.note(note.clone())?;
+            }
+        }
         apply_prepared_news(
             pile,
             signer,
@@ -6067,6 +6142,11 @@ async fn observe_wait(
                         .unwrap_or_default();
                         let habit_fired = !habit_report.is_empty();
                         let ordinary_fired = matches!(candidate.news, News::Report { .. });
+                        if ordinary_fired {
+                            for note in &candidate.observation.notes {
+                                output.note(note.clone())?;
+                            }
+                        }
                         apply_prepared_news(
                             pile,
                             signer,
@@ -6492,39 +6572,67 @@ async fn wake_selection(
     // shows afterward must not impose a historical receipt-read barrier.
     let frozen = snapshot.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (memory_facts, knowledge_view, topic_read) = tokio::task::spawn_blocking(move || {
-        let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
-        let memory_facts = crate::storage::acquire_facts(&reader, memory_collection.rank9)
-            .context("read selected Memory collection")?;
-        let Some((knowledge_rank9, knowledge_latest, topic_index)) = knowledge_inputs else {
-            return Ok((memory_facts, None, None));
-        };
-        let knowledge_facts = crate::storage::acquire_facts(&reader, knowledge_rank9)
-            .context("read selected Knowledge collection")?;
-        let knowledge_order = crate::storage::require_complete_attached_read(
-            reader
+    // The wake reads what is here: a foundation of Memory or
+    // Knowledge the acquisition could not bring is named among the cover's
+    // diagnostics, not a reason to wake with nothing.
+    let (memory_facts, knowledge_view, topic_read, unread_notes) =
+        tokio::task::spawn_blocking(move || {
+            let reader = crate::storage::AcquiringReader::with_handle(frozen, runtime);
+            let (memory_facts, unread_memory) =
+                crate::storage::acquire_facts_read(&reader, memory_collection.rank9)
+                    .context("read selected Memory collection")?
+                    .into_parts();
+            let mut notes: Vec<String> =
+                crate::storage::unread_foundations_note("Memory", &unread_memory)
+                    .into_iter()
+                    .collect();
+            let Some((knowledge_rank9, knowledge_latest, topic_index)) = knowledge_inputs else {
+                return Ok((memory_facts, None, None, notes));
+            };
+            let (knowledge_facts, unread_knowledge) =
+                crate::storage::acquire_facts_read(&reader, knowledge_rank9)
+                    .context("read selected Knowledge collection")?
+                    .into_parts();
+            let (knowledge_order, unread_order) = reader
                 .attached_acquiring(knowledge_latest)?
-                .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()?,
-        )
-        .context("read selected Knowledge supersession index")?;
-        // As in Archive search, keep a bounded part of a cold index. Later reads
-        // reuse those MAPs and ordinary collection maintenance can finish it.
-        let topic_read = topic_index.map(|target| -> Result<_> {
-            Ok(reader
-                .attached_acquiring(target?)?
-                .read_within::<knowledge_model::recall::TopicIndex>(
-                    crate::archive_collection::SEARCH_BUILD_BUDGET,
-                )?)
-        });
-        Ok::<_, anyhow::Error>((
-            memory_facts,
-            Some((knowledge_facts, knowledge_order)),
-            topic_read,
-        ))
-    })
-    .await
-    .context("join frozen wake input selection")??;
+                .read_acquiring::<triblespace::core::collection::latest::LatestIndex>()
+                .context("read selected Knowledge supersession index")?
+                .into_parts();
+            notes.extend(crate::storage::unread_foundations_note(
+                "Knowledge",
+                &unread_knowledge,
+            ));
+            // The supersession index stands on the Knowledge foundations: name
+            // it only for one the facts did not miss.
+            if unread_order
+                .members()
+                .any(|member| !unread_knowledge.contains(member))
+            {
+                notes.extend(crate::storage::unread_foundations_note(
+                    "Knowledge supersession index",
+                    &unread_order,
+                ));
+            }
+            // As in Archive search, keep a bounded part of a cold index. Later reads
+            // reuse those MAPs and ordinary collection maintenance can finish it.
+            let topic_read = topic_index.map(|target| -> Result<_> {
+                Ok(reader
+                    .attached_acquiring(target?)?
+                    .read_within::<knowledge_model::recall::TopicIndex>(
+                        crate::archive_collection::SEARCH_BUILD_BUDGET,
+                    )?)
+            });
+            Ok::<_, anyhow::Error>((
+                memory_facts,
+                Some((knowledge_facts, knowledge_order)),
+                topic_read,
+                notes,
+            ))
+        })
+        .await
+        .context("join frozen wake input selection")??;
     let mut diagnostics = tint.map(|t| t.diagnostics.clone()).unwrap_or_default();
+    diagnostics.extend(unread_notes);
     if let Some(tint) = tint.filter(|t| !t.about.trim().is_empty() && cover_opts.budget_chars > 0) {
         let scorer = if tint.has_memory_scores() {
             "WeMM"
@@ -6659,6 +6767,7 @@ async fn wake_selection(
     let (goals, presented) = match goals_source {
         GoalSources::Attention(sources) => {
             let observation = observe_snapshot_acquiring(snapshot.clone(), &sources, false).await?;
+            cover.diagnostics.extend(observation.notes.iter().cloned());
             let persona_id = read(storage, &snapshot, |reader| {
                 let query = observation.query(reader);
                 persona
@@ -6693,12 +6802,13 @@ async fn wake_selection(
             })
             .await?
         }
-        GoalSources::Overview(goals) => (
-            goals
+        GoalSources::Overview(goals) => {
+            let (goals, notes) = goals
                 .overview(storage, &snapshot, doing_limit, todo_limit)
-                .await?,
-            None,
-        ),
+                .await?;
+            cover.diagnostics.extend(notes);
+            (goals, None)
+        }
     };
     Ok(WakeSelection {
         cover,
@@ -6977,9 +7087,12 @@ async fn cmd_goals(
     let snapshot = storage
         .snapshot()
         .map_err(|error| anyhow!("freeze goals observation: {error}"))?;
-    let goals = sources
+    let (goals, notes) = sources
         .overview(storage, &snapshot, doing_limit, todo_limit)
         .await?;
+    for note in &notes {
+        output.note(note.clone())?;
+    }
     write_complete_report(output, &goals, "Orient goals", &mut |_| {}).await
 }
 
@@ -12043,6 +12156,123 @@ mod tests {
         assert_eq!(output, b"News: peek\n");
         assert!(stored_presentations(&mut pile, &fixture.signer, persona).is_empty());
         pile.close().unwrap();
+    }
+
+    /// A Message foundation stranded on another host: the
+    /// observation answers over what is here and names it; news is the
+    /// resident message only, and receipting that news cannot suppress the
+    /// stranded one. The unread handle is in the observation's read-set, so
+    /// the arrival of its bytes alone makes the observation stale, and the
+    /// next observation presents exactly the message that was away.
+    #[test]
+    fn a_stranded_message_is_news_when_its_bytes_arrive_not_suppressed() {
+        runtime().unwrap().block_on(async {
+            let fixture = TestPile::new();
+            let mut pile = open_store_as(&fixture.path, fixture.signer.verifying_key()).unwrap();
+            let sources = OrientSources::open(&test_storage(), &mut pile, &fixture.signer, false)
+                .await
+                .unwrap();
+            let reader_id = id(92);
+            let author_id = id(93);
+            for (person, label) in [(reader_id, "reader"), (author_id, "author")] {
+                let (profile, _, _) = relations::person_fragment(
+                    person,
+                    relations::ProfileInput {
+                        label: label.to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                pile.commit(sources.relations.source, &fixture.signer, profile)
+                    .unwrap();
+            }
+            let moment = |seconds: f64| clock::point(Epoch::from_tai_seconds(seconds)).unwrap();
+            let (here, here_id) = message::message_fragment(
+                author_id,
+                &message::Recipient::Person(reader_id),
+                "the message that is here",
+                moment(1.0),
+            );
+            pile.commit(sources.messages.source, &fixture.signer, here)
+                .unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let away_body = "the message that is away";
+            let (away, away_id) = message::message_fragment(
+                author_id,
+                &message::Recipient::Person(reader_id),
+                away_body,
+                moment(2.0),
+            );
+            let away_facts = away.facts().clone();
+            let stranded = crate::storage::residual_fixture::strand(
+                &mut pile,
+                sources.messages.source,
+                &fixture.signer,
+                away,
+            )
+            .unwrap();
+            let stranded_hex = hex::encode(stranded.raw);
+
+            let observation = observe_current_sources_acquiring(&mut pile, &sources)
+                .await
+                .unwrap();
+            assert!(
+                observation
+                    .notes
+                    .iter()
+                    .any(|note| note.contains(&stranded_hex)),
+                "{:?}",
+                observation.notes
+            );
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { events, .. } = news else {
+                panic!("the resident message is news");
+            };
+            assert!(events.contains(&here_id), "{events:?}");
+            assert!(!events.contains(&away_id), "{events:?}");
+            // Nothing else changes: the partial observation stays current.
+            assert!(observation.is_current(&pile.snapshot().unwrap()));
+
+            // Its bytes arrive, and nothing else: the observation is stale.
+            let arrived = pile.put::<SimpleArchive, _>(away_facts).unwrap();
+            assert_eq!(
+                arrived, stranded,
+                "the arriving bytes are the stranded foundation"
+            );
+            pile.put::<blobencodings::UTF8String, _>(away_body.to_owned())
+                .unwrap();
+            assert!(!observation.is_current(&pile.snapshot().unwrap()));
+
+            // What the reader was shown is receipted, as a consuming poll
+            // does; the stranded message was never shown, so never receipted.
+            save_test_presentations(&mut pile, &fixture.signer, events.iter().copied()).unwrap();
+            maintain_sources(&mut pile, &fixture.signer, &sources)
+                .await
+                .unwrap();
+            let observation = observe_current_sources_acquiring(&mut pile, &sources)
+                .await
+                .unwrap();
+            assert!(observation.notes.is_empty(), "{:?}", observation.notes);
+            let news = read(&mut pile, &observation.snapshot, |reader| {
+                let query = observation.query(reader);
+                prepare_news_once(&query, reader_id)
+            })
+            .await
+            .unwrap();
+            let News::Report { events, text, .. } = news else {
+                panic!("the message that was away is news once it is here");
+            };
+            assert_eq!(events, vec![away_id], "{text}");
+            assert!(text.contains(away_body), "{text}");
+            pile.close().unwrap();
+        });
     }
 
     #[test]

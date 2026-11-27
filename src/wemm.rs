@@ -2272,12 +2272,14 @@ mod tests {
         );
         let rust = knowledge
             .similar_with(&session, "how references and mutation are checked")
-            .unwrap();
+            .unwrap()
+            .value;
         eprintln!("{rust}");
         assert!(first(rust).contains(&format!("{:x}", revisions[0])));
         let ocean = knowledge
             .similar_with(&session, "the moon pulls the ocean into high tides")
-            .unwrap();
+            .unwrap()
+            .value;
         eprintln!("{ocean}");
         assert!(
             !ocean.contains(&format!("{tides:x}")),
@@ -2285,7 +2287,8 @@ mod tests {
         );
         let lava = knowledge
             .similar_with(&session, "lava from an erupting volcano")
-            .unwrap();
+            .unwrap()
+            .value;
         eprintln!("{lava}");
         assert!(first(lava).contains(&format!("{volcanoes:x}")));
         let picture = run(&mut |out| {

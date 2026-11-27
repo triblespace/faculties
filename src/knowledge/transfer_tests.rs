@@ -253,6 +253,7 @@ impl Fixture {
     fn knowledge_facts(&self, workspace: Id) -> FactArchive {
         KnowledgeStorage {
             storage: &self.storage(workspace).unwrap(),
+            notes: None,
         }
         .view(|view| Ok(view.facts.clone()))
         .unwrap()
@@ -261,6 +262,7 @@ impl Fixture {
     fn files_ids(&self, workspace: Id) -> BTreeSet<Id> {
         KnowledgeStorage {
             storage: &self.storage(workspace).unwrap(),
+            notes: None,
         }
         .view_with_scope(FILES_SCOPE_ID, "Files", |_, files| {
             Ok(find!(id: Id, pattern!(files, [{ ?id @ metadata::tag: &KIND_FILE }])).collect())

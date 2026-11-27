@@ -391,7 +391,12 @@ fn stage_source(
             let (id, reason) = order[index];
             index += 1;
             let gathered = gather_revision(facts, id);
-            carry_texts(&view.reader, &gathered.texts, &mut stage.knowledge_blobs, id)?;
+            carry_texts(
+                &view.reader,
+                &gathered.texts,
+                &mut stage.knowledge_blobs,
+                id,
+            )?;
             // Ids are opaque: the received id and its readable facts are what
             // cross, never a recomputation that could refuse an annotated or
             // randomly identified revision.
@@ -573,9 +578,13 @@ pub(super) fn transfer(
 ) -> Result<TransferReport> {
     let (from, source_root, source_files) = workspace_roots(source, "source")?;
     let (to, destination_root, destination_files) = workspace_roots(destination, "destination")?;
-    let source = KnowledgeStorage { storage: source };
+    let source = KnowledgeStorage {
+        storage: source,
+        notes: None,
+    };
     let destination = KnowledgeStorage {
         storage: destination,
+        notes: None,
     };
     let mut stage = stage_source(source, source_files, revision, options)?;
     if !stage.files.is_empty() && !destination_files {

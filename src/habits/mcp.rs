@@ -112,6 +112,9 @@ impl Faculty for Habits {
                     args.evaluate_conditions
                 };
                 let listing = render::listed(&self.operations.list(evaluate)?, due);
+                for note in &listing.notes {
+                    out.note(note.clone())?;
+                }
                 out.text(listing.text)?;
                 for diagnostic in &listing.diagnostics {
                     out.line(diagnostic)?;

@@ -3,9 +3,10 @@ pub mod cli;
 pub mod mcp;
 pub mod presentation;
 
+use crate::knowledge::{self as knowledge_model, FrontierModel, LinkResolution};
+use crate::storage::Noted;
 #[cfg(test)]
 use crate::storage::{load_signer, open_pile_strict_as};
-use crate::knowledge::{self as knowledge_model, FrontierModel, LinkResolution};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -24,22 +25,25 @@ impl KnowledgeHealth {
     pub fn with_storage(storage: crate::storage::Storage) -> Self {
         Self { storage }
     }
-    pub fn health(&self) -> Result<Health> {
+    // Every report reads what is here and carries a note for
+    // each foundation it could not load: a count over what is here, never a
+    // claim about the rest.
+    pub fn health(&self) -> Result<Noted<Health>> {
         with_model(&self.storage, |model| Ok(health(model)))
     }
-    pub fn tags(&self) -> Result<Vec<TagCount>> {
+    pub fn tags(&self) -> Result<Noted<Vec<TagCount>>> {
         with_model(&self.storage, |model| Ok(tags(model)))
     }
-    pub fn quality(&self) -> Result<Vec<QualityState>> {
+    pub fn quality(&self) -> Result<Noted<Vec<QualityState>>> {
         with_model(&self.storage, |model| Ok(quality(model)))
     }
-    pub fn hubs(&self, top: usize) -> Result<Hubs> {
+    pub fn hubs(&self, top: usize) -> Result<Noted<Hubs>> {
         with_model(&self.storage, |model| Ok(hubs(model, top)))
     }
-    pub fn risk(&self) -> Result<RiskReport> {
+    pub fn risk(&self) -> Result<Noted<RiskReport>> {
         with_model(&self.storage, |model| Ok(risk(model)))
     }
-    pub fn orphans(&self, top: usize) -> Result<Orphans> {
+    pub fn orphans(&self, top: usize) -> Result<Noted<Orphans>> {
         with_model(&self.storage, |model| Ok(orphans(model, top)))
     }
 }
@@ -317,7 +321,7 @@ pub fn orphans(model: &FrontierModel, top: usize) -> Orphans {
 fn with_model<T>(
     storage: &crate::storage::Storage,
     operation: impl FnOnce(&KnowledgeHealthModel) -> Result<T>,
-) -> Result<T> {
+) -> Result<Noted<T>> {
     use crate::storage::AcquiringReader;
     use triblespace::core::blob::encodings::succinctarchive::{
         Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
@@ -337,17 +341,35 @@ fn with_model<T>(
         let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
         let latest = knowledge_model::latest_for_source(pile, source)?;
         let reader = AcquiringReader::new(
-            pile.snapshot().context("freeze Knowledge health's Knowledge observation")?,
+            pile.snapshot()
+                .context("freeze Knowledge health's Knowledge observation")?,
             std::sync::Arc::clone(runtime),
         );
-        let facts = crate::storage::acquire_facts(&reader, rank9)?;
-        let latest = crate::storage::require_complete_attached_read(
-            reader
-                .attached_acquiring(latest)?
-                .read_acquiring::<LatestIndex>()?,
-        )?;
-        let model = KnowledgeHealthModel::load(&reader, &facts, &latest)?;
-        operation(&model)
+        let (facts, unread_facts) =
+            crate::storage::acquire_facts_read(&reader, rank9)?.into_parts();
+        let (latest, unread_latest) = reader
+            .attached_acquiring(latest)?
+            .read_acquiring::<LatestIndex>()?
+            .into_parts();
+        // The supersession index stands on the facts' foundations: name it
+        // only for one the facts did not miss.
+        let mut notes: Vec<String> =
+            crate::storage::unread_foundations_note("Knowledge", &unread_facts)
+                .into_iter()
+                .collect();
+        if unread_latest
+            .members()
+            .any(|member| !unread_facts.contains(member))
+        {
+            notes.extend(crate::storage::unread_foundations_note(
+                "Knowledge supersession index",
+                &unread_latest,
+            ));
+        }
+        let value = KnowledgeHealthModel::load(&reader, &facts, &latest)
+            .and_then(|model| operation(&model))
+            .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
+        Ok(Noted { value, notes })
     })
 }
 
@@ -356,9 +378,9 @@ mod tests {
     use super::*;
     use std::fs::File;
 
+    use crate::knowledge::{author_record, revision_record, tag_record, RevisionDraft};
     use crate::schemas::wiki::TAG_ARCHIVED_ID;
     use crate::storage::initialize_signer;
-    use crate::knowledge::{author_record, revision_record, tag_record, RevisionDraft};
     use hifitime::Epoch;
     use triblespace::core::collection::CollectionStoreExt;
     use triblespace::prelude::*;

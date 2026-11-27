@@ -1320,7 +1320,7 @@ pub fn acquire_facts<R: StoreRead>(
 /// the fetch could not bring stays unread. Storage errors and bytes that
 /// cannot form an archive still fail the read.
 ///
-/// This is the ordinary read (JP, 2026-11-26): answer with what was read,
+/// This is the ordinary read: answer with what was read,
 /// and say what could not be loaded ([`unread_foundations_note`]) instead of
 /// refusing the whole collection for one absent foundation. A count, a list
 /// or a cover read this way is the answer over what is here, and the note
@@ -1340,24 +1340,98 @@ pub fn acquire_facts_read<R: StoreRead>(
     .context("acquire the selected Rank9 facts")
 }
 
+/// [`acquire_attached_facts`] over what is here: the facts of an already
+/// selected observation, and the foundations it omits beside them, as
+/// [`acquire_facts_read`] answers.
+pub fn acquire_attached_facts_read<R: StoreRead>(
+    attached: &AttachedSnapshot<R, Rank9AcceleratedSuccinctArchiveBlob>,
+) -> Result<AttachedRead<FactArchive>> {
+    succinctarchive_union::read_attached_acquiring(attached)
+        .context("acquire the selected Rank9 facts")
+}
+
+/// An answer read over what is here, with the notes of what the read could
+/// not load ([`unread_foundations_note`]) carried beside it. It reads as the
+/// answer itself; a frontend delivers the notes with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Noted<T> {
+    pub value: T,
+    pub notes: Vec<String>,
+}
+
+impl<T> Noted<T> {
+    /// An answer whose read was complete.
+    pub fn complete(value: T) -> Self {
+        Self {
+            value,
+            notes: Vec::new(),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Noted<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Noted<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.value.fmt(formatter)
+    }
+}
+
+impl PartialEq<Noted<String>> for String {
+    fn eq(&self, other: &Noted<String>) -> bool {
+        *self == other.value
+    }
+}
+
+impl PartialEq<String> for Noted<String> {
+    fn eq(&self, other: &String) -> bool {
+        self.value == *other
+    }
+}
+
+/// `error`, with each note of what its read could not load as context: a
+/// thing not found may be in one of them.
+pub fn with_unread_notes(error: anyhow::Error, notes: &[String]) -> anyhow::Error {
+    notes
+        .iter()
+        .fold(error, |error, note| error.context(note.clone()))
+}
+
 /// A note naming the foundations of `label`'s collection a read could not
 /// load, for the caller to deliver beside its answer, or `None` when the read
 /// was complete. Names at most eight, as [`IncompleteAttachedRead`] does.
 pub fn unread_foundations_note(label: &str, unread: &Support<SimpleArchive>) -> Option<String> {
-    if unread.is_empty() {
+    unread_handles_note(label, unread.members(), unread.len())
+}
+
+/// [`unread_foundations_note`] for foundations a caller found unreadable one
+/// by one rather than through an attached read: `count` handles, of which
+/// `handles` yields at least the first eight.
+pub fn unread_handles_note(
+    label: &str,
+    handles: impl IntoIterator<Item = triblespace::core::inline::Inline<Handle<SimpleArchive>>>,
+    count: usize,
+) -> Option<String> {
+    if count == 0 {
         return None;
     }
-    let named = unread
-        .members()
+    let named = handles
+        .into_iter()
         .take(8)
         .map(|handle| hex::encode(handle.raw))
         .collect::<Vec<_>>()
         .join(", ");
-    let more = unread.len().saturating_sub(8);
+    let more = count.saturating_sub(8);
     Some(format!(
         "{} foundation(s) of {label} could not be loaded, so this answer omits whatever \
          they hold: {named}{}",
-        unread.len(),
+        count,
         if more > 0 {
             format!(" (+{more} more)")
         } else {
@@ -1709,7 +1783,7 @@ fn finish_pile<T>(pile: Pile, result: Result<T>) -> Result<T> {
 
 /// Foundations a read cannot simply read, planted in a test pile: one this
 /// pile has the signed record of but not the bytes (a commit stranded on
-/// another host, as on 26 November 2026), and one whose bytes are here and
+/// another host), and one whose bytes are here and
 /// form no archive.
 #[cfg(test)]
 pub(crate) mod residual_fixture {
@@ -1724,18 +1798,21 @@ pub(crate) mod residual_fixture {
     use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
     use triblespace::core::repo::memoryrepo::MemoryRepo;
-    use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::BlobStorePut;
     use triblespace::core::trible::Fragment;
 
     /// Commit `fragment` into `source` elsewhere and give `pile` only the
     /// signed record: the foundation is admitted here, its bytes are not.
-    pub fn strand(
-        pile: &mut Pile,
+    pub fn strand<S>(
+        pile: &mut S,
         source: Collection<SimpleArchive>,
         signer: &SigningKey,
         fragment: Fragment,
-    ) -> Result<Inline<Handle<SimpleArchive>>> {
+    ) -> Result<Inline<Handle<SimpleArchive>>>
+    where
+        S: CollectionStore,
+        S::InsertError: std::error::Error + Send + Sync + 'static,
+    {
         let arriving = MemoryRepo::default().commit(source, signer, fragment)?;
         pile.insert(CollectionRecord::Commit(arriving))?;
         Ok(Handle::<SimpleArchive>::from_hash(arriving.data()))
@@ -1743,11 +1820,16 @@ pub(crate) mod residual_fixture {
 
     /// A signed commit into `source` whose bytes are here but are no
     /// archive at all.
-    pub fn malformed(
-        pile: &mut Pile,
+    pub fn malformed<S>(
+        pile: &mut S,
         source: Collection<SimpleArchive>,
         signer: &SigningKey,
-    ) -> Result<Inline<Handle<SimpleArchive>>> {
+    ) -> Result<Inline<Handle<SimpleArchive>>>
+    where
+        S: CollectionStore + BlobStorePut,
+        S::InsertError: std::error::Error + Send + Sync + 'static,
+        S::PutError: std::error::Error + Send + Sync + 'static,
+    {
         let bytes = triblespace::core::blob::Bytes::from_source(vec![0xEE; 63]);
         let data: CollectionData = Inline::new(pile.put::<UnknownBlob, _>(bytes)?.raw);
         pile.put::<SimpleArchive, _>(triblespace::core::trible::TribleSet::new())?;

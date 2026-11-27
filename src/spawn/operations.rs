@@ -3641,40 +3641,71 @@ impl Spawn {
             .find(|path| path.is_file())
     }
 
-    /// Every spawn, by name.
+    /// Every spawn, by name, over every foundation or refused.
     pub fn list(&self) -> Result<Vec<SpawnView>> {
         self.observe(|facts, reader| spawns_in(facts, reader))
     }
 
-    /// One spawn by its name.
-    pub fn show(&self, name: &str) -> Result<SpawnView> {
-        let name_handle = super::text_handle(name.trim());
-        self.observe(|facts, reader| {
-            let found = find!(
-                (spawn: Id, brief: TextHandle),
-                pattern!(facts, [{ ?spawn @
-                    metadata::tag: KIND_SPAWN,
-                    attrs::name: name_handle,
-                    attrs::brief: ?brief,
-                }])
-            )
-            .collect::<Vec<_>>();
-            match found.as_slice() {
-                [] => bail!("no spawn is named {name}"),
-                [(spawn, brief)] => spawn_view(facts, reader, *spawn, *brief),
-                several => bail!(
-                    "{} briefs share the name {name}: {}",
-                    several.len(),
-                    several
-                        .iter()
-                        .map(|(spawn, _)| format!("{spawn:x}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            }
-        })
+    /// [`Self::list`] over what is here, for `zooid list`: a zooid held only
+    /// in a foundation that is away is not in it, and the note says so.
+    pub fn list_read(&self) -> Result<crate::storage::Noted<Vec<SpawnView>>> {
+        observe_scope_read(
+            &self.storage,
+            DEFAULT_SCOPE_ID,
+            "Spawn",
+            |facts, reader, _| spawns_in(facts, reader),
+        )
     }
 
+    /// One spawn by its name, over every foundation or refused: declaring
+    /// decides on the heads this reads.
+    pub fn show(&self, name: &str) -> Result<SpawnView> {
+        self.observe(|facts, reader| show_in(facts, reader, name))
+    }
+
+    /// [`Self::show`] over what is here, for `zooid show`.
+    pub fn show_read(&self, name: &str) -> Result<crate::storage::Noted<SpawnView>> {
+        observe_scope_read(
+            &self.storage,
+            DEFAULT_SCOPE_ID,
+            "Spawn",
+            |facts, reader, _| show_in(facts, reader, name),
+        )
+    }
+}
+
+/// The spawn named `name` in `facts`.
+fn show_in<R: BlobStoreGet + ?Sized>(
+    facts: &FactArchive,
+    reader: &R,
+    name: &str,
+) -> Result<SpawnView> {
+    let name_handle = super::text_handle(name.trim());
+    let found = find!(
+        (spawn: Id, brief: TextHandle),
+        pattern!(facts, [{ ?spawn @
+            metadata::tag: KIND_SPAWN,
+            attrs::name: name_handle,
+            attrs::brief: ?brief,
+        }])
+    )
+    .collect::<Vec<_>>();
+    match found.as_slice() {
+        [] => bail!("no spawn is named {name}"),
+        [(spawn, brief)] => spawn_view(facts, reader, *spawn, *brief),
+        several => bail!(
+            "{} briefs share the name {name}: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|(spawn, _)| format!("{spawn:x}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+impl Spawn {
     /// The unit's state, as the launcher reads it.
     pub fn unit_state(&self, unit: &str) -> Result<String> {
         self.launcher.state(unit)
@@ -4781,6 +4812,41 @@ pub(super) fn observe_scope<T>(
         let facts = crate::storage::acquire_facts(&snapshot, rank9)
             .with_context(|| format!("read {label} Rank9 collection"))?;
         read(&facts, &snapshot, source.handle())
+    })
+}
+
+/// [`observe_scope`] over what is here, for a view a person
+/// reads: the answer, and a note for each foundation the read could not
+/// load. Not finding something while one is away refuses with the note.
+/// Decisions -- placing or continuing a zooid, declaring over the heads it
+/// saw, settling a run -- keep [`observe_scope`]: absence there could start
+/// a life twice or past the end of its history.
+pub(super) fn observe_scope_read<T>(
+    storage: &Storage,
+    scope: Id,
+    label: &str,
+    read: impl FnOnce(&FactArchive, &AcquiringReader<FacultySnapshot>, CollectionHandle) -> Result<T>,
+) -> Result<crate::storage::Noted<T>> {
+    storage.with_store(|pile, signer, runtime| {
+        let source = storage.open_collection_read(pile, scope, signer.verifying_key(), runtime)?;
+        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ())?;
+        let rank9 = pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)?;
+        runtime
+            .block_on(async {
+                crate::storage::tolerate_own_lag(pile.maintain_attached(succinct, signer).await)?;
+                crate::storage::tolerate_own_lag(pile.maintain_attached(rank9, signer).await)
+            })
+            .with_context(|| format!("maintain {label} fact collection"))?;
+        let snapshot = AcquiringReader::new(pile.snapshot()?, Arc::clone(runtime));
+        let (facts, unread) = crate::storage::acquire_facts_read(&snapshot, rank9)
+            .with_context(|| format!("read {label} Rank9 collection"))?
+            .into_parts();
+        let notes: Vec<String> = crate::storage::unread_foundations_note(label, &unread)
+            .into_iter()
+            .collect();
+        let value = read(&facts, &snapshot, source.handle())
+            .map_err(|error| crate::storage::with_unread_notes(error, &notes))?;
+        Ok(crate::storage::Noted { value, notes })
     })
 }
 
@@ -5906,6 +5972,99 @@ mod tests {
 
     /// The id the queue's own writer gave these facts, taken from the last
     /// build that had it.
+    /// Plant one more Spawn foundation through the raw pile, returning its
+    /// handle in hex.
+    fn plant_spawn(
+        f: &Fixture,
+        plant: impl FnOnce(
+            &mut triblespace::core::repo::pile::Pile,
+            triblespace::core::collection::Collection<
+                triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+            >,
+            &ed25519_dalek::SigningKey,
+        ) -> Result<
+            triblespace::core::inline::Inline<
+                triblespace::core::inline::encodings::hash::Handle<
+                    triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+                >,
+            >,
+        >,
+    ) -> String {
+        let handle = f
+            .storage
+            .with_pile(|pile, signer| {
+                let source = crate::collection_names::open_configured(
+                    pile,
+                    DEFAULT_SCOPE_ID,
+                    signer.verifying_key(),
+                )?;
+                plant(pile, source, signer)
+            })
+            .unwrap();
+        hex::encode(handle.raw)
+    }
+
+    /// A Spawn foundation stranded on another host: the views a
+    /// person reads (`zooid list`, `zooid show`, the colony) answer over what
+    /// is here and name it; the reads decisions are taken on still refuse.
+    #[test]
+    fn zooid_views_go_on_while_a_spawn_foundation_is_away() {
+        let f = fixture();
+        let launched = f
+            .spawn
+            .run(&f.request("Resident before the fault."))
+            .unwrap();
+        let away = plant_spawn(&f, |pile, source, signer| {
+            crate::storage::residual_fixture::strand(
+                pile,
+                source,
+                signer,
+                entity! { metadata::name: "away" },
+            )
+        });
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+
+        let listed = f.spawn.list_read().unwrap();
+        assert!(listed.iter().any(|view| view.name == launched.name));
+        assert!(named(&listed.notes), "{:?}", listed.notes);
+        let shown = f.spawn.show_read(&launched.name).unwrap();
+        assert!(named(&shown.notes), "{:?}", shown.notes);
+        let missing = f.spawn.show_read("nobody-here").unwrap_err();
+        assert!(format!("{missing:#}").contains(&away), "{missing:#}");
+        let colony = f
+            .spawn
+            .colony(&super::super::ColonyOptions::default())
+            .unwrap();
+        assert!(named(&colony.unreadable), "{:?}", colony.unreadable);
+        assert!(super::super::render_colony(&colony).contains(&away));
+
+        // Declaring decides on the heads `show` reads: it stays strict.
+        let strict = f.spawn.show(&launched.name).unwrap_err();
+        assert!(
+            strict
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_some(),
+            "{strict:#}"
+        );
+        assert!(f.spawn.list().is_err());
+    }
+
+    #[test]
+    fn a_malformed_spawn_foundation_fails_zooid_views_loudly() {
+        let f = fixture();
+        f.spawn
+            .run(&f.request("Resident before the fault."))
+            .unwrap();
+        plant_spawn(&f, crate::storage::residual_fixture::malformed);
+        let error = f.spawn.list_read().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                .is_none(),
+            "a fault is not an unread gap: {error:#}"
+        );
+    }
+
     #[test]
     fn the_past_request_fixture_has_the_identity_the_queue_wrote() {
         let (_, id) = past_request(
@@ -7645,7 +7804,7 @@ mod tests {
             ("orchard", orchard, "one tile per block"),
         ] {
             let text = wake(cue, budget);
-            let exact = knowledge.show(&format!("{id:x}"), true).unwrap();
+            let exact = knowledge.show(&format!("{id:x}"), true).unwrap().value;
             assert!(text.contains(&exact), "{text}");
             assert!(
                 !text.contains(absent)
@@ -7708,7 +7867,7 @@ mod tests {
         let semantic = LibraryRenderer
             .wake(&f.storage, Some(&tint), budget)
             .unwrap();
-        assert!(semantic.contains(&knowledge.show(&format!("{orchard:x}"), true).unwrap()));
+        assert!(semantic.contains(&knowledge.show(&format!("{orchard:x}"), true).unwrap().value));
         assert!(semantic.contains("Knowledge topic scorer: WeMM"));
         assert!(!semantic.contains("stale warp schedule"));
         assert!(!semantic.contains("retired warp experiment"));
@@ -7723,7 +7882,7 @@ mod tests {
         let supplemented = LibraryRenderer
             .wake(&f.storage, Some(&coverage_gap), budget)
             .unwrap();
-        assert!(supplemented.contains(&knowledge.show(&format!("{fresh:x}"), true).unwrap()));
+        assert!(supplemented.contains(&knowledge.show(&format!("{fresh:x}"), true).unwrap().value));
         assert!(supplemented.contains("lexical matches without semantic rows"));
         assert!(!wake("warp", 80).contains(crate::knowledge::recall::HEADING));
         for cue in ["", "unmatchedkeyword"] {

@@ -215,10 +215,10 @@ impl Faculty for Knowledge {
         match name {
             "knowledge_create" => {
                 let args: Create = decode_arguments(arguments)?;
-                revision(
-                    out,
-                    knowledge.create(&args.title, &args.content, &args.tags, args.force)?,
-                )
+                let created =
+                    knowledge.create_noted(&args.title, &args.content, &args.tags, args.force)?;
+                super::operations::deliver_notes(&created.notes, out)?;
+                revision(out, created.value)
             }
             "knowledge_edit" => {
                 let args: Edit = decode_arguments(arguments)?;
@@ -235,11 +235,13 @@ impl Faculty for Knowledge {
             }
             "knowledge_show" => {
                 let args: Read = decode_arguments(arguments)?;
-                out.text(knowledge.show(&args.id, args.exact)?)
+                super::operations::noted_text(knowledge.show(&args.id, args.exact)?, out)
             }
             "knowledge_export" => {
                 let args: Read = decode_arguments(arguments)?;
                 let export = knowledge.export(&args.id, args.exact)?;
+                super::operations::deliver_notes(&export.notes, out)?;
+                let export = export.value;
                 let uri = export.uri();
                 out.blob(export.bytes, "text/plain; charset=utf-8", uri)
             }
@@ -248,7 +250,7 @@ impl Faculty for Knowledge {
                 if args.from == Some(0) || args.to == Some(0) {
                     return Err(invalid_arguments("revision positions are one-based"));
                 }
-                out.text(knowledge.diff(&args.id, args.from, args.to)?)
+                super::operations::noted_text(knowledge.diff(&args.id, args.from, args.to)?, out)
             }
             "knowledge_archive" => {
                 let args: Selector = decode_arguments(arguments)?;
@@ -271,18 +273,21 @@ impl Faculty for Knowledge {
             }
             "knowledge_list" => {
                 let args: List = decode_arguments(arguments)?;
-                out.text(knowledge.list(&ListOptions {
-                    tags: args.tags,
-                    with_backlink_tag: args.with_backlink_tag,
-                    without_backlink_tag: args.without_backlink_tag,
-                    with_backlink_type: args.with_backlink_type,
-                    without_backlink_type: args.without_backlink_type,
-                    all: args.all,
-                })?)
+                super::operations::noted_text(
+                    knowledge.list(&ListOptions {
+                        tags: args.tags,
+                        with_backlink_tag: args.with_backlink_tag,
+                        without_backlink_tag: args.without_backlink_tag,
+                        with_backlink_type: args.with_backlink_type,
+                        without_backlink_type: args.without_backlink_type,
+                        all: args.all,
+                    })?,
+                    out,
+                )
             }
             "knowledge_history" => {
                 let args: Selector = decode_arguments(arguments)?;
-                out.text(knowledge.history(&args.id)?)
+                super::operations::noted_text(knowledge.history(&args.id)?, out)
             }
             "knowledge_tag_add" | "knowledge_tag_remove" => {
                 let args: Tag = decode_arguments(arguments)?;
@@ -308,11 +313,14 @@ impl Faculty for Knowledge {
             }
             "knowledge_search" => {
                 let args: Search = decode_arguments(arguments)?;
-                out.text(knowledge.search(&args.query, args.context, args.all)?)
+                super::operations::noted_text(
+                    knowledge.search(&args.query, args.context, args.all)?,
+                    out,
+                )
             }
             "knowledge_similar" => {
                 let args: Query = decode_arguments(arguments)?;
-                out.text(knowledge.similar(&args.query)?)
+                super::operations::noted_text(knowledge.similar(&args.query)?, out)
             }
             "knowledge_check" => {
                 let _: Empty = decode_arguments(arguments)?;

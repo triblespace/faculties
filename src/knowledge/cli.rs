@@ -430,7 +430,11 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
         } => {
             let title = crate::text_arg(&title, "title")?;
             let content = crate::text_arg(&content, "content")?;
-            revision(out, knowledge.create(&title, &content, &tag, force)?)
+            {
+                let created = knowledge.create_noted(&title, &content, &tag, force)?;
+                super::operations::deliver_notes(&created.notes, out)?;
+                revision(out, created.value)
+            }
         }
         Command::Edit {
             id,
@@ -450,13 +454,19 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
                 knowledge.edit(&id, content.as_deref(), title.as_deref(), &tag, force)?,
             )
         }
-        Command::Show { id, exact } => out.text(knowledge.show(&id, exact)?),
+        Command::Show { id, exact } => {
+            super::operations::noted_text(knowledge.show(&id, exact)?, out)
+        }
         Command::Export { id, exact } => {
             let export = knowledge.export(&id, exact)?;
+            super::operations::deliver_notes(&export.notes, out)?;
+            let export = export.value;
             let uri = export.uri();
             out.blob(export.bytes, "text/plain; charset=utf-8", uri)
         }
-        Command::Diff { id, from, to } => out.text(knowledge.diff(&id, from, to)?),
+        Command::Diff { id, from, to } => {
+            super::operations::noted_text(knowledge.diff(&id, from, to)?, out)
+        }
         Command::Archive { id } => tag_change(out, knowledge.archive(&id)?, "archived", true),
         Command::Restore { id } => tag_change(out, knowledge.restore(&id)?, "archived", false),
         Command::Revert { id, to } => revision(out, knowledge.revert(&id, to)?),
@@ -468,15 +478,18 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             with_backlink_type,
             without_backlink_type,
             all,
-        } => out.text(knowledge.list(&ListOptions {
-            tags: tag,
-            with_backlink_tag,
-            without_backlink_tag,
-            with_backlink_type,
-            without_backlink_type,
-            all,
-        })?),
-        Command::History { id } => out.text(knowledge.history(&id)?),
+        } => super::operations::noted_text(
+            knowledge.list(&ListOptions {
+                tags: tag,
+                with_backlink_tag,
+                without_backlink_tag,
+                with_backlink_type,
+                without_backlink_type,
+                all,
+            })?,
+            out,
+        ),
+        Command::History { id } => super::operations::noted_text(knowledge.history(&id)?, out),
         Command::Tag { command } => match command {
             TagCommand::Add { id, name } => {
                 tag_change(out, knowledge.tag(&id, &name, true)?, &name, true)
@@ -512,8 +525,10 @@ fn execute(cli: Cli, out: &mut Out<'_>) -> Result<()> {
             query,
             context,
             all,
-        } => out.text(knowledge.search(&query, context, all)?),
-        Command::Similar { query } => out.text(knowledge.similar(&query)?),
+        } => super::operations::noted_text(knowledge.search(&query, context, all)?, out),
+        Command::Similar { query } => {
+            super::operations::noted_text(knowledge.similar(&query)?, out)
+        }
         Command::Batch {
             action: BatchAction::Export { dir },
         } => {

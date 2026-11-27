@@ -2752,6 +2752,98 @@ mod tests {
         Habits::new(fixture.pile.clone(), Some(fixture.key.clone()))
     }
 
+    /// Plant one more Habit foundation through the raw pile.
+    fn plant(
+        fixture: &Fixture,
+        plant: impl FnOnce(
+            &mut triblespace::core::repo::pile::Pile,
+            Collection<triblespace::core::blob::encodings::simplearchive::SimpleArchive>,
+            &ed25519_dalek::SigningKey,
+        ) -> anyhow::Result<
+            triblespace::core::inline::Inline<
+                triblespace::core::inline::encodings::hash::Handle<
+                    triblespace::core::blob::encodings::simplearchive::SimpleArchive,
+                >,
+            >,
+        >,
+    ) -> String {
+        let storage = crate::storage::Storage::new(fixture.pile.clone(), Some(fixture.key.clone()));
+        let handle = storage
+            .with_pile(|pile, signer| {
+                let source = open_configured(pile, DEFAULT_SCOPE_ID, signer.verifying_key())?;
+                plant(pile, source, signer)
+            })
+            .unwrap();
+        hex::encode(handle.raw)
+    }
+
+    /// A foundation of the collection is stranded on another host: every
+    /// command answers over what is here and names it, and a
+    /// selector that finds nothing refuses with the gap named.
+    #[test]
+    fn commands_go_on_while_a_habit_foundation_is_away() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let resident = api
+            .add("resident habit", "every 1h", "observe", None, &[], &[])
+            .unwrap();
+        assert!(resident.notes.is_empty());
+        let (away_fragment, away_id) =
+            habit_fragment("away habit", "every 1h", "observe", None, &[], &[]).unwrap();
+        let away = plant(&fixture, |pile, source, signer| {
+            crate::storage::residual_fixture::strand(pile, source, signer, away_fragment)
+        });
+        let named = |notes: &[String]| notes.iter().any(|note| note.contains(&away));
+        let selector = format!("{:x}", resident.id);
+
+        // (a) Appends are stored, their receipts naming the gap.
+        let added = api
+            .add("added meanwhile", "every 2h", "observe", None, &[], &[])
+            .unwrap();
+        assert!(
+            !added.already_present && named(&added.notes),
+            "{:?}",
+            added.notes
+        );
+        assert!(named(&api.done(&selector).unwrap().notes));
+        let paused = api.set_state(&selector, DeclaredState::Paused).unwrap();
+        assert!(paused.event.is_some() && named(&paused.notes));
+
+        // (b) Reads answer over what is here and name it.
+        let listed = api.list(false).unwrap();
+        assert!(named(&listed.notes), "{:?}", listed.notes);
+        let ids: BTreeSet<Id> = listed.entries.iter().map(|entry| entry.row.id).collect();
+        assert_eq!(ids, BTreeSet::from([resident.id, added.id]));
+        assert!(named(&crate::habits::render::listed(&listed, false).notes));
+        assert!(named(&api.show(&selector).unwrap().notes));
+        assert!(named(&api.check().unwrap().notes));
+
+        // Not finding a habit while a foundation is away says so.
+        let error = api.show(&format!("{away_id:x}")).unwrap_err();
+        assert!(format!("{error:#}").contains(&away), "{error:#}");
+    }
+
+    #[test]
+    fn a_malformed_habit_foundation_fails_loudly() {
+        let fixture = Fixture::new();
+        let api = api(&fixture);
+        let resident = api
+            .add("resident habit", "every 1h", "observe", None, &[], &[])
+            .unwrap();
+        plant(&fixture, crate::storage::residual_fixture::malformed);
+        let fault = |error: anyhow::Error| {
+            assert!(
+                error
+                    .downcast_ref::<crate::storage::IncompleteAttachedRead>()
+                    .is_none(),
+                "a fault is not an unread gap: {error:#}"
+            )
+        };
+        fault(api.list(false).unwrap_err());
+        fault(api.done(&format!("{:x}", resident.id)).unwrap_err());
+        fault(api.check().unwrap_err());
+    }
+
     /// The schema cannot express cardinality, so a definition carrying two
     /// conditions is two readings of one intention, not a broken record. The
     /// intention is due when any reading is, and is addressed by its id.

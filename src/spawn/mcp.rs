@@ -251,14 +251,19 @@ impl Faculty for Spawn {
             }
             "zooid_list" => {
                 let Empty {} = decode_arguments(arguments)?;
-                out.text(render_list(&self.operations()?.list()?))
+                let spawns = self.operations()?.list_read()?;
+                for note in &spawns.notes {
+                    out.note(note.clone())?;
+                }
+                out.text(render_list(&spawns))
             }
             "zooid_show" => {
                 let args: Show = decode_arguments(arguments)?;
-                out.text(render_show(
-                    &self.operations()?.show(&args.name)?,
-                    args.brief,
-                ))
+                let view = self.operations()?.show_read(&args.name)?;
+                for note in &view.notes {
+                    out.note(note.clone())?;
+                }
+                out.text(render_show(&view, args.brief))
             }
             _ => bail!("Zooid MCP has no tool {name:?}"),
         }

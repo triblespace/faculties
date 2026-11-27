@@ -177,27 +177,57 @@ impl HealthSources {
         let runtime = tokio::runtime::Handle::current();
         tokio::task::spawn_blocking(move || {
             let reader = crate::storage::AcquiringReader::with_handle(snapshot.clone(), runtime);
+            // The requested dashboard reads what is here,
+            // naming each foundation it could not load beside the report.
+            let notes = std::cell::RefCell::new(Vec::new());
+            let unread_health = std::cell::RefCell::new(None);
             let observe = |source: OrientSource| -> Result<OrientFact> {
                 let collection = reader.attached_acquiring(source.rank9)?;
-                let view = crate::storage::acquire_attached_facts(&collection)?;
+                let (view, unread) =
+                    crate::storage::acquire_attached_facts_read(&collection)?.into_parts();
+                notes
+                    .borrow_mut()
+                    .extend(crate::storage::unread_foundations_note(
+                        source.label,
+                        &unread,
+                    ));
+                if source.rank9 == health.rank9 {
+                    *unread_health.borrow_mut() = Some(unread);
+                }
                 Ok(OrientFact {
                     collection: collection.into_frozen(),
                     view,
                 })
             };
+            let facts = observe(health)?;
+            let relations = observe(relations)?;
             let latest_collection = reader.attached_acquiring(latest_target)?;
-            let latest = crate::storage::require_complete_attached_read(
-                latest_collection.read_acquiring::<LwwIndex>()?,
-            )?
-            .query()?;
+            let (latest, unread_latest) =
+                latest_collection.read_acquiring::<LwwIndex>()?.into_parts();
+            // The latest register stands on the health foundations: name it
+            // only for one the facts did not miss.
+            if unread_latest.members().any(|member| {
+                !unread_health
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|unread| unread.contains(member))
+            }) {
+                notes
+                    .borrow_mut()
+                    .extend(crate::storage::unread_foundations_note(
+                        "Swarm health latest",
+                        &unread_latest,
+                    ));
+            }
+            let latest = latest.query()?;
             let presentations = reader.attached(presentations_target)?;
             Ok(HealthObservation {
                 snapshot,
                 evaluated_at: now,
-                facts: observe(health)?,
+                facts,
                 latest,
                 latest_collection: latest_collection.into_frozen(),
-                relations: observe(relations)?,
+                relations,
                 // Show presents this dashboard regardless of old receipts.
                 // Do not fetch historical receipt bytes it never consults.
                 presentations: ReceiptObservation {
@@ -210,6 +240,7 @@ impl HealthSources {
                 },
                 max_age,
                 service_events,
+                notes: notes.into_inner(),
             })
         })
         .await
@@ -419,6 +450,7 @@ impl HealthSources {
             presentations,
             max_age: self.max_age,
             service_events,
+            notes: Vec::new(),
         })
     }
 }
@@ -1364,6 +1396,10 @@ pub(super) struct HealthObservation {
     presentations: ReceiptObservation,
     max_age: Duration,
     service_events: Option<OrientFact>,
+    /// What a requested dashboard's read could not load
+    /// ([`crate::storage::unread_foundations_note`]); passive attention reads
+    /// resident only and leaves this empty.
+    pub(super) notes: Vec<String>,
 }
 
 pub(super) struct HealthReport {

@@ -675,12 +675,22 @@ pub fn run() -> Result<()> {
                 crate::cli::with_output("zooid", |out| out.line(declaring.line(&name)))
             }
             Command::List => {
-                let spawns = spawn.list()?;
-                crate::cli::with_output("zooid", |out| out.text(render_list(&spawns)))
+                let spawns = spawn.list_read()?;
+                crate::cli::with_output("zooid", |out| {
+                    for note in &spawns.notes {
+                        out.note(note.clone())?;
+                    }
+                    out.text(render_list(&spawns))
+                })
             }
             Command::Show { name, brief } => {
-                let view = spawn.show(&name)?;
-                crate::cli::with_output("zooid", |out| out.text(render_show(&view, brief)))
+                let view = spawn.show_read(&name)?;
+                crate::cli::with_output("zooid", |out| {
+                    for note in &view.notes {
+                        out.note(note.clone())?;
+                    }
+                    out.text(render_show(&view, brief))
+                })
             }
             Command::Wait { .. }
             | Command::Feed { .. }

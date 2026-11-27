@@ -32,11 +32,17 @@ pub(crate) fn execute(
 ) -> Result<()> {
     let health = KnowledgeHealth::with_storage(storage);
     match command {
-        Command::Health => presentation::health(&health.health()?, out),
-        Command::Quality => presentation::quality(&health.quality()?, out),
-        Command::Hubs { top } => presentation::hubs(&health.hubs(top)?, out),
-        Command::Risk => presentation::risk(&health.risk()?, out),
-        Command::Orphans { top, ids } => presentation::orphans(&health.orphans(top)?, ids, out),
+        Command::Health => presentation::noted(&health.health()?, out, presentation::health),
+        Command::Quality => presentation::noted(&health.quality()?, out, |rows, out| {
+            presentation::quality(rows, out)
+        }),
+        Command::Hubs { top } => presentation::noted(&health.hubs(top)?, out, presentation::hubs),
+        Command::Risk => presentation::noted(&health.risk()?, out, presentation::risk),
+        Command::Orphans { top, ids } => {
+            presentation::noted(&health.orphans(top)?, out, |report, out| {
+                presentation::orphans(report, ids, out)
+            })
+        }
     }
 }
 
@@ -45,5 +51,9 @@ pub(crate) fn tag_counts(
     storage: crate::storage::Storage,
     out: &mut crate::out::Out<'_>,
 ) -> Result<()> {
-    presentation::tags(&KnowledgeHealth::with_storage(storage).tags()?, out)
+    presentation::noted(
+        &KnowledgeHealth::with_storage(storage).tags()?,
+        out,
+        |rows, out| presentation::tags(rows, out),
+    )
 }

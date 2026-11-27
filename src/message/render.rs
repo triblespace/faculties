@@ -48,7 +48,16 @@ fn render_list_body(body: &MessageText) -> String {
     }
 }
 
+/// Deliver the notes of what a read could not load beside its answer.
+fn notes(notes: &[String], out: &mut Out<'_>) -> Result<()> {
+    for note in notes {
+        out.note(note.clone())?;
+    }
+    Ok(())
+}
+
 pub(super) fn sent(sent: &SentMessage, text: &str, out: &mut Out<'_>) -> Result<()> {
+    notes(&sent.notes, out)?;
     out.line(format!(
         "[{:x}] {:x} -> {:x}: {}",
         sent.id,
@@ -59,6 +68,7 @@ pub(super) fn sent(sent: &SentMessage, text: &str, out: &mut Out<'_>) -> Result<
 }
 
 pub(super) fn acknowledged(ack: &Acknowledgement, out: &mut Out<'_>) -> Result<()> {
+    notes(&ack.notes, out)?;
     if ack.already_read {
         out.line(format!(
             "Message {:x} was already read by {:x}.",
@@ -73,6 +83,7 @@ pub(super) fn acknowledged(ack: &Acknowledgement, out: &mut Out<'_>) -> Result<(
 }
 
 pub(super) fn acknowledged_all(ack: &AcknowledgedMessages, out: &mut Out<'_>) -> Result<()> {
+    notes(&ack.notes, out)?;
     if ack.message_ids.is_empty() {
         out.line(format!("No unread messages for {:x}.", ack.reader))
     } else {
@@ -85,6 +96,7 @@ pub(super) fn acknowledged_all(ack: &AcknowledgedMessages, out: &mut Out<'_>) ->
 }
 
 pub(super) fn list(list: &MessageList, out: &mut Out<'_>) -> Result<()> {
+    notes(&list.notes, out)?;
     if list.entries.is_empty() {
         return out.line("No messages.");
     }
